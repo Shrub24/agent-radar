@@ -1,0 +1,32 @@
+## Context
+
+`LocalFacts` (`src/model.rs`) already carries what Radar reads from `/proc` for a pane's foreground process, composed in the collector above the runtime seam. Herdr's `pane process-info` supplies the pid and program name; the snapshot has no pid, so a process is known only after a per-pane query. Today those queries cover continuity candidates, or every pane while the process view is active.
+
+On a Nix machine a live `pi` reports `/proc/<pid>/exe` as `/nix/store/<hash>-pi-1.0.2/libexec/pi/pi`, while `readlink -f` of the PATH entry gives `/nix/store/<hash>-pi-1.0.2/bin/pi`. The two files differ inside one package, so the comparison cannot be on the executable path.
+
+## Goals / Non-Goals
+
+**Goals:** an honest, conservative stale mark for live agents whose package has been replaced, with no false marks for deliberate other builds.
+
+**Non-Goals:** extension or plugin versions; version-string parsing; restarting anything; a persisted setting; non-Linux support; marking processes that are not agents.
+
+## Decisions
+
+1. **Compare installations, not files.** A process's identity is its `/proc/<pid>/exe` target; the installed one is the PATH match for the process's own program name, resolved with symlinks followed. Under `/nix/store` the identity is the store root (`/nix/store/<hash>-<name>`), so a wrapper and its inner binary agree. Anywhere else it is the resolved path.
+2. **Stale is conservative.** A row is stale when the executable link reads `(deleted)` (its file was replaced or collected: the usual result of any package manager's rename-over), or when both identities are under `/nix/store` and the roots differ. A process from elsewhere (a dev build, a checkout) is *not* the PATH program and is not stale: it has no mark, and the details say so. Rejected: marking every difference, which would flag a deliberate local build on every row.
+3. **Three answers.** The fact is `Current`, `Stale` or `Unknown`. A process that is gone, an unreadable link, no PATH match or a platform that cannot be read is `Unknown`; nothing is shown and nothing is inferred.
+4. **One PATH lookup per program per refresh.** Resolve each distinct program name once per collection, with Radar's own `PATH`; do not read a process's environment. Radar launched with a different PATH than the sessions can therefore mislabel; the details line names both paths so the operator can see why.
+5. **The sweep grows to live agent panes.** The collector's candidates become continuity candidates plus every pane that currently reports an agent. Cost is one `process-info` per agent pane per refresh (about 3 ms each, measured earlier). Rejected for now: caching by pid and start time; add it only if the sweep is measured to matter. An agent whose foreground is a shell or inconclusive has no process and so no mark.
+6. **Composition stays above the seam.** The runtime reports pid and name as it does now; `procfs` reads the executable link and PATH. Nothing in `herdr.rs` or `runtime.rs` changes.
+7. **A mark, not a state.** Agent rows get a small mark in the stale colour, plus a details line such as `binary: outdated (running pi-1.0.2, installed pi-1.0.3)`. A dev or unknown identity gets `binary: not the installed pi`. A retained row has no live process and shows neither. Colour is a new `[colors] stale` role so the operator owns it.
+
+## Risks / Trade-offs
+
+- [PATH differs between Radar and the sessions] → the details line names the running and installed identities; only the Nix-store and deleted rules produce a mark, so a different PATH yields at most a wrong mark for a program installed in two Nix profiles. Revisit with a config key if it bites.
+- [Wrapper scripts and interpreters] → `node`-hosted agents report the interpreter as program; the lookup finds `node`, which is not an agent identity. Limit v1 to agents whose reported program resolves to their own executable; otherwise Unknown.
+- [Extra queries each poll] → bounded by the number of agent panes; measure and cache only on evidence.
+- [A freshly installed program with the same store root as a running one] → equal roots read Current, never stale.
+
+## Migration Plan
+
+No data or config migration; the colour role defaults to a built-in. Reverting removes the mark and the extra sweep. Lifecycle's later "restart stale" reads this fact; it is not part of this change.
