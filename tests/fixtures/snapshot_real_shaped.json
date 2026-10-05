@@ -1,0 +1,330 @@
+{
+  "id": "cli:api:snapshot",
+  "result": {
+    "type": "snapshot",
+    "snapshot": {
+      "protocol": 22,
+      "version": "0.9.3",
+      "focused_workspace_id": "wA",
+      "focused_tab_id": "wA:t1",
+      "focused_pane_id": "wA:p1",
+      "layouts": [
+        {
+          "workspace_id": "wA",
+          "tab_id": "wA:t1",
+          "area": { "x": 0, "y": 0, "width": 120, "height": 40 },
+          "panes": ["wA:p1", "wA:p3"],
+          "splits": [],
+          "focused_pane_id": "wA:p1",
+          "zoomed": false
+        }
+      ],
+      "workspaces": [
+        {
+          "workspace_id": "wA",
+          "label": "main",
+          "number": 1,
+          "pane_count": 6,
+          "tab_count": 3,
+          "active_tab_id": "wA:t1",
+          "focused": true,
+          "agent_status": "idle",
+          "tokens": { "space_label": "main", "space_logo_other": " pi", "space_idle": "" }
+        },
+        {
+          "workspace_id": "wB",
+          "label": "docs",
+          "number": 2,
+          "pane_count": 1,
+          "tab_count": 1,
+          "active_tab_id": "wB:t1",
+          "focused": false,
+          "agent_status": "done",
+          "tokens": {}
+        }
+      ],
+      "tabs": [
+        {
+          "tab_id": "wA:t1",
+          "workspace_id": "wA",
+          "label": "editor",
+          "number": 1,
+          "pane_count": 2,
+          "focused": true,
+          "agent_status": "idle"
+        },
+        {
+          "tab_id": "wA:t2",
+          "workspace_id": "wA",
+          "label": "agent tab",
+          "number": 2,
+          "pane_count": 2,
+          "focused": false,
+          "agent_status": "working"
+        },
+        {
+          "tab_id": "wA:t3",
+          "workspace_id": "wA",
+          "label": "tests",
+          "number": 3,
+          "pane_count": 2,
+          "focused": false,
+          "agent_status": "done"
+        },
+        {
+          "tab_id": "wB:t1",
+          "workspace_id": "wB",
+          "label": "shell",
+          "number": 1,
+          "pane_count": 1,
+          "focused": false,
+          "agent_status": "idle"
+        }
+      ],
+      "panes": [
+        {
+          "pane_id": "wA:p1",
+          "tab_id": "wA:t1",
+          "workspace_id": "wA",
+          "label": "fleet owner task",
+          "agent": "pi",
+          "agent_session": {
+            "agent": "pi",
+            "kind": "path",
+            "source": "herdr:pi",
+            "value": "/home/dev/.pi/agent/sessions/--home-dev-projects-alpha--/2026-09-01T10-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/dev/projects/alpha",
+          "focused": true,
+          "foreground_cwd": "/home/dev/projects/alpha",
+          "revision": 42,
+          "screen_detection_skipped": true,
+          "state_change_seq": 7,
+          "state_labels": { "idle": "waiting for input", "working": "running", "done": "finished" },
+          "terminal_id": "term_s000000000001",
+          "terminal_title": "fleet owner task",
+          "terminal_title_stripped": "fleet owner task",
+          "tokens": {
+            "model": "sample-model-1",
+            "provider": "sample-provider",
+            "session": "fleet owner task",
+            "pi_herdsman_session": "11111111-1111-4111-8111-111111111111",
+            "title": "fleet owner task"
+          },
+          "scroll": { "max_offset_from_bottom": 12, "offset_from_bottom": 0, "viewport_rows": 40 }
+        },
+        {
+          "pane_id": "wA:p2",
+          "tab_id": "wA:t2",
+          "workspace_id": "wA",
+          "label": "worker task",
+          "agent": "pi",
+          "agent_session": {
+            "agent": "pi",
+            "kind": "path",
+            "source": "herdr:pi",
+            "value": "/home/dev/.pi/agent/sessions/--home-dev-projects-beta--/2026-09-02T11-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl"
+          },
+          "agent_status": "working",
+          "cwd": "/home/dev/projects/beta",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/beta",
+          "revision": 17,
+          "terminal_id": "term_s000000000002",
+          "terminal_title": "worker task",
+          "terminal_title_stripped": "worker task",
+          "tokens": {
+            "model": "sample-model-1",
+            "pi_herdsman_session": "22222222-2222-4222-8222-222222222222",
+            "pi_herdsman_parent_session": "11111111-1111-4111-8111-111111111111"
+          },
+          "scroll": { "max_offset_from_bottom": 3, "offset_from_bottom": 3, "viewport_rows": 40 }
+        },
+        {
+          "pane_id": "wA:p3",
+          "tab_id": "wA:t1",
+          "workspace_id": "wA",
+          "agent_status": "unknown",
+          "cwd": "/home/dev/projects/alpha",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/alpha",
+          "revision": 3,
+          "terminal_id": "term_s000000000003",
+          "terminal_title": "build log tail",
+          "terminal_title_stripped": "build log tail",
+          "scroll": { "max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 40 }
+        },
+        {
+          "pane_id": "wA:p4",
+          "tab_id": "wA:t2",
+          "workspace_id": "wA",
+          "agent_status": "unknown",
+          "cwd": "/home/dev/projects/beta",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/beta",
+          "revision": 1,
+          "terminal_id": "term_s000000000004",
+          "scroll": { "max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 40 }
+        },
+        {
+          "pane_id": "wA:p5",
+          "tab_id": "wA:t3",
+          "workspace_id": "wA",
+          "label": "monitor row",
+          "agent": "herdr-radar",
+          "agent_status": "done",
+          "cwd": "/home/dev/projects/gamma",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/gamma",
+          "revision": 6,
+          "terminal_id": "term_s000000000005",
+          "terminal_title": "monitor row",
+          "terminal_title_stripped": "monitor row",
+          "scroll": { "max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 40 }
+        },
+        {
+          "pane_id": "wA:p6",
+          "tab_id": "wA:t3",
+          "workspace_id": "wA",
+          "label": "shell log",
+          "agent_status": "unknown",
+          "cwd": "/home/dev/projects/gamma",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/gamma",
+          "revision": 2,
+          "terminal_id": "term_s000000000006",
+          "terminal_title": "shell log",
+          "terminal_title_stripped": "shell log",
+          "scroll": { "max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 40 }
+        },
+        {
+          "pane_id": "wB:p1",
+          "tab_id": "wB:t1",
+          "workspace_id": "wB",
+          "label": "review task",
+          "agent": "pi",
+          "agent_session": {
+            "agent": "pi",
+            "kind": "id",
+            "source": "herdr:pi",
+            "value": "55555555-5555-4555-8555-555555555555"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/dev/projects/docs",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/docs",
+          "revision": 9,
+          "terminal_id": "term_s000000000007",
+          "terminal_title": "review task",
+          "terminal_title_stripped": "review task",
+          "tokens": { "model": "sample-model-2" },
+          "scroll": { "max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 40 }
+        }
+      ],
+      "agents": [
+        {
+          "agent": "pi",
+          "agent_session": {
+            "agent": "pi",
+            "kind": "path",
+            "source": "herdr:pi",
+            "value": "/home/dev/.pi/agent/sessions/--home-dev-projects-alpha--/2026-09-01T10-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl"
+          },
+          "agent_status": "idle",
+          "completion_seq": 5,
+          "cwd": "/home/dev/projects/alpha",
+          "focused": true,
+          "foreground_cwd": "/home/dev/projects/alpha",
+          "pane_id": "wA:p1",
+          "revision": 42,
+          "screen_detection_skipped": true,
+          "state_change_seq": 7,
+          "state_labels": { "idle": "waiting for input", "working": "running", "done": "finished" },
+          "tab_id": "wA:t1",
+          "terminal_id": "term_s000000000001",
+          "terminal_title": "fleet owner task",
+          "terminal_title_stripped": "fleet owner task",
+          "tokens": {
+            "model": "sample-model-1",
+            "provider": "sample-provider",
+            "session": "fleet owner task",
+            "pi_herdsman_session": "11111111-1111-4111-8111-111111111111",
+            "title": "fleet owner task"
+          },
+          "workspace_id": "wA"
+        },
+        {
+          "agent": "pi",
+          "agent_session": {
+            "agent": "pi",
+            "kind": "path",
+            "source": "herdr:pi",
+            "value": "/home/dev/.pi/agent/sessions/--home-dev-projects-beta--/2026-09-02T11-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl"
+          },
+          "agent_status": "working",
+          "completion_seq": 11,
+          "cwd": "/home/dev/projects/beta",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/beta",
+          "pane_id": "wA:p2",
+          "revision": 17,
+          "state_change_seq": 9,
+          "tab_id": "wA:t2",
+          "terminal_id": "term_s000000000002",
+          "terminal_title": "worker task",
+          "terminal_title_stripped": "worker task",
+          "tokens": {
+            "model": "sample-model-1",
+            "pi_herdsman_session": "22222222-2222-4222-8222-222222222222",
+            "pi_herdsman_parent_session": "11111111-1111-4111-8111-111111111111"
+          },
+          "workspace_id": "wA"
+        },
+        {
+          "agent": "herdr-radar",
+          "agent_session": null,
+          "agent_status": "done",
+          "completion_seq": 2,
+          "cwd": "/home/dev/projects/gamma",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/gamma",
+          "pane_id": "wA:p5",
+          "revision": 6,
+          "state_change_seq": 4,
+          "tab_id": "wA:t3",
+          "terminal_id": "term_s000000000005",
+          "terminal_title": "monitor row",
+          "terminal_title_stripped": "monitor row",
+          "workspace_id": "wA"
+        },
+        {
+          "agent": "pi",
+          "agent_session": {
+            "agent": "pi",
+            "kind": "id",
+            "source": "herdr:pi",
+            "value": "55555555-5555-4555-8555-555555555555"
+          },
+          "agent_status": "idle",
+          "completion_seq": 1,
+          "cwd": "/home/dev/projects/docs",
+          "focused": false,
+          "foreground_cwd": "/home/dev/projects/docs",
+          "pane_id": "wB:p1",
+          "revision": 9,
+          "state_change_seq": 2,
+          "tab_id": "wB:t1",
+          "terminal_id": "term_s000000000007",
+          "terminal_title": "review task",
+          "terminal_title_stripped": "review task",
+          "tokens": {
+            "model": "sample-model-2",
+            "pi_herdsman_session": "/home/dev/.pi/agent/sessions/--home-dev-projects-docs--/2026-09-03T09-00-00-000Z_99999999-9999-4999-8999-999999999999.jsonl"
+          },
+          "workspace_id": "wB"
+        }
+      ]
+    }
+  }
+}

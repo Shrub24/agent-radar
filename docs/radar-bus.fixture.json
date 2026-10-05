@@ -1,0 +1,8 @@
+{"type":"hello","v":1,"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d","pane":"8c7d:p2","ops":[]}
+{"type":"hello","v":1,"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d","ops":[]}
+{"type":"hello","v":1,"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d","pane":"8c7d:p2","ops":[],"client":"pi-bash-processes 0.4.1"}
+{"type":"tasks","tasks":[{"id":"bg-1","state":"running","pid":48213,"started_at":1759218000123,"last_output_at":1759218074567,"output_bytes":18244},{"id":"bg-2","state":"flushing","pid":48330,"started_at":1759218010000,"last_output_at":1759218060000,"output_bytes":9917},{"id":"bg-3","state":"review","pid":48401,"started_at":1759217900000,"last_output_at":1759218000000,"output_bytes":65536,"exit_code":0,"command":"cargo test --locked","cwd":"/home/saurabhj/Projects/dev/agent-radar"}]}
+{"type":"tasks","tasks":[{"id":"bg-4","state":"running"}]}
+{"type":"tasks","tasks":[{"id":"bg-5","state":"paused","pid":48500}]}
+{"type":"tasks","tasks":[]}
+{"type":"heartbeat","at":1759218074567}

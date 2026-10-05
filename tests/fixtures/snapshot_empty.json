@@ -1,0 +1,15 @@
+{
+  "id": "cli:api:snapshot",
+  "result": {
+    "type": "snapshot",
+    "snapshot": {
+      "protocol": 22,
+      "version": "0.9.3",
+      "layouts": [],
+      "workspaces": [],
+      "tabs": [],
+      "panes": [],
+      "agents": []
+    }
+  }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "agent-radar"
+version = "0.1.0"
+edition = "2024"
+# Floor imposed by the dependencies (ratatui 0.30 and ratatui-crossterm 0.1
+# declare rust-version 1.88.0); edition 2024 itself requires 1.85.
+rust-version = "1.88"
+description = "Read-only full-screen fleet overview for local coding agents"
+
+[[bin]]
+name = "radar"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1.6"
+# The frame vocabulary for a working mark: one-character animation presets.
+tui-spinner = "0.4"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"

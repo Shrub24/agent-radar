@@ -1,0 +1,9 @@
+# Cargo build output
+/target
+
+# nix-direnv environment cache
+/.direnv
+
+# nix build result symlinks
+/result
+/result-*
