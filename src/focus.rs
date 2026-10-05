@@ -1,79 +1,24 @@
-//! Focus requests: the one action Radar asks Herdr to take.
+//! Focus requests: the one action Radar asks a runtime to take.
 //!
-//! A workspace row is focused with `herdr workspace focus <id>`, which the CLI
-//! takes by id. Pane focus has no CLI form by id (`herdr pane focus` moves by
-//! direction), so a pane is focused with the socket API's `pane.focus` request:
-//! one newline-delimited JSON object over the server's Unix socket. The socket
-//! path comes from `herdr status --json`, the CLI's own resolution of the
-//! session the collector reads, so Radar reaches the same server with no second
-//! configuration. Focusing a pane raises its workspace and tab with it, so one
-//! request covers all three levels.
-//!
-//! Every request runs on its own thread and is bounded by
-//! [`FocusConfig::timeout`]: the calling loop never waits on Herdr, a CLI still
-//! running at the deadline is killed and reaped by the collector's
-//! [`crate::collector::run`], and a socket exchange past it is abandoned.
-//! [`Focuser::shutdown`] cancels and joins the worker, so a request outstanding
-//! at exit never delays quitting and leaves no child or thread behind.
+//! [`Focuser`] runs one request at a time on its own thread and never waits on
+//! the runtime: [`Focuser::start`] hands the target over, [`Focuser::poll`]
+//! picks up its outcome on a later loop iteration, and [`Focuser::shutdown`]
+//! cancels and joins the worker, so a request outstanding at exit never delays
+//! quitting and leaves no thread behind. How a request is transported — the
+//! CLI invocation, socket discovery, the wire request, its deadline and its
+//! child cleanup — belongs to the runtime adapter behind
+//! [`RuntimeProvider`](crate::runtime::RuntimeProvider); this module holds none
+//! of it and passes a normalized [`Target`] across the seam.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{ErrorKind, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
 
-use crate::collector::{self, CollectorConfig};
 use crate::observation::ObservationState;
+use crate::runtime::{RuntimeProvider, Target};
 use crate::tree::{FleetTree, RowId, RowKind, TreeNode};
-
-/// How often a socket wait re-checks for cancellation and the deadline. Small
-/// enough that a cancelled request rejoins quickly, large enough not to spin.
-const WAIT_GRANULARITY: Duration = Duration::from_millis(10);
-
-/// Where `Enter` wants Herdr's focus moved.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Target {
-    /// A pane row: its workspace, tab and pane in one request.
-    Pane(String),
-    /// A workspace row.
-    Workspace(String),
-}
-
-/// Focus settings.
-#[derive(Clone, Debug)]
-pub struct FocusConfig {
-    /// The `herdr` executable: a name resolved through `PATH`, or a path.
-    pub executable: PathBuf,
-    /// Hard bound on one request. Defaults to the collector's command timeout,
-    /// because both run the same CLI against the same server.
-    pub timeout: Duration,
-}
-
-impl Default for FocusConfig {
-    fn default() -> Self {
-        let collector = CollectorConfig::default();
-        Self {
-            executable: collector.executable,
-            timeout: collector.command_timeout,
-        }
-    }
-}
-
-impl FocusConfig {
-    /// The collector's command settings for the CLI path, so a focus command
-    /// inherits its timeout and child-reaping rules rather than restating them.
-    fn collector(&self) -> CollectorConfig {
-        CollectorConfig {
-            executable: self.executable.clone(),
-            command_timeout: self.timeout,
-            ..CollectorConfig::default()
-        }
-    }
-}
 
 /// A focus request running on its own thread.
 struct Request {
@@ -85,15 +30,15 @@ struct Request {
 
 /// Runs focus requests off the calling thread, one at a time.
 pub struct Focuser {
-    config: FocusConfig,
+    provider: Arc<dyn RuntimeProvider>,
     in_flight: Option<Request>,
 }
 
 impl Focuser {
     /// A focuser that runs nothing until [`Self::start`].
-    pub fn new(config: FocusConfig) -> Self {
+    pub fn new(provider: impl RuntimeProvider + 'static) -> Self {
         Self {
-            config,
+            provider: Arc::new(provider),
             in_flight: None,
         }
     }
@@ -106,12 +51,12 @@ impl Focuser {
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, outcome) = mpsc::channel();
         let worker = {
-            let config = self.config.clone();
+            let provider = Arc::clone(&self.provider);
             let cancel = Arc::clone(&cancel);
             thread::Builder::new()
                 .name("radar-focus".to_string())
                 .spawn(move || {
-                    let _ = sender.send(focus(&config, &target, &cancel));
+                    let _ = sender.send(provider.focus(&target, &cancel));
                 })
                 .expect("focus thread")
         };
@@ -156,159 +101,6 @@ impl Drop for Focuser {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-/// Runs one request to completion, cancellation or the deadline.
-fn focus(config: &FocusConfig, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
-    match target {
-        Target::Workspace(workspace_id) => collector::run(
-            &config.collector(),
-            &["workspace", "focus", workspace_id],
-            cancel,
-        )
-        .map(|_| ()),
-        Target::Pane(pane_id) => focus_pane(config, pane_id, cancel),
-    }
-}
-
-/// Focuses one pane: the CLI reports the socket, the schema's `pane.focus`
-/// request does the rest.
-fn focus_pane(config: &FocusConfig, pane_id: &str, cancel: &AtomicBool) -> Result<(), String> {
-    let status = collector::run(&config.collector(), &["status", "--json"], cancel)?;
-    let socket = socket_path(&status)?;
-    let budget = Budget::of(config.timeout);
-    let mut stream = UnixStream::connect(&socket)
-        .map_err(|error| format!("could not reach herdr at {}: {error}", socket.display()))?;
-    for setting in [
-        stream.set_read_timeout(Some(WAIT_GRANULARITY)),
-        stream.set_write_timeout(Some(WAIT_GRANULARITY)),
-    ] {
-        setting.map_err(|error| format!("herdr socket could not be read: {error}"))?;
-    }
-    // The schema's `pane.focus` params are `{"pane_id": "..."}`; focusing the
-    // pane raises its workspace and tab, so one request does all three.
-    let request = serde_json::json!({
-        "id": "radar:focus",
-        "method": "pane.focus",
-        "params": { "pane_id": pane_id },
-    });
-    write_request(
-        &mut stream,
-        format!("{request}\n").as_bytes(),
-        budget,
-        cancel,
-    )?;
-    let answer = read_answer(&mut stream, budget, cancel)?;
-    decode_answer(&answer)
-}
-
-/// The socket path from `herdr status --json`, which is the server the CLI
-/// (and so the collector) is talking to.
-fn socket_path(status: &str) -> Result<PathBuf, String> {
-    let status: serde_json::Value = serde_json::from_str(status)
-        .map_err(|error| format!("herdr status could not be read: {error}"))?;
-    match status
-        .pointer("/server/socket")
-        .and_then(|path| path.as_str())
-    {
-        Some(path) => Ok(PathBuf::from(path)),
-        None => Err("herdr is not running".to_string()),
-    }
-}
-
-/// One exchange's deadline, so every wait reports the same timeout.
-#[derive(Clone, Copy)]
-struct Budget {
-    deadline: Instant,
-    timeout: Duration,
-}
-
-impl Budget {
-    fn of(timeout: Duration) -> Self {
-        Self {
-            deadline: Instant::now() + timeout,
-            timeout,
-        }
-    }
-
-    /// Waits one granularity. `Err` once the request is cancelled or the
-    /// deadline has passed.
-    fn wait(&self, cancel: &AtomicBool) -> Result<(), String> {
-        if cancel.load(Ordering::SeqCst) {
-            return Err("focus cancelled".to_string());
-        }
-        if Instant::now() >= self.deadline {
-            return Err(format!("herdr timed out after {:?}", self.timeout));
-        }
-        thread::sleep(WAIT_GRANULARITY);
-        Ok(())
-    }
-}
-
-/// Writes the whole request, waiting out a socket that is momentarily busy.
-fn write_request(
-    stream: &mut UnixStream,
-    bytes: &[u8],
-    budget: Budget,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    let mut written = 0;
-    while written < bytes.len() {
-        match stream.write(&bytes[written..]) {
-            Ok(0) => return Err("herdr closed the connection".to_string()),
-            Ok(count) => written += count,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if is_timeout(&error) => budget.wait(cancel)?,
-            Err(error) => return Err(format!("herdr could not be asked: {error}")),
-        }
-    }
-    Ok(())
-}
-
-/// Reads one answer line, waiting out a socket that is momentarily empty.
-fn read_answer(
-    stream: &mut UnixStream,
-    budget: Budget,
-    cancel: &AtomicBool,
-) -> Result<String, String> {
-    let mut answer = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => return Err("herdr closed the connection".to_string()),
-            Ok(count) => {
-                answer.extend_from_slice(&chunk[..count]);
-                if let Some(end) = answer.iter().position(|byte| *byte == b'\n') {
-                    return Ok(String::from_utf8_lossy(&answer[..end]).trim().to_string());
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if is_timeout(&error) => budget.wait(cancel)?,
-            Err(error) => return Err(format!("herdr sent no answer: {error}")),
-        }
-    }
-}
-
-fn is_timeout(error: &std::io::Error) -> bool {
-    matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-}
-
-/// One answer: `result` is success, `error` is Herdr refusing the request.
-fn decode_answer(answer: &str) -> Result<(), String> {
-    let answer: serde_json::Value = serde_json::from_str(answer)
-        .map_err(|error| format!("herdr sent an unreadable answer: {error}"))?;
-    if let Some(error) = answer.get("error") {
-        let reason = error
-            .get("message")
-            .and_then(|message| message.as_str())
-            .or_else(|| error.get("code").and_then(|code| code.as_str()))
-            .unwrap_or("no reason given");
-        return Err(format!("herdr refused to focus: {reason}"));
-    }
-    answer
-        .get("result")
-        .map(|_| ())
-        .ok_or_else(|| "herdr sent an unreadable answer".to_string())
 }
 
 /// The focus target of every row the current observation proves.

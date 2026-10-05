@@ -15,21 +15,26 @@ assignment age, model/thinking/context, unresolved background-task counts and
 bus-backed task details; pane/process views; configurable colours, marks and
 motion; title/model prefix and workspace-suffix stripping; finished sessions
 in the agents-only view through `e`; sorting, attention/working jumps and mouse
-navigation.
+navigation. The nested fleet tree is now synced and archived at
+`openspec/changes/archive/2026-10-06-nested-fleet-tree/`: connected agent/task
+branches, per-branch folding, selectable/filterable task details and parent-pane
+focus. Its owner gate passed 236 tests, fmt, Clippy, build and both PTY smokes;
+see its `verification.md`.
+
+Also landed and archived on 2026-10-06: `background-task-visibility` (agents view
+hides task children, running/all show every unresolved phase, `b` toggles per
+view; 244 tests) and `runtime-provider-seam` (inventory, foreground evidence and
+focus behind `src/runtime.rs`, Herdr in `HerdrRuntime`; 255 tests). Each has its
+owner-gate results in its archived `verification.md`.
 
 ## Next
 
-1. **Proper nested tree.** Planned in
-   `openspec/changes/nested-fleet-tree/` (proposal, design, delta spec and six
-   tasks; strict validation passes). Git-style connectors, selectable
-   background-task rows beneath their agent, and folding at each branch. Keep
-   exact-identity ownership, per-level sorting, filtering ancestry and stable
-   selection. Implementation has not started.
-2. **Lifecycle controls.** Confirmed pane/tab close and idle-only single-agent
+1. **Lifecycle controls.** Confirmed pane/tab close and idle-only single-agent
    restart in the existing tree. Confirmation never overrides an owner's refusal
    for outstanding work or results. Radar requests the action; the runtime
-   provider or Herdsman executes it. Settle the supported owner contracts before
-   enabling destructive actions. Fleet restart, new-tab creation, a project
+   provider or Herdsman executes it. The owner contract is fixed (below) but the owner
+   side is not implemented, so Radar may build and test its client against the
+   fixture and must not enable controls until the owner confirms it landed. Fleet restart, new-tab creation, a project
    picker and separate runtime/agent modes are deferred.
 
 ### Runtime provider interface
@@ -45,16 +50,43 @@ interface. No plugin loader or second production adapter is needed now.
 Managed-agent lifecycle is a separate owner-control interface. A mux closing a
 pane cannot substitute for Herdsman validating and retiring an assignment.
 
-Owner-side discovery (2026-10-06): Herdsman has close preflight but no external
-control endpoint or general restart operation. Its relaunch primitive currently
-covers idle, directly owned workers only, not lead/standalone sessions. The owner
-has proposed a separate versioned request/result file interface with atomic
-admission, owner-enforced expiry and an explicit unknown-outcome state; this is
-not implemented or a finalized consumer contract. The task bus remains
-metadata-only. Before specifying lifecycle implementation, agree target support,
-capability discovery and refusal semantics with that owner. Missing metadata is
-not evidence that a pane is unmanaged; retained managed associations still
-block direct pane/tab closure.
+Owner contract (2026-10-06): `herdsman-control/v1` is specified in
+`pi-extensions/pi-herdsman/docs/reference/herdsman-control.md` with a fixture
+(`herdsman-control.fixture.json`, commit b86b4133, local and unpushed). The
+owner side — directory, watcher, claim, execution — is not implemented; code the
+client against the fixture and keep the UI controls off until it lands. One
+product question is still with the user: whether the owner's model is told a
+request happened (the design says no prompt).
+
+- **Transport:** owner-created request/result directories under
+  `~/.pi/agent/pi-herdsman/control/<ownerSessionId>/`, mode 0700, not symlinks;
+  not the metadata bus or a new socket.
+- **Target:** agent + run id, with pane id, Pi session UUID and session path as
+  cross-checks. The owner repeats its full preflight at execution; a mismatch
+  refuses rather than redirecting the action.
+- **Outcome:** owner-enforced absolute expiry and exclusive claim before effect.
+  A result reports completion; a claim without a result means execution started
+  with unknown outcome and must never be auto-retried. No claim after expiry
+  means not executed. This is not a client timeout that implies cancellation.
+- **Wake:** an owner-pane control token is a short-lived completion hint, not a
+  replacement for the request's result and fresh inventory.
+- **Close:** require confirmation naming what is lost. Direct mux close needs
+  positive unmanaged evidence. A Pi pane without Herdsman metadata is unknown;
+  metadata-bearing and retained managed panes stay owner-routed. Refuse an entire
+  tab if containment is managed or uncertain, never partially close it.
+- **Restart:** idle managed workers only, continuing the same Pi session and
+  preserving label, run id and lineage. Working/waiting/blocked are busy; lost
+  is close-only; unknown refuses. Lead and standalone restart are unsupported,
+  not a prompt to fall back to Herdr process launch.
+
+The runtime seam has landed. Pane and tab close extend its trait when the
+lifecycle change has a consumer; managed close and restart are a separate
+owner-control client. Results use `outcome` `closed | restarted | refused |
+unknown`; refusals carry `invalid_request`, `target_not_found`,
+`target_ambiguous`, `agent_busy` or `unsupported_target`. Confirmation must echo
+operation, label and run id. A tab or workspace holding a managed pane is
+refused whole: send one close per managed agent, then close the container.
+Metadata absence remains unknown, never proof of unmanaged state.
 
 ## Interactivity
 
@@ -76,8 +108,9 @@ that action surface and need stronger target validation and confirmation.
 
 Three operations, in increasing order of what they can destroy. The shape that
 matters is that Radar *triggers* and the owner *executes*: pane operations belong
-to Herdr, agent operations to Herdsman, advertised over the bus's `ops` list. A
-first version must not do any of this itself.
+to the runtime provider, agent operations to Herdsman's separate owner-control
+interface. The task bus stays metadata-only; its `ops` list is not this lifecycle
+transport. Radar must not kill or relaunch agent processes itself.
 
 - **Close a pane or tab (`x`, confirmed).** `d` is taken by the details toggle.
   A tab-close confirmation names the tab and its affected panes, using the
@@ -85,13 +118,14 @@ first version must not do any of this itself.
   the whole tab if managed-agent containment is known or uncertain; do not close
   some panes and then discover an owner refusal. What
   dies differs by what the pane holds, and the confirmation should say which: an
-  idle shell loses nothing; a pane running a command kills that process and its
-  output; a pane hosting a managed worker orphans the owner's assignment, whose
+  idle shell loses its terminal state and scrollback; a pane running a command
+  loses that process and its pane output; a pane hosting a managed worker orphans the owner's assignment, whose
   child will never resolve unless Herdsman retires it. So closing a managed pane
   either goes through Herdsman or is refused with a reason.
-- **Restart an agent (`r`, confirmed, idle only initially).** Ask its owner to
-  replace the process while preserving the session and owner accounting; a
-  replacement pane may differ. The confirmation popup never permits an active
+- **Restart a managed worker (`r`, confirmed, idle only initially).** Ask its
+  owner to relaunch into its retained pane while preserving the Pi session,
+  label, run id, lineage and owner accounting. Lead/standalone sessions remain
+  unsupported; do not add a direct mux-launch fallback. The confirmation popup never permits an active
   or unretrieved assignment to bypass preflight. Three consequences to design for: Herdsman owns the assignment
   and the parent link, so a restart it does not know about leaves a stale
   assignment behind; a reconnect must replace the old bus connection even if
@@ -144,21 +178,20 @@ Radar rather than pulled from it.
   operations a client supports and v1 advertises none, so a later `stop-task` or
   similar can be added without a protocol break. It would need its own sync story
   with the extension's state and is decided separately (open question 1).
-- **Order.** Radar's side has landed: the listener (`src/bus.rs`), the state it
-  feeds beside the observation (`src/app.rs`), and the details join
-  (`src/ui.rs`), verified against a stub publisher by the listener, detail-join
-  and PTY checks. End-to-end publisher validation is separate from those stub
-  checks; its status should be confirmed with `pi-bash-processes`. Per-agent
-  stats from the session file (cost, tokens, last activity, errors) need no bus.
+- **Order.** Radar's side has landed: the listener (`src/bus.rs`), event-driven
+  updates (`src/app.rs`), the shared task projection (`src/tree.rs`), and its
+  row/detail rendering (`src/ui.rs`). Listener, projection, presentation and PTY
+  checks use a stub publisher. End-to-end publisher validation is separate;
+  its status should be confirmed with `pi-bash-processes`. Per-agent stats from
+  the session file (cost, tokens, last activity, errors) need no bus.
 
 ## Tree presentation
 
-- **Nested tree, git style.** Subagents under their owner and a worker's
-  background tasks under the worker, drawn with connectors (`├─`, `└─`, `│`)
-  rather than indentation alone, each level foldable. Ownership is already
-  exact-identity and the tasks are already facts; what is missing is the shape.
-  Next slice: make each task a row of its own, using the same connectors for a
-  branch with one child as for one with several.
+- **Nested tree — done.** Subagents and background tasks have connected,
+  foldable branches (`├─`, `└─`, `│`). Each task is selectable, filterable and
+  has its own details; Enter or a second click focuses its parent's observed
+  pane. Agent disclosure-marker clicks fold without focusing. Connectors follow
+  the visible sorted/filtered tree, including single-child branches.
 - ~~**Sorting.**~~ Done as `s`: source → state → name, per level, with a group
   ranked by its most urgent row and the selection following the row by identity.
   Age order and a configured default order are not built and are not needed yet:
@@ -208,8 +241,8 @@ another tool.
 A fleet view is also an incident view: what failed, what stalled, what was
 proven lost, what is only retained, and for how long. Radar already carries the
 inputs — state, retention basis, source freshness, the collection diagnostic,
-process age and terminal mode. The reporting side does not exist: nothing yet
-summarises the fleet, or says which rows deserve attention.
+process age and terminal mode. Attention jumps already help navigate individual
+rows; fleet summaries and diagnostic reports do not exist yet.
 
 ## Open questions
 

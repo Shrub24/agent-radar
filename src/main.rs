@@ -1,9 +1,10 @@
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_radar::bus::Listener;
 use agent_radar::{
-    Action, App, Collector, CollectorConfig, Config, FocusConfig, Focuser, Geometry,
+    Action, App, Collector, CollectorConfig, Config, Focuser, Geometry, HerdrConfig, HerdrRuntime,
     ObservationState, PaneView, theme, ui,
 };
 use crossterm::event::{
@@ -83,8 +84,11 @@ fn run() -> io::Result<()> {
         disable_mouse_capture();
         restore_hook(info);
     }));
-    let mut collector = Collector::new(CollectorConfig::default());
-    let mut focuser = Focuser::new(FocusConfig::default());
+    // One Herdr adapter, shared: the collector and the focuser read and act on
+    // the same runtime through the same seam.
+    let runtime = Arc::new(HerdrRuntime::new(HerdrConfig::default()));
+    let mut collector = Collector::new(CollectorConfig::default(), Arc::clone(&runtime));
+    let mut focuser = Focuser::new(runtime);
     let mut state = ObservationState::new();
     let mut app = App::new();
     let mut list = ListState::default();

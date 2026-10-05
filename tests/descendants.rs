@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use agent_radar::{Collector, CollectorConfig, ObservationState};
+use agent_radar::{Collector, CollectorConfig, HerdrConfig, HerdrRuntime, ObservationState};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -23,11 +23,13 @@ fn shutdown_does_not_wait_for_descendants_holding_output_pipes() {
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-    let mut collector = Collector::new(CollectorConfig {
-        executable,
-        command_timeout: Duration::from_secs(5),
-        ..CollectorConfig::default()
-    });
+    let mut collector = Collector::new(
+        CollectorConfig::default(),
+        HerdrRuntime::new(HerdrConfig {
+            executable,
+            command_timeout: Duration::from_secs(5),
+        }),
+    );
     collector.tick(&mut ObservationState::new(), false);
     let deadline = Instant::now() + Duration::from_secs(1);
     while !ready.exists() && Instant::now() < deadline {

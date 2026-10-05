@@ -12,7 +12,7 @@ use agent_radar::model::{
     AgentObservation, FleetObservation, HerdsmanFacts, Lineage, Location, Pane, RuntimeStatus,
     SessionUuid, Tab, Workspace,
 };
-use agent_radar::{App, ObservationState, ui};
+use agent_radar::{App, ObservationState, RowId, ui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::widgets::ListState;
@@ -420,24 +420,34 @@ fn the_token_count_is_compared_on_running_tasks_only() {
 }
 
 #[test]
-fn bus_data_survives_a_refresh_and_changes_no_tree_row() {
+fn bus_data_survives_a_refresh_and_is_rebuilt_from_the_bus() {
     let state = fleet(&[("wH:p1", Some(SESSION), Some(1))]);
     let mut app = app_for(&state);
+    // The subject is task rows, hidden by default in agents view.
+    app.toggle_tasks();
+    // The pane's own id is the baseline, held without any connection.
     let rows: Vec<_> = app
         .visible_rows()
         .iter()
         .map(|row| row.id.clone())
         .collect();
+    let token_rows = rows.clone();
 
     publish(&mut app, SESSION, vec![task("bg-1", TaskState::Running)]);
-    // A refresh reconciles the observation; the bus is not a fact of it.
+    // The publisher's task is a row of the tree now, and a refresh rebuilds it
+    // from the bus state rather than losing it: the bus is not a fact of the
+    // observation, so an observation refresh may not clear it.
     app.refresh(&state);
     let after: Vec<_> = app
         .visible_rows()
         .iter()
         .map(|row| row.id.clone())
         .collect();
-    assert_eq!(rows, after);
+    assert_eq!(
+        after, token_rows,
+        "the task identities are the same either way"
+    );
+    assert!(matches!(after.last(), Some(RowId::Task(_))), "{after:?}");
 
     select_agent(&mut app, "wH:p1");
     assert!(screen(&state, &app).contains("task: bg-1"));

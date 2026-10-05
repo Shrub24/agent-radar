@@ -11,6 +11,7 @@ pub mod model;
 pub mod observation;
 pub mod process_icons;
 pub mod procfs;
+pub mod runtime;
 pub mod theme;
 pub mod title;
 pub mod tree;
@@ -19,11 +20,15 @@ pub mod ui;
 pub use app::{Action, App, Geometry, PaneView, RowOrder};
 pub use collector::{Collector, CollectorConfig};
 pub use config::{Config, Palette};
-pub use focus::{FocusConfig, Focuser, Target};
-pub use herdr::{DecodeError, decode_process_info, decode_snapshot};
+pub use focus::Focuser;
+pub use herdr::{DecodeError, HerdrConfig, HerdrRuntime, decode_process_info, decode_snapshot};
 pub use model::{
     AgentObservation, FleetObservation, ForegroundEvidence, Lineage, LocalFacts, Location, Pane,
     RuntimeStatus, SessionIdentity, SessionUuid, Tab, TerminalMode, Workspace,
 };
 pub use observation::{ObservationState, RetainedAgent, RetentionBasis, SourceFreshness};
-pub use tree::{AgentRow, FleetTree, PaneRow, RowId, RowKind, TreeRow};
+pub use runtime::{RuntimeProvider, Target};
+pub use tree::{
+    AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskProjection, TaskRow, TaskSource,
+    TreeRow,
+};

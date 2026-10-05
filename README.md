@@ -50,6 +50,7 @@ configuration is required. Version control uses **jj**.
 | `w` / `W` | Select the next / previous working row |
 | `d` | Show or hide the details panel |
 | `e` | Show or hide finished sessions (panes whose label is a session that has gone) |
+| `b` | Show or hide background-task children in the current view |
 | `q` | Quit, except while entering filter text |
 | `Ctrl-C` | Quit, including during filter entry |
 
@@ -60,7 +61,8 @@ With a mouse:
 | Wheel over the tree | Scroll the list |
 | Wheel over the details | Scroll the details |
 | Left click on a row | Select it |
-| Left click on a row already selected | Focus its pane or workspace, as `Enter` does |
+| Left click on a row already selected | Focus its pane — or, for a task, its owner's pane — or workspace, as `Enter` does |
+| Left click on an agent's disclosure marker | Fold or unfold that branch, without focusing |
 | Left click on a workspace heading | Select it and fold or unfold it |
 
 Mouse capture is on, which is what makes the wheel and the clicks arrive at all.
@@ -85,8 +87,9 @@ name order is alphabetical by the label a row shows. `n` and `w` move to the nex
 row of a kind, wrapping at the ends. A row hidden by a fold or excluded by the
 filter cannot be reached that way, because it is not drawn.
 
-`Enter` on an agent or pane row focuses that pane, and on a workspace row focuses
-that workspace. Radar stays open and keeps its selection. A row whose pane the
+`Enter` on an agent or pane row focuses that pane, on a task row focuses the
+pane its owner row names, and on a workspace row focuses that workspace. Radar
+stays open and keeps its selection. A row whose pane the
 current observation no longer reports, or any row while the displayed inventory is
 last-good rather than current, is refused: nothing is sent and the last line says
 why. A failure — Herdr unreachable, the request refused, or the request past its
@@ -139,6 +142,14 @@ already draws them:
   weight and ink are what a heading has to work with. Panel frames and their
   titles take `border`, which is where a theme usually wants its chrome
   dimmer than its content.
+- Ownership is drawn as a tree. A child that is followed by a visible sibling
+  carries `├─`, the last child `└─`, and the rows beneath a branch that
+  continues carry `│`. A workspace heading carries no connector. The prefix
+  follows the rows actually drawn — filtering or folding a branch changes it
+  rather than leaving a line behind — and takes the `subtle` ink, with its
+  width part of the row's Unicode-aware fitting. Clicking a branch's disclosure
+  marker folds that branch and sends nothing to Herdr; clicking anywhere else
+  on a row selects it, and a second click focuses it.
 - Details sit **beside** the tree, not under it: the tree is a list of short rows
   and the details are a few long lines, so a column costs the tree less than a
   stack of rows does. A terminal narrower than 80 columns stacks them instead.
@@ -195,6 +206,12 @@ builds, editors, merge tools and editors that no agent owns. It costs one
 30-pane fleet) and only sweeps while a pane view is active; the first press of
 `p` fills it in on the next refresh. A pane an agent is already reporting is not
 listed twice — the agent row is the row for that pane.
+
+Which task children those views list is a choice of its own rather than the pane
+filter: `agents` starts with them hidden, `running` and `all` with every
+unresolved task shown. `b` flips the current view's choice, and each view keeps
+its own answer; [Background-task detail](#background-task-detail-the-bus) has
+the phases and the rest.
 
 A pane row has two mark columns, as an agent row does: what the pane is doing
 now, and what it is. The first moves while a command runs, so a busy pane is
@@ -406,21 +423,59 @@ in [`docs/radar-bus.fixture.json`](docs/radar-bus.fixture.json).
 
 A task list is joined to an agent row by the **exact session UUID** the row
 publishes as its ownership lineage (`pi_herdsman_session`). A row that publishes
-no UUID falls back to the pane its `hello` named, and nothing else joins them —
-not the cwd, not a title, not the human session name. A session with no matching
-row is held and shown nowhere. The publisher's list outranks the pane token:
-the details list the tasks, and when `pi_bg_running` disagrees the panel says so
-instead of choosing. Since the token counts only `running` tasks, only those are
-compared with it. A phase word Radar does not know is shown as published, and so
-is the published running count, beside the unresolved count the row badges.
+no UUID falls back to the pane its `hello` named, and only while **exactly one**
+connected publisher names that pane: two of them are an ambiguity, so that row
+gets no publisher's list rather than whichever entry came first. Nothing else
+joins them — not the cwd, not a title, not the human session name. A session
+with no matching row is held and shown nowhere.
 
-Each task draws its id, its state word as published, how long it has run, when it
-last produced output, its output size, its command, and — where published — its
-working directory and exit code. A fact the publisher did not send draws
-nothing: absent is not a zero. A state word this Radar does not know is shown as
-written. `command` and `cwd` are the sensitive fields: both are sanitized and
+One projection decides what a row's tasks are, and the task rows, the `N bg`
+badge and the details all read that same projection, so they cannot disagree. A
+matched publisher's list is authoritative, an **empty list included** — the pane's
+own `pi_bg_tasks` ids are never unioned into it. They are the fallback for a row
+no publisher matches, and each of those rows is marked `tokens`, or
+`last-observed` when the agent itself is retained. A row a publisher speaks for
+shows the publisher's phase word, and when `pi_bg_running` disagrees the panel
+says so instead of choosing. Since the token counts only `running` tasks, only
+those are compared with it. A phase word Radar does not know is shown as
+published.
+
+Each unresolved task is a selectable row beneath its agent, labelled with its
+published command or, without one, its id, then the phase as published, the age
+its published start time implies, and the program's mark from the configured
+`[processes]` table where the command names one. Whether those rows are listed
+is a per-view choice: `agents` starts hidden, `running` and `all` start shown,
+and `b` toggles the current view alone — the pane view, the finished-session
+toggle, branch folds and the `N bg` badge are untouched. `running` and `all`
+list every unresolved task whatever phase it published, including `flushing`,
+`review`, a word Radar does not know and none at all: the processes view is a
+view of outstanding work, not a claim that a task's process is still alive. The
+rows read the current projection whenever they are shown, so a list that arrived
+while they were hidden is what appears. A task hidden under the selection falls
+back to its owner row, which is still there to be read from.
+
+A task's identity is its owner row, the session its facts were reported in,
+and its task id — never the command, and never the id alone, because ids are
+reused between panes and between successive sessions in one pane. The same id
+under a new session is therefore a different task, and a selection does not
+follow it: it falls back to the agent row above it. A task row is a leaf: it
+cannot be folded, and it has no disclosure control. `Enter` or a second click on
+it focuses its owner's pane through the same focus action, with the same refusal
+when that location is stale or no longer observed, because a task is read
+through the pane its owner row names and is never consumed or controlled.
+
+Selecting a task shows its own panel: its id, phase and source basis, and —
+where the publisher sent them — its command, working directory, process id,
+start, last output, output size and exit code. The owner's panel states the same
+facts on its per-task line, drawn from the same projection, so the rows, the
+parent's `N bg` count and both panels cannot disagree. A fact the publisher did
+not send draws nothing: absent is not a zero, and a `tokens` row shows only the
+id and phase its pane published. A state word this Radar does not know is shown
+as written. `command` and `cwd` are the sensitive fields: both are sanitized and
 bounded to 256 characters where they reach the screen, and are never written to
-a file, the configuration or a log.
+a file, the configuration or a log. Task rows move only while their source
+reports the process alive now: a `running` word on a `last-observed` row is
+stated and stays still.
 
 Bus data lives only as long as its connection. A disconnect removes that
 session's entry immediately and the row falls back to its token facts, because a
@@ -438,19 +493,36 @@ heading `· bus off`, and writes the diagnostic on the `bus:` line of the detail
 One Cargo package, with `radar` as its binary:
 
 - `src/main.rs`: terminal lifecycle and event loop.
-- `src/herdr.rs` / `src/collector.rs`: wire decoding and bounded CLI execution.
+- `src/runtime.rs` / `src/herdr.rs`: the runtime seam and its Herdr adapter.
+  Collection asks the seam for a normalized inventory and per-pane foreground
+  evidence, and focus asks it to move to a normalized workspace or pane target;
+  the adapter owns Herdr's executable, CLI arguments, socket discovery, wire
+  decoding and the bounded runner that kills and reaps a stalled command.
+  Managed-agent lifecycle — close and restart — belongs to a separate
+  owner-control interface and is not stubbed here; a second mux would be a
+  second adapter at assembly rather than a change to the collector, focuser or
+  the view.
+- `src/collector.rs`: the refresh schedule. One refresh in flight at a time on
+  its own thread, cancellation that abandons rather than waits, the
+  assignment-age stamp taken once per refresh, and the local `/proc` facts
+  composed into the evidence the adapter returned. Two facts are never lost on
+  a failed call: an inventory error is a stale source that keeps the last-good
+  inventory, and unreadable foreground evidence is inconclusive rather than
+  proof that a pane went away.
 - `src/bus.rs`: the bus line protocol and the listener that accepts extensions.
 - `src/model.rs` / `src/observation.rs`: normalized facts and reconciliation.
 - `src/config.rs` / `src/theme.rs`: the colours, where they come from, and the
   vocabulary they paint (state marks, vendor icons, title rules).
 - `src/tree.rs` / `src/app.rs` / `src/ui.rs` / `src/title.rs`: projection,
   interactions, rendering and title normalisation.
-- `src/focus.rs`: the focus request, its two transports, and what `Enter` sends.
-- `tests/`: sanitized fixtures, fake-executable transport checks, focus tests
-  against a fake `herdr` and a stub API socket, bus listener
-  and detail-join tests against a stub publisher, and a focused PTY check that
-  also connects one to the running dashboard. No real Herdr runtime is modified
-  by these tests.
+- `src/focus.rs`: the focus worker run off the calling thread, its cancellation
+  and message plumbing, and what `Enter` sends. The two transports behind it
+  belong to the adapter.
+- `tests/`: sanitized fixtures, fake-executable and stub-socket transport
+  checks at the adapter, collector and focus tests against an in-memory
+  runtime, bus listener and detail-join tests against a stub publisher, and a
+  focused PTY check that also connects one to the running dashboard. No real
+  Herdr runtime is modified by these tests.
 
 `Cargo.lock` and `flake.lock` record reproducible dependency versions. The approved
 scope and task list are in

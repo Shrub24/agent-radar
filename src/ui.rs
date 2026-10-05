@@ -27,7 +27,7 @@ use crate::bus::Task;
 use crate::model::{AgentState, ForegroundEvidence, HerdsmanFacts, SessionIdentity, TerminalMode};
 use crate::observation::{ObservationState, RetentionBasis, SourceFreshness};
 use crate::theme;
-use crate::tree::{AgentRow, RowKind};
+use crate::tree::{AgentRow, RowKind, TaskRow, TaskSource};
 
 /// Height reserved for the detail panel when the terminal has room for it.
 ///
@@ -229,6 +229,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     // The keys in the order a reader needs them. Full wording first; a terminal
     // that cannot hold it in two lines gets the terse wording instead, so the
     // state words are the first thing to go rather than the last keys.
+    let tasks = task_rows_label(app.shows_tasks());
     let full = vec![
         ("j/k", String::new()),
         ("spc", "fold".to_string()),
@@ -240,6 +241,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("p", app.pane_view().label().to_string()),
         ("d", toggle_label(app.shows_details(), "details")),
         ("e", toggle_label(app.shows_finished(), "finished")),
+        ("b", tasks.clone()),
         ("q", "quit".to_string()),
     ];
     let terse = vec![
@@ -253,6 +255,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("p", app.pane_view().label().to_string()),
         ("d", "details".to_string()),
         ("e", "finished".to_string()),
+        ("b", tasks),
         ("q", "quit".to_string()),
     ];
     match wrap_hints(&full, width) {
@@ -268,6 +271,17 @@ fn toggle_label(shown: bool, noun: &str) -> String {
         format!("hide {noun}")
     } else {
         noun.to_string()
+    }
+}
+
+/// The `b` hint names the action in both states rather than repeating the noun
+/// when the rows are already hidden: unlike `e`, whether background tasks are
+/// listed is a property of the view the footer is describing.
+fn task_rows_label(shown: bool) -> String {
+    if shown {
+        "hide tasks".to_string()
+    } else {
+        "show tasks".to_string()
     }
 }
 
@@ -374,13 +388,27 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, width: usize) -> ListItem<'static
     // The span that gives way when the row is wider than the panel: the name,
     // so the state, age and model on its right stay readable.
     let mut flex: Option<usize> = None;
-    if row.depth > 0 {
-        spans.push(Span::raw("  ".repeat(row.depth)));
+    let connector = Style::new().fg(palette.subtle);
+    // The branch prefix: one two-cell column per ancestor whose line continues,
+    // then this row's own connector where it is not a workspace root. The
+    // markers below stay in one column whatever the prefix says.
+    for continues in &row.connectors.continuation {
+        spans.push(Span::styled(
+            if *continues { "│ " } else { "  " },
+            connector,
+        ));
     }
-    spans.push(Span::styled(
-        fold_marker(row),
-        Style::new().fg(palette.subtle),
-    ));
+    if row.depth > 0 {
+        spans.push(Span::styled(
+            if row.connectors.has_following_sibling {
+                "├─"
+            } else {
+                "└─"
+            },
+            connector,
+        ));
+    }
+    spans.push(Span::styled(fold_marker(row), connector));
     match &row.node.row.kind {
         RowKind::Workspace { number, .. } => {
             // A heading, not body text: weight and the heading's own ink are
@@ -419,10 +447,11 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, width: usize) -> ListItem<'static
             flex = Some(spans.len());
             spans.push(Span::styled(sanitize(&agent.title), title_style));
             // Routine states are carried by their marks; exceptional states
-            // keep a word. Missing facts leave no dangling separators. A
-            // background badge counts what is unresolved, not what is running:
-            // a task that has exited is still work its pane is waiting on.
-            let unresolved = agent.facts.background_task_ids().len();
+            // keep a word. Missing facts leave no dangling separators. The
+            // background badge counts the row's own projected tasks — the same
+            // rows drawn beneath it — never what is merely still running, and
+            // never a source the projection has already replaced.
+            let unresolved = agent.tasks.tasks.len();
             let tail = [
                 (!matches!(
                     agent.state,
@@ -434,8 +463,9 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, width: usize) -> ListItem<'static
                 agent.facts.assigned_for.map(duration),
                 agent.facts.model_and_thinking().map(|m| sanitize(&m)),
                 (unresolved > 0).then(|| {
-                    let moving =
-                        agent.retained.is_none() && agent.facts.background_running.unwrap_or(0) > 0;
+                    // Only a task its source reports alive now moves; a
+                    // last-observed phase word is stated and stays still.
+                    let moving = agent.tasks.tasks.iter().any(TaskRow::is_running);
                     match theme::command_frames().filter(|_| moving) {
                         Some(frames) => format!("{} {unresolved} bg", theme::frame(frames, tick)),
                         None => format!("{unresolved} bg"),
@@ -523,6 +553,58 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, width: usize) -> ListItem<'static
                     flex = Some(spans.len());
                     spans.push(Span::styled(title, Style::new().fg(ink)));
                 }
+            }
+        }
+        RowKind::Task(task) => {
+            // A task leaf: the published command where there is one and its id
+            // otherwise, then the phase word as published, the age its start
+            // time implies and the program's own mark. A process the publisher
+            // reports alive moves in the configured command frames; a fact that
+            // is only last-observed is stated and stays still.
+            let published = task.published.as_ref();
+            let moving = task.is_running() && theme::command_frames().is_some();
+            let (mark, ink) = match theme::command_frames().filter(|_| moving) {
+                Some(frames) => (theme::frame(frames, tick).to_string(), palette.working),
+                None => (theme::pane_mark().to_string(), palette.subtle),
+            };
+            spans.push(Span::styled(format!("{mark} "), Style::new().fg(ink)));
+            // The program mark is the same configured table a pane row reads;
+            // a task with no published command has no program to mark.
+            if let Some(identity) = published
+                .and_then(|published| published.command.as_deref())
+                .and_then(|command| theme::process_mark(program_of(command)))
+            {
+                spans.push(Span::styled(
+                    format!("{identity} "),
+                    Style::new().fg(palette.subtle),
+                ));
+            }
+            flex = Some(spans.len());
+            spans.push(Span::styled(
+                sanitize(row.node.row.title()),
+                Style::new().fg(palette.muted),
+            ));
+            if let Some(phase) = task.phase.as_deref() {
+                spans.push(Span::styled(
+                    format!(" · {}", sanitize(phase)),
+                    Style::new().fg(palette.subtle),
+                ));
+            }
+            // An age only where the publisher reports a start: absent is not a
+            // zero, and a `tokens` task has neither.
+            if let Some(started) = published.and_then(|published| published.started_at) {
+                spans.push(Span::styled(
+                    format!(" · {}", duration(elapsed(started, now_unix_ms()))),
+                    Style::new().fg(palette.subtle),
+                ));
+            }
+            // Where the facts came from is part of the row: the same id can be
+            // a live publisher's task or the pane's last-observed report of it.
+            if task.source == TaskSource::Tokens {
+                spans.push(Span::styled(
+                    format!(" · {}", task.basis()),
+                    Style::new().fg(palette.retained),
+                ));
             }
         }
     }
@@ -727,6 +809,10 @@ fn detail_lines(state: &ObservationState, app: &App) -> Vec<Line<'static>> {
             lines.push(field("agent", unavailable()));
         }
         RowKind::Agent(agent) => {
+            // The pane's raw token list is drawn only while it is still this
+            // row's task source: a matched publisher's list is authoritative,
+            // and printing both would contradict the rows beneath this one.
+            let bus_authoritative = matches!(agent.tasks.source, Some(TaskSource::Bus));
             lines.push(field(
                 "kind",
                 match &agent.retained {
@@ -774,8 +860,8 @@ fn detail_lines(state: &ObservationState, app: &App) -> Vec<Line<'static>> {
                 Some(_) => field("status (last observed)", status),
                 None => field("status", status),
             });
-            lines.extend(herdsman_lines(&agent.facts));
-            lines.extend(bus_lines(app, agent));
+            lines.extend(herdsman_lines(&agent.facts, !bus_authoritative));
+            lines.extend(task_lines(agent));
             // Freshness and identity last: a long reported session path wraps,
             // and it must not push the required fields out of a small panel.
             lines.push(detail_freshness(state, &row));
@@ -787,6 +873,54 @@ fn detail_lines(state: &ObservationState, app: &App) -> Vec<Line<'static>> {
                 lines.push(line);
             }
             return lines;
+        }
+        RowKind::Task(task) => {
+            // A task's own panel carries every fact the publisher sent for it.
+            // The owner's panel keeps the same facts on its per-task line, from
+            // the same projection this row is, so the two cannot disagree.
+            lines.push(field("kind", "background task".to_string()));
+            lines.push(field("task", sanitize(&task.id.id)));
+            // A phase the pane or publisher reported is shown as reported; a
+            // token entry naming only an id says nothing about a phase, so the
+            // field is absent rather than drawn "unavailable".
+            if let Some(phase) = task.phase.as_deref() {
+                lines.push(field("phase", sanitize(phase)));
+            }
+            lines.push(field("source", task.basis().to_string()));
+            if let Some(published) = task.published.as_ref() {
+                let now = now_unix_ms();
+                if let Some(command) = published.command.as_deref() {
+                    lines.push(field("command", bound_text(command)));
+                }
+                if let Some(cwd) = published.cwd.as_deref() {
+                    lines.push(field("cwd", bound_text(cwd)));
+                }
+                if let Some(pid) = published.pid {
+                    lines.push(field("pid", pid.to_string()));
+                }
+                if let Some(started) = published.started_at {
+                    lines.push(field(
+                        "started",
+                        format!("{} ago", duration(elapsed(started, now))),
+                    ));
+                }
+                if let Some(last_output) = published.last_output_at {
+                    lines.push(field(
+                        "last output",
+                        format!("{} ago", duration(elapsed(last_output, now))),
+                    ));
+                }
+                if let Some(bytes) = published.output_bytes {
+                    lines.push(field("output", format!("{bytes} B")));
+                }
+                if let Some(code) = published.exit_code {
+                    lines.push(field("exit", code.to_string()));
+                }
+            }
+            lines.push(field("owner", sanitize(&task.id.owner)));
+            if let Some(session) = &task.id.session {
+                lines.push(field("session", sanitize(session)));
+            }
         }
     }
 
@@ -844,7 +978,7 @@ fn field(label: &str, value: String) -> Line<'static> {
 ///
 /// Every value is text another process wrote — an assignment's display text
 /// above all — so each is sanitized like any other runtime string.
-fn herdsman_lines(facts: &HerdsmanFacts) -> Vec<Line<'static>> {
+fn herdsman_lines(facts: &HerdsmanFacts, tokens_listed: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(role) = facts.role.as_deref() {
         lines.push(field("role", sanitize(role)));
@@ -865,7 +999,7 @@ fn herdsman_lines(facts: &HerdsmanFacts) -> Vec<Line<'static>> {
     if let Some(awaiting) = facts.awaiting() {
         lines.push(field("awaiting", sanitize(&awaiting)));
     }
-    if !facts.background_tasks.is_empty() {
+    if tokens_listed && !facts.background_tasks.is_empty() {
         lines.push(field(
             "background",
             sanitize(&facts.background_tasks.join(", ")),
@@ -913,34 +1047,35 @@ fn unavailable() -> String {
 /// The bus tasks attached to this agent row, and the note a disagreement with
 /// the pane tokens earns.
 ///
-/// The join is the exact `pi_herdsman_session` UUID the source published for
-/// this row. A publisher's `hello` pane is a fallback for a row that publishes
-/// no UUID at all — it is never a second chance for a row whose own UUID names
-/// a session no publisher is connected for, and nothing joins on a cwd, a
-/// title or a human session name.
-fn bus_lines(app: &App, agent: &AgentRow) -> Vec<Line<'static>> {
-    let held = match agent.session_uuid.as_deref() {
-        Some(uuid) => app.bus_session(uuid),
-        None => app.bus_session_on_pane(&agent.pane_id),
-    };
-    let Some(held) = held else {
+/// The task rows, the badge and this summary all read the row's one projection,
+/// so they cannot disagree with each other: the pane's own ids where no
+/// publisher matches the row, and the publisher's complete list — an empty one
+/// included — where one does. What the publisher sent is drawn as sent.
+fn task_lines(agent: &AgentRow) -> Vec<Line<'static>> {
+    let Some(TaskSource::Bus) = agent.tasks.source else {
+        // The token fallback is the pane's own report: its ids and phases are
+        // the rows beneath this one, and the `background` line above states
+        // them as published. Nothing more is claimed about them.
         return Vec::new();
     };
 
     let mut lines = Vec::new();
-    if held.tasks.is_empty() {
+    if agent.tasks.tasks.is_empty() {
         // A published empty list and no publisher are different facts, and the
         // panel says which of the two it is.
         lines.push(field("bus", "connected — no unresolved tasks".into()));
     } else {
         let now = now_unix_ms();
-        for task in &held.tasks {
-            lines.push(bus_task_line(task, now));
-            let id = sanitize(&task.id);
-            if let Some(command) = task.command.as_deref() {
+        for task in &agent.tasks.tasks {
+            let Some(published) = task.published.as_ref() else {
+                continue;
+            };
+            lines.push(bus_task_line(published, now));
+            let id = sanitize(&task.id.id);
+            if let Some(command) = published.command.as_deref() {
                 lines.push(field(&format!("command ({id})"), bound_text(command)));
             }
-            if let Some(cwd) = task.cwd.as_deref() {
+            if let Some(cwd) = published.cwd.as_deref() {
                 lines.push(field(&format!("cwd ({id})"), bound_text(cwd)));
             }
         }
@@ -949,13 +1084,13 @@ fn bus_lines(app: &App, agent: &AgentRow) -> Vec<Line<'static>> {
     // where the two disagree the panel states it instead of resolving it. The
     // token counts running tasks, so only running tasks are comparable with it.
     if let Some(reported) = agent.facts.background_running
-        && reported as usize != held.running()
+        && reported as usize != agent.tasks.running()
     {
         lines.push(field(
             "tokens",
             format!(
                 "report {reported} running; the bus lists {}",
-                held.running()
+                agent.tasks.running()
             ),
         ));
     }
@@ -1083,12 +1218,12 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     use crate::app::Action;
-    use crate::focus::Target;
     use crate::herdr::decode_snapshot;
     use crate::model::{
         AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Location, Pane,
         RuntimeStatus, SemanticState, Tab, Workspace,
     };
+    use crate::runtime::Target;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
 
     const REAL_SHAPED: &str = include_str!("../tests/fixtures/snapshot_real_shaped.json");
@@ -1656,6 +1791,28 @@ mod tests {
             wide.lines().all(|line| !line.starts_with("     ")),
             "and no larger one: {wide}"
         );
+    }
+
+    #[test]
+    fn the_footer_names_the_background_task_toggle_in_both_states() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        // Agents view starts with task rows hidden, so the hint says what
+        // pressing `b` would do.
+        let screen = render_text(&state, &app, 120, 24);
+        assert!(screen.contains("b show tasks"), "{screen}");
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('b'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let screen = render_text(&state, &app, 120, 24);
+        assert!(screen.contains("b hide tasks"), "{screen}");
+
+        // A narrow terminal that falls back to the terse wording still names
+        // the toggle rather than dropping it.
+        let narrow = render_text(&state, &app, 40, 24);
+        assert!(narrow.contains("b"), "{narrow}");
     }
 
     #[test]
@@ -2651,12 +2808,17 @@ mod tests {
         let pane_mark = theme::pane_mark();
         assert!(first.contains(&format!("{pane_mark} ")), "{first}");
 
-        // A running command's mark advances with the clock.
+        // A running command's mark advances with the clock. The row leads with
+        // its branch prefix and fold column, so those are skipped to the mark.
         let lead = |screen: &str| {
             screen
                 .lines()
                 .find(|line| line.contains("nix build .#radar"))
-                .and_then(|line| line.trim_start_matches(['\u{2502}', ' ']).chars().next())
+                .and_then(|line| {
+                    line.trim_start_matches(['\u{2502}', '\u{251c}', '\u{2514}', '\u{2500}', ' '])
+                        .chars()
+                        .next()
+                })
         };
         assert!(lead(&first).is_some_and(|mark| mark != ' '), "{first}");
         assert_ne!(

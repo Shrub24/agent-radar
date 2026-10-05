@@ -1,18 +1,33 @@
-//! Herdr CLI wire decoding — the only module that sees raw `herdr` output.
+//! Herdr adapter — the only module that sees raw `herdr` output or runs it.
 //!
-//! Consumers are the collector boundary: pass the captured stdout of
-//! `herdr api snapshot` to [`decode_snapshot`] and of
-//! `herdr pane process-info --pane <id>` to [`decode_process_info`]. DTOs stay
-//! private here; only normalized [`crate::model`] facts leave this module, so
-//! presentation code never touches source shapes or metadata tokens.
+//! Two decoders turn captured stdout into normalized facts: `herdr api
+//! snapshot` into a [`FleetObservation`] and `herdr pane process-info --pane
+//! <id>` into [`ForegroundEvidence`]. DTOs stay private here; only normalized
+//! [`crate::model`] facts leave this module, so presentation code never touches
+//! source shapes or metadata tokens.
+//!
+//! [`HerdrRuntime`] is the production [`RuntimeProvider`], owning what only
+//! Herdr needs: the executable and the command deadline (`HerdrConfig`), the
+//! CLI arguments and decoders, socket discovery, the `pane.focus` request and
+//! its answer, and the bounded runner that drains both pipes and kills and
+//! reaps a command that stalls or is cancelled. Everything above the seam
+//! passes a provider around instead.
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Location, Pane,
     RuntimeStatus, SemanticState, SessionIdentity, SessionUuid, Tab, Workspace,
 };
+use crate::runtime::{RuntimeProvider, Target};
 
 /// Metadata tokens carrying explicit pi-herdsman ownership UUIDs.
 const LINEAGE_SESSION_TOKEN: &str = "pi_herdsman_session";
@@ -394,6 +409,363 @@ fn token_items(tokens: &HashMap<String, serde_json::Value>, key: &str) -> Vec<St
         .filter(|item| !item.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The adapter: Herdr as a runtime provider
+// ---------------------------------------------------------------------------
+
+/// How to run Herdr: its executable, and the deadline on one invocation.
+///
+/// Adapter configuration rather than collector configuration — the collector
+/// schedules polls, and nothing above the seam names an executable.
+#[derive(Clone, Debug)]
+pub struct HerdrConfig {
+    /// The `herdr` executable: a name resolved through `PATH`, or a path.
+    pub executable: PathBuf,
+    /// Hard bound on one invocation. A command still running at the deadline
+    /// is killed and reaped.
+    pub command_timeout: Duration,
+}
+
+impl Default for HerdrConfig {
+    fn default() -> Self {
+        Self {
+            executable: PathBuf::from("herdr"),
+            command_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Herdr as the production [`RuntimeProvider`].
+pub struct HerdrRuntime {
+    config: HerdrConfig,
+}
+
+impl HerdrRuntime {
+    /// An adapter that runs nothing until asked.
+    pub fn new(config: HerdrConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl RuntimeProvider for HerdrRuntime {
+    fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {
+        let stdout = run(&self.config, &["api", "snapshot"], cancel)?;
+        decode_snapshot(&stdout)
+            .map_err(|error| format!("herdr snapshot could not be read: {error}"))
+    }
+
+    fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence {
+        run(
+            &self.config,
+            &["pane", "process-info", "--pane", pane_id],
+            cancel,
+        )
+        .ok()
+        .and_then(|stdout| decode_process_info(&stdout).ok())
+        .unwrap_or(ForegroundEvidence::Inconclusive)
+    }
+
+    fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
+        match target {
+            // A workspace is focused by id through the CLI.
+            Target::Workspace(workspace_id) => {
+                run(&self.config, &["workspace", "focus", workspace_id], cancel).map(|_| ())
+            }
+            // Pane focus has no CLI form by id (`herdr pane focus` moves by
+            // direction), so it uses the socket API's `pane.focus` request.
+            Target::Pane(pane_id) => self.focus_pane(pane_id, cancel),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Focus: the workspace CLI and the pane socket
+// ---------------------------------------------------------------------------
+
+/// How often a socket wait re-checks for cancellation and the deadline. Small
+/// enough that a cancelled request rejoins quickly, large enough not to spin.
+const SOCKET_WAIT_GRANULARITY: Duration = Duration::from_millis(10);
+
+impl HerdrRuntime {
+    /// Focuses one pane: the CLI reports the socket, the schema's `pane.focus`
+    /// request does the rest. Focusing a pane raises its workspace and tab with
+    /// it, so one request covers all three levels.
+    fn focus_pane(&self, pane_id: &str, cancel: &AtomicBool) -> Result<(), String> {
+        let status = run(&self.config, &["status", "--json"], cancel)?;
+        let socket = socket_path(&status)?;
+        let budget = Budget::of(self.config.command_timeout);
+        let mut stream = UnixStream::connect(&socket)
+            .map_err(|error| format!("could not reach herdr at {}: {error}", socket.display()))?;
+        for setting in [
+            stream.set_read_timeout(Some(SOCKET_WAIT_GRANULARITY)),
+            stream.set_write_timeout(Some(SOCKET_WAIT_GRANULARITY)),
+        ] {
+            setting.map_err(|error| format!("herdr socket could not be read: {error}"))?;
+        }
+        // The schema's `pane.focus` params are `{"pane_id": "..."}`; focusing
+        // the pane raises its workspace and tab, so one request does all three.
+        let request = serde_json::json!({
+            "id": "radar:focus",
+            "method": "pane.focus",
+            "params": { "pane_id": pane_id },
+        });
+        write_request(
+            &mut stream,
+            format!("{request}\n").as_bytes(),
+            budget,
+            cancel,
+        )?;
+        let answer = read_answer(&mut stream, budget, cancel)?;
+        decode_answer(&answer)
+    }
+}
+
+/// The socket path from `herdr status --json`, which is the server the CLI
+/// (and so the collector) is talking to.
+fn socket_path(status: &str) -> Result<PathBuf, String> {
+    let status: serde_json::Value = serde_json::from_str(status)
+        .map_err(|error| format!("herdr status could not be read: {error}"))?;
+    match status
+        .pointer("/server/socket")
+        .and_then(|path| path.as_str())
+    {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Err("herdr is not running".to_string()),
+    }
+}
+
+/// One exchange's deadline, so every wait reports the same timeout.
+#[derive(Clone, Copy)]
+struct Budget {
+    deadline: Instant,
+    timeout: Duration,
+}
+
+impl Budget {
+    fn of(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            timeout,
+        }
+    }
+
+    /// Waits one granularity. `Err` once the request is cancelled or the
+    /// deadline has passed.
+    fn wait(&self, cancel: &AtomicBool) -> Result<(), String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("focus cancelled".to_string());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(format!("herdr timed out after {:?}", self.timeout));
+        }
+        thread::sleep(SOCKET_WAIT_GRANULARITY);
+        Ok(())
+    }
+}
+
+/// Writes the whole request, waiting out a socket that is momentarily busy.
+fn write_request(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    budget: Budget,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut written = 0;
+    while written < bytes.len() {
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Err("herdr closed the connection".to_string()),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if is_timeout(&error) => budget.wait(cancel)?,
+            Err(error) => return Err(format!("herdr could not be asked: {error}")),
+        }
+    }
+    Ok(())
+}
+
+/// Reads one answer line, waiting out a socket that is momentarily empty.
+fn read_answer(
+    stream: &mut UnixStream,
+    budget: Budget,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let mut answer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err("herdr closed the connection".to_string()),
+            Ok(count) => {
+                answer.extend_from_slice(&chunk[..count]);
+                if let Some(end) = answer.iter().position(|byte| *byte == b'\n') {
+                    return Ok(String::from_utf8_lossy(&answer[..end]).trim().to_string());
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if is_timeout(&error) => budget.wait(cancel)?,
+            Err(error) => return Err(format!("herdr sent no answer: {error}")),
+        }
+    }
+}
+
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+/// One answer: `result` is success, `error` is Herdr refusing the request.
+fn decode_answer(answer: &str) -> Result<(), String> {
+    let answer: serde_json::Value = serde_json::from_str(answer)
+        .map_err(|error| format!("herdr sent an unreadable answer: {error}"))?;
+    if let Some(error) = answer.get("error") {
+        let reason = error
+            .get("message")
+            .and_then(|message| message.as_str())
+            .or_else(|| error.get("code").and_then(|code| code.as_str()))
+            .unwrap_or("no reason given");
+        return Err(format!("herdr refused to focus: {reason}"));
+    }
+    answer
+        .get("result")
+        .map(|_| ())
+        .ok_or_else(|| "herdr sent an unreadable answer".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Running the CLI: bounded, drained, killed and reaped
+// ---------------------------------------------------------------------------
+
+/// How often a running command is checked for exit, timeout and cancellation.
+/// Small enough that cancellation feels immediate, large enough not to spin.
+const WAIT_GRANULARITY: Duration = Duration::from_millis(10);
+
+/// Most stdout kept from one command; the rest is discarded.
+const STDOUT_CAP: usize = 8 * 1024 * 1024;
+
+/// Most stderr kept from one command (only its first line reaches a diagnostic).
+const STDERR_CAP: usize = 8 * 1024;
+
+/// Longest stderr excerpt quoted in a diagnostic.
+const DIAGNOSTIC_CHARS: usize = 200;
+
+/// Runs one `herdr` subcommand, returning its stdout.
+///
+/// `Err` carries a user-facing diagnostic; the command has been killed and
+/// reaped by then.
+fn run(config: &HerdrConfig, args: &[&str], cancel: &AtomicBool) -> Result<String, String> {
+    let executable = &config.executable;
+    let mut command = Command::new(executable);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run {}: {error}", executable.display()))?;
+
+    // Drain both pipes on their own threads: waiting for a command that fills
+    // a pipe would deadlock, and the same threads keep its output bounded.
+    let stdout = drain(child.stdout.take().expect("stdout is piped"), STDOUT_CAP);
+    let stderr = drain(child.stderr.take().expect("stderr is piped"), STDERR_CAP);
+
+    let status = wait_for_exit(&mut child, config, cancel);
+    // Descendants may keep the output pipes open after the CLI exits. The
+    // adapter owns this isolated group, so end it before joining readers.
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: process_group(0) assigned this child its own group; a negative
+        // PID targets only that group, never Radar or the pane it observes.
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let stdout = stdout.join().expect("stdout drain thread panicked");
+    let stderr = stderr.join().expect("stderr drain thread panicked");
+
+    match status {
+        Ok(status) if status.success() => Ok(String::from_utf8_lossy(&stdout).into_owned()),
+        Ok(status) => Err(diagnostic(exit_diagnostic(status), &stderr)),
+        Err(reason) => Err(diagnostic(reason, &stderr)),
+    }
+}
+
+/// Waits for a command to exit, killing and reaping it on timeout or
+/// cancellation. `Err` is the diagnostic for having killed it.
+fn wait_for_exit(
+    child: &mut Child,
+    config: &HerdrConfig,
+    cancel: &AtomicBool,
+) -> Result<ExitStatus, String> {
+    let timeout = config.command_timeout;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                kill_and_reap(child);
+                return Err(format!("herdr could not be waited for: {error}"));
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            kill_and_reap(child);
+            return Err("collection cancelled".to_string());
+        }
+        if Instant::now() >= deadline {
+            kill_and_reap(child);
+            return Err(format!("herdr timed out after {timeout:?}"));
+        }
+        thread::sleep(WAIT_GRANULARITY);
+    }
+}
+
+/// Kills a still-running command and reaps it, so a stalled command leaves no
+/// process — not even a zombie — behind.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reads one of a command's pipes to end of file on its own thread, keeping at
+/// most `cap` bytes and discarding the rest.
+///
+/// Reading past the cap rather than stopping is deliberate: an unread pipe
+/// fills at the OS buffer size and would block the command forever.
+fn drain(mut pipe: impl Read + Send + 'static, cap: usize) -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 8 * 1024];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => return kept,
+                Ok(read) => {
+                    let room = cap - kept.len();
+                    kept.extend_from_slice(&buffer[..read.min(room)]);
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(_) => return kept,
+            }
+        }
+    })
+}
+
+/// How a command ended, in terms a user can act on.
+fn exit_diagnostic(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("herdr exited with status {code}"),
+        None => format!("herdr was killed ({status})"),
+    }
+}
+
+/// Quotes the first stderr line in a failure diagnostic: enough to identify the
+/// problem without dumping a whole stream into the overview.
+fn diagnostic(reason: String, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let Some(line) = stderr.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return reason;
+    };
+    let line: String = line.chars().take(DIAGNOSTIC_CHARS).collect();
+    format!("{reason}: {line}")
 }
 
 #[cfg(test)]
@@ -942,5 +1314,48 @@ mod tests {
     fn malformed_process_info_is_rejected() {
         assert!(decode_process_info("not json").is_err());
         assert!(decode_process_info(r#"{"id":"x","result":{}}"#).is_err());
+    }
+
+    // --- the adapter's own transport --------------------------------------
+
+    use std::io::Cursor;
+
+    #[test]
+    fn the_adapter_defaults_match_the_documented_settings() {
+        let config = HerdrConfig::default();
+        assert_eq!(config.executable, PathBuf::from("herdr"));
+        assert_eq!(config.command_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn draining_keeps_the_cap_and_still_reads_to_end_of_file() {
+        let oversize = vec![b'x'; STDOUT_CAP + 512];
+        let kept = drain(Cursor::new(oversize), STDOUT_CAP)
+            .join()
+            .expect("drain thread");
+        assert_eq!(kept.len(), STDOUT_CAP);
+
+        let short = b"{\"result\":{}}".to_vec();
+        let kept = drain(Cursor::new(short.clone()), STDOUT_CAP)
+            .join()
+            .expect("drain thread");
+        assert_eq!(kept, short);
+    }
+
+    #[test]
+    fn a_diagnostic_quotes_only_the_first_stderr_line() {
+        let stderr = b"\n  herdr: no runtime is listening  \nmore detail\n";
+        assert_eq!(
+            diagnostic("herdr exited with status 3".to_string(), stderr),
+            "herdr exited with status 3: herdr: no runtime is listening"
+        );
+        assert_eq!(
+            diagnostic("herdr timed out after 5s".to_string(), b""),
+            "herdr timed out after 5s"
+        );
+
+        let long = format!("{}\n", "e".repeat(DIAGNOSTIC_CHARS + 50));
+        let quoted = diagnostic("failed".to_string(), long.as_bytes());
+        assert_eq!(quoted.chars().count(), "failed: ".len() + DIAGNOSTIC_CHARS);
     }
 }

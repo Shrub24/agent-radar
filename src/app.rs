@@ -20,17 +20,22 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 
-use crate::bus::{BusEvent, BusSession, BusState};
-use crate::focus::Target;
+use crate::bus::{BusEvent, BusState};
 use crate::observation::{ObservationState, SourceFreshness};
+use crate::runtime::Target;
 use crate::theme;
 use ratatui::layout::Rect;
 
 use crate::model::AgentState;
-use crate::tree::{FleetTree, RowId, RowKind, TreeNode};
+use crate::tree::{FleetTree, RowId, RowKind, TaskRow, TreeNode};
 
 /// How long a focus message stays up when no key clears it first.
 const FOCUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
+
+/// The width of a row's disclosure marker in cells: `ui::fold_marker` draws it,
+/// and a leaf keeps the same two blank columns, so the hit cell is the same
+/// whether or not the row has children to show.
+const DISCLOSURE_WIDTH: u16 = 2;
 
 /// What a key asked the main loop to do outside the view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,9 +44,9 @@ pub enum Action {
     Focus(Target),
 }
 
-/// One row of the current view: the projected node plus its display depth and
-/// fold state.
-#[derive(Clone, Copy, Debug)]
+/// One row of the current view: the projected node plus its display depth,
+/// fold state and branch prefix.
+#[derive(Clone, Debug)]
 pub struct VisibleRow<'a> {
     pub id: &'a RowId,
     pub depth: usize,
@@ -50,6 +55,52 @@ pub struct VisibleRow<'a> {
     /// only panes are hidden has none).
     pub has_children: bool,
     pub collapsed: bool,
+    /// The branch prefix to draw before the row's own marks.
+    pub connectors: Connectors,
+}
+
+impl VisibleRow<'_> {
+    /// Where this row's disclosure marker begins, in cells from the panel
+    /// content's left edge: exactly the branch prefix drawn before it. The draw
+    /// and a later marker hit test read one layout through this.
+    pub fn marker_column(&self) -> u16 {
+        (self.connectors.continuation.len() as u16 + u16::from(self.depth > 0)) * 2
+    }
+}
+
+/// How a visible row's branch prefix reads: the vertical continuation lines its
+/// visible ancestry requires, and whether a visible sibling follows it.
+///
+/// Derived while flattening the ordered, filtered view, so folds and filtering
+/// change it with the rows actually drawn; raw child indices cannot say this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Connectors {
+    /// One flag per nested ancestor from the workspace inward: `true` where that
+    /// ancestor is followed by a visible sibling, so its branch line continues
+    /// past this row.
+    pub continuation: Vec<bool>,
+    /// Whether a visible sibling follows this row: the branch connector when
+    /// true, the last-child connector when false.
+    pub has_following_sibling: bool,
+}
+
+/// The prefix a child row draws: its parent's continuation columns, then the
+/// parent's own column when the parent is itself nested. A workspace root draws
+/// no connector, so its children start with an empty prefix and it leaves no
+/// continuation behind them.
+fn child_connectors(
+    parent: &Connectors,
+    parent_depth: usize,
+    has_following_sibling: bool,
+) -> Connectors {
+    let mut continuation = parent.continuation.clone();
+    if parent_depth > 0 {
+        continuation.push(parent.has_following_sibling);
+    }
+    Connectors {
+        continuation,
+        has_following_sibling,
+    }
 }
 
 /// Which ordinary panes the fleet tree lists.
@@ -89,18 +140,22 @@ impl PaneView {
 }
 
 /// Which rows the tree lists: the pane view, plus whether finished sessions are
-/// listed while ordinary panes are hidden.
+/// listed while ordinary panes are hidden and whether background tasks are
+/// listed in this view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Visibility {
     view: PaneView,
     finished: bool,
+    tasks: bool,
 }
 
 impl Visibility {
-    /// Whether this view lists a row of this kind. Everything that is not an
-    /// ordinary pane is always listed.
+    /// Whether this view lists a row of this kind. A workspace, an agent and an
+    /// ordinary pane follow the pane view; background tasks follow their own
+    /// per-view choice.
     fn includes(self, kind: &RowKind) -> bool {
         match kind {
+            RowKind::Task(_) => self.tasks,
             RowKind::Pane(pane) => match self.view {
                 // A finished session is history rather than fleet, so only the
                 // explicit toggle brings it into a view without panes — and
@@ -111,7 +166,49 @@ impl Visibility {
                 PaneView::Running => pane.command().is_some(),
                 PaneView::All => true,
             },
-            _ => true,
+            RowKind::Workspace { .. } | RowKind::Agent(_) => true,
+        }
+    }
+}
+
+/// Whether background-task children are listed, per pane view, for this Radar
+/// run.
+///
+/// A presentation choice rather than a fact: `agents` view is the fleet, so it
+/// starts with the children hidden, while `running` and `all` are the operator's
+/// view of outstanding work and start with them shown. Each view keeps its own
+/// answer, so `b` in one view cannot change what another lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskRows {
+    agents: bool,
+    running: bool,
+    all: bool,
+}
+
+impl Default for TaskRows {
+    fn default() -> Self {
+        Self {
+            agents: false,
+            running: true,
+            all: true,
+        }
+    }
+}
+
+impl TaskRows {
+    fn shown(self, view: PaneView) -> bool {
+        match view {
+            PaneView::Hidden => self.agents,
+            PaneView::Running => self.running,
+            PaneView::All => self.all,
+        }
+    }
+
+    fn toggle(&mut self, view: PaneView) {
+        match view {
+            PaneView::Hidden => self.agents = !self.agents,
+            PaneView::Running => self.running = !self.running,
+            PaneView::All => self.all = !self.all,
         }
     }
 }
@@ -133,6 +230,8 @@ pub struct App {
     /// Off by default: the agents view is the live fleet, and a fleet with its
     /// history in it stops being an overview.
     finished_shown: bool,
+    /// Whether task children are listed, remembered per pane view for this run.
+    task_rows: TaskRows,
     selected: Option<RowId>,
     /// Index of the selected row in the last visible-row list, used as the
     /// fallback position when the selected row disappears.
@@ -231,6 +330,7 @@ impl App {
     /// `Enter` may focus is a property of the observation that was just drawn.
     pub fn refresh(&mut self, state: &ObservationState) {
         self.tree = FleetTree::build(state);
+        self.tree.attach_tasks(&self.bus);
         self.source_current = matches!(state.source_freshness(), SourceFreshness::Current);
         self.focus_targets = if self.source_current {
             crate::focus::targets(&self.tree, state)
@@ -249,20 +349,35 @@ impl App {
     /// ordinary-pane toggle and the filter.
     pub fn visible_rows(&self) -> Vec<VisibleRow<'_>> {
         let mut rows = Vec::new();
-        if let Some(needle) = self.needle() {
-            for root in ordered(&self.tree.roots, self.order) {
-                collect_filtered(root, 0, &needle, self.visibility(), self.order, &mut rows);
+        match self.needle() {
+            Some(needle) => {
+                let roots = ordered(&self.tree.roots, self.order)
+                    .into_iter()
+                    .filter(|root| subtree_matches(root, &needle, self.visibility(), self.order));
+                for root in roots {
+                    collect_filtered(
+                        root,
+                        0,
+                        &needle,
+                        self.visibility(),
+                        self.order,
+                        Connectors::default(),
+                        &mut rows,
+                    );
+                }
             }
-        } else {
-            for root in ordered(&self.tree.roots, self.order) {
-                collect_visible(
-                    root,
-                    0,
-                    self.visibility(),
-                    &self.collapsed,
-                    self.order,
-                    &mut rows,
-                );
+            None => {
+                for root in ordered(&self.tree.roots, self.order) {
+                    collect_visible(
+                        root,
+                        0,
+                        self.visibility(),
+                        &self.collapsed,
+                        self.order,
+                        Connectors::default(),
+                        &mut rows,
+                    );
+                }
             }
         }
         rows
@@ -345,35 +460,57 @@ impl App {
         }
     }
 
-    /// A left click. A heading folds whether or not it was selected; a row that
+    /// A left click. A heading folds whether or not it was selected; an agent
+    /// branch's disclosure cell folds that branch and sends nothing; a row that
     /// was already selected is the one the click acts on.
     fn click(&mut self, at: (u16, u16)) -> Option<Action> {
-        let id = self.row_at(at)?;
-        let heading = matches!(id, RowId::Workspace(_));
-        let already = self.selected.as_ref() == Some(&id);
-        self.selected = Some(id);
-        if heading {
+        let (id, disclosure) = self.row_under(at)?;
+        if matches!(id, RowId::Workspace(_)) {
+            self.selected = Some(id);
             self.toggle_fold();
             return None;
         }
+        if disclosure {
+            // The pointer said where, not which row to act on: the disclosure
+            // cell folds this branch alone and leaves Herdr alone.
+            self.toggle_branch(&id);
+            return None;
+        }
+        let already = self.selected.as_ref() == Some(&id);
+        self.selected = Some(id);
         if already {
             return self.focus_selected();
         }
         None
     }
 
-    /// The row drawn at a position, if the position holds one. A folded row is
-    /// not drawn, so it cannot be under the pointer.
-    fn row_at(&self, at: (u16, u16)) -> Option<RowId> {
+    /// The row drawn at a position, and whether the position falls on its
+    /// disclosure cell. A folded row's descendants are not drawn, so they
+    /// cannot be under the pointer.
+    fn row_under(&self, at: (u16, u16)) -> Option<(RowId, bool)> {
         let content = self.layout.tree_content;
         if !inside(Some(content), at) {
             return None;
         }
         let index = self.layout.offset + (at.1 - content.y) as usize;
-        self.visible_rows()
-            .into_iter()
-            .nth(index)
-            .map(|row| row.id.clone())
+        let row = self.visible_rows().into_iter().nth(index)?;
+        let column = at.0.saturating_sub(content.x);
+        let marker = row.marker_column();
+        let disclosure = row.has_children && (marker..marker + DISCLOSURE_WIDTH).contains(&column);
+        Some((row.id.clone(), disclosure))
+    }
+
+    /// Folds or unfolds one branch by identity, without moving the selection.
+    /// Ignored while a filter is active, as the fold keys are: the filtered
+    /// view shows matching ancestry on purpose, so a fold could not take effect.
+    fn toggle_branch(&mut self, id: &RowId) {
+        if self.needle().is_some() {
+            return;
+        }
+        if !self.collapsed.remove(id) {
+            self.collapsed.insert(id.clone());
+        }
+        self.reconcile_selection();
     }
 
     /// The order siblings are shown in, which `s` cycles.
@@ -415,11 +552,9 @@ impl App {
             .any(|row| match &row.node.row.kind {
                 RowKind::Agent(agent) => {
                     theme::animates(&agent.state, agent.retained.is_some())
-                        || (command
-                            && agent.retained.is_none()
-                            && agent.facts.background_running.unwrap_or(0) > 0
-                            && !agent.facts.background_task_ids().is_empty())
+                        || (command && agent.tasks.tasks.iter().any(TaskRow::is_running))
                 }
+                RowKind::Task(task) => command && task.is_running(),
                 RowKind::Pane(pane) => command && pane.command().is_some(),
                 RowKind::Workspace { .. } => false,
             })
@@ -442,13 +577,33 @@ impl App {
         self.finished_shown
     }
 
+    /// Whether background-task children are listed in the current view.
+    pub fn shows_tasks(&self) -> bool {
+        self.task_rows.shown(self.view)
+    }
+
+    /// `b`: lists or hides background-task children in the current view only.
+    ///
+    /// Facts are untouched: the projection, the parent badges and the details
+    /// stay current while the children are hidden, so revealing them later
+    /// shows the latest report rather than a cached list. A task hidden under
+    /// the selection falls back through [`Self::reconcile_selection`].
+    pub fn toggle_tasks(&mut self) {
+        self.task_rows.toggle(self.view);
+        self.reconcile_selection();
+    }
+
     /// Applies one event from the bus listener.
     ///
-    /// A session's tasks arrive with its connection and leave with it; nothing
-    /// here touches the tree or the observation, so bus data can never change
-    /// an agent's state.
+    /// A session's tasks arrive with its connection and leave with it. Bus data
+    /// never changes an agent's state or its row: only the task children are
+    /// rebuilt, because a publisher's list is not an observation fact. Nothing
+    /// waits for the next poll — the rows and the selection are reconciled here
+    /// and now.
     pub fn apply_bus_event(&mut self, event: BusEvent) {
         self.bus.apply(event);
+        self.tree.attach_tasks(&self.bus);
+        self.reconcile_selection();
     }
 
     /// Records why the bus is not running, or clears it.
@@ -459,21 +614,6 @@ impl App {
     /// Why the bus is not running, when it is not.
     pub fn bus_diagnostic(&self) -> Option<&str> {
         self.bus_diagnostic.as_deref()
-    }
-
-    /// The bus data held for a session, where a publisher is connected for it.
-    pub fn bus_session(&self, session: &str) -> Option<&BusSession> {
-        self.bus.get(session)
-    }
-
-    /// The bus data of a publisher whose `hello` named this pane. A fallback
-    /// for a row that publishes no session UUID of its own, and for nothing
-    /// else.
-    pub fn bus_session_on_pane(&self, pane_id: &str) -> Option<&BusSession> {
-        self.bus
-            .sessions()
-            .find(|(_, held)| held.pane.as_deref() == Some(pane_id))
-            .map(|(_, held)| held)
     }
 
     /// Lists or hides finished sessions.
@@ -487,6 +627,7 @@ impl App {
         Visibility {
             view: self.view,
             finished: self.finished_shown,
+            tasks: self.task_rows.shown(self.view),
         }
     }
 
@@ -508,7 +649,8 @@ impl App {
     /// Left/Right) folds and unfolds the selected branch; `Enter` focuses the
     /// selected row's location; `/` starts filter entry; `p` cycles the pane
     /// view, `d` shows or hides the details, `e` shows or hides finished
-    /// sessions and `s` cycles the order; `n`/`N` jump to the next or previous
+    /// sessions, `b` shows or hides background-task children in the current
+    /// view and `s` cycles the order; `n`/`N` jump to the next or previous
     /// row needing attention and `w`/`W` to the next or previous working row;
     /// in filter entry, printable characters (with Backspace) edit the query,
     /// Enter applies it and Escape clears it and leaves entry. Escape outside
@@ -540,6 +682,7 @@ impl App {
             KeyCode::Char('W') => self.jump(is_working, false),
             KeyCode::Char('d') => self.toggle_details(),
             KeyCode::Char('e') => self.toggle_finished(),
+            KeyCode::Char('b') => self.toggle_tasks(),
             KeyCode::Char('/') => self.filter_editing = true,
             KeyCode::Esc => {
                 self.filter.clear();
@@ -598,12 +741,21 @@ impl App {
             self.set_focus_message(Some("the fleet is stale: not focusing".to_string()));
             return None;
         }
-        match self.focus_targets.get(&id) {
+        // A task is not a location of its own: what to focus is the pane its
+        // owner agent row names, and only while that row is still placed by
+        // this observation. The owner row is already projected, so a task the
+        // bus created focuses its parent without another runtime refresh.
+        let target_id = match &id {
+            RowId::Task(task) => RowId::Agent(task.owner.clone()),
+            other => other.clone(),
+        };
+        match self.focus_targets.get(&target_id) {
             Some(target) => Some(Action::Focus(target.clone())),
             None => {
-                let described = match &id {
+                let described = match &target_id {
                     RowId::Workspace(workspace_id) => format!("workspace {workspace_id}"),
                     RowId::Agent(pane_id) | RowId::Pane(pane_id) => format!("pane {pane_id}"),
+                    RowId::Task(_) => unreachable!("a task is looked up through its owner row"),
                 };
                 self.set_focus_message(Some(format!("{described} is not observed")));
                 None
@@ -745,6 +897,18 @@ impl App {
             self.anchor = index;
             return;
         }
+        // A task its publisher stopped reporting falls back to the agent row it
+        // hung under, which is still there for it to be read from. Only when
+        // that row is gone too does the position fallback below apply.
+        if let Some(RowId::Task(task)) = &self.selected
+            && let Some(index) = rows
+                .iter()
+                .position(|row| matches!(&row.id, RowId::Agent(pane_id) if *pane_id == task.owner))
+        {
+            self.selected = Some(rows[index].id.clone());
+            self.anchor = index;
+            return;
+        }
         // The selected row is gone: stay at the same position if the view has
         // one, otherwise at its end. Selection is never left dangling.
         let anchor = self.anchor.min(rows.len() - 1);
@@ -760,13 +924,16 @@ fn has_visible_children(node: &TreeNode, visible: Visibility) -> bool {
         .any(|child| visible.includes(&child.row.kind))
 }
 
-/// Collects the unfolded view, skipping hidden ordinary panes.
+/// Collects the unfolded view, skipping hidden ordinary panes. A branch's
+/// connector is decided from the siblings that survive filtering and folding,
+/// not from the children the projection holds.
 fn collect_visible<'a>(
     node: &'a TreeNode,
     depth: usize,
     visible: Visibility,
     collapsed: &HashSet<RowId>,
     order: RowOrder,
+    connectors: Connectors,
     out: &mut Vec<VisibleRow<'a>>,
 ) {
     let folded = collapsed.contains(&node.row.id);
@@ -776,16 +943,37 @@ fn collect_visible<'a>(
         node,
         has_children: has_visible_children(node, visible),
         collapsed: folded,
+        connectors: connectors.clone(),
     });
     if folded {
         return;
     }
-    for child in ordered(&node.children, order) {
-        if !visible.includes(&child.row.kind) {
-            continue;
-        }
-        collect_visible(child, depth + 1, visible, collapsed, order, out);
+    let children: Vec<&TreeNode> = ordered(&node.children, order)
+        .into_iter()
+        .filter(|child| visible.includes(&child.row.kind))
+        .collect();
+    let count = children.len();
+    for (index, child) in children.into_iter().enumerate() {
+        collect_visible(
+            child,
+            depth + 1,
+            visible,
+            collapsed,
+            order,
+            child_connectors(&connectors, depth, index + 1 < count),
+            out,
+        );
     }
+}
+
+/// Whether this subtree contributes a row to the filtered view: the row itself
+/// matches, or a visible descendant does. What the filter keeps, so the
+/// connectors are built from the rows that are drawn.
+fn subtree_matches(node: &TreeNode, needle: &str, visible: Visibility, order: RowOrder) -> bool {
+    node.row.matches(needle)
+        || ordered(&node.children, order).into_iter().any(|child| {
+            visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
+        })
 }
 
 /// Whether a position falls inside an area. Radar's areas are half-open, as the
@@ -818,14 +1006,31 @@ fn state_rank(node: &TreeNode) -> u8 {
         // needs a human now: it ranks after everything observed.
         RowKind::Agent(agent) if agent.retained.is_some() => RETAINED_RANK,
         RowKind::Agent(agent) => agent_rank(&agent.state),
+        RowKind::Task(task) => task_rank(task),
         // A pane carries no state of its own, and a workspace carries none
         // except through what is beneath it.
         RowKind::Pane(_) | RowKind::Workspace { .. } => u8::MAX,
     };
     node.children
         .iter()
+        // A task's phase orders task rows among their siblings; it never raises
+        // the rank of the agent or workspace they hang under, because an agent's
+        // urgency is its own state and not its tasks'.
+        .filter(|child| !matches!(child.row.kind, RowKind::Task(_)))
         .map(state_rank)
         .fold(own, std::cmp::min)
+}
+
+/// Where a task's phase sits in state order: a capture that has exited and is
+/// still to be read or certified first, then a process still running, then a
+/// word Radar cannot place. A display rank, and nothing else — no row's state is
+/// derived from it.
+fn task_rank(task: &TaskRow) -> u8 {
+    match task.phase.as_deref() {
+        Some("review") | Some("flushing") => 0,
+        Some("running") => 3,
+        _ => 5,
+    }
 }
 
 /// Where a state sits in state order: what is stuck or unanswered first, then
@@ -874,28 +1079,23 @@ fn is_working(row: &VisibleRow<'_>) -> bool {
 }
 
 /// Collects the filtered view: matching rows plus the ancestry that explains
-/// their placement. Fold state is deliberately ignored here. Returns whether
-/// this subtree contributed any row.
+/// their placement. Fold state is deliberately ignored here. As in the
+/// unfolded view, the connectors come from the rows the filter keeps.
 fn collect_filtered<'a>(
     node: &'a TreeNode,
     depth: usize,
     needle: &str,
     visible: Visibility,
     order: RowOrder,
+    connectors: Connectors,
     out: &mut Vec<VisibleRow<'a>>,
-) -> bool {
-    let mut descendants = Vec::new();
-    let mut descendant_matched = false;
-    for child in ordered(&node.children, order) {
-        if !visible.includes(&child.row.kind) {
-            continue;
-        }
-        descendant_matched |=
-            collect_filtered(child, depth + 1, needle, visible, order, &mut descendants);
-    }
-    if !node.row.matches(needle) && !descendant_matched {
-        return false;
-    }
+) {
+    let children: Vec<&TreeNode> = ordered(&node.children, order)
+        .into_iter()
+        .filter(|child| {
+            visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
+        })
+        .collect();
     out.push(VisibleRow {
         id: &node.row.id,
         depth,
@@ -904,9 +1104,20 @@ fn collect_filtered<'a>(
         // Folding does not apply while filtering: the filtered view shows the
         // ancestry of matches on purpose, so no row reports as collapsed here.
         collapsed: false,
+        connectors: connectors.clone(),
     });
-    out.extend(descendants);
-    true
+    let count = children.len();
+    for (index, child) in children.into_iter().enumerate() {
+        collect_filtered(
+            child,
+            depth + 1,
+            needle,
+            visible,
+            order,
+            child_connectors(&connectors, depth, index + 1 < count),
+            out,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1408,6 +1619,77 @@ mod tests {
         app.focus_targets.clear();
         assert_eq!(press(&mut app, KeyCode::Enter), None);
         assert_eq!(app.focus_message(), Some("pane wA:p1 is not observed"));
+    }
+
+    #[test]
+    fn enter_on_a_task_focuses_its_owners_pane_or_refuses_with_that_pane() {
+        // One agent whose pane tokens name a task: the task row exists from the
+        // projection alone, with no publisher and no second refresh.
+        let observation = FleetObservation {
+            workspaces: vec![Workspace {
+                workspace_id: "wX".into(),
+                label: Some("solo".into()),
+                number: None,
+            }],
+            tabs: vec![Tab {
+                tab_id: "wX:t1".into(),
+                workspace_id: "wX".into(),
+                label: None,
+                number: None,
+            }],
+            panes: vec![Pane {
+                location: Location {
+                    workspace_id: "wX".into(),
+                    tab_id: "wX:t1".into(),
+                    pane_id: "wX:p1".into(),
+                },
+                label: None,
+                title: None,
+            }],
+            agents: vec![AgentObservation {
+                location: Location {
+                    workspace_id: "wX".into(),
+                    tab_id: "wX:t1".into(),
+                    pane_id: "wX:p1".into(),
+                },
+                name: Some("pi".into()),
+                label: Some("owner".into()),
+                status: Some(RuntimeStatus::Working),
+                session: None,
+                lineage: None,
+                facts: crate::model::HerdsmanFacts {
+                    background_tasks: vec!["bg-1:review".into()],
+                    ..Default::default()
+                },
+            }],
+        };
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let mut app = App::new();
+        app.refresh(&state);
+        // The subject is task behavior, so the agents view's default-hidden task
+        // rows are explicitly listed.
+        app.toggle_tasks();
+
+        // A task is read through the pane its owner row names: `Enter` focuses
+        // that pane and sends no task-consumption request.
+        let task = RowId::Task(crate::tree::TaskId {
+            owner: "wX:p1".into(),
+            session: None,
+            id: "bg-1".into(),
+        });
+        select_row(&mut app, &task);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Focus(Target::Pane("wX:p1".into())))
+        );
+        assert_eq!(app.focus_message(), None);
+
+        // The owner row still on screen with no location this observation
+        // places: the refusal names the pane the task would be read through.
+        app.focus_targets.clear();
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(app.focus_message(), Some("pane wX:p1 is not observed"));
     }
 
     #[test]

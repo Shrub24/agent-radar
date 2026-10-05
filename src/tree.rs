@@ -14,7 +14,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::model::{AgentObservation, ForegroundEvidence, Lineage, Pane, TerminalMode};
+use crate::bus::{BusSession, BusState, Task};
+use crate::model::{
+    AgentObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Pane, TerminalMode,
+};
 use crate::observation::{ObservationState, RetentionBasis};
 
 /// A finished session, as its title survives on a pane's label.
@@ -25,6 +28,91 @@ pub struct ExitedSession {
     pub title: String,
     /// The vendor mark that prefix carried, when Radar recognises the provider.
     pub mark: Option<&'static str>,
+}
+
+/// Where a projected task's facts came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskSource {
+    /// A connected publisher's list: the authoritative facts for the session
+    /// it named, and the only source with a command, a working directory, a
+    /// process id, an age or an exit code.
+    Bus,
+    /// The pane's own published ids — the fallback for an agent no publisher
+    /// matches. Unresolved ids and a phase word, and nothing else.
+    Tokens,
+}
+
+/// Stable identity of a projected task row.
+///
+/// A task is scoped to the agent row that owns it and to the session its facts
+/// were reported in: a publisher's id alone is not an identity, because ids are
+/// reused between panes and between successive sessions in one pane. A row that
+/// publishes no session UUID gets a pane-scoped identity instead of a wrong one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TaskId {
+    /// The pane id of the agent row this task hangs under.
+    pub owner: String,
+    /// The exact session UUID these facts belong to, where one is known; `None`
+    /// is the pane-scoped fallback of a row that publishes no session.
+    pub session: Option<String>,
+    /// The publisher's task id, `bg-<n>`.
+    pub id: String,
+}
+
+/// One unresolved background task, normalized for display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRow {
+    /// Owner, session and task id: what selection and folds are keyed by.
+    pub id: TaskId,
+    /// The phase word as published, in the publisher's own vocabulary. `None`
+    /// only where the pane's tokens carried no phase for this id.
+    pub phase: Option<String>,
+    pub source: TaskSource,
+    /// `true` for facts taken from a retained row's tokens: last-observed
+    /// rather than current, so they are labelled and never animated.
+    pub last_observed: bool,
+    /// The publisher's own record, where the bus is the source. It is the only
+    /// place this row's command, working directory, timestamps, output size and
+    /// exit code exist.
+    pub published: Option<Task>,
+}
+
+impl TaskRow {
+    /// Whether this task's process is reported alive now, which is what a
+    /// moving mark means. A last-observed fact never moves.
+    pub fn is_running(&self) -> bool {
+        !self.last_observed && self.phase.as_deref() == Some("running")
+    }
+
+    /// Where these facts came from, in words, for a row or a detail line.
+    pub fn basis(&self) -> &'static str {
+        match (self.source, self.last_observed) {
+            (TaskSource::Bus, _) => "bus",
+            (TaskSource::Tokens, true) => "last-observed",
+            (TaskSource::Tokens, false) => "tokens",
+        }
+    }
+}
+
+/// The unresolved tasks one agent row projects to, and where they came from.
+///
+/// This one projection feeds the row's task children, its badge and its
+/// details, so those cannot disagree. `source` is `None` when nothing is
+/// reported at all; a matched publisher's list that is *empty* is `Some(Bus)`
+/// with no tasks — a publisher saying "nothing unresolved", which is a different
+/// fact from a pane saying nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskProjection {
+    pub source: Option<TaskSource>,
+    pub tasks: Vec<TaskRow>,
+}
+
+impl TaskProjection {
+    /// How many of these tasks are reported alive now: the count the pane's own
+    /// running-token count is comparable with.
+    pub fn running(&self) -> usize {
+        self.tasks.iter().filter(|task| task.is_running()).count()
+    }
 }
 
 /// Stable identity of a projected row.
@@ -39,6 +127,8 @@ pub enum RowId {
     Agent(String),
     /// Ordinary pane row, keyed by its connector-scoped pane id.
     Pane(String),
+    /// Background-task row, keyed by owner, session and task id.
+    Task(TaskId),
 }
 
 /// A display-ready row: everything the tree needs to place it and the detail
@@ -61,21 +151,33 @@ impl TreeRow {
             } => label.as_deref().unwrap_or(workspace_id),
             RowKind::Agent(agent) => &agent.title,
             RowKind::Pane(pane) => &pane.title,
+            // A task's label is its published command where there is one and
+            // its id otherwise: the id is the identity, the command is what a
+            // human recognises.
+            RowKind::Task(task) => task
+                .published
+                .as_ref()
+                .and_then(|published| published.command.as_deref())
+                .unwrap_or(&task.id.id),
         }
     }
 
     /// Case-insensitive match against the displayed label and any available
-    /// role/assignment text. `needle_lower` must already be lowercase.
+    /// role, assignment or task-id text. `needle_lower` must already be
+    /// lowercase.
     pub fn matches(&self, needle_lower: &str) -> bool {
-        let role_and_assignment = match &self.kind {
+        let extra: [Option<&str>; 2] = match &self.kind {
             RowKind::Agent(agent) => [
                 agent.facts.role.as_deref(),
                 agent.facts.assignment.as_deref(),
             ],
+            // A task's label may be its command, so its id is matched beside
+            // it: the id is what a filter is usually typed from.
+            RowKind::Task(task) => [Some(&task.id.id), None],
             _ => [None, None],
         };
         std::iter::once(Some(self.title()))
-            .chain(role_and_assignment)
+            .chain(extra)
             .flatten()
             .any(|text| text.to_lowercase().contains(needle_lower))
     }
@@ -88,10 +190,13 @@ pub enum RowKind {
         label: Option<String>,
         number: Option<u32>,
     },
-    /// Both row kinds are boxed: an agent row carries every fact the source
-    /// published, and the tree moves rows by value.
+    /// Both row kinds that carry every published fact are boxed: an agent row
+    /// carries everything the source said, a task row a publisher's whole
+    /// record, and the tree moves rows by value.
     Agent(Box<AgentRow>),
     Pane(Box<PaneRow>),
+    /// A background task, a leaf under the agent row it joins.
+    Task(Box<TaskRow>),
 }
 
 /// An agent row: current facts, or the last-observed facts of a retained
@@ -127,6 +232,10 @@ pub struct AgentRow {
     /// draws these as they are: a fact the source does not publish is absent,
     /// never defaulted and never derived here.
     pub facts: crate::model::HerdsmanFacts,
+    /// The unresolved tasks this row projects to, from the one source that can
+    /// speak for it (see [`TaskProjection`]). The row's task children are this
+    /// same list, so the badge, the details and the rows drawn cannot disagree.
+    pub tasks: TaskProjection,
 }
 
 /// An ordinary (non-agent) pane row, shown only when the user toggles
@@ -343,6 +452,20 @@ impl FleetTree {
 
         FleetTree { roots }
     }
+
+    /// Attaches every agent row's task children from the bus state.
+    ///
+    /// Task rows are the one thing the observation alone cannot produce: a
+    /// publisher's list is true only while its connection is open. They are
+    /// therefore (re)attached whenever the bus state or the inventory changes,
+    /// which is why this is separate from [`Self::build`] and why the app calls
+    /// it on a bus event as well as on a refresh. Nothing else is touched:
+    /// folds and selection are keyed by [`RowId`] and survive either way.
+    pub fn attach_tasks(&mut self, bus: &BusState) {
+        for node in &mut self.roots {
+            attach_node_tasks(node, bus);
+        }
+    }
 }
 
 /// Workspace groups in source order: reported workspaces first, then any
@@ -430,10 +553,162 @@ fn agent_node(
                     .as_ref()
                     .map(|lineage| lineage.session.as_str().to_string()),
                 facts: agent.facts.clone(),
+                // Filled by `FleetTree::attach_tasks`: the observation cannot
+                // say what a publisher is connected with.
+                tasks: TaskProjection::default(),
             })),
         },
         children: Vec::new(),
     }
+}
+
+/// Recomputes one node's task children and every node's beneath it.
+fn attach_node_tasks(node: &mut TreeNode, bus: &BusState) {
+    // Children first: a worker agent nested under this row owns its own tasks.
+    for child in &mut node.children {
+        attach_node_tasks(child, bus);
+    }
+    let RowKind::Agent(agent) = &node.row.kind else {
+        return;
+    };
+    let projected = project_tasks(
+        &agent.pane_id,
+        agent.session_uuid.as_deref(),
+        &agent.facts,
+        agent.retained.is_some(),
+        bus,
+    );
+    // Task children follow the agent's own children — nested workers keep their
+    // place — and are replaced wholesale, so a resolved task leaves no row
+    // behind. Task rows are leaves and never carry tasks of their own.
+    node.children
+        .retain(|child| !matches!(child.row.kind, RowKind::Task(_)));
+    node.children
+        .extend(projected.tasks.iter().cloned().map(task_node));
+    if let RowKind::Agent(agent) = &mut node.row.kind {
+        agent.tasks = projected;
+    }
+}
+
+/// One task's node: a leaf under its agent row.
+fn task_node(task: TaskRow) -> TreeNode {
+    TreeNode {
+        row: TreeRow {
+            id: RowId::Task(task.id.clone()),
+            kind: RowKind::Task(Box::new(task)),
+        },
+        children: Vec::new(),
+    }
+}
+
+/// The unresolved tasks an agent row projects to, from the one source that can
+/// speak for it.
+///
+/// The join is the exact `pi_herdsman_session` UUID the source published for
+/// this row. A publisher's `hello` pane is the fallback for a row that
+/// publishes no UUID at all, and only while exactly one connected session names
+/// that pane: an ambiguous fallback is no join rather than whichever entry
+/// happened to come first. A matched list is authoritative, an empty list
+/// included, so the pane's token ids are never unioned into it — they are the
+/// fallback for a row no publisher matches.
+fn project_tasks(
+    pane_id: &str,
+    session_uuid: Option<&str>,
+    facts: &HerdsmanFacts,
+    last_observed: bool,
+    bus: &BusState,
+) -> TaskProjection {
+    if let Some((session, held)) = matched_session(pane_id, session_uuid, bus) {
+        return TaskProjection {
+            source: Some(TaskSource::Bus),
+            tasks: held
+                .tasks
+                .iter()
+                .map(|task| TaskRow {
+                    id: TaskId {
+                        owner: pane_id.to_string(),
+                        session: Some(session.to_string()),
+                        id: task.id.clone(),
+                    },
+                    phase: Some(task.state.to_string()),
+                    source: TaskSource::Bus,
+                    // A connected publisher is live even when the agent row
+                    // itself is only retained: the bus is not the observation.
+                    last_observed: false,
+                    published: Some(task.clone()),
+                })
+                .collect(),
+        };
+    }
+    let tasks = token_tasks(pane_id, session_uuid, facts, last_observed);
+    TaskProjection {
+        source: (!tasks.is_empty()).then_some(TaskSource::Tokens),
+        tasks,
+    }
+}
+
+/// The connected session whose list this row publishes, and the session UUID it
+/// published it under.
+///
+/// The exact UUID first; the `hello` pane only for a row that publishes none,
+/// and only when one connected session names that pane — two publishers naming
+/// one pane are an ambiguity, not a coin toss.
+fn matched_session<'a>(
+    pane_id: &str,
+    session_uuid: Option<&'a str>,
+    bus: &'a BusState,
+) -> Option<(&'a str, &'a BusSession)> {
+    if let Some(session) = session_uuid {
+        return bus.get(session).map(|held| (session, held));
+    }
+    let mut candidates = bus
+        .sessions()
+        .filter(|(_, held)| held.pane.as_deref() == Some(pane_id));
+    let (session, held) = candidates.next()?;
+    candidates.next().is_none().then_some((session, held))
+}
+
+/// The token fallback for a row no publisher matches: the pane's own unresolved
+/// ids, each once, with the phase it published for that id.
+///
+/// The id set comes from [`HerdsmanFacts::background_task_ids`], so the
+/// fallback rows are exactly the set the activity derivation sees. A phase is
+/// recovered here from the published `<id>:<phase>` entry, split at its last
+/// colon like the model splits it: an id published without a phase has none,
+/// and a phase word Radar does not know is kept as published.
+fn token_tasks(
+    pane_id: &str,
+    session_uuid: Option<&str>,
+    facts: &HerdsmanFacts,
+    last_observed: bool,
+) -> Vec<TaskRow> {
+    facts
+        .background_task_ids()
+        .into_iter()
+        .map(|id| TaskRow {
+            id: TaskId {
+                owner: pane_id.to_string(),
+                session: session_uuid.map(str::to_string),
+                id: id.to_string(),
+            },
+            phase: published_phase(&facts.background_tasks, id),
+            source: TaskSource::Tokens,
+            last_observed,
+            // The tokens carry no detail: a token-only row has no command, no
+            // age and no exit code to show, and nothing is invented here.
+            published: None,
+        })
+        .collect()
+}
+
+/// The phase published for `id` in an `<id>:<phase>` entry, where there is one.
+fn published_phase(entries: &[String], id: &str) -> Option<String> {
+    entries
+        .iter()
+        .find_map(|entry| match entry.rsplit_once(':') {
+            Some((entry_id, phase)) if entry_id == id => Some(phase.to_string()),
+            _ => None,
+        })
 }
 
 /// Nests agent rows under unambiguous same-workspace owners and returns the
@@ -823,7 +1098,7 @@ mod tests {
         for (_, id, _) in &rows {
             let pane = match id {
                 RowId::Agent(pane) | RowId::Pane(pane) => Some(pane.as_str()),
-                RowId::Workspace(_) => None,
+                RowId::Workspace(_) | RowId::Task(_) => None,
             };
             if let Some(pane) = pane {
                 assert!(seen_panes.insert(pane), "duplicate row for pane {pane}");
