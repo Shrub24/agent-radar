@@ -27,15 +27,62 @@ view; 244 tests) and `runtime-provider-seam` (inventory, foreground evidence and
 focus behind `src/runtime.rs`, Herdr in `HerdrRuntime`; 255 tests). Each has its
 owner-gate results in its archived `verification.md`.
 
+Also landed and archived on 2026-10-06: `stale-binary-marks` (warning glyph and
+configurable colour; conservative live executable comparison), `lifecycle-controls`
+(`x` pane/agent close, `X` tab close, `r` idle managed-worker restart, separate
+default-Cancel confirmation) and `nix-distribution` (checked locked package, default
+app and a Home Manager module; native `x86_64-linux` build verified, `aarch64-linux`
+evaluated only). The lifecycle `verification.md` separates stub-owner verification
+from the unperformed live destructive smoke, and existing Herdsman owners must reload
+for their control inboxes.
+
 ## Next
 
-1. **Lifecycle controls.** Confirmed pane/tab close and idle-only single-agent
-   restart in the existing tree. Confirmation never overrides an owner's refusal
-   for outstanding work or results. Radar requests the action; the runtime
-   provider or Herdsman executes it. The owner contract is fixed (below) but the owner
-   side is not implemented, so Radar may build and test its client against the
-   fixture and must not enable controls until the owner confirms it landed. Fleet restart, new-tab creation, a project
-   picker and separate runtime/agent modes are deferred.
+Current priorities:
+
+1. **Known-process enrichment.** Add Linux observations/metrics/diagnostics to
+   known background tasks, foreground commands and verified agent processes.
+   Descendant relationships support workload attribution; a general process
+   browser or arbitrary unverified hierarchy is deferred.
+2. **Display/TUI refinement.** Review row density and useful details with the
+   operator after known-process enrichment. This remains a priority, but its
+   presentation decisions are deferred to that discussion.
+3. **Herdr-agnosticity and tmux-parity audit.** Cover Radar and pi-herdsman, not
+   just the Rust trait. Establish the actual requirements for a tmux adapter and
+   record gaps before promising parity or starting another implementation.
+
+Preview, session statistics/search, command-specific actions and failure
+reports remain deferred behind this pass. Fleet restart, restart-stale batches,
+new-tab creation, a project picker and separate runtime/agent modes remain out
+of the immediate scope.
+
+### Nix distribution (done)
+
+Implemented and archived as `nix-distribution`; its `verification.md` records the
+native build, the pinned Home Manager consumer cases and the remaining limits.
+Darwin packaging, a NixOS module and an overlay are not provided.
+
+### Herdr-agnosticity / tmux parity audit
+
+Audit the whole integration chain:
+
+- Radar adapter and assembly: inventory, locations, foreground evidence, focus,
+  pane/tab close, identifiers and containment. Identify anything still leaking
+  Herdr meaning through supposedly normalized values.
+- pi-herdsman and the other publishers: discovery, metadata/title publication,
+  pane creation/focus/close/relaunch and reconnect behavior. Radar's trait alone
+  cannot make worker launching or owner lifecycle work under tmux.
+- Identity and transport: stable session/run/worker joins, mux-scoped pane ids,
+  workspace/tab equivalents, bus fallback and owner-control cross-checks. Audit
+  the provider-specific `paneId` contract, not just command spelling.
+- Build a parity matrix: inventory; live agent facts; foreground/process roots;
+  focus; unmanaged pane/tab close; managed close/restart; task bus; retention and
+  source failure. Mark each as supported, equivalent with a documented mapping,
+  unsupported or needing an upstream contract change.
+- Deliver a grounded gap list, smallest necessary seam changes and a tmux
+  implementation/validation plan. Do not start a plugin framework or a second
+  backend during the audit. tmux panes/windows/sessions are not automatically
+  interchangeable with Herdr panes/tabs/workspaces.
 
 ### Runtime provider interface
 
@@ -52,11 +99,12 @@ pane cannot substitute for Herdsman validating and retiring an assignment.
 
 Owner contract (2026-10-06): `herdsman-control/v1` is specified in
 `pi-extensions/pi-herdsman/docs/reference/herdsman-control.md` with a fixture
-(`herdsman-control.fixture.json`, commit b86b4133, local and unpushed). The
-owner side — directory, watcher, claim, execution — is not implemented; code the
-client against the fixture and keep the UI controls off until it lands. One
-product question is still with the user: whether the owner's model is told a
-request happened (the design says no prompt).
+(`herdsman-control.fixture.json`, contract b86b4133, clarification 8f57974d).
+Owner implementation 92e52f0e43a1 is accepted locally; docs correction 6fc793ed
+clarifies that lost close leaves a surviving shell pane untouched. These were
+reported as local, unpushed commits. An active assignment close is learned through
+normal terminal-result delivery; idle close/restart creates no model prompt.
+Existing owner processes must reload before directories/watchers are available.
 
 - **Transport:** owner-created request/result directories under
   `~/.pi/agent/pi-herdsman/control/<ownerSessionId>/`, mode 0700, not symlinks;
@@ -79,9 +127,8 @@ request happened (the design says no prompt).
   is close-only; unknown refuses. Lead and standalone restart are unsupported,
   not a prompt to fall back to Herdr process launch.
 
-The runtime seam has landed. Pane and tab close extend its trait when the
-lifecycle change has a consumer; managed close and restart are a separate
-owner-control client. Results use `outcome` `closed | restarted | refused |
+The runtime seam now includes pane and tab close. Managed close and restart
+use a separate owner-control client. Results use `outcome` `closed | restarted | refused |
 unknown`; refusals carry `invalid_request`, `target_not_found`,
 `target_ambiguous`, `agent_busy` or `unsupported_target`. Confirmation must echo
 operation, label and run id. A tab or workspace holding a managed pane is
@@ -98,13 +145,11 @@ that action surface and need stronger target validation and confirmation.
   heading selects and folds it; the wheel scrolls the panel under the pointer.
   Mouse capture takes the terminal's text selection, which the README states
   along with the bypass key.
-- **Controls beyond focus.** Anything that acts on an agent — steer, interrupt,
-  extend, close — makes Radar a second control surface for semantics Herdsman
-  guards with its own preflight. That is a different proposition from focus and
-  should be decided separately. Analytics over what Radar already observes is
-  the cheaper half of this and comes first.
+- **Further agent controls.** Steer, interrupt and extend remain separate future
+  decisions. Close and idle-worker restart now use Herdsman's owner preflight;
+  this does not authorize additional controls or batch actions.
 
-### Lifecycle controls: next, pending owner contracts
+### Lifecycle controls: implemented single-target actions, deferred fleet restart
 
 Three operations, in increasing order of what they can destroy. The shape that
 matters is that Radar *triggers* and the owner *executes*: pane operations belong
@@ -112,7 +157,7 @@ to the runtime provider, agent operations to Herdsman's separate owner-control
 interface. The task bus stays metadata-only; its `ops` list is not this lifecycle
 transport. Radar must not kill or relaunch agent processes itself.
 
-- **Close a pane or tab (`x`, confirmed).** `d` is taken by the details toggle.
+- **Close a pane (`x`) or tab (`X`), confirmed — implemented.** `d` is taken by the details toggle.
   A tab-close confirmation names the tab and its affected panes, using the
   selected row's observed tab without introducing a second view mode. Refuse
   the whole tab if managed-agent containment is known or uncertain; do not close
@@ -122,7 +167,7 @@ transport. Radar must not kill or relaunch agent processes itself.
   loses that process and its pane output; a pane hosting a managed worker orphans the owner's assignment, whose
   child will never resolve unless Herdsman retires it. So closing a managed pane
   either goes through Herdsman or is refused with a reason.
-- **Restart a managed worker (`r`, confirmed, idle only initially).** Ask its
+- **Restart a managed worker (`r`, confirmed, idle only) — implemented.** Ask its
   owner to relaunch into its retained pane while preserving the Pi session,
   label, run id, lineage and owner accounting. Lead/standalone sessions remain
   unsupported; do not add a direct mux-launch fallback. The confirmation popup never permits an active
@@ -174,7 +219,7 @@ Radar rather than pulled from it.
   trusted over it.
 - **Contract.** A versioned `radar-bus.md` with a fixture, beside Herdsman's
   `pane-metadata.md`; each extension implements its half.
-- **Lifecycle controls are a future maybe, not scoped.** The hello advertises the
+- **Background-task lifecycle controls are a future maybe, not scoped.** The hello advertises the
   operations a client supports and v1 advertises none, so a later `stop-task` or
   similar can be added without a protocol break. It would need its own sync story
   with the extension's state and is decided separately (open question 1).
@@ -201,6 +246,30 @@ Radar rather than pulled from it.
   workspace suffix is stripped, and `e` lists finished sessions even with
   ordinary panes hidden.
 
+## Display/TUI refinement — before further features
+
+The objective is useful information at a glance, not more fields on every row.
+Do this against representative busy fleets, narrow terminals and deep branches:
+
+- Keep fleet overview compact; show the relevant process or task and its age,
+  not every shell/interpreter/helper. Full ancestry remains available through
+  folding/details. OS liveness must not masquerade as an agent activity state.
+- Review repeated titles, model/thinking text, state words, task badges and
+  command wrappers. A datum should earn its inline position; do not duplicate
+  the same command as an agent title, task child and independent process row.
+- Make row kinds and ownership/ancestry distinguishable, with consistent mark
+  columns and connectors. Preserve a selected row across refresh/sort, and
+  handle missing/reused process identities without silently selecting another.
+- Prioritize useful details: exact identity, command/cwd, age, parent/owner link,
+  task phase and actionable diagnostic. Unavailable optional fields should not
+  create walls of placeholders.
+- Check truncation, footer wrapping, confirmation/outcome space, details width
+  and scrolling. Necessary actions and warnings must remain visible at small
+  sizes; persistent outcomes must not swallow the fleet view.
+- Compare concrete render/mockup alternatives before changing defaults. Retain
+  user-controlled colours, glyphs, motion and view choices rather than adding
+  another arbitrary theme or many new toggles.
+
 ## Peek and preview
 
 Radar sees Herdr's metadata, local process facts and bus task metadata, not their
@@ -221,12 +290,88 @@ rather than appearance — the row following the program (its own description, a
 eventually keys it responds to) and a wider selection of marks. The table lives
 in configuration, as the vendor marks and colours already do.
 
-## Processes and links
+## Known-process enrichment
 
-The process view lists panes with a live command, its age and its terminal mode.
-Next: the tree behind those processes — what spawned what — and the links between
-running work and the things that asked for it: an agent, an assignment, a
-background task.
+The first consumer is an existing background-task row, not a new OS hierarchy.
+Enrich known tasks and currently observed foreground/agent processes with local
+facts. Child processes matter because a shell or launcher often does little work
+while its payload consumes resources. Preserve the existing agent/task ownership
+joins; OS parentage must never invent an assignment or owner.
+
+### Mechanisms and first-change scope
+
+- Linux `/proc/<pid>/stat`: process birth ticks, PPID, process group/session,
+  kernel state, user/system CPU time and RSS. `/proc/<pid>/status` can provide
+  thread counts; cwd/executable symlinks are existing observation patterns.
+- CPU percent comes from two samples of the same birth identity and monotonic
+  elapsed time, not a single counter. Use one-core accounting (100% = one core;
+  multithreaded work may exceed it) and keep the first sample unavailable.
+- Report root CPU/RSS and an explicitly labelled live-descendant aggregate plus
+  child count. Sum RSS is not unique memory: shared pages may be counted more
+  than once. Do not add cumulative waited-child CPU to live-child counters.
+- Kernel state and an optional readable wait-channel hint describe observations,
+  not a verdict that work is hung. Sleeping, quiet output and low CPU do not
+  establish a stalled task. Blocking permission/process races yield unavailable
+  metrics, not failed fleet collection.
+- Start with CPU, RSS, state and descendant count in existing task/command
+  details. Avoid extra rows, inline counters or a broad TUI redesign. Disk I/O
+  rates (`/proc/<pid>/io`), historical peaks, alerts and cgroup accounting are
+  separate follow-ons unless required to cover the chosen workload.
+- No generic process browser, system-wide monitoring view, persistent analytics
+  database, session-token analytics or new control operations in this change.
+
+### Identity/coverage blockers (publisher report, 2026-10-06)
+
+`pi-bash-processes` records optional `ManagedTask.procIdent = {pid,startToken,comm}`
+asynchronously immediately after spawn. Linux `startToken` is decimal stat field
+22, not wall-clock task `startedAt`; fallback is `ps lstart`. `comm` changes on
+exec and is diagnostic only. The current task bus omits this identity.
+
+- Extend the publisher/bus contract to advertise the actually captured optional
+  birth identity, including a format discriminator and Linux boot scope. Ensure
+  identity-capture completion publishes an update. Do not retrofit a current
+  `/proc` token as if it had been captured at spawn.
+- Publisher confirmation: `outputBytes` and `lastOutputAt` update on captured
+  stdout/stderr chunks and publish through a coalesced 200 ms output refresh;
+  state changes also publish. This is not a heartbeat or delivery guarantee.
+  Captured output bytes are neither disk nor network I/O. CPU/RSS sampling stays
+  independent and bus disconnection/freshness remains explicit.
+- Legacy/missing identity and pid reuse must not attach metrics to an unrelated
+  process. Show task metadata, with process enrichment unavailable, rather than
+  guessing from PID/command/cwd. `startedAt` is not proof of process identity.
+- `task.pid` is the directly spawned detached child (initial group/session
+  leader), often a shell that may exec without changing PID/start ticks. For
+  systemd resource controls it can be a launcher, not the service payload. A
+  process-tree aggregate must state its coverage; complete payload accounting
+  needs an explicit verified service/cgroup anchor, not guessed daemon ancestry.
+- Finalized `review`/`flushing` task records must not follow a recycled PID.
+  Preserve publisher phase/exit data even when live metrics are unavailable.
+- No output-silence diagnosis from an old bus snapshot or mere quietness,
+  even though continuously producing tasks refresh their captured-output counters.
+
+### Architecture and validation
+
+- Add a small off-thread sampler above the runtime seam. Its inputs are already
+  joined, typed task/foreground anchors; outputs are measurements keyed by
+  stable identity and sample time. Keep Linux reading in `src/procfs.rs` and
+  reuse the existing process-age/binary facts rather than another platform layer.
+- Feed task anchors from the connected task projection; do not make mux
+  inventory depend on extension task records. One shared sampled parent map can
+  support descendant attribution without exposing an arbitrary OS tree.
+- Bound the snapshot and previous-counter cache to current anchors/observed
+  descendants. Revalidate birth identities around collection; `/proc` is not an
+  atomic snapshot, so distinguish partial coverage from zero resources.
+- Task disconnect/replacement, process exit, permission denial and non-Linux
+  hosts degrade enrichment only. Leave state authority and task joins untouched.
+- Boundary tests should cover known root plus busy child, first/second CPU
+  samples, PID reuse, counter reset, missing identity, process exit during reads,
+  partial descendants, publisher disconnect and launcher-only coverage.
+
+Expected work: one upstream identity-contract/publisher slice, then two or
+three thin Radar slices (identity/decode plus sampled facts; task/foreground
+integration and details; final regression gate). Complexity is moderate; full
+systemd/cgroup payload coverage adds a separate scope. Implementation waits for
+agreement on the identity contract, not a general Herdr/tmux audit.
 
 ## Sessions: interaction and search
 
@@ -246,9 +391,10 @@ rows; fleet summaries and diagnostic reports do not exist yet.
 
 ## Open questions
 
-1. **What may Radar do to Herdr?** Focus is settled: it is the one action, and
-   it changes no agent. Lifecycle control is a
-   larger one. This decides the rest of the interactivity section.
+1. **Further controls.** Focus, confirmed unmanaged close and owner-routed
+   managed close/idle restart are settled. Batch restart, new tabs, steer,
+   interrupt and extend need their own decisions and contracts; task lifecycle
+   remains outside the metadata bus.
 2. ~~**Mouse capture** trades the terminal's text selection for clicks.~~
    Taken, and written down in the README. The open half is whether a bypass key
    is enough, or whether capture should be a setting.

@@ -5,7 +5,7 @@ edition = "2024"
 # Floor imposed by the dependencies (ratatui 0.30 and ratatui-crossterm 0.1
 # declare rust-version 1.88.0); edition 2024 itself requires 1.85.
 rust-version = "1.88"
-description = "Read-only full-screen fleet overview for local coding agents"
+description = "Full-screen fleet overview for local coding agents, with focus and confirmed close/restart actions"
 
 [[bin]]
 name = "radar"

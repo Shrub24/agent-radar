@@ -4,8 +4,12 @@ A full-screen fleet overview for coding agents in one local Herdr
 instance. Agents are grouped by workspace and nested under their reported owners;
 tabs remain location details. Herdr is a connector, not the application model.
 
-Radar reads Herdr. Its one action on it is `Enter`, which asks Herdr to focus the
-selected row's pane; everything else Radar shows is observed, never changed.
+Radar observes Herdr, and acts on it only when asked. `Enter` focuses the
+selected row's pane. `x` and `X` ask to close a pane or a tab, and `r` asks a
+managed worker's owner to restart it: each opens a confirmation first and sends
+nothing until it is confirmed, each routes a managed pane to its owner rather
+than the mux, and a tab holding a managed pane is refused whole. Everything else
+Radar shows is observed, never changed.
 
 `plan.md` is the roadmap: interactivity, the nested tree, sorting, peek, process
 links, session search and failure reporting, each with the decision it still
@@ -35,6 +39,73 @@ fleet. It is not a build dependency. The dashboard stays usable and reports a
 source diagnostic if Herdr is unavailable. No daemon or additional runtime
 configuration is required. Version control uses **jj**.
 
+## Installation (Nix)
+
+The canonical flake URL for this repository is `github:Shrub24/agent-radar`.
+Package outputs are provided for `x86_64-linux` and `aarch64-linux`, with Rust
+checks enabled. The native `x86_64-linux` build has been verified; `aarch64-linux`
+has been evaluated, not built. Development shells retain their existing systems.
+
+```sh
+nix run github:Shrub24/agent-radar           # run the installed binary
+nix build github:Shrub24/agent-radar         # ./result/bin/radar
+nix build github:Shrub24/agent-radar#radar   # the same package by name
+```
+
+As a flake input, without a development checkout:
+
+```nix
+inputs.radar.url = "github:Shrub24/agent-radar";
+inputs.radar.inputs.nixpkgs.follows = "nixpkgs";
+# ...
+environment.systemPackages = [ inputs.radar.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+```
+
+Following the consumer's nixpkgs as above builds Radar with that nixpkgs, which
+must therefore provide Rust 1.88 or newer — the floor in `Cargo.toml`, and what
+the flake's own pin satisfies. Nothing here fetches a second toolchain.
+
+### Home Manager
+
+The flake exports a single Home Manager module, so a per-user install needs no
+`environment.systemPackages` entry and no development checkout. Home Manager is
+not an input of this flake: the module is evaluated with the consumer's own Home
+Manager and nixpkgs, and only the default package comes from Radar.
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.radar.homeManagerModules.default ];
+
+  programs.radar = {
+    enable = true;
+    # Optional: without `settings`, only the package is installed.
+    settings = {
+      colors.done = "light-green";
+      appearance.working = "pulse";
+      processes.nvim = "N";
+    };
+  };
+}
+```
+
+`programs.radar.enable` installs the package this flake provides for the
+consumer's system; `programs.radar.package` replaces it with another one.
+`programs.radar.settings` is freeform TOML, and an explicit attrset — an empty
+one included — writes `$XDG_CONFIG_HOME/radar/config.toml`. Its `null` default
+manages no file at all, leaving Radar with the user's own configuration file or
+its built-in defaults. The module sets no `RADAR_CONFIG`, mirrors none of
+Radar's defaults, and adds no service or runtime directory.
+
+The package builds `radar` from `Cargo.lock` in the Nix sandbox and runs the
+crate's own checks; building or running it needs no development shell.
+
+Herdr is not bundled. Install it separately and keep it on `PATH`, which is
+where Radar invokes it. The optional `Herdr Agent Icons Max` font comes from
+`herdr-radar`; without it vendor marks use plain Unicode. `RADAR_ICONS` still
+overrides detection. Configuration is unchanged: `$RADAR_CONFIG`,
+else `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
+
 ## Keys
 
 | Key | Action |
@@ -49,6 +120,10 @@ configuration is required. Version control uses **jj**.
 | `n` / `N` | Select the next / previous row that needs attention (blocked, lost, waiting, unknown) |
 | `w` / `W` | Select the next / previous working row |
 | `d` | Show or hide the details panel |
+| `x` | Ask to close the selected agent's or pane's pane; opens a confirmation that sends nothing until confirmed |
+| `X` | Ask to close the selected row's tab; refused whole if any member is managed or unverified |
+| `r` | Ask the selected worker's owner to restart it; offered only for an owner-advertised idle managed worker |
+| `c` | Dismiss the lifecycle outcome lines |
 | `e` | Show or hide finished sessions (panes whose label is a session that has gone) |
 | `b` | Show or hide background-task children in the current view |
 | `q` | Quit, except while entering filter text |
@@ -94,10 +169,54 @@ current observation no longer reports, or any row while the displayed inventory 
 last-good rather than current, is refused: nothing is sent and the last line says
 why. A failure — Herdr unreachable, the request refused, or the request past its
 timeout — is stated on that line too, which clears on the next key press or after
-a few seconds. Nothing Radar asks Herdr for changes an agent, a pane's contents or
-a layout. The focus request uses `herdr workspace focus` for a workspace and the
-socket API's `pane.focus` request for a pane; `herdr pane focus` moves by
-direction only.
+a few seconds. Nothing the focus path asks Herdr for changes an agent, a pane's
+contents or a layout. The focus request uses `herdr workspace focus` for a
+workspace and the socket API's `pane.focus` request for a pane; `herdr pane
+focus` moves by direction only.
+
+`x`, `X` and `r` open a **confirmation** instead of acting: it names the pane,
+tab or worker, lists what the action may lose (the agent and its assignment,
+outstanding background work, the tab's member panes, or the worker's process),
+and starts on **Cancel**. `Tab` or an arrow swaps the selection, `Enter`
+activates the selected button and `Escape` cancels; the mouse only ever hits the
+two buttons drawn. Nothing is sent until Confirm, and the frozen target is
+revalidated against the current observation first: a stale inventory, a
+disappeared target or a target whose identity changed cancels with a reason.
+Task and workspace rows never redirect a close or restart to a parent.
+
+Only a location with **positive unmanaged evidence** is closed directly through
+Herdr, and only after a second inventory is taken immediately before acting. A
+pane with no agent, or with an agent kind Pi Herdsman never manages, can be
+closed; a Pi pane publishing any `pi_herdsman_*` key is the owner's and refuses
+the direct path, and a Pi pane with no owner metadata is unverified and refuses.
+A tab holding any managed or unverified member refuses whole, so nothing is
+partly applied. A direct mux close has no conditional form, so this cannot be
+atomic across the inventory read and the close — the checks narrow the window,
+they do not eliminate it. Radar never kills a process itself and never removes a
+row optimistically; a successful close is reconciled by the next collection.
+
+A **managed** pane close is routed to its owner instead: `x` on a managed worker
+asks the exact parent session, through `herdsman-control/v1`, never the mux.
+`r` restarts a managed worker the same way, and only when the owner advertises it
+idle: a working, waiting or blocked worker, a lead or standalone session, a
+parentless worker and Radar's own continuity-retained history all refuse rather
+than launching anything. The request names the exact published label, run UUID
+and owner session, echoes the operation, label and run the operator saw, and
+carries the pane and session cross-checks it observed; a missing label, run or
+owner refuses. It is written atomically into the owner's directory —
+owner-created, user-owned, mode `0700`, never created by Radar — so an absent or
+untrusted directory is the transport being unavailable, not something to repair.
+Existing owner processes must reload before their control directories exist: a
+missing directory means unavailable, never unmanaged.
+
+Radar never retries a request, never treats its own timeout as a verdict, and
+never cancels one on quitting. Outcomes derive from the owner's files, and a
+request already written stays executable whether or not Radar is still running.
+Results are shown on the footer's lifecycle line, kept apart from the source
+freshness, until `c` dismisses them. A row is never removed optimistically, and a
+`closed` result reports the effects the owner actually applied — a lost
+generation's close names `process_ended` and leaves its surviving shell pane, so
+Radar never infers a pane close from the outcome alone.
 
 ## Presentation
 
@@ -505,10 +624,10 @@ One Cargo package, with `radar` as its binary:
   evidence, and focus asks it to move to a normalized workspace or pane target;
   the adapter owns Herdr's executable, CLI arguments, socket discovery, wire
   decoding and the bounded runner that kills and reaps a stalled command.
-  Managed-agent lifecycle — close and restart — belongs to a separate
-  owner-control interface and is not stubbed here; a second mux would be a
-  second adapter at assembly rather than a change to the collector, focuser or
-  the view.
+  Managed-agent lifecycle never uses this seam: a managed close or restart is
+  asked of the worker's owner through the file client below, so a second mux
+  would still be a second adapter at assembly rather than a change to the
+  collector, focuser or the view.
 - `src/collector.rs`: the refresh schedule. One refresh in flight at a time on
   its own thread, cancellation that abandons rather than waits, the
   assignment-age stamp taken once per refresh, and the local `/proc` facts
@@ -525,11 +644,20 @@ One Cargo package, with `radar` as its binary:
 - `src/focus.rs`: the focus worker run off the calling thread, its cancellation
   and message plumbing, and what `Enter` sends. The two transports behind it
   belong to the adapter.
+- `src/lifecycle.rs` / `src/control.rs`: the lifecycle executor. `control.rs` is
+  the `herdsman-control/v1` requester — trusted owner directories, atomic bounded
+  publication, bounded result reads, file-derived terminal states. `lifecycle.rs`
+  holds containment policy, the direct-close worker and the off-thread
+  owner-control worker that publishes a confirmed managed close or restart and
+  reads its outcome. Managed actions never touch the runtime seam; `x` on a
+  positively unmanaged pane is the only lifecycle action the mux performs.
 - `tests/`: sanitized fixtures, fake-executable and stub-socket transport
   checks at the adapter, collector and focus tests against an in-memory
-  runtime, bus listener and detail-join tests against a stub publisher, and a
-  focused PTY check that also connects one to the running dashboard. No real
-  Herdr runtime is modified by these tests.
+  runtime, lifecycle tests against fake providers and a stub owner in temporary
+  directories, bus listener and detail-join tests against a stub publisher, and
+  a focused PTY check that also connects one to the running dashboard. No real
+  Herdr runtime is modified by these tests, and no real lifecycle request is
+  written.
 
 `Cargo.lock` and `flake.lock` record reproducible dependency versions. The approved
 scope and task list are in
@@ -545,4 +673,6 @@ runtime/UX acceptance is deliberately manual; automated checks use controlled
 fixtures and executables.
 
 Direct semantic feeds, process/resource trees, daemon clients and other mux
-adapters are outside this milestone, as is every action on Herdr beyond focus.
+adapters are outside this milestone, as is every action on Herdr beyond focus
+and the unmanaged pane/tab close. Managed close and restart are not Herdr
+actions; they are requests to the worker's own owner.
