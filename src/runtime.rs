@@ -34,6 +34,25 @@ pub enum Target {
     Workspace(String),
 }
 
+/// What a lifecycle action asks a runtime to close: an existing normalized
+/// location. A runtime that cannot close refuses explicitly through [`Err`];
+/// the operator flow is the same either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CloseTarget {
+    Pane(String),
+    Tab(String),
+}
+
+impl CloseTarget {
+    /// What the target is, for a one-line message: `pane wA:p1`.
+    pub fn description(&self) -> String {
+        match self {
+            Self::Pane(pane_id) => format!("pane {pane_id}"),
+            Self::Tab(tab_id) => format!("tab {tab_id}"),
+        }
+    }
+}
+
 /// What Radar asks of one runtime: its facts and the one action on it.
 pub trait RuntimeProvider: Send + Sync {
     /// The whole normalized inventory, or a user-facing diagnostic.
@@ -49,6 +68,15 @@ pub trait RuntimeProvider: Send + Sync {
     /// command or exchange, return without waiting out its deadline, and leave
     /// no child process behind.
     fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String>;
+
+    /// Closes `target` through the runtime, for a location Radar has positive
+    /// evidence is unmanaged. An adapter that cannot close returns an explicit
+    /// refusal; nothing here may kill a process directly.
+    ///
+    /// Same cancellation duty as [`Self::focus`]. A close already handed to the
+    /// runtime is not retracted by cancelling: cancellation only abandons a
+    /// request still waiting.
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String>;
 }
 
 /// A shared handle is a provider too, so the collector and focuser can own the
@@ -64,5 +92,9 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
         (**self).focus(target, cancel)
+    }
+
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
+        (**self).close(target, cancel)
     }
 }

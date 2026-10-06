@@ -17,10 +17,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, Geometry, VisibleRow};
+use crate::app::{App, Geometry, Operation, VisibleRow};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bus::Task;
@@ -122,12 +122,117 @@ pub fn render(
         );
     }
 
+    let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
+
     Geometry {
         tree_panel: tree_area,
         tree_content,
         details: detail_area,
         details_lines: details.as_ref().map_or(0, Vec::len),
         offset: list_state.offset(),
+        confirm_cancel,
+        confirm_confirm,
+    }
+}
+
+/// The lifecycle confirmation, drawn over everything else. Returns the two
+/// button rectangles so a pointer can be mapped back to the buttons actually
+/// drawn, and nothing else on screen is clickable while it is up.
+fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect>) {
+    let Some(confirmation) = app.confirmation() else {
+        return (None, None);
+    };
+    let palette = theme::palette();
+    let screen = frame.area();
+    let title = match confirmation.operation {
+        Operation::ClosePane => "Close pane",
+        Operation::CloseTab => "Close tab",
+        Operation::Restart => "Restart worker",
+    };
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled(
+                title.to_string(),
+                Style::new()
+                    .fg(palette.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                sanitize(&confirmation.target.description()),
+                Style::new().fg(palette.subtle),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "This may lose:",
+            Style::new().fg(palette.subtle),
+        )),
+    ];
+    for loss in &confirmation.losses {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", sanitize(loss)),
+            Style::new().fg(palette.muted),
+        )));
+    }
+    lines.push(Line::raw(""));
+    let buttons_row = lines.len();
+    // Cancel first, so the destructive button is not under the pointer each
+    // time the dialog opens, and the default selection is Cancel.
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[ Cancel ]", button_style(!confirmation.confirm_selected)),
+        Span::raw("   "),
+        Span::styled("[ Confirm ]", button_style(confirmation.confirm_selected)),
+    ]));
+
+    let inner_width = lines.iter().map(Line::width).max().unwrap_or(16) as u16;
+    let popup = centered(
+        screen,
+        (inner_width + 4).min(screen.width),
+        (lines.len() as u16 + 2).min(screen.height),
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(palette.border))
+        .title("Confirm");
+    let inner = block.inner(popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+
+    // The buttons line is `  [ Cancel ]   [ Confirm ]`; the offsets are those
+    // literal spans, so the hit test and the draw read one layout.
+    let y = inner.y + buttons_row as u16;
+    let cancel = Rect {
+        x: inner.x + 2,
+        y,
+        width: 10,
+        height: 1,
+    };
+    let confirm = Rect {
+        x: inner.x + 2 + 10 + 3,
+        y,
+        width: 11,
+        height: 1,
+    };
+    (Some(cancel), Some(confirm))
+}
+
+/// A drawn button's ink: the selected one is reversed so it reads as pressed,
+/// the other recedes to second-rank ink.
+fn button_style(selected: bool) -> Style {
+    if selected {
+        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::new().fg(theme::palette().subtle)
+    }
+}
+
+/// A rectangle of at most `width` by `height`, centred in `area`.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
     }
 }
 
@@ -221,11 +326,47 @@ fn regions(area: Rect, wanted: u16) -> (Rect, Rect) {
 /// tree heading and the details.
 fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     let palette = theme::palette();
+    if app.confirmation().is_some() {
+        let pairs = vec![
+            ("tab", "select".to_string()),
+            ("Enter", "confirm".to_string()),
+            ("Esc", "cancel".to_string()),
+        ];
+        return wrap_hints(&pairs, width);
+    }
+    // Lifecycle outcomes are kept until dismissed and shown here, apart from the
+    // source freshness drawn with the tree: an owner's answer says nothing about
+    // whether the fleet is being observed.
+    let mut action_lines: Vec<Line<'static>> = Vec::new();
     if let Some(message) = app.focus_message() {
-        return vec![Line::from(Span::styled(
+        action_lines.push(Line::from(Span::styled(
             sanitize(message),
             Style::new().fg(palette.failed),
-        ))];
+        )));
+    }
+    let notices = app.lifecycle_notices();
+    let shown = notices
+        .iter()
+        .rev()
+        .take(2usize.saturating_sub(action_lines.len()));
+    let count = 2usize.saturating_sub(action_lines.len()).min(notices.len());
+    for (index, notice) in shown.enumerate() {
+        let style = if notice.failed {
+            Style::new().fg(palette.failed)
+        } else {
+            Style::new().fg(palette.done)
+        };
+        let mut spans = vec![Span::styled(sanitize(&notice.text), style)];
+        if index + 1 == count {
+            spans.push(Span::styled(
+                "  ·  c dismiss",
+                Style::new().fg(palette.muted),
+            ));
+        }
+        action_lines.push(Line::from(spans));
+    }
+    if !action_lines.is_empty() {
+        return action_lines;
     }
     if app.is_filter_editing() {
         let pairs = vec![
@@ -247,6 +388,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("/", "filter".to_string()),
         ("n/N", "next".to_string()),
         ("w/W", "work".to_string()),
+        ("x/X", "close pane/tab".to_string()),
         ("s", app.order().label().to_string()),
         ("p", app.pane_view().label().to_string()),
         ("d", toggle_label(app.shows_details(), "details")),
@@ -261,6 +403,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("/", "filter".to_string()),
         ("n", "next".to_string()),
         ("w", "work".to_string()),
+        ("x/X", "close".to_string()),
         ("s", app.order().label().to_string()),
         ("p", app.pane_view().label().to_string()),
         ("d", "details".to_string()),
@@ -1767,6 +1910,15 @@ mod tests {
     #[test]
     fn provider_prefixes_are_stripped_from_projected_titles() {
         let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        // Give the workspace the name the agent's title ends with, so the
+        // suffix check below has something to strip on a row that fits: the
+        // clipped row this fixture drew by default left that check resting on
+        // the width and the mark column rather than on the title.
+        for workspace in &mut observation.workspaces {
+            if workspace.workspace_id == "wA" {
+                workspace.label = Some("nix-homelab".into());
+            }
+        }
         // A live agent title, and a pane keeping a finished session's label.
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
@@ -1794,9 +1946,20 @@ mod tests {
         );
         assert!(screen.contains("01a0edc4"), "{screen}");
         // The raw prefixes are gone; a bare mark beside a rendered logo would
-        // be the same thing said twice.
+        // be the same thing said twice. The mark is read from the icon table
+        // rather than written as `π`: in text mode the pi mark *is* `π`, so a
+        // literal here would make the result depend on the installed font
+        // rather than on the row. Anchoring to the whole finished-session
+        // segment is what catches the duplicate — a row that kept the raw
+        // title would carry the mark twice, and the anchored text is the mark
+        // drawn once, followed by the stripped name.
+        let logo = theme::logo(Some("pi"));
+        let row = format!(
+            "{EXITED} {}01a0edc4 · exited",
+            logo.map_or_else(|| "  ".to_string(), |mark| format!("{mark} "))
+        );
+        assert!(screen.contains(&row), "{screen}");
         assert!(!screen.contains("π - Inspect"), "{screen}");
-        assert!(!screen.contains("π 01a0edc4"), "{screen}");
     }
 
     fn spans_text(spans: &[Span<'_>]) -> String {
@@ -2417,6 +2580,8 @@ mod tests {
             details: app.shows_details().then(|| Rect::new(40, 0, 30, 20)),
             details_lines: 100,
             offset: 0,
+            confirm_cancel: None,
+            confirm_confirm: None,
         }
     }
 
@@ -3316,5 +3481,169 @@ mod tests {
         let panes = render_text(&state, &app, 180, 32);
         assert!(panes.contains("nvim notes.md"), "{panes}");
         assert!(!panes.contains("· exited"), "{panes}");
+    }
+
+    #[test]
+    fn a_confirmation_names_the_target_and_records_its_drawn_buttons() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        show_all_panes(&mut app);
+        select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
+        app.begin_action(crate::app::Operation::ClosePane, &state);
+        assert!(
+            app.confirmation().is_some(),
+            "an unmanaged pane is eligible"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("infallible");
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| {
+                geometry = render(frame, &state, &app, &mut ListState::default(), 0);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Close pane"), "{screen}");
+        assert!(screen.contains("wA:p3"), "{screen}");
+        assert!(screen.contains("This may lose:"), "{screen}");
+        assert!(screen.contains("[ Cancel ]"), "{screen}");
+        assert!(screen.contains("[ Confirm ]"), "{screen}");
+
+        // The pointer is mapped to the buttons actually drawn, and the default
+        // selection is Cancel (reversed), not the destructive button.
+        let cancel = geometry.confirm_cancel.expect("cancel button recorded");
+        let confirm = geometry.confirm_confirm.expect("confirm button recorded");
+        assert_eq!(buffer[(cancel.x, cancel.y)].symbol(), "[");
+        assert_eq!(buffer[(confirm.x, confirm.y)].symbol(), "[");
+        assert!(
+            buffer[(cancel.x, cancel.y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "Cancel is the default selection"
+        );
+    }
+
+    #[test]
+    fn a_managed_agent_shows_no_confirmation() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p1");
+        app.begin_action(crate::app::Operation::ClosePane, &state);
+        assert!(app.confirmation().is_none());
+
+        let screen = render_text(&state, &app, 100, 30);
+        assert!(!screen.contains("[ Confirm ]"), "{screen}");
+        assert!(screen.contains("managed"), "{screen}");
+    }
+
+    #[test]
+    fn a_confirmation_renders_on_every_terminal_size() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        show_all_panes(&mut app);
+        select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
+        app.begin_action(crate::app::Operation::ClosePane, &state);
+        for (width, height) in [(20u16, 6u16), (40, 10), (200, 60)] {
+            let _ = render_text(&state, &app, width, height);
+        }
+    }
+
+    /// One managed worker with a complete published identity.
+    fn managed_state() -> ObservationState {
+        let location = Location {
+            workspace_id: "wM".into(),
+            tab_id: "wM:t1".into(),
+            pane_id: "wM:p1".into(),
+        };
+        let session = crate::model::SessionUuid::parse("01a10c77-8a6b-7035-8a0e-b1fa607bb507")
+            .expect("a UUID");
+        let mut state = ObservationState::new();
+        state.apply_success(FleetObservation {
+            workspaces: vec![Workspace {
+                workspace_id: "wM".into(),
+                label: Some("managed".into()),
+                number: None,
+            }],
+            tabs: vec![Tab {
+                tab_id: "wM:t1".into(),
+                workspace_id: "wM".into(),
+                label: None,
+                number: None,
+            }],
+            panes: vec![Pane {
+                location: location.clone(),
+                label: None,
+                title: None,
+            }],
+            agents: vec![AgentObservation {
+                location,
+                name: Some("pi".into()),
+                label: None,
+                status: Some(RuntimeStatus::Idle),
+                session: None,
+                lineage: Some(crate::model::Lineage {
+                    session: session.clone(),
+                    parent: Some(session),
+                }),
+                facts: HerdsmanFacts {
+                    managed_metadata: true,
+                    label: Some("implementer-1".into()),
+                    run: Some("8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71".into()),
+                    state: Some(SemanticState::Idle),
+                    ..Default::default()
+                },
+            }],
+        });
+        state
+    }
+
+    #[test]
+    fn a_restart_confirmation_names_the_worker() {
+        let state = managed_state();
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wM:p1");
+        app.begin_action(crate::app::Operation::Restart, &state);
+        assert!(app.confirmation().is_some(), "an idle worker is eligible");
+        let screen = render_text(&state, &app, 100, 30);
+        assert!(screen.contains("Restart worker"), "{screen}");
+        assert!(screen.contains("implementer-1"), "{screen}");
+        assert!(screen.contains("[ Cancel ]"), "{screen}");
+    }
+
+    #[test]
+    fn lifecycle_outcomes_render_on_the_footer_apart_from_the_source() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        app.apply_managed_update(crate::lifecycle::Update {
+            id: "r1".into(),
+            label: "implementer-1".into(),
+            operation: crate::control::Operation::Close,
+            kind: crate::lifecycle::UpdateKind::Started,
+        });
+        let screen = render_text(&state, &app, 120, 30);
+        assert!(screen.contains("implementer-1"), "{screen}");
+        assert!(screen.contains("started"), "{screen}");
+        assert!(screen.contains("c dismiss"), "{screen}");
+        let notice = screen
+            .lines()
+            .find(|line| line.contains("started"))
+            .expect("a lifecycle line");
+        assert!(
+            !notice.contains("source:"),
+            "kept apart from the source diagnostic: {notice}"
+        );
+
+        // `c` dismisses the outcome and the key hints return.
+        press(&mut app, 'c');
+        assert!(app.lifecycle_notices().is_empty());
+        let screen = render_text(&state, &app, 120, 30);
+        assert!(!screen.contains("started"), "{screen}");
+        assert!(screen.contains("focus"), "{screen}");
     }
 }

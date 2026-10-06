@@ -27,7 +27,7 @@ use crate::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Location, Pane,
     RuntimeStatus, SemanticState, SessionIdentity, SessionUuid, Tab, Workspace,
 };
-use crate::runtime::{RuntimeProvider, Target};
+use crate::runtime::{CloseTarget, RuntimeProvider, Target};
 
 /// Metadata tokens carrying explicit pi-herdsman ownership UUIDs.
 const LINEAGE_SESSION_TOKEN: &str = "pi_herdsman_session";
@@ -362,6 +362,10 @@ fn herdsman_facts(record: &AgentRecord) -> HerdsmanFacts {
     let Some(tokens) = record.tokens.as_ref() else {
         return facts;
     };
+    // Presence of the owner's namespace is the containment signal, so it is
+    // read from the raw keys rather than from the fields this build knows: a
+    // key a future owner adds still makes the pane managed.
+    facts.managed_metadata = tokens.keys().any(|key| key.starts_with("pi_herdsman_"));
     facts.role = token(tokens, ROLE_TOKEN);
     facts.label = token(tokens, LABEL_TOKEN);
     facts.name = token(tokens, NAME_TOKEN);
@@ -476,6 +480,20 @@ impl RuntimeProvider for HerdrRuntime {
             // Pane focus has no CLI form by id (`herdr pane focus` moves by
             // direction), so it uses the socket API's `pane.focus` request.
             Target::Pane(pane_id) => self.focus_pane(pane_id, cancel),
+        }
+    }
+
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
+        // Herdr's documented grammar closes a location by id: `pane close` or
+        // `tab close`. The adapter owns the grammar; the seam only names which
+        // normalized location.
+        match target {
+            CloseTarget::Pane(pane_id) => {
+                run(&self.config, &["pane", "close", pane_id], cancel).map(|_| ())
+            }
+            CloseTarget::Tab(tab_id) => {
+                run(&self.config, &["tab", "close", tab_id], cancel).map(|_| ())
+            }
         }
     }
 }
@@ -860,6 +878,9 @@ mod tests {
         );
         assert_eq!(owner.role(), None);
         assert_eq!(owner.facts.assignment, None);
+        // The owner publishes pi_herdsman_* tokens, which is the containment
+        // signal; a pane with no tokens is not managed.
+        assert!(owner.facts.managed_metadata);
 
         // Worker: explicit parent link for ownership joins.
         let worker = observation.agent_on_pane("wA:p2").expect("worker agent");
@@ -880,6 +901,7 @@ mod tests {
         assert_eq!(monitor.status, Some(RuntimeStatus::Done));
         assert_eq!(monitor.session, None);
         assert_eq!(monitor.lineage, None);
+        assert!(!monitor.facts.managed_metadata);
 
         // Explicit id-kind session becomes a UUID identity; a path-like
         // lineage token in the same record is rejected as lineage.

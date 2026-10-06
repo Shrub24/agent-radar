@@ -1085,6 +1085,8 @@ fn geometry_of(app: &App) -> Geometry {
         details: app.shows_details().then(|| Rect::new(60, 0, 40, 20)),
         details_lines: 100,
         offset: 0,
+        confirm_cancel: None,
+        confirm_confirm: None,
     }
 }
 

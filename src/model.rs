@@ -307,6 +307,13 @@ pub struct HerdsmanFacts {
     pub label: Option<String>,
     /// A managed worker's run identity.
     pub run: Option<String>,
+    /// Whether this pane's tokens carried any `pi_herdsman_*` key.
+    ///
+    /// Presence, not readability: the owner's metadata is what makes a Pi pane
+    /// managed, so a key whose value this build cannot read still counts. The
+    /// decoder sets this at the adapter boundary, where the raw token map is,
+    /// because the named fields below discard keys this version does not know.
+    pub managed_metadata: bool,
     /// The active assignment's request identity.
     pub request: Option<String>,
     /// A lead's pending owner question.

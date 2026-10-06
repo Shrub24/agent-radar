@@ -385,6 +385,18 @@ pub fn is_agent(token: &str) -> bool {
             .any(|(name, _)| name.eq_ignore_ascii_case(token))
 }
 
+/// Whether Radar ships a mark for this agent kind: the vendors it knows.
+///
+/// Containment reads it to tell a known non-Pi agent — a kind Pi Herdsman never
+/// manages — from one Radar cannot place, which is never guessed unmanaged. The
+/// table is static, so a user's `[brands]` entry cannot change what is safe to
+/// close.
+pub fn shipped_agent(name: &str) -> bool {
+    TEXT.iter()
+        .chain(PUA.iter())
+        .any(|(id, _)| id.eq_ignore_ascii_case(name))
+}
+
 /// Whether `ch` is one of the vendor marks, in either table. Used to take a
 /// mark the runtime left in a title off a row that draws it already.
 pub fn is_mark(ch: char) -> bool {

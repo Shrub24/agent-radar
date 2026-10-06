@@ -17,8 +17,8 @@ use agent_radar::model::{
     Pane, RuntimeStatus, SessionIdentity,
 };
 use agent_radar::{
-    Collector, CollectorConfig, ObservationState, RetentionBasis, RuntimeProvider, SourceFreshness,
-    Target,
+    CloseTarget, Collector, CollectorConfig, ObservationState, RetentionBasis, RuntimeProvider,
+    SourceFreshness, Target,
 };
 
 /// An in-memory runtime: the test keeps the `Arc`, so it can change what the
@@ -102,6 +102,10 @@ impl RuntimeProvider for FakeRuntime {
 
     fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
         unreachable!("the collector never focuses")
+    }
+
+    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
+        unreachable!("the collector never closes anything")
     }
 }
 

@@ -1,0 +1,536 @@
+{
+  "source": {"contract": "herdsman-control/v1", "reference": "pi-herdsman/docs/reference/herdsman-control.md", "fixture": "pi-herdsman/docs/reference/herdsman-control.fixture.json", "correction": "6fc793ed", "sha256": "d5e882d418775d3aeea5d94a7360a0c190c0de821084b455e0f30336820409e1", "note": "Byte-identical copy of the canonical fixture with only this source key inserted; every other field and value is unchanged."},
+  "directory": {
+    "path": "~/.pi/agent/pi-herdsman/control/11111111-2222-4333-8444-555555555555",
+    "trusted": {
+      "owner": "current-user",
+      "mode": "0700",
+      "symlink": false
+    },
+    "untrusted": [
+      {
+        "case": "the control directory is a symlink",
+        "scenario": "Scenario: The directory is not trusted",
+        "owner": "current-user",
+        "mode": "0700",
+        "symlink": true
+      },
+      {
+        "case": "the control directory is owned by another user",
+        "scenario": "Scenario: The directory is not trusted",
+        "owner": "other-user",
+        "mode": "0700",
+        "symlink": false
+      },
+      {
+        "case": "the control directory is readable by the group",
+        "scenario": "Scenario: The directory is not trusted",
+        "owner": "current-user",
+        "mode": "0770",
+        "symlink": false
+      }
+    ]
+  },
+  "requests": [
+    {
+      "case": "close an idle retained worker with every cross-check",
+      "scenario": "Requirement: The owner re-runs the existing close preflight",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000001",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "paneId": "w1:p3",
+        "piSessionId": "9a7b6c5d-4e3f-4a2b-8c1d-0e9f8a7b6c5d",
+        "piSessionPath": "/home/user/.pi/agent/sessions/--project--/2026-01-01T00-00-00-000Z_9a7b6c5d-4e3f-4a2b-8c1d-0e9f8a7b6c5d.jsonl",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "closed" }
+    },
+    {
+      "case": "close a worker naming only the required identity",
+      "scenario": "Requirement: A request targets an identity, never a process",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000002",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "closed" }
+    },
+    {
+      "case": "close a worker with a field this build does not define",
+      "scenario": "Scenario: An unknown field is present",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000003",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "reason": "operator dashboard action",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "closed" }
+    },
+    {
+      "case": "close a worker with a version this build does not speak",
+      "scenario": "Requirement: The contract tolerates an older requester",
+      "request": {
+        "version": 2,
+        "requestId": "a0000000-0000-4000-8000-000000000004",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "invalid_request" }
+    },
+    {
+      "case": "close a worker naming a pane that is not the recorded one",
+      "scenario": "Scenario: A cross-check disagrees",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000005",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "paneId": "w1:p9",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "target_ambiguous" }
+    },
+    {
+      "case": "close a worker without a confirmation",
+      "scenario": "Requirement: Confirmation is required and matches the target",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000006",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "invalid_request" }
+    },
+    {
+      "case": "close a worker whose confirmation names another agent",
+      "scenario": "Scenario: The confirmation names a different agent",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000007",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-2",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "invalid_request" }
+    },
+    {
+      "case": "close a run this owner does not manage",
+      "scenario": "Requirement: A request targets an identity, never a process",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000008",
+        "operation": "close",
+        "agent": "implementer-9",
+        "runId": "7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-9",
+          "runId": "7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "target_not_found" }
+    },
+    {
+      "case": "close a worker whose durable result is unretrieved",
+      "scenario": "Scenario: An unretrieved result blocks the close",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000009",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "agent_busy" }
+    },
+    {
+      "case": "close a worker whose presence cannot be proven",
+      "scenario": "Scenario: Presence cannot be proven",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000010",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "paneId": "w1:p3",
+        "piSessionId": "9a7b6c5d-4e3f-4a2b-8c1d-0e9f8a7b6c5d",
+        "piSessionPath": "/home/user/.pi/agent/sessions/--project--/2026-01-01T00-00-00-000Z_9a7b6c5d-4e3f-4a2b-8c1d-0e9f8a7b6c5d.jsonl",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "target_not_found" }
+    },
+    {
+      "case": "restart an idle retained worker",
+      "scenario": "Scenario: An idle worker restarts",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000011",
+        "operation": "restart",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "paneId": "w1:p3",
+        "confirmation": {
+          "operation": "restart",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "restarted" }
+    },
+    {
+      "case": "restart a working worker",
+      "scenario": "Scenario: A working worker is refused",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000012",
+        "operation": "restart",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "confirmation": {
+          "operation": "restart",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "agent_busy" }
+    },
+    {
+      "case": "restart a lead session, which has no owner",
+      "scenario": "Scenario: A lead has no restart",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000013",
+        "operation": "restart",
+        "agent": "lead",
+        "runId": "6c5b4a39-2817-4065-8e4d-3c2b1a09f876",
+        "confirmation": {
+          "operation": "restart",
+          "label": "lead",
+          "runId": "6c5b4a39-2817-4065-8e4d-3c2b1a09f876"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "unsupported_target" }
+    },
+    {
+      "case": "restart a worker whose live identity changed after receipt",
+      "scenario": "Scenario: The target changes between receipt and effect",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000014",
+        "operation": "restart",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "confirmation": {
+          "operation": "restart",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "refused", "category": "target_ambiguous" }
+    },
+    {
+      "case": "close a worker whose owner stopped after it claimed the request",
+      "scenario": "Scenario: The owner dies mid-execution",
+      "request": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000015",
+        "operation": "close",
+        "agent": "implementer-1",
+        "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71",
+        "confirmation": {
+          "operation": "close",
+          "label": "implementer-1",
+          "runId": "8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71"
+        },
+        "requestedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:30.000Z",
+        "requester": "agent-radar"
+      },
+      "expect": { "outcome": "unknown" }
+    }
+  ],
+  "results": [
+    {
+      "case": "the close ended the process and removed the pane",
+      "scenario": "Requirement: The owner re-runs the existing close preflight",
+      "requestId": "a0000000-0000-4000-8000-000000000001",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000001",
+        "operation": "close",
+        "outcome": "closed",
+        "message": "Closed implementer-1 run 8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71.",
+        "effects": ["process_ended", "pane_closed"],
+        "completedAt": "2026-01-01T00:00:01.000Z"
+      }
+    },
+    {
+      "case": "the restart relaunched the same Pi session in a new process",
+      "scenario": "Scenario: An idle worker restarts",
+      "requestId": "a0000000-0000-4000-8000-000000000011",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000011",
+        "operation": "restart",
+        "outcome": "restarted",
+        "message": "Restarted implementer-1 run 8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71 in the same pane.",
+        "effects": ["process_ended", "session_retained", "process_relaunched"],
+        "completedAt": "2026-01-01T00:00:02.000Z"
+      }
+    },
+    {
+      "case": "the version could not be spoken, so nothing was applied",
+      "scenario": "Requirement: The contract tolerates an older requester",
+      "requestId": "a0000000-0000-4000-8000-000000000004",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000004",
+        "operation": "close",
+        "outcome": "refused",
+        "category": "invalid_request",
+        "message": "Control request version 2 is not supported.",
+        "effects": [],
+        "completedAt": "2026-01-01T00:00:00.500Z"
+      }
+    },
+    {
+      "case": "the confirmation named another agent, so nothing was applied",
+      "scenario": "Scenario: The confirmation names a different agent",
+      "requestId": "a0000000-0000-4000-8000-000000000007",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000007",
+        "operation": "close",
+        "outcome": "refused",
+        "category": "invalid_request",
+        "message": "Confirmation names implementer-2, not implementer-1.",
+        "effects": [],
+        "completedAt": "2026-01-01T00:00:00.500Z"
+      }
+    },
+    {
+      "case": "the supplied pane disagreed with the recorded one",
+      "scenario": "Scenario: A cross-check disagrees",
+      "requestId": "a0000000-0000-4000-8000-000000000005",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000005",
+        "operation": "close",
+        "outcome": "refused",
+        "category": "target_ambiguous",
+        "message": "Supplied pane w1:p9 is not the pane recorded for run 8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71.",
+        "effects": [],
+        "completedAt": "2026-01-01T00:00:00.500Z"
+      }
+    },
+    {
+      "case": "exact identity could not be proved",
+      "scenario": "Requirement: A request targets an identity, never a process",
+      "requestId": "a0000000-0000-4000-8000-000000000008",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000008",
+        "operation": "close",
+        "outcome": "refused",
+        "category": "target_not_found",
+        "message": "No managed worker matches implementer-9 run 7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918.",
+        "effects": [],
+        "completedAt": "2026-01-01T00:00:00.500Z"
+      }
+    },
+    {
+      "case": "an unretrieved durable result held the close",
+      "scenario": "Scenario: An unretrieved result blocks the close",
+      "requestId": "a0000000-0000-4000-8000-000000000009",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000009",
+        "operation": "close",
+        "outcome": "refused",
+        "category": "agent_busy",
+        "message": "implementer-1 has an unretrieved durable result; retrieve it before closing.",
+        "effects": [],
+        "completedAt": "2026-01-01T00:00:00.500Z"
+      }
+    },
+    {
+      "case": "a working worker does not restart",
+      "scenario": "Scenario: A working worker is refused",
+      "requestId": "a0000000-0000-4000-8000-000000000012",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000012",
+        "operation": "restart",
+        "outcome": "refused",
+        "category": "agent_busy",
+        "message": "implementer-1 is working; restart applies to an idle retained worker.",
+        "effects": [],
+        "completedAt": "2026-01-01T00:00:00.500Z"
+      }
+    },
+    {
+      "case": "the target has no owner to act on the request",
+      "scenario": "Scenario: A lead has no restart",
+      "requestId": "a0000000-0000-4000-8000-000000000013",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000013",
+        "operation": "restart",
+        "outcome": "refused",
+        "category": "unsupported_target",
+        "message": "lead is not a managed worker and has no owner session.",
+        "effects": [],
+        "completedAt": "2026-01-01T00:00:00.500Z"
+      }
+    },
+    {
+      "case": "the owner stopped mid-execution and finalized the claim",
+      "scenario": "Scenario: The owner dies mid-execution",
+      "requestId": "a0000000-0000-4000-8000-000000000015",
+      "result": {
+        "version": 1,
+        "requestId": "a0000000-0000-4000-8000-000000000015",
+        "operation": "close",
+        "outcome": "unknown",
+        "message": "Execution started and its outcome is unknown; the operation is not retried.",
+        "effects": [],
+        "completedAt": "2026-01-01T00:05:00.000Z"
+      }
+    }
+  ],
+  "derivation": [
+    {
+      "case": "the owner wrote a result before the requester looked",
+      "scenario": "Requirement: Each request id has exactly three terminal states",
+      "requestId": "a0000000-0000-4000-8000-000000000001",
+      "resultFile": true,
+      "claimFile": true,
+      "expiresAt": "2026-01-01T00:00:30.000Z",
+      "observedAt": "2026-01-01T00:00:01.000Z",
+      "state": "result",
+      "terminal": true
+    },
+    {
+      "case": "the owner died mid-execution and left only its claim",
+      "scenario": "Scenario: The owner dies mid-execution",
+      "requestId": "a0000000-0000-4000-8000-000000000015",
+      "resultFile": false,
+      "claimFile": true,
+      "expiresAt": "2026-01-01T00:00:30.000Z",
+      "observedAt": "2026-01-01T00:01:00.000Z",
+      "state": "started",
+      "terminal": true
+    },
+    {
+      "case": "the request outlived its owner and was never claimed",
+      "scenario": "Scenario: The request outlives its owner",
+      "requestId": "b0000000-0000-4000-8000-000000000001",
+      "resultFile": false,
+      "claimFile": false,
+      "expiresAt": "2026-01-01T00:00:30.000Z",
+      "observedAt": "2026-01-01T00:00:31.000Z",
+      "state": "not_executed",
+      "terminal": true
+    },
+    {
+      "case": "the requester looked while a live owner still held the request",
+      "scenario": "Requirement: Each request id has exactly three terminal states",
+      "requestId": "b0000000-0000-4000-8000-000000000002",
+      "resultFile": false,
+      "claimFile": false,
+      "expiresAt": "2026-01-01T00:00:30.000Z",
+      "observedAt": "2026-01-01T00:00:10.000Z",
+      "state": "pending",
+      "terminal": false
+    }
+  ],
+  "kind": "herdsman-control/v1 request and result documents with the requester's file-state derivation table"
+}

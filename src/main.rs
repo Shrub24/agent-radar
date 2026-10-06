@@ -1,11 +1,12 @@
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_radar::bus::Listener;
 use agent_radar::{
-    Action, App, Collector, CollectorConfig, Config, Focuser, Geometry, HerdrConfig, HerdrRuntime,
-    ObservationState, PaneView, theme, ui,
+    Action, App, Closer, Collector, CollectorConfig, Config, Confirmed, Focuser, Geometry,
+    HerdrConfig, HerdrRuntime, ManagedActions, ObservationState, PaneView, theme, ui,
 };
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -88,7 +89,12 @@ fn run() -> io::Result<()> {
     // the same runtime through the same seam.
     let runtime = Arc::new(HerdrRuntime::new(HerdrConfig::default()));
     let mut collector = Collector::new(CollectorConfig::default(), Arc::clone(&runtime));
-    let mut focuser = Focuser::new(runtime);
+    let mut focuser = Focuser::new(Arc::clone(&runtime));
+    let mut closer = Closer::new(Arc::clone(&runtime));
+    // Managed close/restart goes through the owner's control directories, never
+    // the mux. The worker reads nothing until an operator confirms an action;
+    // an absent or untrusted root is the owner's transport being unavailable.
+    let mut managed = ManagedActions::new(control_root());
     let mut state = ObservationState::new();
     let mut app = App::new();
     let mut list = ListState::default();
@@ -131,6 +137,18 @@ fn run() -> io::Result<()> {
             app.set_focus_message(outcome.err());
             dirty = true;
         }
+        // A confirmed close is answered on its own thread too: input, collection
+        // and quitting stay responsive while it waits on the runtime.
+        if let Some(outcome) = closer.poll() {
+            app.set_focus_message(Some(outcome.unwrap_or_else(|message| message)));
+            dirty = true;
+        }
+        // Owner-routed outcomes arrive from the worker thread the same way: the
+        // UI only reads what is already waiting, and never blocks on a file.
+        while let Some(update) = managed.poll() {
+            app.apply_managed_update(update);
+            dirty = true;
+        }
         // A message that has been up long enough goes away by itself: the
         // footer is the hint line again without the user having to press a key.
         if app.expire_focus_message(Instant::now()) {
@@ -170,20 +188,46 @@ fn run() -> io::Result<()> {
         }
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if (key.code == KeyCode::Char('q') && !app.is_filter_editing())
+                if (key.code == KeyCode::Char('q')
+                    && !app.is_filter_editing()
+                    && app.confirmation().is_none())
                     || (key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
                     break;
                 }
-                if let Some(Action::Focus(target)) = app.handle_key(key) {
-                    focuser.start(target);
+                if let Some(action) = app.handle_key(key) {
+                    match action {
+                        Action::Focus(target) => focuser.start(target),
+                        Action::BeginAction(operation) => app.begin_action(operation, &state),
+                        Action::ConfirmAction => match app.confirm(&state) {
+                            Some(Confirmed::Direct(request)) => closer.start(request),
+                            Some(Confirmed::Managed(request)) => {
+                                if let Err(message) = managed.start(request) {
+                                    app.set_focus_message(Some(message));
+                                }
+                            }
+                            None => {}
+                        },
+                    }
                 }
                 dirty = true;
             }
             Event::Mouse(mouse) => {
-                if let Some(Action::Focus(target)) = app.handle_mouse(mouse) {
-                    focuser.start(target);
+                if let Some(action) = app.handle_mouse(mouse) {
+                    match action {
+                        Action::Focus(target) => focuser.start(target),
+                        Action::BeginAction(operation) => app.begin_action(operation, &state),
+                        Action::ConfirmAction => match app.confirm(&state) {
+                            Some(Confirmed::Direct(request)) => closer.start(request),
+                            Some(Confirmed::Managed(request)) => {
+                                if let Err(message) = managed.start(request) {
+                                    app.set_focus_message(Some(message));
+                                }
+                            }
+                            None => {}
+                        },
+                    }
                 }
                 if let Some(offset) = app.take_scroll() {
                     *list.offset_mut() = offset;
@@ -198,6 +242,8 @@ fn run() -> io::Result<()> {
         listener.stop();
     }
     focuser.shutdown();
+    closer.shutdown();
+    managed.shutdown();
     collector.shutdown();
     Ok(())
 }
@@ -213,4 +259,18 @@ fn enable_mouse_capture() {
 /// the loop, and the panic hook above.
 fn disable_mouse_capture() {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
+}
+
+/// The owner-control root (`~/.pi/agent/pi-herdsman/control`). Radar only ever
+/// reads it and never creates it, so a missing name is just an unavailable
+/// transport rather than something to make.
+fn control_root() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".pi")
+            .join("agent")
+            .join("pi-herdsman")
+            .join("control"),
+        None => PathBuf::new(),
+    }
 }

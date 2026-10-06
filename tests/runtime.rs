@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::model::{ForegroundEvidence, LocalFacts};
-use agent_radar::{HerdrConfig, HerdrRuntime, RuntimeProvider, Target};
+use agent_radar::{CloseTarget, HerdrConfig, HerdrRuntime, RuntimeProvider, Target};
 
 /// A successful snapshot of one pane in one workspace, without agents.
 const SNAPSHOT_ONE_PANE: &str = r#"{"id":"cli:api:snapshot","result":{"type":"snapshot","snapshot":{"workspaces":[{"workspace_id":"wA","label":"main","number":1}],"tabs":[{"tab_id":"wA:t1","workspace_id":"wA","label":"agent tab","number":1}],"panes":[{"pane_id":"wA:p1","tab_id":"wA:t1","workspace_id":"wA"}],"agents":[]}}}"#;
@@ -575,4 +575,102 @@ fn a_hung_focus_cli_is_cancelled_and_reaped() {
         started.elapsed()
     );
     assert!(!process_exists(pid), "the cancelled command was not reaped");
+}
+
+#[test]
+fn a_pane_close_runs_the_documented_cli_grammar() {
+    let _serial = serial();
+    let fake = Fake::new(|dir| {
+        format!(
+            "printf '%s\\n' \"$*\" > \"{dir}/args\"\nexit 0",
+            dir = dir.display()
+        )
+    });
+    let runtime = fake.runtime(Duration::from_secs(2));
+    runtime
+        .close(&CloseTarget::Pane("wA:p3".into()), &cancel())
+        .expect("close succeeds");
+    assert_eq!(fake.read("args").trim(), "pane close wA:p3");
+}
+
+#[test]
+fn a_tab_close_uses_the_tab_grammar() {
+    let _serial = serial();
+    let fake = Fake::new(|dir| {
+        format!(
+            "printf '%s\\n' \"$*\" > \"{dir}/args\"\nexit 0",
+            dir = dir.display()
+        )
+    });
+    let runtime = fake.runtime(Duration::from_secs(2));
+    runtime
+        .close(&CloseTarget::Tab("wA:t1".into()), &cancel())
+        .expect("close succeeds");
+    assert_eq!(fake.read("args").trim(), "tab close wA:t1");
+}
+
+#[test]
+fn a_refused_close_is_a_diagnostic_that_quotes_stderr() {
+    let _serial = serial();
+    let fake = Fake::new(|_| "echo 'herdr: pane wA:p3 not found' >&2\nexit 1".to_string());
+    let runtime = fake.runtime(Duration::from_secs(2));
+    let diagnostic = runtime
+        .close(&CloseTarget::Pane("wA:p3".into()), &cancel())
+        .expect_err("a refusal is a failure");
+    assert!(diagnostic.contains("status 1"), "{diagnostic}");
+    assert!(diagnostic.contains("not found"), "{diagnostic}");
+}
+
+#[test]
+fn a_cancelled_close_is_abandoned_and_reaped() {
+    let _serial = serial();
+    let fake = Fake::new(|dir| {
+        format!(
+            "echo $$ > \"{dir}/pid\"\nexec sleep 60",
+            dir = dir.display()
+        )
+    });
+    let runtime = Arc::new(fake.runtime(Duration::from_secs(30)));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    let worker = {
+        let runtime = Arc::clone(&runtime);
+        let cancel = Arc::clone(&cancel);
+        thread::spawn(move || runtime.close(&CloseTarget::Pane("wA:p3".into()), &cancel))
+    };
+
+    assert!(wait_for_pid_file(&fake.path("pid"), Duration::from_secs(5)));
+    let pid: i32 = fake.read("pid").trim().parse().expect("fake pid");
+    cancel.store(true, Ordering::SeqCst);
+    let message = worker
+        .join()
+        .expect("the adapter worker returns")
+        .expect_err("cancellation is a failure");
+    assert!(message.contains("cancelled"), "{message}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "cancellation waited for the command: {:?}",
+        started.elapsed()
+    );
+    assert!(!process_exists(pid), "the cancelled command was not reaped");
+}
+
+#[test]
+fn a_stalled_close_times_out_and_is_reaped() {
+    let _serial = serial();
+    let fake = Fake::new(|dir| {
+        format!(
+            "echo $$ > \"{dir}/pid\"\nexec sleep 30",
+            dir = dir.display()
+        )
+    });
+    let runtime = fake.runtime(Duration::from_millis(150));
+    let diagnostic = runtime
+        .close(&CloseTarget::Pane("wA:p3".into()), &cancel())
+        .expect_err("the close stalls past the deadline");
+    assert!(diagnostic.contains("timed out"), "{diagnostic}");
+    let pid = wait_for_pid_file(&fake.path("pid"), Duration::from_secs(5))
+        .then(|| fake.read("pid").trim().parse::<i32>().expect("fake pid"))
+        .expect("the fake wrote its pid");
+    assert!(!process_exists(pid), "the stalled close was not reaped");
 }

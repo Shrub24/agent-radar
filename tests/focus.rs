@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::model::{FleetObservation, ForegroundEvidence};
-use agent_radar::{Focuser, RuntimeProvider, Target};
+use agent_radar::{CloseTarget, Focuser, RuntimeProvider, Target};
 
 /// How long one request may take before the test calls it stuck.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -66,6 +66,10 @@ impl RuntimeProvider for FakeRuntime {
                 Err("focus cancelled".to_string())
             }
         }
+    }
+
+    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
+        unreachable!("the focuser never closes anything")
     }
 }
 
