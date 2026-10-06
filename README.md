@@ -126,15 +126,38 @@ else `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
 | `c` | Dismiss the lifecycle outcome lines |
 | `e` | Show or hide finished sessions (panes whose label is a session that has gone) |
 | `b` | Show or hide background-task children in the current view |
+| `Tab` / `Shift-Tab` | Move the keyboard between the tree and the details |
 | `q` | Quit, except while entering filter text |
 | `Ctrl-C` | Quit, including during filter entry |
+
+While the details hold the keyboard:
+
+| Key | Action |
+| --- | --- |
+| `j` / `↓`, `k` / `↑` | Scroll the page one line |
+| `PgDn` / `PgUp` | Scroll the page one viewport |
+| `Home` / `End` | Scroll to the page's first / last line |
+| `←` / `→` | Cycle the pages, wrapping at either end |
+| `Space` | Move to the page's next openable block |
+| `Enter` | Open or close the block the keyboard is on |
+| `Escape` | Give the keyboard back to the tree |
+| `/` and the view keys | Still act on the fleet, as they do from the tree |
+
+Reading a page never moves the selection, folds nothing and sends nothing: `Enter`,
+`x`, `X` and `r` are the panel's keys there and do nothing, so a reader cannot
+focus a pane or open a lifecycle confirmation by scrolling. Filter entry and an
+open confirmation keep precedence — the confirmation's arrows swap its buttons
+rather than turning a page, and typing goes to the filter.
 
 With a mouse:
 
 | Gesture | Action |
 | --- | --- |
 | Wheel over the tree | Scroll the list |
-| Wheel over the details | Scroll the details |
+| Wheel over the details | Scroll the page under the pointer |
+| Left click on a page heading | Show that page and hand the details the keyboard |
+| Left click on a disclosure marker in the details | Open or close that block alone |
+| Left click in the details | Give the details the keyboard without acting on the row |
 | Left click on a row | Select it |
 | Left click on a row already selected | Focus its pane — or, for a task, its owner's pane — or workspace, as `Enter` does |
 | Left click on an agent's disclosure marker | Fold or unfold that branch, without focusing |
@@ -161,6 +184,64 @@ a handoff in progress, then work that is moving, then parked and finished rows;
 name order is alphabetical by the label a row shows. `n` and `w` move to the next
 row of a kind, wrapping at the ends. A row hidden by a fold or excluded by the
 filter cannot be reached that way, because it is not drawn.
+
+## Detail pages
+
+The selected row's facts are split into four pages, so what a reader wants first
+is not buried under the long published text a task list brings with it:
+
+| Page | Shows |
+| --- | --- |
+| Overview | What the row is: its kind and lifecycle, its location, the live foreground PID, what it is running, the row's activity, state and model, and the owner's projected state as its own line |
+| Processes | The process holding the location: the foreground command, the PID, how long it has run, the terminal mode, the binary comparison, and what that process was measured using — its birth identity, scheduler state, interval CPU, resident set and the descendants observed beneath it — with why any fact is withheld |
+| Tasks | The background tasks published for the row — each task's id, phase, source, command, directory, PID, timings, output and exit — and the pane's own token ids when no publisher joins |
+| Source | Where the facts came from: source freshness, the diagnostic when the source failed or a page is retained, the exact session identities, the owner projection and the diagnostics |
+
+Every fact an earlier version showed is still reachable, on one page rather than
+repeated across all four. A page shows only the selected row's facts: a task's
+published PID is named with its source and never borrowed as a live process of
+the row above it.
+
+Resources describe processes, not work. A process's CPU is the interval between
+two readings of that same process incarnation — its first reading has none — and
+its resident set counts pages shared with another process in each process that
+maps them. Beneath a sampled process Radar sums the descendants the kernel
+reports for it, from one snapshot of the process table taken per refresh and
+confirmed before any row is measured: a descendant whose birth identity or
+parent link changed in that window, and anything reached through it, is left
+out. That sum is an observed process sum, not a cgroup, workload or
+agent-ownership total, so a build a pane launched is never the pane's own CPU,
+and a total that could not cover every process it saw is shown as a lower bound
+with the reason instead of as a zero. A process Radar cannot read is not in the
+sum it would have been part of. A published task's PID is never sampled: without
+a birth identity captured at spawn, a PID that has been reused cannot authorise
+metrics. That captured identity is a publisher contract Radar does not have yet;
+until it does, a task's PID is named and the measurements beside it stay absent.
+
+On the page a process's own figures and its descendants' are drawn apart and
+never added together, and the shared-page warning sits beside the sum. Every
+value Radar could not measure says so with its reason rather than as a zero: a
+first reading has no interval to report, and a figure a row can no longer
+observe is drawn as withheld, not as the last one anyone saw.
+
+Long published text starts collapsed behind a `▸` marker: an assignment long
+enough to bury the facts around it, and each task's command and directory. The
+assignment keeps its opening readable while closed, and a closed task block keeps
+the task's line with its id, phase, age, output and exit code — identity, state,
+PID and the measures beside them never collapse, so only the text that would wrap
+over the panel is behind the marker. `Space` picks the page's next openable
+block, `Enter` opens or closes the one it is on, and neither focuses a pane or
+starts a lifecycle action; clicking a marker toggles that block alone. An opened
+block stays open across refreshes while its task survives, leaves with the task
+it belongs to, and closes when the selection moves to another row.
+
+The page headings name all four pages, and they move onto a second row when the
+panel is too narrow to hold them, so every page stays reachable on a stacked or
+narrow terminal. A page keeps its own scroll for the selected row; changing the
+selection brings every page back to its top, and a shorter page, a resize or a
+refresh clamps the offset to the rows actually drawn rather than leaving an empty
+tail. The unit is a drawn row, so the rows a wrapped line takes are part of the
+page like any other and scrolling reaches the last of them.
 
 `Enter` on an agent or pane row focuses that pane, on a task row focuses the
 pane its owner row names, and on a workspace row focuses that workspace. Radar
@@ -359,8 +440,9 @@ what an editor, a pager or an interactive session does — and `❯` is a comman
 still using the shell's line discipline, however long it runs. That is the only
 signal the kernel offers for the difference, and it is a heuristic: `ssh`, a
 pager and an editor opened by `git commit` all look full-screen, because all of
-them have taken the terminal over. The details panel spells out which it decided
-and states the duration as `running for`.
+them have taken the terminal over. The details panel spells out which it decided,
+states the duration as `running for`, and — while the evidence is current — names
+the running process's pid.
 
 #### Program marks
 

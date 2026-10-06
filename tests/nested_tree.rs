@@ -8,6 +8,7 @@
 //! the detail summary are exercised together rather than asserted apart.
 
 use agent_radar::Target;
+use agent_radar::app::DetailPage;
 use agent_radar::bus::{BusEvent, Task, TaskState};
 use agent_radar::config::Config;
 use agent_radar::model::{
@@ -289,6 +290,32 @@ fn screen(state: &ObservationState, app: &App) -> String {
         .join("\n")
 }
 
+/// Every detail page in turn, concatenated, with every disclosure the page
+/// offers open: a test about a fact does not have to know which page or which
+/// block carries it, and a fact that goes missing from all of them still fails.
+fn pages(state: &ObservationState, app: &mut App) -> String {
+    let shown = app.detail_page();
+    let mut out = Vec::new();
+    for page in DetailPage::ALL {
+        app.select_page(page);
+        disclose_all(app);
+        out.push(screen(state, app));
+    }
+    app.select_page(shown);
+    out.join("\n")
+}
+
+/// Opens every block the page on screen offers, so a test about a fact behind a
+/// disclosure reads it the way a reader who opened it does. Idempotent: a page
+/// read twice is not a page toggled shut.
+fn disclose_all(app: &mut App) {
+    for key in app.disclosures() {
+        if !app.disclosure_open(&key) {
+            app.toggle_block(&key);
+        }
+    }
+}
+
 #[test]
 fn a_connected_list_joins_by_exact_session_and_keeps_published_phases() {
     let state = fleet(&[Agent::new("wH:p1")
@@ -333,7 +360,7 @@ fn a_connected_list_joins_by_exact_session_and_keeps_published_phases() {
 
     // The badge counts the same rows, not the pane's tokens.
     select(&mut app, &RowId::Agent("wH:p1".into()));
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(screen.contains("3 bg"), "{screen}");
     assert!(screen.contains("task: bg-1"), "{screen}");
     assert!(!screen.contains("bg-9"), "{screen}");
@@ -366,7 +393,7 @@ fn without_a_publisher_the_rows_are_the_panes_own_ids_and_phases() {
     assert!(!rows[0].is_running() || rows[0].phase.as_deref() == Some("running"));
 
     select(&mut app, &RowId::Agent("wH:p1".into()));
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(screen.contains("4 bg"), "{screen}");
     assert!(
         screen.contains("background: bg-2:running, bg-1:review"),
@@ -390,7 +417,7 @@ fn a_connected_empty_list_wins_over_the_token_ids() {
     assert_eq!(projection(&app, "wH:p1").source, Some(TaskSource::Bus));
 
     select(&mut app, &RowId::Agent("wH:p1".into()));
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(
         screen.contains("bus: connected — no unresolved tasks"),
         "{screen}"
@@ -426,7 +453,7 @@ fn a_disconnect_returns_the_row_to_its_token_ids() {
     // A gone publisher permits the pane's own report again — and proves nothing
     // about the tasks having ended.
     select(&mut app, &RowId::Agent("wH:p1".into()));
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(screen.contains("background: bg-7:review"), "{screen}");
     assert!(!screen.contains("connected"), "{screen}");
 }
@@ -1008,7 +1035,7 @@ fn a_selected_task_shows_its_published_facts_and_the_parent_agrees() {
     publish(&mut app, session('1'), None, vec![running]);
 
     select(&mut app, &task_id("wH:p1", Some(session('1')), "bg-1"));
-    let panel = screen(&state, &app);
+    let panel = pages(&state, &mut app);
     for part in [
         "kind: background task",
         "task: bg-1",
@@ -1028,11 +1055,11 @@ fn a_selected_task_shows_its_published_facts_and_the_parent_agrees() {
 
     // The parent's panel states the same facts from the same projection.
     select(&mut app, &RowId::Agent("wH:p1".into()));
-    let parent = screen(&state, &app);
+    let parent = pages(&state, &mut app);
     for part in [
         "task: bg-1 · running",
-        "command (bg-1): nix build .#radar",
-        "cwd (bg-1): /home/x/proj",
+        "command: nix build .#radar",
+        "cwd: /home/x/proj",
         "exit 0",
         "1 bg",
     ] {
@@ -1083,8 +1110,16 @@ fn geometry_of(app: &App) -> Geometry {
         tree_panel: Rect::new(0, 0, 60, 20),
         tree_content: Rect::new(1, 1, 58, 18),
         details: app.shows_details().then(|| Rect::new(60, 0, 40, 20)),
-        details_lines: 100,
+        details_rows: 100,
+        details_viewport: 15,
+        detail_tabs: [
+            Some(Rect::new(62, 1, 10, 1)),
+            Some(Rect::new(72, 1, 12, 1)),
+            Some(Rect::new(84, 1, 8, 1)),
+            Some(Rect::new(92, 1, 8, 1)),
+        ],
         offset: 0,
+        disclosure_markers: Vec::new(),
         confirm_cancel: None,
         confirm_confirm: None,
     }
@@ -1162,7 +1197,7 @@ fn a_second_click_on_a_task_focuses_its_owners_pane() {
         vec![task("bg-1", TaskState::Running)],
     );
     let geometry = geometry_of(&app);
-    app.note_layout(geometry);
+    app.note_layout(geometry.clone());
     let task = task_id("wH:p1", Some(session('1')), "bg-1");
     let index = visible_ids(&app)
         .iter()
@@ -1194,7 +1229,7 @@ fn a_disclosure_click_folds_a_nested_branch_and_never_focuses() {
     ]);
     let mut app = app_for(&state);
     let geometry = geometry_of(&app);
-    app.note_layout(geometry);
+    app.note_layout(geometry.clone());
     // Drawn rows: home, p1, p2, p3. p2 is nested, so its disclosure sits in the
     // second two-cell column of the prefix.
     let marker = (geometry.tree_content.x + 4, geometry.tree_content.y + 2);
@@ -1246,7 +1281,7 @@ fn a_task_leaf_has_no_disclosure_cell() {
         vec![task("bg-1", TaskState::Running)],
     );
     let geometry = geometry_of(&app);
-    app.note_layout(geometry);
+    app.note_layout(geometry.clone());
     let task = task_id("wH:p1", Some(session('1')), "bg-1");
     let index = visible_ids(&app)
         .iter()
@@ -1278,7 +1313,7 @@ fn a_scrolled_tree_maps_clicks_to_the_rows_drawn_there() {
         offset: 2,
         ..geometry_of(&app)
     };
-    app.note_layout(geometry);
+    app.note_layout(geometry.clone());
     // Rows: home, p1, p2, p3. With the offset applied, the first drawn line is
     // the third row, not the first.
     let drawn = visible_ids(&app)[2].clone();
@@ -1304,7 +1339,7 @@ fn a_disclosure_click_does_nothing_while_a_filter_is_active() {
     app.handle_key(key(KeyCode::Enter));
 
     let geometry = geometry_of(&app);
-    app.note_layout(geometry);
+    app.note_layout(geometry.clone());
     // The filtered view draws home, p1, p2 whatever the fold state, so a marker
     // click there could not take effect and is ignored.
     let marker = (geometry.tree_content.x + 2, geometry.tree_content.y + 1);
@@ -1509,7 +1544,7 @@ fn a_hidden_task_leaves_no_rows_filter_matches_or_pointer_targets() {
 
     // The line the task row occupied is no longer a pointer target.
     let geometry = geometry_of(&app);
-    app.note_layout(geometry);
+    app.note_layout(geometry.clone());
     let index = visible_ids(&app)
         .iter()
         .position(|id| *id == owner)

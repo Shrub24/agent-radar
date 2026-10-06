@@ -4,7 +4,9 @@
 Two things are exercised end to end: source failure/recovery with its terminal
 cleanup, and the bus — a real client over the socket Radar binds in this process,
 whose tasks must reach the selected agent's details, and which must not delay a
-quit while it is connected.
+quit while it is connected. The details are read through the keys a reader uses:
+Tab into the panel, ←/→ to the page a fact lives on, Space and Enter to open the
+block a page holds behind its marker, Escape back to the tree.
 """
 
 import argparse
@@ -117,6 +119,12 @@ cat '{snapshot}'
             # The details panel on one freshly drawn frame. Hiding and showing
             # it makes the redraw write the panel whole: a redraw diffs against
             # the frame before it, so a phrase only survives in a fresh panel.
+            # The page the panel is on is not part of hiding it.
+            #
+            # A phrase spanning a style change — a label and its value, two
+            # words of help text — is written in runs with cursor moves between
+            # them, so only a run of one style is assertable: whole words, not
+            # sentences.
             deadline = time.monotonic() + 3
             last = b""
             while time.monotonic() < deadline:
@@ -133,6 +141,33 @@ cat '{snapshot}'
             raise AssertionError(
                 f"the details panel never showed {has!r} without {lacks!r}: {last!r}"
             )
+
+        def after(keys, text, timeout=3):
+            # A phrase only the next frame carries: the bytes read from now on,
+            # not the run's whole history, so a phrase the previous frame wrote
+            # cannot stand in for one that is no longer drawn. `seen` keeps the
+            # run either way.
+            os.write(master, keys)
+            fresh = bytearray()
+            deadline = time.monotonic() + timeout
+            while text not in fresh and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    chunk = os.read(master, 65536)
+                    seen.extend(chunk)
+                    fresh.extend(chunk)
+                    if b"\x1b[6n" in chunk:
+                        os.write(master, b"\x1b[1;1R")
+                assert process.poll() is None, f"dashboard exited: {bytes(fresh)!r}"
+            assert text in fresh, f"missing {text!r} after {keys!r}: {bytes(fresh)!r}"
+
+        def focus_details():
+            # Tab hands the details the keyboard, and their own key hints are
+            # what says so: the tree's hints never name a scroll.
+            after(b"\t", b"scroll")
+
+        def escape_details():
+            # Escape hands it back, and the tree's hints are back with it.
+            after(b"\x1b", b"fold")
 
         client = None
         try:
@@ -177,15 +212,46 @@ cat '{snapshot}'
             client = connect()
             hello(client, SESSION)
             tasks(client, [{"id": "bg-1", "state": "running",
-                            "command": "nix build .#radar"}])
+                            "command": "nix build .#radar",
+                            "cwd": "/home/dev/proj"}])
             os.write(master, b"j")  # the first row is the workspace; this selects the agent
+
+            # The panel opens on Overview, where what the row is and what it
+            # awaits are written. The published task is the Tasks page's, so it
+            # is reached the way a reader reaches it: Tab into the details, →
+            # past Processes, and Escape back to the tree.
+            focus_details()
+            expect_panel(b"awaiting:")
+            focus_details()
+            os.write(master, b"\x1b[C")  # Overview → Processes
+            escape_details()
+            focus_details()
+            os.write(master, b"\x1b[C")  # Processes → Tasks
+            expect_panel(b"bg-1")
+
+            # The page's long text starts behind its marker: Space puts the
+            # keyboard on the block and Enter opens it, and Enter closes it
+            # again. The fresh bytes are what says so — the frame before the key
+            # does not carry the directory, and the hidden-and-shown panel after
+            # it does not either.
+            focus_details()
+            os.write(master, b" ")
+            after(b"\r", b"/home/dev/proj")
+            os.write(master, b"\r")
+            expect_panel(b"bg-1", lacks=b"/home/dev/proj")
+
+            # The page's own keys read the row instead of moving the fleet: `k`
+            # scrolls the page, where unfocused it would select the row above and
+            # take the joined task with the selection.
+            focus_details()
+            os.write(master, b"k")
             expect_panel(b"bg-1")
 
             # The publisher goes away: the task's detail goes with it and the
-            # pane tokens are the row's facts again (the frame writes cells in
-            # runs, so only whole words are assertable here).
+            # pane tokens are the row's facts again, on the page that carries
+            # them.
             client.close()
-            expect_panel(b"awaiting:", lacks=b"bg-1")
+            expect_panel(b"bg-7", lacks=b"bg-1")
 
             # A new connection takes the session over, and stays connected.
             client = connect()
@@ -231,6 +297,8 @@ cat '{snapshot}'
             os.close(master)
             os.close(slave)
     print("PASS: source failure/empty/recovery; stub publisher connect/replace/disconnect; "
+          "details focus, page cycling, a scroll key, a disclosure opened and closed "
+          "with Space/Enter, and Escape back to the tree; "
           "q in filter entry; stalled quit with a client connected; mouse capture taken and "
           "released; terminal restoration")
 

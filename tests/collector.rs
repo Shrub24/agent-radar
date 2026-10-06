@@ -7,15 +7,17 @@
 //! everything here drives a small fake provider and a normalized observation:
 //! no CLI, no wire fixture, no subprocess.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::model::{
-    AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, LocalFacts, Location,
-    Pane, RuntimeStatus, SessionIdentity,
+    AgentObservation, CpuPercent, FleetObservation, ForegroundEvidence, HerdsmanFacts, LocalFacts,
+    Location, Pane, ProcessResources, ProcessState, RuntimeStatus, SessionIdentity, Total,
 };
+use agent_radar::procfs::{Procs, Sampler};
 use agent_radar::{
     CloseTarget, Collector, CollectorConfig, ObservationState, RetentionBasis, RuntimeProvider,
     SourceFreshness, Target,
@@ -117,6 +119,76 @@ fn collector_for(runtime: &Arc<FakeRuntime>) -> Collector {
         },
         Arc::clone(runtime),
     )
+}
+
+/// A `/proc/<pid>/stat` line with the fields Radar samples, for a process
+/// started by `parent`.
+fn stat_line_under(parent: i32, cpu_ticks: u64, start_ticks: u64, rss_pages: i64) -> String {
+    format!(
+        "42 (pi) S {parent} 42 42 0 -1 4194560 100 0 0 0 0 {cpu_ticks} 3 4 20 0 3 0 \
+         {start_ticks} 0 {rss_pages}"
+    )
+}
+
+/// A `/proc/<pid>/stat` line for a process no root in a test claims.
+fn stat_line(cpu_ticks: u64, start_ticks: u64, rss_pages: i64) -> String {
+    stat_line_under(1, cpu_ticks, start_ticks, rss_pages)
+}
+
+/// A process table the test scripts, so metrics come from readings it set
+/// rather than from this machine. The test keeps a handle to change what the
+/// next sample finds.
+#[derive(Clone)]
+struct ScriptedProcs {
+    readings: Arc<Mutex<HashMap<i32, String>>>,
+}
+
+impl ScriptedProcs {
+    fn holding(pid: i32, stat: &str) -> Self {
+        Self {
+            readings: Arc::new(Mutex::new(HashMap::from([(pid, stat.to_string())]))),
+        }
+    }
+
+    /// What the next sample of `pid` finds.
+    fn set(&self, pid: i32, stat: &str) {
+        self.readings
+            .lock()
+            .expect("readings")
+            .insert(pid, stat.to_string());
+    }
+}
+
+impl Procs for ScriptedProcs {
+    fn boot_id(&mut self) -> Option<String> {
+        Some("boot-1".to_string())
+    }
+
+    fn pids(&mut self, limit: usize, _cancel: &AtomicBool) -> Option<Vec<i32>> {
+        let mut pids: Vec<i32> = self
+            .readings
+            .lock()
+            .expect("readings")
+            .keys()
+            .copied()
+            .collect();
+        pids.sort_unstable();
+        pids.truncate(limit);
+        Some(pids)
+    }
+
+    fn stat(&mut self, pid: i32) -> Option<String> {
+        self.readings.lock().expect("readings").get(&pid).cloned()
+    }
+
+    fn page_size(&mut self) -> Option<u64> {
+        Some(4096)
+    }
+}
+
+/// The root sample the state holds for `wA:p1`, if the collector took one.
+fn sample(state: &ObservationState) -> Option<ProcessResources> {
+    state.foreground("wA:p1")?.local().resources
 }
 
 /// Drives the collector the way the main loop does until `done` holds.
@@ -552,4 +624,133 @@ fn shutdown_and_drop_abandon_a_stalled_runtime_without_waiting() {
         "dropping the collector left the runtime call outstanding"
     );
     assert_eq!(state.source_freshness(), &SourceFreshness::Pending);
+}
+
+#[test]
+fn a_live_pane_carries_a_root_sample_and_a_stale_or_retained_row_does_not() {
+    let runtime = Arc::new(FakeRuntime::default());
+    let procs = ScriptedProcs::holding(4242, &stat_line(0, 1_000, 8));
+    let mut collector = Collector::sampling(
+        CollectorConfig {
+            poll_interval: Duration::from_millis(10),
+        },
+        Arc::clone(&runtime),
+        Sampler::reading(procs.clone()),
+    );
+    let mut state = ObservationState::new();
+    runtime.set_inventory(inventory(&["wA:p1"], vec![agent("wA:p1", None)]));
+    runtime.set_evidence(ForegroundEvidence::command(
+        4242,
+        Some("pi".into()),
+        Some("pi".into()),
+    ));
+
+    // The pane's own process is sampled: who it is and what it is doing, with
+    // no CPU until a second reading of the same identity exists.
+    assert!(refresh_until(&mut collector, &mut state, |state| sample(
+        state
+    )
+    .is_some()));
+    let first = sample(&state).expect("a sample");
+    assert_eq!(first.identity.pid, 4242);
+    assert_eq!(first.identity.boot_id, "boot-1");
+    assert_eq!(first.identity.start_ticks, 1_000);
+    assert_eq!(first.state, ProcessState::Sleeping);
+    assert_eq!(first.rss_bytes, Some(8 * 4096));
+    assert_eq!(first.cpu, None);
+
+    // A later reading of the same incarnation measures the interval.
+    procs.set(4242, &stat_line(1_000_000, 1_000, 8));
+    assert!(
+        refresh_until(&mut collector, &mut state, |state| sample(state)
+            .and_then(|sample| sample.cpu)
+            .is_some()),
+        "the second sample should measure an interval"
+    );
+
+    // A refresh that fails samples nothing. The machine moves on while
+    // collection is down, and neither its newer reading nor the last-good one
+    // reaches a row as current: the source says it is stale.
+    runtime.fail_inventory("herdr is down");
+    assert!(refresh_until(&mut collector, &mut state, |state| matches!(
+        state.source_freshness(),
+        SourceFreshness::Stale { .. }
+    )));
+    let failed = runtime.refreshes.load(Ordering::SeqCst);
+    procs.set(4242, &stat_line(2_000_000, 1_000, 16));
+    assert!(refresh_until(&mut collector, &mut state, |_| {
+        runtime.refreshes.load(Ordering::SeqCst) > failed + 2
+    }));
+    assert_eq!(
+        sample(&state).expect("the last-good sample").rss_bytes,
+        Some(8 * 4096),
+        "a failed refresh must not sample the machine"
+    );
+    assert!(matches!(
+        state.source_freshness(),
+        SourceFreshness::Stale { .. }
+    ));
+
+    // A retained row is a pane whose agent stopped being reported. Its pane
+    // reports a shell, and a shell is not a process to sample.
+    runtime.set_inventory(inventory(&["wA:p1"], vec![]));
+    runtime.set_evidence(ForegroundEvidence::Shell);
+    assert!(refresh_until(&mut collector, &mut state, |state| {
+        state.retained().contains_key("wA:p1")
+            && matches!(state.foreground("wA:p1"), Some(ForegroundEvidence::Shell))
+    }));
+    assert_eq!(sample(&state), None);
+    assert_eq!(state.source_freshness(), &SourceFreshness::Current);
+}
+
+#[test]
+fn a_build_beneath_a_pane_reaches_the_row_as_a_measured_sum() {
+    let runtime = Arc::new(FakeRuntime::default());
+    let procs = ScriptedProcs::holding(4242, &stat_line(0, 1_000, 8));
+    // A build the pane launched: a process of its own, beneath it.
+    procs.set(4243, &stat_line_under(4242, 0, 2_000, 64));
+    let mut collector = Collector::sampling(
+        CollectorConfig {
+            poll_interval: Duration::from_millis(10),
+        },
+        Arc::clone(&runtime),
+        Sampler::reading(procs.clone()),
+    );
+    let mut state = ObservationState::new();
+    runtime.set_inventory(inventory(&["wA:p1"], vec![agent("wA:p1", None)]));
+    runtime.set_evidence(ForegroundEvidence::command(
+        4242,
+        Some("pi".into()),
+        Some("pi".into()),
+    ));
+
+    // The pane is sampled and the build beneath it is summed from the same
+    // refresh: it is not the pane's own resident set, and it has no interval
+    // until a second reading of it exists.
+    assert!(
+        refresh_until(&mut collector, &mut state, |state| sample(state)
+            .is_some_and(|sample| sample.descendants.observed == Some(1))),
+        "the pane's sample should carry the build beneath it"
+    );
+    let first = sample(&state).expect("a sample");
+    assert_eq!(first.rss_bytes, Some(8 * 4096));
+    assert_eq!(first.descendants.rss_bytes, Total::Complete(64 * 4096));
+    assert_eq!(
+        first.descendants.cpu,
+        Total::Partial(
+            CpuPercent::from_hundredths(0),
+            "no CPU sample could be compared with for 1 of them".to_string()
+        )
+    );
+
+    // The build runs on: the next refresh measures its interval, and the total
+    // stops being a lower bound.
+    procs.set(4243, &stat_line_under(4242, 1_000_000, 2_000, 64));
+    assert!(
+        refresh_until(&mut collector, &mut state, |state| matches!(
+            sample(state).map(|sample| sample.descendants.cpu),
+            Some(Total::Complete(_))
+        )),
+        "the build's interval should be measured"
+    );
 }

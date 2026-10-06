@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 
-use crate::bus::{BusEvent, BusState};
+use crate::bus::{BusEvent, BusState, Task};
 use crate::control::{self, ControlResult, Outcome};
 use crate::lifecycle::{self, CloseRequest, Containment, TargetIdentity};
 use crate::observation::{ObservationState, SourceFreshness};
@@ -29,7 +29,9 @@ use crate::theme;
 use ratatui::layout::Rect;
 
 use crate::model::{AgentState, FleetObservation};
-use crate::tree::{AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskRow, TreeNode};
+use crate::tree::{
+    AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskRow, TaskSource, TreeNode,
+};
 
 /// How long a focus message stays up when no key clears it first.
 const FOCUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
@@ -51,6 +53,111 @@ pub enum Action {
     /// Confirm was activated; the caller revalidates the frozen target and
     /// starts the close or manages the request when it still holds.
     ConfirmAction,
+}
+
+/// Which page of the selected row's details the panel shows.
+///
+/// The pages split the same facts by what they are about, so the identity a
+/// reader wants is not buried under the long published text a task list brings
+/// with it. Every page stays reachable: none of them is the only place a fact
+/// about the row lives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DetailPage {
+    /// What the row is: location, the live PID, activity and model.
+    #[default]
+    Overview,
+    /// The process holding the row's location.
+    Processes,
+    /// The background work published for the row.
+    Tasks,
+    /// Where the facts came from and how current they are.
+    Source,
+}
+
+impl DetailPage {
+    /// Every page, in the order the panel offers them.
+    pub const ALL: [Self; 4] = [Self::Overview, Self::Processes, Self::Tasks, Self::Source];
+
+    /// How many pages there are.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// The page's name, as its tab and the hint line state it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Processes => "Processes",
+            Self::Tasks => "Tasks",
+            Self::Source => "Source",
+        }
+    }
+
+    /// This page's slot in the per-page scroll and in the drawn tabs.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Overview => 0,
+            Self::Processes => 1,
+            Self::Tasks => 2,
+            Self::Source => 3,
+        }
+    }
+
+    /// The page after this one, wrapping at the end.
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::COUNT]
+    }
+
+    /// The page before this one, wrapping at the start.
+    pub fn previous(self) -> Self {
+        Self::ALL[(self.index() + Self::COUNT - 1) % Self::COUNT]
+    }
+}
+
+/// A block of long content the details start collapsed.
+///
+/// Only text long enough to bury the facts around it is behind a disclosure: a
+/// row's assignment, and a task's command and directory. Identity, state, PID
+/// and the measures beside them are never hidden.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Disclosure {
+    /// The selected row's assignment text.
+    Assignment,
+    /// One published task's long text, named by the task's identity so a
+    /// refresh that keeps the task keeps its expansion.
+    Task(TaskId),
+}
+
+/// How long an assignment may be before the details collapse it: past the width
+/// of a panel line, it buries the facts that follow it.
+const ASSIGNMENT_COLLAPSED_OVER: usize = 80;
+
+/// Whether an assignment is long enough to start collapsed.
+fn assignment_is_long(text: &str) -> bool {
+    text.chars().count() > ASSIGNMENT_COLLAPSED_OVER
+}
+
+/// Whether a published task has long text worth hiding.
+fn task_has_long_text(task: &Task) -> bool {
+    task.command.is_some() || task.cwd.is_some()
+}
+
+/// The tasks whose long text a row's Tasks page holds behind a disclosure, in
+/// the order it draws them. A matched publisher's list is authoritative over the
+/// pane's own token ids, and a task the publisher sent no detail for has nothing
+/// to hide.
+pub fn collapsible_tasks(row: &VisibleRow<'_>) -> Vec<TaskId> {
+    fn collapsible(task: &TaskRow) -> Option<TaskId> {
+        task.published
+            .as_ref()
+            .filter(|published| task_has_long_text(published))
+            .map(|_| task.id.clone())
+    }
+    match &row.node.row.kind {
+        RowKind::Agent(agent) if matches!(agent.tasks.source, Some(TaskSource::Bus)) => {
+            agent.tasks.tasks.iter().filter_map(collapsible).collect()
+        }
+        RowKind::Task(task) => collapsible(task).into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The lifecycle operation a confirmation is for.
@@ -278,9 +385,22 @@ pub struct App {
     focus_message: Option<(String, Instant)>,
     /// How siblings are ordered. Structure is never changed by it.
     order: RowOrder,
-    /// Where the last draw put things, and how far the details are scrolled.
+    /// Where the last draw put things, and how far each page is scrolled.
     layout: Geometry,
-    details_scroll: u16,
+    /// Which page of the selected row the panel shows.
+    detail_page: DetailPage,
+    /// Whether the details panel has the keyboard. Tab hands it over and back;
+    /// a run starts with the tree holding it.
+    details_focused: bool,
+    /// How far each page is scrolled, for the current selection. Reset when the
+    /// selection moves, because an offset belongs to the row it was scrolled in.
+    detail_scroll: [u16; DetailPage::COUNT],
+    /// Which long blocks the reader has opened. Keyed by the block rather than
+    /// by position, so a refresh that keeps a task keeps its expansion, and one
+    /// that drops a task drops it.
+    expanded_disclosures: HashSet<Disclosure>,
+    /// Which of the page's blocks the keyboard is on.
+    disclosure_target: usize,
     /// A wheel turn over the tree, waiting for the main loop to apply it to the
     /// list state it owns.
     scroll_request: Option<usize>,
@@ -337,7 +457,7 @@ pub struct Notice {
 /// Where the last draw put the panels, so a mouse event can be mapped back to
 /// the row it landed on. Radar binds nothing else to the pointer, so this is the whole
 /// of what it has to remember about its own layout.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Geometry {
     /// The tree panel, its frame included.
     pub tree_panel: Rect,
@@ -345,8 +465,19 @@ pub struct Geometry {
     pub tree_content: Rect,
     /// The details panel, when it was drawn.
     pub details: Option<Rect>,
-    /// How many lines the details hold, so a wheel over them can clamp.
-    pub details_lines: usize,
+    /// The rows the details page occupies at the width it was just drawn at: a
+    /// line long enough to wrap is drawn over several rows, and the panel
+    /// scrolls in the rows a reader can see, so this is the unit of the clamp.
+    pub details_rows: usize,
+    /// How many of those rows fit beside the page tabs and inside the frame,
+    /// so a scroll to one screenful knows what a screenful is.
+    pub details_viewport: u16,
+    /// Where each page's tab was drawn, indexed by [`DetailPage::index`], so a
+    /// click is answered by the tab actually on screen.
+    pub detail_tabs: [Option<Rect>; DetailPage::COUNT],
+    /// Where each openable block's marker was drawn, so a click answers with
+    /// the block it labels rather than with a position in a list.
+    pub disclosure_markers: Vec<(Disclosure, Rect)>,
     /// The first row the list drew.
     pub offset: usize,
     /// The confirmation dialog's Cancel button, when one was drawn.
@@ -411,6 +542,7 @@ impl App {
             HashMap::new()
         };
         self.reconcile_selection();
+        self.prune_disclosures();
     }
 
     /// The projected tree as of the last [`Self::refresh`].
@@ -456,21 +588,196 @@ impl App {
         rows
     }
 
-    /// Records where the draw just put the panels, and keeps the details scroll
-    /// inside the content that is now there.
+    /// Records where the draw just put the panels, and keeps the page on screen
+    /// scrolled inside the rows that are now there.
     pub fn note_layout(&mut self, layout: Geometry) {
-        let visible = layout
-            .details
-            .map(|area| area.height.saturating_sub(2))
-            .unwrap_or(0) as usize;
-        let max = layout.details_lines.saturating_sub(visible) as u16;
-        self.details_scroll = self.details_scroll.min(max);
+        let max = layout
+            .details_rows
+            .saturating_sub(layout.details_viewport as usize) as u16;
+        let page = self.detail_page.index();
+        self.detail_scroll[page] = self.detail_scroll[page].min(max);
         self.layout = layout;
     }
 
-    /// How far the details are scrolled, in lines.
+    /// How far the page on screen is scrolled, in the rows the panel draws.
     pub fn details_scroll(&self) -> u16 {
-        self.details_scroll
+        self.detail_scroll[self.detail_page.index()]
+    }
+
+    /// The page of the selected row the panel shows.
+    pub fn detail_page(&self) -> DetailPage {
+        self.detail_page
+    }
+
+    /// Shows a page. Every page keeps its own scroll, so returning to one finds
+    /// it where it was left.
+    pub fn select_page(&mut self, page: DetailPage) {
+        self.detail_page = page;
+        self.clamp_disclosure_target();
+    }
+
+    /// `←`/`→` in the details: the previous or next page, wrapping at the ends.
+    pub fn cycle_page(&mut self, forward: bool) {
+        self.select_page(if forward {
+            self.detail_page.next()
+        } else {
+            self.detail_page.previous()
+        });
+    }
+
+    /// Whether the details panel holds the keyboard.
+    pub fn details_focused(&self) -> bool {
+        self.details_focused
+    }
+
+    /// Tab: hands the keyboard to the other panel. A hidden details panel is not
+    /// a panel to hand it to, so the tree keeps it.
+    pub fn toggle_detail_focus(&mut self) {
+        if self.shows_details() {
+            self.details_focused = !self.details_focused;
+        }
+    }
+
+    /// Scrolls the page on screen by `rows`, clamped to the rows the last draw
+    /// reported.
+    pub fn scroll_page(&mut self, rows: i32) {
+        let max = self.scroll_max() as i32;
+        let page = self.detail_page.index();
+        self.detail_scroll[page] = (self.detail_scroll[page] as i32 + rows).clamp(0, max) as u16;
+    }
+
+    /// Scrolls the page on screen to `offset`, clamped like [`Self::scroll_page`].
+    pub fn scroll_page_to(&mut self, offset: u16) {
+        let max = self.scroll_max();
+        let page = self.detail_page.index();
+        self.detail_scroll[page] = offset.min(max);
+    }
+
+    /// How far the page on screen can be scrolled: what is left of its content
+    /// once the viewport is full.
+    fn scroll_max(&self) -> u16 {
+        self.layout
+            .details_rows
+            .saturating_sub(self.layout.details_viewport as usize) as u16
+    }
+
+    /// What one `PageUp`/`PageDown` moves.
+    fn page_step(&self) -> i32 {
+        self.layout.details_viewport.max(1) as i32
+    }
+
+    /// The blocks the page on screen offers, in the order it draws them.
+    pub fn disclosures(&self) -> Vec<Disclosure> {
+        self.disclosures_on(self.detail_page)
+    }
+
+    /// The blocks `page` offers, in the order it draws them.
+    fn disclosures_on(&self, page: DetailPage) -> Vec<Disclosure> {
+        let Some(row) = self.selected_row() else {
+            return Vec::new();
+        };
+        match page {
+            DetailPage::Overview => match &row.node.row.kind {
+                RowKind::Agent(agent)
+                    if agent
+                        .facts
+                        .assignment
+                        .as_deref()
+                        .is_some_and(assignment_is_long) =>
+                {
+                    vec![Disclosure::Assignment]
+                }
+                _ => Vec::new(),
+            },
+            DetailPage::Tasks => collapsible_tasks(&row)
+                .into_iter()
+                .map(Disclosure::Task)
+                .collect(),
+            DetailPage::Processes | DetailPage::Source => Vec::new(),
+        }
+    }
+
+    /// Whether a block is open. A block the selected row no longer offers reads
+    /// closed.
+    pub fn disclosure_open(&self, key: &Disclosure) -> bool {
+        self.expanded_disclosures.contains(key)
+    }
+
+    /// The block the keyboard is on, among the page's.
+    pub fn disclosure_target(&self) -> Option<Disclosure> {
+        self.disclosures().get(self.disclosure_target).cloned()
+    }
+
+    /// Space: the page's next block, wrapping. A page with nothing to open
+    /// moves nothing.
+    pub fn cycle_disclosure(&mut self) {
+        let count = self.disclosures().len();
+        if count > 0 {
+            self.disclosure_target = (self.disclosure_target + 1) % count;
+        }
+    }
+
+    /// Enter, and a click on a marker: opens or closes one block, and leaves the
+    /// fleet alone.
+    pub fn toggle_disclosure(&mut self) {
+        if let Some(key) = self.disclosure_target() {
+            self.toggle_block(&key);
+        }
+    }
+
+    /// Opens or closes one named block, and puts the keyboard on it.
+    pub fn toggle_block(&mut self, key: &Disclosure) {
+        if !self.expanded_disclosures.remove(key) {
+            self.expanded_disclosures.insert(key.clone());
+        }
+        let keys = self.disclosures();
+        if let Some(index) = keys.iter().position(|offered| offered == key) {
+            self.disclosure_target = index;
+        }
+    }
+
+    /// The block whose marker was drawn at a position, if any.
+    fn disclosure_marker_under(&self, at: (u16, u16)) -> Option<Disclosure> {
+        self.layout
+            .disclosure_markers
+            .iter()
+            .find(|(_, marker)| inside(Some(*marker), at))
+            .map(|(key, _)| key.clone())
+    }
+
+    /// Drops the expansions the selected row no longer offers: a task that
+    /// vanished takes its expansion with it, and one that survives keeps it.
+    fn prune_disclosures(&mut self) {
+        let offered: Vec<Disclosure> = DetailPage::ALL
+            .into_iter()
+            .flat_map(|page| self.disclosures_on(page))
+            .collect();
+        self.expanded_disclosures
+            .retain(|key| offered.contains(key));
+        self.clamp_disclosure_target();
+    }
+
+    /// Keeps the keyboard's block inside the blocks the page on screen offers,
+    /// so a marker is always drawn for the block Enter would open.
+    fn clamp_disclosure_target(&mut self) {
+        let count = self.disclosures().len();
+        self.disclosure_target = if count == 0 {
+            0
+        } else {
+            self.disclosure_target.min(count - 1)
+        };
+    }
+
+    /// Moves the selection to a row identity. Another row starts every page at
+    /// its top: a scroll belongs to the row it was scrolled in, and so does an
+    /// opened block.
+    fn select(&mut self, id: Option<RowId>) {
+        if self.selected != id {
+            self.detail_scroll = [0; DetailPage::COUNT];
+            self.expanded_disclosures.clear();
+            self.disclosure_target = 0;
+        }
+        self.selected = id;
     }
 
     /// The scroll a wheel turn asked the tree for, taken once by the main loop.
@@ -505,23 +812,12 @@ impl App {
         }
     }
 
-    /// A wheel turn: the details panel scrolls its own lines, the tree moves the
-    /// list's first drawn row, and a turn anywhere else does nothing.
+    /// A wheel turn: the page under the pointer scrolls its own rows, the tree
+    /// moves the list's first drawn row, and a turn anywhere else does nothing.
     fn wheel(&mut self, at: (u16, u16), down: bool) {
-        const STEP: usize = 3;
+        const STEP: i32 = 3;
         if inside(self.layout.details, at) {
-            let visible = self
-                .layout
-                .details
-                .map(|area| area.height.saturating_sub(2))
-                .unwrap_or(0) as usize;
-            let max = self.layout.details_lines.saturating_sub(visible) as u16;
-            let step = STEP as u16;
-            self.details_scroll = if down {
-                (self.details_scroll + step).min(max)
-            } else {
-                self.details_scroll.saturating_sub(step)
-            };
+            self.scroll_page(if down { STEP } else { -STEP });
             return;
         }
         if !inside(Some(self.layout.tree_panel), at) {
@@ -531,9 +827,9 @@ impl App {
         let max = self.visible_rows().len().saturating_sub(visible);
         let offset = self.layout.offset;
         let next = if down {
-            (offset + STEP).min(max)
+            (offset + STEP as usize).min(max)
         } else {
-            offset.saturating_sub(STEP)
+            offset.saturating_sub(STEP as usize)
         };
         if next != offset {
             self.scroll_request = Some(next);
@@ -544,9 +840,33 @@ impl App {
     /// branch's disclosure cell folds that branch and sends nothing; a row that
     /// was already selected is the one the click acts on.
     fn click(&mut self, at: (u16, u16)) -> Option<Action> {
+        // A page's tab is the page: clicking one shows it and hands the panel
+        // the keyboard, which is what makes the tabs the pointer's way into the
+        // details.
+        if let Some(page) = self.page_tab_under(at) {
+            self.detail_page = page;
+            self.details_focused = true;
+            return None;
+        }
+        // A marker is the block it labels: clicking one opens or closes that
+        // block alone, and never acts on the row.
+        if let Some(key) = self.disclosure_marker_under(at) {
+            self.details_focused = true;
+            self.toggle_block(&key);
+            return None;
+        }
+        if inside(self.layout.details, at) {
+            // Reading a page is not acting on its row: a click in the panel
+            // only hands it the keyboard.
+            self.details_focused = true;
+            return None;
+        }
+        if inside(Some(self.layout.tree_panel), at) {
+            self.details_focused = false;
+        }
         let (id, disclosure) = self.row_under(at)?;
         if matches!(id, RowId::Workspace(_)) {
-            self.selected = Some(id);
+            self.select(Some(id));
             self.toggle_fold();
             return None;
         }
@@ -557,11 +877,19 @@ impl App {
             return None;
         }
         let already = self.selected.as_ref() == Some(&id);
-        self.selected = Some(id);
+        self.select(Some(id));
         if already {
             return self.focus_selected();
         }
         None
+    }
+
+    /// The page tab a position lands on, from the rectangles the last draw
+    /// reported.
+    fn page_tab_under(&self, at: (u16, u16)) -> Option<DetailPage> {
+        DetailPage::ALL
+            .into_iter()
+            .find(|page| inside(self.layout.detail_tabs[page.index()], at))
     }
 
     /// The row drawn at a position, and whether the position falls on its
@@ -684,6 +1012,7 @@ impl App {
         self.bus.apply(event);
         self.tree.attach_tasks(&self.bus);
         self.reconcile_selection();
+        self.prune_disclosures();
     }
 
     /// Records why the bus is not running, or clears it.
@@ -725,16 +1054,19 @@ impl App {
 
     /// Applies one key event, answering with what the main loop has to do.
     ///
-    /// Bindings: `j`/Down and `k`/Up move the selection; `Space` (or
-    /// Left/Right) folds and unfolds the selected branch; `Enter` focuses the
-    /// selected row's location; `/` starts filter entry; `p` cycles the pane
-    /// view, `d` shows or hides the details, `e` shows or hides finished
-    /// sessions, `b` shows or hides background-task children in the current
-    /// view and `s` cycles the order; `n`/`N` jump to the next or previous
-    /// row needing attention and `w`/`W` to the next or previous working row;
-    /// in filter entry, printable characters (with Backspace) edit the query,
-    /// Enter applies it and Escape clears it and leaves entry. Escape outside
-    /// entry clears an active filter.
+    /// Bindings: `j`/Down and `k`/Up move the selection; `Tab`/`Shift-Tab` hand
+    /// the keyboard between the tree and the details; `Space` (or Left/Right)
+    /// folds and unfolds the selected branch; `Enter` focuses the selected row's
+    /// location; `/` starts filter entry; `p` cycles the pane view, `d` shows or
+    /// hides the details, `e` shows or hides finished sessions, `b` shows or
+    /// hides background-task children in the current view and `s` cycles the
+    /// order; `n`/`N` jump to the next or previous row needing attention and
+    /// `w`/`W` to the next or previous working row; in filter entry, printable
+    /// characters (with Backspace) edit the query, Enter applies it and Escape
+    /// clears it and leaves entry. Escape outside entry clears an active filter.
+    ///
+    /// While the details hold the keyboard its own keys answer instead: see
+    /// [`Self::handle_details_key`].
     ///
     /// Any key the view handles drops a focus message: the user has moved on.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -753,11 +1085,15 @@ impl App {
             self.handle_filter_key(key);
             return None;
         }
+        if self.details_focused && self.handle_details_key(key) {
+            return None;
+        }
         match key.code {
             KeyCode::Char('x') => return Some(Action::BeginAction(Operation::ClosePane)),
             KeyCode::Char('X') => return Some(Action::BeginAction(Operation::CloseTab)),
             KeyCode::Char('r') => return Some(Action::BeginAction(Operation::Restart)),
             KeyCode::Char('c') => self.dismiss_notices(),
+            KeyCode::Tab | KeyCode::BackTab => self.toggle_detail_focus(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char(' ') => self.toggle_fold(),
@@ -781,6 +1117,40 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// The keys the details answer while they hold the keyboard, and whether the
+    /// key was theirs.
+    ///
+    /// `j`/`k` and the arrows scroll, `PageUp`/`PageDown` move a viewport,
+    /// `Home`/`End` reach the limits, `←`/`→` cycle the pages and Escape hands
+    /// the keyboard back to the tree without touching the filter. Space moves to
+    /// the page's next openable block and Enter opens or closes the one the
+    /// keyboard is on.
+    ///
+    /// A key that would act on the selected row is the panel's too, and does
+    /// nothing: `Enter` focuses a pane and `x`, `X` and `r` open lifecycle
+    /// confirmations, none of which a reader of a page asked for. Every other
+    /// key is left to the tree's own map, so the view keys — `/`, `d`, `s`, `p`,
+    /// `e`, `b`, `c` and the jumps — keep working from either panel.
+    fn handle_details_key(&mut self, key: KeyEvent) -> bool {
+        let page = self.page_step();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_page(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_page(-1),
+            KeyCode::PageDown => self.scroll_page(page),
+            KeyCode::PageUp => self.scroll_page(-page),
+            KeyCode::Home => self.scroll_page_to(0),
+            KeyCode::End => self.scroll_page_to(u16::MAX),
+            KeyCode::Left => self.cycle_page(false),
+            KeyCode::Right => self.cycle_page(true),
+            KeyCode::Esc => self.details_focused = false,
+            KeyCode::Char(' ') => self.cycle_disclosure(),
+            KeyCode::Enter => self.toggle_disclosure(),
+            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('r') => {}
+            _ => return false,
+        }
+        true
     }
 
     /// `n`/`N` and `w`/`W`: move the selection to the nearest row of a kind,
@@ -813,7 +1183,7 @@ impl App {
             (false, None) => matching.last().copied(),
         };
         if let Some(index) = next {
-            self.selected = Some(rows[index].id.clone());
+            self.select(Some(rows[index].id.clone()));
         }
     }
 
@@ -1233,7 +1603,7 @@ impl App {
     pub fn move_selection(&mut self, delta: i32) {
         let rows = self.visible_rows();
         if rows.is_empty() {
-            self.selected = None;
+            self.select(None);
             self.anchor = 0;
             return;
         }
@@ -1241,7 +1611,7 @@ impl App {
             .selected_index()
             .unwrap_or_else(|| self.anchor.min(rows.len() - 1));
         let next = (current as i64 + delta as i64).clamp(0, rows.len() as i64 - 1) as usize;
-        self.selected = Some(rows[next].id.clone());
+        self.select(Some(rows[next].id.clone()));
         self.anchor = next;
     }
 
@@ -1287,9 +1657,13 @@ impl App {
         }
     }
 
-    /// Shows or hides the details panel.
+    /// Shows or hides the details panel. A hidden panel cannot hold the
+    /// keyboard, so hiding it hands the keyboard back to the tree.
     pub fn toggle_details(&mut self) {
         self.details_hidden = !self.details_hidden;
+        if self.details_hidden {
+            self.details_focused = false;
+        }
     }
 
     /// Moves to the next pane view: agents, then what is running, then every
@@ -1311,7 +1685,7 @@ impl App {
     fn reconcile_selection(&mut self) {
         let rows = self.visible_rows();
         if rows.is_empty() {
-            self.selected = None;
+            self.select(None);
             self.anchor = 0;
             return;
         }
@@ -1324,19 +1698,23 @@ impl App {
         // A task its publisher stopped reporting falls back to the agent row it
         // hung under, which is still there for it to be read from. Only when
         // that row is gone too does the position fallback below apply.
-        if let Some(RowId::Task(task)) = &self.selected
+        let task_owner = match &self.selected {
+            Some(RowId::Task(task)) => Some(task.owner.clone()),
+            _ => None,
+        };
+        if let Some(owner) = task_owner
             && let Some(index) = rows
                 .iter()
-                .position(|row| matches!(&row.id, RowId::Agent(pane_id) if *pane_id == task.owner))
+                .position(|row| matches!(&row.id, RowId::Agent(pane_id) if *pane_id == owner))
         {
-            self.selected = Some(rows[index].id.clone());
+            self.select(Some(rows[index].id.clone()));
             self.anchor = index;
             return;
         }
         // The selected row is gone: stay at the same position if the view has
         // one, otherwise at its end. Selection is never left dangling.
         let anchor = self.anchor.min(rows.len() - 1);
-        self.selected = Some(rows[anchor].id.clone());
+        self.select(Some(rows[anchor].id.clone()));
         self.anchor = anchor;
     }
 }
@@ -1751,8 +2129,286 @@ mod tests {
         assert!(!app.shows_finished());
     }
 
+    #[test]
+    fn tab_moves_the_keyboard_between_the_panels_and_escape_hands_it_back() {
+        let (_state, mut app) = fixture();
+        assert!(!app.details_focused(), "the tree starts with the keyboard");
+        press(&mut app, KeyCode::Tab);
+        assert!(app.details_focused());
+        press(&mut app, KeyCode::BackTab);
+        assert!(!app.details_focused());
+
+        // Escape leaves the panel without clearing a filter the tree set.
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Tab);
+        assert!(app.details_focused());
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.details_focused(), "Escape returns to the tree");
+        assert_eq!(app.filter_query(), "w", "the filter survives the panel");
+    }
+
+    #[test]
+    fn reading_the_pages_leaves_the_selection_and_its_folds_alone() {
+        let (_state, mut app) = fixture();
+        let workspace = RowId::Workspace("wA".into());
+        select_row(&mut app, &workspace);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.is_collapsed(&workspace), "the branch folds");
+        let rows = row_ids(&app);
+
+        press(&mut app, KeyCode::Tab);
+        assert!(app.details_focused());
+        assert_eq!(app.detail_page(), DetailPage::Overview);
+        for code in [
+            KeyCode::Right,
+            KeyCode::Left,
+            KeyCode::Left,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char(' '),
+            KeyCode::End,
+        ] {
+            assert_eq!(press(&mut app, code), None, "{code:?} acts on the fleet");
+        }
+        assert_eq!(
+            app.detail_page(),
+            DetailPage::Source,
+            "the pages cycle, wrapping at the start"
+        );
+        assert_eq!(
+            app.selected_row().map(|row| row.id.clone()),
+            Some(workspace.clone())
+        );
+        assert!(app.is_collapsed(&workspace), "and the fold holds");
+        assert_eq!(row_ids(&app), rows, "no panel key moved the tree");
+    }
+
+    #[test]
+    fn the_details_issue_no_lifecycle_or_focus_action() {
+        let (state, mut app) = fixture();
+        show_all_panes(&mut app);
+        let pane = RowId::Pane("wA:p3".into());
+        select_row(&mut app, &pane);
+        press(&mut app, KeyCode::Tab);
+        assert!(app.details_focused());
+
+        // Enter focuses a pane and x, X and r open lifecycle confirmations; from
+        // a page they are the panel's keys and do nothing at all.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+            KeyCode::Char('X'),
+            KeyCode::Char('r'),
+        ] {
+            assert_eq!(press(&mut app, code), None, "{code:?} is the panel's");
+            assert!(app.confirmation().is_none(), "{code:?} opened a dialog");
+        }
+        assert_eq!(
+            app.selected_row().map(|row| row.id.clone()),
+            Some(pane),
+            "the selected row is the same one"
+        );
+        assert!(app.details_focused(), "the panel still has the keyboard");
+
+        // Back in the tree the same keys act again, so the panel is what
+        // suppressed them.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('x')),
+            Some(Action::BeginAction(Operation::ClosePane))
+        );
+        app.begin_action(Operation::ClosePane, &state);
+        assert!(app.confirmation().is_some());
+    }
+
+    #[test]
+    fn space_picks_the_pages_next_block_and_enter_opens_only_that_one() {
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let owner = observation
+            .agents
+            .iter_mut()
+            .find(|agent| agent.location.pane_id == "wA:p1")
+            .expect("owner");
+        // The session the fixture owner was launched in, which is what its
+        // published tasks must name to join to it.
+        let session = owner
+            .lineage
+            .as_ref()
+            .expect("the owner publishes its session")
+            .session
+            .as_str()
+            .to_string();
+        // Long enough that the panel puts it behind a marker rather than
+        // drawing it over everything below it.
+        owner.facts.assignment = Some("x".repeat(200));
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let mut app = App::new();
+        app.refresh(&state);
+        publish_tasks(
+            &mut app,
+            &session,
+            ["bg-1", "bg-2"]
+                .iter()
+                .map(|id| task_with_command(id, "nix build .#radar"))
+                .collect(),
+        );
+        let owner_row = RowId::Agent("wA:p1".into());
+        select_row(&mut app, &owner_row);
+        press(&mut app, KeyCode::Tab);
+
+        // Overview's one block is the long assignment, and Enter opens it
+        // without focusing a pane or raising a dialog.
+        assert_eq!(app.disclosures(), vec![Disclosure::Assignment]);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(app.disclosure_open(&Disclosure::Assignment));
+        assert!(app.confirmation().is_none());
+        assert_eq!(
+            app.selected_row().map(|row| row.id.clone()),
+            Some(owner_row.clone())
+        );
+
+        // Processes has nothing to open, so its keys move nothing at all.
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.detail_page(), DetailPage::Processes);
+        assert!(app.disclosures().is_empty());
+        assert_eq!(press(&mut app, KeyCode::Char(' ')), None);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(app.disclosure_open(&Disclosure::Assignment));
+
+        // Tasks offers one block per task with text behind it. Space cycles
+        // them, and Enter opens the one the keyboard is on — the other task's
+        // block and the assignment stay as they were.
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.detail_page(), DetailPage::Tasks);
+        let blocks = app.disclosures();
+        assert_eq!(blocks.len(), 2, "one block per task: {blocks:?}");
+        assert_eq!(app.disclosure_target().as_ref(), Some(&blocks[0]));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.disclosure_target().as_ref(), Some(&blocks[1]));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            app.disclosure_target().as_ref(),
+            Some(&blocks[0]),
+            "Space wraps"
+        );
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(app.disclosure_open(&blocks[0]));
+        assert!(!app.disclosure_open(&blocks[1]));
+        assert!(app.disclosure_open(&Disclosure::Assignment));
+        assert!(app.confirmation().is_none());
+        assert!(
+            app.details_focused(),
+            "opening a block is not leaving the panel"
+        );
+        assert_eq!(
+            app.selected_row().map(|row| row.id.clone()),
+            Some(owner_row)
+        );
+
+        // Back on a page with one block, the keyboard is on that block rather
+        // than at a position the page does not have, so the marker drawn is the
+        // one Enter would open.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.detail_page(), DetailPage::Overview);
+        assert_eq!(
+            app.disclosure_target().as_ref(),
+            Some(&Disclosure::Assignment)
+        );
+    }
+
+    #[test]
+    fn a_confirmation_keeps_precedence_over_the_details_keys() {
+        let (state, mut app) = fixture();
+        show_all_panes(&mut app);
+        select_row(&mut app, &RowId::Pane("wA:p3".into()));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        let page = app.detail_page();
+        app.begin_action(Operation::ClosePane, &state);
+
+        // The dialog answers the navigation keys: Right moves the dialog's
+        // cursor rather than the panel's page, and Enter activates the button
+        // the cursor is on.
+        assert_eq!(press(&mut app, KeyCode::Right), None);
+        assert_eq!(app.detail_page(), page, "the page did not move");
+        assert!(app.confirmation().expect("open").confirm_selected);
+        assert_eq!(press(&mut app, KeyCode::Left), None);
+        assert!(
+            !app.confirmation().expect("open").confirm_selected,
+            "and back to Cancel"
+        );
+        assert_eq!(app.detail_page(), page);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert!(app.confirmation().is_none(), "Cancel is the default");
+        assert!(app.details_focused(), "the panel kept the keyboard");
+    }
+
+    #[test]
+    fn filter_entry_keeps_its_keys_while_the_details_are_focused() {
+        let (_state, mut app) = fixture();
+        press(&mut app, KeyCode::Tab);
+        let page = app.detail_page();
+        press(&mut app, KeyCode::Char('/'));
+
+        // Typed text is text: the panel's own keys are characters here, and
+        // Enter ends entry rather than acting on the row.
+        for code in [KeyCode::Char('j'), KeyCode::Char('r'), KeyCode::Enter] {
+            assert_eq!(press(&mut app, code), None, "{code:?} is filter entry");
+        }
+        assert_eq!(app.filter_query(), "jr");
+        assert_eq!(app.detail_page(), page, "the pages did not move");
+        assert_eq!(app.details_scroll(), 0, "nor did the page scroll");
+    }
+
+    #[test]
+    fn hiding_the_details_returns_the_keyboard_to_the_tree() {
+        let (_state, mut app) = fixture();
+        press(&mut app, KeyCode::Tab);
+        assert!(app.details_focused());
+
+        // `d` is the tree's own key and still works from the panel; a hidden
+        // panel cannot hold a keyboard.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.shows_details());
+        assert!(!app.details_focused());
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.details_focused(), "Tab has nowhere to hand it to");
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    /// A running task carrying the long text a disclosure holds.
+    fn task_with_command(id: &str, command: &str) -> Task {
+        Task {
+            id: id.into(),
+            state: crate::bus::TaskState::Running,
+            command: Some(command.into()),
+            cwd: None,
+            pid: None,
+            started_at: None,
+            last_output_at: None,
+            output_bytes: None,
+            exit_code: None,
+        }
+    }
+
+    /// Connects `session` and publishes `tasks` as its complete list, as the
+    /// listener would report it.
+    fn publish_tasks(app: &mut App, session: &str, tasks: Vec<Task>) {
+        app.apply_bus_event(BusEvent::Connected {
+            session: session.into(),
+            pane: None,
+        });
+        app.apply_bus_event(BusEvent::Tasks {
+            session: session.into(),
+            tasks,
+        });
     }
 
     fn app_with_fixture() -> App {

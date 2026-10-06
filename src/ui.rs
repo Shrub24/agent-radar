@@ -20,13 +20,13 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, Geometry, Operation, VisibleRow};
+use crate::app::{App, DetailPage, Disclosure, Geometry, Operation, VisibleRow};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bus::Task;
 use crate::model::{
-    AgentState, BinaryFreshness, BinaryIdentity, ForegroundEvidence, HerdsmanFacts,
-    SessionIdentity, TerminalMode,
+    AgentState, BinaryFreshness, BinaryIdentity, CpuPercent, ForegroundEvidence, HerdsmanFacts,
+    ProcessState, SessionIdentity, TerminalMode, Total,
 };
 use crate::observation::{ObservationState, RetentionBasis, SourceFreshness};
 use crate::theme;
@@ -72,12 +72,18 @@ pub fn render(
         frame.render_widget(Paragraph::new(hints), hint_area);
     }
 
-    let details = app.shows_details().then(|| detail_lines(state, app));
-    let (tree_area, detail_area) = body_areas(body, details.as_deref(), app);
+    let details = app
+        .shows_details()
+        .then(|| detail_page_lines(state, app, app.detail_page()));
+    let (tree_area, detail_area) = body_areas(
+        body,
+        details.as_ref().map(|page| page.lines.as_slice()),
+        app,
+    );
 
     let rows = app.visible_rows();
     let block = Block::bordered()
-        .border_style(Style::new().fg(theme::palette().border))
+        .border_style(Style::new().fg(panel_border(!app.details_focused())))
         .title(tree_title(state, app));
     let tree_content = block.inner(tree_area);
     if rows.is_empty() {
@@ -108,18 +114,69 @@ pub fn render(
         frame.render_stateful_widget(list, tree_area, list_state);
     }
 
-    if let (Some(detail_area), Some(lines)) = (detail_area, &details) {
+    let mut detail_tabs = [None; DetailPage::COUNT];
+    let mut disclosure_markers: Vec<(Disclosure, Rect)> = Vec::new();
+    let mut details_viewport = 0u16;
+    let mut details_rows = 0usize;
+    if let (Some(detail_area), Some(page_lines)) = (detail_area, details.as_ref()) {
+        let block = Block::bordered()
+            .border_style(Style::new().fg(panel_border(app.details_focused())))
+            .title("Details");
+        let inner = block.inner(detail_area);
+        frame.render_widget(block, detail_area);
+        let (tabs, tab_rows) = draw_page_tabs(frame, inner, app.detail_page());
+        detail_tabs = tabs;
+        let content = Rect {
+            y: inner.y.saturating_add(tab_rows),
+            height: inner.height.saturating_sub(tab_rows),
+            ..inner
+        };
+        details_viewport = content.height;
+        let (rows, line_rows) = page_rows(&page_lines.lines, content.width);
+        details_rows = rows;
+        // The page scrolls in the rows it is drawn over, not in its lines: a line
+        // long enough to wrap takes several rows, and a clamp counted in lines
+        // stops with the last of them past the end of the panel. A page that has
+        // shrunk since its last draw can also hold a scroll past its end, so the
+        // offset is clamped here as well as where the keys move it.
+        let offset = rows.saturating_sub(content.height as usize);
+        let offset = (app.details_scroll() as usize).min(offset);
+        // A page is bounded by the facts it lists, so its rows are within a
+        // terminal's own coordinate space; one that somehow wrapped further
+        // scrolls to the last addressable row rather than anywhere else.
+        let offset = u16::try_from(offset).unwrap_or(u16::MAX);
         frame.render_widget(
-            Paragraph::new(lines.clone())
-                .wrap(Wrap { trim: false })
-                .scroll((app.details_scroll(), 0))
-                .block(
-                    Block::bordered()
-                        .border_style(Style::new().fg(theme::palette().border))
-                        .title("Details"),
-                ),
-            detail_area,
+            Paragraph::new(page_lines.lines.clone())
+                .wrap(PAGE_WRAP)
+                .scroll((offset, 0)),
+            content,
         );
+        // Where each block's marker is drawn: the row its line starts on, less
+        // the rows the scroll has taken off the top. A marker the scroll or the
+        // end of the panel has taken off the screen is drawn nowhere, and is not
+        // a click target, so nothing answers to a glyph that is not there.
+        for (key, index) in &page_lines.markers {
+            let Some(row) = line_rows
+                .get(*index)
+                .and_then(|row| row.checked_sub(offset as usize))
+            else {
+                continue;
+            };
+            if row >= content.height as usize {
+                continue;
+            }
+            disclosure_markers.push((
+                key.clone(),
+                Rect {
+                    x: content.x,
+                    y: content.y + row as u16,
+                    // The marker is drawn as a two-cell affordance, so the whole
+                    // of it is the pointer's target.
+                    width: 2.min(content.width),
+                    height: 1,
+                },
+            ));
+        }
     }
 
     let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
@@ -128,11 +185,127 @@ pub fn render(
         tree_panel: tree_area,
         tree_content,
         details: detail_area,
-        details_lines: details.as_ref().map_or(0, Vec::len),
+        details_rows,
+        details_viewport,
+        detail_tabs,
+        disclosure_markers,
         offset: list_state.offset(),
         confirm_cancel,
         confirm_confirm,
     }
+}
+
+/// How the details panel wraps a page's lines. One place for it, so the rows a
+/// page is scrolled by are measured with the same wrapping it is drawn with.
+const PAGE_WRAP: Wrap = Wrap { trim: false };
+
+/// Where a page's lines sit once the panel has wrapped them at `width`: the rows
+/// the whole page occupies, and the row each line starts on.
+///
+/// The paragraph widget is asked for the count, on the same inner width and with
+/// the same wrapping the page is drawn with, rather than the rows being counted
+/// here: the panel scrolls in rows a reader can see, and a count that disagreed
+/// with the widget would leave the last of them past the end of the page. The
+/// widget wraps each line on its own, so a line starts at the rows of the lines
+/// above it and its own are the ones it takes.
+fn page_rows(lines: &[Line<'static>], width: u16) -> (usize, Vec<usize>) {
+    let mut offsets = Vec::with_capacity(lines.len());
+    let mut row = 0;
+    for line in lines {
+        offsets.push(row);
+        row += Paragraph::new(vec![line.clone()])
+            .wrap(PAGE_WRAP)
+            .line_count(width);
+    }
+    (row, offsets)
+}
+
+/// The ink a panel's frame is drawn in. The focused panel takes the heading
+/// role, so which panel answers the keyboard is visible before reading a word
+/// of either.
+fn panel_border(focused: bool) -> ratatui::style::Color {
+    if focused {
+        theme::palette().heading
+    } else {
+        theme::palette().border
+    }
+}
+
+/// Draws the page tabs across the top of the details, and says which row of the
+/// panel the page's own content starts on.
+///
+/// The tabs are drawn apart from the content so that scrolling a page does not
+/// scroll its navigation away, and over as many rows as the panel is narrow, so
+/// a stacked panel keeps every page selectable. Each drawn tab's rectangle goes
+/// back to the caller, so a click is answered by the tab actually drawn.
+fn draw_page_tabs(
+    frame: &mut Frame,
+    area: Rect,
+    active: DetailPage,
+) -> ([Option<Rect>; DetailPage::COUNT], u16) {
+    let palette = theme::palette();
+    let mut tabs = [None; DetailPage::COUNT];
+    let mut x = area.x;
+    let mut row = 0u16;
+    for page in DetailPage::ALL {
+        let width = tab_width(page);
+        if x > area.x && x + width > area.right() {
+            row += 1;
+            x = area.x;
+        }
+        if area.y + row >= area.bottom() {
+            // No room left in the panel: the page keeps its place in the cycle
+            // (`←`/`→`) rather than being drawn outside the frame.
+            break;
+        }
+        let rect = Rect {
+            x,
+            y: area.y + row,
+            width,
+            height: 1,
+        };
+        let style = if page == active {
+            Style::new()
+                .bg(palette.selection)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(palette.subtle)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ", page.label()),
+                style,
+            ))),
+            rect,
+        );
+        tabs[page.index()] = Some(rect);
+        x += width;
+    }
+    (tabs, row + 1)
+}
+
+/// How wide one page's tab is drawn: its label and one space either side, so
+/// the whole tab is a pointer target.
+fn tab_width(page: DetailPage) -> u16 {
+    page.label().chars().count() as u16 + 2
+}
+
+/// How many rows the page tabs need in a panel whose content is `width` cells
+/// wide. The layout is the one [`draw_page_tabs`] performs, told in advance: the
+/// stacked panel has to reserve these rows before it knows it needs them.
+fn tab_rows(width: u16) -> u16 {
+    let width = width.max(1);
+    let mut rows = 1u16;
+    let mut x = 0u16;
+    for page in DetailPage::ALL {
+        let tab = tab_width(page);
+        if x > 0 && x + tab > width {
+            rows += 1;
+            x = 0;
+        }
+        x += tab;
+    }
+    rows
 }
 
 /// The lifecycle confirmation, drawn over everything else. Returns the two
@@ -256,12 +429,14 @@ fn body_areas(body: Rect, details: Option<&[Line<'_>]>, app: &App) -> (Rect, Opt
     }
 
     // Stacked: as many rows as the content needs, counting the rows a long
-    // identity will actually wrap onto, and never more than half the body.
+    // identity will actually wrap onto and the rows the page tabs take, and
+    // never more than half the body.
     let columns = body.width.saturating_sub(2).max(1) as u32;
     let rows: u16 = detail
         .iter()
         .map(|line| (line.width() as u32).div_ceil(columns).max(1) as u16)
         .sum();
+    let rows = rows.saturating_add(tab_rows(body.width.saturating_sub(2)));
     let cap = if body.height >= DETAIL_HEIGHT + 4 {
         DETAIL_HEIGHT + 2
     } else {
@@ -373,6 +548,20 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
             ("type", "filter".to_string()),
             ("Enter", "keep".to_string()),
             ("Esc", "clear".to_string()),
+        ];
+        return wrap_hints(&pairs, width);
+    }
+    // The panel that has the keyboard says so by naming its own keys: the
+    // details answer to a different set from the tree, and a reader who has just
+    // tabbed into them needs that set rather than the tree's.
+    if app.details_focused() {
+        let pairs = vec![
+            ("j/k", "scroll".to_string()),
+            ("spc/Enter", "open".to_string()),
+            ("←/→", "page".to_string()),
+            ("tab", "tree".to_string()),
+            ("Esc", "tree".to_string()),
+            ("d", "hide".to_string()),
         ];
         return wrap_hints(&pairs, width);
     }
@@ -922,6 +1111,161 @@ fn binary_line(identity: &BinaryIdentity) -> Option<Line<'static>> {
     ))
 }
 
+/// What a descendant sum is, said on the page that draws one: the processes the
+/// kernel reports beneath a root, which is neither who owns them nor what work
+/// they serve — and a resident set that counts a page shared by two processes
+/// in each of them.
+const DESCENDANT_SUM: &str = "observed processes beneath this one, not a workload or assignment total \
+     (a page shared with another process counts in each)";
+
+/// The metrics for a row whose foreground process was sampled: the incarnation
+/// the reading belongs to, the kernel's own state, what that process is using,
+/// and what is observed beneath it.
+///
+/// The process's own figures and its descendants' are drawn apart and never
+/// added together: a build under a pane is the build's CPU, not the pane's.
+/// Nothing here is inherited from an owner, a session or a background task — a
+/// task's published PID arrives without a birth identity and is not sampled at
+/// all. A value this machine could not measure says so with its reason rather
+/// than as a zero, and a sum that could not cover every member is drawn as the
+/// lower bound it is.
+fn metric_lines(foreground: Option<&ForegroundEvidence>) -> Vec<Line<'static>> {
+    let Some(ForegroundEvidence::NonShell { local, .. }) = foreground else {
+        // A shell or an inconclusive answer names no process, so nothing was
+        // sampled and there is no metric to draw.
+        return Vec::new();
+    };
+    let Some(resources) = local.resources.as_ref() else {
+        return vec![field(
+            "metrics",
+            format!(
+                "{} — this refresh took no sample of this process",
+                unavailable()
+            ),
+        )];
+    };
+    let identity = &resources.identity;
+    let descendants = &resources.descendants;
+    vec![
+        field(
+            "birth",
+            format!(
+                "pid {} · boot {} · start ticks {}",
+                identity.pid,
+                sanitize(&identity.boot_id),
+                identity.start_ticks,
+            ),
+        ),
+        field("state", state_line(resources.state)),
+        field("cpu", cpu_line(resources.cpu)),
+        field("rss", rss_line(resources.rss_bytes)),
+        field(
+            "descendants",
+            match descendants.observed {
+                Some(count) => format!(
+                    "{count} {} observed beneath this one",
+                    if count == 1 { "process" } else { "processes" }
+                ),
+                None => format!(
+                    "{} — nothing beneath this process could be enumerated",
+                    unavailable()
+                ),
+            },
+        ),
+        field(
+            "descendant cpu",
+            total_line(&descendants.cpu, |cpu| cpu_line(Some(*cpu))),
+        ),
+        field(
+            "descendant rss",
+            total_line(&descendants.rss_bytes, |bytes| rss_line(Some(*bytes))),
+        ),
+        field("descendant sum", DESCENDANT_SUM.to_string()),
+    ]
+}
+
+/// The scheduler state the kernel reported, in words.
+///
+/// It says only what the scheduler is doing with the process — a sleeping
+/// process may be waiting on a socket or on nothing, and a zombie has already
+/// exited — so it is drawn as the kernel's own state, never as progress or as a
+/// verdict on the work underneath.
+fn state_line(state: ProcessState) -> String {
+    match state {
+        ProcessState::Running => "running — on a CPU or waiting for one".into(),
+        ProcessState::Sleeping => "sleeping — waiting, and wakeable".into(),
+        ProcessState::DiskSleep => "uninterruptible sleep — blocked in the kernel".into(),
+        ProcessState::Stopped => "stopped by a signal".into(),
+        ProcessState::TracingStop => "stopped by a tracer".into(),
+        ProcessState::Zombie => "zombie — exited, not yet reaped".into(),
+        ProcessState::Dead => "dead — gone, or being torn down".into(),
+        ProcessState::Idle => "idle — below the scheduler's oldest run queue".into(),
+        ProcessState::Other(letter) => {
+            format!(
+                "unknown — this kernel reports '{}'",
+                sanitize(&letter.to_string())
+            )
+        }
+    }
+}
+
+/// Interval CPU as a reader wants it: a percentage of one CPU, which work on
+/// more than one can carry past 100.
+///
+/// Unavailable until two readings of the same incarnation make an interval. A
+/// first reading, a counter that went backwards, no elapsed time and a failed
+/// read all leave nothing to measure — which is not the same as zero, and is
+/// not always the warm-up either. A measured idle interval is zero, and is
+/// drawn as one.
+fn cpu_line(cpu: Option<CpuPercent>) -> String {
+    let Some(cpu) = cpu else {
+        return format!(
+            "{} — no interval of this process has been measured",
+            unavailable()
+        );
+    };
+    format!("{:.1}% of one CPU", cpu.hundredths() as f64 / 100.0)
+}
+
+/// A process's resident set, or why this machine cannot say. A page count the
+/// kernel wrote that is not a size, and a machine that cannot report its page
+/// size, both leave nothing to convert.
+fn rss_line(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => size(bytes),
+        None => format!(
+            "{} — the kernel's page count could not be converted",
+            unavailable()
+        ),
+    }
+}
+
+/// A total as the page draws it: its value, or why it is not one. A partial
+/// total keeps what it does cover and says it is a lower bound; an unknown one
+/// is unavailable, with the reason no total could be made.
+fn total_line<T>(total: &Total<T>, show: impl Fn(&T) -> String) -> String {
+    match total {
+        Total::Complete(value) => show(value),
+        Total::Partial(value, reason) => {
+            format!("{} — a lower bound: {}", show(value), sanitize(reason))
+        }
+        Total::Unknown(reason) => format!("{} — {}", unavailable(), sanitize(reason)),
+    }
+}
+
+/// A byte count in the units a reader compares sizes in.
+fn size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    match bytes {
+        gib if gib >= GIB => format!("{:.1} GiB", gib as f64 / GIB as f64),
+        mib if mib >= MIB => format!("{:.1} MiB", mib as f64 / MIB as f64),
+        kib if kib >= KIB => format!("{:.1} KiB", kib as f64 / KIB as f64),
+        bytes => format!("{bytes} B"),
+    }
+}
+
 fn basis_label(basis: &RetentionBasis) -> &'static str {
     match basis {
         RetentionBasis::ShellForeground => "shell foreground",
@@ -929,48 +1273,192 @@ fn basis_label(basis: &RetentionBasis) -> &'static str {
     }
 }
 
-/// Detail-panel content for the selected row.
-fn detail_lines(state: &ObservationState, app: &App) -> Vec<Line<'static>> {
+/// The process holding a pane's foreground, when the evidence names a
+/// non-shell one: a shell, an inconclusive foreground or no evidence at all
+/// leaves nothing running to name.
+fn foreground_pid(foreground: Option<&ForegroundEvidence>) -> Option<i32> {
+    match foreground? {
+        ForegroundEvidence::NonShell { pid, .. } => Some(*pid),
+        _ => None,
+    }
+}
+
+/// Detail-panel content for the selected row's page.
+///
+/// Every page begins with the row's own title, so a page always says which row
+/// it is describing; what follows is the facts that page is about. Splitting
+/// them keeps identity, the live PID and the agent's activity in front of the
+/// long published text, and leaves every fact the panel used to draw reachable
+/// on some page.
+/// The lines of one page, and where among them each openable block's summary
+/// was drawn: what the render needs to report a click back to the block it
+/// landed on.
+#[derive(Default)]
+struct PageLines {
+    lines: Vec<Line<'static>>,
+    markers: Vec<(Disclosure, usize)>,
+}
+
+impl PageLines {
+    fn push(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+    }
+
+    fn extend(&mut self, lines: Vec<Line<'static>>) {
+        self.lines.extend(lines);
+    }
+
+    /// Adds a block's summary line, and remembers where its marker went.
+    fn push_block(&mut self, key: &Disclosure, summary: Line<'static>) {
+        self.markers.push((key.clone(), self.lines.len()));
+        self.lines.push(summary);
+    }
+}
+
+/// The openable blocks of the page being drawn: which the page offers, which of
+/// them are open, and which one the keyboard is on.
+struct Blocks<'a> {
+    targets: Vec<Disclosure>,
+    highlighted: Option<Disclosure>,
+    app: &'a App,
+}
+
+impl<'a> Blocks<'a> {
+    fn new(app: &'a App) -> Self {
+        Self {
+            targets: app.disclosures(),
+            highlighted: app.disclosure_target(),
+            app,
+        }
+    }
+
+    /// Whether the page offers this block, and whether it is open. `None` is
+    /// content with nothing to open, which is drawn as it always was.
+    fn open(&self, key: &Disclosure) -> Option<bool> {
+        self.targets
+            .contains(key)
+            .then(|| self.app.disclosure_open(key))
+    }
+
+    /// The block's marker: closed or open, in the ink the keyboard's target
+    /// takes so the block Enter would open is the one the eye finds.
+    fn marker(&self, key: &Disclosure, open: bool) -> Span<'static> {
+        let glyph = if open { "▾ " } else { "▸ " };
+        let ink = if self.highlighted.as_ref() == Some(key) {
+            Style::new()
+                .fg(theme::palette().heading)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme::palette().subtle)
+        };
+        Span::styled(glyph, ink)
+    }
+
+    /// A block's summary line: its marker, its label and the facts that stay
+    /// visible whether it is open or closed. `None` is content with nothing to
+    /// open, which is drawn without a marker rather than with one that answers
+    /// to nothing.
+    fn summary(
+        &self,
+        key: &Disclosure,
+        open: Option<bool>,
+        label: &str,
+        value: String,
+    ) -> Line<'static> {
+        let mut spans = Vec::new();
+        if let Some(open) = open {
+            spans.push(self.marker(key, open));
+        }
+        spans.push(Span::styled(
+            format!("{label}: "),
+            Style::new().fg(theme::palette().subtle),
+        ));
+        spans.push(Span::raw(value));
+        Line::from(spans)
+    }
+}
+
+/// The opening of a long text: enough to recognise it, short enough to leave the
+/// panel to the facts around it.
+const DIGEST_LIMIT: usize = 60;
+
+fn digest(text: &str) -> String {
+    if text.chars().count() <= DIGEST_LIMIT {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(DIGEST_LIMIT).collect();
+    format!("{kept}…")
+}
+
+/// The page's lines, and the block each marker among them belongs to.
+fn detail_page_lines(state: &ObservationState, app: &App, page: DetailPage) -> PageLines {
+    let mut page_lines = PageLines::default();
     let Some(row) = app.selected_row() else {
-        return vec![Line::from("no row selected")];
+        page_lines.push(Line::from("no row selected"));
+        return page_lines;
     };
-    let mut lines = vec![Line::from(Span::styled(
+    page_lines.push(Line::from(Span::styled(
         sanitize(row.node.row.title()),
         Style::new().add_modifier(Modifier::BOLD),
-    ))];
+    )));
+    let blocks = Blocks::new(app);
+    match page {
+        DetailPage::Overview => overview_lines(state, &row, &blocks, &mut page_lines),
+        DetailPage::Processes => page_lines.extend(process_lines(state, &row)),
+        DetailPage::Tasks => task_page_lines(&row, &blocks, &mut page_lines),
+        DetailPage::Source => page_lines.extend(source_lines(state, &row)),
+    }
+    // The bus is a subsystem beside the source rather than part of it, so its
+    // failure is written on every page: nothing here depends on it, and a
+    // reader should not have to find a page to learn it is down.
+    if let Some(line) = bus_diagnostic(app) {
+        page_lines.push(line);
+    }
+    page_lines
+}
 
+/// Overview: what this row is, in the compact form: location, the live PID and
+/// the agent's activity and model, with the published assignment and what it
+/// awaits kept to a summary. The command, the age and the measurements of the
+/// process are the Processes page's.
+fn overview_lines(
+    state: &ObservationState,
+    row: &VisibleRow<'_>,
+    blocks: &Blocks<'_>,
+    page: &mut PageLines,
+) {
     match &row.node.row.kind {
         RowKind::Workspace {
             workspace_id,
             label,
             number,
         } => {
-            lines.push(field("kind", "workspace".to_string()));
-            lines.push(field(
+            page.push(field("kind", "workspace".to_string()));
+            page.push(field(
                 "workspace",
                 location_text(label.as_deref(), workspace_id),
             ));
-            lines.push(field(
+            page.push(field(
                 "number",
                 number.map(|n| n.to_string()).unwrap_or_else(unavailable),
             ));
         }
         RowKind::Pane(pane) => {
-            lines.push(field(
+            page.push(field(
                 "kind",
                 match pane.exited {
                     Some(_) => "pane (finished session)".to_string(),
                     None => "pane".to_string(),
                 },
             ));
-            lines.push(field(
+            page.push(field(
                 "state",
                 match &pane.exited {
                     Some(_) => "exited — no agent reported on this pane".to_string(),
                     None => unavailable(),
                 },
             ));
-            lines.push(field(
+            page.push(field(
                 "location",
                 location_line(
                     (pane.workspace_label.as_deref(), &pane.workspace_id),
@@ -979,44 +1467,25 @@ fn detail_lines(state: &ObservationState, app: &App) -> Vec<Line<'static>> {
                 ),
             ));
             if let Some(session) = &pane.exited {
-                lines.push(field("session", sanitize(&session.title)));
+                page.push(field("session", sanitize(&session.title)));
                 // The row is the session now, so this is what the pane is
                 // instead of it.
-                lines.push(field("pane now", sanitize(&pane.title)));
+                page.push(field("pane now", sanitize(&pane.title)));
             }
-            lines.push(field(
-                "foreground",
-                match &pane.foreground {
-                    Some(ForegroundEvidence::NonShell { .. }) => {
-                        pane.command().unwrap_or_else(unavailable)
-                    }
-                    Some(ForegroundEvidence::Shell) => "shell — nothing in the foreground".into(),
-                    Some(ForegroundEvidence::Inconclusive) => {
-                        "unknown — PID fields disagree".into()
-                    }
-                    None => unavailable(),
-                },
-            ));
-            lines.push(field("terminal", terminal_line(pane.terminal())));
-            lines.push(field(
-                "running for",
-                pane.running_for().map(duration).unwrap_or_else(unavailable),
-            ));
-            lines.push(field("agent", unavailable()));
+            if let Some(line) = live_pid(state, pane.foreground.as_ref()) {
+                page.push(line);
+            }
+            page.push(field("agent", unavailable()));
         }
         RowKind::Agent(agent) => {
-            // The pane's raw token list is drawn only while it is still this
-            // row's task source: a matched publisher's list is authoritative,
-            // and printing both would contradict the rows beneath this one.
-            let bus_authoritative = matches!(agent.tasks.source, Some(TaskSource::Bus));
-            lines.push(field(
+            page.push(field(
                 "kind",
                 match &agent.retained {
                     Some(basis) => format!("agent (retained — {})", basis_label(basis)),
                     None => "agent (current)".to_string(),
                 },
             ));
-            lines.push(field(
+            page.push(field(
                 "location",
                 location_line(
                     (agent.workspace_label.as_deref(), &agent.workspace_id),
@@ -1024,7 +1493,13 @@ fn detail_lines(state: &ObservationState, app: &App) -> Vec<Line<'static>> {
                     &agent.pane_id,
                 ),
             ));
-            lines.push(field(
+            // A retained row has no live process, so it names no PID.
+            if agent.retained.is_none()
+                && let Some(line) = live_pid(state, agent.foreground.as_ref())
+            {
+                page.push(line);
+            }
+            page.push(field(
                 "agent",
                 agent
                     .name
@@ -1037,103 +1512,259 @@ fn detail_lines(state: &ObservationState, app: &App) -> Vec<Line<'static>> {
                 .as_ref()
                 .map(|status| sanitize(&status.to_string()))
                 .unwrap_or_else(unavailable);
-            // The row draws the state derived from the pane; the panel says so
-            // and names the owner's projection beside it when there is one.
-            lines.push(field(
+            // The row draws the state derived from the pane; how the owner
+            // projects it, and the identities it published, are Source facts.
+            page.push(field(
                 "state",
                 format!("{} (derived from the pane)", sanitize(agent.state.word())),
             ));
-            if let Some(projected) = &agent.facts.state {
-                lines.push(field(
-                    "assignment",
-                    format!(
-                        "{} (owner projection)",
-                        sanitize(AgentState::from(projected).word())
-                    ),
-                ));
-            }
-            lines.push(match &agent.retained {
+            page.push(match &agent.retained {
                 Some(_) => field("status (last observed)", status),
                 None => field("status", status),
             });
-            lines.extend(herdsman_lines(&agent.facts, !bus_authoritative));
-            lines.extend(task_lines(agent));
-            // A machine fact like the pane's terminal: a live process compared
-            // with the program installed now. A retained row has no process,
-            // and a stale source must not present its last-good facts as
-            // freshly read.
-            if agent.retained.is_none()
-                && matches!(state.source_freshness(), SourceFreshness::Current)
-            {
-                lines.extend(agent.binary().and_then(binary_line));
-            }
-            // Freshness and identity last: a long reported session path wraps,
-            // and it must not push the required fields out of a small panel.
-            lines.push(detail_freshness(state, &row));
-            lines.push(field(
-                "identity",
-                session_text(agent.session.as_ref()).unwrap_or_else(unavailable),
-            ));
-            if let Some(line) = bus_diagnostic(app) {
-                lines.push(line);
-            }
-            return lines;
+            activity_lines(&agent.facts, blocks, page);
         }
         RowKind::Task(task) => {
-            // A task's own panel carries every fact the publisher sent for it.
-            // The owner's panel keeps the same facts on its per-task line, from
-            // the same projection this row is, so the two cannot disagree.
-            lines.push(field("kind", "background task".to_string()));
-            lines.push(field("task", sanitize(&task.id.id)));
+            page.push(field("kind", "background task".to_string()));
+            page.push(field("task", sanitize(&task.id.id)));
             // A phase the pane or publisher reported is shown as reported; a
             // token entry naming only an id says nothing about a phase, so the
             // field is absent rather than drawn "unavailable".
             if let Some(phase) = task.phase.as_deref() {
-                lines.push(field("phase", sanitize(phase)));
+                page.push(field("phase", sanitize(phase)));
             }
-            lines.push(field("source", task.basis().to_string()));
-            if let Some(published) = task.published.as_ref() {
-                let now = now_unix_ms();
-                if let Some(command) = published.command.as_deref() {
-                    lines.push(field("command", bound_text(command)));
-                }
-                if let Some(cwd) = published.cwd.as_deref() {
-                    lines.push(field("cwd", bound_text(cwd)));
-                }
-                if let Some(pid) = published.pid {
-                    lines.push(field("pid", pid.to_string()));
-                }
-                if let Some(started) = published.started_at {
-                    lines.push(field(
-                        "started",
-                        format!("{} ago", duration(elapsed(started, now))),
-                    ));
-                }
-                if let Some(last_output) = published.last_output_at {
-                    lines.push(field(
-                        "last output",
-                        format!("{} ago", duration(elapsed(last_output, now))),
-                    ));
-                }
-                if let Some(bytes) = published.output_bytes {
-                    lines.push(field("output", format!("{bytes} B")));
-                }
-                if let Some(code) = published.exit_code {
-                    lines.push(field("exit", code.to_string()));
-                }
-            }
-            lines.push(field("owner", sanitize(&task.id.owner)));
+            page.push(field("source", task.basis().to_string()));
+            page.push(field("owner", sanitize(&task.id.owner)));
             if let Some(session) = &task.id.session {
-                lines.push(field("session", sanitize(session)));
+                page.push(field("session", sanitize(session)));
             }
         }
     }
+}
 
-    lines.push(detail_freshness(state, &row));
-    if let Some(line) = bus_diagnostic(app) {
-        lines.push(line);
+/// Processes: the process holding this row's location. A row whose process is
+/// not currently observed says so rather than drawing last-good facts as live,
+/// and a container row has no process to name.
+///
+/// The measurements come last, after the identity and command they belong to,
+/// and they belong to this row's own process: a background task's published PID
+/// is named without them, because a PID alone cannot authorise a reading of a
+/// process that may have been replaced.
+fn process_lines(state: &ObservationState, row: &VisibleRow<'_>) -> Vec<Line<'static>> {
+    let current = matches!(state.source_freshness(), SourceFreshness::Current);
+    match &row.node.row.kind {
+        RowKind::Workspace { .. } => vec![field(
+            "process",
+            "none — a workspace holds panes, not a process".to_string(),
+        )],
+        RowKind::Pane(pane) => {
+            if !current {
+                return vec![withheld("the source is not current")];
+            }
+            let mut lines = Vec::new();
+            lines.extend(live_pid(state, pane.foreground.as_ref()));
+            lines.push(field(
+                "foreground",
+                foreground_text(pane.foreground.as_ref(), pane.command()),
+            ));
+            lines.push(field("terminal", terminal_line(pane.terminal())));
+            lines.push(field(
+                "running for",
+                pane.running_for().map(duration).unwrap_or_else(unavailable),
+            ));
+            lines.extend(metric_lines(pane.foreground.as_ref()));
+            lines
+        }
+        RowKind::Agent(agent) => {
+            let unavailable_reason = match (&agent.retained, current) {
+                (Some(_), _) => Some("this row is retained, not currently observed"),
+                (None, false) => Some("the source is not current"),
+                (None, true) => None,
+            };
+            if let Some(reason) = unavailable_reason {
+                return vec![withheld(reason)];
+            }
+            let mut lines = Vec::new();
+            lines.extend(live_pid(state, agent.foreground.as_ref()));
+            lines.push(field(
+                "foreground",
+                foreground_text(
+                    agent.foreground.as_ref(),
+                    agent
+                        .foreground
+                        .as_ref()
+                        .and_then(ForegroundEvidence::command_line),
+                ),
+            ));
+            // A live agent's running executable compared with the program
+            // installed now: a machine fact about the process, not the agent.
+            lines.extend(agent.binary().and_then(binary_line));
+            lines.extend(metric_lines(agent.foreground.as_ref()));
+            lines
+        }
+        RowKind::Task(task) => {
+            let published = task.published.as_ref();
+            let mut lines = vec![match published.and_then(|published| published.pid) {
+                Some(pid) => field("pid", pid.to_string()),
+                None => field("pid", unavailable()),
+            }];
+            lines.push(field("source", task.basis().to_string()));
+            // A task's PID arrives without the identity of the process it
+            // names, so no sample can be attributed to it: the publisher's
+            // captured-at-spawn birth identity is still outstanding.
+            lines.push(field(
+                "metrics",
+                "unavailable — the publisher sends no process birth identity".to_string(),
+            ));
+            lines
+        }
+    }
+}
+
+/// Tasks: the background work this row knows about. The list, the pane's own
+/// tokens and the publisher's facts stay together, so a count can be read
+/// against the list it counts. A task's long text is behind its own disclosure,
+/// with the identity and state it belongs to always drawn.
+fn task_page_lines(row: &VisibleRow<'_>, blocks: &Blocks<'_>, page: &mut PageLines) {
+    match &row.node.row.kind {
+        RowKind::Agent(agent) => {
+            // The pane's raw token list is drawn only while it is still this
+            // row's task source: a matched publisher's list is authoritative,
+            // and printing both would contradict the rows beneath this one.
+            let bus_authoritative = matches!(agent.tasks.source, Some(TaskSource::Bus));
+            let before = page.lines.len();
+            task_lines(agent, blocks, page);
+            page.extend(task_fact_lines(&agent.facts, !bus_authoritative));
+            if page.lines.len() == before {
+                page.push(field("tasks", "none published".to_string()));
+            }
+        }
+        RowKind::Task(task) => {
+            let key = Disclosure::Task(task.id.clone());
+            let open = blocks.open(&key);
+            let summary = blocks.summary(&key, open, "task", task_row_summary(task));
+            match open {
+                Some(_) => page.push_block(&key, summary),
+                None => page.push(summary),
+            }
+            match task.published.as_ref() {
+                // A publisher that sent no detail for the task is a fact of its
+                // own, and the page names it rather than drawing nothing.
+                None => page.push(field(
+                    "tasks",
+                    "none — the publisher sent no detail for this task".to_string(),
+                )),
+                Some(published) => {
+                    let now = now_unix_ms();
+                    let mut detail = Vec::new();
+                    // A command and a directory are the two fields that wrap
+                    // over the panel, so they are what the disclosure holds; the
+                    // measures below are one line each and stay drawn, because an
+                    // exit code behind a marker is not one a reader can compare
+                    // down the list.
+                    if open != Some(false) {
+                        if let Some(command) = published.command.as_deref() {
+                            detail.push(field("command", bound_text(command)));
+                        }
+                        if let Some(cwd) = published.cwd.as_deref() {
+                            detail.push(field("cwd", bound_text(cwd)));
+                        }
+                    }
+                    if let Some(started) = published.started_at {
+                        detail.push(field(
+                            "started",
+                            format!("{} ago", duration(elapsed(started, now))),
+                        ));
+                    }
+                    if let Some(last_output) = published.last_output_at {
+                        detail.push(field(
+                            "last output",
+                            format!("{} ago", duration(elapsed(last_output, now))),
+                        ));
+                    }
+                    if let Some(bytes) = published.output_bytes {
+                        detail.push(field("output", format!("{bytes} B")));
+                    }
+                    if let Some(code) = published.exit_code {
+                        detail.push(field("exit", code.to_string()));
+                    }
+                    page.extend(detail);
+                }
+            }
+        }
+        RowKind::Pane(_) => page.push(field(
+            "tasks",
+            "none — this pane reports no agent".to_string(),
+        )),
+        RowKind::Workspace { .. } => page.push(field(
+            "tasks",
+            "none — tasks are published per pane".to_string(),
+        )),
+    }
+}
+
+/// A task row's own line on the Tasks page: what the block is, so the fields
+/// behind its disclosure have something to hang from.
+fn task_row_summary(task: &TaskRow) -> String {
+    match task.phase.as_deref() {
+        Some(phase) => format!("{} · {}", sanitize(&task.id.id), sanitize(phase)),
+        None => sanitize(&task.id.id),
+    }
+}
+
+/// Source: how current the facts are, where this row's identity comes from, and
+/// what the owner published about it — its projected state, the run, request and
+/// ask it names, and the session behind them.
+fn source_lines(state: &ObservationState, row: &VisibleRow<'_>) -> Vec<Line<'static>> {
+    let mut lines = vec![detail_freshness(state, row)];
+    if let RowKind::Agent(agent) = &row.node.row.kind {
+        if let Some(projected) = &agent.facts.state {
+            lines.push(field(
+                "projection",
+                format!(
+                    "{} (owner projection)",
+                    sanitize(AgentState::from(projected).word())
+                ),
+            ));
+        }
+        lines.push(field(
+            "identity",
+            session_text(agent.session.as_ref()).unwrap_or_else(unavailable),
+        ));
+        lines.extend(owner_identity_lines(&agent.facts));
     }
     lines
+}
+
+/// The line a page draws when the facts it holds are not this row's to claim
+/// right now, so a withheld value is never read as an absent one.
+fn withheld(reason: &str) -> Line<'static> {
+    field("process", format!("withheld — {reason}"))
+}
+
+/// The live PID line for a row whose process was queried, when one is known.
+///
+/// A stale inventory's last-good evidence is not a process known to be running
+/// now, so no PID is drawn from one.
+fn live_pid(
+    state: &ObservationState,
+    foreground: Option<&ForegroundEvidence>,
+) -> Option<Line<'static>> {
+    if !matches!(state.source_freshness(), SourceFreshness::Current) {
+        return None;
+    }
+    foreground_pid(foreground).map(|pid| field("pid", pid.to_string()))
+}
+
+/// What the pane's foreground is, in the words the panel uses for it: a shell
+/// or an inconclusive answer is not a command to name.
+fn foreground_text(foreground: Option<&ForegroundEvidence>, command: Option<String>) -> String {
+    match foreground {
+        Some(ForegroundEvidence::NonShell { .. }) => command.unwrap_or_else(unavailable),
+        Some(ForegroundEvidence::Shell) => "shell — nothing in the foreground".into(),
+        Some(ForegroundEvidence::Inconclusive) => "unknown — PID fields disagree".into(),
+        None => unavailable(),
+    }
 }
 
 /// Freshness for the selected row: a retained association is not current, and
@@ -1178,32 +1809,62 @@ fn field(label: &str, value: String) -> Line<'static> {
     ])
 }
 
-/// The Herdsman facts the details carry, each drawn only while the source
-/// publishes it: a fact nobody reported is absent here, never a placeholder.
+/// What the agent is doing, for Overview: the facts Herdsman publishes about
+/// it, each drawn only while the source publishes it — a fact nobody reported
+/// is absent here, never a placeholder. The assignment is the one field long
+/// enough to bury the rest, so it is drawn behind this page's disclosure.
 ///
 /// Every value is text another process wrote — an assignment's display text
 /// above all — so each is sanitized like any other runtime string.
-fn herdsman_lines(facts: &HerdsmanFacts, tokens_listed: bool) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+fn activity_lines(facts: &HerdsmanFacts, blocks: &Blocks<'_>, page: &mut PageLines) {
     if let Some(role) = facts.role.as_deref() {
-        lines.push(field("role", sanitize(role)));
+        page.push(field("role", sanitize(role)));
     }
     // Herdr's own display agent is where a worker's agent definition comes
     // from; it earns a line only when it says more than the role already does.
     if let Some(definition) = facts.definition.as_deref()
         && Some(definition) != facts.role.as_deref()
     {
-        lines.push(field("definition", sanitize(definition)));
+        page.push(field("definition", sanitize(definition)));
     }
     if let Some(assignment) = facts.assignment.as_deref() {
-        lines.push(field("assignment", sanitize(assignment)));
+        let key = Disclosure::Assignment;
+        match blocks.open(&key) {
+            Some(open) => {
+                let text = sanitize(assignment);
+                let value = if open { text } else { digest(&text) };
+                let summary = blocks.summary(&key, Some(open), "assignment", value);
+                page.push_block(&key, summary);
+            }
+            None => page.push(field("assignment", sanitize(assignment))),
+        }
     }
     if let Some(assigned) = facts.assigned_for {
-        lines.push(field("assigned for", duration(assigned)));
+        page.push(field("assigned for", duration(assigned)));
     }
     if let Some(awaiting) = facts.awaiting() {
-        lines.push(field("awaiting", sanitize(&awaiting)));
+        page.push(field("awaiting", sanitize(&awaiting)));
     }
+    if let Some(model) = facts.model.as_deref() {
+        page.push(field("model", sanitize(model)));
+    }
+    if let Some(provider) = facts.provider.as_deref() {
+        page.push(field("provider", sanitize(provider)));
+    }
+    if let Some(thinking) = facts.thinking.as_deref() {
+        page.push(field("thinking", sanitize(thinking)));
+    }
+    if let Some(usage) = facts.context_usage.as_deref() {
+        page.push(field("context usage", sanitize(usage)));
+    }
+}
+
+/// The pane's own published background facts, for Tasks.
+///
+/// `tokens_listed` is false where a matched publisher's list is authoritative:
+/// printing both would contradict the rows beneath the owner.
+fn task_fact_lines(facts: &HerdsmanFacts, tokens_listed: bool) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     if tokens_listed && !facts.background_tasks.is_empty() {
         lines.push(field(
             "background",
@@ -1218,18 +1879,13 @@ fn herdsman_lines(facts: &HerdsmanFacts, tokens_listed: bool) -> Vec<Line<'stati
     if let Some(started) = facts.background_started.as_deref() {
         lines.push(field("background started", sanitize(started)));
     }
-    if let Some(model) = facts.model.as_deref() {
-        lines.push(field("model", sanitize(model)));
-    }
-    if let Some(provider) = facts.provider.as_deref() {
-        lines.push(field("provider", sanitize(provider)));
-    }
-    if let Some(thinking) = facts.thinking.as_deref() {
-        lines.push(field("thinking", sanitize(thinking)));
-    }
-    if let Some(usage) = facts.context_usage.as_deref() {
-        lines.push(field("context usage", sanitize(usage)));
-    }
+    lines
+}
+
+/// The identities the owner published for this row, for Source: what a reader
+/// cross-checks against Herdsman's own records rather than against activity.
+fn owner_identity_lines(facts: &HerdsmanFacts) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     if let Some(name) = facts.session_name.as_deref() {
         lines.push(field("session name", sanitize(name)));
     }
@@ -1256,32 +1912,42 @@ fn unavailable() -> String {
 /// so they cannot disagree with each other: the pane's own ids where no
 /// publisher matches the row, and the publisher's complete list — an empty one
 /// included — where one does. What the publisher sent is drawn as sent.
-fn task_lines(agent: &AgentRow) -> Vec<Line<'static>> {
+fn task_lines(agent: &AgentRow, blocks: &Blocks<'_>, page: &mut PageLines) {
     let Some(TaskSource::Bus) = agent.tasks.source else {
         // The token fallback is the pane's own report: its ids and phases are
         // the rows beneath this one, and the `background` line above states
         // them as published. Nothing more is claimed about them.
-        return Vec::new();
+        return;
     };
 
-    let mut lines = Vec::new();
     if agent.tasks.tasks.is_empty() {
         // A published empty list and no publisher are different facts, and the
         // panel says which of the two it is.
-        lines.push(field("bus", "connected — no unresolved tasks".into()));
+        page.push(field("bus", "connected — no unresolved tasks".into()));
     } else {
         let now = now_unix_ms();
         for task in &agent.tasks.tasks {
             let Some(published) = task.published.as_ref() else {
                 continue;
             };
-            lines.push(bus_task_line(published, now));
-            let id = sanitize(&task.id.id);
-            if let Some(command) = published.command.as_deref() {
-                lines.push(field(&format!("command ({id})"), bound_text(command)));
+            let key = Disclosure::Task(task.id.clone());
+            let open = blocks.open(&key);
+            let summary = blocks.summary(&key, open, "task", task_summary(published, now));
+            match open {
+                Some(_) => page.push_block(&key, summary),
+                None => page.push(summary),
             }
-            if let Some(cwd) = published.cwd.as_deref() {
-                lines.push(field(&format!("cwd ({id})"), bound_text(cwd)));
+            // The command and the directory are the lines that wrap over the
+            // panel, so they are the ones the disclosure holds. The summary
+            // above carries the identity, the state and the measures open or
+            // closed, so nothing a reader compares across tasks moves.
+            if open != Some(false) {
+                if let Some(command) = published.command.as_deref() {
+                    page.push(field("command", bound_text(command)));
+                }
+                if let Some(cwd) = published.cwd.as_deref() {
+                    page.push(field("cwd", bound_text(cwd)));
+                }
             }
         }
     }
@@ -1291,7 +1957,7 @@ fn task_lines(agent: &AgentRow) -> Vec<Line<'static>> {
     if let Some(reported) = agent.facts.background_running
         && reported as usize != agent.tasks.running()
     {
-        lines.push(field(
+        page.push(field(
             "tokens",
             format!(
                 "report {reported} running; the bus lists {}",
@@ -1299,14 +1965,15 @@ fn task_lines(agent: &AgentRow) -> Vec<Line<'static>> {
             ),
         ));
     }
-    lines
 }
 
 /// One task as the details draw it: its id, its state word as published, how
 /// long it has run, how long ago it last produced output, how much it has
 /// produced, and its exit code once there is one. A field the publisher did not
 /// send draws nothing — absent is not a zero.
-fn bus_task_line(task: &Task, now_unix_ms: u64) -> Line<'static> {
+/// A published task's identity and the measures beside it, as one line's value:
+/// the facts that never collapse.
+fn task_summary(task: &Task, now_unix_ms: u64) -> String {
     let mut parts = vec![sanitize(&task.id), sanitize(&task.state.to_string())];
     if let Some(started) = task.started_at {
         parts.push(duration(elapsed(started, now_unix_ms)));
@@ -1323,7 +1990,7 @@ fn bus_task_line(task: &Task, now_unix_ms: u64) -> Line<'static> {
     if let Some(code) = task.exit_code {
         parts.push(format!("exit {code}"));
     }
-    field("task", parts.join(" · "))
+    parts.join(" · ")
 }
 
 /// How long ago a published Unix-millisecond timestamp was.
@@ -1425,9 +2092,10 @@ mod tests {
     use crate::app::Action;
     use crate::herdr::decode_snapshot;
     use crate::model::{
-        AgentObservation, BinaryFreshness, BinaryIdentity, FleetObservation, ForegroundEvidence,
-        HerdsmanFacts, LocalFacts, Location, Pane, RuntimeStatus, SemanticState, Tab, TerminalMode,
-        Workspace,
+        AgentObservation, BinaryFreshness, BinaryIdentity, CpuPercent, DescendantResources,
+        FleetObservation, ForegroundEvidence, HerdsmanFacts, LocalFacts, Location, Pane,
+        ProcessIdentity, ProcessResources, ProcessState, RuntimeStatus, SemanticState, Tab,
+        TerminalMode, Total, Workspace,
     };
     use crate::runtime::Target;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
@@ -1464,6 +2132,92 @@ mod tests {
 
     fn render_text(state: &ObservationState, app: &App, width: u16, height: u16) -> String {
         render_with(state, app, width, height, &mut ListState::default(), 0)
+    }
+
+    /// A draw of one named page: the panel keeps a fact on one page, and a test
+    /// about that fact says which rather than relying on the default.
+    fn render_page(
+        state: &ObservationState,
+        app: &mut App,
+        page: DetailPage,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let shown = app.detail_page();
+        app.select_page(page);
+        let screen = render_text(state, app, width, height);
+        app.select_page(shown);
+        screen
+    }
+
+    /// Every page in turn, concatenated: the facts a reader can reach, whichever
+    /// page carries them.
+    fn render_pages(state: &ObservationState, app: &mut App, width: u16, height: u16) -> String {
+        DetailPage::ALL
+            .into_iter()
+            .map(|page| render_page(state, app, page, width, height))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// One page's panel text, with the panel's own wrapping undone and the fleet
+    /// column left out: a phrase is asserted as the page carries it rather than
+    /// as one row of a narrow panel. The panel is still the one drawn, so a fact
+    /// that never reaches it still fails.
+    fn panel_text(state: &ObservationState, app: &mut App, page: DetailPage) -> String {
+        let shown = app.detail_page();
+        app.select_page(page);
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 30)).expect("infallible test backend");
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| {
+                geometry = render(frame, state, app, &mut ListState::default(), 0);
+            })
+            .expect("draw");
+        app.note_layout(geometry.clone());
+        app.select_page(shown);
+        let details = geometry.details.expect("the details panel is drawn");
+        let buffer = terminal.backend().buffer();
+        // The panel's own box, dropped: its rows are padded to its width, and
+        // joining that padding into a phrase would split it again.
+        (details.y + 1..details.bottom().saturating_sub(1))
+            .map(|y| {
+                (details.x + 1..details.right().saturating_sub(1))
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .filter(|row| !row.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A draw that reports where it put things and stores that layout the way
+    /// the main loop does, so the panel scrolls against the content it just
+    /// drew.
+    fn draw(
+        state: &ObservationState,
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> (String, Geometry) {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("infallible test backend");
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| {
+                geometry = render(frame, state, app, &mut ListState::default(), 0);
+            })
+            .expect("draw");
+        app.note_layout(geometry.clone());
+        let buffer = terminal.backend().buffer();
+        let screen = (0..buffer.area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (screen, geometry)
     }
 
     fn row_text(buffer: &Buffer, y: u16) -> String {
@@ -1554,7 +2308,7 @@ mod tests {
         let state = fixture_state();
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        let screen = render_text(&state, &app, 180, 30);
+        let screen = render_pages(&state, &mut app, 180, 30);
 
         // Workspace grouping, nested worker under its owner, lifecycle, and no
         // ordinary panes (hidden by default).
@@ -1641,7 +2395,7 @@ mod tests {
         let mut app = app_for(&state);
         show_all_panes(&mut app);
         select_agent(&mut app, "wA:p1");
-        let screen = render_text(&state, &app, 180, 30);
+        let screen = render_pages(&state, &mut app, 180, 30);
 
         assert!(screen.contains("retained (shell foreground)"), "{screen}");
         assert!(
@@ -1651,8 +2405,10 @@ mod tests {
         assert!(screen.contains("status (last observed): idle"), "{screen}");
         assert!(screen.contains("not currently observed"), "{screen}");
         // Exactly one row for the pane: the tree draws the name once, and the
-        // details name it twice (its heading and the session's human name).
-        assert_eq!(screen.matches("fleet owner task").count(), 3, "{screen}");
+        // panel names it twice on Source — its own title and the session's
+        // human name.
+        let source = render_page(&state, &mut app, DetailPage::Source, 180, 30);
+        assert_eq!(source.matches("fleet owner task").count(), 3, "{source}");
         assert!(!screen.contains("pane wA:p1"), "{screen}");
         // The retained marker is visually distinct, not just textual.
         let mut terminal =
@@ -1676,7 +2432,7 @@ mod tests {
         state.apply_failure("herdr exited with status 1");
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p1");
-        let screen = render_text(&state, &app, 180, 30);
+        let screen = render_pages(&state, &mut app, 180, 30);
 
         // The heading says the facts are not current, and the details say why.
         assert!(screen.contains("Fleet · STALE"), "{screen}");
@@ -1754,18 +2510,22 @@ mod tests {
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p1");
 
-        let mut terminal = Terminal::new(TestBackend::new(90, 30)).expect("infallible");
-        terminal
-            .draw(|frame| {
-                render(frame, &state, &app, &mut ListState::default(), 0);
-            })
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        let screen: String = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol().to_string())
-            .collect();
+        // The runtime text reaches the screen on more than one page: the label
+        // is a row fact, the role is Overview's and the failure is written on
+        // Source. Every page it can appear on is read.
+        let mut screen = String::new();
+        for page in [DetailPage::Overview, DetailPage::Source] {
+            app.select_page(page);
+            let mut terminal = Terminal::new(TestBackend::new(90, 30)).expect("infallible");
+            terminal
+                .draw(|frame| {
+                    render(frame, &state, &app, &mut ListState::default(), 0);
+                })
+                .expect("draw");
+            for cell in terminal.backend().buffer().content() {
+                screen.push_str(cell.symbol());
+            }
+        }
 
         assert!(
             !screen.chars().any(char::is_control),
@@ -2113,13 +2873,13 @@ mod tests {
             let state = state_with_facts(facts, status);
             let mut app = app_for(&state);
             select_agent(&mut app, "wH:p1");
-            let screen = render_text(&state, &app, 180, 34);
+            let screen = render_pages(&state, &mut app, 180, 34);
             assert!(
                 screen.contains(&format!("state: {word} (derived from the pane)")),
                 "{screen}"
             );
             assert_eq!(
-                screen.contains("assignment: lost (owner projection)"),
+                screen.contains("projection: lost (owner projection)"),
                 projected,
                 "{screen}"
             );
@@ -2173,7 +2933,7 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wH:p1");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_pages(&state, &mut app, 180, 34);
 
         // The row is the runtime label Herdsman publishes — neither Herdr's
         // truncated agent name nor its task-bearing title — with how long the
@@ -2230,7 +2990,7 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wH:p1");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_pages(&state, &mut app, 180, 34);
 
         // The row counts what is unresolved, and the details keep the
         // published running count and the oldest outstanding start beside it.
@@ -2264,7 +3024,7 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wH:p1");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_pages(&state, &mut app, 180, 34);
 
         // Work in flight stays in flight; the whole outstanding set is still
         // named, and its two halves stay distinguishable.
@@ -2296,7 +3056,7 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wH:p1");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_pages(&state, &mut app, 180, 34);
 
         assert!(screen.contains("worker task · 2 bg"), "{screen}");
         assert!(screen.contains("awaiting: 2 background tasks"), "{screen}");
@@ -2355,7 +3115,7 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wH:p1");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_pages(&state, &mut app, 180, 34);
 
         // Waiting is a routine state, so the row carries it as mark and colour
         // alone; the panel names it and names the projection beside it.
@@ -2366,7 +3126,7 @@ mod tests {
             "{screen}"
         );
         assert!(
-            screen.contains("assignment: blocked (owner projection)"),
+            screen.contains("projection: blocked (owner projection)"),
             "{screen}"
         );
         assert!(screen.contains("status: idle"), "{screen}");
@@ -2377,7 +3137,7 @@ mod tests {
         let state = state_with_facts(HerdsmanFacts::default(), RuntimeStatus::Idle);
         let mut app = app_for(&state);
         select_agent(&mut app, "wH:p1");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_pages(&state, &mut app, 180, 34);
 
         for absent in [
             "role:",
@@ -2421,7 +3181,7 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wH:p1");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_pages(&state, &mut app, 180, 34);
 
         assert!(screen.contains("fleet lead"), "{screen}");
         assert!(!screen.contains("fleet lead · idle"), "{screen}");
@@ -2578,8 +3338,16 @@ mod tests {
             tree_panel: Rect::new(0, 0, 40, 20),
             tree_content: Rect::new(1, 1, 38, 18),
             details: app.shows_details().then(|| Rect::new(40, 0, 30, 20)),
-            details_lines: 100,
+            details_rows: 100,
+            details_viewport: 15,
+            detail_tabs: [
+                Some(Rect::new(42, 1, 10, 1)),
+                Some(Rect::new(52, 1, 12, 1)),
+                Some(Rect::new(64, 1, 8, 1)),
+                Some(Rect::new(42, 2, 8, 1)),
+            ],
             offset: 0,
+            disclosure_markers: Vec::new(),
             confirm_cancel: None,
             confirm_confirm: None,
         }
@@ -2606,7 +3374,7 @@ mod tests {
         ]);
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
-        app.note_layout(geometry);
+        app.note_layout(geometry.clone());
 
         // Row 0 is the workspace heading; row 1 its first child.
         let (x, first_child) = (geometry.tree_content.x + 2, geometry.tree_content.y + 1);
@@ -2629,7 +3397,7 @@ mod tests {
         let state = state_of(&[("wA:p1", "wA", "idle", "first", "")]);
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
-        app.note_layout(geometry);
+        app.note_layout(geometry.clone());
         let before = app.visible_rows().len();
 
         let (x, heading) = (geometry.tree_content.x + 2, geometry.tree_content.y);
@@ -2677,7 +3445,7 @@ mod tests {
             tree_content: Rect::new(1, 1, 38, 3),
             ..geometry_of(&app)
         };
-        app.note_layout(geometry);
+        app.note_layout(geometry.clone());
 
         let tree = (geometry.tree_content.x + 2, geometry.tree_content.y + 1);
         app.handle_mouse(mouse_at(tree, MouseEventKind::ScrollDown));
@@ -2706,8 +3474,275 @@ mod tests {
         assert_eq!(app.details_scroll(), 3);
     }
 
+    #[test]
+    fn a_click_on_a_page_tab_shows_that_page_and_hands_the_panel_the_keyboard() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let geometry = geometry_of(&app);
+        app.note_layout(geometry.clone());
+        assert!(!app.details_focused());
+
+        for page in DetailPage::ALL {
+            let tab = geometry.detail_tabs[page.index()].expect("the tab is drawn");
+            click_at(&mut app, (tab.x, tab.y));
+            assert_eq!(app.detail_page(), page);
+            assert!(
+                app.details_focused(),
+                "the pointer put the keyboard in the panel"
+            );
+        }
+    }
+
+    #[test]
+    fn every_page_is_reachable_on_a_narrow_terminal() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        // Narrow enough that the details are stacked under the fleet. The second
+        // draw is the settled one: the panel is sized from the layout the last
+        // one reported.
+        draw(&state, &mut app, 46, 20);
+        let (screen, mut geometry) = draw(&state, &mut app, 46, 20);
+        let details = geometry.details.expect("the panel is drawn");
+        assert!(screen.contains("Details"), "{screen}");
+
+        for page in DetailPage::ALL {
+            let tab = geometry.detail_tabs[page.index()]
+                .unwrap_or_else(|| panic!("{page:?} has no tab on a narrow terminal"));
+            assert!(
+                tab.x >= details.x && tab.right() <= details.right() && tab.y < details.bottom(),
+                "{page:?} draws outside the panel: {tab:?} in {details:?}"
+            );
+            click_at(&mut app, (tab.x + tab.width / 2, tab.y));
+            assert_eq!(app.detail_page(), page);
+            let (narrow, drawn) = draw(&state, &mut app, 46, 20);
+            geometry = drawn;
+            assert!(narrow.contains(page.label()), "{page:?} is named: {narrow}");
+            assert!(
+                narrow.contains("worker task"),
+                "the row's identity stays on every page: {narrow}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_page_keeps_its_own_scroll_and_a_new_selection_starts_at_the_top() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        // Short enough that the panel holds more content than its viewport.
+        let (_, geometry) = draw(&state, &mut app, 120, 12);
+        let max = (geometry.details_rows - geometry.details_viewport as usize) as u16;
+        assert!(max > 0, "the panel has more to show than it fits");
+
+        // Overview scrolls to its last line and stops there.
+        app.scroll_page_to(u16::MAX);
+        assert_eq!(app.details_scroll(), max);
+        app.scroll_page(1);
+        assert_eq!(app.details_scroll(), max, "the tail is not scrolled past");
+
+        // Another page starts at its own top, and Overview keeps its place.
+        app.select_page(DetailPage::Source);
+        assert_eq!(app.details_scroll(), 0);
+        app.scroll_page(2);
+        app.select_page(DetailPage::Overview);
+        assert_eq!(app.details_scroll(), max, "Overview kept its place");
+
+        // A new selection starts every page at the top; the page itself stays.
+        select_agent(&mut app, "wA:p1");
+        assert_eq!(app.details_scroll(), 0);
+        assert_eq!(app.detail_page(), DetailPage::Overview);
+    }
+
+    #[test]
+    fn a_taller_panel_clamps_the_scroll_it_no_longer_needs() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let (_, short) = draw(&state, &mut app, 120, 12);
+        app.scroll_page_to(u16::MAX);
+        assert!(app.details_scroll() > 0, "there was something to scroll");
+
+        // The terminal grows: the same content fits with less to scroll, and the
+        // offset is clamped to the content rather than left past its last line.
+        let (screen, tall) = draw(&state, &mut app, 120, 40);
+        assert!(short.details_viewport < tall.details_viewport);
+        assert!(
+            tall.details_rows <= tall.details_viewport as usize,
+            "nothing is left to scroll: {:?}",
+            tall.details_rows
+        );
+        assert_eq!(app.details_scroll(), 0, "the offset came back to the top");
+        assert!(
+            screen.contains("worker task"),
+            "the panel is still showing its row: {screen}"
+        );
+    }
+
+    #[test]
+    fn every_fact_of_a_row_is_reachable_somewhere_across_the_pages() {
+        let mut state = state_with_facts(
+            HerdsmanFacts {
+                label: Some("bash-pane-facts".into()),
+                role: Some("worker".into()),
+                assignment: Some("Run the terminal smoke suite".into()),
+                model: Some("example/model".into()),
+                session_name: Some("worker session".into()),
+                ..HerdsmanFacts::default()
+            },
+            RuntimeStatus::Working,
+        );
+        state.apply_evidence(
+            "wH:p1",
+            ForegroundEvidence::command(4242, Some("cargo".into()), Some("test".into())),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wH:p1");
+
+        // Facts are split across the pages, not dropped: the union of the four
+        // is what proves each one still reached the screen.
+        let pages = render_pages(&state, &mut app, 180, 34);
+        for fact in [
+            "kind: agent",
+            "pid: 4242",
+            "foreground: cargo",
+            "role: worker",
+            "assignment: Run the terminal smoke suite",
+            "model: example/model",
+            "session name: worker session",
+            "source: current",
+        ] {
+            assert!(pages.contains(fact), "missing {fact:?}:\n{pages}");
+        }
+
+        // The identity a reader wants first is where they look first: Overview
+        // puts the live PID above the long assignment it belongs to, and
+        // Processes carries the process itself.
+        let overview = render_page(&state, &mut app, DetailPage::Overview, 180, 34);
+        let pid = overview.find("pid: 4242").expect("the PID is on Overview");
+        let assignment = overview
+            .find("assignment: Run the terminal smoke suite")
+            .expect("the assignment is on Overview");
+        assert!(pid < assignment, "the PID comes first:\n{overview}");
+        let processes = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
+        assert!(processes.contains("pid: 4242"), "{processes}");
+        assert!(processes.contains("foreground: cargo"), "{processes}");
+    }
+
+    /// The block's marker as the last draw reported it, for the pointer tests.
+    fn marker_of(geometry: &Geometry, key: &Disclosure) -> (u16, u16) {
+        let rect = geometry
+            .disclosure_markers
+            .iter()
+            .find(|(marker, _)| marker == key)
+            .unwrap_or_else(|| panic!("{key:?} drew no marker: {:?}", geometry.disclosure_markers))
+            .1;
+        (rect.x, rect.y)
+    }
+
+    fn is_inside(area: Rect, at: (u16, u16)) -> bool {
+        at.0 >= area.x && at.0 < area.right() && at.1 >= area.y && at.1 < area.bottom()
+    }
+
+    #[test]
+    fn a_long_assignment_stays_behind_its_marker_until_it_is_opened() {
+        // Long enough that the panel collapses it, and carrying control
+        // sequences: what the marker opens is the text the panel drew before,
+        // sanitized the same way.
+        let assignment = format!("\u{1b}[31m{}\u{1b}[0m TAIL", "x".repeat(200));
+        let state = state_with_facts(
+            HerdsmanFacts {
+                label: Some("bash-pane-facts".into()),
+                assignment: Some(assignment),
+                ..HerdsmanFacts::default()
+            },
+            RuntimeStatus::Working,
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wH:p1");
+
+        // Closed: the marker, the opening of the text, and nothing of the tail
+        // past the digest.
+        let (collapsed, geometry) = draw(&state, &mut app, 120, 30);
+        assert!(collapsed.contains("▸ assignment:"), "{collapsed}");
+        assert!(
+            collapsed.contains("xxxxxxxxxx"),
+            "the opening of the text stays readable: {collapsed}"
+        );
+        assert!(!collapsed.contains("TAIL"), "{collapsed}");
+        assert!(!collapsed.contains('\u{1b}'), "{collapsed}");
+        let marker = marker_of(&geometry, &Disclosure::Assignment);
+        assert!(
+            is_inside(geometry.details.expect("the panel is drawn"), marker),
+            "the marker is drawn in the panel it belongs to: {marker:?}"
+        );
+
+        // The marker is that block's target: a click on it opens the one block
+        // and acts on no row.
+        assert_eq!(click_at(&mut app, marker), None);
+        assert!(app.disclosure_open(&Disclosure::Assignment));
+        let (opened, _) = draw(&state, &mut app, 120, 30);
+        assert!(
+            opened.contains("TAIL"),
+            "the whole text is reachable:\n{opened}"
+        );
+        // The row separators are the only control characters a joined screen
+        // has, so an escape among them is a sequence that reached the panel.
+        assert!(
+            !opened.chars().any(|ch| ch.is_control() && ch != '\n'),
+            "{opened}"
+        );
+
+        // The terminal narrows until the panel stacks under the fleet: the
+        // marker moves with it, and where it used to be drawn is not a target.
+        draw(&state, &mut app, 46, 20);
+        let (_, narrow) = draw(&state, &mut app, 46, 20);
+        assert_eq!(click_at(&mut app, marker), None);
+        assert!(
+            app.disclosure_open(&Disclosure::Assignment),
+            "a position the marker left does not toggle its block"
+        );
+        let narrow_marker = marker_of(&narrow, &Disclosure::Assignment);
+        assert!(
+            is_inside(narrow.details.expect("the panel is drawn"), narrow_marker),
+            "the marker follows its panel: {narrow_marker:?} in {:?}",
+            narrow.details
+        );
+        assert_eq!(click_at(&mut app, narrow_marker), None);
+        assert!(!app.disclosure_open(&Disclosure::Assignment));
+        let (closed, _) = draw(&state, &mut app, 46, 20);
+        assert!(
+            !closed.contains("TAIL"),
+            "the block closed again:\n{closed}"
+        );
+    }
+
+    #[test]
+    fn a_page_with_nothing_to_open_reports_no_marker() {
+        let state = state_with_facts(
+            HerdsmanFacts {
+                label: Some("plain".into()),
+                ..HerdsmanFacts::default()
+            },
+            RuntimeStatus::Working,
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wH:p1");
+
+        for page in DetailPage::ALL {
+            app.select_page(page);
+            let (screen, geometry) = draw(&state, &mut app, 120, 30);
+            assert!(app.disclosures().is_empty(), "{page:?} offers a block");
+            assert!(
+                geometry.disclosure_markers.is_empty(),
+                "{page:?} drew a marker with nothing behind it:\n{screen}"
+            );
+        }
+    }
+
     /// The row at a drawn index, clicked once.
-    fn click_row(app: &mut App, geometry: Geometry, index: usize) -> Option<Action> {
+    fn click_row(app: &mut App, geometry: &Geometry, index: usize) -> Option<Action> {
         click_at(
             app,
             (
@@ -2836,14 +3871,14 @@ mod tests {
         ]);
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
-        app.note_layout(geometry);
+        app.note_layout(geometry.clone());
         assert_eq!(drawn_titles(&app), ["wA", "alpha", "wB", "gamma"]);
 
         // Fold the first workspace by clicking its heading, then the row drawn
         // below it is the next workspace rather than the child it replaced.
-        click_row(&mut app, geometry, 0);
+        click_row(&mut app, &geometry, 0);
         assert_eq!(drawn_titles(&app), ["wA", "wB", "gamma"]);
-        click_row(&mut app, geometry, 1);
+        click_row(&mut app, &geometry, 1);
         assert_eq!(
             app.selected_row()
                 .map(|row| row.node.row.title().to_string()),
@@ -2856,17 +3891,17 @@ mod tests {
         let state = retained_working_state();
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
-        app.note_layout(geometry);
+        app.note_layout(geometry.clone());
         let index = app
             .visible_rows()
             .iter()
             .position(|row| row.id == &crate::tree::RowId::Agent("wA:p2".to_string()))
             .expect("the retained row is drawn");
 
-        click_row(&mut app, geometry, index);
+        click_row(&mut app, &geometry, index);
         assert!(
             matches!(
-                click_row(&mut app, geometry, index),
+                click_row(&mut app, &geometry, index),
                 Some(Action::Focus(Target::Pane(pane))) if pane == "wA:p2"
             ),
             "a retained row's pane is the useful thing to focus"
@@ -2878,22 +3913,22 @@ mod tests {
         let mut state = state_of(&[("wA:p1", "wA", "idle", "alpha", "")]);
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
-        app.note_layout(geometry);
+        app.note_layout(geometry.clone());
 
         // The row is selected by the first click, so the second is the one that
         // acts.
         let child = 1;
-        click_row(&mut app, geometry, child);
+        click_row(&mut app, &geometry, child);
         assert!(matches!(
-            click_row(&mut app, geometry, child),
+            click_row(&mut app, &geometry, child),
             Some(Action::Focus(_))
         ));
 
         state.apply_failure("herdr exited with status 1");
         app.refresh(&state);
-        app.note_layout(geometry);
+        app.note_layout(geometry.clone());
         assert!(
-            click_row(&mut app, geometry, child).is_none(),
+            click_row(&mut app, &geometry, child).is_none(),
             "a last-good row is not a location Radar can still see"
         );
         assert!(
@@ -3085,6 +4120,7 @@ mod tests {
                     running_for: Some(std::time::Duration::from_secs(running)),
                     terminal,
                     binary: Default::default(),
+                    resources: None,
                 };
             }
             state.apply_evidence(pane, evidence);
@@ -3105,7 +4141,8 @@ mod tests {
         assert!(screen.contains("❯ nix build .#radar · 4m"), "{screen}");
 
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
-        let details = render_text(&state, &app, 180, 30);
+        // The command, the terminal mode and the age are the Processes page's.
+        let details = render_page(&state, &mut app, DetailPage::Processes, 180, 30);
         assert!(details.contains("foreground: nvim notes.md"), "{details}");
         assert!(
             details.contains("terminal: full screen — the program is drawing the pane"),
@@ -3251,7 +4288,7 @@ mod tests {
         let mut app = app_for(&state);
         show_all_panes(&mut app);
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
-        let screen = render_text(&state, &app, 180, 32);
+        let screen = render_page(&state, &mut app, DetailPage::Processes, 180, 32);
 
         assert!(screen.contains("nix build .#radar"), "{screen}");
         assert!(screen.contains("foreground: nix build .#radar"), "{screen}");
@@ -3268,6 +4305,7 @@ mod tests {
                 running_for: None,
                 terminal: TerminalMode::Unknown,
                 binary: identity,
+                resources: None,
             };
         }
         evidence
@@ -3281,13 +4319,404 @@ mod tests {
         }
     }
 
+    /// Foreground evidence for one sampled process: a non-shell command with the
+    /// local facts a refresh composed onto it.
+    fn sampled(pid: i32, resources: ProcessResources) -> ForegroundEvidence {
+        let mut evidence =
+            ForegroundEvidence::command(pid, Some("nix".into()), Some("nix build .#radar".into()));
+        if let ForegroundEvidence::NonShell { local, .. } = &mut evidence {
+            *local = LocalFacts {
+                running_for: Some(Duration::from_secs(134)),
+                terminal: TerminalMode::Line,
+                binary: BinaryIdentity::default(),
+                resources: Some(resources),
+            };
+        }
+        evidence
+    }
+
+    /// A sampled process, with whatever the scan observed beneath it.
+    fn resources(
+        cpu: Option<CpuPercent>,
+        rss_bytes: Option<u64>,
+        descendants: DescendantResources,
+    ) -> ProcessResources {
+        ProcessResources {
+            identity: ProcessIdentity {
+                boot_id: "6d9d2f0a-2f6f-4a1f-9c2d-2f6f4a1f9c2d".into(),
+                pid: 4242,
+                start_ticks: 9_812,
+            },
+            state: ProcessState::Sleeping,
+            rss_bytes,
+            cpu,
+            descendants,
+        }
+    }
+
+    /// Nothing observed beneath a root, with every process of the scan read.
+    fn no_descendants() -> DescendantResources {
+        DescendantResources {
+            observed: Some(0),
+            rss_bytes: Total::Complete(0),
+            cpu: Total::Complete(CpuPercent::from_hundredths(0)),
+        }
+    }
+
+    #[test]
+    fn an_idle_root_and_a_busy_descendant_are_drawn_apart() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    // A measured idle interval is a measurement: zero, not
+                    // unknown.
+                    Some(CpuPercent::from_hundredths(0)),
+                    Some(8 * 1024 * 1024),
+                    DescendantResources {
+                        observed: Some(2),
+                        rss_bytes: Total::Complete(512 * 1024 * 1024),
+                        // Work on more than one CPU carries past 100%.
+                        cpu: Total::Complete(CpuPercent::from_hundredths(12_500)),
+                    },
+                ),
+            ),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+
+        // The incarnation the reading belongs to, and the kernel's own state.
+        assert!(processes.contains("birth: pid 4242 · boot "), "{processes}");
+        assert!(processes.contains("start ticks 9812"), "{processes}");
+        assert!(
+            processes.contains("state: sleeping — waiting, and wakeable"),
+            "{processes}"
+        );
+        // The root's own figures are its own: the build beneath it is not added
+        // to them.
+        assert!(processes.contains("cpu: 0.0% of one CPU"), "{processes}");
+        assert!(processes.contains("rss: 8.0 MiB"), "{processes}");
+        assert!(
+            processes.contains("descendants: 2 processes observed beneath this one"),
+            "{processes}"
+        );
+        // The descendants are a separate sum, qualified as what it is.
+        assert!(
+            processes.contains("descendant cpu: 125.0% of one CPU"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("descendant rss: 512.0 MiB"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("not a workload or assignment total"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("a page shared with another process counts in each"),
+            "{processes}"
+        );
+    }
+
+    #[test]
+    fn cpu_without_an_interval_is_unavailable_rather_than_zero() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled(4242, resources(None, Some(4_096), no_descendants())),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+
+        // No interval to measure — a first reading, a counter that went
+        // backwards and a failed read all say this, and none is a zero.
+        assert!(
+            processes.contains("cpu: unavailable — no interval of this process has been measured"),
+            "{processes}"
+        );
+        // A descendant total that really is zero is drawn as a measurement.
+        assert!(
+            processes.contains("descendant cpu: 0.0% of one CPU"),
+            "{processes}"
+        );
+        // The root's own line, between the state above it and the resident set
+        // below it, is the one that must not read as a zero.
+        let root = processes
+            .split("state: ")
+            .nth(1)
+            .and_then(|rest| rest.split("rss: ").next())
+            .expect("the state and the resident set");
+        assert!(
+            root.contains("cpu: unavailable — no interval"),
+            "{processes}"
+        );
+        assert!(!root.contains("0.0%"), "{processes}");
+        // Nothing observed beneath the root is a fact about the root, not a
+        // missing measurement.
+        assert!(
+            processes.contains("descendants: 0 processes observed beneath this one"),
+            "{processes}"
+        );
+    }
+
+    #[test]
+    fn a_partial_or_unknown_total_says_why() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(4_200)),
+                    Some(1_048_576),
+                    DescendantResources {
+                        observed: Some(3),
+                        rss_bytes: Total::Partial(
+                            2_048,
+                            "a process beneath this one was reparented while the table was read"
+                                .into(),
+                        ),
+                        cpu: Total::Unknown("the process scan was cancelled".into()),
+                    },
+                ),
+            ),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+
+        // The root's own reading is unaffected by what could not be totalled
+        // beneath it.
+        assert!(processes.contains("cpu: 42.0% of one CPU"), "{processes}");
+        // A lower bound keeps the value it does cover and says it is one.
+        assert!(
+            processes.contains(
+                "descendant rss: 2.0 KiB — a lower bound: \
+                 a process beneath this one was reparented while the table was read"
+            ),
+            "{processes}"
+        );
+        // An unknown total is unavailable with its reason, never a complete zero.
+        assert!(
+            processes.contains("descendant cpu: unavailable — the process scan was cancelled"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("descendants: 3 processes observed beneath this one"),
+            "{processes}"
+        );
+    }
+
+    #[test]
+    fn descendants_that_could_not_be_enumerated_are_unavailable() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(100)),
+                    Some(4_096),
+                    DescendantResources {
+                        observed: None,
+                        rss_bytes: Total::Unknown("the process table could not be read".into()),
+                        cpu: Total::Unknown("the process table could not be read".into()),
+                    },
+                ),
+            ),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+
+        assert!(
+            processes.contains(
+                "descendants: unavailable — nothing beneath this process could be enumerated"
+            ),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("descendant rss: unavailable — the process table could not be read"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("descendant cpu: unavailable — the process table could not be read"),
+            "{processes}"
+        );
+    }
+
+    #[test]
+    fn a_stale_or_retained_row_withholds_its_metrics() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(12_340)),
+                    Some(1_024),
+                    no_descendants(),
+                ),
+            ),
+        );
+        // The evidence survives a failed collection, and none of it may be
+        // drawn as a live measurement.
+        state.apply_failure("herdr exited with status 1");
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(
+            processes.contains("withheld — the source is not current"),
+            "{processes}"
+        );
+        assert!(!processes.contains("birth:"), "{processes}");
+        assert!(!processes.contains("cpu:"), "{processes}");
+        assert!(!processes.contains("descendant"), "{processes}");
+
+        // A retained row is an association nobody observes now: its
+        // last-observed process is not a reading either.
+        let retained = retained_working_state();
+        let mut app = app_for(&retained);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&retained, &mut app, DetailPage::Processes);
+        assert!(
+            processes.contains("withheld — this row is retained, not currently observed"),
+            "{processes}"
+        );
+        assert!(!processes.contains("birth:"), "{processes}");
+        assert!(!processes.contains("descendant"), "{processes}");
+    }
+
+    #[test]
+    fn a_process_with_no_sample_invents_no_metric() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            ForegroundEvidence::command(4242, Some("pi".into()), Some("pi".into())),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+
+        // The process is named and nothing was sampled for it: the page says so
+        // rather than drawing a birth identity or a resource it never read.
+        assert!(processes.contains("pid: 4242"), "{processes}");
+        assert!(
+            processes
+                .contains("metrics: unavailable — this refresh took no sample of this process"),
+            "{processes}"
+        );
+        assert!(!processes.contains("birth:"), "{processes}");
+        assert!(!processes.contains("rss:"), "{processes}");
+    }
+
+    #[test]
+    fn the_pages_rows_are_the_rows_the_panel_draws() {
+        // The panel measures each page line on its own and adds them up, so the
+        // sum must be the rows of the whole page: a word too long to break, a
+        // run of spaces and an empty line are where a count taken from the text
+        // rather than from the widget would disagree.
+        let lines = vec![
+            Line::from(""),
+            Line::from(format!("a very long identifier {}", "x".repeat(60))),
+            Line::from("two  spaces  between  words"),
+            Line::from(""),
+            Line::from("short"),
+        ];
+        for width in [8u16, 12, 20, 40] {
+            let (total, offsets) = page_rows(&lines, width);
+            let whole = Paragraph::new(lines.clone())
+                .wrap(PAGE_WRAP)
+                .line_count(width);
+            assert_eq!(total, whole, "the rows of the page at width {width}");
+            assert_eq!(offsets.len(), lines.len(), "one row per line to start on");
+            assert_eq!(offsets[0], 0, "the page starts at its first row");
+            assert!(
+                offsets.windows(2).all(|pair| pair[0] < pair[1]),
+                "every line takes a row of its own: {offsets:?} at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_end_of_a_wrapped_page_is_reachable_on_a_small_panel() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(0)),
+                    Some(8 * 1024 * 1024),
+                    DescendantResources {
+                        observed: Some(2),
+                        rss_bytes: Total::Complete(512 * 1024 * 1024),
+                        cpu: Total::Complete(CpuPercent::from_hundredths(12_500)),
+                    },
+                ),
+            ),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+
+        // A panel with room for less than the page. The metric lines wrap, so
+        // the page occupies more rows than it has lines, and End reaches its
+        // last row rather than stopping at the last one that starts on it.
+        let (_, short) = draw(&state, &mut app, 120, 12);
+        assert!(
+            short.details_rows > short.details_viewport as usize,
+            "the panel has more to show than it fits: {short:?}"
+        );
+        let max = (short.details_rows - short.details_viewport as usize) as u16;
+        app.scroll_page_to(u16::MAX);
+        assert_eq!(app.details_scroll(), max, "the clamp counts drawn rows");
+        let (scrolled, _) = draw(&state, &mut app, 120, 12);
+        assert!(scrolled.contains("descendant rss:"), "{scrolled}");
+        assert!(
+            scrolled.contains("counts in each)"),
+            "the last wrapped row of the page is drawn: {scrolled}"
+        );
+        // The end is the end: a further scroll key does not move the page.
+        app.scroll_page(3);
+        assert_eq!(app.details_scroll(), max);
+
+        // Narrow enough that the panel stacks under the fleet, and wraps the
+        // same page further still: every row stays reachable there too.
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        draw(&state, &mut app, 46, 20);
+        let (_, narrow) = draw(&state, &mut app, 46, 20);
+        app.scroll_page_to(u16::MAX);
+        assert_eq!(
+            app.details_scroll(),
+            (narrow.details_rows - narrow.details_viewport as usize) as u16
+        );
+        let (scrolled, _) = draw(&state, &mut app, 46, 20);
+        assert!(scrolled.contains("descendant sum:"), "{scrolled}");
+        assert!(
+            scrolled.contains("counts in each)"),
+            "the last wrapped row is drawn on a stacked panel: {scrolled}"
+        );
+
+        // The values are on the page, not only in its last rows.
+        let page = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(page.contains("descendant rss: 512.0 MiB"), "{page}");
+    }
+
     #[test]
     fn a_live_stale_agent_is_marked_and_names_both_installations() {
         let mut state = fixture_state();
         state.apply_evidence("wA:p2", binary_evidence(stale_identity()));
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
 
         let mark = theme::stale_mark();
         assert!(screen.contains(&format!("{mark} worker task")), "{screen}");
@@ -3326,7 +4755,7 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        let screen = render_text(&state, &app, 180, 34);
+        let screen = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
 
         assert!(
             !screen.contains(&format!("{} worker task", theme::stale_mark())),
@@ -3355,7 +4784,9 @@ mod tests {
         );
         let mut app = app_for(&matching);
         select_agent(&mut app, "wA:p2");
-        let screen = render_text(&matching, &app, 180, 34);
+        // Read on Processes, the page that carries the comparison: an absence
+        // asserted anywhere else would say nothing about it.
+        let screen = render_page(&matching, &mut app, DetailPage::Processes, 180, 34);
         assert!(!screen.contains("binary:"), "{screen}");
         assert!(
             !screen.contains(&format!("{} worker task", theme::stale_mark())),
@@ -3368,7 +4799,7 @@ mod tests {
         unknown.apply_evidence("wA:p2", binary_evidence(BinaryIdentity::default()));
         let mut app = app_for(&unknown);
         select_agent(&mut app, "wA:p2");
-        let screen = render_text(&unknown, &app, 180, 34);
+        let screen = render_page(&unknown, &mut app, DetailPage::Processes, 180, 34);
         assert!(!screen.contains("binary:"), "{screen}");
         assert!(
             !screen.contains(&format!("{} worker task", theme::stale_mark())),
@@ -3385,14 +4816,90 @@ mod tests {
         state.apply_failure("herdr exited with status 1");
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        let screen = render_text(&state, &app, 180, 34);
+        let source = render_page(&state, &mut app, DetailPage::Source, 180, 34);
+        assert!(source.contains("source: stale"), "{source}");
 
-        assert!(screen.contains("source: stale"), "{screen}");
-        assert!(!screen.contains("binary:"), "{screen}");
+        // The comparison is withheld, not drawn from the last-good evidence.
+        let processes = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
         assert!(
-            !screen.contains(&format!("{} worker task", theme::stale_mark())),
-            "{screen}"
+            processes.contains("withheld — the source is not current"),
+            "{processes}"
         );
+        assert!(!processes.contains("binary:"), "{processes}");
+        assert!(
+            !processes.contains(&format!("{} worker task", theme::stale_mark())),
+            "{processes}"
+        );
+    }
+
+    #[test]
+    fn live_foreground_evidence_names_its_pid_on_an_agent_and_on_a_pane() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            ForegroundEvidence::command(4242, Some("pi".into()), Some("pi".into())),
+        );
+        state.apply_evidence(
+            "wA:p3",
+            ForegroundEvidence::command(7, Some("nvim".into()), Some("nvim notes.md".into())),
+        );
+        let mut app = app_for(&state);
+
+        select_agent(&mut app, "wA:p2");
+        let agent = render_text(&state, &app, 180, 34);
+        assert!(agent.contains("pid: 4242"), "{agent}");
+
+        show_all_panes(&mut app);
+        select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
+        // Overview names the PID beside the location; Processes carries the
+        // command that PID is running.
+        let overview = render_text(&state, &app, 180, 30);
+        assert!(overview.contains("pid: 7"), "{overview}");
+        let processes = render_page(&state, &mut app, DetailPage::Processes, 180, 30);
+        assert!(
+            processes.contains("foreground: nvim notes.md"),
+            "{processes}"
+        );
+        assert!(processes.contains("pid: 7"), "{processes}");
+    }
+
+    #[test]
+    fn absent_inconclusive_or_stale_evidence_names_no_pid() {
+        // Nothing was asked about the pane: there is no process to name, on
+        // any page that could name one.
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let screen = render_pages(&state, &mut app, 180, 34);
+        assert!(!screen.contains("pid:"), "{screen}");
+
+        // A shell is not a foreground process, and disagreeing PID fields
+        // name none either.
+        let mut shell = fixture_state();
+        shell.apply_evidence("wA:p2", ForegroundEvidence::Shell);
+        shell.apply_evidence("wA:p3", ForegroundEvidence::Inconclusive);
+        let mut app = app_for(&shell);
+        select_agent(&mut app, "wA:p2");
+        let screen = render_pages(&shell, &mut app, 180, 34);
+        assert!(!screen.contains("pid:"), "{screen}");
+        show_all_panes(&mut app);
+        select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
+        let screen = render_pages(&shell, &mut app, 180, 30);
+        assert!(!screen.contains("pid:"), "{screen}");
+
+        // A stale source's last-good evidence is not a process known to be
+        // running now.
+        let mut stale = fixture_state();
+        stale.apply_evidence(
+            "wA:p2",
+            ForegroundEvidence::command(4242, Some("pi".into()), Some("pi".into())),
+        );
+        stale.apply_failure("herdr exited with status 1");
+        let mut app = app_for(&stale);
+        select_agent(&mut app, "wA:p2");
+        let screen = render_pages(&stale, &mut app, 180, 34);
+        assert!(screen.contains("source: stale"), "{screen}");
+        assert!(!screen.contains("pid:"), "{screen}");
     }
 
     /// A pane the fixture reports with no agent, but whose label is a finished

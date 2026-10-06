@@ -8,9 +8,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use agent_radar::BinaryFreshness;
-use agent_radar::procfs::{BinaryIndex, identity};
+use agent_radar::procfs::{BinaryIndex, Sampler, identity};
 
 /// A directory of this test's own, removed when the case ends.
 fn workspace(name: &str) -> PathBuf {
@@ -201,7 +202,16 @@ fn a_gone_process_has_unknown_facts() {
     // A pid that cannot exist: nothing is older than the process table. The
     // read is Radar's own `/proc`, not an installed store.
     let mut index = BinaryIndex::searching(Vec::new());
-    let facts = agent_radar::procfs::facts(i32::MAX, Some("pi"), &mut index);
+    let mut sampler = Sampler::new();
+    let facts = agent_radar::procfs::facts(
+        i32::MAX,
+        Some("pi"),
+        &mut index,
+        &mut sampler,
+        Instant::now(),
+    );
     assert!(facts.running_for.is_none());
     assert_eq!(facts.binary.freshness, BinaryFreshness::Unknown);
+    // A process that cannot be read is not one to sample either.
+    assert_eq!(facts.resources, None);
 }

@@ -7,6 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent_radar::app::DetailPage;
 use agent_radar::bus::{BusEvent, Task, TaskState};
 use agent_radar::model::{
     AgentObservation, FleetObservation, HerdsmanFacts, Lineage, Location, Pane, RuntimeStatus,
@@ -15,6 +16,7 @@ use agent_radar::model::{
 use agent_radar::{App, ObservationState, RowId, ui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::widgets::ListState;
 
 /// The session UUID the fixture pane publishes as its lineage.
@@ -125,19 +127,63 @@ fn select_agent(app: &mut App, pane_id: &str) {
     assert_eq!(app.selected_index(), Some(index));
 }
 
+/// Selects a task row, which the tree lists only in the view that shows them.
+fn select_task(app: &mut App, id: &str) {
+    let rows = app.visible_rows();
+    let index = rows
+        .iter()
+        .position(|row| matches!(&row.id, agent_radar::RowId::Task(task) if task.id == id))
+        .expect("task row is visible");
+    app.move_selection(index as i32 - app.selected_index().unwrap_or(0) as i32);
+    assert_eq!(app.selected_index(), Some(index));
+}
+
 /// The whole screen, one trimmed row per line.
 ///
+/// Every detail page in turn, concatenated, with every disclosure it offers
+/// open: a test about a fact does not have to know which page or which block
+/// carries it, and a fact that goes missing from all of them still fails.
+fn pages(state: &ObservationState, app: &mut App) -> String {
+    let shown = app.detail_page();
+    let mut out = Vec::new();
+    for page in DetailPage::ALL {
+        app.select_page(page);
+        disclose_all(app);
+        out.push(screen(state, app));
+    }
+    app.select_page(shown);
+    out.join("\n")
+}
+
+/// Opens every block the page on screen offers, so a test about a fact behind a
+/// disclosure reads it the way a reader who opened it does. Idempotent: a page
+/// read twice is not a page toggled shut.
+fn disclose_all(app: &mut App) {
+    for key in app.disclosures() {
+        if !app.disclosure_open(&key) {
+            app.toggle_block(&key);
+        }
+    }
+}
+
 /// Wide enough that the details column reaches its maximum width, so a phrase
 /// a test asserts sits on one row instead of being wrapped mid-phrase.
 fn screen(state: &ObservationState, app: &App) -> String {
+    drawn(state, app).0
+}
+
+/// A draw of the whole screen, and where it put the panel's markers, for the
+/// tests about what a click on a disclosure lands on.
+fn drawn(state: &ObservationState, app: &App) -> (String, agent_radar::Geometry) {
     let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("infallible test backend");
+    let mut geometry = agent_radar::Geometry::default();
     terminal
         .draw(|frame| {
-            ui::render(frame, state, app, &mut ListState::default(), 0);
+            geometry = ui::render(frame, state, app, &mut ListState::default(), 0);
         })
         .expect("draw");
     let buffer = terminal.backend().buffer();
-    (0..buffer.area.height)
+    let screen = (0..buffer.area.height)
         .map(|y| {
             (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol().to_string())
@@ -146,7 +192,57 @@ fn screen(state: &ObservationState, app: &App) -> String {
                 .to_string()
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    (screen, geometry)
+}
+
+/// A draw of one screen size that records the layout the way the main loop does,
+/// so a test can scroll the panel against what it just drew.
+fn draw_at(
+    state: &ObservationState,
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> (String, agent_radar::Geometry) {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("infallible backend");
+    let mut geometry = agent_radar::Geometry::default();
+    terminal
+        .draw(|frame| {
+            geometry = ui::render(frame, state, app, &mut ListState::default(), 0);
+        })
+        .expect("draw");
+    app.note_layout(geometry.clone());
+    let buffer = terminal.backend().buffer();
+    let screen = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (screen, geometry)
+}
+
+/// The glyph a drawn screen has at a position, if it has one there.
+fn glyph_at(screen: &str, at: (u16, u16)) -> Option<char> {
+    screen
+        .lines()
+        .nth(at.1 as usize)?
+        .chars()
+        .nth(at.0 as usize)
+}
+
+/// A left click at a position, through the same handler the executable uses.
+fn click_at(app: &mut App, at: (u16, u16)) {
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: at.0,
+        row: at.1,
+        modifiers: KeyModifiers::NONE,
+    });
 }
 
 fn now_unix_ms() -> u64 {
@@ -171,7 +267,7 @@ fn tasks_join_by_the_exact_session_uuid() {
     publish(&mut app, SESSION, vec![running]);
 
     select_agent(&mut app, "wH:p1");
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     for part in [
         "task: bg-1",
         "running",
@@ -179,8 +275,8 @@ fn tasks_join_by_the_exact_session_uuid() {
         "output 4s ago",
         "18244 B",
         "exit 0",
-        "command (bg-1): nix build .#radar",
-        "cwd (bg-1): /home/x/proj",
+        "command: nix build .#radar",
+        "cwd: /home/x/proj",
     ] {
         assert!(screen.contains(part), "missing {part:?}:\n{screen}");
     }
@@ -202,7 +298,7 @@ fn a_row_with_its_own_session_uuid_never_falls_back_to_the_pane() {
     });
 
     select_agent(&mut app, "wH:p1");
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(!screen.contains("task:"), "{screen}");
 }
 
@@ -220,7 +316,7 @@ fn a_row_without_a_session_uuid_joins_by_the_hello_pane() {
     });
 
     select_agent(&mut app, "wH:p1");
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(screen.contains("task: bg-1"), "{screen}");
 }
 
@@ -235,7 +331,7 @@ fn a_session_matching_no_row_is_shown_nowhere() {
     );
 
     select_agent(&mut app, "wH:p1");
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(!screen.contains("task:"), "{screen}");
     assert!(!screen.contains("bg-9"), "{screen}");
 }
@@ -247,7 +343,7 @@ fn absent_optional_fields_draw_no_placeholder() {
     publish(&mut app, SESSION, vec![task("bg-9", TaskState::Flushing)]);
 
     select_agent(&mut app, "wH:p1");
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(screen.contains("task: bg-9"), "{screen}");
     assert!(screen.contains("flushing"), "{screen}");
     for absent in ["command (", "cwd (", "exit ", " B", "ago"] {
@@ -277,7 +373,7 @@ fn every_published_state_word_is_drawn_as_published() {
     );
 
     select_agent(&mut app, "wH:p1");
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     for part in [
         "task: bg-1 · running",
         "task: bg-2 · flushing",
@@ -305,6 +401,11 @@ fn an_over_long_command_is_bounded_and_control_sequences_never_reach_the_screen(
     publish(&mut app, SESSION, vec![running]);
 
     select_agent(&mut app, "wH:p1");
+    // The published command and directory are Tasks facts, and the long text a
+    // disclosure holds: the bound is measured on that one page with its block
+    // open, not on a union that multiplies the count.
+    app.select_page(DetailPage::Tasks);
+    disclose_all(&mut app);
     let screen = screen(&state, &app);
     assert!(
         !screen.contains('\x1b'),
@@ -325,9 +426,9 @@ fn an_over_long_command_is_bounded_and_control_sequences_never_reach_the_screen(
         !screen.contains("TAIL"),
         "the tail past the bound is not drawn"
     );
-    assert!(screen.contains("command (bg-1): "), "{screen}");
+    assert!(screen.contains("command: "), "{screen}");
     // The long word wraps onto its own row, so only the label is contiguous.
-    assert!(screen.contains("cwd (bg-1):"), "{screen}");
+    assert!(screen.contains("cwd:"), "{screen}");
 }
 
 #[test]
@@ -338,7 +439,7 @@ fn an_empty_list_is_connected_and_distinct_from_no_connection() {
 
     // No publisher: the pane tokens are the baseline, and nothing claims a
     // connection.
-    let baseline = screen(&state, &app);
+    let baseline = pages(&state, &mut app);
     assert!(
         baseline.contains("awaiting: 2 background tasks"),
         "{baseline}"
@@ -347,7 +448,7 @@ fn an_empty_list_is_connected_and_distinct_from_no_connection() {
 
     // A live connection that publishes nothing unresolved is not silence.
     publish(&mut app, SESSION, vec![]);
-    let connected = screen(&state, &app);
+    let connected = pages(&state, &mut app);
     assert!(
         connected.contains("bus: connected — no unresolved tasks"),
         "{connected}"
@@ -360,12 +461,12 @@ fn a_disconnect_restores_the_token_baseline() {
     let mut app = app_for(&state);
     publish(&mut app, SESSION, vec![task("bg-1", TaskState::Running)]);
     select_agent(&mut app, "wH:p1");
-    assert!(screen(&state, &app).contains("task: bg-1"));
+    assert!(pages(&state, &mut app).contains("task: bg-1"));
 
     app.apply_bus_event(BusEvent::Disconnected {
         session: SESSION.into(),
     });
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
     assert!(!screen.contains("task:"), "{screen}");
     assert!(!screen.contains("connected"), "{screen}");
     assert!(screen.contains("awaiting: 2 background tasks"), "{screen}");
@@ -399,7 +500,7 @@ fn the_token_count_is_compared_on_running_tasks_only() {
         let mut app = app_for(&state);
         publish(&mut app, SESSION, tasks);
         select_agent(&mut app, "wH:p1");
-        let screen = screen(&state, &app);
+        let screen = pages(&state, &mut app);
         // The list is shown whatever the tokens say.
         assert!(
             screen.contains("task: bg-"),
@@ -450,7 +551,7 @@ fn bus_data_survives_a_refresh_and_is_rebuilt_from_the_bus() {
     assert!(matches!(after.last(), Some(RowId::Task(_))), "{after:?}");
 
     select_agent(&mut app, "wH:p1");
-    assert!(screen(&state, &app).contains("task: bg-1"));
+    assert!(pages(&state, &mut app).contains("task: bg-1"));
 }
 
 #[test]
@@ -461,7 +562,7 @@ fn a_bus_diagnostic_is_stated_beside_source_freshness() {
         "bus socket /run/user/1000/agent-radar/radar.sock: another Radar owns it".into(),
     ));
     select_agent(&mut app, "wH:p1");
-    let screen = screen(&state, &app);
+    let screen = pages(&state, &mut app);
 
     assert!(screen.contains("Fleet · current"), "{screen}");
     assert!(screen.contains("bus off"), "{screen}");
@@ -477,4 +578,281 @@ fn a_bus_diagnostic_is_stated_beside_source_freshness() {
     }
     assert!(!screen.contains("UNAVAILABLE"), "{screen}");
     assert!(!screen.contains("source: unavailable"), "{screen}");
+}
+
+/// A running task with the long text a disclosure holds.
+fn task_with_text(id: &str, command: &str, cwd: &str) -> Task {
+    let mut task = task(id, TaskState::Running);
+    task.command = Some(command.into());
+    task.cwd = Some(cwd.into());
+    task
+}
+
+#[test]
+fn a_task_processes_page_names_its_published_pid_and_borrows_no_metrics() {
+    let state = fleet(&[("wH:p1", Some(SESSION), Some(1))]);
+    let mut app = app_for(&state);
+    app.toggle_tasks();
+    let mut running = task("bg-1", TaskState::Running);
+    running.pid = Some(4242);
+    publish(&mut app, SESSION, vec![running]);
+    select_task(&mut app, "bg-1");
+    app.select_page(DetailPage::Processes);
+
+    let processes = screen(&state, &app);
+    // The publisher's PID is named, with where it came from.
+    assert!(processes.contains("pid: 4242"), "{processes}");
+    assert!(processes.contains("source: bus"), "{processes}");
+    // It arrives without the identity of the process it names, so nothing was
+    // measured for it: the page says why instead of borrowing the row's or the
+    // owner's metrics.
+    assert!(processes.contains("metrics: unavailable"), "{processes}");
+    assert!(processes.contains("birth identity"), "{processes}");
+    assert!(!processes.contains("birth:"), "{processes}");
+    assert!(!processes.contains("cpu:"), "{processes}");
+    assert!(!processes.contains("rss:"), "{processes}");
+    assert!(!processes.contains("descendant"), "{processes}");
+}
+
+#[test]
+fn a_disclosure_target_follows_wrapped_rows_and_the_scroll() {
+    // A label long enough that the page's own title wraps over two rows, so a
+    // scroll that counted lines would move the rows below it by more than the
+    // row it was asked for.
+    let pane = "wH:p1-with-a-long-identifier-tail";
+    let state = fleet(&[(pane, Some(SESSION), Some(1))]);
+    let mut app = app_for(&state);
+    app.toggle_tasks();
+    // A command long enough that the panel collapses it: the block carries a
+    // marker, and its command wraps over several rows once it is opened.
+    let command = format!("nix build .#radar {}", "--verbose ".repeat(12));
+    publish(
+        &mut app,
+        SESSION,
+        vec![task_with_text("bg-1", &command, "/home/x/proj")],
+    );
+    select_agent(&mut app, pane);
+    app.select_page(DetailPage::Tasks);
+
+    // Closed, the block is one row, and its marker is drawn on it. Opening it is
+    // the click on that row, and nothing else.
+    let (screen, geometry) = draw_at(&state, &mut app, 120, 10);
+    let (key, marker) = geometry
+        .disclosure_markers
+        .first()
+        .expect("the task block has a marker")
+        .clone();
+    assert_eq!(
+        glyph_at(&screen, (marker.x, marker.y)),
+        Some('\u{25b8}'),
+        "the target is on the glyph:\n{screen}"
+    );
+    click_at(&mut app, (marker.x, marker.y));
+    assert!(app.disclosure_open(&key), "the glyph's row opens its block");
+
+    // Opened, its command wraps, so the page occupies more rows than the panel
+    // has and has to scroll.
+    let (opened, geometry) = draw_at(&state, &mut app, 120, 10);
+    let content = geometry.details.expect("the panel is drawn");
+    assert!(
+        geometry.details_rows > geometry.details_viewport as usize,
+        "the page is taller than the panel: {geometry:?}"
+    );
+    let block = geometry
+        .disclosure_markers
+        .iter()
+        .find(|(marker_key, _)| marker_key == &key)
+        .expect("the open block has a marker")
+        .1;
+    assert_eq!(
+        glyph_at(&opened, (block.x, block.y)),
+        Some('\u{25be}'),
+        "the open block's target is on its glyph:\n{opened}"
+    );
+
+    // Scrolling by one row moves the page by exactly one drawn row, wrapped
+    // lines included: every row is where the row below it was.
+    app.scroll_page(1);
+    assert_eq!(app.details_scroll(), 1);
+    let (scrolled, geometry) = draw_at(&state, &mut app, 120, 10);
+    let content_now = geometry.details.expect("the panel is drawn");
+    assert_eq!(content_now, content, "the panel kept its size");
+    let before: Vec<&str> = opened.lines().collect();
+    let after: Vec<&str> = scrolled.lines().collect();
+    // The page's own rows: below the panel's frame and its row of page tabs. Only
+    // the panel's columns move, so the fleet's are left out of the comparison.
+    let first = geometry.detail_tabs[0].expect("the pages are tabbed").y + 1;
+    let panel_row = |screen: &[&str], row: u16| -> String {
+        screen[row as usize]
+            .chars()
+            .skip(content.x as usize)
+            .take(content.width as usize)
+            .collect()
+    };
+    for row in first..content.bottom() - 2 {
+        assert_eq!(
+            panel_row(&after, row),
+            panel_row(&before, row + 1),
+            "row {row} is the row below it after one row of scroll:\n{scrolled}"
+        );
+    }
+    let moved = geometry
+        .disclosure_markers
+        .iter()
+        .find(|(marker_key, _)| marker_key == &key)
+        .expect("the open block is still on screen")
+        .1;
+    assert_eq!(moved.y, block.y - 1, "by the row it was asked for");
+    assert_eq!(glyph_at(&scrolled, (moved.x, moved.y)), Some('\u{25be}'));
+
+    // The row the marker used to occupy answers to nothing, and the row it is on
+    // now closes exactly the block it labels.
+    click_at(&mut app, (block.x, block.y));
+    assert!(
+        app.disclosure_open(&key),
+        "a position the marker left does not toggle its block"
+    );
+    click_at(&mut app, (moved.x, moved.y));
+    assert!(!app.disclosure_open(&key), "the glyph's row closes it");
+
+    // The terminal narrows until the panel stacks under the fleet, and the page
+    // wraps further still: the target is on the glyph there too.
+    let (stacked, geometry) = draw_at(&state, &mut app, 46, 24);
+    let closed = geometry
+        .disclosure_markers
+        .iter()
+        .find(|(marker_key, _)| marker_key == &key)
+        .expect("the marker is drawn on a stacked panel")
+        .1;
+    assert!(
+        is_inside(
+            geometry.details.expect("the panel is drawn"),
+            (closed.x, closed.y)
+        ),
+        "the marker is drawn in the panel it belongs to: {closed:?}"
+    );
+    assert_eq!(
+        glyph_at(&stacked, (closed.x, closed.y)),
+        Some('\u{25b8}'),
+        "the target follows the glyph after a resize:\n{stacked}"
+    );
+    click_at(&mut app, (closed.x, closed.y));
+    assert!(app.disclosure_open(&key), "the stacked marker opens it");
+}
+
+/// Whether a position is inside a drawn area.
+fn is_inside(area: ratatui::layout::Rect, at: (u16, u16)) -> bool {
+    at.0 >= area.x && at.0 < area.right() && at.1 >= area.y && at.1 < area.bottom()
+}
+
+#[test]
+fn a_task_block_hides_only_its_command_and_directory() {
+    let state = fleet(&[("wH:p1", Some(SESSION), None)]);
+    let mut app = app_for(&state);
+    let mut running = task_with_text("bg-1", "nix build .#radar", "/home/x/proj");
+    running.started_at = Some(now_unix_ms() - 158_000);
+    running.output_bytes = Some(18_244);
+    running.exit_code = Some(0);
+    publish(&mut app, SESSION, vec![running]);
+    select_agent(&mut app, "wH:p1");
+    app.select_page(DetailPage::Tasks);
+
+    // Closed: the facts a reader compares down the list stay drawn — identity,
+    // state and the measures beside them — and the text that wraps over the
+    // panel is the part behind the marker.
+    let (collapsed, geometry) = drawn(&state, &app);
+    assert!(collapsed.contains("▸ task: bg-1 · running"), "{collapsed}");
+    assert!(collapsed.contains("2m38s"), "{collapsed}");
+    assert!(collapsed.contains("18244 B"), "{collapsed}");
+    assert!(collapsed.contains("exit 0"), "{collapsed}");
+    assert!(!collapsed.contains("command:"), "{collapsed}");
+    assert!(!collapsed.contains("cwd:"), "{collapsed}");
+    let markers = geometry.disclosure_markers;
+    assert_eq!(markers.len(), 1, "one block to open: {markers:?}");
+    let details = geometry.details.expect("the panel is drawn");
+    let (key, marker) = &markers[0];
+    assert!(
+        marker.x >= details.x
+            && marker.right() <= details.right()
+            && marker.y >= details.y
+            && marker.y < details.bottom(),
+        "the marker is drawn in the panel it belongs to: {marker:?} in {details:?}"
+    );
+
+    // Opened, and only through the interface a reader has.
+    assert!(!app.disclosure_open(key));
+    app.toggle_block(key);
+    assert!(app.disclosure_open(key));
+    let (opened, _) = drawn(&state, &app);
+    assert!(opened.contains("▾ task: bg-1 · running"), "{opened}");
+    assert!(opened.contains("command: nix build .#radar"), "{opened}");
+    assert!(opened.contains("cwd: /home/x/proj"), "{opened}");
+    assert!(opened.contains("exit 0"), "{opened}");
+}
+
+#[test]
+fn a_task_with_nothing_long_to_hide_draws_no_marker() {
+    let state = fleet(&[("wH:p1", Some(SESSION), None)]);
+    let mut app = app_for(&state);
+    publish(&mut app, SESSION, vec![task("bg-1", TaskState::Running)]);
+    select_agent(&mut app, "wH:p1");
+    app.select_page(DetailPage::Tasks);
+
+    // The task line is drawn as it always was, and the marker is not: a glyph
+    // that opens nothing is a target the pointer would answer with a block that
+    // is not there.
+    let (screen, geometry) = drawn(&state, &app);
+    assert!(screen.contains("task: bg-1 · running"), "{screen}");
+    assert!(app.disclosures().is_empty(), "nothing to open");
+    assert!(
+        geometry.disclosure_markers.is_empty(),
+        "a marker with nothing behind it: {:?}\n{screen}",
+        geometry.disclosure_markers
+    );
+}
+
+#[test]
+fn an_opened_task_block_survives_its_task_and_leaves_with_it() {
+    let state = fleet(&[("wH:p1", Some(SESSION), None)]);
+    let mut app = app_for(&state);
+    publish(
+        &mut app,
+        SESSION,
+        vec![task_with_text("bg-1", "nix build", "/home/x")],
+    );
+    select_agent(&mut app, "wH:p1");
+    app.select_page(DetailPage::Tasks);
+    let block = app.disclosures().pop().expect("the task has text to open");
+    app.toggle_block(&block);
+    assert!(app.disclosure_open(&block));
+    assert!(screen(&state, &app).contains("command: nix build"));
+
+    // The publisher publishes its list again with the same task in it, and the
+    // next poll refreshes against the same observation: the task is the same
+    // one, so the block the reader opened is still theirs.
+    app.apply_bus_event(BusEvent::Tasks {
+        session: SESSION.into(),
+        tasks: vec![task_with_text("bg-1", "nix build", "/home/x")],
+    });
+    app.refresh(&state);
+    assert_eq!(app.disclosures(), vec![block.clone()]);
+    assert!(app.disclosure_open(&block));
+
+    // A list that no longer carries the task takes its block with it, and the
+    // task that replaced it starts closed.
+    publish(
+        &mut app,
+        SESSION,
+        vec![task_with_text("bg-2", "cargo test", "/home/y")],
+    );
+    assert!(
+        !app.disclosure_open(&block),
+        "a task that left left its expansion behind"
+    );
+    let replaced = app.disclosures();
+    assert_eq!(replaced.len(), 1, "{replaced:?}");
+    assert!(!app.disclosure_open(&replaced[0]));
+    let screen = screen(&state, &app);
+    assert!(screen.contains("task: bg-2"), "{screen}");
+    assert!(!screen.contains("command: cargo test"), "{screen}");
 }

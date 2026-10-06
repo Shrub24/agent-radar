@@ -544,6 +544,11 @@ impl FleetObservation {
 ///
 /// The reconciler treats only [`ForegroundEvidence::NonShell`] as positive
 /// supersession evidence; absence or ambiguity retains the last observation.
+// `NonShell` is far larger than the other variants because it is the only one
+// with a process to describe. Boxing its facts would add an allocation to every
+// pane's evidence for a difference no held-in-memory set notices: there is one
+// of these per pane, not one per process sampled.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ForegroundEvidence {
     /// The pane shell owns the foreground process group (shell PID evidence).
@@ -578,6 +583,165 @@ pub struct LocalFacts {
     pub terminal: TerminalMode,
     /// How the foreground program's executable compares with the installed one.
     pub binary: BinaryIdentity,
+    /// What the process is using, from the sample taken for it. `None` when no
+    /// sample was taken: this machine has no reader for that process, the
+    /// process could not be read, or the platform cannot sample at all. A
+    /// reading from an earlier refresh is never carried here.
+    pub resources: Option<ProcessResources>,
+}
+
+/// Which process incarnation a sample belongs to.
+///
+/// The kernel reuses process ids, so a pid does not name a process: one
+/// incarnation is the boot it started in, its pid, and when it started. Those
+/// are what make two readings comparable — counters may only be subtracted
+/// from an earlier reading of the same identity, and a difference taken across
+/// two of them measures neither process.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProcessIdentity {
+    /// The boot this process started in, as the kernel reports it.
+    pub boot_id: String,
+    /// The process id, unique within one boot and one incarnation of it.
+    pub pid: i32,
+    /// Start time since boot, in clock ticks (`starttime` in
+    /// `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
+    pub start_ticks: u64,
+}
+
+/// What one process is using, as the collector sampled it.
+///
+/// These are the resources of that process and of nothing larger: a build
+/// running beneath a pane is a descendant and is summed separately in
+/// [`Self::descendants`], and nothing here says who owns the process, what work
+/// it serves, or whether it is progressing. Every field comes from one read of
+/// the process, so a sample never mixes two incarnations; RSS is that process's
+/// resident set, in which pages shared with another process are counted here as
+/// well.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessResources {
+    /// The incarnation these readings belong to.
+    pub identity: ProcessIdentity,
+    /// The kernel's scheduler state when the sample was taken.
+    pub state: ProcessState,
+    /// Resident set size in bytes. `None` when this machine cannot convert the
+    /// kernel's page count.
+    pub rss_bytes: Option<u64>,
+    /// Interval CPU since the previous sample of this same identity. `None`
+    /// until such a sample exists, and whenever the interval cannot be
+    /// measured.
+    pub cpu: Option<CpuPercent>,
+    /// What the processes beneath this one are using, as the refresh's scan
+    /// observed them. Never merged with the fields above: a build's work is not
+    /// its launcher's.
+    pub descendants: DescendantResources,
+}
+
+/// A total over processes, and what it actually covers.
+///
+/// A sum is not a measurement by itself: it can be small because its members
+/// were idle, or because the scan could not read them. The variant keeps that
+/// difference, so an incomplete total can never be read as a complete zero, and
+/// the reason travels with it because the reader has to know which members are
+/// missing to know what the number is worth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Total<T> {
+    /// Every member of the set contributed to it.
+    Complete(T),
+    /// A lower bound: some members could not contribute, for the reason given.
+    Partial(T, String),
+    /// Nothing could be totalled, for the reason given.
+    Unknown(String),
+}
+
+/// What the processes beneath one root are using, as one scan observed them.
+///
+/// The members are the kernel's descendants — the ancestry its parent links
+/// reported when the scan read them — and never a claim of ownership: a build
+/// beneath a pane belongs to no agent, session, assignment or background task
+/// that Radar knows of, and none of these totals is a cgroup or workload total.
+/// A process beneath two roots contributes to each of their totals while being
+/// read once, and RSS is summed per process, so pages shared between two
+/// descendants, or between a descendant and its ancestor, are counted once for
+/// every process that maps them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescendantResources {
+    /// How many processes the scan observed beneath the root. `None` when none
+    /// could be enumerated at all.
+    pub observed: Option<u32>,
+    /// The resident set of those of them whose size could be read.
+    pub rss_bytes: Total<u64>,
+    /// Their interval CPU. Every one of them needs its own matching pair of
+    /// readings, so a descendant seen for the first time contributes nothing
+    /// and leaves this partial.
+    pub cpu: Total<CpuPercent>,
+}
+
+/// Interval CPU use of one process, as a percentage of one CPU.
+///
+/// Held in hundredths of a percent, as an integer: the value is a ratio of two
+/// kernel counter readings, and an exact integer is what a row can show and a
+/// test can assert. `12.5%` of one CPU is `1_250`. It measures the process
+/// rather than the machine, so a process that used two CPUs for a whole
+/// interval is `20_000`, not `100%`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuPercent(u32);
+
+impl CpuPercent {
+    /// From hundredths of a percent of one CPU.
+    pub fn from_hundredths(hundredths: u32) -> Self {
+        Self(hundredths)
+    }
+
+    /// Hundredths of a percent of one CPU.
+    pub fn hundredths(self) -> u32 {
+        self.0
+    }
+}
+
+/// The scheduler state the kernel reports for a process.
+///
+/// A state letter travels with every process and is observable, but it says
+/// only what the scheduler is doing with it: a sleeping process may be waiting
+/// on a socket or on nothing, and a zombie has already exited. It is not
+/// activity, not progress and not a verdict on the work underneath.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessState {
+    /// Running, or waiting its turn on a CPU.
+    Running,
+    /// Interruptible sleep: waiting, but wakeable.
+    Sleeping,
+    /// Uninterruptible sleep, usually blocked in the kernel on I/O.
+    DiskSleep,
+    /// Stopped by a signal.
+    Stopped,
+    /// Stopped because something is tracing it.
+    TracingStop,
+    /// Exited, not yet reaped by its parent.
+    Zombie,
+    /// Gone, or being torn down.
+    Dead,
+    /// Idle in the kernel, below the scheduler's oldest run queue.
+    Idle,
+    /// A state this kernel wrote that Radar does not name.
+    Other(char),
+}
+
+impl ProcessState {
+    /// What the kernel's state letter stands for, or [`Self::Other`] for a
+    /// letter this kernel has and Radar does not name.
+    pub fn from_letter(letter: char) -> Self {
+        match letter {
+            'R' => Self::Running,
+            'S' => Self::Sleeping,
+            'D' => Self::DiskSleep,
+            'T' => Self::Stopped,
+            't' => Self::TracingStop,
+            'Z' => Self::Zombie,
+            'X' | 'x' => Self::Dead,
+            'I' => Self::Idle,
+            other => Self::Other(other),
+        }
+    }
 }
 
 /// How a foreground process's running executable compares with the program

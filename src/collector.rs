@@ -33,7 +33,13 @@
 //! active assignment's age is measured once per refresh against one read of the
 //! clock, so decoded facts stay clockless and the rows of a single frame stay
 //! comparable. Local `/proc` facts are composed into the foreground evidence the
-//! provider returned, so every adapter gets them the same way.
+//! provider returned, so every adapter gets them the same way; that includes the
+//! process's resources, the one fact with a memory — interval CPU is the
+//! difference between two readings of the same process, and the history is
+//! carried from one refresh to the next and pruned to the processes the last one
+//! saw. A refresh's process table is read once, before the roots are sampled, so
+//! every root summarises its descendants from the same snapshot at the same
+//! instant.
 //!
 //! Which panes get queried comes from
 //! [`ObservationState::continuity_candidates`], which the reconciler re-arms on
@@ -42,15 +48,15 @@
 //! cycles: retention itself is immediate, and its shell/non-shell confirmation
 //! lands within two poll intervals.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::observation::ObservationState;
-use crate::procfs;
+use crate::procfs::{self, Sampler};
 use crate::runtime::RuntimeProvider;
 
 /// Interval between refreshes when [`CollectorConfig::poll_interval`] is left
@@ -108,6 +114,14 @@ pub struct Collector {
     /// The runtime this collector reads. Injected at assembly, so the same path
     /// serves the production adapter and a test fake.
     provider: Arc<dyn RuntimeProvider>,
+    /// The resource sampling history, one for the run.
+    ///
+    /// It outlives a refresh — interval CPU is the difference between two
+    /// readings of the same process — and a refresh runs on its own thread, so
+    /// it is shared with that thread rather than handed over: one lock, held for
+    /// the length of the refresh that sampling belongs to, which is the only
+    /// time any thread touches it.
+    sampler: Arc<Mutex<Sampler>>,
     /// When the next refresh may start; already due at construction.
     next_refresh: Instant,
     in_flight: Option<Refresh>,
@@ -117,9 +131,20 @@ pub struct Collector {
 impl Collector {
     /// A collector that runs nothing until the first [`Self::tick`].
     pub fn new(config: CollectorConfig, provider: impl RuntimeProvider + 'static) -> Self {
+        Self::sampling(config, provider, Sampler::new())
+    }
+
+    /// A collector sampling with `sampler`, as tests and callers that must not
+    /// read this machine's process table supply.
+    pub fn sampling(
+        config: CollectorConfig,
+        provider: impl RuntimeProvider + 'static,
+        sampler: Sampler,
+    ) -> Self {
         Self {
             config,
             provider: Arc::new(provider),
+            sampler: Arc::new(Mutex::new(sampler)),
             next_refresh: Instant::now(),
             in_flight: None,
             stopped: false,
@@ -221,10 +246,11 @@ impl Collector {
         let worker = {
             let provider = Arc::clone(&self.provider);
             let cancel = Arc::clone(&cancel);
+            let sampler = Arc::clone(&self.sampler);
             thread::Builder::new()
                 .name("radar-collector".to_string())
                 .spawn(move || {
-                    let _ = sender.send(collect(provider.as_ref(), &candidates, &cancel));
+                    let _ = sender.send(collect(provider.as_ref(), &candidates, &cancel, &sampler));
                 })
                 .expect("collector thread")
         };
@@ -247,6 +273,7 @@ fn collect(
     provider: &dyn RuntimeProvider,
     candidates: &[String],
     cancel: &AtomicBool,
+    sampler: &Mutex<Sampler>,
 ) -> RefreshOutcome {
     let mut observation = match provider.inventory(cancel) {
         Ok(observation) => observation,
@@ -256,17 +283,38 @@ fn collect(
     // One PATH lookup per distinct program name for the whole refresh, and one
     // entry point for the local facts composed onto the evidence below.
     let mut binaries = procfs::BinaryIndex::new();
+    // The sampling history is this refresh's for as long as it samples: the
+    // collector starts no other refresh, so the lock is never contended. A
+    // worker that panicked while holding it leaves counters and timestamps
+    // behind, and the worst a half-updated history can do is report one interval
+    // as unknown — which is not a reason to stop measuring.
+    let mut sampler = sampler
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // One instant for the whole refresh, so every interval in one frame is
+    // measured over the same clock, and one snapshot of the process table for
+    // every root in it: descendants are summed from that scan rather than the
+    // table being walked once per pane.
+    let now = Instant::now();
+    if !candidates.is_empty() {
+        sampler.scan(now, cancel);
+    }
+    let evidence = candidates
+        .iter()
+        .map(|pane_id| {
+            (
+                pane_id.clone(),
+                evidence_for(provider, pane_id, cancel, &mut binaries, &mut sampler, now),
+            )
+        })
+        .collect();
+    // The refresh is the unit the history is bounded by, and this is after every
+    // root has summed its descendants: the processes this refresh did not read do
+    // not come back, and their counters are not kept for them.
+    sampler.finish();
     RefreshOutcome::Success {
         observation,
-        evidence: candidates
-            .iter()
-            .map(|pane_id| {
-                (
-                    pane_id.clone(),
-                    evidence_for(provider, pane_id, cancel, &mut binaries),
-                )
-            })
-            .collect(),
+        evidence,
     }
 }
 
@@ -306,13 +354,15 @@ fn evidence_for(
     pane_id: &str,
     cancel: &AtomicBool,
     binaries: &mut procfs::BinaryIndex,
+    sampler: &mut Sampler,
+    now: Instant,
 ) -> ForegroundEvidence {
     let mut evidence = provider.foreground_evidence(pane_id, cancel);
     if let ForegroundEvidence::NonShell {
         pid, name, local, ..
     } = &mut evidence
     {
-        *local = procfs::facts(*pid, name.as_deref(), binaries);
+        *local = procfs::facts(*pid, name.as_deref(), binaries, sampler, now);
     }
     evidence
 }

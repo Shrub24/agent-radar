@@ -264,7 +264,8 @@ pub fn decode_snapshot(output: &str) -> Result<FleetObservation, DecodeError> {
 /// Decodes `herdr pane process-info --pane <id>` output into foreground
 /// evidence.
 ///
-/// Only PID/process-group facts are interpreted, never shell executable names.
+/// A pane's original shell PID can survive `exec` into another program, so
+/// matching PIDs alone do not establish that the foreground is still a shell.
 /// Malformed output is an error (the collector reports it as inconclusive);
 /// absent or inconsistent PID fields decode to
 /// [`ForegroundEvidence::Inconclusive`].
@@ -277,23 +278,48 @@ pub fn decode_process_info(output: &str) -> Result<ForegroundEvidence, DecodeErr
     else {
         return Ok(ForegroundEvidence::Inconclusive);
     };
-    if foreground_group == shell_pid {
-        return Ok(ForegroundEvidence::Shell);
-    }
     // The foreground group leader identifies the command occupying the pane.
-    // If it is already gone, nothing can be positively named.
-    match record
+    // The original shell may have exec'd into it without changing its PID.
+    let Some(leader) = record
         .foreground_processes
         .iter()
         .find(|p| p.pid == foreground_group)
-    {
-        Some(leader) => Ok(ForegroundEvidence::command(
-            leader.pid,
-            non_empty(leader.name.clone()),
-            non_empty(leader.cmdline.clone()),
-        )),
-        None => Ok(ForegroundEvidence::Inconclusive),
+    else {
+        return Ok(ForegroundEvidence::Inconclusive);
+    };
+    if foreground_group == shell_pid {
+        let Some(name) = leader.name.as_deref().filter(|name| !name.is_empty()) else {
+            return Ok(ForegroundEvidence::Inconclusive);
+        };
+        if matches!(
+            name.trim_start_matches('-'),
+            "sh" | "bash"
+                | "dash"
+                | "ash"
+                | "zsh"
+                | "fish"
+                | "ksh"
+                | "ksh93"
+                | "mksh"
+                | "csh"
+                | "tcsh"
+                | "nu"
+                | "elvish"
+                | "yash"
+                | "osh"
+                | "oil"
+                | "xonsh"
+                | "pwsh"
+                | "powershell"
+        ) {
+            return Ok(ForegroundEvidence::Shell);
+        }
     }
+    Ok(ForegroundEvidence::command(
+        leader.pid,
+        non_empty(leader.name.clone()),
+        non_empty(leader.cmdline.clone()),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,6 +1291,18 @@ mod tests {
         assert_eq!(
             decode_process_info(&output).expect("decodes"),
             ForegroundEvidence::Shell
+        );
+    }
+
+    #[test]
+    fn exec_replaced_shell_pid_is_a_foreground_command() {
+        let output = process_info(
+            r#"{"pane_id":"wS:pV","shell_pid":1624478,"foreground_process_group_id":1624478,
+                "foreground_processes":[{"pid":1624478,"name":"pi","cmdline":"pi --approve"}]}"#,
+        );
+        assert_eq!(
+            decode_process_info(&output).expect("decodes"),
+            ForegroundEvidence::command(1624478, Some("pi".into()), Some("pi --approve".into()))
         );
     }
 
