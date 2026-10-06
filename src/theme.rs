@@ -208,6 +208,19 @@ pub fn pane_mark() -> &'static str {
     if nerd_font() { "\u{e795}" } else { "\u{25ad}" }
 }
 
+/// The warning mark beside a live agent whose running executable is not the
+/// program installed now. A triangle from the Nerd Font where one can be drawn,
+/// a plain bang where it cannot, so the row is never blank-then-nothing.
+pub fn stale_mark() -> &'static str {
+    stale_mark_for(nerd_font())
+}
+
+/// The stale mark for a terminal with or without the Nerd Font, so the choice
+/// is testable without controlling the process-wide font detection.
+fn stale_mark_for(nerd_font: bool) -> &'static str {
+    if nerd_font { "\u{f071}" } else { "!" }
+}
+
 /// The frames the running-command marks move by: an ordinary pane's foreground
 /// command, and the mark beside an agent row's running background work. One
 /// setting, because both mean the same thing — a process is running here.
@@ -477,6 +490,11 @@ mod tests {
         assert!(!needs_nerd_font("\u{25ad}"));
         assert!(needs_nerd_font("\u{e795}"));
         assert!(needs_nerd_font("\u{f0524}"));
+        // The stale warning is one of those codepoints, so a terminal without
+        // the font gets the plain fallback rather than tofu.
+        assert!(needs_nerd_font("\u{f071}"));
+        assert_eq!(stale_mark_for(false), "!");
+        assert_eq!(stale_mark_for(true), "\u{f071}");
         assert!(
             crate::process_icons::PROCESS_ICONS
                 .iter()

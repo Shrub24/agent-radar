@@ -141,10 +141,13 @@ impl Collector {
         }
         let applied = self.apply_finished(state);
         if self.in_flight.is_none() && Instant::now() >= self.next_refresh {
+            // A whole-fleet process sweep covers every pane; otherwise the
+            // candidates are the continuity retentions plus the live agent panes
+            // an agent row's staleness mark needs.
             let candidates = if processes {
                 state.pane_ids()
             } else {
-                state.continuity_candidates()
+                state.evidence_candidates()
             };
             self.start_refresh(candidates);
         }
@@ -250,11 +253,19 @@ fn collect(
         Err(diagnostic) => return RefreshOutcome::Failure { diagnostic },
     };
     stamp_assignment_ages(&mut observation);
+    // One PATH lookup per distinct program name for the whole refresh, and one
+    // entry point for the local facts composed onto the evidence below.
+    let mut binaries = procfs::BinaryIndex::new();
     RefreshOutcome::Success {
         observation,
         evidence: candidates
             .iter()
-            .map(|pane_id| (pane_id.clone(), evidence_for(provider, pane_id, cancel)))
+            .map(|pane_id| {
+                (
+                    pane_id.clone(),
+                    evidence_for(provider, pane_id, cancel, &mut binaries),
+                )
+            })
             .collect(),
     }
 }
@@ -282,21 +293,26 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-/// Foreground evidence for one continuity candidate.
+/// Foreground evidence for one pane.
 ///
 /// The provider answers with what the runtime reports; this machine's own facts
-/// about that process are composed in here, where the process id is already in
-/// hand, so nothing above the seam has to know about `/proc` and every adapter
-/// gets the composition the same way. An inconclusive answer has no process to
-/// look up and is passed through unchanged.
+/// about that process are composed in here, where the process id and the
+/// program name the runtime reported are already in hand, so nothing above the
+/// seam has to know about `/proc` or `PATH` and every adapter gets the
+/// composition the same way. An inconclusive answer has no process to look up
+/// and is passed through unchanged.
 fn evidence_for(
     provider: &dyn RuntimeProvider,
     pane_id: &str,
     cancel: &AtomicBool,
+    binaries: &mut procfs::BinaryIndex,
 ) -> ForegroundEvidence {
     let mut evidence = provider.foreground_evidence(pane_id, cancel);
-    if let ForegroundEvidence::NonShell { pid, local, .. } = &mut evidence {
-        *local = procfs::facts(*pid);
+    if let ForegroundEvidence::NonShell {
+        pid, name, local, ..
+    } = &mut evidence
+    {
+        *local = procfs::facts(*pid, name.as_deref(), binaries);
     }
     evidence
 }

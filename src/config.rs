@@ -52,6 +52,8 @@ pub struct Palette {
     pub retained: Color,
     /// A source failure the user has to notice.
     pub failed: Color,
+    /// A live agent whose running executable is not the one installed now.
+    pub stale: Color,
     /// The fill behind the selected row.
     pub selection: Color,
 }
@@ -63,7 +65,7 @@ impl Palette {
     /// The printed document and its round trip are derived from this, so a
     /// role cannot be added to the palette and silently left out of what the
     /// user is shown or able to set.
-    pub fn named(&self) -> [(&'static str, Color); 13] {
+    pub fn named(&self) -> [(&'static str, Color); 14] {
         [
             ("heading", self.heading),
             ("border", self.border),
@@ -77,6 +79,7 @@ impl Palette {
             ("settling", self.settling),
             ("retained", self.retained),
             ("failed", self.failed),
+            ("stale", self.stale),
             ("selection", self.selection),
         ]
     }
@@ -105,6 +108,10 @@ impl Default for Palette {
             settling: Color::Blue,
             retained: Color::LightYellow,
             failed: Color::LightRed,
+            // A warning, not a failure: the process still runs, its file does
+            // not match. Distinct from `blocked`'s light yellow so the two
+            // read apart on the same row.
+            stale: Color::Yellow,
             selection: Color::Black,
         }
     }
@@ -458,6 +465,7 @@ impl Palette {
             "settling" => self.settling = color,
             "retained" => self.retained = color,
             "failed" => self.failed = color,
+            "stale" => self.stale = color,
             "selection" => self.selection = color,
             _ => {}
         }
@@ -581,7 +589,7 @@ struct FileAppearance {
 
 impl FileColors {
     /// The roles the document set, in a fixed order.
-    fn entries(&self) -> [(&'static str, Option<&ColorSpec>); 13] {
+    fn entries(&self) -> [(&'static str, Option<&ColorSpec>); 14] {
         [
             ("heading", self.heading.as_ref()),
             ("border", self.border.as_ref()),
@@ -595,6 +603,7 @@ impl FileColors {
             ("settling", self.settling.as_ref()),
             ("retained", self.retained.as_ref()),
             ("failed", self.failed.as_ref()),
+            ("stale", self.stale.as_ref()),
             ("selection", self.selection.as_ref()),
         ]
     }
@@ -615,6 +624,7 @@ struct FileColors {
     settling: Option<ColorSpec>,
     retained: Option<ColorSpec>,
     failed: Option<ColorSpec>,
+    stale: Option<ColorSpec>,
     selection: Option<ColorSpec>,
 }
 

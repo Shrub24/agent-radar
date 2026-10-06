@@ -121,6 +121,12 @@ already draws them:
   one is published; an agent with no published hue takes the row's ink rather
   than an invented colour. Green and red stay reserved for done and for a source
   failure.
+- A live agent whose running executable no longer matches the program `PATH`
+  resolves is marked with a warning glyph in the `stale` colour, and its details
+  name the running and installed installations. A deliberate other build — a
+  checkout or a second installation — has no mark and says `not the installed
+  program`; a process that has gone, or a comparison that cannot be read, claims
+  nothing.
 - The working row is set in **bold** as well as coloured: weight is the second
   axis a coloured list needs, and spending it on the lifecycle that is *moving*
   keeps the finished and parked rows quiet.
@@ -289,6 +295,7 @@ blocked   = "light-yellow" # waiting on its owner: the row to act on
 settling  = "blue"        # a handoff converging, dimmer than working
 retained  = "light-yellow"
 failed    = "light-red"
+stale     = "yellow"      # a live agent whose binary was replaced
 selection = "dark-gray"   # the fill behind the selected row
 
 [brands]                  # a vendor's own colour, literal by nature

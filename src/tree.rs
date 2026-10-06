@@ -236,6 +236,22 @@ pub struct AgentRow {
     /// speak for it (see [`TaskProjection`]). The row's task children are this
     /// same list, so the badge, the details and the rows drawn cannot disagree.
     pub tasks: TaskProjection,
+    /// What the source last reported about the pane's foreground, when a live
+    /// process was queried for this pane. `None` for a retained row (no live
+    /// process to compare) and until a refresh has asked about the pane.
+    pub foreground: Option<ForegroundEvidence>,
+}
+
+impl AgentRow {
+    /// How the foreground executable compares with the program installed now,
+    /// when a live process was queried for this pane. A shell, an inconclusive
+    /// foreground or no query at all yields nothing to claim.
+    pub fn binary(&self) -> Option<&crate::model::BinaryIdentity> {
+        match self.foreground.as_ref()? {
+            ForegroundEvidence::NonShell { local, .. } => Some(&local.binary),
+            _ => None,
+        }
+    }
 }
 
 /// An ordinary (non-agent) pane row, shown only when the user toggles
@@ -358,7 +374,14 @@ impl FleetTree {
                 }
                 let pane = inventory.pane(pane_id);
                 agents.push((
-                    agent_node(agent, None, pane, &workspace_labels, &tab_labels),
+                    agent_node(
+                        agent,
+                        None,
+                        pane,
+                        state.foreground(pane_id).cloned(),
+                        &workspace_labels,
+                        &tab_labels,
+                    ),
                     agent.lineage.clone(),
                 ));
             }
@@ -377,6 +400,9 @@ impl FleetTree {
                         agent,
                         Some(retained.basis.clone()),
                         pane,
+                        // A retained row has no live process: it is not shown
+                        // staleness at all, whatever evidence the pane holds.
+                        None,
                         &workspace_labels,
                         &tab_labels,
                     ),
@@ -504,6 +530,7 @@ fn agent_node(
     agent: &AgentObservation,
     retained: Option<RetentionBasis>,
     pane: Option<&Pane>,
+    foreground: Option<ForegroundEvidence>,
     workspace_labels: &HashMap<&str, &str>,
     tab_labels: &HashMap<&str, &str>,
 ) -> TreeNode {
@@ -556,6 +583,7 @@ fn agent_node(
                 // Filled by `FleetTree::attach_tasks`: the observation cannot
                 // say what a publisher is connected with.
                 tasks: TaskProjection::default(),
+                foreground,
             })),
         },
         children: Vec::new(),

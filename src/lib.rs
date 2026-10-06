@@ -23,8 +23,9 @@ pub use config::{Config, Palette};
 pub use focus::Focuser;
 pub use herdr::{DecodeError, HerdrConfig, HerdrRuntime, decode_process_info, decode_snapshot};
 pub use model::{
-    AgentObservation, FleetObservation, ForegroundEvidence, Lineage, LocalFacts, Location, Pane,
-    RuntimeStatus, SessionIdentity, SessionUuid, Tab, TerminalMode, Workspace,
+    AgentObservation, BinaryFreshness, BinaryIdentity, FleetObservation, ForegroundEvidence,
+    Lineage, LocalFacts, Location, Pane, RuntimeStatus, SessionIdentity, SessionUuid, Tab,
+    TerminalMode, Workspace,
 };
 pub use observation::{ObservationState, RetainedAgent, RetentionBasis, SourceFreshness};
 pub use runtime::{RuntimeProvider, Target};

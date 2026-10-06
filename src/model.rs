@@ -562,13 +562,49 @@ fn base_name(value: &str) -> &str {
 
 /// What this machine knows about the process holding a pane's foreground,
 /// beyond what the runtime reports.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LocalFacts {
     /// How long the process has been alive, measured from its own start time
     /// rather than from when Radar first saw it.
     pub running_for: Option<Duration>,
     /// What it has done to the terminal.
     pub terminal: TerminalMode,
+    /// How the foreground program's executable compares with the installed one.
+    pub binary: BinaryIdentity,
+}
+
+/// How a foreground process's running executable compares with the program
+/// `PATH` resolves for the same name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BinaryFreshness {
+    /// The running executable is the installed program, or another file inside
+    /// the same installation.
+    Current,
+    /// The running executable's file was replaced or removed, or its
+    /// installation differs from the one installed now.
+    Stale,
+    /// Nothing could be compared: the process is gone, its executable or the
+    /// installed program is unreadable, the running file is not the named
+    /// program, or this platform has no reader.
+    #[default]
+    Unknown,
+}
+
+/// What was compared, and how it came out.
+///
+/// The two identities are the installations the executables belong to — the
+/// Nix store root, or the resolved path elsewhere — never parsed into versions
+/// or package names: the freshness says whether they differ, and the identities
+/// let a row name both without inventing anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BinaryIdentity {
+    pub freshness: BinaryFreshness,
+    /// The installation the running executable belongs to. `None` when its
+    /// executable could not be read, or was not the named program.
+    pub running: Option<String>,
+    /// The installation the `PATH` match for the program belongs to. `None`
+    /// when no search directory has it.
+    pub installed: Option<String>,
 }
 
 /// Whether a foreground program has taken the terminal over.
@@ -605,7 +641,7 @@ impl ForegroundEvidence {
     /// What this machine knows about the foreground process, if one is named.
     pub fn local(&self) -> LocalFacts {
         match self {
-            Self::NonShell { local, .. } => *local,
+            Self::NonShell { local, .. } => local.clone(),
             _ => LocalFacts::default(),
         }
     }

@@ -24,7 +24,10 @@ use crate::app::{App, Geometry, VisibleRow};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bus::Task;
-use crate::model::{AgentState, ForegroundEvidence, HerdsmanFacts, SessionIdentity, TerminalMode};
+use crate::model::{
+    AgentState, BinaryFreshness, BinaryIdentity, ForegroundEvidence, HerdsmanFacts,
+    SessionIdentity, TerminalMode,
+};
 use crate::observation::{ObservationState, RetentionBasis, SourceFreshness};
 use crate::theme;
 use crate::tree::{AgentRow, RowKind, TaskRow, TaskSource};
@@ -87,7 +90,14 @@ pub fn render(
     } else {
         let items: Vec<ListItem> = rows
             .iter()
-            .map(|row| row_item(row, tick, tree_area.width.saturating_sub(2) as usize))
+            .map(|row| {
+                row_item(
+                    row,
+                    tick,
+                    tree_area.width.saturating_sub(2) as usize,
+                    matches!(state.source_freshness(), SourceFreshness::Current),
+                )
+            })
             .collect();
         list_state.select(app.selected_index());
         let list = List::new(items).block(block).highlight_style(
@@ -382,7 +392,12 @@ fn empty_message(state: &ObservationState, app: &App) -> String {
     }
 }
 
-fn row_item(row: &VisibleRow<'_>, tick: usize, width: usize) -> ListItem<'static> {
+fn row_item(
+    row: &VisibleRow<'_>,
+    tick: usize,
+    width: usize,
+    source_current: bool,
+) -> ListItem<'static> {
     let palette = theme::palette();
     let mut spans: Vec<Span<'static>> = Vec::new();
     // The span that gives way when the row is wider than the panel: the name,
@@ -438,6 +453,20 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, width: usize) -> ListItem<'static
                 spans.push(Span::styled(
                     format!("{logo} "),
                     Style::new().fg(theme::agent_ink(name, retained)),
+                ));
+            }
+            // A stale mark only where the facts are current and a live process
+            // was compared: a retained row has no process, and a stale source
+            // must not present its last-good facts as freshly read.
+            if source_current
+                && !retained
+                && agent
+                    .binary()
+                    .is_some_and(|binary| binary.freshness == BinaryFreshness::Stale)
+            {
+                spans.push(Span::styled(
+                    format!("{} ", theme::stale_mark()),
+                    Style::new().fg(palette.stale),
                 ));
             }
             // The row's own text carries the state too, with weight spent on
@@ -726,6 +755,30 @@ fn terminal_line(mode: TerminalMode) -> String {
     }
 }
 
+/// How a live agent's running executable compares with the program installed
+/// now, in words.
+///
+/// Two identities that differ without a replacement are a deliberate other
+/// build — a checkout or a second installation — not a stale one; matching
+/// installations say nothing, and an unknown comparison is never claimed.
+fn binary_line(identity: &BinaryIdentity) -> Option<Line<'static>> {
+    let running = identity.running.as_deref();
+    let installed = identity.installed.as_deref();
+    let verdict = match identity.freshness {
+        BinaryFreshness::Stale => "stale",
+        BinaryFreshness::Current if running != installed => "not the installed program",
+        _ => return None,
+    };
+    Some(field(
+        "binary",
+        format!(
+            "{verdict} — running {}, installed {}",
+            sanitize(running?),
+            sanitize(installed?)
+        ),
+    ))
+}
+
 fn basis_label(basis: &RetentionBasis) -> &'static str {
     match basis {
         RetentionBasis::ShellForeground => "shell foreground",
@@ -862,6 +915,15 @@ fn detail_lines(state: &ObservationState, app: &App) -> Vec<Line<'static>> {
             });
             lines.extend(herdsman_lines(&agent.facts, !bus_authoritative));
             lines.extend(task_lines(agent));
+            // A machine fact like the pane's terminal: a live process compared
+            // with the program installed now. A retained row has no process,
+            // and a stale source must not present its last-good facts as
+            // freshly read.
+            if agent.retained.is_none()
+                && matches!(state.source_freshness(), SourceFreshness::Current)
+            {
+                lines.extend(agent.binary().and_then(binary_line));
+            }
             // Freshness and identity last: a long reported session path wraps,
             // and it must not push the required fields out of a small panel.
             lines.push(detail_freshness(state, &row));
@@ -1220,8 +1282,9 @@ mod tests {
     use crate::app::Action;
     use crate::herdr::decode_snapshot;
     use crate::model::{
-        AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Location, Pane,
-        RuntimeStatus, SemanticState, Tab, Workspace,
+        AgentObservation, BinaryFreshness, BinaryIdentity, FleetObservation, ForegroundEvidence,
+        HerdsmanFacts, LocalFacts, Location, Pane, RuntimeStatus, SemanticState, Tab, TerminalMode,
+        Workspace,
     };
     use crate::runtime::Target;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
@@ -2856,6 +2919,7 @@ mod tests {
                 *local = LocalFacts {
                     running_for: Some(std::time::Duration::from_secs(running)),
                     terminal,
+                    binary: Default::default(),
                 };
             }
             state.apply_evidence(pane, evidence);
@@ -3028,6 +3092,142 @@ mod tests {
         assert!(screen.contains("foreground: nix build .#radar"), "{screen}");
         // The executable's own path never reaches the screen.
         assert!(!screen.contains("/nix/store/abc-nix"), "{screen}");
+    }
+
+    /// Foreground evidence for a pane, carrying a binary comparison, so a row
+    /// and its details can be read against exactly that identity.
+    fn binary_evidence(identity: BinaryIdentity) -> ForegroundEvidence {
+        let mut evidence = ForegroundEvidence::command(4242, Some("pi".into()), Some("pi".into()));
+        if let ForegroundEvidence::NonShell { local, .. } = &mut evidence {
+            *local = LocalFacts {
+                running_for: None,
+                terminal: TerminalMode::Unknown,
+                binary: identity,
+            };
+        }
+        evidence
+    }
+
+    fn stale_identity() -> BinaryIdentity {
+        BinaryIdentity {
+            freshness: BinaryFreshness::Stale,
+            running: Some("/run/pi-1.0.1".into()),
+            installed: Some("/nix/store/aaa-pi-1.0.2".into()),
+        }
+    }
+
+    #[test]
+    fn a_live_stale_agent_is_marked_and_names_both_installations() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", binary_evidence(stale_identity()));
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let screen = render_text(&state, &app, 180, 34);
+
+        let mark = theme::stale_mark();
+        assert!(screen.contains(&format!("{mark} worker task")), "{screen}");
+        // The details name the two installations exactly, with no version
+        // parsed out of either.
+        assert!(screen.contains("binary: stale"), "{screen}");
+        assert!(screen.contains("/run/pi-1.0.1"), "{screen}");
+        assert!(screen.contains("/nix/store/aaa-pi-1.0.2"), "{screen}");
+
+        // The mark wears the configured stale role, not a hardcoded colour.
+        let mut terminal = Terminal::new(TestBackend::new(180, 34)).expect("infallible");
+        terminal
+            .draw(|frame| {
+                render(frame, &state, &app, &mut ListState::default(), 0);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let cell = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == mark)
+            .expect("the stale mark is drawn");
+        assert_eq!(cell.style().fg, Some(theme::palette().stale));
+    }
+
+    #[test]
+    fn a_readable_other_build_is_unmarked_and_says_it_is_not_installed() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            binary_evidence(BinaryIdentity {
+                freshness: BinaryFreshness::Current,
+                running: Some("/home/dev/pi".into()),
+                installed: Some("/nix/store/aaa-pi-1.0.2".into()),
+            }),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let screen = render_text(&state, &app, 180, 34);
+
+        assert!(
+            !screen.contains(&format!("{} worker task", theme::stale_mark())),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("binary: not the installed program"),
+            "{screen}"
+        );
+        assert!(screen.contains("/home/dev/pi"), "{screen}");
+        assert!(screen.contains("/nix/store/aaa-pi-1.0.2"), "{screen}");
+    }
+
+    #[test]
+    fn matching_or_unreadable_installations_claim_nothing() {
+        // A running executable that is the installed one says nothing: there is
+        // no warning to give.
+        let mut matching = fixture_state();
+        matching.apply_evidence(
+            "wA:p2",
+            binary_evidence(BinaryIdentity {
+                freshness: BinaryFreshness::Current,
+                running: Some("/nix/store/aaa-pi-1.0.2".into()),
+                installed: Some("/nix/store/aaa-pi-1.0.2".into()),
+            }),
+        );
+        let mut app = app_for(&matching);
+        select_agent(&mut app, "wA:p2");
+        let screen = render_text(&matching, &app, 180, 34);
+        assert!(!screen.contains("binary:"), "{screen}");
+        assert!(
+            !screen.contains(&format!("{} worker task", theme::stale_mark())),
+            "{screen}"
+        );
+
+        // An unknown comparison — a gone process, no PATH match, an interpreter
+        // — is not claimed either way.
+        let mut unknown = fixture_state();
+        unknown.apply_evidence("wA:p2", binary_evidence(BinaryIdentity::default()));
+        let mut app = app_for(&unknown);
+        select_agent(&mut app, "wA:p2");
+        let screen = render_text(&unknown, &app, 180, 34);
+        assert!(!screen.contains("binary:"), "{screen}");
+        assert!(
+            !screen.contains(&format!("{} worker task", theme::stale_mark())),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_stale_source_does_not_present_binary_freshness_as_current() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", binary_evidence(stale_identity()));
+        // The last-good inventory and its foreground evidence survive a failed
+        // collection; neither may be presented as a fresh comparison.
+        state.apply_failure("herdr exited with status 1");
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let screen = render_text(&state, &app, 180, 34);
+
+        assert!(screen.contains("source: stale"), "{screen}");
+        assert!(!screen.contains("binary:"), "{screen}");
+        assert!(
+            !screen.contains(&format!("{} worker task", theme::stale_mark())),
+            "{screen}"
+        );
     }
 
     /// A pane the fixture reports with no agent, but whose label is a finished

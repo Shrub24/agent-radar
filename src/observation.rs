@@ -8,7 +8,7 @@
 //!
 //! All transitions are pure: no I/O, no clock, no Herdr knowledge. The
 //! collector supplies decoded [`ForegroundEvidence`] for the panes returned by
-//! [`ObservationState::continuity_candidates`].
+//! [`ObservationState::evidence_candidates`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -239,11 +239,31 @@ impl ObservationState {
     /// Panes of retained associations that still need a process-info query in
     /// this cycle.
     ///
-    /// The collector should query `herdr pane process-info` only for these and
-    /// feed each result back through [`Self::apply_evidence`]. Owned, so the
-    /// caller can mutate the state while iterating.
+    /// The collector feeds each result back through [`Self::apply_evidence`],
+    /// and reaches the live agent panes through [`Self::evidence_candidates`].
+    /// Owned, so the caller can mutate the state while iterating.
     pub fn continuity_candidates(&self) -> Vec<String> {
         self.awaiting_evidence.iter().cloned().collect()
+    }
+
+    /// The panes one non-process refresh asks for foreground evidence.
+    ///
+    /// That is the continuity candidates plus every pane that currently reports
+    /// an agent: an agent row needs a live process to compare with the
+    /// installed program, and a pane is named once however it qualifies. The two
+    /// sets are disjoint by the retention invariant (a retained pane has no
+    /// agent reported on it), and the set makes that structural.
+    pub fn evidence_candidates(&self) -> Vec<String> {
+        let mut candidates: BTreeSet<String> = self.awaiting_evidence.clone();
+        if let Some(inventory) = &self.inventory {
+            candidates.extend(
+                inventory
+                    .agents
+                    .iter()
+                    .map(|agent| agent.location.pane_id.clone()),
+            );
+        }
+        candidates.into_iter().collect()
     }
 }
 
@@ -549,6 +569,40 @@ mod tests {
         assert!(restarted.retained().is_empty());
         assert!(restarted.inventory().is_none());
         assert_eq!(restarted.source_freshness(), &SourceFreshness::Pending);
+    }
+
+    #[test]
+    fn evidence_candidates_cover_agent_panes_and_retentions_once_each() {
+        let one = "/home/dev/sessions/one.jsonl";
+        let two = "/home/dev/sessions/two.jsonl";
+        let three = "/home/dev/sessions/three.jsonl";
+        let mut state = ObservationState::new();
+        state.apply_success(observation(
+            &["wA:p1", "wA:p2"],
+            vec![
+                agent("wA:p1", Some(reported(one)), RuntimeStatus::Idle),
+                agent("wA:p2", Some(reported(two)), RuntimeStatus::Idle),
+            ],
+        ));
+        // The agent on wA:p2 vanishes; its pane stays and is retained, while
+        // wA:p1 and wA:p3 report live agents.
+        state.apply_success(observation(
+            &["wA:p1", "wA:p2", "wA:p3"],
+            vec![
+                agent("wA:p1", Some(reported(one)), RuntimeStatus::Idle),
+                agent("wA:p3", Some(reported(three)), RuntimeStatus::Idle),
+            ],
+        ));
+        assert_eq!(state.continuity_candidates(), vec!["wA:p2".to_string()]);
+
+        assert_eq!(
+            state.evidence_candidates(),
+            vec![
+                "wA:p1".to_string(),
+                "wA:p2".to_string(),
+                "wA:p3".to_string()
+            ]
+        );
     }
 
     #[test]

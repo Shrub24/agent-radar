@@ -412,6 +412,40 @@ fn inconclusive_evidence_leaves_the_association_unverified_and_the_inventory_cur
 }
 
 #[test]
+fn live_agent_panes_receive_foreground_evidence_in_the_agents_view() {
+    let runtime = Arc::new(FakeRuntime::default());
+    // Two live agents and one agent-less pane.
+    let inventory = inventory(
+        &["wA:p1", "wA:p2", "wA:p3"],
+        vec![agent("wA:p1", None), agent("wA:p3", None)],
+    );
+    runtime.set_inventory(inventory.clone());
+    // The state already holds the inventory, so the first refresh's candidates
+    // are the live agent panes rather than an empty first pass.
+    let mut state = ObservationState::new();
+    state.apply_success(inventory);
+    // A long poll interval so exactly one refresh runs: the query list is then
+    // the candidate set of a single refresh, not an accumulation of them.
+    let mut collector = Collector::new(
+        CollectorConfig {
+            poll_interval: Duration::from_secs(30),
+        },
+        Arc::clone(&runtime),
+    );
+    assert!(refresh_until(&mut collector, &mut state, |state| state
+        .foreground("wA:p1")
+        .is_some()
+        && state.foreground("wA:p3").is_some()));
+
+    let mut queried = runtime.queried.lock().expect("queried").clone();
+    queried.sort();
+    // Both agent panes were asked about, so each agent row has a live process
+    // to compare; the agent-less pane was not, and no pane was asked twice.
+    assert_eq!(queried, vec!["wA:p1".to_string(), "wA:p3".to_string()]);
+    collector.shutdown();
+}
+
+#[test]
 fn foreground_evidence_is_queried_only_for_continuity_candidates() {
     let runtime = Arc::new(FakeRuntime::default());
     runtime.set_inventory(inventory(&["wA:p1", "wA:p2", "wA:p3"], vec![]));
