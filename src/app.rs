@@ -28,7 +28,7 @@ use crate::runtime::{CloseTarget, Target};
 use crate::theme;
 use ratatui::layout::Rect;
 
-use crate::model::{AgentState, FleetObservation};
+use crate::model::{AgentState, FleetObservation, ForegroundEvidence};
 use crate::tree::{
     AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskRow, TaskSource, TreeNode,
 };
@@ -115,15 +115,36 @@ impl DetailPage {
 /// A block of long content the details start collapsed.
 ///
 /// Only text long enough to bury the facts around it is behind a disclosure: a
-/// row's assignment, and a task's command and directory. Identity, state, PID
-/// and the measures beside them are never hidden.
+/// row's assignment, a task's command and directory, and the verbose half of a
+/// live process's identity. The short forms of what a block holds stay on the
+/// page, so a marker is never the only thing saying a fact exists.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Disclosure {
     /// The selected row's assignment text.
     Assignment,
+    /// The verbose half of the selected row's process identity: the roots a
+    /// freshness comparison was made between, the whole executable path, the
+    /// birth identity a sample belongs to, what a state letter means and what a
+    /// descendant sum is.
+    Process,
     /// One published task's long text, named by the task's identity so a
     /// refresh that keeps the task keeps its expansion.
     Task(TaskId),
+}
+
+/// Whether the selected row's Processes page describes a live process at all.
+///
+/// A shell, an inconclusive foreground, a pane with no process, a retained row
+/// and a task's published PID all leave the page with nothing verbose to hold,
+/// and a block that opens onto nothing is worse than no block: the page offers
+/// one exactly where it draws the facts the block repeats in full.
+fn process_detail_is_drawn(row: &VisibleRow<'_>) -> bool {
+    let foreground = match &row.node.row.kind {
+        RowKind::Pane(pane) => pane.foreground.as_ref(),
+        RowKind::Agent(agent) if agent.retained.is_none() => agent.foreground.as_ref(),
+        _ => None,
+    };
+    matches!(foreground, Some(ForegroundEvidence::NonShell { .. }))
 }
 
 /// How long an assignment may be before the details collapse it: past the width
@@ -693,6 +714,12 @@ impl App {
                 .into_iter()
                 .map(Disclosure::Task)
                 .collect(),
+            // The block holds the facts of a process, and the page draws those
+            // only from a current inventory: a stale-source row offers nothing
+            // to open, so no key answers to a marker that is not drawn.
+            DetailPage::Processes if self.source_current && process_detail_is_drawn(&row) => {
+                vec![Disclosure::Process]
+            }
             DetailPage::Processes | DetailPage::Source => Vec::new(),
         }
     }

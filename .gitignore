@@ -1,6 +1,9 @@
 # Cargo build output
 /target
 
+# Delegation briefs and evidence written by agents working in this repo
+/.pi-herdsman
+
 # nix-direnv environment cache
 /.direnv
 

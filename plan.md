@@ -43,10 +43,14 @@ Current priorities:
 1. **Known-process enrichment.** Add Linux observations/metrics/diagnostics to
    known background tasks, foreground commands and verified agent processes.
    Descendant relationships support workload attribution; a general process
-   browser or arbitrary unverified hierarchy is deferred.
+   browser or arbitrary unverified hierarchy is deferred. The agent binary
+   staleness marks that this direction needed are landed; the descendant tree
+   below is its next step.
 2. **Display/TUI refinement.** Review row density and useful details with the
    operator after known-process enrichment. This remains a priority, but its
-   presentation decisions are deferred to that discussion.
+   presentation decisions are deferred to that discussion. The Processes page
+   has had its pass: short headed values, a short enumerable kernel state, a
+   deduplicated identity, and everything verbose behind one block.
 3. **Herdr-agnosticity and tmux-parity audit.** Cover Radar and pi-herdsman, not
    just the Rust trait. Establish the actual requirements for a tmux adapter and
    record gaps before promising parity or starting another implementation.
@@ -319,6 +323,27 @@ joins; OS parentage must never invent an assignment or owner.
   separate follow-ons unless required to cover the chosen workload.
 - No generic process browser, system-wide monitoring view, persistent analytics
   database, session-token analytics or new control operations in this change.
+
+### Descendant tree (after the compact Processes layout)
+
+The compact Processes page draws aggregate-only descendant facts, so no
+individual child is listed yet. The agreed next slice is the screen it leaves
+room for: the Descendants section opens into a foldable table — name, PID, CPU
+and RSS columns, one row per observed child, branches folded per level, and
+selecting a row moving the compact process detail to that process.
+
+- This is a sampler change before it is a render change: per-child rows need
+  each descendant's name, PID, CPU, RSS and depth, where only aggregates are
+  sampled today. Foldable rows without that identity would be invented.
+- Rejected: mapping an external `pstree` into the panel. Its output carries no
+  usable identity for selection and arranges the same text with no metrics.
+- Rejected for now: adopting `tui-tree-widget`. Radar already rolls its own tree
+  (`TreeNode`, stable row identities, its own row rendering); the widget would
+  supply selection and folding but neither the sampled data nor the column
+  layout, so it earns a dependency only if that folding work proves costly.
+- The tree stays beneath the selected row's own process. It is not a system-wide
+  process browser, and root and descendant figures remain drawn apart rather
+  than added together.
 
 ### Identity/coverage blockers (publisher report, 2026-10-06)
 

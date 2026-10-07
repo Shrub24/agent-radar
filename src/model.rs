@@ -581,7 +581,8 @@ pub struct LocalFacts {
     pub running_for: Option<Duration>,
     /// What it has done to the terminal.
     pub terminal: TerminalMode,
-    /// How the foreground program's executable compares with the installed one.
+    /// How the foreground program's executable compares with the installed
+    /// program of its own name or package family.
     pub binary: BinaryIdentity,
     /// What the process is using, from the sample taken for it. `None` when no
     /// sample was taken: this machine has no reader for that process, the
@@ -744,38 +745,66 @@ impl ProcessState {
     }
 }
 
-/// How a foreground process's running executable compares with the program
-/// `PATH` resolves for the same name.
+/// How a foreground process's running executable compares with the installed
+/// program it would run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BinaryFreshness {
     /// The running executable is the installed program, or another file inside
-    /// the same installation.
+    /// the same installation as the one installed now.
     Current,
     /// The running executable's file was replaced or removed, or its
     /// installation differs from the one installed now.
     Stale,
     /// Nothing could be compared: the process is gone, its executable or the
-    /// installed program is unreadable, the running file is not the named
-    /// program, or this platform has no reader.
+    /// installed program is unreadable, the running file is not the program the
+    /// counterpart belongs to, or this platform has no reader.
     #[default]
     Unknown,
 }
 
+/// Why a running executable could not be compared, when it could not.
+///
+/// Each variant is something a reader can act on differently: a program that is
+/// not installed, an installed entrypoint whose payload cannot be identified,
+/// an executable that cannot be read, or a running file that is not the program
+/// in question. The words a row uses are the row's, not this type's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryUnknown {
+    /// No installed counterpart of that name is on the search path.
+    NoCounterpart,
+    /// The counterpart exists, but the payload it runs could not be identified:
+    /// its entrypoint is unreadable, or its shape is one this comparison
+    /// refuses rather than guesses at.
+    UnsupportedLauncher,
+    /// The running process's own executable could not be read.
+    Unreadable,
+    /// The running file is not the program the runtime named, or the runtime
+    /// named none: nothing about it is attributed to a program.
+    NotCompared,
+}
+
 /// What was compared, and how it came out.
 ///
-/// The two identities are the installations the executables belong to — the
-/// Nix store root, or the resolved path elsewhere — never parsed into versions
-/// or package names: the freshness says whether they differ, and the identities
-/// let a row name both without inventing anything.
+/// `running` and `installed` are the installations the executables belong to —
+/// the Nix store root, or the resolved path elsewhere — and they are what the
+/// freshness compares. A bolt variant's payload is compared by package family,
+/// so its identities carry the package roots; every other program is compared
+/// by file name and keeps the earlier meaning. `executable` is the running file
+/// itself, which the kernel reports and nobody invokes, kept so a row can name
+/// what is running even when no verdict was reached.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BinaryIdentity {
     pub freshness: BinaryFreshness,
     /// The installation the running executable belongs to. `None` when its
-    /// executable could not be read, or was not the named program.
+    /// executable could not be read.
     pub running: Option<String>,
-    /// The installation the `PATH` match for the program belongs to. `None`
-    /// when no search directory has it.
+    /// The installation the installed counterpart's payload belongs to. `None`
+    /// when no counterpart was found or its payload could not be identified.
     pub installed: Option<String>,
+    /// The running executable's own path, when it could be read.
+    pub executable: Option<String>,
+    /// Why nothing was compared, when nothing was.
+    pub unknown: Option<BinaryUnknown>,
 }
 
 /// Whether a foreground program has taken the terminal over.

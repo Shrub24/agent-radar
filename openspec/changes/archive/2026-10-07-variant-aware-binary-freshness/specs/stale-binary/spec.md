@@ -1,8 +1,5 @@
-# stale-binary Specification
+## MODIFIED Requirements
 
-## Purpose
-Mark a live agent whose running binary has since been replaced, as a label on its row and details that never changes its state, so a user can see which sessions predate an update.
-## Requirements
 ### Requirement: A live agent is marked stale when its binary was replaced
 
 Radar SHALL select the installed counterpart of a running executable from the running executable's own package family, read from its Nix store derivation name by separating the store hash, the exact package name and the version. It SHALL compare the running executable's package root with the payload package root of that exact counterpart, and SHALL mark the agent stale only when the running executable's link reports it deleted, or when both package roots are Nix store paths that differ. An entrypoint named by a versioned package of the same family SHALL mean that package root is the payload root, with nothing read from the entrypoint; an entrypoint anywhere else — an unversioned launcher package of that name included — SHALL be resolved only when it is a script whose single unconditional target is one strictly literal absolute store path, and every other entrypoint SHALL be unknown. Differing store roots SHALL be stale even when the two packages carry the same version, and no version string, build stamp or manifest SHALL be consulted to excuse a difference. A runtime-reported program name SHALL NOT select a bolt family's counterpart, which the running executable's package family alone selects; for every other program the runtime-reported name remains the name resolved on the search path, and a package name SHALL match exactly rather than as a prefix. For every program outside the handled families the existing comparison by matching file name SHALL be unchanged. Radar SHALL read nothing from a process's environment, SHALL NOT execute the counterpart, and SHALL NOT read the counterpart's compiled content. When the running process or its executable cannot be read, the exact package name or version cannot be separated, the counterpart cannot be resolved, the resolution is ambiguous, or the platform has no reader, the freshness SHALL be unknown and no claim SHALL be shown.
@@ -87,17 +84,7 @@ A stale agent row SHALL carry a mark in the configured stale colour, and its det
 - **WHEN** an agent row is retained after its agent returned
 - **THEN** it shows no staleness
 
-### Requirement: Live agent panes are inspected for their process
-
-Radar SHALL query the foreground process of every pane that currently reports an agent, in addition to the panes it already queries, so each live agent row has a process to compare. The query SHALL follow the existing deadlines, cancellation and failure rules, and a pane whose foreground is a shell or inconclusive SHALL show no staleness.
-
-#### Scenario: Agents view
-- **WHEN** the agents view is active
-- **THEN** each live agent pane has foreground evidence recorded without the process view being open
-
-#### Scenario: Unreadable foreground
-- **WHEN** a pane's foreground evidence is a shell or inconclusive
-- **THEN** its agent row shows no staleness and its other facts are unchanged
+## ADDED Requirements
 
 ### Requirement: Executable identity is inspectable on the Processes page
 
@@ -137,4 +124,3 @@ For an agent row or an ordinary pane row whose foreground evidence is current, t
 
 - **WHEN** the row is retained, the source observation is stale or unavailable, or the foreground is a shell or inconclusive
 - **THEN** no executable path, package identity or unknown reason is drawn for it, and no block is offered for the keyboard to open
-

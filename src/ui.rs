@@ -25,8 +25,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bus::Task;
 use crate::model::{
-    AgentState, BinaryFreshness, BinaryIdentity, CpuPercent, ForegroundEvidence, HerdsmanFacts,
-    ProcessState, SessionIdentity, TerminalMode, Total,
+    AgentState, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent, ForegroundEvidence,
+    HerdsmanFacts, ProcessState, SessionIdentity, TerminalMode, Total,
 };
 use crate::observation::{ObservationState, RetentionBasis, SourceFreshness};
 use crate::theme;
@@ -1087,28 +1087,127 @@ fn terminal_line(mode: TerminalMode) -> String {
     }
 }
 
-/// How a live agent's running executable compares with the program installed
-/// now, in words.
+/// The verdict a freshness comparison has to give, where it has one to give.
 ///
-/// Two identities that differ without a replacement are a deliberate other
-/// build — a checkout or a second installation — not a stale one; matching
-/// installations say nothing, and an unknown comparison is never claimed.
-fn binary_line(identity: &BinaryIdentity) -> Option<Line<'static>> {
-    let running = identity.running.as_deref();
-    let installed = identity.installed.as_deref();
-    let verdict = match identity.freshness {
-        BinaryFreshness::Stale => "stale",
-        BinaryFreshness::Current if running != installed => "not the installed program",
-        _ => return None,
+/// A current comparison has none: the package line above names what is running,
+/// and a stale mark's absence is what says it is the installed one. A
+/// deliberate other build says what it is and stops there — naming both roots
+/// on a line a reader scans is what the block is for. A comparison that could
+/// not be made gives its reason in a word; the sentence is the block's.
+fn verdict_line(identity: &BinaryIdentity) -> Option<Line<'static>> {
+    match identity.freshness {
+        BinaryFreshness::Current if identity.running == identity.installed => None,
+        // One side alone cannot be compared with anything, so nothing is
+        // claimed either way.
+        BinaryFreshness::Current if identity.running.is_none() || identity.installed.is_none() => {
+            None
+        }
+        BinaryFreshness::Current => Some(field("binary", "other build".to_string())),
+        // A comparison nobody attempted carries no reason, and a verdict with
+        // no reason to give is not a verdict.
+        BinaryFreshness::Unknown => identity
+            .unknown
+            .map(|reason| field("binary", unknown_word(reason).to_string())),
+        BinaryFreshness::Stale => {
+            let palette = theme::palette();
+            let mut spans = vec![Span::styled(
+                "binary: ".to_string(),
+                Style::new().fg(palette.subtle),
+            )];
+            spans.push(Span::styled(
+                format!("{} (stale)", theme::stale_mark()),
+                Style::new().fg(palette.stale),
+            ));
+            // The installed target, named as compactly as the package line
+            // names the running one. A running file the kernel marked deleted
+            // has no counterpart to name, and the mark stands alone.
+            if let Some(installed) = identity.installed.as_deref() {
+                spans.push(Span::raw(format!(
+                    " installed {}",
+                    package_text(installed, identity.running.as_deref())
+                )));
+            }
+            Some(Line::from(spans))
+        }
+    }
+}
+
+/// Where the store keeps its packages. A root under it is a hash and a name;
+/// anywhere else a path is its own identity.
+const STORE: &str = "/nix/store/";
+
+/// How much of a store hash the page shows: enough to tell two builds of one
+/// version apart in a panel, far short of the 32 characters that name the same
+/// root twice.
+const SHORT_HASH: usize = 7;
+
+/// A store root's hash and package name, for `/nix/store` paths only.
+fn store_root(path: &str) -> Option<(&str, &str)> {
+    let (hash, name) = path.strip_prefix(STORE)?.split_once('-')?;
+    (!hash.is_empty() && !name.is_empty()).then_some((hash, name))
+}
+
+/// The first [`SHORT_HASH`] characters of a store hash, cut on a character
+/// boundary so a path this machine did not write cannot split a character.
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(SHORT_HASH).collect()
+}
+
+/// A package as one short phrase: its name and version, and a short hash of its
+/// store root where two builds of that same version have to be told apart.
+///
+/// Two versions name themselves, and one installation compared with itself has
+/// only one build to name; two builds of one version are the same words over
+/// different bits, and the hash is the only thing that tells a reader which of
+/// them is running. A path outside the store has no version to prefer and is
+/// named whole — it is short, and it is what the runtime was given.
+fn package_text(root: &str, other: Option<&str>) -> String {
+    let Some((hash, name)) = store_root(root) else {
+        return sanitize(root);
     };
-    Some(field(
-        "binary",
-        format!(
-            "{verdict} — running {}, installed {}",
-            sanitize(running?),
-            sanitize(installed?)
-        ),
-    ))
+    match other.and_then(store_root) {
+        Some((other_hash, other_name)) if other_name == name && other_hash != hash => {
+            format!("{} {}", sanitize(name), short_hash(hash))
+        }
+        _ => sanitize(name),
+    }
+}
+
+/// A path inside a root, as it is drawn: the root is named once, by the package
+/// line, and repeating it under every file says nothing.
+///
+/// A path only sharing a prefix with the root — another package beside it — is
+/// not inside it, and a path that *is* the root has nothing relative to show.
+fn relative_to<'a>(path: &'a str, root: Option<&str>) -> Option<&'a str> {
+    let rest = path.strip_prefix(root?)?;
+    if rest.is_empty() {
+        return None;
+    }
+    rest.strip_prefix('/')
+}
+
+/// The same reason in a word or two, for the line a reader scans: the sentence
+/// it is cut from is the block's.
+fn unknown_word(reason: BinaryUnknown) -> &'static str {
+    match reason {
+        BinaryUnknown::NoCounterpart => "no counterpart",
+        BinaryUnknown::UnsupportedLauncher => "payload unknown",
+        BinaryUnknown::Unreadable => "unreadable",
+        BinaryUnknown::NotCompared => "not the named program",
+    }
+}
+
+/// Why nothing was compared, in the page's words. Each reason is a different
+/// thing to go and look at.
+fn unknown_reason(reason: BinaryUnknown) -> &'static str {
+    match reason {
+        BinaryUnknown::NoCounterpart => "no installed counterpart resolves",
+        BinaryUnknown::UnsupportedLauncher => {
+            "the installed counterpart's payload could not be identified"
+        }
+        BinaryUnknown::Unreadable => "the running executable could not be read",
+        BinaryUnknown::NotCompared => "the running file is not the program the runtime named",
+    }
 }
 
 /// What a descendant sum is, said on the page that draws one: the processes the
@@ -1118,9 +1217,8 @@ fn binary_line(identity: &BinaryIdentity) -> Option<Line<'static>> {
 const DESCENDANT_SUM: &str = "observed processes beneath this one, not a workload or assignment total \
      (a page shared with another process counts in each)";
 
-/// The metrics for a row whose foreground process was sampled: the incarnation
-/// the reading belongs to, the kernel's own state, what that process is using,
-/// and what is observed beneath it.
+/// The measurements for a row whose foreground process was sampled, in two
+/// sections: what that process itself is, and what is observed beneath it.
 ///
 /// The process's own figures and its descendants' are drawn apart and never
 /// added together: a build under a pane is the build's CPU, not the pane's.
@@ -1144,112 +1242,237 @@ fn metric_lines(foreground: Option<&ForegroundEvidence>) -> Vec<Line<'static>> {
             ),
         )];
     };
-    let identity = &resources.identity;
     let descendants = &resources.descendants;
-    vec![
-        field(
-            "birth",
-            format!(
-                "pid {} · boot {} · start ticks {}",
-                identity.pid,
-                sanitize(&identity.boot_id),
-                identity.start_ticks,
-            ),
-        ),
-        field("state", state_line(resources.state)),
-        field("cpu", cpu_line(resources.cpu)),
-        field("rss", rss_line(resources.rss_bytes)),
-        field(
-            "descendants",
-            match descendants.observed {
-                Some(count) => format!(
-                    "{count} {} observed beneath this one",
-                    if count == 1 { "process" } else { "processes" }
-                ),
-                None => format!(
-                    "{} — nothing beneath this process could be enumerated",
-                    unavailable()
-                ),
-            },
-        ),
-        field(
-            "descendant cpu",
-            total_line(&descendants.cpu, |cpu| cpu_line(Some(*cpu))),
-        ),
-        field(
-            "descendant rss",
-            total_line(&descendants.rss_bytes, |bytes| rss_line(Some(*bytes))),
-        ),
-        field("descendant sum", DESCENDANT_SUM.to_string()),
-    ]
+    let (cpu, cpu_reason) = measured_value(
+        cpu_value(resources.cpu),
+        "no interval of this process has been measured",
+    );
+    let (rss, rss_reason) = measured_value(
+        rss_value(resources.rss_bytes),
+        "the kernel's page count could not be converted",
+    );
+    let (count, count_reason) = measured_value(
+        descendant_count(descendants.observed),
+        "nothing beneath this process could be enumerated",
+    );
+    let (total_cpu, total_cpu_reason) = total_value(&descendants.cpu, |cpu| cpu_percent(*cpu));
+    let (total_rss, total_rss_reason) = total_value(&descendants.rss_bytes, |bytes| size(*bytes));
+
+    let mut lines = metric_section(
+        "process",
+        &[
+            vec![Metric::stated("state", state_word(resources.state))],
+            vec![
+                Metric::measured("cpu", cpu, cpu_reason),
+                Metric::measured("rss", rss, rss_reason),
+            ],
+        ],
+    );
+    lines.extend(metric_section(
+        "descendants",
+        &[
+            vec![Metric::measured("count", count, count_reason)],
+            vec![
+                Metric::measured("cpu", total_cpu, total_cpu_reason),
+                Metric::measured("rss", total_rss, total_rss_reason),
+            ],
+        ],
+    ));
+    lines
 }
 
-/// The scheduler state the kernel reported, in words.
+/// Cells between one fact of a metric section and the fact beside it, and
+/// between a fact's label and its value.
+const METRIC_FACT_GAP: usize = 2;
+const METRIC_LABEL_GAP: usize = 2;
+
+/// The narrowest panel a metric section is drawn in on the side-by-side layout.
 ///
-/// It says only what the scheduler is doing with the process — a sleeping
-/// process may be waiting on a socket or on nothing, and a zombie has already
-/// exited — so it is drawn as the kernel's own state, never as progress or as a
-/// verdict on the work underneath.
-fn state_line(state: ProcessState) -> String {
-    match state {
-        ProcessState::Running => "running — on a CPU or waiting for one".into(),
-        ProcessState::Sleeping => "sleeping — waiting, and wakeable".into(),
-        ProcessState::DiskSleep => "uninterruptible sleep — blocked in the kernel".into(),
-        ProcessState::Stopped => "stopped by a signal".into(),
-        ProcessState::TracingStop => "stopped by a tracer".into(),
-        ProcessState::Zombie => "zombie — exited, not yet reaped".into(),
-        ProcessState::Dead => "dead — gone, or being torn down".into(),
-        ProcessState::Idle => "idle — below the scheduler's oldest run queue".into(),
-        ProcessState::Other(letter) => {
-            format!(
-                "unknown — this kernel reports '{}'",
-                sanitize(&letter.to_string())
-            )
+/// Two facts share a line only when both fit inside that width. A row that had
+/// to wrap leaves the second fact's label at the end of the line above its own
+/// value, and a label read apart from its number is worse than a fact on a line
+/// of its own. The panel's real width is not known here — the page is built
+/// before it is laid out — so the width the layout can never go below is the
+/// one a pair has to fit.
+const METRIC_PAIR_WIDTH: usize = 28;
+
+/// One fact of a compact metric section: its label, its value as the section
+/// draws it, and the reason that value is not a measurement — or is only a bound
+/// on one — when there is a reason to give.
+struct Metric {
+    label: &'static str,
+    value: String,
+    reason: Option<String>,
+}
+
+impl Metric {
+    /// A fact drawn as it was read, with nothing qualifying it.
+    fn stated(label: &'static str, value: String) -> Self {
+        Self {
+            label,
+            value,
+            reason: None,
+        }
+    }
+
+    /// A measured value that carries a reason: `unavailable` with why nothing
+    /// was measured, or a lower bound with why it is one.
+    fn measured(label: &'static str, value: String, reason: Option<String>) -> Self {
+        Self {
+            label,
+            value,
+            reason,
         }
     }
 }
 
-/// Interval CPU as a reader wants it: a percentage of one CPU, which work on
-/// more than one can carry past 100.
+/// A value this machine may not have measured, with the reason it did not.
+///
+/// The value stays `unavailable` and the reason travels beside it, so nothing
+/// measured can be silently dropped and nothing unmeasured can read as a zero.
+fn measured_value(value: Option<String>, reason: &str) -> (String, Option<String>) {
+    match value {
+        Some(value) => (value, None),
+        None => (unavailable(), Some(reason.to_string())),
+    }
+}
+
+/// One metric section: a heading, then the facts given, at most two to a row.
+///
+/// Labels are as wide as the section's longest, so the values line up down the
+/// section instead of drifting with the label above them. Two facts share a row
+/// while both fit the narrowest panel a section is drawn in; a row that does not
+/// gives each fact a line of its own, so no value is ever cut short and no label
+/// is ever left on the line above its own number.
+///
+/// A value that could not be measured, or that covers only part of what it
+/// names, keeps its place on the line and puts its reason on the next one,
+/// aligned under the value it belongs to. A reader comparing two readings
+/// compares the values, and a reason reads as a reason rather than as another
+/// measurement. A fact that has a reason therefore never shares its line: the
+/// reason belongs to one value, and a line drawing two of them has no way to say
+/// which.
+fn metric_section(heading_text: &str, rows: &[Vec<Metric>]) -> Vec<Line<'static>> {
+    let palette = theme::palette();
+    let mut lines = vec![heading(heading_text)];
+    for row in rows {
+        // A row's labels are as wide as its own longest, so a row of two facts
+        // spends no more of the panel on its labels than it has to: the width a
+        // pair saves is the width the panel is being spent on.
+        let label_width = row
+            .iter()
+            .map(|metric| metric.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let cell_width =
+            |metric: &Metric| label_width + METRIC_LABEL_GAP + metric.value.chars().count();
+        let paired = row.len() > 1
+            && row.iter().all(|metric| metric.reason.is_none())
+            && row.iter().map(cell_width).sum::<usize>() + METRIC_FACT_GAP * (row.len() - 1)
+                <= METRIC_PAIR_WIDTH;
+        let drawn: Vec<&[Metric]> = if paired {
+            vec![row.as_slice()]
+        } else {
+            row.iter().map(std::slice::from_ref).collect()
+        };
+        let reason_column = " ".repeat(label_width + METRIC_LABEL_GAP);
+        for facts in drawn {
+            let mut spans = Vec::new();
+            for (index, metric) in facts.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw(" ".repeat(METRIC_FACT_GAP)));
+                }
+                spans.push(Span::styled(
+                    format!(
+                        "{:<label_width$}{}",
+                        metric.label,
+                        " ".repeat(METRIC_LABEL_GAP)
+                    ),
+                    Style::new().fg(palette.subtle),
+                ));
+                spans.push(Span::raw(metric.value.clone()));
+            }
+            lines.push(Line::from(spans));
+            for metric in facts {
+                if let Some(reason) = &metric.reason {
+                    lines.push(Line::from(vec![
+                        Span::raw(reason_column.clone()),
+                        Span::styled(reason.clone(), Style::new().fg(palette.muted)),
+                    ]));
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// The scheduler state the kernel reported, as one short enumerable name.
+///
+/// It says only what the scheduler is doing with the process — a sleeping
+/// process may be waiting on a socket or on nothing, and a zombie has already
+/// exited — so it is the kernel's own state, never progress or a verdict on the
+/// work underneath, and it carries no activity colour. The name is kept short
+/// on purpose: this is the value that changes while a reader watches, and a
+/// changing sentence reads as a changing claim.
+fn state_word(state: ProcessState) -> String {
+    match state {
+        ProcessState::Running => "running".into(),
+        ProcessState::Sleeping => "sleeping".into(),
+        ProcessState::DiskSleep => "disk wait".into(),
+        ProcessState::Stopped => "stopped".into(),
+        ProcessState::TracingStop => "traced".into(),
+        ProcessState::Zombie => "zombie".into(),
+        ProcessState::Dead => "dead".into(),
+        ProcessState::Idle => "idle".into(),
+        ProcessState::Other(letter) => format!("unknown ({})", sanitize(&letter.to_string())),
+    }
+}
+
+/// A measured interval as a section draws it: a percentage of one CPU, which
+/// work on more than one can carry past 100.
+///
+/// The base is not repeated on every value: it is a property of the measure
+/// rather than of one reading, and stating it beside each number is what the
+/// section's width is spent on instead of the numbers.
+fn cpu_percent(cpu: CpuPercent) -> String {
+    format!("{:.1}%", cpu.hundredths() as f64 / 100.0)
+}
+
+/// Interval CPU, or nothing when this machine has no interval to measure.
 ///
 /// Unavailable until two readings of the same incarnation make an interval. A
 /// first reading, a counter that went backwards, no elapsed time and a failed
 /// read all leave nothing to measure — which is not the same as zero, and is
 /// not always the warm-up either. A measured idle interval is zero, and is
 /// drawn as one.
-fn cpu_line(cpu: Option<CpuPercent>) -> String {
-    let Some(cpu) = cpu else {
-        return format!(
-            "{} — no interval of this process has been measured",
-            unavailable()
-        );
-    };
-    format!("{:.1}% of one CPU", cpu.hundredths() as f64 / 100.0)
+fn cpu_value(cpu: Option<CpuPercent>) -> Option<String> {
+    cpu.map(cpu_percent)
 }
 
-/// A process's resident set, or why this machine cannot say. A page count the
-/// kernel wrote that is not a size, and a machine that cannot report its page
-/// size, both leave nothing to convert.
-fn rss_line(bytes: Option<u64>) -> String {
-    match bytes {
-        Some(bytes) => size(bytes),
-        None => format!(
-            "{} — the kernel's page count could not be converted",
-            unavailable()
-        ),
-    }
+/// A process's resident set, or nothing when this machine cannot convert the
+/// kernel's page count to a size.
+fn rss_value(bytes: Option<u64>) -> Option<String> {
+    bytes.map(size)
 }
 
-/// A total as the page draws it: its value, or why it is not one. A partial
-/// total keeps what it does cover and says it is a lower bound; an unknown one
-/// is unavailable, with the reason no total could be made.
-fn total_line<T>(total: &Total<T>, show: impl Fn(&T) -> String) -> String {
+/// How many processes were observed beneath a root, as a section draws it: a
+/// count, or nothing when none could be enumerated at all.
+fn descendant_count(observed: Option<u32>) -> Option<String> {
+    observed.map(|count| match count {
+        1 => "1 process".to_string(),
+        count => format!("{count} processes"),
+    })
+}
+
+/// A total as a section draws it: its value, or why it is not one. A partial
+/// total keeps what it does cover, marked as the lower bound it is, and carries
+/// the reason it is incomplete; an unknown one is unavailable, with the reason
+/// no total could be made.
+fn total_value<T>(total: &Total<T>, show: impl Fn(&T) -> String) -> (String, Option<String>) {
     match total {
-        Total::Complete(value) => show(value),
-        Total::Partial(value, reason) => {
-            format!("{} — a lower bound: {}", show(value), sanitize(reason))
-        }
-        Total::Unknown(reason) => format!("{} — {}", unavailable(), sanitize(reason)),
+        Total::Complete(value) => (show(value), None),
+        Total::Partial(value, reason) => (format!("≥{}", show(value)), Some(sanitize(reason))),
+        Total::Unknown(reason) => (unavailable(), Some(sanitize(reason))),
     }
 }
 
@@ -1340,6 +1563,20 @@ impl<'a> Blocks<'a> {
             .then(|| self.app.disclosure_open(key))
     }
 
+    /// A block's marker and label with no facts beside them: for a block whose
+    /// content is only ever its body.
+    fn marker_line(&self, key: &Disclosure, open: Option<bool>, label: &str) -> Line<'static> {
+        let mut spans = Vec::new();
+        if let Some(open) = open {
+            spans.push(self.marker(key, open));
+        }
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::new().fg(theme::palette().subtle),
+        ));
+        Line::from(spans)
+    }
+
     /// The block's marker: closed or open, in the ink the keyboard's target
     /// takes so the block Enter would open is the one the eye finds.
     fn marker(&self, key: &Disclosure, open: bool) -> Span<'static> {
@@ -1404,7 +1641,7 @@ fn detail_page_lines(state: &ObservationState, app: &App, page: DetailPage) -> P
     let blocks = Blocks::new(app);
     match page {
         DetailPage::Overview => overview_lines(state, &row, &blocks, &mut page_lines),
-        DetailPage::Processes => page_lines.extend(process_lines(state, &row)),
+        DetailPage::Processes => process_lines(state, &row, &blocks, &mut page_lines),
         DetailPage::Tasks => task_page_lines(&row, &blocks, &mut page_lines),
         DetailPage::Source => page_lines.extend(source_lines(state, &row)),
     }
@@ -1550,30 +1787,33 @@ fn overview_lines(
 /// and they belong to this row's own process: a background task's published PID
 /// is named without them, because a PID alone cannot authorise a reading of a
 /// process that may have been replaced.
-fn process_lines(state: &ObservationState, row: &VisibleRow<'_>) -> Vec<Line<'static>> {
+fn process_lines(
+    state: &ObservationState,
+    row: &VisibleRow<'_>,
+    blocks: &Blocks<'_>,
+    page: &mut PageLines,
+) {
     let current = matches!(state.source_freshness(), SourceFreshness::Current);
     match &row.node.row.kind {
-        RowKind::Workspace { .. } => vec![field(
+        RowKind::Workspace { .. } => page.push(field(
             "process",
             "none — a workspace holds panes, not a process".to_string(),
-        )],
+        )),
         RowKind::Pane(pane) => {
             if !current {
-                return vec![withheld("the source is not current")];
+                page.push(withheld("the source is not current"));
+                return;
             }
-            let mut lines = Vec::new();
-            lines.extend(live_pid(state, pane.foreground.as_ref()));
-            lines.push(field(
-                "foreground",
-                foreground_text(pane.foreground.as_ref(), pane.command()),
-            ));
-            lines.push(field("terminal", terminal_line(pane.terminal())));
-            lines.push(field(
+            if let Some(line) = live_pid(state, pane.foreground.as_ref()) {
+                page.push(line);
+            }
+            identity_lines(pane.foreground.as_ref(), blocks, page);
+            page.push(field("terminal", terminal_line(pane.terminal())));
+            page.push(field(
                 "running for",
                 pane.running_for().map(duration).unwrap_or_else(unavailable),
             ));
-            lines.extend(metric_lines(pane.foreground.as_ref()));
-            lines
+            page.extend(metric_lines(pane.foreground.as_ref()));
         }
         RowKind::Agent(agent) => {
             let unavailable_reason = match (&agent.retained, current) {
@@ -1582,41 +1822,31 @@ fn process_lines(state: &ObservationState, row: &VisibleRow<'_>) -> Vec<Line<'st
                 (None, true) => None,
             };
             if let Some(reason) = unavailable_reason {
-                return vec![withheld(reason)];
+                page.push(withheld(reason));
+                return;
             }
-            let mut lines = Vec::new();
-            lines.extend(live_pid(state, agent.foreground.as_ref()));
-            lines.push(field(
-                "foreground",
-                foreground_text(
-                    agent.foreground.as_ref(),
-                    agent
-                        .foreground
-                        .as_ref()
-                        .and_then(ForegroundEvidence::command_line),
-                ),
-            ));
-            // A live agent's running executable compared with the program
-            // installed now: a machine fact about the process, not the agent.
-            lines.extend(agent.binary().and_then(binary_line));
-            lines.extend(metric_lines(agent.foreground.as_ref()));
-            lines
+            if let Some(line) = live_pid(state, agent.foreground.as_ref()) {
+                page.push(line);
+            }
+            // A live agent's running executable and the comparison made from
+            // it: machine facts about the process, not the agent.
+            identity_lines(agent.foreground.as_ref(), blocks, page);
+            page.extend(metric_lines(agent.foreground.as_ref()));
         }
         RowKind::Task(task) => {
             let published = task.published.as_ref();
-            let mut lines = vec![match published.and_then(|published| published.pid) {
+            page.push(match published.and_then(|published| published.pid) {
                 Some(pid) => field("pid", pid.to_string()),
                 None => field("pid", unavailable()),
-            }];
-            lines.push(field("source", task.basis().to_string()));
+            });
+            page.push(field("source", task.basis().to_string()));
             // A task's PID arrives without the identity of the process it
             // names, so no sample can be attributed to it: the publisher's
             // captured-at-spawn birth identity is still outstanding.
-            lines.push(field(
+            page.push(field(
                 "metrics",
                 "unavailable — the publisher sends no process birth identity".to_string(),
             ));
-            lines
         }
     }
 }
@@ -1756,15 +1986,196 @@ fn live_pid(
     foreground_pid(foreground).map(|pid| field("pid", pid.to_string()))
 }
 
-/// What the pane's foreground is, in the words the panel uses for it: a shell
-/// or an inconclusive answer is not a command to name.
-fn foreground_text(foreground: Option<&ForegroundEvidence>, command: Option<String>) -> String {
-    match foreground {
-        Some(ForegroundEvidence::NonShell { .. }) => command.unwrap_or_else(unavailable),
-        Some(ForegroundEvidence::Shell) => "shell — nothing in the foreground".into(),
-        Some(ForegroundEvidence::Inconclusive) => "unknown — PID fields disagree".into(),
-        None => unavailable(),
+/// The row's foreground: the process's own command name as the runtime reports
+/// it, the executable the kernel is running, and how that executable compares
+/// with the program installed now.
+///
+/// The name is the runtime's report of a running process — for a bolt pane the
+/// exec-replaced payload — so nothing here says what the pane was started with,
+/// and the name is never taken for a launcher or an alias. The process's
+/// arguments are not drawn at all: a harness takes its prompt and system prompt
+/// as arguments, and nothing the runtime reports tells a prompt from a flag. A
+/// shell or an inconclusive answer is not a process to name, and is stated
+/// instead.
+///
+/// The page draws this identity short — the package once, the executable inside
+/// it, a verdict only where there is one — and holds the long halves of the same
+/// facts behind the page's block: the roots a comparison was made between, the
+/// whole path, the birth identity, what a state means and what a sum is. A row
+/// with no process draws none of it and is offered no block.
+fn identity_lines(
+    foreground: Option<&ForegroundEvidence>,
+    blocks: &Blocks<'_>,
+    page: &mut PageLines,
+) {
+    let Some(ForegroundEvidence::NonShell {
+        name,
+        command,
+        local,
+        ..
+    }) = foreground
+    else {
+        page.push(match foreground {
+            Some(ForegroundEvidence::Shell) => field(
+                "foreground",
+                "shell — nothing in the foreground".to_string(),
+            ),
+            Some(ForegroundEvidence::Inconclusive) => {
+                field("foreground", "unknown — PID fields disagree".to_string())
+            }
+            _ => field("foreground", unavailable()),
+        });
+        return;
+    };
+    page.push(field(
+        "observed",
+        observed_name(name.as_deref(), command.as_deref()),
+    ));
+    let binary = &local.binary;
+    if let Some(running) = binary.running.as_deref() {
+        page.push(field(
+            "package",
+            package_text(running, binary.installed.as_deref()),
+        ));
     }
+    // The executable within the package that carries it: the store root is
+    // named by the line above, and its hash twice on one page is a hash a
+    // reader has to compare with itself. A file outside that root is drawn
+    // whole, and one that is the root says nothing the line above did not.
+    if let Some(executable) = binary.executable.as_deref() {
+        let executable = sanitize(executable);
+        let running = binary.running.as_deref().map(sanitize);
+        match relative_to(&executable, running.as_deref()) {
+            Some(relative) => page.push(field("executable", relative.to_string())),
+            None if Some(&executable) == running.as_ref() => {}
+            None => page.push(field("executable", executable)),
+        }
+    }
+    if let Some(verdict) = verdict_line(binary) {
+        page.push(verdict);
+    }
+    let key = Disclosure::Process;
+    if let Some(open) = blocks.open(&key) {
+        page.push_block(&key, blocks.marker_line(&key, Some(open), "details"));
+        if open {
+            page.extend(process_detail_lines(foreground));
+        }
+    }
+}
+
+/// The verbose half of a live process's identity, behind the page's block.
+///
+/// The two roots are the sides the comparison was made between, drawn whole so
+/// the hash on the package line above can be read against the build it names.
+/// The whole executable path is the one the relative form was cut from, and the
+/// birth identity is what a sample belongs to: a PID alone is a number the
+/// machine reuses, and the boot id and start ticks are what tell two of them
+/// apart. The state letters travel as one word each, so what the kernel meant by
+/// the one on the page is here, and a descendant sum is what it is only with
+/// the sentence that says so.
+fn process_detail_lines(foreground: Option<&ForegroundEvidence>) -> Vec<Line<'static>> {
+    let Some(ForegroundEvidence::NonShell { local, .. }) = foreground else {
+        return Vec::new();
+    };
+    let binary = &local.binary;
+    let mut lines = Vec::new();
+    if let Some(running) = binary.running.as_deref() {
+        lines.push(field("running", sanitize(running)));
+    }
+    if let Some(installed) = binary.installed.as_deref() {
+        lines.push(field("installed", sanitize(installed)));
+    }
+    if let Some(executable) = binary.executable.as_deref() {
+        lines.push(field("executable", sanitize(executable)));
+    }
+    if binary.freshness == BinaryFreshness::Unknown
+        && let Some(reason) = binary.unknown
+    {
+        lines.push(field(
+            "comparison",
+            format!("unknown — {}", unknown_reason(reason)),
+        ));
+    }
+    let state = local.resources.as_ref().map(|resources| resources.state);
+    if let Some(resources) = local.resources.as_ref() {
+        let identity = &resources.identity;
+        lines.push(field(
+            "birth",
+            format!(
+                "pid {} · boot {} · start ticks {}",
+                identity.pid,
+                sanitize(&identity.boot_id),
+                identity.start_ticks,
+            ),
+        ));
+    }
+    lines.push(heading("states"));
+    let mut states = NAMED_STATES.to_vec();
+    // A letter Radar cannot name is the one worth explaining, so the row's own
+    // is drawn beside the ones it can.
+    if let Some(state @ ProcessState::Other(_)) = state {
+        states.push(state);
+    }
+    for state in states {
+        lines.push(field(&state_word(state), state_meaning(state).to_string()));
+    }
+    lines.push(field("descendants", DESCENDANT_SUM.to_string()));
+    lines
+}
+
+/// A section heading: the word that says what the lines under it are.
+fn heading(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::new()
+            .fg(theme::palette().heading)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The kernel states Radar draws by name, in the order the kernel letters run.
+/// [`ProcessState::Other`] is not among them: a letter this kernel wrote and
+/// Radar does not name is explained where a row carries one.
+const NAMED_STATES: [ProcessState; 8] = [
+    ProcessState::Running,
+    ProcessState::Sleeping,
+    ProcessState::DiskSleep,
+    ProcessState::Stopped,
+    ProcessState::TracingStop,
+    ProcessState::Zombie,
+    ProcessState::Dead,
+    ProcessState::Idle,
+];
+
+/// What the kernel's state letter means for the process that carries it, in the
+/// page's words.
+///
+/// The letter says only what the scheduler is doing with the process: a sleeping
+/// process may be waiting on a socket or on nothing, and a zombie has already
+/// exited. One word of state is not readable without it.
+fn state_meaning(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Running => "executing, or waiting its turn on a CPU",
+        ProcessState::Sleeping => "waiting, but wakeable",
+        ProcessState::DiskSleep => "blocked in the kernel, usually on I/O",
+        ProcessState::Stopped => "stopped by a signal",
+        ProcessState::TracingStop => "stopped because something is tracing it",
+        ProcessState::Zombie => "exited, not yet reaped by its parent",
+        ProcessState::Dead => "gone, or being torn down",
+        ProcessState::Idle => "idle in the kernel, below the oldest run queue",
+        ProcessState::Other(_) => "a state this kernel wrote that Radar does not name",
+    }
+}
+
+/// The running process's command name as the runtime reports it, sanitized like
+/// every other external text. A runtime that reports no name still reports the
+/// command line, and its first word names the program the kernel is running.
+fn observed_name(name: Option<&str>, command: Option<&str>) -> String {
+    let name = name
+        .map(str::to_owned)
+        .or_else(|| command.map(program_of).map(str::to_owned))
+        .unwrap_or_else(unavailable);
+    sanitize(&name)
 }
 
 /// Freshness for the selected row: a retained association is not current, and
@@ -2087,15 +2498,17 @@ fn sanitize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     use crate::app::Action;
     use crate::herdr::decode_snapshot;
     use crate::model::{
-        AgentObservation, BinaryFreshness, BinaryIdentity, CpuPercent, DescendantResources,
-        FleetObservation, ForegroundEvidence, HerdsmanFacts, LocalFacts, Location, Pane,
-        ProcessIdentity, ProcessResources, ProcessState, RuntimeStatus, SemanticState, Tab,
-        TerminalMode, Total, Workspace,
+        AgentObservation, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent,
+        DescendantResources, FleetObservation, ForegroundEvidence, HerdsmanFacts, LocalFacts,
+        Location, Pane, ProcessIdentity, ProcessResources, ProcessState, RuntimeStatus,
+        SemanticState, Tab, TerminalMode, Total, Workspace,
     };
     use crate::runtime::Target;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
@@ -2165,10 +2578,21 @@ mod tests {
     /// as one row of a narrow panel. The panel is still the one drawn, so a fact
     /// that never reaches it still fails.
     fn panel_text(state: &ObservationState, app: &mut App, page: DetailPage) -> String {
+        panel_text_at(state, app, page, 120)
+    }
+
+    /// The same at a chosen terminal width: a value longer than the panel's own
+    /// width wraps mid-token, and joining its rows would split it with a space.
+    fn panel_text_at(
+        state: &ObservationState,
+        app: &mut App,
+        page: DetailPage,
+        width: u16,
+    ) -> String {
         let shown = app.detail_page();
         app.select_page(page);
         let mut terminal =
-            Terminal::new(TestBackend::new(120, 30)).expect("infallible test backend");
+            Terminal::new(TestBackend::new(width, 30)).expect("infallible test backend");
         let mut geometry = Geometry::default();
         terminal
             .draw(|frame| {
@@ -3606,7 +4030,7 @@ mod tests {
         for fact in [
             "kind: agent",
             "pid: 4242",
-            "foreground: cargo",
+            "observed: cargo",
             "role: worker",
             "assignment: Run the terminal smoke suite",
             "model: example/model",
@@ -3627,7 +4051,7 @@ mod tests {
         assert!(pid < assignment, "the PID comes first:\n{overview}");
         let processes = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
         assert!(processes.contains("pid: 4242"), "{processes}");
-        assert!(processes.contains("foreground: cargo"), "{processes}");
+        assert!(processes.contains("observed: cargo"), "{processes}");
     }
 
     /// The block's marker as the last draw reported it, for the pointer tests.
@@ -4143,7 +4567,7 @@ mod tests {
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
         // The command, the terminal mode and the age are the Processes page's.
         let details = render_page(&state, &mut app, DetailPage::Processes, 180, 30);
-        assert!(details.contains("foreground: nvim notes.md"), "{details}");
+        assert!(details.contains("observed: nvim"), "{details}");
         assert!(
             details.contains("terminal: full screen — the program is drawing the pane"),
             "{details}"
@@ -4275,7 +4699,7 @@ mod tests {
     }
 
     #[test]
-    fn a_running_pane_leads_with_its_command_and_reports_it_in_the_details() {
+    fn a_running_pane_is_led_by_its_command_and_its_process_is_named_in_the_details() {
         let mut state = fixture_state();
         state.apply_evidence(
             "wA:p3",
@@ -4290,16 +4714,33 @@ mod tests {
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
         let screen = render_page(&state, &mut app, DetailPage::Processes, 180, 32);
 
+        // The row leads with the command the pane is running...
         assert!(screen.contains("nix build .#radar"), "{screen}");
-        assert!(screen.contains("foreground: nix build .#radar"), "{screen}");
-        // The executable's own path never reaches the screen.
-        assert!(!screen.contains("/nix/store/abc-nix"), "{screen}");
+        // ...and the page names the process itself rather than the invocation:
+        // the observed name is the command the runtime reports.
+        assert!(screen.contains("observed: nix"), "{screen}");
+        // An identity this machine never read claims nothing: no executable
+        // path and no comparison is invented for it.
+        assert!(!screen.contains("executable:"), "{screen}");
+        assert!(!screen.contains("binary:"), "{screen}");
     }
 
     /// Foreground evidence for a pane, carrying a binary comparison, so a row
     /// and its details can be read against exactly that identity.
     fn binary_evidence(identity: BinaryIdentity) -> ForegroundEvidence {
-        let mut evidence = ForegroundEvidence::command(4242, Some("pi".into()), Some("pi".into()));
+        named_binary_evidence("pi", "pi", identity)
+    }
+
+    /// The same, for a process the runtime reports under a given name and
+    /// command line: the process facts are the runtime's, the comparison is
+    /// this machine's.
+    fn named_binary_evidence(
+        name: &str,
+        command: &str,
+        identity: BinaryIdentity,
+    ) -> ForegroundEvidence {
+        let mut evidence =
+            ForegroundEvidence::command(4242, Some(name.to_string()), Some(command.to_string()));
         if let ForegroundEvidence::NonShell { local, .. } = &mut evidence {
             *local = LocalFacts {
                 running_for: None,
@@ -4316,6 +4757,8 @@ mod tests {
             freshness: BinaryFreshness::Stale,
             running: Some("/run/pi-1.0.1".into()),
             installed: Some("/nix/store/aaa-pi-1.0.2".into()),
+            executable: Some("/run/pi".into()),
+            unknown: None,
         }
     }
 
@@ -4386,40 +4829,51 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
 
-        // The incarnation the reading belongs to, and the kernel's own state.
-        assert!(processes.contains("birth: pid 4242 · boot "), "{processes}");
-        assert!(processes.contains("start ticks 9812"), "{processes}");
+        // The section heading and the kernel's own state as one short name: the
+        // incarnation the reading belongs to, and what the name means, are the
+        // block's.
+        assert!(processes.contains("process state  sleeping"), "{processes}");
         assert!(
-            processes.contains("state: sleeping — waiting, and wakeable"),
-            "{processes}"
+            !processes.contains("waiting, and wakeable"),
+            "the kernel's state is a value, not a sentence: {processes}"
         );
+        assert!(!processes.contains("boot "), "{processes}");
+        assert!(!processes.contains("start ticks"), "{processes}");
         // The root's own figures are its own: the build beneath it is not added
-        // to them.
-        assert!(processes.contains("cpu: 0.0% of one CPU"), "{processes}");
-        assert!(processes.contains("rss: 8.0 MiB"), "{processes}");
+        // to them. Two facts share the line, with the values aligned.
+        assert!(processes.contains("cpu  0.0%  rss  8.0 MiB"), "{processes}");
+        // The descendants are a separate sum, under a heading of their own.
         assert!(
-            processes.contains("descendants: 2 processes observed beneath this one"),
-            "{processes}"
-        );
-        // The descendants are a separate sum, qualified as what it is.
-        assert!(
-            processes.contains("descendant cpu: 125.0% of one CPU"),
+            processes.contains("descendants count  2 processes"),
             "{processes}"
         );
         assert!(
-            processes.contains("descendant rss: 512.0 MiB"),
+            processes.contains("cpu  125.0%  rss  512.0 MiB"),
+            "{processes}"
+        );
+        // The sum is qualified as what it is, and never added to the root's:
+        // the sentence that says so is held behind the block with the birth
+        // identity, and neither is on the line a reader scans.
+        assert!(
+            !processes.contains("not a workload or assignment total"),
+            "{processes}"
+        );
+        app.toggle_block(&Disclosure::Process);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        assert!(
+            processes.contains(
+                "observed processes beneath this one, not a workload or assignment total \
+                 (a page shared with another process counts in each)"
+            ),
             "{processes}"
         );
         assert!(
-            processes.contains("not a workload or assignment total"),
+            processes.contains("birth: pid 4242 · boot 6d9d2f0a-2f6f-4a1f-9c2d-2f6f4a1f9c2d"),
             "{processes}"
         );
-        assert!(
-            processes.contains("a page shared with another process counts in each"),
-            "{processes}"
-        );
+        assert!(processes.contains("start ticks 9812"), "{processes}");
     }
 
     #[test]
@@ -4431,37 +4885,30 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
 
         // No interval to measure — a first reading, a counter that went
-        // backwards and a failed read all say this, and none is a zero.
+        // backwards and a failed read all say this, and none is a zero. The
+        // value keeps the line; the reason it is not one is drawn beneath it.
+        assert!(processes.contains("cpu  unavailable"), "{processes}");
         assert!(
-            processes.contains("cpu: unavailable — no interval of this process has been measured"),
+            processes.contains("no interval of this process has been measured"),
             "{processes}"
         );
         // A descendant total that really is zero is drawn as a measurement.
-        assert!(
-            processes.contains("descendant cpu: 0.0% of one CPU"),
-            "{processes}"
-        );
-        // The root's own line, between the state above it and the resident set
+        assert!(processes.contains("cpu  0.0%"), "{processes}");
+        // The root's own line, between the state above it and the descendants
         // below it, is the one that must not read as a zero.
         let root = processes
-            .split("state: ")
+            .split("state  sleeping")
             .nth(1)
-            .and_then(|rest| rest.split("rss: ").next())
-            .expect("the state and the resident set");
-        assert!(
-            root.contains("cpu: unavailable — no interval"),
-            "{processes}"
-        );
+            .and_then(|rest| rest.split("descendants").next())
+            .expect("the state and the descendant heading");
+        assert!(root.contains("cpu  unavailable"), "{processes}");
         assert!(!root.contains("0.0%"), "{processes}");
         // Nothing observed beneath the root is a fact about the root, not a
         // missing measurement.
-        assert!(
-            processes.contains("descendants: 0 processes observed beneath this one"),
-            "{processes}"
-        );
+        assert!(processes.contains("count  0 processes"), "{processes}");
     }
 
     #[test]
@@ -4488,28 +4935,26 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
 
         // The root's own reading is unaffected by what could not be totalled
         // beneath it.
-        assert!(processes.contains("cpu: 42.0% of one CPU"), "{processes}");
-        // A lower bound keeps the value it does cover and says it is one.
+        assert!(processes.contains("cpu  42.0%"), "{processes}");
+        // A lower bound keeps the value it does cover, marked as the bound it
+        // is, and says why on the line beneath it.
+        assert!(processes.contains("rss  ≥2.0 KiB"), "{processes}");
         assert!(
-            processes.contains(
-                "descendant rss: 2.0 KiB — a lower bound: \
-                 a process beneath this one was reparented while the table was read"
-            ),
+            processes
+                .contains("a process beneath this one was reparented while the table was read"),
             "{processes}"
         );
         // An unknown total is unavailable with its reason, never a complete zero.
+        assert!(processes.contains("cpu  unavailable"), "{processes}");
         assert!(
-            processes.contains("descendant cpu: unavailable — the process scan was cancelled"),
+            processes.contains("the process scan was cancelled"),
             "{processes}"
         );
-        assert!(
-            processes.contains("descendants: 3 processes observed beneath this one"),
-            "{processes}"
-        );
+        assert!(processes.contains("count  3 processes"), "{processes}");
     }
 
     #[test]
@@ -4532,20 +4977,22 @@ mod tests {
         );
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
 
+        assert!(processes.contains("count  unavailable"), "{processes}");
         assert!(
-            processes.contains(
-                "descendants: unavailable — nothing beneath this process could be enumerated"
-            ),
+            processes.contains("nothing beneath this process could be enumerated"),
             "{processes}"
         );
-        assert!(
-            processes.contains("descendant rss: unavailable — the process table could not be read"),
-            "{processes}"
-        );
-        assert!(
-            processes.contains("descendant cpu: unavailable — the process table could not be read"),
+        assert!(processes.contains("rss  unavailable"), "{processes}");
+        assert!(processes.contains("cpu  unavailable"), "{processes}");
+        // Each value that could not be totalled says so, with the reason the
+        // table gave once per value it belongs to.
+        assert_eq!(
+            processes
+                .matches("the process table could not be read")
+                .count(),
+            2,
             "{processes}"
         );
     }
@@ -4574,9 +5021,10 @@ mod tests {
             processes.contains("withheld — the source is not current"),
             "{processes}"
         );
-        assert!(!processes.contains("birth:"), "{processes}");
-        assert!(!processes.contains("cpu:"), "{processes}");
-        assert!(!processes.contains("descendant"), "{processes}");
+        assert!(!processes.contains("birth"), "{processes}");
+        assert!(!processes.contains("cpu"), "{processes}");
+        assert!(!processes.contains("rss"), "{processes}");
+        assert!(!processes.contains("descendants"), "{processes}");
 
         // A retained row is an association nobody observes now: its
         // last-observed process is not a reading either.
@@ -4588,8 +5036,8 @@ mod tests {
             processes.contains("withheld — this row is retained, not currently observed"),
             "{processes}"
         );
-        assert!(!processes.contains("birth:"), "{processes}");
-        assert!(!processes.contains("descendant"), "{processes}");
+        assert!(!processes.contains("birth"), "{processes}");
+        assert!(!processes.contains("descendants"), "{processes}");
     }
 
     #[test]
@@ -4604,15 +5052,151 @@ mod tests {
         let processes = panel_text(&state, &mut app, DetailPage::Processes);
 
         // The process is named and nothing was sampled for it: the page says so
-        // rather than drawing a birth identity or a resource it never read.
+        // rather than heading a section and drawing a birth identity or a
+        // resource it never read.
         assert!(processes.contains("pid: 4242"), "{processes}");
         assert!(
             processes
                 .contains("metrics: unavailable — this refresh took no sample of this process"),
             "{processes}"
         );
-        assert!(!processes.contains("birth:"), "{processes}");
-        assert!(!processes.contains("rss:"), "{processes}");
+        assert!(!processes.contains("birth"), "{processes}");
+        assert!(!processes.contains("rss"), "{processes}");
+        assert!(!processes.contains("descendants"), "{processes}");
+    }
+
+    #[test]
+    fn every_kernel_state_is_one_short_name() {
+        // The value that changes while a reader watches is one word, never a
+        // sentence about what the scheduler is doing: a changing sentence reads
+        // as a changing claim.
+        for (state, word) in [
+            (ProcessState::Running, "running"),
+            (ProcessState::Sleeping, "sleeping"),
+            (ProcessState::DiskSleep, "disk wait"),
+            (ProcessState::Stopped, "stopped"),
+            (ProcessState::TracingStop, "traced"),
+            (ProcessState::Zombie, "zombie"),
+            (ProcessState::Dead, "dead"),
+            (ProcessState::Idle, "idle"),
+            (ProcessState::Other('W'), "unknown (W)"),
+        ] {
+            let rendered = state_word(state);
+            assert_eq!(rendered, word, "{state:?}");
+            assert!(
+                rendered
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || " ()".contains(ch)),
+                "{rendered:?} is a value, not a sentence"
+            );
+        }
+    }
+
+    /// A sampled process that also carries a binary comparison, so a page can
+    /// be read with both its measurements and its identity.
+    fn sampled_binary(
+        pid: i32,
+        resources: ProcessResources,
+        name: &str,
+        identity: BinaryIdentity,
+    ) -> ForegroundEvidence {
+        let mut evidence = sampled(pid, resources);
+        if let ForegroundEvidence::NonShell {
+            name: reported,
+            local,
+            ..
+        } = &mut evidence
+        {
+            *reported = Some(name.to_string());
+            local.binary = identity;
+        }
+        evidence
+    }
+
+    #[test]
+    fn the_metric_sections_stay_compact_in_a_narrow_panel() {
+        // A first sample — no interval for the CPU — over descendants whose
+        // resident set is only a lower bound: both kinds of qualification are
+        // drawn on the narrowest panel the side-by-side layout draws.
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    None,
+                    Some(7 * 1024 * 1024),
+                    DescendantResources {
+                        observed: Some(2),
+                        rss_bytes: Total::Partial(
+                            1_024,
+                            "a descendant exited while the table was read".into(),
+                        ),
+                        cpu: Total::Complete(CpuPercent::from_hundredths(11_820)),
+                    },
+                ),
+            ),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+
+        // 28 cells of content: each section is its heading and short labelled
+        // values, every value drawn whole.
+        let (screen, _) = draw(&state, &mut app, 90, 30);
+        assert!(screen.contains("process"), "{screen}");
+        assert!(screen.contains("state  sleeping"), "{screen}");
+        assert!(screen.contains("cpu  unavailable"), "{screen}");
+        assert!(screen.contains("rss  7.0 MiB"), "{screen}");
+        assert!(screen.contains("descendants"), "{screen}");
+        assert!(screen.contains("count  2 processes"), "{screen}");
+        assert!(screen.contains("cpu  118.2%"), "{screen}");
+        assert!(screen.contains("rss  ≥1.0 KiB"), "{screen}");
+
+        // A reason is drawn on its own row, under the column the values are
+        // drawn in and not under the labels: the values stay comparable with
+        // the row above, and the reason reads as a reason.
+        let rows: Vec<&str> = screen.lines().collect();
+        for (value, reason) in [
+            ("unavailable", "no interval of this"),
+            ("≥1.0 KiB", "a descendant exited"),
+        ] {
+            let value_row = rows
+                .iter()
+                .find(|row| row.contains(value))
+                .unwrap_or_else(|| panic!("no row draws {value:?}: {screen}"));
+            let reason_row = rows
+                .iter()
+                .find(|row| row.contains(reason))
+                .unwrap_or_else(|| panic!("no row draws {reason:?}: {screen}"));
+            assert_eq!(
+                reason_row.find(reason),
+                value_row.find(value),
+                "the reason is drawn under its value: {screen}"
+            );
+        }
+
+        // Two facts that fit together share the line even here: the horizontal
+        // space is what the panel is being spent on, and a fact with no reason
+        // costs nothing but its own width.
+        let mut measured = fixture_state();
+        measured.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(1_240)),
+                    Some(86 * 1024 * 1024),
+                    no_descendants(),
+                ),
+            ),
+        );
+        let mut app = app_for(&measured);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        let (screen, _) = draw(&measured, &mut app, 90, 30);
+        assert!(screen.contains("cpu  12.4%  rss  86.0 MiB"), "{screen}");
+        assert!(screen.contains("count  0 processes"), "{screen}");
     }
 
     #[test]
@@ -4667,7 +5251,9 @@ mod tests {
 
         // A panel with room for less than the page. The metric lines wrap, so
         // the page occupies more rows than it has lines, and End reaches its
-        // last row rather than stopping at the last one that starts on it.
+        // last row rather than stopping at the last one that starts on it. The
+        // block is open, which is what makes the page that much longer.
+        app.toggle_block(&Disclosure::Process);
         let (_, short) = draw(&state, &mut app, 120, 12);
         assert!(
             short.details_rows > short.details_viewport as usize,
@@ -4677,10 +5263,11 @@ mod tests {
         app.scroll_page_to(u16::MAX);
         assert_eq!(app.details_scroll(), max, "the clamp counts drawn rows");
         let (scrolled, _) = draw(&state, &mut app, 120, 12);
-        assert!(scrolled.contains("descendant rss:"), "{scrolled}");
+        // The page ends in the descendant sums, and End reaches that row
+        // however far the block and the wraps pushed it down.
         assert!(
-            scrolled.contains("counts in each)"),
-            "the last wrapped row of the page is drawn: {scrolled}"
+            scrolled.contains("512.0 MiB"),
+            "the last row of the page is drawn: {scrolled}"
         );
         // The end is the end: a further scroll key does not move the page.
         app.scroll_page(3);
@@ -4691,6 +5278,7 @@ mod tests {
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
         app.select_page(DetailPage::Processes);
+        app.toggle_block(&Disclosure::Process);
         draw(&state, &mut app, 46, 20);
         let (_, narrow) = draw(&state, &mut app, 46, 20);
         app.scroll_page_to(u16::MAX);
@@ -4699,15 +5287,14 @@ mod tests {
             (narrow.details_rows - narrow.details_viewport as usize) as u16
         );
         let (scrolled, _) = draw(&state, &mut app, 46, 20);
-        assert!(scrolled.contains("descendant sum:"), "{scrolled}");
         assert!(
-            scrolled.contains("counts in each)"),
-            "the last wrapped row is drawn on a stacked panel: {scrolled}"
+            scrolled.contains("512.0 MiB"),
+            "the last row is drawn on a stacked panel: {scrolled}"
         );
 
         // The values are on the page, not only in its last rows.
-        let page = panel_text(&state, &mut app, DetailPage::Processes);
-        assert!(page.contains("descendant rss: 512.0 MiB"), "{page}");
+        let page = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        assert!(page.contains("cpu  125.0%  rss  512.0 MiB"), "{page}");
     }
 
     #[test]
@@ -4720,11 +5307,31 @@ mod tests {
 
         let mark = theme::stale_mark();
         assert!(screen.contains(&format!("{mark} worker task")), "{screen}");
-        // The details name the two installations exactly, with no version
-        // parsed out of either.
-        assert!(screen.contains("binary: stale"), "{screen}");
-        assert!(screen.contains("/run/pi-1.0.1"), "{screen}");
-        assert!(screen.contains("/nix/store/aaa-pi-1.0.2"), "{screen}");
+        // The details name the process, the executable within its package and
+        // the verdict: a mark, the word, and the installed target as compactly
+        // as the package line names the running one. Both roots are the block's.
+        let page = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(page.contains("observed: pi"), "{page}");
+        assert!(page.contains("package: /run/pi-1.0.1"), "{page}");
+        // A wrapper outside the package it starts is drawn where it is: there
+        // is no root to cut it against, and no store prefix to repeat either.
+        assert!(page.contains("executable: /run/pi"), "{page}");
+        assert!(
+            page.contains(&format!(
+                "binary: {} (stale) installed pi-1.0.2",
+                theme::stale_mark()
+            )),
+            "{page}"
+        );
+        assert!(!page.contains("/nix/store/aaa-pi-1.0.2"), "{page}");
+        app.toggle_block(&Disclosure::Process);
+        let page = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(page.contains("running: /run/pi-1.0.1"), "{page}");
+        assert!(
+            page.contains("installed: /nix/store/aaa-pi-1.0.2"),
+            "{page}"
+        );
+        assert!(page.contains("executable: /run/pi"), "{page}");
 
         // The mark wears the configured stale role, not a hardcoded colour.
         let mut terminal = Terminal::new(TestBackend::new(180, 34)).expect("infallible");
@@ -4751,6 +5358,8 @@ mod tests {
                 freshness: BinaryFreshness::Current,
                 running: Some("/home/dev/pi".into()),
                 installed: Some("/nix/store/aaa-pi-1.0.2".into()),
+                executable: Some("/home/dev/pi".into()),
+                unknown: None,
             }),
         );
         let mut app = app_for(&state);
@@ -4761,50 +5370,495 @@ mod tests {
             !screen.contains(&format!("{} worker task", theme::stale_mark())),
             "{screen}"
         );
+        // The running package is named, and the verdict says what the
+        // difference is: another build, not a replacement. Neither root is on
+        // the line a reader scans; both are in the block.
+        let page = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(page.contains("package: /home/dev/pi"), "{page}");
+        assert!(page.contains("binary: other build"), "{page}");
+        assert!(!page.contains("/nix/store/aaa-pi-1.0.2"), "{page}");
+        assert!(!page.contains("current"), "{page}");
+        app.toggle_block(&Disclosure::Process);
+        let page = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(page.contains("running: /home/dev/pi"), "{page}");
         assert!(
-            screen.contains("binary: not the installed program"),
-            "{screen}"
+            page.contains("installed: /nix/store/aaa-pi-1.0.2"),
+            "{page}"
         );
-        assert!(screen.contains("/home/dev/pi"), "{screen}");
-        assert!(screen.contains("/nix/store/aaa-pi-1.0.2"), "{screen}");
     }
 
     #[test]
-    fn matching_or_unreadable_installations_claim_nothing() {
-        // A running executable that is the installed one says nothing: there is
-        // no warning to give.
-        let mut matching = fixture_state();
-        matching.apply_evidence(
+    fn a_current_comparison_stays_readable_without_a_mark() {
+        // A running executable that is the installed one has no warning to
+        // give, and no verdict either: the page names the process and the
+        // package once, with the executable inside it.
+        let mut state = fixture_state();
+        state.apply_evidence(
             "wA:p2",
             binary_evidence(BinaryIdentity {
                 freshness: BinaryFreshness::Current,
                 running: Some("/nix/store/aaa-pi-1.0.2".into()),
                 installed: Some("/nix/store/aaa-pi-1.0.2".into()),
+                executable: Some("/nix/store/aaa-pi-1.0.2/lib/pi/pi".into()),
+                unknown: None,
             }),
         );
-        let mut app = app_for(&matching);
+        let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
-        // Read on Processes, the page that carries the comparison: an absence
-        // asserted anywhere else would say nothing about it.
-        let screen = render_page(&matching, &mut app, DetailPage::Processes, 180, 34);
-        assert!(!screen.contains("binary:"), "{screen}");
-        assert!(
-            !screen.contains(&format!("{} worker task", theme::stale_mark())),
-            "{screen}"
-        );
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
 
-        // An unknown comparison — a gone process, no PATH match, an interpreter
-        // — is not claimed either way.
-        let mut unknown = fixture_state();
-        unknown.apply_evidence("wA:p2", binary_evidence(BinaryIdentity::default()));
-        let mut app = app_for(&unknown);
-        select_agent(&mut app, "wA:p2");
-        let screen = render_page(&unknown, &mut app, DetailPage::Processes, 180, 34);
-        assert!(!screen.contains("binary:"), "{screen}");
+        assert!(processes.contains("observed: pi"), "{processes}");
+        assert!(processes.contains("package: pi-1.0.2"), "{processes}");
+        assert!(processes.contains("executable: lib/pi/pi"), "{processes}");
+        // One package, named once, and nothing claiming a verdict: a current
+        // comparison says so by having no mark and no words.
+        assert!(!processes.contains("/nix/store/"), "{processes}");
+        assert!(!processes.contains("binary:"), "{processes}");
+        assert!(!processes.contains("current"), "{processes}");
+        app.toggle_block(&Disclosure::Process);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        assert!(
+            processes.contains("running: /nix/store/aaa-pi-1.0.2"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("installed: /nix/store/aaa-pi-1.0.2"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("executable: /nix/store/aaa-pi-1.0.2/lib/pi/pi"),
+            "{processes}"
+        );
+        let screen = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
         assert!(
             !screen.contains(&format!("{} worker task", theme::stale_mark())),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn an_unknown_comparison_states_why_it_could_not_be_made() {
+        // One wording per typed reason, and no mark whatever the reason: an
+        // unknown comparison is never claimed either way. A running file that
+        // was read stays nameable beside the reason it could not be used.
+        for (reason, executable, word, sentence) in [
+            (
+                BinaryUnknown::NoCounterpart,
+                Some("/nix/store/aaa-nvim/bin/nvim"),
+                "no counterpart",
+                "unknown — no installed counterpart resolves",
+            ),
+            (
+                BinaryUnknown::UnsupportedLauncher,
+                Some("/nix/store/aaa-pi-bolt/bin/pi-bolt"),
+                "payload unknown",
+                "unknown — the installed counterpart's payload could not be identified",
+            ),
+            (
+                BinaryUnknown::Unreadable,
+                None,
+                "unreadable",
+                "unknown — the running executable could not be read",
+            ),
+            (
+                BinaryUnknown::NotCompared,
+                Some("/nix/store/aaa-nvim/bin/nvim"),
+                "not the named program",
+                "unknown — the running file is not the program the runtime named",
+            ),
+        ] {
+            let mut state = fixture_state();
+            state.apply_evidence(
+                "wA:p2",
+                binary_evidence(BinaryIdentity {
+                    executable: executable.map(str::to_string),
+                    unknown: Some(reason),
+                    ..BinaryIdentity::default()
+                }),
+            );
+            let mut app = app_for(&state);
+            select_agent(&mut app, "wA:p2");
+            let processes = panel_text(&state, &mut app, DetailPage::Processes);
+            assert!(processes.contains(word), "{reason:?}: {processes}");
+            assert!(!processes.contains(sentence), "{reason:?}: {processes}");
+            // The reason in full, and the path it is about, are the block's.
+            app.toggle_block(&Disclosure::Process);
+            let open = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+            assert!(open.contains(sentence), "{reason:?}: {open}");
+            match executable {
+                Some(path) => assert!(
+                    open.contains(&format!("executable: {path}")),
+                    "{reason:?}: {open}"
+                ),
+                // An unreadable link has no path to name, so neither the
+                // executable nor an identity is drawn.
+                None => assert!(!open.contains("executable:"), "{reason:?}: {open}"),
+            }
+            let screen = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
+            assert!(
+                !screen.contains(&format!("{} worker task", theme::stale_mark())),
+                "{reason:?}: {screen}"
+            );
+        }
+
+        // An identity nothing was compared against and which carries no reason
+        // has nothing to state, so it claims nothing.
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", binary_evidence(BinaryIdentity::default()));
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(!processes.contains("executable:"), "{processes}");
+        assert!(!processes.contains("binary:"), "{processes}");
+    }
+
+    #[test]
+    fn an_ordinary_pane_shows_the_same_process_identity_as_an_agent() {
+        // One seam draws both rows: a pane with a process in it gets the
+        // executable and the comparison as an agent row does.
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p3",
+            named_binary_evidence(
+                "pi-bolt",
+                "pi-bolt --approve",
+                BinaryIdentity {
+                    freshness: BinaryFreshness::Stale,
+                    running: Some("/nix/store/aaa-pi-bolt-0.7.1".into()),
+                    installed: Some("/nix/store/bbb-pi-bolt-0.7.1".into()),
+                    executable: Some("/nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi".into()),
+                    unknown: None,
+                },
+            ),
+        );
+        let mut app = app_for(&state);
+        show_all_panes(&mut app);
+        select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
+        // Wide enough that the executable's own path is asserted as one token.
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+
+        assert!(processes.contains("observed: pi-bolt"), "{processes}");
+        // The package once, with the hash that tells the two builds of this
+        // version apart, the executable inside it and a marked verdict.
+        assert!(
+            processes.contains("package: pi-bolt-0.7.1 aaa"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("executable: lib/pi-bolt/pi"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains(&format!(
+                "binary: {} (stale) installed pi-bolt-0.7.1 bbb",
+                theme::stale_mark()
+            )),
+            "{processes}"
+        );
+        assert!(!processes.contains("/nix/store/"), "{processes}");
+        app.toggle_block(&Disclosure::Process);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        assert!(
+            processes.contains("running: /nix/store/aaa-pi-bolt-0.7.1"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("installed: /nix/store/bbb-pi-bolt-0.7.1"),
+            "{processes}"
+        );
+        assert!(
+            processes.contains("executable: /nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi"),
+            "{processes}"
+        );
+    }
+
+    #[test]
+    fn the_process_block_holds_what_the_page_draws_short() {
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled_binary(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(1_240)),
+                    Some(86 * 1024 * 1024),
+                    DescendantResources {
+                        observed: Some(2),
+                        rss_bytes: Total::Partial(
+                            410 * 1024 * 1024,
+                            "a descendant exited while the table was read".into(),
+                        ),
+                        cpu: Total::Complete(CpuPercent::from_hundredths(11_820)),
+                    },
+                ),
+                "pi-bolt",
+                BinaryIdentity {
+                    freshness: BinaryFreshness::Stale,
+                    running: Some("/nix/store/aaa-pi-bolt-0.7.1".into()),
+                    installed: Some("/nix/store/bbb-pi-bolt-0.7.1".into()),
+                    executable: Some("/nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi".into()),
+                    unknown: None,
+                },
+            ),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+
+        // The narrowest panel the side-by-side layout draws, and a wide one:
+        // what a reader scans is the package once, the executable inside it and
+        // a marked verdict. No store prefix is repeated, no incarnation, no
+        // meaning and no sentence, and nothing claims the running build is the
+        // installed one.
+        for width in [90, 120] {
+            let closed = panel_text_at(&state, &mut app, DetailPage::Processes, width);
+            assert!(
+                closed.contains("package: pi-bolt-0.7.1 aaa"),
+                "{width}: {closed}"
+            );
+            assert!(
+                closed.contains("executable: lib/pi-bolt/pi"),
+                "{width}: {closed}"
+            );
+            assert!(
+                closed.contains(&format!(
+                    "binary: {} (stale) installed pi-bolt-0.7.1 bbb",
+                    theme::stale_mark()
+                )),
+                "{width}: {closed}"
+            );
+            assert!(!closed.contains("/nix/store/"), "{width}: {closed}");
+            assert!(!closed.contains("boot "), "{width}: {closed}");
+            assert!(!closed.contains("start ticks"), "{width}: {closed}");
+            assert!(
+                !closed.contains("waiting, but wakeable"),
+                "{width}: {closed}"
+            );
+            assert!(!closed.contains("assignment total"), "{width}: {closed}");
+            assert!(!closed.contains("current"), "{width}: {closed}");
+            assert!(closed.contains("▸ details"), "{width}: {closed}");
+        }
+
+        // Everything the page drew short is one keypress away, whole: both
+        // roots, the path they were cut from, the incarnation the reading
+        // belongs to, what each state letter means, and what a sum is.
+        app.toggle_block(&Disclosure::Process);
+        let open = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        for fact in [
+            "running: /nix/store/aaa-pi-bolt-0.7.1",
+            "installed: /nix/store/bbb-pi-bolt-0.7.1",
+            "executable: /nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi",
+            "birth: pid 4242 · boot 6d9d2f0a-2f6f-4a1f-9c2d-2f6f4a1f9c2d · start ticks 9812",
+            "running: executing, or waiting its turn on a CPU",
+            "sleeping: waiting, but wakeable",
+            "zombie: exited, not yet reaped by its parent",
+            "descendants: observed processes beneath this one, not a workload or \
+             assignment total (a page shared with another process counts in each)",
+        ] {
+            assert!(open.contains(fact), "{fact:?} is not in the block: {open}");
+        }
+    }
+
+    /// The selected row is a live process: it offers one block on the Processes
+    /// page, drawn as the block a marker opens.
+    fn assert_process_block(state: &ObservationState, case: &str) {
+        let mut app = app_for(state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        assert_eq!(
+            app.disclosures(),
+            vec![Disclosure::Process],
+            "{case}: the page's blocks"
+        );
+        let page = panel_text(state, &mut app, DetailPage::Processes);
+        assert!(page.contains("▸ details"), "{case}: {page}");
+    }
+
+    /// The same row with no live process: nothing to hold behind a marker, and
+    /// no marker answering to nothing.
+    fn assert_no_process_block(state: &ObservationState, case: &str) {
+        let mut app = app_for(state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        assert!(app.disclosures().is_empty(), "{case}: a block is offered");
+        let page = panel_text(state, &mut app, DetailPage::Processes);
+        assert!(!page.contains("details"), "{case}: {page}");
+    }
+
+    #[test]
+    fn the_process_block_is_offered_only_where_a_process_is_drawn() {
+        // A shell, an inconclusive foreground and a pane nothing was read for
+        // name no process, so the page has nothing verbose to hold.
+        for (evidence, case) in [
+            (Some(ForegroundEvidence::Shell), "a shell"),
+            (
+                Some(ForegroundEvidence::Inconclusive),
+                "an inconclusive foreground",
+            ),
+            (None, "no evidence"),
+        ] {
+            let mut state = fixture_state();
+            if let Some(evidence) = evidence {
+                state.apply_evidence("wA:p2", evidence);
+            }
+            assert_no_process_block(&state, case);
+        }
+        // A retained row draws no process facts at all.
+        assert_no_process_block(&retained_working_state(), "a retained row");
+        // Nor does a last-good row of a stale inventory, which draws the
+        // process withheld rather than as live.
+        let mut stale = fixture_state();
+        stale.apply_evidence("wA:p2", binary_evidence(stale_identity()));
+        stale.apply_failure("herdr exited with status 1");
+        assert_no_process_block(&stale, "a stale source");
+        // And a row that does name one offers exactly that block.
+        let mut live = fixture_state();
+        live.apply_evidence("wA:p2", binary_evidence(stale_identity()));
+        assert_process_block(&live, "a live process");
+    }
+
+    #[test]
+    fn the_process_block_opens_from_the_page_at_either_width() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", binary_evidence(stale_identity()));
+        // A click on the marker, and Enter from the keyboard the page's own tab
+        // hands the panel: both toggle the one block, at either panel width.
+        for width in [120, 90] {
+            let mut app = app_for(&state);
+            select_agent(&mut app, "wA:p2");
+            app.select_page(DetailPage::Processes);
+            draw(&state, &mut app, width, 30);
+            let (_, mut geometry) = draw(&state, &mut app, width, 30);
+            let marker = marker_of(&geometry, &Disclosure::Process);
+            let details = geometry.details.expect("the panel is drawn");
+            assert!(is_inside(details, marker), "{width}: {marker:?}");
+            assert!(!app.disclosure_open(&Disclosure::Process));
+
+            assert_eq!(click_at(&mut app, marker), None);
+            assert!(app.disclosure_open(&Disclosure::Process));
+            let (open, drawn) = draw(&state, &mut app, width, 30);
+            geometry = drawn;
+            // The wrapped drawing puts the label and the path on their own
+            // rows, so the whole root is what says the body is drawn.
+            assert!(open.contains("/nix/store/aaa-pi-1.0.2"), "{width}: {open}");
+
+            let tab = geometry.detail_tabs[DetailPage::Processes.index()].expect("the tab");
+            click_at(&mut app, (tab.x, tab.y));
+            assert!(app.details_focused());
+            let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.handle_key(key), None);
+            assert!(!app.disclosure_open(&Disclosure::Process));
+            let (closed, _) = draw(&state, &mut app, width, 30);
+            assert!(
+                !closed.contains("/nix/store/aaa-pi-1.0.2"),
+                "{width}: {closed}"
+            );
+            assert!(closed.contains("▸ details"), "{width}: {closed}");
+        }
+    }
+
+    #[test]
+    fn the_observed_name_is_no_invocation_and_its_arguments_are_not_drawn() {
+        // A bolt payload is exec-replaced, so the runtime reports the payload's
+        // own name: the page says what was observed, never what the pane was
+        // started with. Its arguments can carry a prompt, so none are drawn.
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            named_binary_evidence(
+                "pi\u{7}",
+                "/nix/store/aaa\u{7}-pi-bolt-0.7.1/lib/pi-bolt/pi --approve \
+                 --system-prompt You are a helpful assistant \
+                 --append-system-prompt Task: do the thing",
+                BinaryIdentity {
+                    freshness: BinaryFreshness::Current,
+                    running: Some("/nix/store/aaa-pi-bolt-0.7.1".into()),
+                    installed: Some("/nix/store/aaa-pi-bolt-0.7.1".into()),
+                    executable: Some("/nix/store/aaa\u{7}-pi-bolt-0.7.1/lib/pi-bolt/pi".into()),
+                    unknown: None,
+                },
+            ),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        // Wide enough that the executable's own path is asserted as one token.
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+
+        // The name and the path are shown sanitized, and the path is drawn
+        // inside the package that carries it.
+        assert!(processes.contains("observed: pi"), "{processes}");
+        assert!(
+            processes.contains("executable: lib/pi-bolt/pi"),
+            "{processes}"
+        );
+        // No argument reaches the page — above all not a prompt.
+        for argument in [
+            "--approve",
+            "--system-prompt",
+            "--append-system-prompt",
+            "You are a helpful assistant",
+            "Task: do the thing",
+        ] {
+            assert!(
+                !processes.contains(argument),
+                "{argument:?} is an argument, not the process: {processes}"
+            );
+        }
+        // And the whole path the relative form was cut from is still there.
+        app.toggle_block(&Disclosure::Process);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        assert!(
+            processes.contains("executable: /nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi"),
+            "{processes}"
+        );
+        // And nothing on the page claims to be what started the pane.
+        for word in ["invocation", "launcher", "alias", "started with"] {
+            assert!(!processes.contains(word), "{word:?}: {processes}");
+        }
+    }
+
+    #[test]
+    fn a_retained_shell_or_inconclusive_row_draws_no_process_identity() {
+        // A retained row's process is gone; a shell or an inconclusive answer
+        // names none. None of them may borrow the identity fields.
+        let mut retained = fixture_state();
+        let mut without_worker = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        without_worker
+            .agents
+            .retain(|agent| agent.location.pane_id != "wA:p2");
+        retained.apply_success(without_worker);
+        retained.apply_evidence("wA:p2", ForegroundEvidence::Shell);
+        let mut app = app_for(&retained);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&retained, &mut app, DetailPage::Processes);
+        assert!(processes.contains("withheld"), "{processes}");
+        assert!(!processes.contains("observed:"), "{processes}");
+        assert!(!processes.contains("executable:"), "{processes}");
+        assert!(!processes.contains("binary:"), "{processes}");
+
+        // A shell and an inconclusive answer say what the foreground is, and
+        // claim no process.
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", ForegroundEvidence::Shell);
+        state.apply_evidence("wA:p3", ForegroundEvidence::Inconclusive);
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(
+            processes.contains("foreground: shell — nothing in the foreground"),
+            "{processes}"
+        );
+        assert!(!processes.contains("observed:"), "{processes}");
+
+        show_all_panes(&mut app);
+        select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
+        let processes = panel_text(&state, &mut app, DetailPage::Processes);
+        assert!(
+            processes.contains("foreground: unknown — PID fields disagree"),
+            "{processes}"
+        );
+        assert!(!processes.contains("observed:"), "{processes}");
+        assert!(!processes.contains("binary:"), "{processes}");
     }
 
     #[test]
@@ -4819,12 +5873,15 @@ mod tests {
         let source = render_page(&state, &mut app, DetailPage::Source, 180, 34);
         assert!(source.contains("source: stale"), "{source}");
 
-        // The comparison is withheld, not drawn from the last-good evidence.
+        // The process, its executable and the comparison are withheld, not
+        // drawn from the last-good evidence.
         let processes = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
         assert!(
             processes.contains("withheld — the source is not current"),
             "{processes}"
         );
+        assert!(!processes.contains("observed:"), "{processes}");
+        assert!(!processes.contains("executable:"), "{processes}");
         assert!(!processes.contains("binary:"), "{processes}");
         assert!(
             !processes.contains(&format!("{} worker task", theme::stale_mark())),
@@ -4856,10 +5913,7 @@ mod tests {
         let overview = render_text(&state, &app, 180, 30);
         assert!(overview.contains("pid: 7"), "{overview}");
         let processes = render_page(&state, &mut app, DetailPage::Processes, 180, 30);
-        assert!(
-            processes.contains("foreground: nvim notes.md"),
-            "{processes}"
-        );
+        assert!(processes.contains("observed: nvim"), "{processes}");
         assert!(processes.contains("pid: 7"), "{processes}");
     }
 

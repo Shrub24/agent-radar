@@ -608,10 +608,15 @@ fn a_task_processes_page_names_its_published_pid_and_borrows_no_metrics() {
     // owner's metrics.
     assert!(processes.contains("metrics: unavailable"), "{processes}");
     assert!(processes.contains("birth identity"), "{processes}");
-    assert!(!processes.contains("birth:"), "{processes}");
-    assert!(!processes.contains("cpu:"), "{processes}");
-    assert!(!processes.contains("rss:"), "{processes}");
-    assert!(!processes.contains("descendant"), "{processes}");
+    // And no section of metrics it never had: no heading, no birth identity's
+    // own value, none of the values a sampled process is drawn with.
+    assert!(!processes.contains("boot "), "{processes}");
+    assert!(!processes.contains("cpu"), "{processes}");
+    assert!(!processes.contains("rss"), "{processes}");
+    assert!(!processes.contains("descendants"), "{processes}");
+    // And no block: a published PID carries no process facts, so there is
+    // nothing behind a marker for Enter to open.
+    assert!(app.disclosures().is_empty(), "{:?}", app.disclosures());
 }
 
 #[test]

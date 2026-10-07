@@ -33,9 +33,9 @@ pub use lifecycle::{
     CloseRequest, Closer, Containment, ManagedActions, ManagedRequest, Update, UpdateKind,
 };
 pub use model::{
-    AgentObservation, BinaryFreshness, BinaryIdentity, FleetObservation, ForegroundEvidence,
-    Lineage, LocalFacts, Location, Pane, RuntimeStatus, SessionIdentity, SessionUuid, Tab,
-    TerminalMode, Workspace,
+    AgentObservation, BinaryFreshness, BinaryIdentity, BinaryUnknown, FleetObservation,
+    ForegroundEvidence, Lineage, LocalFacts, Location, Pane, RuntimeStatus, SessionIdentity,
+    SessionUuid, Tab, TerminalMode, Workspace,
 };
 pub use observation::{ObservationState, RetainedAgent, RetentionBasis, SourceFreshness};
 pub use runtime::{CloseTarget, RuntimeProvider, Target};

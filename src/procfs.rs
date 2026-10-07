@@ -7,9 +7,14 @@
 //! all are read here and nowhere else — a process that is gone, or a platform
 //! whose state cannot be read, yields unknown facts rather than a guess.
 //!
-//! Only the process's own executable is compared, and only with the program
-//! `PATH` resolves for the name the runtime reports. A process's environment is
-//! never read, so Radar's own `PATH` is the one that decides.
+//! Comparison is by package family for the Pi-Bolt variants and by file name for
+//! everything else. A bolt process holds `<package>/lib/pi-bolt/pi` while `PATH`
+//! resolves `<package>/bin/pi-bolt`, so the two files never share a name and a
+//! comparison by name can decide nothing about them: those families are resolved
+//! from the running executable's own store package and compared root by root,
+//! and the name the runtime reports — `pi`, the name of the payload every
+//! variant replaced its shell with — selects no program. A process's environment
+//! is never read, so Radar's own `PATH` is the one that decides.
 //!
 //! Resources are the one fact with a memory. Interval CPU is the difference
 //! between two readings of the same process incarnation, so [`Sampler`] keeps
@@ -36,8 +41,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::model::{
-    BinaryFreshness, BinaryIdentity, CpuPercent, DescendantResources, LocalFacts, ProcessIdentity,
-    ProcessResources, ProcessState, TerminalMode, Total,
+    BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent, DescendantResources, LocalFacts,
+    ProcessIdentity, ProcessResources, ProcessState, TerminalMode, Total,
 };
 
 /// The kernel's marker on an executable link whose file has been unlinked or
@@ -128,21 +133,280 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-/// How the running executable compares with the program `PATH` resolves for
-/// `program`, through `binaries`.
+/// The package families whose running payload is resolved by package rather
+/// than by file name.
+///
+/// Pi-Bolt's variants are one product built as several packages: a pane's
+/// process holds `<package>/lib/pi-bolt/pi` while the command `PATH` resolves is
+/// `<package>/bin/pi-bolt`, so the two files never share a name. These are the
+/// exact package names resolved this way, and a name that merely starts with one
+/// of them is not one of them: `pi-bolt` never stands for `pi-bolt-child`.
+const BOLT_FAMILIES: [&str; 2] = ["pi-bolt", "pi-bolt-child"];
+
+/// The largest launcher script this resolver reads.
+///
+/// A launcher that leads a process is a short setup script. A file larger than
+/// this is not the shape being looked for, and is not read to find out.
+const MAX_LAUNCHER_BYTES: u64 = 64 * 1024;
+
+/// The package name and version of a Nix store derivation root name.
+///
+/// A store path is `<store>/<hash>-<name>-<version>`, so the first `-` ends the
+/// hash and the last one ends the package name: `hxdd…-pi-bolt-0.7.1` is
+/// `pi-bolt` at `0.7.1`. A root with no version — an unversioned launcher
+/// package, or any other name — is not a versioned package, and a version that
+/// does not start with a digit is not read as one. Nothing is inferred from a
+/// name that does not have the shape.
+fn store_package(root_name: &str) -> Option<(&str, &str)> {
+    let (_, package) = root_name.split_once('-')?;
+    let (name, version) = package.rsplit_once('-')?;
+    version
+        .starts_with(|c: char| c.is_ascii_digit())
+        .then_some((name, version))
+}
+
+/// The bolt family the running executable belongs to, when it is one.
+///
+/// Read from the running file's own store package and nothing else, so the same
+/// payload is the same family however the runtime names the process.
+fn bolt_family(running: &Path) -> Option<&'static str> {
+    let root = installation(running);
+    let (name, _version) = store_package(file_name(&root)?)?;
+    BOLT_FAMILIES.into_iter().find(|family| *family == name)
+}
+
+/// The package root whose payload an installed entrypoint runs, or why it could
+/// not be identified.
+///
+/// Two shapes are recognized and nothing else:
+///
+/// * An entrypoint inside a versioned package of the same family is that
+///   package's own launcher — the shape a Nix package has, where `bin/pi-bolt`
+///   and `lib/pi-bolt/pi` share one store root — so the package root is the
+///   payload root and nothing is read.
+/// * Otherwise the entrypoint must be a launcher script whose shape is
+///   unambiguous, and the package root of its one target is the payload root
+///   (see [`script_target`]).
+///
+/// A root that is not a versioned package of the family is not a payload root
+/// merely because the entrypoint sits inside it: an unversioned launcher package
+/// has a root of its own that holds no payload.
+pub fn counterpart_root(installed: &Path, family: &str) -> Result<PathBuf, BinaryUnknown> {
+    let root = installation(installed);
+    if let Some((name, _version)) = file_name(&root).and_then(store_package)
+        && name == family
+    {
+        return Ok(root);
+    }
+    // Only a launcher script is read, and only its one declared entrypoint is
+    // followed — and that entrypoint must itself be a versioned package of
+    // this exact family. A launcher naming another family's package, an
+    // unrelated program, an unversioned root or a file inside a package says
+    // nothing about which payload this family runs, so it is refused rather
+    // than taken as an answer.
+    let payload = installation(&script_target(installed)?);
+    let Some((name, _version)) = file_name(&payload).and_then(store_package) else {
+        return Err(BinaryUnknown::UnsupportedLauncher);
+    };
+    (name == family)
+        .then_some(payload)
+        .ok_or(BinaryUnknown::UnsupportedLauncher)
+}
+
+/// The store path one launcher script runs, when its shape says so.
+///
+/// The recognized shape is a short script whose only mention of `exec` is one
+/// line at the start of a line naming one absolute store path literally. Setup
+/// may precede it — flags, an exported variable, a test of a file — because that
+/// is what the launchers in use contain, and
+///
+/// * the `exec` must be the last thing the script does: an `exec` inside a
+///   branch is followed by that branch's `fi`, `done` or `else`, and so is any
+///   line after it,
+/// * the script must mention `exec` exactly once, so several possible targets,
+///   an indented or compound `exec` are refused rather than chosen between,
+/// * the target must be one literal store entrypoint, `<root>/bin/<program>`:
+///   a quoted, computed or variable target does not say where the process
+///   goes, and neither does a bare store file or a deeper path, and
+/// * the file must be a script at all — a readable `#!` file no larger than
+///   [`MAX_LAUNCHER_BYTES`].
+///
+/// This reads a launcher's declared target. It is not a shell interpreter, it
+/// executes nothing, and it reads no compiled content: every other shape is
+/// unknown rather than guessed at.
+fn script_target(script: &Path) -> Result<PathBuf, BinaryUnknown> {
+    let unsupported = || BinaryUnknown::UnsupportedLauncher;
+    let metadata = std::fs::metadata(script).map_err(|_| unsupported())?;
+    if metadata.len() > MAX_LAUNCHER_BYTES {
+        return Err(unsupported());
+    }
+    let text = std::fs::read_to_string(script).map_err(|_| unsupported())?;
+    let mut lines = text.lines();
+    if !lines.next().is_some_and(|first| first.starts_with("#!")) {
+        return Err(unsupported());
+    }
+    let mut target: Option<PathBuf> = None;
+    for line in lines {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.split_whitespace().any(|word| word == "exec") {
+            // Setup, which may precede the one target but not follow it.
+            if target.is_some() {
+                return Err(unsupported());
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("exec ") else {
+            return Err(unsupported());
+        };
+        let Some(word) = rest.split_whitespace().next() else {
+            return Err(unsupported());
+        };
+        if target.is_some() || !literal_store_entrypoint(word) {
+            return Err(unsupported());
+        }
+        target = Some(PathBuf::from(word));
+    }
+    target.ok_or_else(unsupported)
+}
+
+/// Whether `word` is one literal store entrypoint and nothing else.
+///
+/// The token must be the whole target: no quoting, no substitution, no trailing
+/// punctuation. The recognized shape is `<root>/bin/<program>` — a package
+/// root, its `bin` directory and one program file — because that is what a
+/// launcher names. A bare store file, a deeper path inside a package and any
+/// `.` or `..` component are not that shape. The root name is not judged here:
+/// whether it is this family's versioned package is [`counterpart_root`]'s
+/// question.
+fn literal_store_entrypoint(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix("/nix/store/") else {
+        return false;
+    };
+    let mut components = rest.split('/');
+    let (Some(root), Some("bin"), Some(program), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+    [root, program].into_iter().all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+    })
+}
+
+/// How the running executable compares with the program installed for it,
+/// through `binaries`.
 ///
 /// `running` is the executable's link target and `deleted` whether the kernel
-/// marked it so. This is the comparison behind [`facts`], exposed so it can be
-/// driven with injected paths.
+/// marked it so. `program` is the name the runtime reports, which is used only
+/// where a payload is resolved by file name: a bolt variant is resolved from the
+/// running file's own package family, so one the runtime names `pi` — or does
+/// not name at all — is still compared. This is the comparison behind [`facts`],
+/// exposed so it can be driven with injected paths.
 pub fn identity(
     running: &Path,
     deleted: bool,
-    program: &str,
+    program: Option<&str>,
     binaries: &mut BinaryIndex,
 ) -> BinaryIdentity {
+    match bolt_family(running) {
+        Some(family) => bolt_identity(running, deleted, family, binaries),
+        None => named_identity(running, deleted, program, binaries),
+    }
+}
+
+/// How a bolt variant's running payload compares with the payload its installed
+/// counterpart runs.
+///
+/// The counterpart is the exact family name the running package names, so a
+/// child is never compared with the lead's launcher however the runtime names
+/// it. Roots that differ are stale whatever version both packages carry: the
+/// question is whether this process runs what `PATH` points at now, and a
+/// rebuild of the same version is a different build.
+fn bolt_identity(
+    running: &Path,
+    deleted: bool,
+    family: &str,
+    binaries: &mut BinaryIndex,
+) -> BinaryIdentity {
+    let running_installation = installation(running);
+    let mut identity = BinaryIdentity {
+        running: Some(running_installation.display().to_string()),
+        executable: Some(running.display().to_string()),
+        unknown: Some(BinaryUnknown::NoCounterpart),
+        ..BinaryIdentity::default()
+    };
+    let payload = match binaries.installed(family) {
+        Some(installed) => counterpart_root(&installed, family),
+        None => Err(BinaryUnknown::NoCounterpart),
+    };
+    match payload {
+        Ok(payload) => {
+            identity.installed = Some(payload.display().to_string());
+            identity.unknown = None;
+            identity.freshness = if deleted
+                || (in_store(&running_installation)
+                    && in_store(&payload)
+                    && running_installation != payload)
+            {
+                BinaryFreshness::Stale
+            } else {
+                BinaryFreshness::Current
+            };
+            identity
+        }
+        // The kernel's mark is a fact about the running file: the process lost
+        // its binary, and is stale whether or not a counterpart was read.
+        Err(_) if deleted => {
+            identity.freshness = BinaryFreshness::Stale;
+            identity.unknown = None;
+            identity
+        }
+        Err(reason) => {
+            identity.unknown = Some(reason);
+            identity
+        }
+    }
+}
+
+/// How the running executable compares with the program `PATH` resolves for the
+/// name the runtime reports.
+///
+/// This is the comparison for every program whose payload is not resolved by
+/// package: the two files must share a name, and their installations are
+/// compared. A file with another name — an interpreter, a helper, a build the
+/// runtime misnames — is not attributed to a program at all.
+fn named_identity(
+    running: &Path,
+    deleted: bool,
+    program: Option<&str>,
+    binaries: &mut BinaryIndex,
+) -> BinaryIdentity {
+    let executable = Some(running.display().to_string());
+    let Some(program) = program else {
+        return BinaryIdentity {
+            executable,
+            unknown: Some(BinaryUnknown::NotCompared),
+            ..BinaryIdentity::default()
+        };
+    };
     match binaries.installed(program) {
-        Some(installed) => classify(running, deleted, &installed),
-        None => BinaryIdentity::default(),
+        Some(installed) => compare_named(running, deleted, &installed),
+        None => BinaryIdentity {
+            executable,
+            unknown: Some(BinaryUnknown::NoCounterpart),
+            ..BinaryIdentity::default()
+        },
     }
 }
 
@@ -749,20 +1013,22 @@ fn clock_ticks() -> Option<i64> {
     None
 }
 
-/// Compares a running executable's link target with the installed program.
+/// Compares a running executable's link target with the file `PATH` resolved
+/// for the program the runtime named.
 ///
 /// The comparison is between installations, not files: inside the Nix store a
 /// wrapper and the binary it launches share a store root, so they agree. A
-/// running file whose name is not the installed program's is not compared at
-/// all — an interpreter or helper the runtime reports is never attributed to
-/// the agent.
-fn classify(running: &Path, deleted: bool, installed: &Path) -> BinaryIdentity {
-    let (Some(running_name), Some(installed_name)) = (file_name(running), file_name(installed))
-    else {
-        return BinaryIdentity::default();
-    };
-    if running_name != installed_name {
-        return BinaryIdentity::default();
+/// running file whose name is not that match's is not compared at all — an
+/// interpreter or helper the runtime reports is never attributed to the agent.
+fn compare_named(running: &Path, deleted: bool, installed: &Path) -> BinaryIdentity {
+    let executable = Some(running.display().to_string());
+    let same_name = file_name(running).is_some_and(|name| Some(name) == file_name(installed));
+    if !same_name {
+        return BinaryIdentity {
+            executable,
+            unknown: Some(BinaryUnknown::NotCompared),
+            ..BinaryIdentity::default()
+        };
     }
     let running_installation = installation(running);
     let installed_installation = installation(installed);
@@ -780,6 +1046,8 @@ fn classify(running: &Path, deleted: bool, installed: &Path) -> BinaryIdentity {
         // inside one package name the same installation.
         running: Some(running_installation.display().to_string()),
         installed: Some(installed_installation.display().to_string()),
+        executable,
+        unknown: None,
     }
 }
 
@@ -814,7 +1082,9 @@ mod platform {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use super::{BinaryIdentity, BinaryIndex, LocalFacts, Procs, Stat, TerminalMode, identity};
+    use super::{
+        BinaryIdentity, BinaryIndex, BinaryUnknown, LocalFacts, Procs, Stat, TerminalMode, identity,
+    };
 
     /// This machine's process table, as [`Procs`] reads it.
     pub struct SystemProcs;
@@ -875,22 +1145,24 @@ mod platform {
         }
     }
 
-    /// How the process's executable compares with the installed program.
+    /// How the process's executable compares with the program installed for it.
     fn binary_identity(
         pid: i32,
         program: Option<&str>,
         binaries: &mut BinaryIndex,
     ) -> BinaryIdentity {
-        let Some(program) = program else {
-            return BinaryIdentity::default();
+        // The executable is read before the name is considered: a bolt variant
+        // is compared from its own package, and a runtime name that is missing,
+        // empty or `pi` says nothing about which program is running.
+        let Ok(link) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+            return BinaryIdentity {
+                unknown: Some(BinaryUnknown::Unreadable),
+                ..BinaryIdentity::default()
+            };
         };
         // The kernel appends " (deleted)" when the file the process started
         // from has been unlinked or replaced — the ordinary result of an
-        // upgrade. It is not stale on its own: with no installed match the
-        // comparison is Unknown, never a mark.
-        let Ok(link) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
-            return BinaryIdentity::default();
-        };
+        // upgrade, and a fact about the running file on its own.
         let link = link.to_string_lossy();
         let (running, deleted) = match link.strip_suffix(super::DELETED) {
             Some(path) => (PathBuf::from(path), true),
@@ -978,6 +1250,7 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::model::BinaryFreshness;
 
         fn attributes(line_discipline: libc::tcflag_t) -> libc::termios {
             let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
@@ -1016,7 +1289,9 @@ mod platform {
             let facts = facts(i32::MAX, Some("pi"), &mut binaries);
             assert_eq!(facts.running_for, None);
             assert_eq!(facts.terminal, TerminalMode::Unknown);
-            assert_eq!(facts.binary, BinaryIdentity::default());
+            assert_eq!(facts.binary.freshness, BinaryFreshness::Unknown);
+            assert_eq!(facts.binary.unknown, Some(BinaryUnknown::Unreadable));
+            assert_eq!(facts.binary.executable, None);
         }
     }
 }
@@ -1062,7 +1337,74 @@ mod tests {
     use super::*;
 
     fn identity_of(running: &str, deleted: bool, installed: &str) -> BinaryIdentity {
-        classify(Path::new(running), deleted, Path::new(installed))
+        compare_named(Path::new(running), deleted, Path::new(installed))
+    }
+
+    #[test]
+    fn a_store_root_name_yields_its_package_and_version() {
+        assert_eq!(
+            store_package("hxdd4znbva7jbas38cr1piavy5ig67j8-pi-bolt-0.7.1"),
+            Some(("pi-bolt", "0.7.1"))
+        );
+        assert_eq!(
+            store_package("ijm3q5j0w25i5iw12sl8ql7kxfwmzns2-pi-bolt-child-0.7.1"),
+            Some(("pi-bolt-child", "0.7.1"))
+        );
+        // An unversioned launcher package is not a versioned package, and a
+        // name with no store hash is not a store root name.
+        assert_eq!(
+            store_package("zyhpxvlrpvm7xc29p8p41ysqwxs57ryh-pi-bolt"),
+            None
+        );
+        assert_eq!(store_package("pi-bolt"), None);
+        assert_eq!(store_package("pi-bolt-child"), None);
+        // A version that does not start with a digit is not read as one.
+        assert_eq!(store_package("aaa-release-candidate"), None);
+    }
+
+    #[test]
+    fn only_a_versioned_bolt_package_names_a_family() {
+        assert_eq!(
+            bolt_family(Path::new("/nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi")),
+            Some("pi-bolt")
+        );
+        assert_eq!(
+            bolt_family(Path::new(
+                "/nix/store/bbb-pi-bolt-child-0.7.1/lib/pi-bolt/pi"
+            )),
+            Some("pi-bolt-child")
+        );
+        // A name that merely starts with a family is not one of them, and a
+        // program outside the store has no package at all.
+        assert_eq!(
+            bolt_family(Path::new("/nix/store/ccc-pi-boltX-0.7.1/lib/pi-bolt/pi")),
+            None
+        );
+        assert_eq!(bolt_family(Path::new("/usr/local/bin/pi")), None);
+        assert_eq!(
+            bolt_family(Path::new("/nix/store/ddd-pi-1.0.4/bin/pi")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_versioned_packages_own_entrypoint_names_its_own_root() {
+        // The shape a derivation provides: `bin/pi-bolt` beside `lib/pi-bolt/pi`
+        // in one root needs no reading, and the payload root is that root.
+        let root = "/nix/store/aaa-pi-bolt-0.7.1";
+        assert_eq!(
+            counterpart_root(
+                Path::new("/nix/store/aaa-pi-bolt-0.7.1/bin/pi-bolt"),
+                "pi-bolt"
+            ),
+            Ok(PathBuf::from(root))
+        );
+        // The unversioned launcher package in the profile is not a payload root:
+        // its root holds no payload, and it carries no versioned package name.
+        assert_eq!(
+            counterpart_root(Path::new("/nix/store/zzz-pi-bolt/bin/pi-bolt"), "pi-bolt"),
+            Err(BinaryUnknown::UnsupportedLauncher)
+        );
     }
 
     #[test]
@@ -1134,8 +1476,11 @@ mod tests {
         // a python interpreter: nothing is claimed.
         let identity = identity_of("/usr/bin/python3", false, "/nix/store/bbb-pi-1.0.3/bin/pi");
         assert_eq!(identity.freshness, BinaryFreshness::Unknown);
+        assert_eq!(identity.unknown, Some(BinaryUnknown::NotCompared));
         assert_eq!(identity.running, None);
         assert_eq!(identity.installed, None);
+        // What is running is still nameable, without being attributed.
+        assert_eq!(identity.executable.as_deref(), Some("/usr/bin/python3"));
     }
 
     /// A stat line with the fields Radar reads, as the kernel writes them. The
