@@ -10,7 +10,7 @@ openspec validate --all --strict
 nix build .#checks.x86_64-linux.package --no-link
 ```
 
-The combined managed command completed with exit 0 (bg-829, certified result retrieved). Formatting, warnings-denied Clippy, locked tests/build, both PTY smoke scenarios and strict OpenSpec validation passed. Checked Linux package built successfully at `/nix/store/s97zxfwgxpm71s0cpy0k9v8n7m84ksbv-agent-radar-0.1.0`, via the configured remote builder.
+The combined managed command completed with exit 0 (bg-829, certified result retrieved). Formatting, warnings-denied Clippy, locked tests/build, both PTY smoke scenarios and strict OpenSpec validation passed. Checked Linux package built successfully at `/nix/store/s97zxfwgxpm71s0cpy0k9v8n7m84ksbv-agent-radar-0.1.0`, via the configured remote builder. That build covered the resolver and the first presentation; the compact presentation follow-up below was gated the same way and its checked package built at `/nix/store/rjf2blgxd3v6msv1gyh1dmzjikfyql51-agent-radar-0.1.0` (bg-865, certified result retrieved).
 
 The resolver review correction requires a versioned target of the exact same family and an absolute store `bin/<program>` entrypoint without dot components. Regression cases include unrelated versioned packages, unversioned/further-hop launchers, non-bin targets and dot components. Main/child remain separate even though their payloads are named `pi`. Same-version rebuilt store roots remain stale.
 
