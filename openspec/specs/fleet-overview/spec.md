@@ -192,30 +192,9 @@ Radar SHALL draw a mark of its own in the leading column of every ordinary pane 
 - **WHEN** the icon font is absent
 - **THEN** the pane mark is drawn from the text fallback rather than as an unknown glyph
 
-### Requirement: Herdsman facts on the row and in the details
+### Requirement: An agent row is named and dated from published facts
 
-Radar SHALL draw an agent row as its name — a managed worker's runtime label, a lead's published name, or the reported title when neither is published — the activity state derived from the pane, the age of its active assignment where one exists, and its model and thinking level where those are known. Every other Herdsman fact SHALL be reachable in the details panel: the owner's projected state, labelled as the owner's, the assignment's display text, the role, the agent definition, the full model, the provider, context usage, the session's human name, the run, request and pending-ask identities, what the pane is awaiting, its unresolved background tasks with the phases they were published with, and the running-task count its own publisher states beside them. The row's background badge SHALL count the pane's unresolved background tasks, never the running-task count. A background task's published phase word SHALL be preserved whether or not Radar recognises it, and a task published without a phase SHALL keep its whole text as its id. The details SHALL distinguish the owner's projection from the state derived from the pane.
-
-#### Scenario: A projected state disagreeing with the pane
-- **WHEN** the owner's assignment projection differs from the activity state derived from the pane's own facts
-- **THEN** the row shows the derived activity state and the details name the owner's assignment projection beside it, labelled as the owner's
-
-#### Scenario: A pane whose tasks have all exited into review
-- **WHEN** a pane's own publisher counts no running task while listing several tasks that exited with their captures unread, and the pane's runtime state is idle
-- **THEN** the derived activity is waiting and the row badges the listed tasks
-- **AND** the details keep the published running count and the oldest outstanding start beside the unresolved set
-
-#### Scenario: A pane working with work outstanding
-- **WHEN** a pane's runtime reports working while its awaited set is non-empty
-- **THEN** the derived activity is working, and the details still name everything it awaits
-
-#### Scenario: A pane whose runtime state is unknown
-- **WHEN** a pane's runtime state is unreported or unknown while work is outstanding
-- **THEN** the derived activity stays unknown rather than being inferred as idle
-
-#### Scenario: A phase word Radar does not know
-- **WHEN** a background task is published with a phase word this Radar does not recognise
-- **THEN** the task is kept as published, counted as unresolved, and shown with that word rather than dropped
+Radar SHALL draw an agent row as its name — a managed worker's runtime label, a lead's published name, or the reported title when neither is published — the activity state derived from the pane, the age of its active assignment where one exists, and its model and thinking level where those are known. Facts that are absent SHALL be omitted rather than drawn as an empty placeholder.
 
 #### Scenario: A worker's name
 - **WHEN** a managed worker publishes its runtime label
@@ -229,13 +208,46 @@ Radar SHALL draw an agent row as its name — a managed worker's runtime label, 
 - **WHEN** an agent has no assignment start time
 - **THEN** its row shows no age, while a known model and thinking level are still shown
 
-#### Scenario: A projected state the runtime does not report
-- **WHEN** the owner projects `settling` or `blocked` while the pane's own facts say it is working
-- **THEN** the row shows the pane's own activity, and the details name the owner's projection beside it
+#### Scenario: A pane whose runtime state is unknown
+- **WHEN** a pane's runtime state is unreported or unknown while work is outstanding
+- **THEN** the derived activity stays unknown rather than being inferred as idle
 
 #### Scenario: Facts that are absent
 - **WHEN** an agent publishes no model, thinking level or assignment
 - **THEN** the row omits them rather than drawing an empty placeholder
+
+### Requirement: The background badge counts unresolved work
+
+The row's background badge SHALL count the pane's unresolved background tasks, never the running-task count its publisher states. A background task's published phase word SHALL be preserved whether or not Radar recognises it, and a task published without a phase SHALL keep its whole text as its id.
+
+#### Scenario: A pane whose tasks have all exited into review
+- **WHEN** a pane's own publisher counts no running task while listing several tasks that exited with their captures unread, and the pane's runtime state is idle
+- **THEN** the derived activity is waiting and the row badges the listed tasks
+- **AND** the details keep the published running count and the oldest outstanding start beside the unresolved set
+
+#### Scenario: A phase word Radar does not know
+- **WHEN** a background task is published with a phase word this Radar does not recognise
+- **THEN** the task is kept as published, counted as unresolved, and shown with that word rather than dropped
+
+### Requirement: Herdsman facts are reachable in the details
+
+Every other Herdsman fact SHALL be reachable in the details panel: the owner's projected state, the assignment's display text, the role, the agent definition, the full model, the provider, context usage, the session's human name, the run, request and pending-ask identities, what the pane is awaiting, and its unresolved background tasks with the phases they were published with and the running-task count beside them.
+
+#### Scenario: A pane working with work outstanding
+- **WHEN** a pane's runtime reports working while its awaited set is non-empty
+- **THEN** the derived activity is working, and the details still name everything it awaits
+
+### Requirement: The owner's projection is distinguished from derived activity
+
+The details SHALL label the owner's projected state as the owner's and SHALL distinguish it from the activity state derived from the pane.
+
+#### Scenario: A projected state disagreeing with the pane
+- **WHEN** the owner's assignment projection differs from the activity state derived from the pane's own facts
+- **THEN** the row shows the derived activity state and the details name the owner's assignment projection beside it, labelled as the owner's
+
+#### Scenario: A projected state the runtime does not report
+- **WHEN** the owner projects `settling` or `blocked` while the pane's own facts say it is working
+- **THEN** the row shows the pane's own activity, and the details name the owner's projection beside it
 
 ### Requirement: User-set colours
 
@@ -253,9 +265,9 @@ Radar SHALL draw every colour it uses from configuration, each with a built-in d
 - **WHEN** the file names an unknown slot or an unknown colour value
 - **THEN** the diagnostic is reported and the overview still runs with the built-in colours
 
-### Requirement: User-set motion
+### Requirement: Animation settings are read from configuration
 
-Radar SHALL read separate animation settings for working, waiting, blocked, settling, lost and unknown states, one shared by the marks that mean a process is running in a pane, and their shared frame rate, from the same configuration, each with a built-in default. It SHALL report an unusable animation or rate without preventing the overview from running. `none` SHALL retain the affected mark without animating. Idle, done, exited, retained rows, and a pane whose command has stopped SHALL NOT animate.
+Radar SHALL read separate animation settings for working, waiting, blocked, settling, lost and unknown states, one shared by the marks that mean a process is running in a pane, and their shared frame rate, from the same configuration, each with a built-in default. It SHALL report an unusable animation or rate without preventing the overview from running.
 
 #### Scenario: A configured animation is used
 - **WHEN** the configuration names an animation for a state that animates
@@ -264,6 +276,10 @@ Radar SHALL read separate animation settings for working, waiting, blocked, sett
 #### Scenario: An unusable animation or rate
 - **WHEN** the file names an animation that does not exist, or a rate outside the accepted range
 - **THEN** the diagnostic is reported and the overview still runs with the built-in animation
+
+### Requirement: Only observed change animates
+
+`none` SHALL retain the affected mark without animating. Idle, done, exited, retained rows, and a pane whose command has stopped SHALL NOT animate.
 
 #### Scenario: Nothing is animating
 - **WHEN** no state on screen animates

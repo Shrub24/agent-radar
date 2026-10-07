@@ -34,13 +34,29 @@ Radar SHALL keep reported session identity, runtime location, lifecycle and opti
 - **WHEN** an agent record contains no explicit ownership identity
 - **THEN** ownership remains unavailable rather than inferred from the agent's tab or workspace
 
-### Requirement: Herdsman pane-metadata facts
+### Requirement: Herdsman pane-metadata facts are kept distinct from runtime facts
 
-Radar SHALL read the Herdsman facts that Herdr republishes as pane-metadata tokens — the agent's role, a managed worker's runtime label, the owner's projected state, the active assignment with its display text and start time, the run, request and pending-ask identities, a lead's published name, what the pane is awaiting, the background tasks it reports, and the session's model, provider, thinking level and context usage — and SHALL keep them distinct from runtime facts. Awaited and background facts are the same thing twice, published by two extensions on one pane: the awaited set is the union of the awaited items and the `pi_bg_tasks` ids, and `pi_bg_running` is a count of that set's running members, never a substitute for it. A value this version does not recognise SHALL be preserved rather than dropped or coerced. A value absent from the metadata SHALL stay unavailable: Herdr's own agent name and title SHALL NOT be read as Herdsman facts.
+Radar SHALL read the Herdsman facts that Herdr republishes as pane-metadata tokens — the agent's role, a managed worker's runtime label, the owner's projected state, the active assignment with its display text and start time, the run, request and pending-ask identities, and a lead's published name — and SHALL keep them distinct from runtime facts.
 
 #### Scenario: An owner-projected state
 - **WHEN** the metadata carries `pi_herdsman_state` and Herdr reports its own lifecycle status for the same agent
 - **THEN** Radar presents the state derived from the pane as the agent's state and the owner's projection as its assignment state, exposing both
+
+#### Scenario: A worker's runtime label
+- **WHEN** the metadata carries `pi_herdsman_label`
+- **THEN** Radar exposes it as the worker's name and does not read Herdr's own truncated agent name or its task-bearing title as a name
+
+#### Scenario: Assignment facts
+- **WHEN** a worker's metadata carries an active assignment with its display text and a start time
+- **THEN** Radar exposes the assignment and an age measured from that start time, and exposes no age for an agent that has no start time
+
+#### Scenario: Lineage from pane metadata
+- **WHEN** a record carries exact session and parent-session identities
+- **THEN** ownership is taken from those identities, and the human session name is never used as an identity
+
+### Requirement: Awaited and background facts are one set published twice
+
+Radar SHALL read what the pane is awaiting, the background tasks it reports, and the session's model, provider, thinking level and context usage. Awaited and background facts are the same thing twice, published by two extensions on one pane: the awaited set is the union of the awaited items and the `pi_bg_tasks` ids, and `pi_bg_running` is a count of that set's running members, never a substitute for it.
 
 #### Scenario: The owner's projection has expired
 - **WHEN** no owner-published state is present for an agent, as happens once its published lifetime elapses
@@ -58,21 +74,17 @@ Radar SHALL read the Herdsman facts that Herdr republishes as pane-metadata toke
 - **WHEN** a pane reports outstanding awaited items or a non-empty set of outstanding background task ids and its runtime state is neither working nor unknown
 - **THEN** Radar presents it as waiting rather than idle
 
-#### Scenario: A worker's runtime label
-- **WHEN** the metadata carries `pi_herdsman_label`
-- **THEN** Radar exposes it as the worker's name and does not read Herdr's own truncated agent name or its task-bearing title as a name
+### Requirement: Unrecognised and absent metadata values
 
-#### Scenario: Assignment facts
-- **WHEN** a worker's metadata carries an active assignment with its display text and a start time
-- **THEN** Radar exposes the assignment and an age measured from that start time, and exposes no age for an agent that has no start time
+A value this version does not recognise SHALL be preserved rather than dropped or coerced. A value absent from the metadata SHALL stay unavailable: Herdr's own agent name and title SHALL NOT be read as Herdsman facts.
 
 #### Scenario: An unrecognised state value
 - **WHEN** the metadata publishes a state value this version does not know
 - **THEN** Radar shows it as reported rather than mapping it onto a state it does know
 
-#### Scenario: Lineage from pane metadata
-- **WHEN** a record carries exact session and parent-session identities
-- **THEN** ownership is taken from those identities, and the human session name is never used as an identity
+#### Scenario: A pane carrying no Herdsman facts
+- **WHEN** a pane's metadata carries no Herdsman fact at all
+- **THEN** its role, assignment, state and awaited set stay unavailable rather than being taken from Herdr's agent name or title
 
 ### Requirement: Per-pane foreground evidence
 
