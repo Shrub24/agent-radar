@@ -1120,6 +1120,9 @@ fn geometry_of(app: &App) -> Geometry {
         ],
         offset: 0,
         disclosure_markers: Vec::new(),
+        process_rows: Vec::new(),
+        process_folds: Vec::new(),
+        details_content: Rect::new(61, 2, 38, 17),
         confirm_cancel: None,
         confirm_confirm: None,
     }

@@ -38,11 +38,13 @@ for their control inboxes.
 
 ## Next
 
-Finish the active `foldable-process-descendants` change first. Its verified
-per-member sampling slice is accepted; table presentation and interaction are
-still in progress. Keep this work separate from lifecycle and state contracts.
+The `foldable-process-descendants` change is landed: verified per-member
+samples, the collapsed Processes table and its local selection/folding mode are
+implemented, verified and archived. Its gates are recorded in that change's
+`verification.md`. Keep the next work separate from lifecycle and state
+contracts.
 
-After that, in priority order:
+In priority order:
 
 1. **Lead restart and recovery.** Establish safe lead/standalone restart and
    recovery of existing children, pending requests and task results. Keeping a
@@ -349,7 +351,7 @@ Radar rather than pulled from it.
   workspace suffix is stripped, and `e` lists finished sessions even with
   ordinary panes hidden.
 
-## Display/TUI refinement — after the active Processes change
+## Display/TUI refinement
 
 The objective is useful information at a glance, not more fields on every row.
 Do this against representative busy fleets, narrow terminals and deep branches:
@@ -423,17 +425,17 @@ joins; OS parentage must never invent an assignment or owner.
 - No generic process browser, system-wide monitoring view, persistent analytics
   database, session-token analytics or new control operations in this change.
 
-### Descendant tree (after the compact Processes layout)
+### Descendant tree (landed)
 
-Active change: `openspec/changes/foldable-process-descendants/`. The sampler
-slice is independently accepted: confirmed per-member name, birth identity,
-parent identity, state, CPU and RSS are now available beside the qualified
-sums. The remaining slices draw an initially collapsed table — name, PID, CPU
-and RSS columns, a root anchor, branches folded per level, and selecting a row
-moving the compact process detail to that process.
+Active change: none. The change is implemented, verified and archived as
+`openspec/changes/archive/2026-10-08-foldable-process-descendants/`. The sampler
+now carries confirmed per-member name, birth identity, parent identity, state,
+CPU and RSS beside the qualified sums, and the Processes page draws them as an
+initially collapsed table with a root anchor, deterministic preorder, aligned
+name/PID/CPU/RSS columns and a labelled `t` mode for selection and branch
+folding. Rows are ordered deterministically and their observed names sanitized;
+selection and folds follow birth identity, never PID alone.
 
-- Rendering must order the verified members deterministically and sanitize their
-  observed names. Selection and folds follow birth identity, never PID alone.
 - Rejected: mapping an external `pstree` into the panel. Its output carries no
   usable identity for selection and arranges the same text with no metrics.
 - Rejected for now: adopting `tui-tree-widget`. Radar already rolls its own tree

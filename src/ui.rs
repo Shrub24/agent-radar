@@ -20,13 +20,17 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, DetailPage, Disclosure, Geometry, Operation, VisibleRow};
+use crate::app::{
+    App, DetailPage, Disclosure, Geometry, Operation, ProcessRow, ProcessTable, VisibleRow,
+};
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bus::Task;
 use crate::model::{
-    AgentState, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent, ForegroundEvidence,
-    HerdsmanFacts, ProcessState, SessionIdentity, TerminalMode, Total,
+    AgentObservation, AgentState, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent,
+    DescendantSample, ForegroundEvidence, HerdsmanFacts, ProcessIdentity, ProcessResources,
+    ProcessState, SessionIdentity, SessionUuid, TerminalMode, Total,
 };
 use crate::observation::{ObservationState, RetentionBasis, SourceFreshness};
 use crate::theme;
@@ -72,9 +76,15 @@ pub fn render(
         frame.render_widget(Paragraph::new(hints), hint_area);
     }
 
-    let details = app
-        .shows_details()
-        .then(|| detail_page_lines(state, app, app.detail_page()));
+    let details = app.shows_details().then(|| {
+        detail_page_lines(
+            state,
+            app,
+            app.detail_page(),
+            detail_content_width(body.width),
+            app.process_selection(),
+        )
+    });
     let (tree_area, detail_area) = body_areas(
         body,
         details.as_ref().map(|page| page.lines.as_slice()),
@@ -116,6 +126,9 @@ pub fn render(
 
     let mut detail_tabs = [None; DetailPage::COUNT];
     let mut disclosure_markers: Vec<(Disclosure, Rect)> = Vec::new();
+    let mut process_rows: Vec<(ProcessIdentity, usize, Option<Rect>)> = Vec::new();
+    let mut process_folds: Vec<(ProcessIdentity, Rect)> = Vec::new();
+    let mut details_content = Rect::default();
     let mut details_viewport = 0u16;
     let mut details_rows = 0usize;
     if let (Some(detail_area), Some(page_lines)) = (detail_area, details.as_ref()) {
@@ -131,6 +144,7 @@ pub fn render(
             height: inner.height.saturating_sub(tab_rows),
             ..inner
         };
+        details_content = content;
         details_viewport = content.height;
         let (rows, line_rows) = page_rows(&page_lines.lines, content.width);
         details_rows = rows;
@@ -177,6 +191,34 @@ pub fn render(
                 },
             ));
         }
+        // Where each process row is drawn, and where the cell that folds it is.
+        // The row's place in the page is recorded whether or not the scroll has
+        // left it on screen: the keyboard's cursor is scrolled to a row the panel
+        // is not showing, and only a row it is showing is a pointer's target.
+        for (identity, index, foldable) in &page_lines.process_rows {
+            let page_row = line_rows.get(*index).copied();
+            let drawn = page_row
+                .and_then(|row| row.checked_sub(offset as usize))
+                .filter(|row| *row < content.height as usize)
+                .map(|row| Rect {
+                    x: content.x,
+                    y: content.y + row as u16,
+                    width: content.width,
+                    height: 1,
+                });
+            process_rows.push((identity.clone(), page_row.unwrap_or(0), drawn));
+            if *foldable && let Some(rect) = drawn {
+                // The fold marker is the row's own first cell, and the whole of
+                // it is the target.
+                process_folds.push((
+                    identity.clone(),
+                    Rect {
+                        width: TABLE_MARKER.min(content.width as usize) as u16,
+                        ..rect
+                    },
+                ));
+            }
+        }
     }
 
     let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
@@ -185,10 +227,13 @@ pub fn render(
         tree_panel: tree_area,
         tree_content,
         details: detail_area,
+        details_content,
         details_rows,
         details_viewport,
         detail_tabs,
         disclosure_markers,
+        process_rows,
+        process_folds,
         offset: list_state.offset(),
         confirm_cancel,
         confirm_confirm,
@@ -422,7 +467,7 @@ fn body_areas(body: Rect, details: Option<&[Line<'_>]>, app: &App) -> (Rect, Opt
     debug_assert!(app.shows_details(), "details are only laid out when shown");
 
     if body.width >= SIDE_BY_SIDE_MIN_WIDTH {
-        let width = (body.width / 3).clamp(DETAIL_MIN_WIDTH, DETAIL_MAX_WIDTH);
+        let width = detail_panel_width(body.width);
         let [tree, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(width)]).areas(body);
         return (tree, Some(detail_area));
@@ -431,7 +476,7 @@ fn body_areas(body: Rect, details: Option<&[Line<'_>]>, app: &App) -> (Rect, Opt
     // Stacked: as many rows as the content needs, counting the rows a long
     // identity will actually wrap onto and the rows the page tabs take, and
     // never more than half the body.
-    let columns = body.width.saturating_sub(2).max(1) as u32;
+    let columns = detail_content_width(body.width) as u32;
     let rows: u16 = detail
         .iter()
         .map(|line| (line.width() as u32).div_ceil(columns).max(1) as u16)
@@ -446,6 +491,24 @@ fn body_areas(body: Rect, details: Option<&[Line<'_>]>, app: &App) -> (Rect, Opt
     let [tree, detail_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(body);
     (tree, Some(detail_area))
+}
+
+/// The panel width the details are drawn in, for a body of this width: beside
+/// the tree it is a clamped third of the body, and below it the whole body.
+fn detail_panel_width(body_width: u16) -> u16 {
+    if body_width >= SIDE_BY_SIDE_MIN_WIDTH {
+        (body_width / 3).clamp(DETAIL_MIN_WIDTH, DETAIL_MAX_WIDTH)
+    } else {
+        body_width
+    }
+}
+
+/// The cells the details' own content is drawn in: the panel, less its borders.
+/// The page is wrapped to this before it is laid out, so a fact the panel cannot
+/// hold on one line is continued under its own column rather than re-wrapped by
+/// the drawing under the label.
+fn detail_content_width(body_width: u16) -> u16 {
+    detail_panel_width(body_width).saturating_sub(2).max(1)
 }
 
 /// The content column: the terminal, less a small gutter, and no wider column
@@ -1217,58 +1280,57 @@ fn unknown_reason(reason: BinaryUnknown) -> &'static str {
 const DESCENDANT_SUM: &str = "observed processes beneath this one, not a workload or assignment total \
      (a page shared with another process counts in each)";
 
-/// The measurements for a row whose foreground process was sampled, in two
-/// sections: what that process itself is, and what is observed beneath it.
+/// The measurements of one process: what the kernel says it is doing and what it
+/// is using now.
 ///
-/// The process's own figures and its descendants' are drawn apart and never
-/// added together: a build under a pane is the build's CPU, not the pane's.
-/// Nothing here is inherited from an owner, a session or a background task — a
-/// task's published PID arrives without a birth identity and is not sampled at
-/// all. A value this machine could not measure says so with its reason rather
-/// than as a zero, and a sum that could not cover every member is drawn as the
-/// lower bound it is.
-fn metric_lines(foreground: Option<&ForegroundEvidence>) -> Vec<Line<'static>> {
-    let Some(ForegroundEvidence::NonShell { local, .. }) = foreground else {
-        // A shell or an inconclusive answer names no process, so nothing was
-        // sampled and there is no metric to draw.
-        return Vec::new();
-    };
-    let Some(resources) = local.resources.as_ref() else {
-        return vec![field(
-            "metrics",
-            format!(
-                "{} — this refresh took no sample of this process",
-                unavailable()
-            ),
-        )];
-    };
-    let descendants = &resources.descendants;
+/// The values are whoever the page is describing — the row's own foreground, or
+/// the descendant the reader selected — and nothing here is inherited from an
+/// owner, a session or a background task: a task's published PID arrives without
+/// a birth identity and is not sampled at all. A value this machine could not
+/// measure says so with its reason rather than as a zero, and a measured idle
+/// interval is drawn as the zero it is.
+fn process_section(
+    state: ProcessState,
+    cpu: Option<CpuPercent>,
+    rss_bytes: Option<u64>,
+) -> Vec<Line<'static>> {
     let (cpu, cpu_reason) = measured_value(
-        cpu_value(resources.cpu),
+        cpu_value(cpu),
         "no interval of this process has been measured",
     );
     let (rss, rss_reason) = measured_value(
-        rss_value(resources.rss_bytes),
+        rss_value(rss_bytes),
         "the kernel's page count could not be converted",
     );
+    metric_section(
+        "process",
+        &[
+            vec![Metric::stated("state", state_word(state))],
+            vec![
+                Metric::measured("cpu", cpu, cpu_reason),
+                Metric::measured("rss", rss, rss_reason),
+            ],
+        ],
+    )
+}
+
+/// The qualified sums of what was observed beneath a root: how many processes,
+/// and what they are using between them.
+///
+/// The root's own figures are drawn apart from these and never added to them: a
+/// build under a pane is the build's CPU, not the pane's. A sum that could not
+/// cover every member is drawn as the lower bound it is, with the reason it is
+/// one, and a root nothing could be enumerated beneath draws that as unavailable
+/// rather than as a measured zero.
+fn descendant_section(resources: &ProcessResources) -> Vec<Line<'static>> {
+    let descendants = &resources.descendants;
     let (count, count_reason) = measured_value(
         descendant_count(descendants.observed),
         "nothing beneath this process could be enumerated",
     );
     let (total_cpu, total_cpu_reason) = total_value(&descendants.cpu, |cpu| cpu_percent(*cpu));
     let (total_rss, total_rss_reason) = total_value(&descendants.rss_bytes, |bytes| size(*bytes));
-
-    let mut lines = metric_section(
-        "process",
-        &[
-            vec![Metric::stated("state", state_word(resources.state))],
-            vec![
-                Metric::measured("cpu", cpu, cpu_reason),
-                Metric::measured("rss", rss, rss_reason),
-            ],
-        ],
-    );
-    lines.extend(metric_section(
+    metric_section(
         "descendants",
         &[
             vec![Metric::measured("count", count, count_reason)],
@@ -1277,8 +1339,7 @@ fn metric_lines(foreground: Option<&ForegroundEvidence>) -> Vec<Line<'static>> {
                 Metric::measured("rss", total_rss, total_rss_reason),
             ],
         ],
-    ));
-    lines
+    )
 }
 
 /// Cells between one fact of a metric section and the fact beside it, and
@@ -1520,6 +1581,11 @@ fn foreground_pid(foreground: Option<&ForegroundEvidence>) -> Option<i32> {
 struct PageLines {
     lines: Vec<Line<'static>>,
     markers: Vec<(Disclosure, usize)>,
+    /// The process rows this page drew, in the order they were drawn: each row's
+    /// birth identity, the line it was drawn on, and whether the table can fold
+    /// its branch. The render turns these into the rectangles the pointer and the
+    /// cursor work from; a row is its identity, never the line it landed on.
+    process_rows: Vec<(ProcessIdentity, usize, bool)>,
 }
 
 impl PageLines {
@@ -1544,15 +1610,22 @@ struct Blocks<'a> {
     targets: Vec<Disclosure>,
     highlighted: Option<Disclosure>,
     app: &'a App,
+    width: usize,
 }
 
 impl<'a> Blocks<'a> {
-    fn new(app: &'a App) -> Self {
+    fn new(app: &'a App, width: usize) -> Self {
         Self {
             targets: app.disclosures(),
             highlighted: app.disclosure_target(),
             app,
+            width,
         }
+    }
+
+    /// The cells this page's content is drawn in.
+    fn content_width(&self) -> usize {
+        self.width
     }
 
     /// Whether the page offers this block, and whether it is open. `None` is
@@ -1628,7 +1701,17 @@ fn digest(text: &str) -> String {
 }
 
 /// The page's lines, and the block each marker among them belongs to.
-fn detail_page_lines(state: &ObservationState, app: &App, page: DetailPage) -> PageLines {
+///
+/// `selection` is the row of the process table the reader has selected, when one
+/// is: the processes page describes that descendant, and every other page draws
+/// its own row's facts. See [`process_lines`].
+fn detail_page_lines(
+    state: &ObservationState,
+    app: &App,
+    page: DetailPage,
+    width: u16,
+    selection: Option<&ProcessIdentity>,
+) -> PageLines {
     let mut page_lines = PageLines::default();
     let Some(row) = app.selected_row() else {
         page_lines.push(Line::from("no row selected"));
@@ -1638,10 +1721,10 @@ fn detail_page_lines(state: &ObservationState, app: &App, page: DetailPage) -> P
         sanitize(row.node.row.title()),
         Style::new().add_modifier(Modifier::BOLD),
     )));
-    let blocks = Blocks::new(app);
+    let blocks = Blocks::new(app, width as usize);
     match page {
         DetailPage::Overview => overview_lines(state, &row, &blocks, &mut page_lines),
-        DetailPage::Processes => process_lines(state, &row, &blocks, &mut page_lines),
+        DetailPage::Processes => process_lines(state, &row, &blocks, selection, &mut page_lines),
         DetailPage::Tasks => task_page_lines(&row, &blocks, &mut page_lines),
         DetailPage::Source => page_lines.extend(source_lines(state, &row)),
     }
@@ -1779,6 +1862,27 @@ fn overview_lines(
     }
 }
 
+/// The row of the process table the reader has selected, when one is: the page
+/// describes its own row's foreground unless a descendant's birth identity is
+/// given here.
+///
+/// The rows the scan confirmed decide whether the process that was selected is
+/// still there, so a process that vanished, or a pid the kernel handed to
+/// another process, falls back to the root instead of drawing a stranger's facts
+/// as the reader's own. Task 3.1 owns the cursor that produces one; until then
+/// the page is drawn with none.
+fn selected_sample<'observation>(
+    resources: &'observation ProcessResources,
+    selection: Option<&ProcessIdentity>,
+) -> Option<&'observation DescendantSample> {
+    let selection = selection?;
+    resources
+        .descendants
+        .members
+        .iter()
+        .find(|member| member.identity == *selection)
+}
+
 /// Processes: the process holding this row's location. A row whose process is
 /// not currently observed says so rather than drawing last-good facts as live,
 /// and a container row has no process to name.
@@ -1791,6 +1895,7 @@ fn process_lines(
     state: &ObservationState,
     row: &VisibleRow<'_>,
     blocks: &Blocks<'_>,
+    selection: Option<&ProcessIdentity>,
     page: &mut PageLines,
 ) {
     let current = matches!(state.source_freshness(), SourceFreshness::Current);
@@ -1799,21 +1904,12 @@ fn process_lines(
             "process",
             "none — a workspace holds panes, not a process".to_string(),
         )),
-        RowKind::Pane(pane) => {
+        RowKind::Pane(_) => {
             if !current {
                 page.push(withheld("the source is not current"));
                 return;
             }
-            if let Some(line) = live_pid(state, pane.foreground.as_ref()) {
-                page.push(line);
-            }
-            identity_lines(pane.foreground.as_ref(), blocks, page);
-            page.push(field("terminal", terminal_line(pane.terminal())));
-            page.push(field(
-                "running for",
-                pane.running_for().map(duration).unwrap_or_else(unavailable),
-            ));
-            page.extend(metric_lines(pane.foreground.as_ref()));
+            observed_process_lines(state, row, blocks, selection, page);
         }
         RowKind::Agent(agent) => {
             let unavailable_reason = match (&agent.retained, current) {
@@ -1825,13 +1921,7 @@ fn process_lines(
                 page.push(withheld(reason));
                 return;
             }
-            if let Some(line) = live_pid(state, agent.foreground.as_ref()) {
-                page.push(line);
-            }
-            // A live agent's running executable and the comparison made from
-            // it: machine facts about the process, not the agent.
-            identity_lines(agent.foreground.as_ref(), blocks, page);
-            page.extend(metric_lines(agent.foreground.as_ref()));
+            observed_process_lines(state, row, blocks, selection, page);
         }
         RowKind::Task(task) => {
             let published = task.published.as_ref();
@@ -1849,6 +1939,94 @@ fn process_lines(
             ));
         }
     }
+}
+
+/// The body of a Processes page whose row has a process that is current: what
+/// the page describes, the runtime's own facts about the foreground process, its
+/// measurements and the qualified sums of what is beneath it.
+///
+/// The page describes its own row's foreground unless the reader has selected a
+/// descendant, and then the selection's own sample names and measures it, above
+/// the root's. The binary comparison is made from the root's executable and from
+/// nothing else, so a page drawing a child draws it under a heading of the
+/// root's own: a descendant's sample says nothing about which build the root
+/// runs.
+fn observed_process_lines(
+    state: &ObservationState,
+    row: &VisibleRow<'_>,
+    blocks: &Blocks<'_>,
+    selection: Option<&ProcessIdentity>,
+    page: &mut PageLines,
+) {
+    let foreground = match &row.node.row.kind {
+        RowKind::Pane(pane) => pane.foreground.as_ref(),
+        RowKind::Agent(agent) => agent.foreground.as_ref(),
+        _ => None,
+    };
+    // The name the runtime reports for the running process, and the sample the
+    // scan took of it. The table's first row carries the name the `observed`
+    // line above it does, so a reader reads one process in both.
+    let (root_name, resources) = match foreground {
+        Some(ForegroundEvidence::NonShell {
+            name,
+            command,
+            local,
+            ..
+        }) => (
+            observed_name(name.as_deref(), command.as_deref()),
+            local.resources.as_ref(),
+        ),
+        // A shell, an inconclusive foreground and no evidence at all name no
+        // process, and the identity lines below say which of them it is.
+        _ => (unavailable(), None),
+    };
+    let selected = resources.and_then(|resources| selected_sample(resources, selection));
+    if let Some(sample) = selected {
+        // The reader's row, from its own sample and from nothing else: the
+        // kernel's name for it, its own incarnation and the figures read for it.
+        // Its name is the kernel's `comm`, never the arguments it was started
+        // with and never a claim about what started it.
+        page.push(field("pid", sample.identity.pid.to_string()));
+        page.push(field("observed", sanitize(&sample.name)));
+        page.extend(process_section(sample.state, sample.cpu, sample.rss_bytes));
+        page.push(heading("foreground root"));
+    }
+    if let Some(line) = live_pid(state, foreground) {
+        page.push(line);
+    }
+    // A live agent's running executable and the comparison made from it:
+    // machine facts about the process, not the agent.
+    identity_lines(foreground, blocks, page);
+    if let RowKind::Pane(pane) = &row.node.row.kind {
+        page.push(field("terminal", terminal_line(pane.terminal())));
+        page.push(field(
+            "running for",
+            pane.running_for().map(duration).unwrap_or_else(unavailable),
+        ));
+    }
+    match resources {
+        Some(resources) => {
+            // A picked child's page is drawn above the root's own: with the table
+            // open, the root's own figures are its first row, and are not drawn a
+            // second time here. The sums are not in the table and stay.
+            if selected.is_none() || blocks.open(&Disclosure::ProcessTable) != Some(true) {
+                page.extend(process_section(
+                    resources.state,
+                    resources.cpu,
+                    resources.rss_bytes,
+                ));
+            }
+            page.extend(descendant_section(resources));
+        }
+        None => page.push(field(
+            "metrics",
+            format!(
+                "{} — this refresh took no sample of this process",
+                unavailable()
+            ),
+        )),
+    }
+    process_table(row, &root_name, blocks, page);
 }
 
 /// Tasks: the background work this row knows about. The list, the pane's own
@@ -1962,6 +2140,20 @@ fn source_lines(state: &ObservationState, row: &VisibleRow<'_>) -> Vec<Line<'sta
             session_text(agent.session.as_ref()).unwrap_or_else(unavailable),
         ));
         lines.extend(owner_identity_lines(&agent.facts));
+        // The lineage the tree placed this row by. A retained row keeps its
+        // observation, so its link stays readable after the agent goes away.
+        let observation = state
+            .inventory()
+            .and_then(|inventory| inventory.agent_on_pane(&agent.pane_id))
+            .or_else(|| {
+                state
+                    .retained()
+                    .get(agent.pane_id.as_str())
+                    .map(|retained| &retained.observation)
+            });
+        if let Some(observation) = observation {
+            lines.extend(lineage_lines(state, observation));
+        }
     }
     lines
 }
@@ -2046,9 +2238,9 @@ fn identity_lines(
         let executable = sanitize(executable);
         let running = binary.running.as_deref().map(sanitize);
         match relative_to(&executable, running.as_deref()) {
-            Some(relative) => page.push(field("executable", relative.to_string())),
+            Some(relative) => page.push(field("exe", relative.to_string())),
             None if Some(&executable) == running.as_ref() => {}
-            None => page.push(field("executable", executable)),
+            None => page.push(field("exe", executable)),
         }
     }
     if let Some(verdict) = verdict_line(binary) {
@@ -2058,7 +2250,7 @@ fn identity_lines(
     if let Some(open) = blocks.open(&key) {
         page.push_block(&key, blocks.marker_line(&key, Some(open), "details"));
         if open {
-            page.extend(process_detail_lines(foreground));
+            page.extend(process_detail_lines(foreground, blocks.content_width()));
         }
     }
 }
@@ -2073,54 +2265,496 @@ fn identity_lines(
 /// apart. The state letters travel as one word each, so what the kernel meant by
 /// the one on the page is here, and a descendant sum is what it is only with
 /// the sentence that says so.
-fn process_detail_lines(foreground: Option<&ForegroundEvidence>) -> Vec<Line<'static>> {
+fn process_detail_lines(
+    foreground: Option<&ForegroundEvidence>,
+    width: usize,
+) -> Vec<Line<'static>> {
     let Some(ForegroundEvidence::NonShell { local, .. }) = foreground else {
         return Vec::new();
     };
     let binary = &local.binary;
-    let mut lines = Vec::new();
-    if let Some(running) = binary.running.as_deref() {
-        lines.push(field("running", sanitize(running)));
-    }
-    if let Some(installed) = binary.installed.as_deref() {
-        lines.push(field("installed", sanitize(installed)));
+    let running = binary.running.as_deref().map(sanitize);
+    let installed = binary.installed.as_deref().map(sanitize);
+    let mut rows = Vec::new();
+    // The roots, and the prefix they share stated once: two whole store paths
+    // repeat a store, a name and a version on one panel, and the part that says
+    // which build is which is the part past the prefix.
+    let mut stated: Option<String> = None;
+    match (running.as_deref(), installed.as_deref()) {
+        (Some(running), Some(installed)) if running == installed => {
+            rows.push(BlockRow::new("root", running.to_string()));
+        }
+        (Some(running), Some(installed)) => match shared_prefix(running, installed) {
+            Some(prefix) => {
+                rows.push(BlockRow::new("store", prefix.clone()));
+                rows.push(BlockRow::new(
+                    "running",
+                    running[prefix.len()..].to_string(),
+                ));
+                rows.push(BlockRow::new(
+                    "installed",
+                    installed[prefix.len()..].to_string(),
+                ));
+                stated = Some(prefix);
+            }
+            None => {
+                rows.push(BlockRow::new("running", running.to_string()));
+                rows.push(BlockRow::new("installed", installed.to_string()));
+            }
+        },
+        (Some(running), None) => rows.push(BlockRow::new("running", running.to_string())),
+        (None, Some(installed)) => rows.push(BlockRow::new("installed", installed.to_string())),
+        (None, None) => {}
     }
     if let Some(executable) = binary.executable.as_deref() {
-        lines.push(field("executable", sanitize(executable)));
+        let executable = sanitize(executable);
+        let roots = [running.as_deref(), stated.as_deref()];
+        let relative = roots
+            .iter()
+            .flatten()
+            .find_map(|root| relative_to(&executable, Some(root)));
+        // A file that *is* the root says nothing the root's own row did not.
+        let is_a_root = roots
+            .iter()
+            .flatten()
+            .any(|root| *root == executable.as_str());
+        match (relative, is_a_root) {
+            (Some(relative), _) => rows.push(BlockRow::new("exe", relative.to_string())),
+            (None, true) => {}
+            (None, false) => rows.push(BlockRow::new("exe", executable)),
+        }
     }
     if binary.freshness == BinaryFreshness::Unknown
         && let Some(reason) = binary.unknown
     {
-        lines.push(field(
-            "comparison",
-            format!("unknown — {}", unknown_reason(reason)),
-        ));
+        rows.push(BlockRow::new("unknown", unknown_reason(reason).to_string()));
     }
-    let state = local.resources.as_ref().map(|resources| resources.state);
     if let Some(resources) = local.resources.as_ref() {
         let identity = &resources.identity;
-        lines.push(field(
+        rows.push(BlockRow::new(
             "birth",
             format!(
-                "pid {} · boot {} · start ticks {}",
-                identity.pid,
-                sanitize(&identity.boot_id),
-                identity.start_ticks,
+                "pid {} · start ticks {}",
+                identity.pid, identity.start_ticks,
+            ),
+        ));
+        // The boot id gets a row of its own: a UUID is longer than any column a
+        // half-width panel gives a value, and it reads better hyphen by hyphen
+        // than mashing three short facts together to make room for it.
+        rows.push(BlockRow::new("boot", sanitize(&identity.boot_id)));
+        // The meaning of the state this row is showing, named where the row's
+        // own word is drawn: the eight other kernel states are the kernel's,
+        // and a list of them described is a paragraph where a fact belongs.
+        rows.push(BlockRow::new(
+            "state",
+            format!(
+                "{} — {}",
+                state_word(resources.state),
+                state_meaning(resources.state)
             ),
         ));
     }
-    lines.push(heading("states"));
-    let mut states = NAMED_STATES.to_vec();
-    // A letter Radar cannot name is the one worth explaining, so the row's own
-    // is drawn beside the ones it can.
-    if let Some(state @ ProcessState::Other(_)) = state {
-        states.push(state);
+    rows.push(BlockRow::new("note", DESCENDANT_SUM.to_string()));
+    block_lines(&rows, width)
+}
+
+/// One labelled row of a block: the label, and the value drawn after the column
+/// every row of that block shares.
+struct BlockRow {
+    label: &'static str,
+    text: String,
+}
+
+impl BlockRow {
+    fn new(label: &'static str, text: String) -> Self {
+        Self { label, text }
     }
-    for state in states {
-        lines.push(field(&state_word(state), state_meaning(state).to_string()));
+}
+
+/// Draws a block's rows: one label column, the value beside its label, and a
+/// value too long for the panel continued under that same column rather than
+/// under the label it belongs to.
+fn block_lines(rows: &[BlockRow], width: usize) -> Vec<Line<'static>> {
+    let column = rows.iter().map(|row| row.label.len()).max().unwrap_or(0);
+    let indent = column + 1;
+    let value_width = width.saturating_sub(indent).max(MIN_VALUE_COLUMN);
+    let mut lines = Vec::new();
+    for row in rows {
+        for (index, part) in wrap_value(&row.text, value_width).into_iter().enumerate() {
+            let lead = if index == 0 {
+                format!("{:<column$} ", row.label)
+            } else {
+                " ".repeat(indent)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(lead, Style::new().fg(theme::palette().subtle)),
+                Span::raw(part),
+            ]));
+        }
     }
-    lines.push(field("descendants", DESCENDANT_SUM.to_string()));
     lines
+}
+
+/// The label of the block the process table is held behind, where the page's
+/// other block is labelled `details` and says only that it holds more.
+const TABLE_LABEL: &str = "process table";
+
+/// The label while the reader is moving through the table's rows: the mode is
+/// local to this page, and the page names it where the table is named.
+const TABLE_LABEL_NAVIGATING: &str = "process table · navigating";
+
+/// The cells the table keeps at the start of every row for its fold marker: the
+/// glyph that says whether a branch is open or folded, and the room beside it —
+/// the same two-cell affordance the page's other markers are clicked by. A leaf's
+/// marker is blank, so every row's name starts in the same cell.
+const TABLE_MARKER: usize = 2;
+
+/// Cells between two columns of the process table.
+const TABLE_GAP: usize = 2;
+
+/// Cells one level of a branch takes in the name's own column: the guide that
+/// marks it, and the room beside it.
+const BRANCH_SEGMENT: usize = 3;
+
+/// The narrowest name column the table draws before it gives up a metric column:
+/// a branch guide and a few characters of a name. The name and the pid are what
+/// identify a row and neither is given up; the metric columns go, widest first.
+const TABLE_NAME_MIN: usize = 6;
+
+/// The cell the table draws for a value this machine did not measure. A table
+/// has one cell for a reading and no room for the eleven of `unavailable`: a
+/// dash is not a number and not a zero, and the table says what it means below
+/// the rows it drew one in.
+const TABLE_UNMEASURED: &str = "—";
+
+/// Draws the table: the columns it can name, one single-line row per process, and
+/// what a dash means where one was drawn.
+///
+/// Every line is built to the panel's own width, so nothing here wraps into the
+/// row below it: a name is shortened, and then the metric columns are dropped —
+/// the resident set before the CPU — before a row is allowed past the panel's
+/// edge. The branch guides are drawn inside the name's own column, so a deeper
+/// tree spends the name's width rather than pushing the pid off the panel.
+fn process_table_lines(
+    table: &ProcessTable,
+    root_name: &str,
+    width: usize,
+    selected: &ProcessIdentity,
+    folded: &HashSet<ProcessIdentity>,
+    page: &mut PageLines,
+) {
+    let subtle = Style::new().fg(theme::palette().subtle);
+    let cpu = |row: &ProcessRow| {
+        row.cpu
+            .map(cpu_percent)
+            .unwrap_or_else(|| TABLE_UNMEASURED.to_string())
+    };
+    let rss = |row: &ProcessRow| {
+        row.rss_bytes
+            .map(size)
+            .unwrap_or_else(|| TABLE_UNMEASURED.to_string())
+    };
+    // Each column is as wide as the widest thing drawn in it, its own heading
+    // included: a tree whose pids are shorter than `pid` still lines its rows up
+    // under the heading.
+    let widest = |values: Vec<String>, heading: &str| {
+        values
+            .iter()
+            .map(|value| display_cells(value))
+            .max()
+            .unwrap_or(0)
+            .max(display_cells(heading))
+    };
+    let pid_width = widest(
+        table
+            .rows
+            .iter()
+            .map(|row| row.identity.pid.to_string())
+            .collect(),
+        "pid",
+    );
+    let cpu_width = widest(table.rows.iter().map(&cpu).collect(), "cpu");
+    let rss_width = widest(table.rows.iter().map(&rss).collect(), "rss");
+    // What the columns right of the name cost, given which of them the panel is
+    // paying for. A panel too narrow for all of them gives up the widest fact
+    // first, and keeps the name and the pid whatever happens.
+    let tail = |with_cpu: bool, with_rss: bool| {
+        TABLE_MARKER
+            + pid_width
+            + TABLE_GAP
+            + if with_cpu { cpu_width + TABLE_GAP } else { 0 }
+            + if with_rss { rss_width + TABLE_GAP } else { 0 }
+    };
+    let show_rss = width >= TABLE_NAME_MIN + tail(true, true);
+    let show_cpu = width >= TABLE_NAME_MIN + tail(true, show_rss);
+    let name_width = width.saturating_sub(tail(show_cpu, show_rss));
+    // A value in a column of its own, as wide as the column: the spaces that
+    // are left of it are counted in cells, so the value ends in the same cell in
+    // every row whatever it says.
+    let column = |value: &str, width: usize| {
+        format!(
+            "{:pad$}{value}",
+            "",
+            pad = width.saturating_sub(display_cells(value))
+        )
+    };
+    // One row, from the cells it draws. The name column is filled to its own
+    // width, so every column starts in the same cell whatever the name's length
+    // or the width of its characters. The marker column is the caller's: it is
+    // paid for out of the row, before the name.
+    let cells = |branch: usize, name: &str, pid: &str, cpu: Option<&str>, rss: Option<&str>| {
+        let name = shorten(name, name_width.saturating_sub(branch));
+        let mut text = name.clone();
+        let pad = name_width
+            .saturating_sub(branch)
+            .saturating_sub(display_cells(&name));
+        text.push_str(&" ".repeat(pad));
+        text.push_str(&column(pid, pid_width + TABLE_GAP));
+        if let Some(cpu) = cpu {
+            text.push_str(&column(cpu, cpu_width + TABLE_GAP));
+        }
+        if let Some(rss) = rss {
+            text.push_str(&column(rss, rss_width + TABLE_GAP));
+        }
+        text
+    };
+    page.push(Line::from(Span::styled(
+        format!(
+            "{:marker$}{}",
+            "",
+            cells(
+                0,
+                "name",
+                "pid",
+                show_cpu.then_some("cpu"),
+                show_rss.then_some("rss"),
+            ),
+            marker = TABLE_MARKER
+        ),
+        subtle,
+    )));
+    for row in table.visible() {
+        // A branch is drawn out of the name's own cells, and the levels nearest
+        // the process are the ones that say where it sits: a column too narrow
+        // for the whole ancestry drops the outer guides — saying so with an
+        // ellipsis — rather than drawing the row flush with the root's own
+        // children. Every guide is one cell, so the levels are counted in
+        // characters and the branch kept is at most the name's own width.
+        let mut branch = String::new();
+        for guide in &row.guides {
+            branch.push_str(if *guide { "│  " } else { "   " });
+        }
+        if row.parent.is_some() {
+            branch.push_str(if row.last { "└─ " } else { "├─ " });
+        }
+        let branch = if display_cells(&branch) < name_width {
+            branch
+        } else if name_width == 0 {
+            // No cell for the guides and none for the ellipsis that says they
+            // were left out: the row's own marker cell is all it has.
+            String::new()
+        } else {
+            let levels = name_width.saturating_sub(1) / BRANCH_SEGMENT;
+            let dropped = branch.chars().count() - levels * BRANCH_SEGMENT;
+            let kept: String = branch.chars().skip(dropped).collect();
+            format!("…{kept}")
+        };
+        let branch_width = display_cells(&branch);
+        // The marker column: the fold of this row's branch, or a blank cell where
+        // the row has no branch to fold. Both say the same thing about a process
+        // beneath it, and neither names a command.
+        let marker = match row.has_children {
+            true if folded.contains(&row.identity) => "▸ ",
+            true => "▾ ",
+            false => "  ",
+        };
+        // The row's own process is named by the runtime, and every process under
+        // it by the kernel's own read: both are external text, sanitized here
+        // like everything else drawn from outside.
+        let name = sanitize(row.name.as_deref().unwrap_or(root_name));
+        let pid = row.identity.pid.to_string();
+        // The reader's row is a band across the table: it is marked by the cells
+        // it fills, which no name column has to pay for.
+        let ink = |base: Style| match row.identity == *selected {
+            true => Style::new()
+                .bg(theme::palette().selection)
+                .add_modifier(Modifier::BOLD),
+            false => base,
+        };
+        let index = page.lines.len();
+        page.process_rows
+            .push((row.identity.clone(), index, row.has_children));
+        page.push(Line::from(vec![
+            Span::styled(format!("{marker}{branch}"), ink(subtle)),
+            Span::styled(
+                cells(
+                    branch_width,
+                    &name,
+                    &pid,
+                    show_cpu.then(|| cpu(row)).as_deref(),
+                    show_rss.then(|| rss(row)).as_deref(),
+                ),
+                ink(Style::new()),
+            ),
+        ]));
+    }
+    let unmeasured = table
+        .visible()
+        .any(|row| (show_cpu && row.cpu.is_none()) || (show_rss && row.rss_bytes.is_none()));
+    if unmeasured {
+        page.push(Line::from(Span::styled(
+            format!("{TABLE_UNMEASURED} not measured"),
+            subtle,
+        )));
+    }
+}
+
+/// The cells a piece of text takes on the terminal, as Ratatui measures it for
+/// layout: the characters of a name are not cells, so a name with characters
+/// wider than one — or marks that take none — is measured by what will be drawn.
+/// Everything this table aligns is measured here, because a column laid out in
+/// characters shifts every cell after it.
+fn display_cells(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// A name shortened to the cells a column gives it, keeping the front of it: a
+/// process is recognised by how its name starts, and the pid beside it names the
+/// row when the name is not enough. The ellipsis is paid for out of the column:
+/// the characters kept are as many as leave room for it, and a character too
+/// wide for what is left is dropped rather than cut.
+fn shorten(name: &str, width: usize) -> String {
+    if display_cells(name) <= width {
+        return name.to_string();
+    }
+    if width == 0 {
+        // Not even the ellipsis has a cell to sit in.
+        return String::new();
+    }
+    let mut kept = String::new();
+    for ch in name.chars() {
+        kept.push(ch);
+        if display_cells(&kept) + 1 > width {
+            kept.pop();
+            break;
+        }
+    }
+    kept.push('…');
+    kept
+}
+
+/// The process table's block, where the page has a verified tree to draw: the
+/// root's own row and a row for every process the same scan confirmed beneath it.
+///
+/// The table is offered only where the scan that sampled the root also enumerated
+/// what is beneath it: an unreadable or budgeted scan is not a tree of nothing,
+/// and the sums above already say it is not a measurement.
+fn process_table(row: &VisibleRow<'_>, root_name: &str, blocks: &Blocks<'_>, page: &mut PageLines) {
+    let Some(table) = blocks.app.process_table(row) else {
+        return;
+    };
+    let key = Disclosure::ProcessTable;
+    let Some(open) = blocks.open(&key) else {
+        return;
+    };
+    let label = match blocks.app.process_navigating() {
+        true => TABLE_LABEL_NAVIGATING,
+        false => TABLE_LABEL,
+    };
+    page.push_block(&key, blocks.marker_line(&key, Some(open), label));
+    if open {
+        let selected = blocks
+            .app
+            .process_selection()
+            .unwrap_or(&table.root)
+            .clone();
+        process_table_lines(
+            &table,
+            root_name,
+            blocks.content_width(),
+            &selected,
+            blocks.app.process_folded(),
+            page,
+        );
+    }
+}
+
+/// The narrowest value column a block is wrapped to: past that, a fact is one
+/// character per row and the wrapping costs more than the fact is worth.
+const MIN_VALUE_COLUMN: usize = 8;
+
+/// Wraps `text` to `width` cells, at a space where one is near enough and inside
+/// a word only when the word is longer than the whole line. The pieces come back
+/// without indentation; the caller draws them in its value column.
+fn wrap_value(text: &str, width: usize) -> Vec<String> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            pieces.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() || pieces.is_empty() {
+        pieces.push(current);
+    }
+    let mut lines = Vec::new();
+    for piece in pieces {
+        let mut rest = piece.as_str();
+        loop {
+            let count = rest.chars().count();
+            if count <= width {
+                lines.push(rest.to_string());
+                break;
+            }
+            let split = split_word(rest, width);
+            lines.push(rest[..split].to_string());
+            rest = &rest[split..];
+        }
+    }
+    lines
+}
+
+/// Where to cut a word that cannot fit the column whole: at the last separator
+/// it can, so a store path breaks at a store and a boot id at a hyphen, and
+/// inside a run of characters only when there is no separator to break at.
+fn split_word(word: &str, width: usize) -> usize {
+    let boundary = word
+        .char_indices()
+        .filter(|(index, character)| *index < width && matches!(character, '/' | '-'))
+        .map(|(index, character)| index + character.len_utf8())
+        .next_back();
+    boundary.unwrap_or_else(|| {
+        word.char_indices()
+            .nth(width)
+            .map(|(index, _)| index)
+            .unwrap_or(word.len())
+    })
+}
+
+/// The prefix two paths share down to a component boundary, when each leaves
+/// something past it: `/nix/store/aaa-pi` and `/nix/store/bbb-pi` share
+/// `/nix/store/`, where two sibling files share their directory and not their
+/// name.
+fn shared_prefix(a: &str, b: &str) -> Option<String> {
+    let mut end = 0;
+    for ((index, left), right) in a.char_indices().zip(b.chars()) {
+        if left != right {
+            break;
+        }
+        if left == '/' {
+            end = index + 1;
+        }
+    }
+    if end <= 1 || end >= a.len() || end >= b.len() {
+        return None;
+    }
+    Some(a[..end].to_string())
 }
 
 /// A section heading: the word that says what the lines under it are.
@@ -2132,20 +2766,6 @@ fn heading(text: &str) -> Line<'static> {
             .add_modifier(Modifier::BOLD),
     ))
 }
-
-/// The kernel states Radar draws by name, in the order the kernel letters run.
-/// [`ProcessState::Other`] is not among them: a letter this kernel wrote and
-/// Radar does not name is explained where a row carries one.
-const NAMED_STATES: [ProcessState; 8] = [
-    ProcessState::Running,
-    ProcessState::Sleeping,
-    ProcessState::DiskSleep,
-    ProcessState::Stopped,
-    ProcessState::TracingStop,
-    ProcessState::Zombie,
-    ProcessState::Dead,
-    ProcessState::Idle,
-];
 
 /// What the kernel's state letter means for the process that carries it, in the
 /// page's words.
@@ -2310,6 +2930,74 @@ fn owner_identity_lines(facts: &HerdsmanFacts) -> Vec<Line<'static>> {
         lines.push(field("ask", sanitize(ask)));
     }
     lines
+}
+
+/// This row's lineage, for Source: the session the owner published for it and the
+/// parent it named, with what became of that link.
+///
+/// A worker that lands at a workspace root can be there because two panes
+/// publish one session UUID, which makes its parent an ambiguity rather than an
+/// owner. The tree does not fabricate a nesting, so the reason is said here
+/// rather than left for a reader to infer from where the row landed.
+fn lineage_lines(state: &ObservationState, agent: &AgentObservation) -> Vec<Line<'static>> {
+    let Some(lineage) = agent.lineage.as_ref() else {
+        return Vec::new();
+    };
+    let mut lines = vec![field("session uuid", sanitize(lineage.session.as_str()))];
+    if let Some(parent) = lineage.parent.as_ref() {
+        lines.push(field("parent", parent_link(state, agent, parent)));
+    }
+    lines
+}
+
+/// What became of a parent link: the row it is nested under, or the reason the
+/// tree left it where it is. The rule is the tree's own — one claimant in the
+/// workspace, and never the row itself.
+fn parent_link(state: &ObservationState, agent: &AgentObservation, parent: &SessionUuid) -> String {
+    let uuid = sanitize(parent.as_str());
+    let owners: Vec<&AgentObservation> = state
+        .inventory()
+        .map(|inventory| {
+            inventory
+                .agents
+                .iter()
+                .filter(|other| {
+                    other.location.workspace_id == agent.location.workspace_id
+                        && other
+                            .lineage
+                            .as_ref()
+                            .is_some_and(|lineage| &lineage.session == parent)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    match owners.as_slice() {
+        [] => format!("{uuid} — no row publishes this session, so this row is not nested"),
+        [owner] if owner.location.pane_id == agent.location.pane_id => {
+            format!("{uuid} — this row's own session, so it is not nested")
+        }
+        [owner] => format!("{uuid} — nested under {}", owner_name(owner)),
+        owners => format!(
+            "{uuid} — {} rows publish this session, so this row is not nested",
+            owners.len()
+        ),
+    }
+}
+
+/// The name an owner is linked by: the label or name it published, and the pane
+/// that carries it.
+fn owner_name(agent: &AgentObservation) -> String {
+    let name = agent
+        .facts
+        .label
+        .as_deref()
+        .or(agent.label.as_deref())
+        .or(agent.facts.name.as_deref())
+        .filter(|name| !name.is_empty());
+    match name {
+        Some(name) => format!("{} · {}", agent.location.pane_id, sanitize(name)),
+        None => agent.location.pane_id.clone(),
+    }
 }
 
 fn unavailable() -> String {
@@ -2506,8 +3194,8 @@ mod tests {
     use crate::herdr::decode_snapshot;
     use crate::model::{
         AgentObservation, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent,
-        DescendantResources, FleetObservation, ForegroundEvidence, HerdsmanFacts, LocalFacts,
-        Location, Pane, ProcessIdentity, ProcessResources, ProcessState, RuntimeStatus,
+        DescendantResources, DescendantSample, FleetObservation, ForegroundEvidence, HerdsmanFacts,
+        LocalFacts, Location, Pane, ProcessIdentity, ProcessResources, ProcessState, RuntimeStatus,
         SemanticState, Tab, TerminalMode, Total, Workspace,
     };
     use crate::runtime::Target;
@@ -2581,6 +3269,15 @@ mod tests {
         panel_text_at(state, app, page, 120)
     }
 
+    /// A block row read from the drawn panel: the label and the value that
+    /// follows it, with the column's padding flattened out. A value the panel
+    /// wrapped comes back as one string, because its rows are joined the same
+    /// way.
+    fn draws_row(page: &str, label: &str, value: &str) -> bool {
+        let flat = page.split_whitespace().collect::<Vec<_>>().join(" ");
+        flat.contains(&format!("{label} {value}"))
+    }
+
     /// The same at a chosen terminal width: a value longer than the panel's own
     /// width wraps mid-token, and joining its rows would split it with a space.
     fn panel_text_at(
@@ -2616,6 +3313,100 @@ mod tests {
             .filter(|row| !row.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The rows of the details panel as the screen drew them, one string per
+    /// screen row: the wrapping the panel did is kept, so a row that spilled
+    /// onto the row below it is two of these.
+    fn panel_rows(
+        state: &ObservationState,
+        app: &mut App,
+        page: DetailPage,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let shown = app.detail_page();
+        app.select_page(page);
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("infallible test backend");
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| {
+                geometry = render(frame, state, app, &mut ListState::default(), 0);
+            })
+            .expect("draw");
+        app.note_layout(geometry.clone());
+        app.select_page(shown);
+        let details = geometry.details.expect("the details panel is drawn");
+        let buffer = terminal.backend().buffer();
+        (details.y + 1..details.bottom().saturating_sub(1))
+            .map(|y| {
+                (details.x + 1..details.right().saturating_sub(1))
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    /// The details panel as the screen drew it, one string per drawn cell of
+    /// every screen row: a string's place in one of these is the column its cell
+    /// is drawn in, which is what the table's columns have to line up in. Rows
+    /// the panel left empty are dropped.
+    fn panel_cell_rows(
+        state: &ObservationState,
+        app: &mut App,
+        page: DetailPage,
+        width: u16,
+        height: u16,
+    ) -> Vec<Vec<String>> {
+        let shown = app.detail_page();
+        app.select_page(page);
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("infallible test backend");
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| {
+                geometry = render(frame, state, app, &mut ListState::default(), 0);
+            })
+            .expect("draw");
+        app.note_layout(geometry.clone());
+        app.select_page(shown);
+        let details = geometry.details.expect("the details panel is drawn");
+        let buffer = terminal.backend().buffer();
+        (details.y + 1..details.bottom().saturating_sub(1))
+            .map(|y| {
+                (details.x + 1..details.right().saturating_sub(1))
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+            .collect()
+    }
+
+    /// The cell a one-cell-per-character string is drawn in on a screen row: the
+    /// process a row wrapped into another screen row finds nothing here.
+    fn cell_start(cells: &[String], text: &str) -> Option<usize> {
+        let wanted: Vec<String> = text.chars().map(|ch| ch.to_string()).collect();
+        cells
+            .windows(wanted.len())
+            .position(|window| window == wanted.as_slice())
+    }
+
+    /// A page's lines as one string, flattened the way the panel draws them:
+    /// for the page a render builds from a selection rather than from the app's
+    /// own state.
+    fn page_text(lines: &[Line<'static>]) -> String {
+        let mut text = String::new();
+        for line in lines {
+            for span in &line.spans {
+                text.push_str(&span.content);
+            }
+            text.push('\n');
+        }
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// A draw that reports where it put things and stores that layout the way
@@ -2725,6 +3516,102 @@ mod tests {
 
     fn select_agent(app: &mut App, pane_id: &str) {
         select_row(app, crate::tree::RowId::Agent(pane_id.into()));
+    }
+
+    /// A lineage whose UUIDs are derived from small numbers, so a test can name
+    /// the exact session a parent link points at.
+    fn lineage(uuid: u32, parent: Option<u32>) -> crate::model::Lineage {
+        let root = |n: u32| {
+            crate::model::SessionUuid::parse(&format!("01a1{n:04x}-0000-4000-8000-{n:012x}"))
+                .expect("uuid-shaped")
+        };
+        crate::model::Lineage {
+            session: root(uuid),
+            parent: parent.map(root),
+        }
+    }
+
+    /// A one-workspace fleet holding exactly these agents, each with a pane.
+    fn lineage_state(agents: Vec<AgentObservation>) -> ObservationState {
+        let panes = agents
+            .iter()
+            .map(|agent| Pane {
+                location: agent.location.clone(),
+                label: None,
+                title: None,
+            })
+            .collect();
+        let mut state = ObservationState::new();
+        state.apply_success(FleetObservation {
+            workspaces: vec![Workspace {
+                workspace_id: "wH".into(),
+                label: Some("herdsman".into()),
+                number: None,
+            }],
+            tabs: vec![Tab {
+                tab_id: "wH:t1".into(),
+                workspace_id: "wH".into(),
+                label: None,
+                number: None,
+            }],
+            panes,
+            agents,
+        });
+        state
+    }
+
+    #[test]
+    fn source_says_what_became_of_the_parent_link() {
+        // One worker, and two rows publishing the session its parent link names.
+        // The tree does not invent a nesting it cannot choose, so the reason has
+        // to be readable: a worker at a workspace root otherwise looks orphaned.
+        let agent = |pane: &str, lineage: crate::model::Lineage| AgentObservation {
+            location: Location {
+                workspace_id: "wH".into(),
+                tab_id: "wH:t1".into(),
+                pane_id: pane.into(),
+            },
+            name: Some("pi".into()),
+            label: Some(format!("agent {pane}")),
+            status: Some(RuntimeStatus::Idle),
+            session: None,
+            lineage: Some(lineage),
+            facts: HerdsmanFacts::default(),
+        };
+
+        let ambiguous = lineage_state(vec![
+            agent("wH:p2Q", lineage(1, Some(2))),
+            agent("wH:p2P", lineage(2, None)),
+            agent("wH:p1E", lineage(2, None)),
+        ]);
+        let mut app = app_for(&ambiguous);
+        select_agent(&mut app, "wH:p2Q");
+        let source = render_page(&ambiguous, &mut app, DetailPage::Source, 180, 30);
+        assert!(
+            source.contains("session uuid: 01a10001-0000-4000-8000-000000000001"),
+            "{source}"
+        );
+        assert!(
+            source.contains("parent: 01a10002-0000-4000-8000-000000000002"),
+            "{source}"
+        );
+        assert!(
+            source.contains("2 rows") && source.contains("publish this session"),
+            "the ambiguity is the reason the row is not nested: {source}"
+        );
+
+        // The same worker with one claimant: the link the tree used is named.
+        let linked = lineage_state(vec![
+            agent("wH:p2Q", lineage(1, Some(2))),
+            agent("wH:p2P", lineage(2, None)),
+        ]);
+        let mut app = app_for(&linked);
+        select_agent(&mut app, "wH:p2Q");
+        let source = render_page(&linked, &mut app, DetailPage::Source, 180, 30);
+        assert!(
+            source.contains("nested") && source.contains("under wH:p2P · agent wH:p2P"),
+            "{source}"
+        );
     }
 
     #[test]
@@ -3772,6 +4659,9 @@ mod tests {
             ],
             offset: 0,
             disclosure_markers: Vec::new(),
+            process_rows: Vec::new(),
+            process_folds: Vec::new(),
+            details_content: Rect::new(41, 2, 28, 17),
             confirm_cancel: None,
             confirm_confirm: None,
         }
@@ -4721,7 +5611,7 @@ mod tests {
         assert!(screen.contains("observed: nix"), "{screen}");
         // An identity this machine never read claims nothing: no executable
         // path and no comparison is invented for it.
-        assert!(!screen.contains("executable:"), "{screen}");
+        assert!(!screen.contains("exe:"), "{screen}");
         assert!(!screen.contains("binary:"), "{screen}");
     }
 
@@ -4778,6 +5668,160 @@ mod tests {
         evidence
     }
 
+    /// The root identity every sampled-process test reads beneath.
+    fn root_identity() -> ProcessIdentity {
+        ProcessIdentity {
+            boot_id: "6d9d2f0a-2f6f-4a1f-9c2d-2f6f4a1f9c2d".into(),
+            pid: 4242,
+            start_ticks: 9_812,
+        }
+    }
+
+    /// One process a scan verified beneath a root: the identity it was read as,
+    /// the process it was read beneath, and what that read carried.
+    fn descendant(
+        pid: i32,
+        parent: &ProcessIdentity,
+        name: &str,
+        state: ProcessState,
+        cpu: Option<CpuPercent>,
+        rss_bytes: Option<u64>,
+    ) -> DescendantSample {
+        DescendantSample {
+            identity: ProcessIdentity {
+                boot_id: parent.boot_id.clone(),
+                pid,
+                start_ticks: parent.start_ticks + u64::from(pid as u32),
+            },
+            parent: parent.clone(),
+            name: name.to_string(),
+            state,
+            cpu,
+            rss_bytes,
+        }
+    }
+
+    /// The table's drawn lines for one projection, without the page around them:
+    /// the layout tests read the cells a row is built from.
+    fn table_lines(
+        resources: &ProcessResources,
+        root_name: &str,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let folded = HashSet::new();
+        let table = ProcessTable::of(&folded, resources).expect("a verified tree");
+        let mut page = PageLines::default();
+        process_table_lines(&table, root_name, width, &table.root, &folded, &mut page);
+        page.lines
+    }
+
+    /// The tree the process-table tests draw: a quiet root, a busy shell with a
+    /// build beneath it, and a process with neither an interval nor a size to
+    /// show.
+    ///
+    /// The members come in no order a reader can follow — a child before its
+    /// parent, and the siblings shuffled — because that is the order a scan
+    /// walking the table read them in.
+    fn read_tree() -> DescendantResources {
+        let root = root_identity();
+        let shell = descendant(
+            300,
+            &root,
+            "bash",
+            ProcessState::Sleeping,
+            Some(CpuPercent::from_hundredths(1_250)),
+            Some(3 * 1024 * 1024),
+        );
+        let editor = descendant(310, &root, "node", ProcessState::Running, None, None);
+        let build = descendant(
+            311,
+            &shell.identity,
+            "esbuild-service-worker",
+            ProcessState::DiskSleep,
+            Some(CpuPercent::from_hundredths(2_000)),
+            Some(64 * 1024 * 1024),
+        );
+        DescendantResources {
+            observed: Some(3),
+            members: vec![build, editor, shell],
+            rss_bytes: Total::Complete(67 * 1024 * 1024),
+            cpu: Total::Complete(CpuPercent::from_hundredths(3_250)),
+        }
+    }
+
+    /// A root and two descendants observed under names that take more cells than
+    /// they have characters — one wider than its characters, one whose characters
+    /// take no cells of their own — at pids shorter than the table's own `pid`
+    /// heading.
+    ///
+    /// The names are what a layout counted in characters gets wrong, and the pids
+    /// are what a column measured from its values alone gets wrong.
+    fn wide_resources() -> ProcessResources {
+        let root = ProcessIdentity {
+            boot_id: root_identity().boot_id,
+            pid: 7,
+            start_ticks: 9_812,
+        };
+        ProcessResources {
+            identity: root.clone(),
+            state: ProcessState::Sleeping,
+            rss_bytes: Some(8 * 1024 * 1024),
+            cpu: Some(CpuPercent::from_hundredths(0)),
+            descendants: DescendantResources {
+                observed: Some(2),
+                members: vec![
+                    descendant(
+                        88,
+                        &root,
+                        "日本語のビルド",
+                        ProcessState::Sleeping,
+                        Some(CpuPercent::from_hundredths(1_250)),
+                        Some(3 * 1024 * 1024),
+                    ),
+                    descendant(
+                        9,
+                        &root,
+                        "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+                        ProcessState::Running,
+                        Some(CpuPercent::from_hundredths(2_000)),
+                        Some(64 * 1024 * 1024),
+                    ),
+                ],
+                rss_bytes: Total::Complete(67 * 1024 * 1024),
+                cpu: Total::Complete(CpuPercent::from_hundredths(3_250)),
+            },
+        }
+    }
+
+    /// The pane whose table is drawn from [`wide_resources`], its process
+    /// observed under a name that is twice as wide as it is long.
+    fn wide_tree() -> ForegroundEvidence {
+        let mut evidence = sampled(7, wide_resources());
+        if let ForegroundEvidence::NonShell { name, .. } = &mut evidence {
+            *name = Some("日本語のルート".into());
+        }
+        evidence
+    }
+
+    /// A pane whose process was sampled, with everything the scan confirmed
+    /// beneath it and the comparison this machine made of the running file.
+    fn sampled_tree(binary: BinaryIdentity) -> ForegroundEvidence {
+        let mut evidence = sampled(
+            4242,
+            resources(
+                // A measured idle interval is a measurement: the root is quiet
+                // and the shell beneath it is not.
+                Some(CpuPercent::from_hundredths(0)),
+                Some(8 * 1024 * 1024),
+                read_tree(),
+            ),
+        );
+        if let ForegroundEvidence::NonShell { local, .. } = &mut evidence {
+            local.binary = binary;
+        }
+        evidence
+    }
+
     /// A sampled process, with whatever the scan observed beneath it.
     fn resources(
         cpu: Option<CpuPercent>,
@@ -4785,11 +5829,7 @@ mod tests {
         descendants: DescendantResources,
     ) -> ProcessResources {
         ProcessResources {
-            identity: ProcessIdentity {
-                boot_id: "6d9d2f0a-2f6f-4a1f-9c2d-2f6f4a1f9c2d".into(),
-                pid: 4242,
-                start_ticks: 9_812,
-            },
+            identity: root_identity(),
             state: ProcessState::Sleeping,
             rss_bytes,
             cpu,
@@ -4800,6 +5840,7 @@ mod tests {
     /// Nothing observed beneath a root, with every process of the scan read.
     fn no_descendants() -> DescendantResources {
         DescendantResources {
+            members: Vec::new(),
             observed: Some(0),
             rss_bytes: Total::Complete(0),
             cpu: Total::Complete(CpuPercent::from_hundredths(0)),
@@ -4819,6 +5860,7 @@ mod tests {
                     Some(CpuPercent::from_hundredths(0)),
                     Some(8 * 1024 * 1024),
                     DescendantResources {
+                        members: Vec::new(),
                         observed: Some(2),
                         rss_bytes: Total::Complete(512 * 1024 * 1024),
                         // Work on more than one CPU carries past 100%.
@@ -4862,18 +5904,21 @@ mod tests {
         );
         app.toggle_block(&Disclosure::Process);
         let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        // Both are held behind the block and wrapped into its value column, so
+        // the sentence and the birth identity are asserted in their parts.
         assert!(
-            processes.contains(
-                "observed processes beneath this one, not a workload or assignment total \
-                 (a page shared with another process counts in each)"
-            ),
+            processes.contains("observed processes beneath this one"),
+            "{processes}"
+        );
+        assert!(processes.contains("counts in each)"), "{processes}");
+        assert!(
+            draws_row(&processes, "birth", "pid 4242 · start ticks 9812"),
             "{processes}"
         );
         assert!(
-            processes.contains("birth: pid 4242 · boot 6d9d2f0a-2f6f-4a1f-9c2d-2f6f4a1f9c2d"),
+            draws_row(&processes, "boot", "6d9d2f0a-2f6f-4a1f-9c2d"),
             "{processes}"
         );
-        assert!(processes.contains("start ticks 9812"), "{processes}");
     }
 
     #[test]
@@ -4922,6 +5967,7 @@ mod tests {
                     Some(CpuPercent::from_hundredths(4_200)),
                     Some(1_048_576),
                     DescendantResources {
+                        members: Vec::new(),
                         observed: Some(3),
                         rss_bytes: Total::Partial(
                             2_048,
@@ -4968,6 +6014,7 @@ mod tests {
                     Some(CpuPercent::from_hundredths(100)),
                     Some(4_096),
                     DescendantResources {
+                        members: Vec::new(),
                         observed: None,
                         rss_bytes: Total::Unknown("the process table could not be read".into()),
                         cpu: Total::Unknown("the process table could not be read".into()),
@@ -5065,6 +6112,1013 @@ mod tests {
         assert!(!processes.contains("descendants"), "{processes}");
     }
 
+    /// Whether one drawn row of the panel carries every one of these cells: a
+    /// table row is asserted as the cells a reader sees rather than as the
+    /// padding between them.
+    fn row_has(rows: &[String], cells: &[&str]) -> bool {
+        rows.iter().any(|row| {
+            let flat = row.split_whitespace().collect::<Vec<_>>().join(" ");
+            cells.iter().all(|cell| flat.contains(cell))
+        })
+    }
+
+    #[test]
+    fn a_branch_too_deep_for_the_name_column_keeps_the_levels_nearest_the_process() {
+        let root = root_identity();
+        let mut parent = root.clone();
+        let mut members = Vec::new();
+        for (depth, pid) in (500..=508).enumerate() {
+            let member = descendant(
+                pid,
+                &parent,
+                &format!("process-at-depth-{depth}"),
+                ProcessState::Sleeping,
+                None,
+                None,
+            );
+            parent = member.identity.clone();
+            members.push(member);
+        }
+        let resources = resources(
+            None,
+            None,
+            DescendantResources {
+                observed: Some(members.len() as u32),
+                members,
+                rss_bytes: Total::Complete(0),
+                cpu: Total::Complete(CpuPercent::from_hundredths(0)),
+            },
+        );
+        let table = ProcessTable::of(&HashSet::new(), &resources).expect("a verified tree");
+        assert_eq!(table.rows.len(), 10, "the root and nine processes under it");
+
+        // No width the panel can be, however narrow, is allowed to wrap a row
+        // into the row below it or to run past its own edge.
+        for width in [8, 12, 20, 28, 58] {
+            let lines = table_lines(&resources, "nix", width);
+            assert!(
+                lines.iter().all(|line| line.width() <= width),
+                "a row is wider than the panel at {width}: {lines:?}"
+            );
+            assert_eq!(
+                page_rows(&lines, width as u16).0,
+                lines.len(),
+                "a row wrapped at {width}"
+            );
+        }
+
+        // The deepest process keeps the levels nearest it rather than drawing
+        // flush with the root's own children, and says its ancestry is cut.
+        let deepest = table_lines(&resources, "nix", 14)
+            .pop()
+            .expect("the last row of the table");
+        let deepest: String = deepest
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let deepest = deepest.trim_start();
+        assert!(deepest.starts_with('…'), "{deepest:?}");
+        assert!(deepest.contains('└'), "{deepest:?}");
+    }
+
+    #[test]
+    fn a_wide_name_is_measured_in_cells_and_never_draws_past_the_panel() {
+        let resources = wide_resources();
+
+        // Every width the page is ever drawn at, from the narrowest content
+        // column the details panel has (30 cells of panel less its borders) to
+        // well past the columns: no line is wider than the panel it is drawn in.
+        // A row laid out in characters overruns the panel, and the panel wraps
+        // the rest of the process into the row below it.
+        for width in 28..=200 {
+            for line in table_lines(&resources, "日本語のルート", width) {
+                assert!(
+                    line.width() <= width,
+                    "at {width} cells: {} drawn",
+                    line.width()
+                );
+            }
+        }
+
+        // A name with characters wider than one cell is shortened to a width,
+        // never emptied of the characters a terminal draws:
+        let wide: String = table_lines(&resources, "日本語のルート", 200)
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        assert!(wide.contains("日本語のルート"), "{wide}");
+        assert!(wide.contains("日本語のビルド"), "{wide}");
+        assert!(wide.contains("e\u{301}e\u{301}e\u{301}"), "{wide}");
+    }
+
+    #[test]
+    fn the_table_heading_is_part_of_the_column_it_names() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", wide_tree());
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.toggle_block(&Disclosure::ProcessTable);
+
+        // Every pid in this tree is shorter than the heading that names the
+        // column: were the column measured from its values alone, the heading
+        // would sit one cell from the name of whichever process fills the name
+        // column, in the cell the gap is there to keep clear.
+        let rows = panel_cell_rows(&state, &mut app, DetailPage::Processes, 84, 40);
+        let header = rows
+            .iter()
+            .position(|cells| cell_start(cells, "name") == Some(TABLE_MARKER))
+            .unwrap_or_else(|| panic!("the table's heading: {rows:?}"));
+        let table = &rows[header..];
+        let heading = cell_start(&table[0], "pid").expect("the pid heading");
+        let name_end = (0..heading)
+            .rev()
+            .find(|index| {
+                table[1..]
+                    .iter()
+                    .any(|cells| !cells[*index].trim().is_empty())
+            })
+            .unwrap_or_else(|| panic!("a name in the column: {table:?}"));
+        let gap = heading - name_end - 1;
+        assert!(
+            gap >= TABLE_GAP,
+            "the heading is {gap} cells from the name column: {table:?}"
+        );
+    }
+
+    #[test]
+    fn wide_names_keep_the_numeric_columns_in_one_cell_in_every_row() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", wide_tree());
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.toggle_block(&Disclosure::ProcessTable);
+
+        // What the table draws, row by row: the heading, then the root and the
+        // processes beneath it in pid order. The heading is wider than every pid
+        // under it.
+        let headings = ["pid", "cpu", "rss"];
+        let drawn = [
+            ["7", "0.0%", "8.0 MiB"],
+            ["9", "20.0%", "64.0 MiB"],
+            ["88", "12.5%", "3.0 MiB"],
+        ];
+        let widths: Vec<usize> = (0..headings.len())
+            .map(|column| {
+                drawn
+                    .iter()
+                    .map(|row| display_cells(row[column]))
+                    .chain([display_cells(headings[column])])
+                    .max()
+                    .unwrap()
+            })
+            .collect();
+
+        // 84 columns of terminal put the page in its narrowest content column
+        // (28 cells), where the marker column costs the resident set its own:
+        // 140 and 200 leave the page wide enough for every column. The columns
+        // go one at a time, the widest fact first — never the pid.
+        for (width, height, columns) in [
+            (200u16, 40u16, &headings[..]),
+            (140, 40, &headings[..]),
+            (84, 40, &headings[..2]),
+        ] {
+            let rows = panel_cell_rows(&state, &mut app, DetailPage::Processes, width, height);
+            let header = rows
+                .iter()
+                .position(|cells| cell_start(cells, "name") == Some(TABLE_MARKER))
+                .unwrap_or_else(|| panic!("the table's heading at {width}: {rows:?}"));
+            let table = &rows[header..];
+            let heading = &table[0];
+            let shown = |column: &str| cell_start(heading, column).is_some();
+            for column in &headings {
+                assert_eq!(
+                    shown(column),
+                    columns.contains(column),
+                    "{column:?} at {width} columns: {heading:?}"
+                );
+            }
+
+            // Each row of the table is one line of the panel: its name, its pid
+            // and its figures are drawn on the same screen row, so nothing
+            // wrapped a process into the row below — and every pid is drawn.
+            let mut starts: Vec<Vec<usize>> = Vec::new();
+            for (index, values) in drawn.iter().enumerate() {
+                let cells = table
+                    .get(index + 1)
+                    .unwrap_or_else(|| panic!("row {index} at {width} columns: {table:?}"));
+                let mut row = Vec::new();
+                for (position, heading) in headings.iter().enumerate() {
+                    if !shown(heading) {
+                        continue;
+                    }
+                    row.push(
+                        cell_start(cells, values[position])
+                            .map(|start| start + display_cells(values[position]))
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{:?} is not on its own row at {width}: {table:?}",
+                                    values[position]
+                                )
+                            }),
+                    );
+                }
+                starts.push(row);
+            }
+
+            // The heading and every process beneath it put the columns they draw
+            // in the same cells: the values are right-aligned in their columns, so
+            // a column ends in one cell and begins in one cell, whatever the name
+            // beside it is made of.
+            for (index, row) in starts.iter().enumerate() {
+                let offset = |values: &Vec<usize>| -> Vec<usize> {
+                    values
+                        .iter()
+                        .zip(headings.iter().filter(|heading| shown(heading)))
+                        .map(|(end, heading)| {
+                            end - widths[headings
+                                .iter()
+                                .position(|name| name == heading)
+                                .expect("a drawn column")]
+                        })
+                        .collect()
+                };
+                assert_eq!(
+                    offset(row),
+                    offset(&starts[0]),
+                    "row {index} draws its numbers elsewhere at {width}: {table:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_process_table_draws_the_confirmed_tree_in_the_columns_it_names() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", sampled_tree(BinaryIdentity::default()));
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+
+        // Collapsed, the page pays one line for the table and draws none of the
+        // processes beneath the root.
+        let collapsed = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        assert!(collapsed.contains("▸ process table"), "{collapsed}");
+        for name in ["bash", "node", "esbuild"] {
+            assert!(!collapsed.contains(name), "{name:?}: {collapsed}");
+        }
+
+        app.toggle_block(&Disclosure::ProcessTable);
+        let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        let flat = processes.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // The columns are named, and the first row is the root itself: the
+        // anchor every branch below it hangs from, and the reason the root's own
+        // figures are here rather than among the sums.
+        assert!(processes.contains("▾ process table"), "{processes}");
+        assert!(flat.contains("name pid cpu rss"), "{processes}");
+        // One row per confirmed process, each at the depth its parent puts it,
+        // with the siblings of one parent by pid — the order the scan read them
+        // in was no order at all.
+        for row in [
+            "nix 4242 0.0% 8.0 MiB",
+            "├─ bash 300 12.5% 3.0 MiB",
+            "│ └─ esbuild-service-worker 311 20.0% 64.0 MiB",
+            "└─ node 310 — —",
+        ] {
+            assert!(flat.contains(row), "{row:?} is not drawn: {processes}");
+        }
+        let drawn: Vec<usize> = [
+            "nix 4242",
+            "bash 300",
+            "esbuild-service-worker 311",
+            "node 310",
+        ]
+        .iter()
+        .map(|row| {
+            flat.find(row)
+                .unwrap_or_else(|| panic!("{row:?}: {processes}"))
+        })
+        .collect();
+        assert!(drawn.is_sorted(), "not in hierarchy order: {processes}");
+
+        // A process whose interval was never measured draws a dash — not the
+        // zero a measured idle interval is — and the table says what it means.
+        let node = processes
+            .split("└─ node")
+            .nth(1)
+            .expect("the node row is drawn");
+        assert!(!node.contains("0.0%"), "{processes}");
+        assert!(processes.contains("— not measured"), "{processes}");
+        // While the root, quiet, was measured: its own zero is a reading.
+        assert!(flat.contains("nix 4242 0.0%"), "{processes}");
+    }
+
+    #[test]
+    fn a_narrow_panel_keeps_every_process_row_on_one_line() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", sampled_tree(BinaryIdentity::default()));
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.toggle_block(&Disclosure::ProcessTable);
+
+        // The narrowest content column the details are ever drawn in: the panel
+        // beside the tree is never narrower, and below that width the whole
+        // body is the panel.
+        let rows = panel_rows(&state, &mut app, DetailPage::Processes, 84, 40);
+        let header = rows
+            .iter()
+            .position(|row| row.trim_start().starts_with("name"))
+            .unwrap_or_else(|| panic!("the table's own header: {rows:?}"));
+        let table = &rows[header..];
+
+        // Every row is one line of the panel: the name, the pid and what the
+        // row has to say about it are on the same line, and nothing spilled
+        // into the row below.
+        for cells in [
+            &["nix", "4242", "0.0%"][..],
+            &["bash", "300", "12.5%"][..],
+            &["esbuil…", "311", "20.0%"][..],
+            &["node", "310", "—"][..],
+        ] {
+            assert!(row_has(table, cells), "{cells:?} is not one row: {rows:?}");
+        }
+        // The resident set is the column that went, and a name the panel cannot
+        // hold whole is shortened rather than wrapped onto the row below. The
+        // heading names the columns that were drawn, and no others.
+        assert!(!row_has(table, &["rss"]), "the size is drawn: {rows:?}");
+        assert!(!row_has(table, &["MiB"]), "the size is drawn: {rows:?}");
+        assert!(row_has(table, &["esbuil…"]), "{rows:?}");
+        // The fold marker is drawn where there is a branch to fold, and the cell
+        // is left blank where there is none: the row's own marker column.
+        assert!(row_has(table, &["▾", "nix"]), "{rows:?}");
+        assert!(row_has(table, &["▾", "bash"]), "{rows:?}");
+        assert!(
+            !row_has(table, &["▾", "node"]),
+            "a leaf is foldable: {rows:?}"
+        );
+        // The pid is the column that never goes.
+        for pid in ["4242", "300", "311", "310"] {
+            assert!(row_has(table, &[pid]), "{pid} is not drawn: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn a_short_panel_reaches_every_process_row_by_scrolling() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", sampled_tree(BinaryIdentity::default()));
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        app.toggle_block(&Disclosure::ProcessTable);
+
+        // A panel with room for a few rows draws what it can hold and keeps the
+        // rest a scroll away, which is where the table is.
+        let (_, geometry) = draw(&state, &mut app, 200, 14);
+        assert!(
+            geometry.details_rows > geometry.details_viewport as usize,
+            "the page is not longer than the panel: {geometry:?}"
+        );
+        app.scroll_page_to(u16::MAX);
+        let (screen, geometry) = draw(&state, &mut app, 200, 14);
+        assert_eq!(
+            app.details_scroll() as usize,
+            geometry.details_rows - geometry.details_viewport as usize,
+            "the last row of the page is not the last the panel can reach"
+        );
+
+        // Every row of the table is on a screen row of its own — none of them
+        // wrapped into the row below — and the last of them is reachable.
+        let screen_rows: Vec<String> = screen.lines().map(str::to_string).collect();
+        for cells in [
+            &["├─", "bash", "300", "12.5%", "3.0 MiB"][..],
+            &[
+                "│",
+                "└─",
+                "esbuild-service-worker",
+                "311",
+                "20.0%",
+                "64.0 MiB",
+            ][..],
+            &["└─", "node", "310", "—"][..],
+        ] {
+            assert!(
+                row_has(&screen_rows, cells),
+                "{cells:?} is not one row: {screen}"
+            );
+        }
+        assert!(screen.contains("— not measured"), "{screen}");
+    }
+
+    #[test]
+    fn a_selected_descendant_draws_its_own_sample_and_not_the_root_binary() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", sampled_tree(stale_identity()));
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        let shell = read_tree()
+            .members
+            .into_iter()
+            .find(|member| member.identity.pid == 300)
+            .expect("the shell's own verified row");
+
+        // The page a render builds for the reader's selection: the block above
+        // the heading describes the shell, from its own sample.
+        let page = detail_page_lines(
+            &state,
+            &app,
+            DetailPage::Processes,
+            58,
+            Some(&shell.identity),
+        );
+        let processes = page_text(&page.lines);
+        let (selected, root) = processes
+            .split_once("foreground root")
+            .unwrap_or_else(|| panic!("the root's evidence, under its own heading: {processes}"));
+        assert!(selected.contains("pid: 300"), "{processes}");
+        assert!(selected.contains("observed: bash"), "{processes}");
+        assert!(selected.contains("cpu 12.5%"), "{processes}");
+        assert!(selected.contains("rss 3.0 MiB"), "{processes}");
+        // Nothing of the root's binary identity is attributed to the child: the
+        // comparison is made from the root's own executable, and a descendant's
+        // sample says nothing about which build the root runs.
+        for borrowed in ["package", "binary", "/run/pi", "stale", "current"] {
+            assert!(
+                !selected.contains(borrowed),
+                "{borrowed:?} is attributed to the selected row: {processes}"
+            );
+        }
+        // It is still drawn, under the root's own heading, with the root's pid
+        // and the qualified sums beneath it.
+        assert!(root.contains("pid: 4242"), "{processes}");
+        assert!(root.contains("observed: nix"), "{processes}");
+        assert!(root.contains("package: /run/pi-1.0.1"), "{processes}");
+        assert!(root.contains("binary:"), "{processes}");
+        assert!(root.contains("(stale)"), "{processes}");
+        assert!(
+            root.contains("descendants count 3 processes"),
+            "{processes}"
+        );
+
+        // A selection this observation does not carry — a process that exited,
+        // or a pid the kernel handed on — draws the root rather than fitting a
+        // stranger's facts to it.
+        let replaced = ProcessIdentity {
+            start_ticks: 1,
+            ..shell.identity.clone()
+        };
+        let page = detail_page_lines(&state, &app, DetailPage::Processes, 58, Some(&replaced));
+        let processes = page_text(&page.lines);
+        assert!(!processes.contains("foreground root"), "{processes}");
+        assert!(processes.contains("observed: nix"), "{processes}");
+    }
+
+    #[test]
+    fn the_drawn_page_describes_the_selected_process_and_draws_the_root_once() {
+        // The production path: the selection the cursor made is what the drawn
+        // page describes, not one handed to the line builder directly.
+        let (state, mut app) = process_table_app(sampled_tree(stale_identity()));
+        let shell = tree_identity(300);
+        press_key(&mut app, KeyCode::Char('t'));
+        press_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.process_selection(), Some(&shell));
+
+        let panel = panel_text(&state, &mut app, DetailPage::Processes);
+        let (above, table) = panel
+            .split_once("process table")
+            .expect("the table's marker");
+        let (selected, root) = above
+            .split_once("foreground root")
+            .expect("the root's own heading");
+        // The selected row's own sample: its name, its incarnation and its
+        // figures, drawn from the observation the page was built against.
+        assert!(draws_row(selected, "pid:", "300"), "{panel}");
+        assert!(draws_row(selected, "observed:", "bash"), "{panel}");
+        assert!(draws_row(selected, "state", "sleeping"), "{panel}");
+        assert!(draws_row(selected, "cpu", "12.5%"), "{panel}");
+        assert!(draws_row(selected, "rss", "3.0 MiB"), "{panel}");
+        for borrowed in ["package", "binary", "(stale)", "/run/pi"] {
+            assert!(
+                !selected.contains(borrowed),
+                "{borrowed:?} is attributed to the child: {panel}"
+            );
+        }
+        // The root's own evidence stays under its own heading...
+        assert!(draws_row(root, "pid:", "4242"), "{panel}");
+        assert!(root.contains("(stale)"), "{panel}");
+        // ...and its figures are its row in the table, not a second section
+        // above it.
+        assert!(
+            !draws_row(root, "cpu", "0.0%"),
+            "the root's own section is drawn twice: {panel}"
+        );
+        assert!(draws_row(table, "nix", "4242"), "{panel}");
+    }
+
+    #[test]
+    fn the_process_table_is_offered_only_where_a_scan_verified_the_tree() {
+        // A scan that read the table and found nothing beneath the root is a
+        // measured empty observation: the root is still a row, and the only one.
+        let mut live = fixture_state();
+        live.apply_evidence(
+            "wA:p2",
+            sampled(4242, resources(None, Some(4_096), no_descendants())),
+        );
+        let mut app = app_for(&live);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        assert_eq!(
+            app.disclosures(),
+            vec![Disclosure::Process, Disclosure::ProcessTable]
+        );
+        app.toggle_block(&Disclosure::ProcessTable);
+        let processes = panel_text_at(&live, &mut app, DetailPage::Processes, 200);
+        let flat = processes.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("nix 4242 — 4.0 KiB"), "{processes}");
+        assert!(processes.contains("count  0 processes"), "{processes}");
+
+        // A scan that could not enumerate is not a tree of nothing: the page
+        // offers no table, and the sums say what could not be read instead.
+        let mut unknown = fixture_state();
+        unknown.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(0)),
+                    Some(4_096),
+                    DescendantResources {
+                        observed: None,
+                        members: Vec::new(),
+                        rss_bytes: Total::Unknown("the process scan was cancelled".into()),
+                        cpu: Total::Unknown("the process scan was cancelled".into()),
+                    },
+                ),
+            ),
+        );
+        let mut app = app_for(&unknown);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        assert_eq!(app.disclosures(), vec![Disclosure::Process]);
+        let processes = panel_text_at(&unknown, &mut app, DetailPage::Processes, 200);
+        assert!(!processes.contains("process table"), "{processes}");
+        assert!(processes.contains("count  unavailable"), "{processes}");
+        assert!(
+            processes.contains("nothing beneath this process could be enumerated"),
+            "{processes}"
+        );
+    }
+
+    #[test]
+    fn the_process_table_marker_opens_it_from_the_page() {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", sampled_tree(BinaryIdentity::default()));
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+
+        let (closed, mut geometry) = draw(&state, &mut app, 120, 30);
+        assert!(!closed.contains("esbuild"), "{closed}");
+        // Both of the page's blocks are drawn, each with the marker that answers
+        // for it, in the order the page offers them.
+        let details = marker_of(&geometry, &Disclosure::Process);
+        let table = marker_of(&geometry, &Disclosure::ProcessTable);
+        assert!(details.1 < table.1, "{details:?} and {table:?}");
+        let rows_closed = geometry.details_rows;
+
+        // A click on the table's marker opens the block, and the page it is
+        // drawn into is longer than the page without it.
+        assert_eq!(click_at(&mut app, table), None);
+        assert!(app.disclosure_open(&Disclosure::ProcessTable));
+        let (open, drawn) = draw(&state, &mut app, 120, 30);
+        geometry = drawn;
+        let open_rows: Vec<String> = open.lines().map(str::to_string).collect();
+        assert!(row_has(&open_rows, &["bash", "300"]), "{open}");
+        assert!(
+            geometry.details_rows > rows_closed,
+            "{} is not longer than {rows_closed}",
+            geometry.details_rows
+        );
+
+        // The marker still answers on the longer page: it closes what it opened.
+        let table = marker_of(&geometry, &Disclosure::ProcessTable);
+        click_at(&mut app, table);
+        assert!(!app.disclosure_open(&Disclosure::ProcessTable));
+        let (closed, _) = draw(&state, &mut app, 120, 30);
+        assert!(!closed.contains("esbuild"), "{closed}");
+    }
+
+    /// A key event the panel's own map answers, for the tests that move the
+    /// process cursor rather than the page.
+    fn press_key(app: &mut App, code: KeyCode) -> Option<Action> {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// The identity of one process the shared `read_tree` scan verified, by pid:
+    /// what a cursor is asserted against, rather than a pid the kernel may hand
+    /// on to another process.
+    fn tree_identity(pid: i32) -> ProcessIdentity {
+        read_tree()
+            .members
+            .into_iter()
+            .find(|member| member.identity.pid == pid)
+            .unwrap_or_else(|| panic!("pid {pid} is one of the tree's"))
+            .identity
+    }
+
+    /// An app on the Processes page with the row's verified table open and the
+    /// keyboard in the details, drawn once so the layout the pointer and the
+    /// cursor are measured against exists.
+    fn process_table_app(evidence: ForegroundEvidence) -> (ObservationState, App) {
+        let mut state = fixture_state();
+        state.apply_evidence("wA:p2", evidence);
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        app.toggle_block(&Disclosure::ProcessTable);
+        press_key(&mut app, KeyCode::Tab);
+        assert!(app.details_focused(), "the panel has the keyboard");
+        draw(&state, &mut app, 120, 30);
+        (state, app)
+    }
+
+    #[test]
+    fn t_enters_process_row_navigation_only_with_the_table_open() {
+        let (state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+
+        // With the details focused and the table open, t names the mode where
+        // the table is named.
+        press_key(&mut app, KeyCode::Char('t'));
+        assert!(app.process_navigating());
+        let rows = panel_rows(&state, &mut app, DetailPage::Processes, 120, 30);
+        assert!(
+            rows.iter().any(|row| row.contains("navigating")),
+            "the mode is named where the table is: {rows:?}"
+        );
+
+        // t again leaves the mode, and the table's own label is back.
+        press_key(&mut app, KeyCode::Char('t'));
+        assert!(!app.process_navigating());
+        let rows = panel_rows(&state, &mut app, DetailPage::Processes, 120, 30);
+        assert!(
+            !rows.iter().any(|row| row.contains("navigating")),
+            "{rows:?}"
+        );
+
+        // Closing the table leaves the mode: the mode is the table's.
+        press_key(&mut app, KeyCode::Char('t'));
+        assert!(app.process_navigating());
+        app.toggle_block(&Disclosure::ProcessTable);
+        assert!(!app.process_navigating());
+        app.toggle_block(&Disclosure::ProcessTable);
+
+        // With the table open but the keyboard in the tree, t is not the
+        // table's, and with the table closed there is no mode to enter.
+        press_key(&mut app, KeyCode::Esc);
+        assert!(!app.details_focused());
+        press_key(&mut app, KeyCode::Char('t'));
+        assert!(!app.process_navigating(), "the tree's t is not the table's");
+        press_key(&mut app, KeyCode::Tab);
+        app.toggle_block(&Disclosure::ProcessTable);
+        press_key(&mut app, KeyCode::Char('t'));
+        assert!(!app.process_navigating(), "a closed table has no rows");
+    }
+
+    #[test]
+    fn the_process_cursor_moves_over_drawn_rows_without_wrapping() {
+        let (_state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        let shell = tree_identity(300);
+        let build = tree_identity(311);
+        let editor = tree_identity(310);
+        let fleet = selected_id(&app);
+
+        press_key(&mut app, KeyCode::Char('t'));
+        // The cursor starts on the row's own process, which the page draws
+        // without a separate selection.
+        assert_eq!(app.process_selection(), None, "the root is the start");
+        press_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.process_selection(), Some(&shell));
+        press_key(&mut app, KeyCode::Down);
+        assert_eq!(app.process_selection(), Some(&build));
+        press_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.process_selection(), Some(&editor));
+        // Past the last drawn row the cursor stays where it is: the mode never
+        // wraps.
+        press_key(&mut app, KeyCode::Char('j'));
+        press_key(&mut app, KeyCode::Down);
+        assert_eq!(app.process_selection(), Some(&editor));
+        // Home and End reach the limits, and the first row does not wrap to the
+        // last either.
+        press_key(&mut app, KeyCode::Home);
+        assert_eq!(app.process_selection(), None);
+        press_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.process_selection(), None, "the first row does not wrap");
+        press_key(&mut app, KeyCode::End);
+        assert_eq!(app.process_selection(), Some(&editor));
+        assert_eq!(selected_id(&app), fleet, "no row key touched the fleet");
+    }
+
+    #[test]
+    fn folding_a_branch_hides_its_descendants_and_keeps_the_cursor_reachable() {
+        let (state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        let shell = tree_identity(300);
+        let editor = tree_identity(310);
+
+        press_key(&mut app, KeyCode::Char('t'));
+        press_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.process_selection(), Some(&shell));
+        // Enter folds the shell's branch: the build beneath it goes and the
+        // shell stays, drawn with the marker that says so.
+        press_key(&mut app, KeyCode::Enter);
+        let rows = panel_rows(&state, &mut app, DetailPage::Processes, 120, 30);
+        assert!(rows.iter().any(|row| row.contains("300")), "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("311")),
+            "the folded branch is not drawn: {rows:?}"
+        );
+        // A fold is keyed by the process, not by its position: the editor is a
+        // leaf, so folding it changes nothing.
+        press_key(&mut app, KeyCode::End);
+        assert_eq!(app.process_selection(), Some(&editor));
+        press_key(&mut app, KeyCode::Char(' '));
+        let rows = panel_rows(&state, &mut app, DetailPage::Processes, 120, 30);
+        assert!(rows.iter().any(|row| row.contains("310")), "{rows:?}");
+        // Space opens the shell's branch again.
+        press_key(&mut app, KeyCode::Home);
+        press_key(&mut app, KeyCode::Char('j'));
+        press_key(&mut app, KeyCode::Char(' '));
+        let rows = panel_rows(&state, &mut app, DetailPage::Processes, 120, 30);
+        assert!(
+            rows.iter().any(|row| row.contains("311")),
+            "the branch opens again: {rows:?}"
+        );
+        assert!(app.process_folded().is_empty());
+    }
+
+    #[test]
+    fn a_process_row_click_selects_and_enters_and_a_fold_marker_only_folds() {
+        let (state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        let shell = tree_identity(300);
+        let fleet = selected_id(&app);
+        let (_screen, geometry) = draw(&state, &mut app, 120, 30);
+
+        // The whole row is the target: a click on it selects that process and
+        // enters the table's local mode, and acts on nothing else.
+        let row = geometry
+            .process_rows
+            .iter()
+            .find(|(identity, _, _)| identity == &shell)
+            .and_then(|(_, _, rect)| *rect)
+            .expect("the shell's row is on screen");
+        assert_eq!(click_at(&mut app, (row.right() - 1, row.y)), None);
+        assert_eq!(app.process_selection(), Some(&shell));
+        assert!(app.process_navigating(), "a row click enters the mode");
+        assert!(app.details_focused());
+        assert_eq!(selected_id(&app), fleet, "the fleet row is untouched");
+
+        // The marker cell folds only the branch it labels: with the root's row
+        // selected, folding the shell leaves the cursor on the root.
+        let (_screen, geometry) = draw(&state, &mut app, 120, 30);
+        press_key(&mut app, KeyCode::Home);
+        assert_eq!(app.process_selection(), None);
+        let marker = geometry
+            .process_folds
+            .iter()
+            .find(|(identity, _)| identity == &shell)
+            .map(|(_, rect)| *rect)
+            .expect("the shell's branch has a marker");
+        assert_eq!(click_at(&mut app, (marker.x, marker.y)), None);
+        assert_eq!(
+            app.process_selection(),
+            None,
+            "the marker did not select its own row"
+        );
+        let rows = panel_rows(&state, &mut app, DetailPage::Processes, 120, 30);
+        assert!(
+            !rows.iter().any(|row| row.contains("esbuild")),
+            "the marker folded its branch: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_selected_process_that_vanished_or_was_recycled_returns_to_the_root() {
+        let (mut state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        let shell = tree_identity(300);
+
+        press_key(&mut app, KeyCode::Char('t'));
+        press_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.process_selection(), Some(&shell));
+
+        // The shell exits: the next observation carries no process with its
+        // identity, and the compact block returns to the root rather than
+        // inventing a sample for a row that is gone.
+        let mut without = read_tree();
+        without
+            .members
+            .retain(|member| member.identity.pid != 300 && member.parent.pid != 300);
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(0)),
+                    Some(8 * 1024 * 1024),
+                    without,
+                ),
+            ),
+        );
+        app.refresh(&state);
+        assert_eq!(app.process_selection(), None, "the root is the fallback");
+        assert!(app.process_folded().is_empty());
+
+        // The kernel hands the pid on to another process: the identity is not
+        // the row, so the old selection and its folds stay with the process
+        // that is gone.
+        let (mut state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        press_key(&mut app, KeyCode::Char('t'));
+        press_key(&mut app, KeyCode::Char('j'));
+        press_key(&mut app, KeyCode::Enter); // the shell's branch is folded
+        assert!(!app.process_folded().is_empty());
+        let mut recycled = read_tree();
+        for member in &mut recycled.members {
+            if member.identity.pid == 300 {
+                member.identity.start_ticks += 1_000;
+            }
+            if member.parent.pid == 300 {
+                member.parent.start_ticks += 1_000;
+            }
+        }
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(0)),
+                    Some(8 * 1024 * 1024),
+                    recycled,
+                ),
+            ),
+        );
+        app.refresh(&state);
+        assert_eq!(
+            app.process_selection(),
+            None,
+            "a recycled pid is another row"
+        );
+        assert!(app.process_folded().is_empty(), "no fold is inherited");
+        let rows = panel_rows(&state, &mut app, DetailPage::Processes, 120, 30);
+        assert!(
+            rows.iter().any(|row| row.contains("311")),
+            "the replacement's branch is not folded: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn another_selection_drops_the_process_cursor_and_its_folds() {
+        let (state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        let shell = tree_identity(300);
+        press_key(&mut app, KeyCode::Char('t'));
+        press_key(&mut app, KeyCode::Char('j'));
+        press_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.process_selection(), Some(&shell));
+        assert!(!app.process_folded().is_empty());
+
+        // Another row is another process: the cursor, the mode and the folds
+        // are the row's, and are not carried onto the row that is selected
+        // next.
+        select_agent(&mut app, "wA:p1");
+        assert!(!app.process_navigating());
+        assert_eq!(app.process_selection(), None);
+        assert!(app.process_folded().is_empty());
+        assert!(
+            app.process_table_on_page()
+                .is_none_or(|table| table.root != shell)
+        );
+        let _ = state;
+    }
+
+    #[test]
+    fn process_navigation_issues_no_fleet_lifecycle_or_mux_action() {
+        let (_state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        let fleet = selected_id(&app);
+        press_key(&mut app, KeyCode::Char('t'));
+
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Down,
+            KeyCode::Char('k'),
+            KeyCode::Up,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+        ] {
+            assert_eq!(press_key(&mut app, code), None, "{code:?} acted");
+        }
+        // The page's lifecycle keys are the panel's either way: they open no
+        // confirmation and focus no pane.
+        for code in [KeyCode::Char('x'), KeyCode::Char('X'), KeyCode::Char('r')] {
+            assert_eq!(press_key(&mut app, code), None, "{code:?} is the panel's");
+        }
+        assert!(app.confirmation().is_none());
+        assert_eq!(selected_id(&app), fleet, "no key moved the fleet");
+        assert!(app.details_focused(), "the panel kept the keyboard");
+    }
+
+    #[test]
+    fn the_cursor_is_scrolled_into_sight_and_the_targets_follow_a_resize() {
+        let (state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        press_key(&mut app, KeyCode::Char('t'));
+
+        // A panel shorter than the page: End puts the cursor on the last row
+        // and the page scrolls the least that draws it.
+        let (_screen, geometry) = draw(&state, &mut app, 120, 12);
+        assert!(
+            geometry
+                .process_rows
+                .iter()
+                .any(|(_, _, rect)| rect.is_none()),
+            "the page is longer than the panel"
+        );
+        press_key(&mut app, KeyCode::End);
+        // Selecting a descendant adds its own compact block to the page, so the
+        // panel scrolls against the page the selection produced: the move draws
+        // once, and the reveal is applied from the rows that draw reported.
+        draw(&state, &mut app, 120, 12);
+        let (_screen, geometry) = draw(&state, &mut app, 120, 12);
+        let last = geometry.process_rows.last().expect("the table has rows");
+        assert!(last.2.is_some(), "the cursor's row is drawn: {geometry:?}");
+        assert!(last.1 > 0, "the page scrolled to it");
+
+        // A resize moves every row; the targets are the rectangles this draw
+        // reported, not the ones the last layout had.
+        let (screen, resized) = draw(&state, &mut app, 60, 30);
+        assert!(
+            resized
+                .process_rows
+                .iter()
+                .all(|(_, _, rect)| rect.is_some()),
+            "every row is on screen after the resize: {screen}"
+        );
+        let known: Vec<ProcessIdentity> = resized
+            .process_rows
+            .iter()
+            .map(|(identity, _, _)| identity.clone())
+            .collect();
+        let shell = tree_identity(300);
+        let row = resized
+            .process_rows
+            .iter()
+            .find(|(identity, _, _)| identity == &shell)
+            .and_then(|(_, _, rect)| *rect)
+            .expect("the shell's row is drawn after the resize");
+        assert!(known.contains(&shell));
+        assert_eq!(click_at(&mut app, (row.right() - 1, row.y)), None);
+        assert_eq!(app.process_selection(), Some(&shell));
+    }
+
+    #[test]
+    fn a_refresh_leaves_no_stale_process_pointer_target() {
+        let (mut state, mut app) = process_table_app(sampled_tree(BinaryIdentity::default()));
+        let build = tree_identity(311);
+        let fleet = selected_id(&app);
+        let (_screen, geometry) = draw(&state, &mut app, 120, 30);
+        let build_row = geometry
+            .process_rows
+            .iter()
+            .find(|(identity, _, _)| identity == &build)
+            .and_then(|(_, _, rect)| *rect)
+            .expect("the build's row is on screen");
+
+        // The scan no longer verifies the build, and the row it was drawn in is
+        // another process now: the click answers to what is drawn there, never
+        // to the identity that was.
+        let mut without = read_tree();
+        without.members.retain(|member| member.identity.pid != 311);
+        state.apply_evidence(
+            "wA:p2",
+            sampled(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(0)),
+                    Some(8 * 1024 * 1024),
+                    without,
+                ),
+            ),
+        );
+        app.refresh(&state);
+        draw(&state, &mut app, 120, 30);
+        assert_eq!(
+            click_at(&mut app, (build_row.right() - 1, build_row.y)),
+            None
+        );
+        assert_ne!(
+            app.process_selection(),
+            Some(&build),
+            "the vanished row answered a click"
+        );
+        assert_eq!(selected_id(&app), fleet, "the fleet is untouched");
+    }
+
     #[test]
     fn every_kernel_state_is_one_short_name() {
         // The value that changes while a reader watches is one word, never a
@@ -5127,6 +7181,7 @@ mod tests {
                     None,
                     Some(7 * 1024 * 1024),
                     DescendantResources {
+                        members: Vec::new(),
                         observed: Some(2),
                         rss_bytes: Total::Partial(
                             1_024,
@@ -5238,6 +7293,7 @@ mod tests {
                     Some(CpuPercent::from_hundredths(0)),
                     Some(8 * 1024 * 1024),
                     DescendantResources {
+                        members: Vec::new(),
                         observed: Some(2),
                         rss_bytes: Total::Complete(512 * 1024 * 1024),
                         cpu: Total::Complete(CpuPercent::from_hundredths(12_500)),
@@ -5315,7 +7371,7 @@ mod tests {
         assert!(page.contains("package: /run/pi-1.0.1"), "{page}");
         // A wrapper outside the package it starts is drawn where it is: there
         // is no root to cut it against, and no store prefix to repeat either.
-        assert!(page.contains("executable: /run/pi"), "{page}");
+        assert!(page.contains("exe: /run/pi"), "{page}");
         assert!(
             page.contains(&format!(
                 "binary: {} (stale) installed pi-1.0.2",
@@ -5326,12 +7382,12 @@ mod tests {
         assert!(!page.contains("/nix/store/aaa-pi-1.0.2"), "{page}");
         app.toggle_block(&Disclosure::Process);
         let page = panel_text(&state, &mut app, DetailPage::Processes);
-        assert!(page.contains("running: /run/pi-1.0.1"), "{page}");
-        assert!(
-            page.contains("installed: /nix/store/aaa-pi-1.0.2"),
-            "{page}"
-        );
-        assert!(page.contains("executable: /run/pi"), "{page}");
+        // The roots share no prefix down to a component boundary, so each is
+        // drawn whole where it lives rather than cut against the other.
+        assert!(page.contains("/run/pi-1.0.1"), "{page}");
+        assert!(page.contains("/nix/store/aaa-pi-1.0.2"), "{page}");
+        assert!(page.contains("exe"), "{page}");
+        assert!(page.contains("/run/pi"), "{page}");
 
         // The mark wears the configured stale role, not a hardcoded colour.
         let mut terminal = Terminal::new(TestBackend::new(180, 34)).expect("infallible");
@@ -5380,11 +7436,8 @@ mod tests {
         assert!(!page.contains("current"), "{page}");
         app.toggle_block(&Disclosure::Process);
         let page = panel_text(&state, &mut app, DetailPage::Processes);
-        assert!(page.contains("running: /home/dev/pi"), "{page}");
-        assert!(
-            page.contains("installed: /nix/store/aaa-pi-1.0.2"),
-            "{page}"
-        );
+        assert!(page.contains("/home/dev/pi"), "{page}");
+        assert!(page.contains("/nix/store/aaa-pi-1.0.2"), "{page}");
     }
 
     #[test]
@@ -5409,7 +7462,7 @@ mod tests {
 
         assert!(processes.contains("observed: pi"), "{processes}");
         assert!(processes.contains("package: pi-1.0.2"), "{processes}");
-        assert!(processes.contains("executable: lib/pi/pi"), "{processes}");
+        assert!(processes.contains("exe: lib/pi/pi"), "{processes}");
         // One package, named once, and nothing claiming a verdict: a current
         // comparison says so by having no mark and no words.
         assert!(!processes.contains("/nix/store/"), "{processes}");
@@ -5417,18 +7470,13 @@ mod tests {
         assert!(!processes.contains("current"), "{processes}");
         app.toggle_block(&Disclosure::Process);
         let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        // One root, named once, and the executable inside it: the comparison
+        // named the same root on both sides, so there is nothing to tell apart.
         assert!(
-            processes.contains("running: /nix/store/aaa-pi-1.0.2"),
+            draws_row(&processes, "root", "/nix/store/aaa-pi-1.0.2"),
             "{processes}"
         );
-        assert!(
-            processes.contains("installed: /nix/store/aaa-pi-1.0.2"),
-            "{processes}"
-        );
-        assert!(
-            processes.contains("executable: /nix/store/aaa-pi-1.0.2/lib/pi/pi"),
-            "{processes}"
-        );
+        assert!(draws_row(&processes, "exe", "lib/pi/pi"), "{processes}");
         let screen = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
         assert!(
             !screen.contains(&format!("{} worker task", theme::stale_mark())),
@@ -5484,15 +7532,13 @@ mod tests {
             // The reason in full, and the path it is about, are the block's.
             app.toggle_block(&Disclosure::Process);
             let open = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
-            assert!(open.contains(sentence), "{reason:?}: {open}");
+            let sentence = sentence.trim_start_matches("unknown — ");
+            assert!(draws_row(&open, "unknown", sentence), "{reason:?}: {open}");
             match executable {
-                Some(path) => assert!(
-                    open.contains(&format!("executable: {path}")),
-                    "{reason:?}: {open}"
-                ),
+                Some(path) => assert!(open.contains(path), "{reason:?}: {open}"),
                 // An unreadable link has no path to name, so neither the
                 // executable nor an identity is drawn.
-                None => assert!(!open.contains("executable:"), "{reason:?}: {open}"),
+                None => assert!(!open.contains("exe:"), "{reason:?}: {open}"),
             }
             let screen = render_page(&state, &mut app, DetailPage::Processes, 180, 34);
             assert!(
@@ -5508,7 +7554,7 @@ mod tests {
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
         let processes = panel_text(&state, &mut app, DetailPage::Processes);
-        assert!(!processes.contains("executable:"), "{processes}");
+        assert!(!processes.contains("exe:"), "{processes}");
         assert!(!processes.contains("binary:"), "{processes}");
     }
 
@@ -5544,10 +7590,7 @@ mod tests {
             processes.contains("package: pi-bolt-0.7.1 aaa"),
             "{processes}"
         );
-        assert!(
-            processes.contains("executable: lib/pi-bolt/pi"),
-            "{processes}"
-        );
+        assert!(processes.contains("exe: lib/pi-bolt/pi"), "{processes}");
         assert!(
             processes.contains(&format!(
                 "binary: {} (stale) installed pi-bolt-0.7.1 bbb",
@@ -5556,18 +7599,22 @@ mod tests {
             "{processes}"
         );
         assert!(!processes.contains("/nix/store/"), "{processes}");
+        // The store the two roots sit in is stated once, each root carries the
+        // part that names its build, and the executable is named inside the
+        // running one: three rows, three pieces of one path, nothing repeated.
         app.toggle_block(&Disclosure::Process);
         let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        assert!(draws_row(&processes, "store", "/nix/store/"), "{processes}");
         assert!(
-            processes.contains("running: /nix/store/aaa-pi-bolt-0.7.1"),
+            draws_row(&processes, "running", "aaa-pi-bolt-0.7.1"),
             "{processes}"
         );
         assert!(
-            processes.contains("installed: /nix/store/bbb-pi-bolt-0.7.1"),
+            draws_row(&processes, "installed", "bbb-pi-bolt-0.7.1"),
             "{processes}"
         );
         assert!(
-            processes.contains("executable: /nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi"),
+            draws_row(&processes, "exe", "lib/pi-bolt/pi"),
             "{processes}"
         );
     }
@@ -5583,6 +7630,7 @@ mod tests {
                     Some(CpuPercent::from_hundredths(1_240)),
                     Some(86 * 1024 * 1024),
                     DescendantResources {
+                        members: Vec::new(),
                         observed: Some(2),
                         rss_bytes: Total::Partial(
                             410 * 1024 * 1024,
@@ -5616,10 +7664,7 @@ mod tests {
                 closed.contains("package: pi-bolt-0.7.1 aaa"),
                 "{width}: {closed}"
             );
-            assert!(
-                closed.contains("executable: lib/pi-bolt/pi"),
-                "{width}: {closed}"
-            );
+            assert!(closed.contains("exe: lib/pi-bolt/pi"), "{width}: {closed}");
             assert!(
                 closed.contains(&format!(
                     "binary: {} (stale) installed pi-bolt-0.7.1 bbb",
@@ -5639,24 +7684,112 @@ mod tests {
             assert!(closed.contains("▸ details"), "{width}: {closed}");
         }
 
-        // Everything the page drew short is one keypress away, whole: both
-        // roots, the path they were cut from, the incarnation the reading
-        // belongs to, what each state letter means, and what a sum is.
+        // Everything the page drew short is one keypress away: the store both
+        // roots sit in, the part of each that names its build, the executable
+        // inside the running one, the birth the reading belongs to, what the
+        // state it is showing means, and what a sum is. The other kernel states
+        // are the kernel's, and a list of them described is a paragraph where a
+        // fact belongs.
         app.toggle_block(&Disclosure::Process);
         let open = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
         for fact in [
-            "running: /nix/store/aaa-pi-bolt-0.7.1",
-            "installed: /nix/store/bbb-pi-bolt-0.7.1",
-            "executable: /nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi",
-            "birth: pid 4242 · boot 6d9d2f0a-2f6f-4a1f-9c2d-2f6f4a1f9c2d · start ticks 9812",
-            "running: executing, or waiting its turn on a CPU",
-            "sleeping: waiting, but wakeable",
-            "zombie: exited, not yet reaped by its parent",
-            "descendants: observed processes beneath this one, not a workload or \
-             assignment total (a page shared with another process counts in each)",
+            "store     /nix/store/",
+            "running   aaa-pi-bolt-0.7.1",
+            "installed bbb-pi-bolt-0.7.1",
+            "exe       lib/pi-bolt/pi",
+            "birth     pid 4242 · start ticks 9812",
+            "boot      6d9d2f0a-2f6f-4a1f-9c2d",
+            "state     sleeping — waiting, but wakeable",
+            "observed processes beneath this one",
+            "counts in each)",
         ] {
             assert!(open.contains(fact), "{fact:?} is not in the block: {open}");
         }
+        assert!(!open.contains("zombie"), "{open}");
+    }
+
+    #[test]
+    fn a_word_wider_than_the_column_breaks_where_it_can_be_read() {
+        // A store path breaks at a store and a boot id at a hyphen, rather than
+        // inside a hash.
+        assert_eq!(
+            wrap_value("see /nix/store/aaa-pi-1.0.2", 12),
+            vec!["see", "/nix/store/", "aaa-pi-1.0.2"]
+        );
+        assert_eq!(
+            wrap_value("6d9d2f0a-2f6f-4a1f-9c2d-2f6f4a1f9c2d", 25),
+            vec!["6d9d2f0a-2f6f-4a1f-9c2d-", "2f6f4a1f9c2d"]
+        );
+        // A run of characters with nothing to break at still gets columns.
+        assert_eq!(wrap_value("aaaaaaaa", 3), vec!["aaa", "aaa", "aa"]);
+    }
+
+    #[test]
+    fn the_block_draws_facts_beside_their_labels_and_hangs_what_wraps() {
+        // The reader's complaints, each one an assertion: the store prefix
+        // repeated on every row, values stacked under their labels, a wrapped
+        // fact landing under the label instead of its value, and a glossary of
+        // states the row is not in.
+        let mut state = fixture_state();
+        state.apply_evidence(
+            "wA:p2",
+            sampled_binary(
+                4242,
+                resources(
+                    Some(CpuPercent::from_hundredths(1_240)),
+                    Some(86 * 1024 * 1024),
+                    DescendantResources {
+                        members: Vec::new(),
+                        observed: Some(2),
+                        rss_bytes: Total::Partial(
+                            410 * 1024 * 1024,
+                            "a descendant exited while the table was read".into(),
+                        ),
+                        cpu: Total::Complete(CpuPercent::from_hundredths(11_820)),
+                    },
+                ),
+                "pi-bolt",
+                BinaryIdentity {
+                    freshness: BinaryFreshness::Stale,
+                    running: Some("/nix/store/aaa-pi-bolt-0.7.1".into()),
+                    installed: Some("/nix/store/bbb-pi-bolt-0.7.1".into()),
+                    executable: Some("/nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi".into()),
+                    unknown: None,
+                },
+            ),
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wA:p2");
+        app.select_page(DetailPage::Processes);
+        app.toggle_block(&Disclosure::Process);
+
+        // One store, named once: each root is the part past it.
+        let open = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
+        assert_eq!(open.matches("/nix/store/").count(), 1, "{open}");
+        // Every fact beside its label, in one column.
+        for row in [
+            "store     /nix/store/",
+            "running   aaa-pi-bolt-0.7.1",
+            "installed bbb-pi-bolt-0.7.1",
+            "exe       lib/pi-bolt/pi",
+            "state     sleeping — waiting, but wakeable",
+        ] {
+            assert!(open.contains(row), "{row:?} is not a row: {open}");
+        }
+        // The meanings of the states this row is not in are the kernel's.
+        for absent in ["zombie", "disk wait", "tracing", "reaped"] {
+            assert!(!open.contains(absent), "{absent:?}: {open}");
+        }
+
+        // A fact too long for the panel is continued under the value column
+        // rather than under the label it belongs to.
+        let screen = render_page(&state, &mut app, DetailPage::Processes, 90, 34);
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("│          beneath this one")),
+            "{screen}"
+        );
     }
 
     /// The selected row is a live process: it offers one block on the Processes
@@ -5738,9 +7871,13 @@ mod tests {
             assert!(app.disclosure_open(&Disclosure::Process));
             let (open, drawn) = draw(&state, &mut app, width, 30);
             geometry = drawn;
-            // The wrapped drawing puts the label and the path on their own
-            // rows, so the whole root is what says the body is drawn.
-            assert!(open.contains("/nix/store/aaa-pi-1.0.2"), "{width}: {open}");
+            // The block's own rows are what says the body is drawn, at either
+            // width: a root long enough to wrap is still the same row.
+            assert!(open.contains("running"), "{width}: {open}");
+            assert!(
+                draws_row(&open, "installed", "/nix/store/aaa-pi-"),
+                "{width}: {open}"
+            );
 
             let tab = geometry.detail_tabs[DetailPage::Processes.index()].expect("the tab");
             click_at(&mut app, (tab.x, tab.y));
@@ -5749,10 +7886,7 @@ mod tests {
             assert_eq!(app.handle_key(key), None);
             assert!(!app.disclosure_open(&Disclosure::Process));
             let (closed, _) = draw(&state, &mut app, width, 30);
-            assert!(
-                !closed.contains("/nix/store/aaa-pi-1.0.2"),
-                "{width}: {closed}"
-            );
+            assert!(!closed.contains("running"), "{width}: {closed}");
             assert!(closed.contains("▸ details"), "{width}: {closed}");
         }
     }
@@ -5787,10 +7921,7 @@ mod tests {
         // The name and the path are shown sanitized, and the path is drawn
         // inside the package that carries it.
         assert!(processes.contains("observed: pi"), "{processes}");
-        assert!(
-            processes.contains("executable: lib/pi-bolt/pi"),
-            "{processes}"
-        );
+        assert!(processes.contains("exe: lib/pi-bolt/pi"), "{processes}");
         // No argument reaches the page — above all not a prompt.
         for argument in [
             "--approve",
@@ -5804,11 +7935,16 @@ mod tests {
                 "{argument:?} is an argument, not the process: {processes}"
             );
         }
-        // And the whole path the relative form was cut from is still there.
+        // And how the executable's own path was cut into the rows: the root it
+        // lives in, then the file's place under that root.
         app.toggle_block(&Disclosure::Process);
         let processes = panel_text_at(&state, &mut app, DetailPage::Processes, 200);
         assert!(
-            processes.contains("executable: /nix/store/aaa-pi-bolt-0.7.1/lib/pi-bolt/pi"),
+            draws_row(&processes, "root", "/nix/store/aaa-pi-bolt-0.7.1"),
+            "{processes}"
+        );
+        assert!(
+            draws_row(&processes, "exe", "lib/pi-bolt/pi"),
             "{processes}"
         );
         // And nothing on the page claims to be what started the pane.
@@ -5833,7 +7969,7 @@ mod tests {
         let processes = panel_text(&retained, &mut app, DetailPage::Processes);
         assert!(processes.contains("withheld"), "{processes}");
         assert!(!processes.contains("observed:"), "{processes}");
-        assert!(!processes.contains("executable:"), "{processes}");
+        assert!(!processes.contains("exe:"), "{processes}");
         assert!(!processes.contains("binary:"), "{processes}");
 
         // A shell and an inconclusive answer say what the foreground is, and
@@ -5881,7 +8017,7 @@ mod tests {
             "{processes}"
         );
         assert!(!processes.contains("observed:"), "{processes}");
-        assert!(!processes.contains("executable:"), "{processes}");
+        assert!(!processes.contains("exe:"), "{processes}");
         assert!(!processes.contains("binary:"), "{processes}");
         assert!(
             !processes.contains(&format!("{} worker task", theme::stale_mark())),

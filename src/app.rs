@@ -28,7 +28,10 @@ use crate::runtime::{CloseTarget, Target};
 use crate::theme;
 use ratatui::layout::Rect;
 
-use crate::model::{AgentState, FleetObservation, ForegroundEvidence};
+use crate::model::{
+    AgentState, CpuPercent, DescendantSample, FleetObservation, ForegroundEvidence,
+    ProcessIdentity, ProcessResources,
+};
 use crate::tree::{
     AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskRow, TaskSource, TreeNode,
 };
@@ -127,9 +130,24 @@ pub enum Disclosure {
     /// birth identity a sample belongs to, what a state letter means and what a
     /// descendant sum is.
     Process,
+    /// The table of processes the scan observed beneath the selected row's own
+    /// process: one row each, in the hierarchy their parent links reported.
+    ProcessTable,
     /// One published task's long text, named by the task's identity so a
     /// refresh that keeps the task keeps its expansion.
     Task(TaskId),
+}
+
+/// The foreground of a row whose Processes page describes a process: a pane with
+/// none reported, an inconclusive foreground, a shell, a retained row and a
+/// container row all leave the page with no process of its own.
+fn described_foreground<'row>(row: &'row VisibleRow<'_>) -> Option<&'row ForegroundEvidence> {
+    let foreground = match &row.node.row.kind {
+        RowKind::Pane(pane) => pane.foreground.as_ref(),
+        RowKind::Agent(agent) if agent.retained.is_none() => agent.foreground.as_ref(),
+        _ => None,
+    };
+    foreground.filter(|foreground| matches!(foreground, ForegroundEvidence::NonShell { .. }))
 }
 
 /// Whether the selected row's Processes page describes a live process at all.
@@ -139,12 +157,180 @@ pub enum Disclosure {
 /// and a block that opens onto nothing is worse than no block: the page offers
 /// one exactly where it draws the facts the block repeats in full.
 fn process_detail_is_drawn(row: &VisibleRow<'_>) -> bool {
-    let foreground = match &row.node.row.kind {
-        RowKind::Pane(pane) => pane.foreground.as_ref(),
-        RowKind::Agent(agent) if agent.retained.is_none() => agent.foreground.as_ref(),
-        _ => None,
+    described_foreground(row).is_some()
+}
+
+/// Whether the selected row's Processes page has a verified process table to
+/// offer: a sampled process whose descendants the same scan enumerated.
+///
+/// A scan that could not be read, a root with no sample of its own and a row
+/// whose process is not current all leave the page with no tree to draw, and the
+/// page says which instead of opening onto a table of nothing.
+fn process_table_is_drawn(row: &VisibleRow<'_>) -> bool {
+    let Some(ForegroundEvidence::NonShell { local, .. }) = described_foreground(row) else {
+        return false;
     };
-    matches!(foreground, Some(ForegroundEvidence::NonShell { .. }))
+    local
+        .resources
+        .as_ref()
+        .is_some_and(|resources| resources.descendants.observed.is_some())
+}
+
+/// One row of the process table: a process and the branch it hangs from.
+///
+/// A row is its process's birth identity. It is never a pid and never a position
+/// in the drawn table, so the same process observed again is the same row and a
+/// pid the kernel handed on is another row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessRow {
+    pub identity: ProcessIdentity,
+    /// The process this row was read beneath; `None` for the row's own process.
+    pub parent: Option<ProcessIdentity>,
+    /// The kernel's name for the process (`comm`), as the read carried it. The
+    /// row's own process has none: the runtime reports that name, and the page
+    /// draws it from there rather than from a kernel read of a descendant.
+    pub name: Option<String>,
+    /// Interval CPU for this process, `None` until an interval exists.
+    pub cpu: Option<CpuPercent>,
+    pub rss_bytes: Option<u64>,
+    /// One flag per branch above this row, true where that branch has a process
+    /// after it — all the vertical guides are drawn from.
+    pub guides: Vec<bool>,
+    /// Whether this row is the last of its own branch.
+    pub last: bool,
+    /// Whether the scan verified processes beneath this one, so the table can
+    /// fold them away.
+    pub has_children: bool,
+    /// Whether a folded branch above this row hides it. A folded branch's own row
+    /// stays visible: the fold is what it shows instead of its children.
+    pub hidden: bool,
+}
+
+/// The process table of one fleet row: the row's own process and every process
+/// one scan verified beneath it, in the order the page draws them — the root
+/// first, then depth-first with the children of one parent in pid order.
+///
+/// One projection serves the drawing and the reader's cursor both, so the rows a
+/// key moves through are the rows on the page. A folded branch is still a row
+/// (its process is still observed) but not a drawn one.
+pub(crate) struct ProcessTable {
+    /// The row's own process: the anchor a vanished selection falls back to, and
+    /// the identity every fold and the cursor are kept against.
+    pub root: ProcessIdentity,
+    /// Every confirmed row, in drawn order, the folded ones included.
+    pub rows: Vec<ProcessRow>,
+}
+
+impl ProcessTable {
+    /// The rows the page draws, in order.
+    pub fn visible(&self) -> impl Iterator<Item = &ProcessRow> {
+        self.rows.iter().filter(|row| !row.hidden)
+    }
+
+    /// The row for a process, when this table has one.
+    pub fn row(&self, identity: &ProcessIdentity) -> Option<&ProcessRow> {
+        self.rows.iter().find(|row| &row.identity == identity)
+    }
+
+    /// The nearest drawn row at or above `identity`: a process that a fold put
+    /// out of sight is selected as the branch that folded it, so the cursor is
+    /// never left on a row the page does not draw.
+    pub fn anchor(&self, identity: &ProcessIdentity) -> &ProcessIdentity {
+        let mut row = self.row(identity);
+        while let Some(hidden) = row.filter(|row| row.hidden) {
+            match hidden.parent.as_ref().and_then(|parent| self.row(parent)) {
+                Some(parent) => row = Some(parent),
+                None => return &self.root,
+            }
+        }
+        row.map_or(&self.root, |row| &row.identity)
+    }
+
+    /// Projects the table one fleet row's scan verified, or `None` where the page
+    /// draws none: a scan that could not enumerate what is beneath the process is
+    /// not a tree of nothing, and the sums beside it already say so.
+    ///
+    /// The members are the ones the same scan measured, taken as they came: this
+    /// projects the order, the depth and the folds, and reads no process of its
+    /// own.
+    pub(crate) fn of(
+        folded: &HashSet<ProcessIdentity>,
+        resources: &ProcessResources,
+    ) -> Option<Self> {
+        resources.descendants.observed?;
+        let mut children: HashMap<&ProcessIdentity, Vec<&DescendantSample>> = HashMap::new();
+        for member in &resources.descendants.members {
+            children.entry(&member.parent).or_default().push(member);
+        }
+        let root = resources.identity.clone();
+        let table_root = ProcessRow {
+            identity: root.clone(),
+            parent: None,
+            name: None,
+            cpu: resources.cpu,
+            rss_bytes: resources.rss_bytes,
+            guides: Vec::new(),
+            last: true,
+            has_children: children.contains_key(&root),
+            hidden: false,
+        };
+        let mut rows = vec![table_root];
+        descend(
+            &mut rows,
+            &children,
+            &root,
+            &mut Vec::new(),
+            folded,
+            folded.contains(&root),
+        );
+        Some(Self { root, rows })
+    }
+}
+
+/// Adds the processes verified beneath `parent`, each followed by its own:
+/// depth-first, the children of one parent in pid order.
+///
+/// `guides` carries, for each branch above the one being drawn, whether that
+/// branch has a process after it. `hidden` says whether a folded branch is
+/// already above this level: the branch that was folded stays drawn, and the
+/// processes under it do not.
+fn descend(
+    rows: &mut Vec<ProcessRow>,
+    children: &HashMap<&ProcessIdentity, Vec<&DescendantSample>>,
+    parent: &ProcessIdentity,
+    guides: &mut Vec<bool>,
+    folded: &HashSet<ProcessIdentity>,
+    hidden: bool,
+) {
+    let Some(siblings) = children.get(parent) else {
+        return;
+    };
+    let mut siblings = siblings.clone();
+    siblings.sort_by_key(|sample| sample.identity.pid);
+    for (index, sample) in siblings.iter().enumerate() {
+        let last = index + 1 == siblings.len();
+        rows.push(ProcessRow {
+            identity: sample.identity.clone(),
+            parent: Some(sample.parent.clone()),
+            name: Some(sample.name.clone()),
+            cpu: sample.cpu,
+            rss_bytes: sample.rss_bytes,
+            guides: guides.clone(),
+            last,
+            has_children: children.contains_key(&sample.identity),
+            hidden,
+        });
+        guides.push(!last);
+        descend(
+            rows,
+            children,
+            &sample.identity,
+            guides,
+            folded,
+            hidden || folded.contains(&sample.identity),
+        );
+        guides.pop();
+    }
 }
 
 /// How long an assignment may be before the details collapse it: past the width
@@ -422,6 +608,10 @@ pub struct App {
     expanded_disclosures: HashSet<Disclosure>,
     /// Which of the page's blocks the keyboard is on.
     disclosure_target: usize,
+    /// The reader's place in the Processes page's process table: which process
+    /// they picked and which branches they folded. It is local to that page and
+    /// to the row whose table it was made in.
+    process: ProcessCursor,
     /// A wheel turn over the tree, waiting for the main loop to apply it to the
     /// list state it owns.
     scroll_request: Option<usize>,
@@ -432,6 +622,29 @@ pub struct App {
     /// transient focus message and from the source diagnostics, so an owner's
     /// answer cannot be mistaken for the fleet's freshness.
     notices: Vec<Notice>,
+}
+
+/// The reader's place in one fleet row's process table.
+///
+/// It belongs to the processes it was made in: another row, another process of
+/// the row's own, or a process that is gone drops it, rather than carrying a fold
+/// or a cursor onto a process it never described.
+#[derive(Clone, Debug, Default)]
+struct ProcessCursor {
+    /// Whether process-row navigation is on. A mode of the Processes page, not a
+    /// binding of the fleet: every key that leaves the page leaves the mode.
+    navigating: bool,
+    /// The row's own process the folds and the cursor belong to.
+    root: Option<ProcessIdentity>,
+    /// The process the reader picked, when it is not the row's own process.
+    selected: Option<ProcessIdentity>,
+    /// The branches the reader folded, by birth identity.
+    folded: HashSet<ProcessIdentity>,
+    /// Whether a selection asked to be shown. A selection changes the page —
+    /// the picked process's own compact block replaces the root's — so the row
+    /// to scroll to is the one the *next* draw reports, not the one the last
+    /// layout still describes.
+    reveal: bool,
 }
 
 /// A lifecycle confirmation, frozen at the moment it opened.
@@ -486,6 +699,17 @@ pub struct Geometry {
     pub tree_content: Rect,
     /// The details panel, when it was drawn.
     pub details: Option<Rect>,
+    /// The cells the page's lines are drawn in: the panel inside its frame and
+    /// below the page tabs.
+    pub details_content: Rect,
+    /// Every process-table row the draw laid out, in order: the row's birth
+    /// identity, the page row it starts on (before the scroll), and where it was
+    /// drawn — a row the scroll has taken off the panel has no rectangle, and no
+    /// click lands on it.
+    pub process_rows: Vec<(ProcessIdentity, usize, Option<Rect>)>,
+    /// Where each foldable process row's marker was drawn: the cell that folds
+    /// that branch and does nothing else.
+    pub process_folds: Vec<(ProcessIdentity, Rect)>,
     /// The rows the details page occupies at the width it was just drawn at: a
     /// line long enough to wrap is drawn over several rows, and the panel
     /// scrolls in the rows a reader can see, so this is the unit of the clamp.
@@ -564,6 +788,7 @@ impl App {
         };
         self.reconcile_selection();
         self.prune_disclosures();
+        self.reconcile_process();
     }
 
     /// The projected tree as of the last [`Self::refresh`].
@@ -618,6 +843,12 @@ impl App {
         let page = self.detail_page.index();
         self.detail_scroll[page] = self.detail_scroll[page].min(max);
         self.layout = layout;
+        // A selection that asked to be shown does it against the page this draw
+        // produced, so the cursor is scrolled to with the rows it is drawn among.
+        if self.process.reveal {
+            self.process.reveal = false;
+            self.reveal_process();
+        }
     }
 
     /// How far the page on screen is scrolled, in the rows the panel draws.
@@ -631,8 +862,12 @@ impl App {
     }
 
     /// Shows a page. Every page keeps its own scroll, so returning to one finds
-    /// it where it was left.
+    /// it where it was left. The process-row mode belongs to the Processes page:
+    /// showing another page leaves it.
     pub fn select_page(&mut self, page: DetailPage) {
+        if page != self.detail_page {
+            self.process.navigating = false;
+        }
         self.detail_page = page;
         self.clamp_disclosure_target();
     }
@@ -652,10 +887,12 @@ impl App {
     }
 
     /// Tab: hands the keyboard to the other panel. A hidden details panel is not
-    /// a panel to hand it to, so the tree keeps it.
+    /// a panel to hand it to, so the tree keeps it. The process-row mode needs
+    /// the keyboard in this panel, so handing it over leaves the mode.
     pub fn toggle_detail_focus(&mut self) {
         if self.shows_details() {
             self.details_focused = !self.details_focused;
+            self.process.navigating = false;
         }
     }
 
@@ -714,11 +951,15 @@ impl App {
                 .into_iter()
                 .map(Disclosure::Task)
                 .collect(),
-            // The block holds the facts of a process, and the page draws those
+            // The blocks hold the facts of a process, and the page draws those
             // only from a current inventory: a stale-source row offers nothing
             // to open, so no key answers to a marker that is not drawn.
             DetailPage::Processes if self.source_current && process_detail_is_drawn(&row) => {
-                vec![Disclosure::Process]
+                let mut blocks = vec![Disclosure::Process];
+                if process_table_is_drawn(&row) {
+                    blocks.push(Disclosure::ProcessTable);
+                }
+                blocks
             }
             DetailPage::Processes | DetailPage::Source => Vec::new(),
         }
@@ -752,10 +993,14 @@ impl App {
         }
     }
 
-    /// Opens or closes one named block, and puts the keyboard on it.
+    /// Opens or closes one named block, and puts the keyboard on it. Closing the
+    /// process table leaves the process-row mode: the mode is the table's.
     pub fn toggle_block(&mut self, key: &Disclosure) {
-        if !self.expanded_disclosures.remove(key) {
+        let open = !self.expanded_disclosures.remove(key);
+        if open {
             self.expanded_disclosures.insert(key.clone());
+        } else if key == &Disclosure::ProcessTable {
+            self.process.navigating = false;
         }
         let keys = self.disclosures();
         if let Some(index) = keys.iter().position(|offered| offered == key) {
@@ -795,6 +1040,261 @@ impl App {
         };
     }
 
+    /// The process table of one fleet row, or `None` where the page draws none.
+    pub(crate) fn process_table(&self, row: &VisibleRow<'_>) -> Option<ProcessTable> {
+        let Some(ForegroundEvidence::NonShell { local, .. }) = described_foreground(row) else {
+            return None;
+        };
+        ProcessTable::of(&self.process.folded, local.resources.as_ref()?)
+    }
+
+    /// The process table of the row the page is showing: what the page draws, and
+    /// the rows the reader's cursor moves through.
+    pub(crate) fn process_table_on_page(&self) -> Option<ProcessTable> {
+        let row = self.selected_row()?;
+        self.process_table(&row)
+    }
+
+    /// The process the page's compact details describe, when the reader has
+    /// picked one that is not the row's own process.
+    pub(crate) fn process_selection(&self) -> Option<&ProcessIdentity> {
+        self.process.selected.as_ref()
+    }
+
+    /// The process the table marks as the reader's row: the picked process, or
+    /// the table's own process when they have picked none.
+    pub(crate) fn process_cursor_on(&self, table: &ProcessTable) -> ProcessIdentity {
+        self.process
+            .selected
+            .clone()
+            .unwrap_or_else(|| table.root.clone())
+    }
+
+    /// Whether process-row navigation is on.
+    pub(crate) fn process_navigating(&self) -> bool {
+        self.process.navigating
+    }
+
+    /// The branches the reader folded, by birth identity.
+    pub(crate) fn process_folded(&self) -> &HashSet<ProcessIdentity> {
+        &self.process.folded
+    }
+
+    /// `t`: enters or leaves process-row navigation. Leaving is always allowed;
+    /// entering needs the keyboard, the Processes page and the table open, so a
+    /// page with no table has no mode to enter.
+    pub fn toggle_process_navigation(&mut self) {
+        if self.process.navigating {
+            self.process.navigating = false;
+            return;
+        }
+        if !self.details_focused
+            || self.detail_page != DetailPage::Processes
+            || !self
+                .expanded_disclosures
+                .contains(&Disclosure::ProcessTable)
+        {
+            return;
+        }
+        let Some(table) = self.process_table_on_page() else {
+            return;
+        };
+        self.process.navigating = true;
+        self.process.root = Some(table.root.clone());
+    }
+
+    /// `j`/`k` and the arrows in the mode: the next or previous drawn row. A move
+    /// past either end stays where it is — the mode never wraps the table.
+    pub fn move_process(&mut self, delta: i32) {
+        let Some(table) = self.process_table_on_page() else {
+            return;
+        };
+        let rows: Vec<ProcessIdentity> = table.visible().map(|row| row.identity.clone()).collect();
+        let cursor = self.process_cursor_on(&table);
+        let next = match rows.iter().position(|row| *row == cursor) {
+            Some(index) if delta < 0 => index.saturating_sub(1),
+            Some(index) => (index + 1).min(rows.len().saturating_sub(1)),
+            None => 0,
+        };
+        if let Some(identity) = rows.get(next) {
+            self.select_process(Some(identity.clone()));
+        }
+    }
+
+    /// Home/End in the mode: the first or the last drawn row.
+    pub fn reach_process(&mut self, last: bool) {
+        let Some(table) = self.process_table_on_page() else {
+            return;
+        };
+        let row = if last {
+            table.visible().last()
+        } else {
+            table.visible().next()
+        };
+        if let Some(row) = row {
+            self.select_process(Some(row.identity.clone()));
+        }
+    }
+
+    /// Enter and Space in the mode: folds the selected row's branch away, or
+    /// opens it again. A row with no process beneath it has no branch to fold.
+    pub fn fold_selected_process(&mut self) {
+        let Some(table) = self.process_table_on_page() else {
+            return;
+        };
+        let cursor = self.process_cursor_on(&table);
+        if !table.row(&cursor).is_some_and(|row| row.has_children) {
+            return;
+        }
+        self.fold_process(&cursor);
+    }
+
+    /// Folds or opens one branch, by identity. The cursor stays on a row the
+    /// table draws: a process the fold put out of sight is selected as its
+    /// branch.
+    pub fn fold_process(&mut self, identity: &ProcessIdentity) {
+        if !self.process.folded.remove(identity) {
+            self.process.folded.insert(identity.clone());
+        }
+        self.anchor_process();
+    }
+
+    /// Selects a process row by identity. The row is scrolled into sight from
+    /// the page the *next* draw produces, because a selection's own compact
+    /// block changes the page it is drawn on. The row's own process is the
+    /// page's root: picked or not, the page draws it the same way.
+    fn select_process(&mut self, identity: Option<ProcessIdentity>) {
+        let root = self.process_table_on_page().map(|table| table.root);
+        self.process.selected = match (identity, root) {
+            (Some(identity), Some(root)) if identity == root => None,
+            (identity, _) => identity,
+        };
+        self.process.reveal = true;
+    }
+
+    /// Keeps the cursor on a drawn row: a selected process that is gone, or that
+    /// a fold put out of sight, is selected as its branch — the table's own
+    /// process when nothing above it is left.
+    fn anchor_process(&mut self) {
+        let Some(table) = self.process_table_on_page() else {
+            return;
+        };
+        let Some(selected) = self.process.selected.clone() else {
+            return;
+        };
+        let anchor = table.anchor(&selected).clone();
+        self.process.selected = (anchor != table.root).then_some(anchor);
+    }
+
+    /// Scrolls the panel the least that puts the cursor's row in sight, measured
+    /// from the layout of the last draw. A refresh never comes here: the viewport
+    /// is moved by a key, not by the fleet changing under it.
+    fn reveal_process(&mut self) {
+        let viewport = self.layout.details_viewport as usize;
+        if viewport == 0 {
+            return;
+        }
+        let Some(table) = self.process_table_on_page() else {
+            return;
+        };
+        let cursor = self.process_cursor_on(&table);
+        let Some(&(_, row, _)) = self
+            .layout
+            .process_rows
+            .iter()
+            .find(|(identity, _, _)| *identity == cursor)
+        else {
+            return;
+        };
+        let offset = self.details_scroll() as usize;
+        let target = if row < offset {
+            row
+        } else if row + 1 > offset + viewport {
+            row + 1 - viewport
+        } else {
+            return;
+        };
+        self.scroll_page_to(target as u16);
+    }
+
+    /// Brings the reader's place in the process table onto the observation just
+    /// applied: the folds and the cursor are about the processes they were made
+    /// in, and a process that replaced one of them inherits none of it.
+    fn reconcile_process(&mut self) {
+        let Some(table) = self.process_table_on_page() else {
+            // The page draws no table now: there is no row for a cursor to be on,
+            // and the folds were about a tree that is no longer observed.
+            self.process = ProcessCursor::default();
+            return;
+        };
+        if self.process.root.as_ref() != Some(&table.root) {
+            // The page's own process is another process now.
+            self.process = ProcessCursor {
+                root: Some(table.root.clone()),
+                ..ProcessCursor::default()
+            };
+            return;
+        }
+        let observed: HashSet<&ProcessIdentity> =
+            table.rows.iter().map(|row| &row.identity).collect();
+        self.process
+            .folded
+            .retain(|identity| observed.contains(identity));
+        self.anchor_process();
+    }
+
+    /// A left click on the process table: a fold marker folds that branch alone,
+    /// and the row it landed on is selected and entered. Both hand the details
+    /// the keyboard, and neither acts on the fleet or on a process.
+    fn process_click(&mut self, at: (u16, u16)) -> bool {
+        if let Some(identity) = self.process_fold_under(at) {
+            self.details_focused = true;
+            self.fold_process(&identity);
+            return true;
+        }
+        let Some(identity) = self.process_row_under(at) else {
+            return false;
+        };
+        self.details_focused = true;
+        self.select_process(Some(identity));
+        self.process.navigating = true;
+        true
+    }
+
+    /// The process row a position lands on, from the rectangles the last draw
+    /// reported. A rectangle belongs to the draw that recorded it, so the row is
+    /// resolved against the table the page draws now: a row a refresh dropped is
+    /// not something a click can land on.
+    fn process_row_under(&self, at: (u16, u16)) -> Option<ProcessIdentity> {
+        let identity = self
+            .layout
+            .process_rows
+            .iter()
+            .find(|(_, _, rect)| inside(*rect, at))?
+            .0
+            .clone();
+        self.table_has(&identity).then_some(identity)
+    }
+
+    /// The fold marker a position lands on, when the row it labels is still
+    /// drawn.
+    fn process_fold_under(&self, at: (u16, u16)) -> Option<ProcessIdentity> {
+        let identity = self
+            .layout
+            .process_folds
+            .iter()
+            .find(|(_, rect)| inside(Some(*rect), at))?
+            .0
+            .clone();
+        self.table_has(&identity).then_some(identity)
+    }
+
+    /// Whether the table the page draws now still has this row, drawn.
+    fn table_has(&self, identity: &ProcessIdentity) -> bool {
+        self.process_table_on_page()
+            .is_some_and(|table| table.visible().any(|row| &row.identity == identity))
+    }
+
     /// Moves the selection to a row identity. Another row starts every page at
     /// its top: a scroll belongs to the row it was scrolled in, and so does an
     /// opened block.
@@ -803,6 +1303,9 @@ impl App {
             self.detail_scroll = [0; DetailPage::COUNT];
             self.expanded_disclosures.clear();
             self.disclosure_target = 0;
+            // The process table belongs to the row it was drawn for: another row
+            // is another process, and folds and a cursor are not carried onto it.
+            self.process = ProcessCursor::default();
         }
         self.selected = id;
     }
@@ -880,6 +1383,11 @@ impl App {
         if let Some(key) = self.disclosure_marker_under(at) {
             self.details_focused = true;
             self.toggle_block(&key);
+            return None;
+        }
+        // A process row is the process it names, and a process row's marker is
+        // that row's branch: neither acts on the fleet, the mux or the owner.
+        if self.process_click(at) {
             return None;
         }
         if inside(self.layout.details, at) {
@@ -1153,16 +1661,55 @@ impl App {
     /// `Home`/`End` reach the limits, `←`/`→` cycle the pages and Escape hands
     /// the keyboard back to the tree without touching the filter. Space moves to
     /// the page's next openable block and Enter opens or closes the one the
-    /// keyboard is on.
+    /// keyboard is on. `t` enters or leaves process-row navigation on the
+    /// Processes page, where the arrows and `j`/`k` move through the process
+    /// table, `Home`/`End` reach its ends and Enter or Space folds the selected
+    /// branch; every other key below keeps its meaning in that mode too.
     ///
     /// A key that would act on the selected row is the panel's too, and does
     /// nothing: `Enter` focuses a pane and `x`, `X` and `r` open lifecycle
-    /// confirmations, none of which a reader of a page asked for. Every other
-    /// key is left to the tree's own map, so the view keys — `/`, `d`, `s`, `p`,
-    /// `e`, `b`, `c` and the jumps — keep working from either panel.
+    /// confirmations, none of which a reader of a page asked for. So does a
+    /// process row: entering its navigation is not selecting a fleet row and
+    /// never reaches the mux or the owner. Every other key is left to the tree's
+    /// own map, so the view keys — `/`, `d`, `s`, `p`, `e`, `b`, `c` and the
+    /// jumps — keep working from either panel.
     fn handle_details_key(&mut self, key: KeyEvent) -> bool {
+        // While the reader is moving through the process table, the keys that
+        // move are the table's: the page's scrolling, the disclosures and the
+        // tree's selection are not what the reader asked for. Every other key
+        // keeps its own meaning below.
+        if self.process.navigating {
+            match key.code {
+                KeyCode::Char('t') => {
+                    self.process.navigating = false;
+                    return true;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.move_process(1);
+                    return true;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.move_process(-1);
+                    return true;
+                }
+                KeyCode::Home => {
+                    self.reach_process(false);
+                    return true;
+                }
+                KeyCode::End => {
+                    self.reach_process(true);
+                    return true;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.fold_selected_process();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         let page = self.page_step();
         match key.code {
+            KeyCode::Char('t') => self.toggle_process_navigation(),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_page(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_page(-1),
             KeyCode::PageDown => self.scroll_page(page),
@@ -1171,7 +1718,10 @@ impl App {
             KeyCode::End => self.scroll_page_to(u16::MAX),
             KeyCode::Left => self.cycle_page(false),
             KeyCode::Right => self.cycle_page(true),
-            KeyCode::Esc => self.details_focused = false,
+            KeyCode::Esc => {
+                self.process.navigating = false;
+                self.details_focused = false;
+            }
             KeyCode::Char(' ') => self.cycle_disclosure(),
             KeyCode::Enter => self.toggle_disclosure(),
             KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('r') => {}
@@ -1690,6 +2240,7 @@ impl App {
         self.details_hidden = !self.details_hidden;
         if self.details_hidden {
             self.details_focused = false;
+            self.process.navigating = false;
         }
     }
 

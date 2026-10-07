@@ -33,7 +33,9 @@
 //! reading only counts if the same incarnation is still beneath the same parent:
 //! a member that exited, whose pid was handed on or that was reparented is left
 //! out with its unverifiable subtree, and the totals that would have carried it
-//! say so.
+//! say so. Those members are also what a root publishes one by one, so a reader
+//! can see which child spent the CPU the total reports: the rows are the members
+//! the totals are made of, never a second walk of the table.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -41,8 +43,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::model::{
-    BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent, DescendantResources, LocalFacts,
-    ProcessIdentity, ProcessResources, ProcessState, TerminalMode, Total,
+    BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent, DescendantResources,
+    DescendantSample, LocalFacts, ProcessIdentity, ProcessResources, ProcessState, TerminalMode,
+    Total,
 };
 
 /// The kernel's marker on an executable link whose file has been unlinked or
@@ -504,6 +507,10 @@ enum Scan {
 struct Entry {
     /// The identity that read carried.
     identity: ProcessIdentity,
+    /// The name that read carried: the kernel's `comm`, which is not argv.
+    name: String,
+    /// The scheduler state that read carried.
+    state: ProcessState,
     /// The parent it was read under, kept so the link can be confirmed later.
     parent: i32,
     /// Its own interval CPU, against the baseline of the same incarnation.
@@ -518,6 +525,17 @@ struct Entry {
     unconfirmed: Option<String>,
 }
 
+/// One process an ancestry walk reached: the entry the scan read, and the
+/// identity of the process it was read beneath.
+///
+/// The parent is the entry the walk was standing on when it followed the link,
+/// which is what makes the link a fact rather than a pid: a pid names a
+/// different process once the kernel reuses it.
+struct Member<'a> {
+    parent: &'a ProcessIdentity,
+    entry: &'a Entry,
+}
+
 impl Snapshot {
     /// A snapshot that could not be taken, for `reason`.
     fn unavailable(reason: &str) -> Self {
@@ -529,8 +547,8 @@ impl Snapshot {
         }
     }
 
-    /// The processes beneath `root` in this snapshot, and why any were left
-    /// out.
+    /// The processes beneath `root` in this snapshot, each with the process it
+    /// was read beneath, and why any were left out.
     ///
     /// The walk follows the parent links the same reads reported, and refuses a
     /// link that cannot be real: a process that started before the one the link
@@ -539,7 +557,7 @@ impl Snapshot {
     /// kernel gives a process one parent — so a table read in pieces cannot
     /// double-count, and reaching a process twice is itself the sign of a cycle
     /// in those links.
-    fn beneath(&self, root: i32) -> (Vec<&Entry>, Vec<String>) {
+    fn beneath(&self, root: i32) -> (Vec<Member<'_>>, Vec<String>) {
         let mut members = Vec::new();
         let mut why = Vec::new();
         let mut seen = HashSet::from([root]);
@@ -567,7 +585,10 @@ impl Snapshot {
                     push_once(&mut why, "an ancestry link pointed at a reused pid");
                     continue;
                 }
-                members.push(entry);
+                members.push(Member {
+                    parent: &parent.identity,
+                    entry,
+                });
                 reached.push(*child);
             }
         }
@@ -602,6 +623,7 @@ fn summed<T>(total: T, missing: u32, reasons: &[String], missing_reason: &str) -
 fn unavailable(reason: &str) -> DescendantResources {
     DescendantResources {
         observed: None,
+        members: Vec::new(),
         rss_bytes: Total::Unknown(reason.to_string()),
         cpu: Total::Unknown(reason.to_string()),
     }
@@ -614,6 +636,10 @@ fn unavailable(reason: &str) -> DescendantResources {
 /// itself contain spaces and parentheses, which is why the fields are counted
 /// from the *last* `)` rather than by splitting the whole line.
 struct Stat {
+    /// The kernel's name for the process (field 2), between the parentheses it
+    /// writes it in: it may hold spaces and parentheses of its own, so it runs
+    /// from the first `(` to the last `)`.
+    name: String,
     /// Scheduler state (field 3).
     state: ProcessState,
     /// The process that started it (field 4).
@@ -630,11 +656,16 @@ struct Stat {
 impl Stat {
     /// Reads those fields, or `None` when this is not a stat line.
     fn parse(text: &str) -> Option<Self> {
-        let fields: Vec<&str> = text[text.rfind(')')? + 1..].split_whitespace().collect();
+        // The name comes first and is parenthesised, so the fields below are
+        // counted from what follows the `)` that closes it.
+        let name = text.find('(')? + 1;
+        let named_to = text.rfind(')').filter(|end| *end >= name)?;
+        let fields: Vec<&str> = text[named_to + 1..].split_whitespace().collect();
         // The remainder begins at `state`, so a field is where proc(5) puts it,
         // counted from three less.
         let field = |number: usize| fields.get(number - 3).copied();
         Some(Self {
+            name: text[name..named_to].to_string(),
             state: ProcessState::from_letter(field(3)?.chars().next()?),
             parent: field(4)?.parse().ok()?,
             cpu_ticks: field(14)?
@@ -750,6 +781,7 @@ impl Sampler {
                 start_ticks: stat.start_ticks,
             };
             let cpu = self.cpu_percent(&identity, &stat, now);
+            let rss_bytes = page_size.and_then(|page| stat.rss_bytes(page));
             // Every reading is kept as the baseline the next refresh measures
             // from: a process that is nobody's descendant today can be one
             // tomorrow, and it cannot be given a history retroactively. One that
@@ -767,9 +799,11 @@ impl Sampler {
                 pid,
                 Entry {
                     identity,
+                    name: stat.name,
+                    state: stat.state,
                     parent: stat.parent,
                     cpu,
-                    rss_bytes: page_size.and_then(|page| stat.rss_bytes(page)),
+                    rss_bytes,
                     unconfirmed: None,
                 },
             );
@@ -895,11 +929,14 @@ impl Sampler {
         self.observed.remove(&entry.identity);
     }
 
-    /// What this refresh's snapshot observed beneath `root`, summed.
+    /// What this refresh's snapshot observed beneath `root`: the members
+    /// themselves, and what they add up to.
     ///
     /// The root is only summarised against a snapshot that read the same
     /// incarnation: a scan taken before a reused pid would otherwise hand the new
-    /// process the other one's children.
+    /// process the other one's children. The rows are those same members, so a
+    /// reader can see which one spent what the total reports without a second
+    /// reading of the table.
     fn descendants(&self, root: &ProcessIdentity) -> DescendantResources {
         let Some(snapshot) = &self.snapshot else {
             return unavailable("the process table was not scanned this refresh");
@@ -922,17 +959,29 @@ impl Sampler {
         let mut cpu_total = 0u32;
         let mut cpu_missing = 0u32;
         for member in &members {
-            match member.rss_bytes {
+            match member.entry.rss_bytes {
                 Some(bytes) => rss_total = rss_total.saturating_add(bytes),
                 None => rss_missing += 1,
             }
-            match member.cpu {
+            match member.entry.cpu {
                 Some(percent) => cpu_total = cpu_total.saturating_add(percent.hundredths()),
                 None => cpu_missing += 1,
             }
         }
+        let rows = members
+            .iter()
+            .map(|member| DescendantSample {
+                identity: member.entry.identity.clone(),
+                parent: member.parent.clone(),
+                name: member.entry.name.clone(),
+                state: member.entry.state,
+                cpu: member.entry.cpu,
+                rss_bytes: member.entry.rss_bytes,
+            })
+            .collect();
         DescendantResources {
             observed: Some(members.len() as u32),
+            members: rows,
             // A machine whose page size cannot be read converts no resident set
             // at all, which is not a total of zero.
             rss_bytes: match snapshot.page_size {
@@ -1494,8 +1543,30 @@ mod tests {
         start_ticks: u64,
         rss_pages: i64,
     ) -> String {
+        named(
+            pid,
+            "we (ird) name",
+            state,
+            parent,
+            cpu_ticks,
+            start_ticks,
+            rss_pages,
+        )
+    }
+
+    /// The same line under a name a test chose, so the rows of two processes can
+    /// be told apart by what the kernel called them.
+    fn named(
+        pid: i32,
+        name: &str,
+        state: char,
+        parent: i32,
+        cpu_ticks: u64,
+        start_ticks: u64,
+        rss_pages: i64,
+    ) -> String {
         format!(
-            "{pid} (we (ird) name) {state} {parent} 42 42 0 -1 4194560 100 0 0 0 \
+            "{pid} ({name}) {state} {parent} 42 42 0 -1 4194560 100 0 0 0 \
              {utime} {stime} 3 4 20 0 3 0 {start_ticks} 0 {rss_pages}",
             utime = cpu_ticks / 2,
             stime = cpu_ticks - cpu_ticks / 2,
@@ -1519,6 +1590,30 @@ mod tests {
         (
             pid,
             Some(line(pid, 'S', parent, cpu_ticks, start_ticks, rss_pages)),
+        )
+    }
+
+    /// The same process under a name and state a test chose.
+    fn named_proc(
+        pid: i32,
+        name: &str,
+        state: char,
+        parent: i32,
+        start_ticks: u64,
+        cpu_ticks: u64,
+        rss_pages: i64,
+    ) -> (i32, Option<String>) {
+        (
+            pid,
+            Some(named(
+                pid,
+                name,
+                state,
+                parent,
+                cpu_ticks,
+                start_ticks,
+                rss_pages,
+            )),
         )
     }
 
@@ -1697,6 +1792,10 @@ mod tests {
     #[test]
     fn a_stat_line_is_read_from_its_last_parenthesis() {
         let stat = Stat::parse(&stat_line('S', 30, 987_654, 8)).expect("a stat line");
+        // The name is parenthesised and may hold spaces and parentheses of its
+        // own: it is the first `(` to the last `)`, and the fields are counted
+        // from what follows.
+        assert_eq!(stat.name, "we (ird) name");
         assert_eq!(stat.state, ProcessState::Sleeping);
         assert_eq!(stat.cpu_ticks, 30);
         assert_eq!(stat.start_ticks, 987_654);
@@ -1705,6 +1804,9 @@ mod tests {
         // line whose fields are missing is only half a sample.
         assert!(Stat::parse("42 (short) R 1 2").is_none());
         assert!(Stat::parse("not a stat line").is_none());
+        // Parentheses the wrong way round are not a name either, rather than a
+        // slice of the line's own bytes.
+        assert!(Stat::parse("42 ) S 1 (").is_none());
     }
 
     #[test]
@@ -2094,6 +2196,10 @@ mod tests {
         // whole refresh shares.
         assert_eq!(shell.descendants.observed, Some(1));
         assert_eq!(shell.descendants.rss_bytes, Total::Complete(4096));
+        // One row per member the walk confirmed, and the nested root's row is
+        // the build alone: what a total covers is what its rows say.
+        assert_eq!(root.descendants.members.len(), 2);
+        assert_eq!(shell.descendants.members.len(), 1);
         assert_eq!(
             table.reads(),
             vec![
@@ -2129,6 +2235,110 @@ mod tests {
     }
 
     #[test]
+    fn a_root_carries_a_verified_row_for_each_process_beneath_it() {
+        // A pane (100) running a shell (200) that started a build (300), and a
+        // sibling (400) beneath none of them.
+        let procs = ScriptedProcs::new().holding(vec![
+            named_proc(100, "pi", 'S', 1, 10, 0, 4),
+            named_proc(200, "bash", 'S', 100, 20, 1_000, 2),
+            named_proc(300, "cargo", 'R', 200, 30, 2_000, 1),
+            named_proc(400, "sleep", 'S', 1, 40, 0, 8),
+        ]);
+        let table = procs.clone();
+        let (mut sampler, at) = sampler_over(procs);
+        scan(&mut sampler, at);
+        let root = sampler.sample(100, at).expect("the root's sample");
+        let rows = &root.descendants.members;
+
+        // The rows are the processes beneath the root: not the root itself, and
+        // not a process that is nobody's descendant here.
+        assert_eq!(root.descendants.observed, Some(2));
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.identity.pid != 100 && row.identity.pid != 400),
+            "{rows:?}"
+        );
+
+        // Each row is one process: the incarnation the scan read, the process it
+        // was read beneath — an identity, not a pid that may name somebody else
+        // by the next refresh — the kernel's own name for it, and its own
+        // resources.
+        let shell = rows
+            .iter()
+            .find(|row| row.identity.pid == 200)
+            .expect("the shell's row");
+        assert_eq!(shell.identity.start_ticks, 20);
+        assert_eq!(shell.identity.boot_id, "boot-1");
+        assert_eq!(
+            (shell.parent.pid, shell.parent.start_ticks),
+            (100, 10),
+            "the row names the process it was read beneath"
+        );
+        assert_eq!(shell.name, "bash");
+        assert_eq!(shell.state, ProcessState::Sleeping);
+        assert_eq!(shell.rss_bytes, Some(2 * 4096));
+        // The scan was the first reading of the shell, so its interval is
+        // unavailable rather than zero.
+        assert_eq!(shell.cpu, None);
+
+        // The build is read beneath the shell, and the state the kernel reported
+        // travels with it.
+        let build = rows
+            .iter()
+            .find(|row| row.identity.pid == 300)
+            .expect("the build's row");
+        assert_eq!(build.parent, shell.identity);
+        assert_eq!(build.name, "cargo");
+        assert_eq!(build.state, ProcessState::Running);
+
+        // The rows cost no reading of their own: the refresh's scan read the
+        // table once, the confirmation read it again, and the root's own sample
+        // was read and confirmed — and nothing else was asked of the machine.
+        assert_eq!(
+            table.reads(),
+            vec![100, 200, 300, 400, 100, 200, 300, 400, 100, 100]
+        );
+    }
+
+    #[test]
+    fn a_member_row_measures_its_own_interval() {
+        let hertz = clock_ticks().expect("this kernel knows its tick rate") as u64;
+        let procs = ScriptedProcs::new().holding(vec![
+            named_proc(100, "pi", 'S', 1, 10, 0, 4),
+            named_proc(200, "cargo", 'R', 100, 20, 1_000, 2),
+        ]);
+        let table = procs.clone();
+        let (mut sampler, at) = sampler_over(procs);
+        scan(&mut sampler, at);
+        let root = sampler.sample(100, at).expect("the root's sample");
+        assert_eq!(
+            root.descendants.members[0].cpu, None,
+            "a first reading has no interval"
+        );
+        sampler.finish();
+
+        // The build worked for half of the second the next refresh covers.
+        table.now_reading(
+            200,
+            Some(named(200, "cargo", 'R', 100, 1_000 + hertz / 2, 20, 2)),
+        );
+        let later = at + Duration::from_secs(1);
+        scan(&mut sampler, later);
+        let root = sampler.sample(100, later).expect("the root's sample");
+        let row = &root.descendants.members[0];
+        assert_eq!(row.identity.pid, 200);
+        assert_eq!(row.identity.start_ticks, 20);
+        assert_eq!(row.cpu, Some(CpuPercent::from_hundredths(5_000)));
+        // The row carries the reading the total is made of rather than a second
+        // measurement of the same process.
+        assert_eq!(
+            root.descendants.cpu,
+            Total::Complete(CpuPercent::from_hundredths(5_000))
+        );
+    }
+
+    #[test]
     fn a_cycle_in_the_ancestry_walk_is_reported_and_ends() {
         // Two processes each naming the other as its parent, which one read of a
         // table being written is free to show: a walk that trusted it would never
@@ -2139,6 +2349,10 @@ mod tests {
         scan(&mut sampler, at);
         let root = sampler.sample(100, at).expect("the root's sample");
         assert_eq!(root.descendants.observed, Some(1));
+        // The one link that could be real is a row, with the process it was read
+        // beneath: only the link that closed the cycle is refused.
+        assert_eq!(root.descendants.members.len(), 1);
+        assert_eq!(root.descendants.members[0].parent.pid, 100);
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(
@@ -2167,6 +2381,10 @@ mod tests {
         scan(&mut sampler, at);
         let root = sampler.sample(100, at).expect("the root's sample");
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(
+            root.descendants.members.is_empty(),
+            "a row is only drawn for a link the walk confirmed"
+        );
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(0, "an ancestry link pointed at a reused pid".to_string())
@@ -2199,6 +2417,10 @@ mod tests {
         scan(&mut sampler, later);
         let root = sampler.sample(100, later).expect("the root's sample");
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(
+            root.descendants.members.is_empty(),
+            "a process that exited leaves no row"
+        );
         assert_eq!(root.descendants.rss_bytes, Total::Complete(0));
         assert_eq!(
             root.descendants.cpu,
@@ -2214,6 +2436,11 @@ mod tests {
         let root = sampler.sample(100, later).expect("the root's sample");
         assert_eq!(root.descendants.observed, Some(1));
         assert_eq!(root.descendants.rss_bytes, Total::Complete(4096));
+        // The new member's own row says the same: it is counted, and it has
+        // nothing to measure its CPU against yet.
+        assert_eq!(root.descendants.members.len(), 1);
+        assert_eq!(root.descendants.members[0].identity.pid, 300);
+        assert_eq!(root.descendants.members[0].cpu, None);
         assert_eq!(
             root.descendants.cpu,
             Total::Partial(
@@ -2232,6 +2459,10 @@ mod tests {
         scan(&mut sampler, at);
         let root = sampler.sample(100, at).expect("the root's sample");
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(
+            root.descendants.members.is_empty(),
+            "a process that was never read has no row"
+        );
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(0, "1 of the processes could not be read".to_string())
@@ -2262,6 +2493,10 @@ mod tests {
         assert_eq!(table.reads(), vec![100]);
         let root = sampler.sample(100, at).expect("the root's sample");
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(
+            root.descendants.members.is_empty(),
+            "a scan that confirmed nothing has no rows"
+        );
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(0, "the process scan was cancelled".to_string())
@@ -2292,6 +2527,7 @@ mod tests {
         // rest of the table is not in it.
         let root = sampler.sample(100, at).expect("the root's sample");
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(root.descendants.members.is_empty());
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(
@@ -2304,6 +2540,7 @@ mod tests {
         // tree.
         let unreached = sampler.sample(200, at).expect("the child's own sample");
         assert_eq!(unreached.descendants.observed, None);
+        assert!(unreached.descendants.members.is_empty());
         assert_eq!(
             unreached.descendants.rss_bytes,
             Total::Unknown("this process was not in the process scan".to_string())
@@ -2329,6 +2566,10 @@ mod tests {
         let root = sampler.sample(100, at).expect("the replacement's sample");
         assert_eq!(root.identity.start_ticks, 500);
         assert_eq!(root.descendants.observed, None);
+        assert!(
+            root.descendants.members.is_empty(),
+            "a replacement is handed none of the other process's rows"
+        );
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Unknown("the process changed between the scan and its sample".to_string())
@@ -2365,6 +2606,10 @@ mod tests {
         // The build beneath the shell is left out with it, and the root says why
         // instead of reporting a total it did not confirm.
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(
+            root.descendants.members.is_empty(),
+            "the refuted subtree leaves no rows"
+        );
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(
@@ -2401,6 +2646,10 @@ mod tests {
         let root = sampler.sample(100, at).expect("the root's sample");
 
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(
+            root.descendants.members.is_empty(),
+            "the replaced reading leaves no row"
+        );
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(
@@ -2424,6 +2673,10 @@ mod tests {
         let root = sampler.sample(100, at).expect("the root's sample");
 
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(
+            root.descendants.members.is_empty(),
+            "a process that vanished before its confirmation leaves no row"
+        );
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(
@@ -2463,6 +2716,10 @@ mod tests {
         // complete total.
         let root = sampler.sample(100, at).expect("the root's sample");
         assert_eq!(root.descendants.observed, Some(0));
+        assert!(
+            root.descendants.members.is_empty(),
+            "a refresh that confirmed nothing has no rows"
+        );
         assert_eq!(
             root.descendants.rss_bytes,
             Total::Partial(0, "the process scan was cancelled".to_string())

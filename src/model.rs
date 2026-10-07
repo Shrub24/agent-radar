@@ -654,6 +654,34 @@ pub enum Total<T> {
     Unknown(String),
 }
 
+/// One process beneath a root, as one refresh's scan confirmed it.
+///
+/// These are the members the totals of [`DescendantResources`] are made of, from
+/// the same snapshot, the same reads and the same confirmation — never a second
+/// walk and never a second reading of `/proc`. The parent is the identity of the
+/// process this one was read beneath: what a table can order and fold by is the
+/// incarnation, since a pid alone names a different process once the kernel
+/// reuses it. The name is the kernel's own short name for the process, which is
+/// neither the arguments it was started with nor a claim about what started it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescendantSample {
+    /// The incarnation this reading belongs to.
+    pub identity: ProcessIdentity,
+    /// The incarnation of the process it was read beneath.
+    pub parent: ProcessIdentity,
+    /// The kernel's name for the process (`comm` in `/proc/<pid>/stat`), which
+    /// is not argv and says nothing about who started it.
+    pub name: String,
+    /// The scheduler state the kernel reported for it.
+    pub state: ProcessState,
+    /// Interval CPU since the previous sample of this same identity. `None` when
+    /// no interval can be measured; a measured idle interval is `Some(0)`.
+    pub cpu: Option<CpuPercent>,
+    /// Resident set size in bytes. `None` when this machine cannot convert the
+    /// kernel's page count.
+    pub rss_bytes: Option<u64>,
+}
+
 /// What the processes beneath one root are using, as one scan observed them.
 ///
 /// The members are the kernel's descendants — the ancestry its parent links
@@ -669,6 +697,10 @@ pub struct DescendantResources {
     /// How many processes the scan observed beneath the root. `None` when none
     /// could be enumerated at all.
     pub observed: Option<u32>,
+    /// Those processes: one sample each, and exactly the ones `observed` counts
+    /// and the totals cover. Empty when none could be enumerated, and the
+    /// totals below say why.
+    pub members: Vec<DescendantSample>,
     /// The resident set of those of them whose size could be read.
     pub rss_bytes: Total<u64>,
     /// Their interval CPU. Every one of them needs its own matching pair of

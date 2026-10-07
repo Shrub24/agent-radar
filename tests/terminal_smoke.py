@@ -20,6 +20,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -53,6 +54,29 @@ def check(binary, bus_off=False):
                                    "pi_bg_tasks": "bg-7:running,bg-8:running"}}],
         }}}) + "\n")
         socket_path = directory / "radar.sock"
+        # The Processes page's own process table needs a real process this
+        # machine's sampler can read, with a process beneath it: a python
+        # leader and the sleep it started. The fake CLI reports it as the
+        # pane's foreground command, so the table is a tree of this run.
+        helper = subprocess.Popen(
+            [sys.executable, "-c",
+             "import subprocess, time\n"
+             "child = subprocess.Popen(['sleep', '120'])\n"
+             "print(child.pid, flush=True)\n"
+             "time.sleep(120)\n"],
+            stdout=subprocess.PIPE, text=True,
+        )
+        child_pid = int(helper.stdout.readline().strip())
+        process_info = directory / "process-info.json"
+        process_info.write_text(json.dumps({"result": {"process_info": {
+            # The group leader is the python process; the shell pid is some
+            # other pid, which is what makes the foreground a command rather
+            # than a shell.
+            "shell_pid": 1,
+            "foreground_process_group_id": helper.pid,
+            "foreground_processes": [{"pid": helper.pid, "name": "python3",
+                                      "cmdline": "python3 -c pass"}],
+        }}}) + "\n")
         fake = directory / "herdr"
         fake.write_text(f'''#!/bin/sh
 read -r mode < '{mode}'
@@ -60,6 +84,7 @@ case "$mode" in
   error) printf 'controlled source failure\\n' >&2; exit 7 ;;
   stall) printf '%s' $$ > '{ready}'; exec sleep 30 ;;
 esac
+if [ "$1" = "pane" ] && [ "$2" = "process-info" ]; then cat '{process_info}'; exit 0; fi
 cat '{snapshot}'
 ''')
         fake.chmod(0o755)
@@ -89,6 +114,13 @@ cat '{snapshot}'
                 seen.extend(chunk)
                 if b"\x1b[6n" in chunk:
                     os.write(master, b"\x1b[1;1R")
+
+        def settle(seconds=0.35):
+            # A key that is clamped to the layout of the frame before it — a
+            # scroll is. Keys written in one batch are handled before that
+            # draw, so a step waits for the redraw the spinner forces anyway.
+            time.sleep(seconds)
+            drain()
 
         def expect(text):
             deadline = time.monotonic() + 3
@@ -259,6 +291,44 @@ cat '{snapshot}'
             tasks(client, [{"id": "bg-3", "state": "flushing"}])
             expect_panel(b"bg-3")
 
+            # The Processes page's process table, navigated the way a reader
+            # does: the table is the real process tree this run started, the
+            # python leader with a sleep beneath it. A taller panel first, so
+            # the page's blocks are read whole rather than scrolled — the run's
+            # own size comes back for the quit that is timed at the end; Space
+            # and Enter open both blocks, t names the table's own mode, j moves
+            # over its rows, Enter folds the root's branch away, and the same
+            # key opens it again.
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 70, 100, 0, 0))
+            settle()
+            focus_details()
+            os.write(master, b"\x1b[D")
+            settle()  # Tasks → Processes
+            os.write(master, b" \r \r")
+            settle()  # both of the page's blocks open
+            expect_panel(b"process table")
+            focus_details()
+            after(b"t", b"navigating")
+            os.write(master, b"j")
+            settle()  # the cursor moves to the process beneath the root
+            os.write(master, b"k")
+            settle()  # and back to the root
+            os.write(master, b"\r")
+            settle()  # Enter folds the root's branch
+            expect_panel(str(helper.pid).encode(), lacks=str(child_pid).encode())
+            focus_details()
+            os.write(master, b"t")
+            settle()
+            os.write(master, b"\r")
+            settle()  # Enter opens the branch again
+            expect_panel(str(child_pid).encode())
+            # Back to the table's ordinary page and then to the fleet, whose
+            # own hints are what say the panel let the keyboard go.
+            focus_details()
+            escape_details()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+            settle()
+
             mode.write_text("stall\n")
             deadline = time.monotonic() + 3
             while not ready.exists() and time.monotonic() < deadline:
@@ -282,6 +352,14 @@ cat '{snapshot}'
             assert b"\x1b[?1006l" in seen, "mouse capture was not released"
             assert termios.tcgetattr(slave) == original, "terminal input modes changed"
         finally:
+            if helper.poll() is None:
+                helper.kill()
+                helper.wait()
+            helper.stdout.close()
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             if client is not None:
                 client.close()
             if squatter is not None:
@@ -298,7 +376,8 @@ cat '{snapshot}'
             os.close(slave)
     print("PASS: source failure/empty/recovery; stub publisher connect/replace/disconnect; "
           "details focus, page cycling, a scroll key, a disclosure opened and closed "
-          "with Space/Enter, and Escape back to the tree; "
+          "with Space/Enter, process-row navigation with t, a branch folded and opened "
+          "on the process table, and Escape back to the tree; "
           "q in filter entry; stalled quit with a client connected; mouse capture taken and "
           "released; terminal restoration")
 

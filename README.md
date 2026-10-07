@@ -140,6 +140,7 @@ While the details hold the keyboard:
 | `←` / `→` | Cycle the pages, wrapping at either end |
 | `Space` | Move to the page's next openable block |
 | `Enter` | Open or close the block the keyboard is on |
+| `t` | With Processes focused and its process table open, enter or leave process-row navigation, where `j`/`k`, `Home`/`End` and `Enter`/`Space` move over the table's rows and fold their branches instead of the page |
 | `Escape` | Give the keyboard back to the tree |
 | `/` and the view keys | Still act on the fleet, as they do from the tree |
 
@@ -148,6 +149,24 @@ Reading a page never moves the selection, folds nothing and sends nothing: `Ente
 focus a pane or open a lifecycle confirmation by scrolling. Filter entry and an
 open confirmation keep precedence — the confirmation's arrows swap its buttons
 rather than turning a page, and typing goes to the filter.
+
+The process table has a small mode of its own. With the Processes page focused
+and the table open, `t` enters it and the table's own label says so. There `j` /
+`↓` and `k` / `↑` select the next and previous row without wrapping, `Home` and
+`End` reach the first and last, and `Enter` or `Space` fold or open the selected
+process's branch — a leaf has none to fold. Outside the mode every key is the
+page's again: scrolling, the block cycle, page switching, `Tab` and `Escape` are
+unchanged, and so are `PgUp`/`PgDn` and the wheel. Selecting a row gives the
+compact process block above the table that process's own name, PID, state,
+interval CPU and resident set, while the root's binary comparison stays under
+its own `foreground root` heading and is never attributed to a descendant. The
+mode, the cursor and the folds belong to the selected row's own process, keyed
+by its birth identity: another row, a process replaced at the same PID, a root
+whose table is no longer offered, and closing the table all leave the page
+without them, and a process that folds out of sight or goes away returns the
+cursor to the root. Clicking a row selects that process and enters the mode;
+clicking a row's fold marker only folds that branch. None of it focuses a pane,
+changes the fleet selection or its folds, or issues a close or restart.
 
 With a mouse:
 
@@ -193,7 +212,7 @@ is not buried under the long published text a task list brings with it:
 | Page | Shows |
 | --- | --- |
 | Overview | What the row is: its kind and lifecycle, its location, the live foreground PID, what it is running, the row's activity, state and model, and the owner's projected state as its own line |
-| Processes | The process holding the location: the command name the runtime reports for it, the package it runs from and the executable inside it, how that compares with the program `PATH` resolves now, the PID, how long it has run, the terminal mode, and what that process was measured using — scheduler state, interval CPU, resident set and the descendants observed beneath it — with the birth identity, both store roots, the whole executable path, the state meanings and every reason held behind the page's `details` block |
+| Processes | The process holding the location: the command name the runtime reports for it, the package it runs from and the executable inside it, how that compares with the program `PATH` resolves now, the PID, how long it has run, the terminal mode, and what that process was measured using — scheduler state, interval CPU, resident set and the descendants observed beneath it, summed and then drawn one row each in a table of their own — with the store, the roots' own parts, the birth identity, what the state it is showing means and every reason held behind the page's `details` block |
 | Tasks | The background tasks published for the row — each task's id, phase, source, command, directory, PID, timings, output and exit — and the pane's own token ids when no publisher joins |
 | Source | Where the facts came from: source freshness, the diagnostic when the source failed or a page is retained, the exact session identities, the owner projection and the diagnostics |
 
@@ -216,8 +235,8 @@ ordinary pane row whose foreground evidence is current:
 - `package` names the running installation once: the package's name and version,
   and the first characters of the store hash when the comparison has two builds
   of that one version to tell apart. A path outside the Nix store is named whole.
-- `executable` is the file the kernel is running inside that package, relative to
-  the package root (`lib/pi-bolt/pi`) rather than the whole store path that names
+- `exe` is the file the kernel is running inside that package, relative to the
+  package root (`lib/pi-bolt/pi`) rather than the whole store path that names
   it twice. A file outside that root is drawn where it is.
 - `binary` is how the running executable compares with the program `PATH`
   resolves now, and it is drawn only when it has something to say: a current
@@ -229,11 +248,15 @@ ordinary pane row whose foreground evidence is current:
   could not be made gives its reason in a word or two — no counterpart, payload
   unknown, unreadable, not the named program.
 - `▸ details` is the page's block, and holds the long halves of the same facts:
-  both store roots whole, the whole executable path, the birth identity the
-  reading belongs to (PID, boot id and start ticks), the full sentence behind a
-  comparison that could not be made, what each kernel state letter means, and
-  what a descendant sum is. Space and Enter, or a click on the marker, open it,
-  and the body scrolls with the page like any other row.
+  the store the two roots sit in, stated once, with each root's own part beside
+  it (`store /nix/store/`, then `running aaa-pi-bolt-0.7.1` and
+  `installed bbb-pi-bolt-0.7.1`), the executable's place under the running root,
+  the birth identity the reading belongs to (PID, boot id and start ticks), the
+  full sentence behind a comparison that could not be made, what the kernel
+  state this row is showing means, and what a descendant sum is. Every fact is
+  a labelled row in one column, and a fact too long for the panel continues
+  under that column rather than under its label. Space and Enter, or a click on
+  the marker, open it, and the body scrolls with the page like any other row.
 
 The process's arguments are never drawn on this page: a harness takes its prompt
 and system prompt as arguments, and nothing the runtime reports tells a prompt
@@ -309,12 +332,31 @@ value Radar could not measure says so with its reason rather than as a zero: a
 first reading has no interval to report, and a figure a row can no longer
 observe is drawn as withheld, not as the last one anyone saw.
 
+Those confirmed descendants are drawn individually too, one row each, in a table
+held behind the page's own `▸ process table` marker and closed until a reader
+opens it. The root is the table's first row: every process beneath it is indented
+under the one it was read beneath, and the siblings of one parent are ordered by
+PID, so an unchanged table draws the same tree on every refresh. Each row is one
+line of the panel — a name, a PID, an interval CPU and a resident set, aligned
+down the columns — whatever the panel's width: as it narrows the resident set is
+dropped first and then the CPU, and a name its column cannot hold is shortened,
+while the PID is never the column that goes. A `—` is a value this machine did
+not measure and never the zero a measured idle interval is, and a table that drew
+one says so beneath its rows. The name is the kernel's own short name for the
+process, sanitized like every other external text: it is not the arguments the
+process was started with, and it is never a claim about what started it. A table
+is offered only where the scan that sampled the root enumerated what is beneath
+it, so a scan that could not be read leaves the sums saying so rather than
+drawing an empty tree, and a stale or retained row draws none of it.
+
 Long published text starts collapsed behind a `▸` marker: an assignment long
-enough to bury the facts around it, and each task's command and directory. The
-assignment keeps its opening readable while closed, and a closed task block keeps
-the task's line with its id, phase, age, output and exit code — identity, state,
-PID and the measures beside them never collapse, so only the text that would wrap
-over the panel is behind the marker. `Space` picks the page's next openable
+enough to bury the facts around it, each task's command and directory, and the
+table of processes observed beneath the page's own foreground process. The
+assignment keeps its opening readable while closed, a closed task block keeps
+the task's line with its id, phase, age, output and exit code, and the closed
+table keeps its one-line marker — identity, state, PID and the measures beside
+them never collapse, so only the text that would wrap over the panel is behind
+the marker. `Space` picks the page's next openable
 block, `Enter` opens or closes the one it is on, and neither focuses a pane or
 starts a lifecycle action; clicking a marker toggles that block alone. An opened
 block stays open across refreshes while its task survives, leaves with the task
