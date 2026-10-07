@@ -38,27 +38,125 @@ for their control inboxes.
 
 ## Next
 
-Current priorities:
+Finish the active `foldable-process-descendants` change first. Its verified
+per-member sampling slice is accepted; table presentation and interaction are
+still in progress. Keep this work separate from lifecycle and state contracts.
 
-1. **Known-process enrichment.** Add Linux observations/metrics/diagnostics to
-   known background tasks, foreground commands and verified agent processes.
-   Descendant relationships support workload attribution; a general process
-   browser or arbitrary unverified hierarchy is deferred. The agent binary
-   staleness marks that this direction needed are landed; the descendant tree
-   below is its next step.
-2. **Display/TUI refinement.** Review row density and useful details with the
-   operator after known-process enrichment. This remains a priority, but its
-   presentation decisions are deferred to that discussion. The Processes page
-   has had its pass: short headed values, a short enumerable kernel state, a
-   deduplicated identity, and everything verbose behind one block.
-3. **Herdr-agnosticity and tmux-parity audit.** Cover Radar and pi-herdsman, not
-   just the Rust trait. Establish the actual requirements for a tmux adapter and
-   record gaps before promising parity or starting another implementation.
+After that, in priority order:
 
-Preview, session statistics/search, command-specific actions and failure
-reports remain deferred behind this pass. Fleet restart, restart-stale batches,
-new-tab creation, a project picker and separate runtime/agent modes remain out
-of the immediate scope.
+1. **Lead restart and recovery.** Establish safe lead/standalone restart and
+   recovery of existing children, pending requests and task results. Keeping a
+   session UUID is necessary but does not prove recovery. This is the foundation
+   for stale restarts, not a direct Herdr relaunch fallback.
+2. **Structured waiting and failure reporting.** Publish activity, waiting
+   reason, last outcome and available action separately. Distinguish a question
+   awaiting an answer, a permission request, a scheduled rate-limit retry and a
+   failed turn with no retry. Coordinate this contract with lead recovery.
+3. **Stale-lead restart plans and batches.** Build on the recovery contract:
+   detect eligible stale leads, show a confirmed plan, execute through the owner
+   and report each result. Prefer leads over indiscriminately restarting all
+   panes. Startup detection and a restart offer come before opt-in automation.
+4. **Owner lifecycle/state daemon.** Complement Herdr first with direct owner
+   reporting, durable registration, reconnect/recovery and control routing.
+   Replacing Herdr's state/lifecycle role is a later migration, not a requirement
+   to replace its pane inventory and focus at the same time. Design this seam
+   alongside priorities 1–2; migrate transport incrementally.
+5. **Herdr-agnosticity and tmux-parity audit.** Cover Radar, pi-herdsman,
+   publishers and launchers. Record actual parity gaps before starting another
+   mux backend; use the daemon separation rather than assuming it fixes parity.
+6. **Further TUI and information surfaces.** Review the completed Processes
+   table and fleet density with the operator, then add non-consuming preview,
+   session statistics/search and fleet failure summaries in that order.
+
+Background-task resource enrichment still needs publisher-captured birth
+identity; it is not a prerequisite for lead recovery. Command-specific actions,
+new tabs, a project picker, separate runtime/agent modes and arbitrary process
+browsing remain later work. Cooperative whole-fleet restart follows safe
+lead-only restart; it must not become a bulk kill.
+
+### Lead recovery and stale restarts
+
+Basic confirmed pane/tab close and idle managed-worker restart are already
+implemented. The missing owner operation is lead/standalone restart, including
+its recovery guarantees:
+
+- Identify the exact session and live process incarnation. Confirm that the old
+  process has exited before resuming its session; never create a second attach
+  as a side effect of restart.
+- Preserve or explicitly reconcile child runs, ownership/lineage, pending asks
+  and requests, unresolved task results and control outcomes. A new process
+  retaining the same session UUID is not sufficient evidence of success.
+- Have the owner declare restart eligibility and supported recovery. A lead
+  may look idle while still owning active children or unconsumed results; row
+  activity alone must not authorize its restart.
+- Publish request acceptance, execution and the resulting session/process
+  identity. Unknown execution stays unknown and suppressed, not automatically
+  retried or inferred successful because a pane disappeared.
+- For stale batches, use the existing exact binary-counterpart comparison;
+  unknown freshness is not stale. Freeze and revalidate each target, report
+  refused/skipped/unknown results, and leave the initiating session until last.
+- On Radar launch, detect stale leads and offer a restart plan first. Silent
+  startup restart is not the default. Later opt-in automation needs positive
+  lead identity, owner-certified eligibility and the same recovery guarantees.
+
+Evaluate moving Herdr's restart-on-launch responsibility into this owner-routed
+path. Do not copy its all-pane restart behavior: preserve ordinary panes and
+managed children unless their owner explicitly includes them in the plan.
+
+### Structured activity, reasons and outcomes
+
+A process being idle does not mean its last turn succeeded, and one word such
+as `blocked` cannot describe every reason an agent needs attention. Owners
+should publish distinct facts rather than make Radar infer them from output:
+
+| Activity | Reason or outcome | Action |
+| --- | --- | --- |
+| waiting | user answer required | open the pending question |
+| blocked | permission required | open the permission request |
+| waiting | rate-limited, retry scheduled | show retry timing |
+| idle | last turn failed with 429, no retry scheduled | show failure and supported retry action |
+| unknown | publisher disconnected | show stale evidence, not a successful idle session |
+
+Define reason/outcome lifetimes, observation timestamps and pending-request
+identities so old failures do not overwrite current activity and a dismissed
+notice does not resolve a pending question. Available actions must be advertised
+capabilities, not promises that Radar can issue them yet. Preserve coarse token
+fallback where richer reporting is absent; missing detail stays unknown.
+
+### Direct owner reporting and a lifecycle/state daemon
+
+The initial migration complements Herdr:
+
+- Herdr remains the mux adapter for pane inventory, locations and focus.
+- Pi/Herdsman and background-task owners publish lifecycle facts directly;
+  Radar joins them by exact session/run/process identities, with pane location
+  kept separate from agent ownership.
+- A daemon provides durable registration, fresh snapshots, reconnect/recovery
+  and request routing. Registration must distinguish session context from a
+  live publisher incarnation; reconnect must not revive an old writer's state.
+- Each operation has a declared owner. The daemon transports facts and requests
+  unless an explicit supervision contract makes it the lifecycle owner;
+  transport alone does not authorize it to kill or relaunch processes.
+- Controls retain exact-target preflight, confirmation, exclusive execution,
+  expiry and acknowledged outcomes. They must preserve the existing meaning of
+  started/unknown requests across Radar or daemon restarts.
+- Background-task observation remains non-consuming. Neither state display nor
+  a new transport may acknowledge a result or compete with the agent's `get`.
+
+Specify direct reporting and control/recovery contracts with pi-extensions
+before choosing the daemon implementation. Migrate one reporting/control
+surface at a time with an explicit fallback; do not silently turn the current
+metadata-only task bus into a lifecycle command channel.
+
+### Verification and shipping gates
+
+- Complete the descendant-table source, PTY and checked Nix gates.
+- Run an operator-approved live lifecycle smoke against owners that loaded the
+  supported contract; stub-owner tests do not prove live recovery.
+- Confirm real background-task publisher integration separately from the stub
+  publisher PTY tests.
+- Resolve inherited requirement-length warnings exposed by OpenSpec 1.14.1
+  before the next all-spec strict shipping gate, without changing behavior.
 
 ### Nix distribution (done)
 
@@ -153,7 +251,7 @@ that action surface and need stronger target validation and confirmation.
   decisions. Close and idle-worker restart now use Herdsman's owner preflight;
   this does not authorize additional controls or batch actions.
 
-### Lifecycle controls: implemented single-target actions, deferred fleet restart
+### Lifecycle controls: implemented baseline and restart roadmap
 
 Three operations, in increasing order of what they can destroy. The shape that
 matters is that Radar *triggers* and the owner *executes*: pane operations belong
@@ -182,7 +280,8 @@ transport. Radar must not kill or relaunch agent processes itself.
   not retrieved must be accounted for rather than silently discarded. It goes through Herdsman for those reasons, and
   never through `pi-bg`, whose `get` and `stop` are the agent's own consumption
   path.
-- **Restart the fleet (after a `pi` update).** Never a bulk kill: an agent in
+- **Restart the fleet (after a `pi` update), later.** Lead recovery and confirmed
+  stale-lead batches above come first. Never a bulk kill: an agent in
   `review` still has a completion its `pi-bg get` would consume, and a hard kill
   throws those away. It has to be cooperative — ask each agent to stop, wait for
   it, relaunch, report the ones that did not stop — and it needs an ordering rule
@@ -250,7 +349,7 @@ Radar rather than pulled from it.
   workspace suffix is stripped, and `e` lists finished sessions even with
   ordinary panes hidden.
 
-## Display/TUI refinement — before further features
+## Display/TUI refinement — after the active Processes change
 
 The objective is useful information at a glance, not more fields on every row.
 Do this against representative busy fleets, narrow terminals and deep branches:
@@ -326,15 +425,15 @@ joins; OS parentage must never invent an assignment or owner.
 
 ### Descendant tree (after the compact Processes layout)
 
-The compact Processes page draws aggregate-only descendant facts, so no
-individual child is listed yet. The agreed next slice is the screen it leaves
-room for: the Descendants section opens into a foldable table — name, PID, CPU
-and RSS columns, one row per observed child, branches folded per level, and
-selecting a row moving the compact process detail to that process.
+Active change: `openspec/changes/foldable-process-descendants/`. The sampler
+slice is independently accepted: confirmed per-member name, birth identity,
+parent identity, state, CPU and RSS are now available beside the qualified
+sums. The remaining slices draw an initially collapsed table — name, PID, CPU
+and RSS columns, a root anchor, branches folded per level, and selecting a row
+moving the compact process detail to that process.
 
-- This is a sampler change before it is a render change: per-child rows need
-  each descendant's name, PID, CPU, RSS and depth, where only aggregates are
-  sampled today. Foldable rows without that identity would be invented.
+- Rendering must order the verified members deterministically and sanitize their
+  observed names. Selection and folds follow birth identity, never PID alone.
 - Rejected: mapping an external `pstree` into the panel. Its output carries no
   usable identity for selection and arranges the same text with no metrics.
 - Rejected for now: adopting `tui-tree-widget`. Radar already rolls its own tree
@@ -417,9 +516,10 @@ rows; fleet summaries and diagnostic reports do not exist yet.
 ## Open questions
 
 1. **Further controls.** Focus, confirmed unmanaged close and owner-routed
-   managed close/idle restart are settled. Batch restart, new tabs, steer,
-   interrupt and extend need their own decisions and contracts; task lifecycle
-   remains outside the metadata bus.
+   managed close/idle-worker restart are settled. Lead recovery, structured
+   reasons/outcomes and stale-lead batches are prioritized above but still need
+   owner contracts. New tabs, steer, interrupt and extend remain later decisions;
+   task lifecycle remains outside the metadata bus.
 2. ~~**Mouse capture** trades the terminal's text selection for clicks.~~
    Taken, and written down in the README. The open half is whether a bypass key
    is enough, or whether capture should be a setting.
