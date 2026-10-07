@@ -49,3 +49,32 @@ source-current flag the focus targets use, and a regression covers it.
 - No destructive lifecycle smoke, process-environment reads or wrapper execution.
 - No loaded extension/plugin build metadata claim; packaging metadata consumption is deferred.
 - Linux package only; other platforms were not exercised.
+
+## Follow-up: the block's rows reflowed
+
+Read by the user and rebuilt in the primary session. The first block drew prose
+lines whose labels changed with the facts present, repeated the store prefix on
+every root and on the executable, carried a nine-line glossary of kernel states
+the row was not in, and wrapped a fact too long for the panel to the start of the
+following row — under its label rather than its value.
+
+The block now draws one labelled row per fact in a column the rows share, wraps a
+long value into that value column, states the shared store once with each root's
+part past it, draws the executable as its place under the running root, and
+carries the meaning of the state the row is actually showing. `render` computes
+the panel's content width with the layout's own rule and the block context
+carries it, so the drawing no longer re-breaks text it was handed.
+
+- `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
+  `cargo test --locked` (15 suites, 273 library tests), `cargo build --locked`,
+  both `tests/terminal_smoke.py` scenarios and `openspec validate --all
+  --strict` (13/13) pass.
+- New regression `the_block_draws_facts_beside_their_labels_and_hangs_what_wraps`:
+  one `/nix/store/` in the block, the labelled rows in one column, no state
+  glossary, and a wrapped fact continued under the value column in the 90-column
+  drawing. Nine identity tests were re-pointed to the row vocabulary.
+
+Limit: at the narrowest side-by-side panel (28 content cells) a root longer than
+the value column still breaks inside its own token, continuing under the value
+column rather than under the label. Eliding the path was rejected, so the break
+is the honest one for a path that cannot fit.

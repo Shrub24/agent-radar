@@ -184,26 +184,46 @@ package as name-version (with a short hash only when two builds of one version
 must be told apart), the executable relative to that package, and a verdict only
 when there is one. Current draws nothing; stale is the mark with `(stale)` and
 the installed target; a different build says so; an unknown comparison keeps a
-short reason word. The whole roots, the whole path, the birth identity, each
-state's meaning, the descendant qualification and the whole reason a comparison
-or a value could not be made stay readable in one block opened on demand, so
-nothing was dropped for being short.
+short reason word.
 
 Rejected: keeping the current verdict as a fact (the absence of the mark already
 says it, and it cost the line `cpu` and `rss` share); the whole sentence as the
-unknown reason on the line (the word finds it, the block explains it); a per-fact
-reason column (a reason is not a value, so it is drawn under the value it
-qualifies and never paired with one); a fixed panel width for pairing (the page is
-built before it is laid out, and the fixed 28-cell threshold is honest at both
-widths until width-aware packing earns its plumbing); a glossary of only the row's
-own state (the block is closed by default, and the states it lists are the ones
-the row shows over a run).
+unknown reason on the line (the word finds it, the block explains it).
 
 The kernel state is drawn as one short enumerable name — running, sleeping, disk
 wait, stopped, traced, zombie, dead, idle, unknown — never a sentence, never
 animated, and never in the working or failed ink: the scheduler's state is not a
 verdict on the work underneath it, and a process flips between `running` and
 `sleeping` constantly.
+
+### 9. The block draws labelled rows, wrapped into their own column
+
+The first block was a list of prose lines whose labels varied with the facts
+present, so values did not line up; it repeated the store prefix on every root
+and on the executable; it printed a nine-line glossary of kernel states the row
+was not in; and a fact too long for the panel wrapped to the start of the
+following row, under the label rather than the value.
+
+The block now draws one labelled row per fact, in a column shared by the block's
+rows, and wraps a long value into the value column so its continuation reads as
+the same fact. The two roots are drawn as the part past the store they share,
+which is stated once, and the executable as its place under the running root:
+the whole path is three rows that name each piece once. The state row carries the
+meaning of the state the row is actually showing, so the glossary is gone.
+
+This needed the panel's content width before the page is built, which the page
+previously did not have. `render` computes it from the body width with the same
+rule the layout uses, and the block context carries it down; the drawing no
+longer has to re-break text it was handed.
+
+Rejected: a per-fact reason column (a reason is not a value, so it stays under
+the value it qualifies); keeping a fixed 28-cell pairing threshold in the metric
+section (it was chosen because the page was built before it was laid out, which
+is no longer the constraint it was; the threshold still pairs at every width the
+side-by-side panel is drawn at, so replacing it with the real column is a
+cleanup, not a correction); a prose sentence per long fact (what the reader
+called a wall); eliding a long path or eliding the middle of a root (an identity
+that cannot be read whole is not an identity).
 
 ## Risks / Trade-offs
 

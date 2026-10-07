@@ -20,6 +20,7 @@
 - [x] 3.1 Draw the observed command name, the full sanitized executable path, the running package identity, the installed counterpart identity and the unknown reason on the Processes page, for agent rows and for ordinary pane rows whose foreground evidence is current.
 - [x] 3.2 Keep a current identity inspectable, and never present the observed name, its arguments or the executable path as an invocation, an alias or a launcher; keep prompt and system-prompt arguments out entirely.
 - [x] 3.3 Add render regressions for a current bolt row, a stale bolt row, an unknown verdict with its reason, an ordinary pane row, an exec-replaced `pi` name shown as an observed name, and withholding for retained rows, stale or unavailable sources, shells and inconclusive foregrounds.
+- [x] 3.4 Draw the block as labelled rows in one column: the shared store stated once with each root's part past it, the executable as its place under the running root, long facts wrapped into the value column, and the state glossary cut to the state the row is showing.
 
 ## 4. Documentation and gates
 
