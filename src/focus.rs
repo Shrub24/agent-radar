@@ -17,14 +17,14 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
 
 use crate::observation::ObservationState;
-use crate::runtime::{RuntimeProvider, Target};
+use crate::runtime::{FocusOutcome, RuntimeProvider, Target};
 use crate::tree::{FleetTree, RowId, RowKind, TreeNode};
 
 /// A focus request running on its own thread.
 struct Request {
     /// Set by the owner; the worker turns it into a kill or an abandoned wait.
     cancel: Arc<AtomicBool>,
-    outcome: Receiver<Result<(), String>>,
+    outcome: Receiver<FocusOutcome>,
     worker: JoinHandle<()>,
 }
 
@@ -56,7 +56,7 @@ impl Focuser {
             thread::Builder::new()
                 .name("radar-focus".to_string())
                 .spawn(move || {
-                    let _ = sender.send(provider.focus(&target, &cancel));
+                    let _ = sender.send(provider.focus_outcome(&target, &cancel));
                 })
                 .expect("focus thread")
         };
@@ -68,7 +68,7 @@ impl Focuser {
     }
 
     /// The finished request's outcome, if one is waiting. Never blocks.
-    pub fn poll(&mut self) -> Option<Result<(), String>> {
+    pub fn poll(&mut self) -> Option<FocusOutcome> {
         let request = self.in_flight.as_mut()?;
         let outcome = match request.outcome.try_recv() {
             Ok(outcome) => outcome,
@@ -76,7 +76,7 @@ impl Focuser {
             // The worker always hands over exactly one outcome before
             // returning, so this is only reachable through a panic in it.
             Err(TryRecvError::Disconnected) => {
-                Err("the focus request stopped unexpectedly".to_string())
+                FocusOutcome::Unknown("the focus request stopped unexpectedly".to_string())
             }
         };
         let request = self.in_flight.take().expect("checked above");

@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_radar::bus::Listener;
+use agent_radar::runtime::RuntimeProvider;
 use agent_radar::{
     Action, App, Closer, Collector, CollectorConfig, Config, Confirmed, Focuser, Geometry,
-    HerdrConfig, HerdrRuntime, ManagedActions, ObservationState, PaneView, theme, ui,
+    HerdrConfig, ManagedActions, ObservationState, PaneView, control_plane, theme, ui,
 };
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -18,13 +19,28 @@ const USAGE: &str = "\
 radar — read-only fleet overview for local coding agents
 
 usage: radar [--print-config] [--help]
+       radar daemon [--help]
 
   --print-config   print the configuration in use, to copy and edit
   --help           this message
+  daemon           serve the control plane and stay up until signalled
 
 Configuration is read from `$RADAR_CONFIG`, else
 `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
 Radar draws without one.
+";
+
+const DAEMON_USAGE: &str = "\
+radar daemon — the control plane Radar talks to
+
+usage: radar daemon
+
+Serves one JSON request and one JSON response per line on the control socket at
+`$RADAR_CONTROL_SOCKET`, else `$XDG_RUNTIME_DIR/agent-radar/control.sock`, else
+`/tmp/agent-radar-<uid>/control.sock`, keeping one record per operation under
+`$RADAR_CONTROL_STATE`, else `$XDG_STATE_HOME/agent-radar/control`, else
+`~/.local/state/agent-radar/control`. Prints the socket it is serving on. Stops
+on SIGINT or SIGTERM, removing that socket file and leaving the records in place.
 ";
 
 fn main() -> io::Result<()> {
@@ -51,9 +67,53 @@ fn handle_arguments() -> Option<i32> {
             print!("{USAGE}");
             Some(0)
         }
+        Some("daemon") => Some(match std::env::args().nth(2).as_deref() {
+            Some("--help" | "-h") => {
+                print!("{DAEMON_USAGE}");
+                0
+            }
+            Some(other) => {
+                eprintln!("radar daemon: unknown argument `{other}`\n\n{DAEMON_USAGE}");
+                2
+            }
+            None => serve_daemon(),
+        }),
         Some(other) => {
             eprintln!("radar: unknown argument `{other}`\n\n{USAGE}");
             Some(2)
+        }
+    }
+}
+
+/// Serves the control plane until the process is signalled, and reports the
+/// socket it is on before it starts waiting.
+///
+/// Radar itself never starts this process: the daemon is the operator's to run,
+/// and a TUI that spawned a long-lived server on someone's behalf would be a
+/// surprise on their machine. The exit code is the shell's to read, so a daemon
+/// that could not bind says so and stops rather than serving nothing quietly.
+fn serve_daemon() -> i32 {
+    if let Err(diagnostic) = agent_radar::install_signal_handlers() {
+        eprintln!("radar daemon: {diagnostic}");
+        return 1;
+    }
+    let mut daemon = match agent_radar::Daemon::bind() {
+        Ok(daemon) => daemon,
+        Err(diagnostic) => {
+            eprintln!("radar daemon: {diagnostic}");
+            return 1;
+        }
+    };
+    println!(
+        "radar daemon: serving {} with records under {}",
+        daemon.path().display(),
+        daemon.state_dir().display()
+    );
+    match daemon.run() {
+        Ok(()) => 0,
+        Err(diagnostic) => {
+            eprintln!("radar daemon: {diagnostic}");
+            1
         }
     }
 }
@@ -74,8 +134,27 @@ fn load_config() -> Config {
     }
 }
 
+/// The runtime Radar will use this run, chosen and reported before anything is
+/// drawn.
+///
+/// The choice is made once: the daemon when it was configured and passed its
+/// handshake, the direct adapter otherwise. Nothing switches later, and nothing
+/// retries an operation the daemon may have accepted.
+fn selected_runtime(config: &Config) -> Arc<dyn RuntimeProvider> {
+    let selection = control_plane::select(&config.runtime, HerdrConfig::default());
+    if let Some(diagnostic) = &selection.diagnostic {
+        eprintln!("radar: {diagnostic}");
+    }
+    selection.provider
+}
+
 fn run() -> io::Result<()> {
-    theme::install(load_config());
+    let config = load_config();
+    theme::install(config.clone());
+    // The runtime is chosen before the terminal is taken over and before anything
+    // is collected or acted on, so the one line explaining a configured daemon
+    // that could not be used is readable rather than drawn over.
+    let runtime = selected_runtime(&config);
     let mut terminal = ratatui::try_init()?;
     enable_mouse_capture();
     // The panic path restores the terminal through the hook `try_init` installed;
@@ -85,9 +164,8 @@ fn run() -> io::Result<()> {
         disable_mouse_capture();
         restore_hook(info);
     }));
-    // One Herdr adapter, shared: the collector and the focuser read and act on
-    // the same runtime through the same seam.
-    let runtime = Arc::new(HerdrRuntime::new(HerdrConfig::default()));
+    // One runtime, shared: the collector, the focuser and the closer read and act
+    // on the same adapter through the same seam.
     let mut collector = Collector::new(CollectorConfig::default(), Arc::clone(&runtime));
     let mut focuser = Focuser::new(Arc::clone(&runtime));
     let mut closer = Closer::new(Arc::clone(&runtime));
@@ -134,7 +212,7 @@ fn run() -> io::Result<()> {
         // A focus request is answered on its own thread; applying the outcome
         // here is what puts a failure on the footer, and never waits on Herdr.
         if let Some(outcome) = focuser.poll() {
-            app.set_focus_message(outcome.err());
+            app.set_focus_message(outcome.diagnostic().map(str::to_string));
             dirty = true;
         }
         // A confirmed close is answered on its own thread too: input, collection

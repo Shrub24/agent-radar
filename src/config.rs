@@ -177,6 +177,45 @@ impl Default for Appearance {
     }
 }
 
+/// Which mux backend Radar talks to this run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeBackend {
+    /// The adapter in this process, as Radar has always run.
+    Direct,
+    /// A control daemon the operator started.
+    Daemon,
+}
+
+/// How Radar reaches the multiplexer.
+///
+/// The direct adapter is the default, so a machine that runs no daemon is
+/// unaffected by this key existing. `daemon` asks for the control plane, and
+/// Radar reports once and uses the direct adapter when that daemon cannot be
+/// used — it never starts one, and it never switches after an operation has
+/// been handed over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    pub backend: RuntimeBackend,
+    /// The daemon's socket, when the operator names one instead of accepting the
+    /// documented path order.
+    ///
+    /// A named socket is held to the rule `radar daemon` binds under: this
+    /// user's own socket, in a real directory of this user's with mode `0700`.
+    /// Radar checks that before it connects, and a layout the daemon could not
+    /// have bound — `/tmp/probe.sock` among them — is reported once and answered
+    /// by the direct adapter rather than connected to.
+    pub socket: Option<PathBuf>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            backend: RuntimeBackend::Direct,
+            socket: None,
+        }
+    }
+}
+
 /// The loaded configuration: defaults with any file's choices applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -186,6 +225,8 @@ pub struct Config {
     /// Program marks for pane rows, by program name. Unknown programs fall back
     /// to the pane's own mark, and a value of `"none"` removes a program's.
     pub processes: BTreeMap<String, String>,
+    /// Which mux backend to use, and where its daemon listens.
+    pub runtime: RuntimeConfig,
 }
 
 impl Default for Config {
@@ -195,6 +236,7 @@ impl Default for Config {
             brands: default_brands(),
             appearance: Appearance::default(),
             processes: default_processes(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -312,6 +354,30 @@ impl Config {
             }
             config.appearance.fps = fps;
         }
+        let runtime = file.runtime.unwrap_or_default();
+        if let Some(backend) = runtime.backend {
+            config.runtime.backend = match backend.trim().to_ascii_lowercase().as_str() {
+                "direct" => RuntimeBackend::Direct,
+                "daemon" => RuntimeBackend::Daemon,
+                other => {
+                    return Err(format!(
+                        "runtime.backend: `{other}` is not a backend; use `direct` or `daemon`"
+                    ));
+                }
+            };
+        }
+        if let Some(socket) = &runtime.socket {
+            // An empty path names nothing, and resolving it would silently fall
+            // back to a different socket than the one the user wrote.
+            if socket.trim().is_empty() {
+                return Err(
+                    "runtime.socket: an empty path names no socket; remove the key to use the \
+                     documented path"
+                        .to_string(),
+                );
+            }
+            config.runtime.socket = Some(PathBuf::from(socket.trim()));
+        }
         Ok(config)
     }
 
@@ -409,6 +475,30 @@ impl Config {
                 out.push_str(&format!("\n\"{program}\" = \"none\""));
             }
         }
+        let backend = match self.runtime.backend {
+            RuntimeBackend::Direct => "direct",
+            RuntimeBackend::Daemon => "daemon",
+        };
+        // The socket is written as a comment when none was set: the documented
+        // path order is the default, and naming a path here would override it.
+        let socket = match &self.runtime.socket {
+            Some(socket) => format!("socket = \"{}\"", socket.display()),
+            None => "# socket = \"/run/agent-radar/control.sock\"".to_string(),
+        };
+        out.push_str(&format!(
+            "\n\n# Which multiplexer Radar talks to. `direct` runs the adapter in this process;\n\
+             # `daemon` uses the control plane from a `radar daemon` you started, and falls\n\
+             # back to `direct` — saying so once — when that daemon is unreachable, is a\n\
+             # socket Radar may not trust, or speaks a protocol this build does not. Radar\n\
+             # never starts a daemon.\n\
+             [runtime]\n\
+             # `direct` or `daemon`\n\
+             backend = \"{backend}\"\n\
+             # the daemon's socket; leave it out for the documented path order. It must be\n\
+             # one the daemon could have bound: this user's own socket, in a real directory\n\
+             # of this user's with mode 0700\n\
+             {socket}"
+        ));
         out.push('\n');
         out
     }
@@ -572,6 +662,14 @@ struct FileConfig {
     brands: Option<BTreeMap<String, ColorSpec>>,
     appearance: Option<FileAppearance>,
     processes: Option<BTreeMap<String, String>>,
+    runtime: Option<FileRuntime>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileRuntime {
+    backend: Option<String>,
+    socket: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -824,5 +922,61 @@ htop = "none"
                 "{role}"
             );
         }
+    }
+
+    #[test]
+    fn the_direct_adapter_is_the_default_runtime() {
+        assert_eq!(RuntimeConfig::default().backend, RuntimeBackend::Direct);
+        assert_eq!(RuntimeConfig::default().socket, None);
+        // A file that names nothing keeps behaving as it did before the key
+        // existed, and so does one that names another section.
+        for document in ["", "[colors]\ndone = \"red\"\n", "[runtime]\n"] {
+            let config = Config::parse(document).expect("parses");
+            assert_eq!(config.runtime, RuntimeConfig::default(), "{document}");
+        }
+    }
+
+    #[test]
+    fn the_daemon_backend_and_its_socket_are_configurable() {
+        let config = Config::parse("[runtime]\nbackend = \"daemon\"\n").expect("parses");
+        assert_eq!(config.runtime.backend, RuntimeBackend::Daemon);
+        assert_eq!(config.runtime.socket, None, "the path order is the default");
+
+        let config =
+            Config::parse("[runtime]\nbackend = \"daemon\"\nsocket = \"/tmp/probe.sock\"\n")
+                .expect("parses");
+        assert_eq!(config.runtime.backend, RuntimeBackend::Daemon);
+        assert_eq!(
+            config.runtime.socket,
+            Some(PathBuf::from("/tmp/probe.sock"))
+        );
+
+        // The document prints the choice and reads back as the same config, with
+        // the socket left as a comment when the path order is in use.
+        let printed = config.to_document();
+        assert!(printed.contains("backend = \"daemon\""), "{printed}");
+        assert!(
+            printed.contains("socket = \"/tmp/probe.sock\""),
+            "{printed}"
+        );
+        assert_eq!(Config::parse(&printed).expect("round trips"), config);
+        let printed = Config::default().to_document();
+        assert!(printed.contains("backend = \"direct\""), "{printed}");
+        assert!(!printed.contains("\nsocket = "), "{printed}");
+        assert_eq!(
+            Config::parse(&printed).expect("round trips"),
+            Config::default()
+        );
+    }
+
+    #[test]
+    fn a_backend_it_does_not_know_says_so() {
+        let error = Config::parse("[runtime]\nbackend = \"tmux\"\n").expect_err("unknown");
+        assert!(error.contains("runtime.backend"), "{error}");
+        assert!(error.contains("tmux"), "{error}");
+        let error = Config::parse("[runtime]\nbackend = \"daemon\"\nsockett = \"/x\"\n")
+            .expect_err("unknown key");
+        assert!(error.contains("sockett"), "{error}");
+        assert!(Config::parse("[runtime]\nsocket = \"\"\n").is_err());
     }
 }

@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::model::{FleetObservation, ForegroundEvidence};
-use agent_radar::{CloseTarget, Focuser, RuntimeProvider, Target};
+use agent_radar::{CloseTarget, FocusOutcome, Focuser, RuntimeProvider, Target};
 
 /// How long one request may take before the test calls it stuck.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -55,15 +55,21 @@ impl RuntimeProvider for FakeRuntime {
     }
 
     fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
+        self.focus_outcome(target, cancel)
+            .diagnostic()
+            .map_or(Ok(()), |message| Err(message.to_string()))
+    }
+
+    fn focus_outcome(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
         self.seen.lock().expect("seen").push(target.clone());
         match &self.behavior {
-            Behavior::Succeed => Ok(()),
-            Behavior::Refuse(message) => Err(message.clone()),
+            Behavior::Succeed => FocusOutcome::Completed,
+            Behavior::Refuse(message) => FocusOutcome::Refused(message.clone()),
             Behavior::Block => {
                 while !cancel.load(Ordering::SeqCst) {
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err("focus cancelled".to_string())
+                FocusOutcome::Unknown("focus cancelled".to_string())
             }
         }
     }
@@ -74,7 +80,7 @@ impl RuntimeProvider for FakeRuntime {
 }
 
 /// Runs one request to its outcome, never waiting on the runtime itself.
-fn request(runtime: FakeRuntime, target: Target) -> Result<(), String> {
+fn request(runtime: FakeRuntime, target: Target) -> FocusOutcome {
     let mut focuser = Focuser::new(runtime);
     focuser.start(target);
     let deadline = Instant::now() + PATIENCE;
@@ -95,7 +101,7 @@ fn a_workspace_target_reaches_the_runtime() {
     let runtime = FakeRuntime::new(Behavior::Succeed);
     let seen = Arc::clone(&runtime.seen);
     let outcome = request(runtime, Target::Workspace("wA".into()));
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, FocusOutcome::Completed);
     assert_eq!(
         *seen.lock().expect("seen"),
         vec![Target::Workspace("wA".into())]
@@ -107,7 +113,7 @@ fn a_pane_target_reaches_the_runtime() {
     let runtime = FakeRuntime::new(Behavior::Succeed);
     let seen = Arc::clone(&runtime.seen);
     let outcome = request(runtime, Target::Pane("wA:p1".into()));
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, FocusOutcome::Completed);
     assert_eq!(
         *seen.lock().expect("seen"),
         vec![Target::Pane("wA:p1".into())]
@@ -121,8 +127,8 @@ fn a_refusal_is_reported_unchanged() {
     ));
     let outcome = request(runtime, Target::Pane("wA:p1".into()));
     assert_eq!(
-        outcome.expect_err("a refusal is a failure"),
-        "herdr refused to focus: pane wA:p1 not found"
+        outcome,
+        FocusOutcome::Refused("herdr refused to focus: pane wA:p1 not found".into())
     );
 }
 

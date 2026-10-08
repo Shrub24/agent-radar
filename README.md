@@ -36,8 +36,14 @@ python3 tests/terminal_smoke.py
 
 Herdr must be installed separately and available on `PATH` to observe a live
 fleet. It is not a build dependency. The dashboard stays usable and reports a
-source diagnostic if Herdr is unavailable. No daemon or additional runtime
-configuration is required. Version control uses **jj**.
+source diagnostic if Herdr is unavailable. Direct Herdr access remains the
+default; an optional local `radar daemon` provides backend-neutral physical mux
+wrapping for Radar and extension clients. The operator starts it separately;
+Radar does not start or supervise it. Start with the [daemon consumer guide](docs/daemon.md)
+for the API, lifecycle and adoption path. See the [control-plane protocol and
+extension examples](docs/control-plane.md) and the direct [agent-registration
+contract and publisher example](docs/agent-registration.md). Version control
+uses **jj**.
 
 ## Installation (Nix)
 
@@ -883,7 +889,11 @@ must leave Radar usable and say why on the last line. Real
 runtime/UX acceptance is deliberately manual; automated checks use controlled
 fixtures and executables.
 
-Direct semantic feeds, process/resource trees, daemon clients and other mux
-adapters are outside this milestone, as is every action on Herdr beyond focus
-and the unmanaged pane/tab close. Managed close and restart are not Herdr
-actions; they are requests to the worker's own owner.
+The local control plane now wraps backend-neutral physical mux observations and
+primitives (focus, guarded unmanaged close, creation, literal input, bounded
+output reads and curated metadata reporting); Herdr is the production backend
+today. This does not add agent/session authority, a publisher registry, inferred
+resume/restart, topology, or a production tmux backend. Managed-worker close and
+restart remain requests to the worker's owner, not mux operations. The daemon's
+[protocol reference](docs/control-plane.md) documents capabilities, durable
+operation records, uncertainty and extension-porting examples.

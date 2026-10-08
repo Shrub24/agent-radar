@@ -44,6 +44,18 @@ implemented, verified and archived. Its gates are recorded in that change's
 `verification.md`. Keep the next work separate from lifecycle and state
 contracts.
 
+The active `mux-control-plane` change starts with Herdr wrapping: a Radar-owned
+daemon exposes inventory, focus, guarded close, creation/splitting, input, output
+reads and metadata reporting behind a backend-neutral interface. Durable requests
+avoid replay after ambiguous effects; current owner controls stay intact. Radar
+keeps its direct adapter as an explicit mode/startup fallback, never as a retry
+of an uncertain operation. pi-extensions can port mux calls onto this interface.
+
+Agent/session awareness, lead recovery, stale restart plans, a publisher registry
+and parent/child topology remain future work over this seam. tmux is a later backend,
+not a prerequisite for the Herdr wrapper. The daemon's existence does not settle
+assignment authority or prove that a relaunched process recovered its children.
+
 In priority order:
 
 1. **Lead restart and recovery.** Establish safe lead/standalone restart and
@@ -107,9 +119,14 @@ managed children unless their owner explicitly includes them in the plan.
 
 ### Structured activity, reasons and outcomes
 
+**Ownership split:** Pi supplies execution evidence; Herdsman supplies assignment
+authority; the coordinator supplies backend-independent physical observations
+and controls. Keep those channels distinct even when one daemon transports all
+three. Execution status does not certify assignment delivery or restart eligibility.
+
 A process being idle does not mean its last turn succeeded, and one word such
-as `blocked` cannot describe every reason an agent needs attention. Owners
-should publish distinct facts rather than make Radar infer them from output:
+as `blocked` cannot describe every reason an agent needs attention. Prefer Pi's
+upstream evidence and owner reports over inferring state from terminal text:
 
 | Activity | Reason or outcome | Action |
 | --- | --- | --- |
@@ -125,11 +142,45 @@ notice does not resolve a pending question. Available actions must be advertised
 capabilities, not promises that Radar can issue them yet. Preserve coarse token
 fallback where richer reporting is absent; missing detail stays unknown.
 
+### Upstream Pi Program status (OSC 7501)
+
+Plan execution reporting around Pi 1.1.0's Program status rather than duplicating
+its state inference in extensions. Verified upstream at commit
+`1cedd32724abfcb0915f76cc61b6827e2c16dbad`:
+
+- Wire states: `idle`, `working`, `blocked`, `done`, `error`, plus `clear` to remove
+  a report. Preserve `error` on the wire even if the UI calls it failed.
+- `blocked` can carry `permission`, `question` or `auth`; optional messages are
+  session names, dialog titles or the first line of an error, not prompts or model
+  output. Treat those messages as potentially sensitive diagnostics nonetheless.
+- Runs and compaction report working; unretried run errors report error. Successful
+  retries supersede earlier errors, and cancellation settles to idle. These are
+  execution outcomes, not Herdsman assignment completion or recovery evidence.
+- Pi emits after a supporting terminal answers the OSC query; `PI_PROGRAM_STATUS=1`
+  forces emission and `=0` disables it. Upstream explicitly says tmux/screen do not
+  forward reports. Forcing emission is not proof that a backend can observe them.
+- Current local Pi builds do not yet include this addition (user report). Keep
+  existing evidence/fallback until a deployed build and adapter prove support.
+
+The future coordinator should expose structured program status as an optional,
+source-labelled observation with freshness and pane/process-incarnation binding.
+Test support through the backend's structured terminal parser/event API; do not
+scrape scrollback or seize the pane's PTY. A tmux route needs an explicit capture
+mechanism or a Pi publisher bridge. Missing support is unknown, not idle; clear,
+pane reuse, process exit and reconnect must not carry an old failure to a new process.
+The current Herdr-wrapping slice does not implement an OSC parser or a new publisher.
+
+References (pinned originals):
+- [Terminal setup: Program status](https://github.com/badlogic/pi-mono/blob/1cedd32724abfcb0915f76cc61b6827e2c16dbad/packages/coding-agent/docs/terminal-setup.md#program-status)
+- [Reporter semantics](https://github.com/badlogic/pi-mono/blob/1cedd32724abfcb0915f76cc61b6827e2c16dbad/packages/coding-agent/src/modes/interactive/program-status-reporter.ts)
+- [OSC codec and fields](https://github.com/badlogic/pi-mono/blob/1cedd32724abfcb0915f76cc61b6827e2c16dbad/packages/tui/src/program-status.ts)
+
 ### Direct owner reporting and a lifecycle/state daemon
 
 The initial migration complements Herdr:
 
-- Herdr remains the mux adapter for pane inventory, locations and focus.
+- The coordinator wraps Herdr as the first backend for physical pane inventory,
+  locations, focus and controls, with a backend-neutral port for consumers.
 - Pi/Herdsman and background-task owners publish lifecycle facts directly;
   Radar joins them by exact session/run/process identities, with pane location
   kept separate from agent ownership.
@@ -145,10 +196,10 @@ The initial migration complements Herdr:
 - Background-task observation remains non-consuming. Neither state display nor
   a new transport may acknowledge a result or compete with the agent's `get`.
 
-Specify direct reporting and control/recovery contracts with pi-extensions
-before choosing the daemon implementation. Migrate one reporting/control
-surface at a time with an explicit fallback; do not silently turn the current
-metadata-only task bus into a lifecycle command channel.
+Start with the physical mux wrappers in `mux-control-plane`; develop direct
+execution reporting and assignment-aware recovery with pi-extensions afterwards.
+Migrate one surface at a time with an explicit fallback; do not silently turn the
+current metadata-only task bus into a lifecycle command channel.
 
 ### Verification and shipping gates
 

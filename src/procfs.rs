@@ -635,7 +635,7 @@ fn unavailable(reason: &str) -> DescendantResources {
 /// cannot mix two incarnations. The command name sits in parentheses and may
 /// itself contain spaces and parentheses, which is why the fields are counted
 /// from the *last* `)` rather than by splitting the whole line.
-struct Stat {
+pub(crate) struct Stat {
     /// The kernel's name for the process (field 2), between the parentheses it
     /// writes it in: it may hold spaces and parentheses of its own, so it runs
     /// from the first `(` to the last `)`.
@@ -675,6 +675,15 @@ impl Stat {
             start_ticks: field(22)?.parse().ok()?,
             rss_pages: field(24)?.parse().ok()?,
         })
+    }
+
+    /// Extracts the process birth stamp from a stat line. This shares the
+    /// sampler's proc(5) parser so verification and sampling interpret PID reuse
+    /// identically.
+    pub(crate) fn birth_identity(text: &str) -> Option<(i32, u64)> {
+        let pid = text.split_once(' ')?.0.parse().ok()?;
+        let start_ticks = Self::parse(text)?.start_ticks;
+        Some((pid, start_ticks))
     }
 
     /// Resident set size in bytes, or `None` when the kernel's page count is

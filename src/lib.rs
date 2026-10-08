@@ -6,6 +6,7 @@ pub mod bus;
 pub mod collector;
 pub mod config;
 pub mod control;
+pub mod control_plane;
 pub mod focus;
 pub mod herdr;
 pub mod lifecycle;
@@ -27,6 +28,11 @@ pub use config::{Config, Palette};
 pub use control::{
     ControlError, ControlRequest, ControlResult, NewRequest, Outcome, OwnerControl, RequestState,
 };
+pub use control_plane::{
+    Category, Code, Daemon, Derived, ErrorBody, MAX_LINE_BYTES, PROTOCOL_VERSION, RecordState,
+    Refusal, Request, RequestOutcome, RequestRecord, Response, Store, decode_request,
+    install_signal_handlers, socket_path, state_dir,
+};
 pub use focus::Focuser;
 pub use herdr::{DecodeError, HerdrConfig, HerdrRuntime, decode_process_info, decode_snapshot};
 pub use lifecycle::{
@@ -38,7 +44,7 @@ pub use model::{
     SessionUuid, Tab, TerminalMode, Workspace,
 };
 pub use observation::{ObservationState, RetainedAgent, RetentionBasis, SourceFreshness};
-pub use runtime::{CloseTarget, RuntimeProvider, Target};
+pub use runtime::{CloseTarget, FocusOutcome, RuntimeProvider, Target};
 pub use tree::{
     AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskProjection, TaskRow, TaskSource,
     TreeRow,

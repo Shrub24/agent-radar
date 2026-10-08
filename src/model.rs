@@ -7,10 +7,36 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
+mod option_duration_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(duration) => u64::try_from(duration.as_millis())
+                .map(Some)
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer),
+            None => Option::<u64>::None.serialize(serializer),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Duration>, D::Error> {
+        Option::<u64>::deserialize(deserializer).map(|value| value.map(Duration::from_millis))
+    }
+}
+
 /// Connector-scoped runtime location: Herdr workspace, tab and pane identifiers.
 ///
 /// Pane identity is a runtime location detail; it is never an agent identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     pub workspace_id: String,
     pub tab_id: String,
@@ -21,7 +47,8 @@ pub struct Location {
 ///
 /// Only explicitly supplied UUID metadata is ever turned into this type —
 /// session file paths are never scanned for embedded UUIDs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SessionUuid(String);
 
 impl SessionUuid {
@@ -58,7 +85,8 @@ impl SessionUuid {
 ///
 /// Identity is separate from [`Location`]: the same session may move between
 /// panes, and a pane may host different sessions over time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum SessionIdentity {
     /// An explicit UUID identity, reported as `agent_session.kind == "id"`.
     Uuid(SessionUuid),
@@ -77,7 +105,7 @@ pub enum SessionIdentity {
 ///
 /// Used only for ownership joins (worker → owner). Lineage is never used as
 /// session identity, and absent or malformed tokens yield no lineage at all.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lineage {
     pub session: SessionUuid,
     pub parent: Option<SessionUuid>,
@@ -89,7 +117,8 @@ pub struct Lineage {
 /// availability for new work, result delivery or safe lifecycle actions.
 /// Unrecognized values are preserved verbatim in [`RuntimeStatus::Other`] so a
 /// source change never fails an otherwise valid inventory.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RuntimeStatus {
     Idle,
     Working,
@@ -124,7 +153,7 @@ impl std::fmt::Display for RuntimeStatus {
 }
 
 /// A Herdr workspace: the first display grouping for the fleet tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub workspace_id: String,
     pub label: Option<String>,
@@ -132,7 +161,7 @@ pub struct Workspace {
 }
 
 /// A Herdr tab within a workspace; shown as location detail, not a tree level.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tab {
     pub tab_id: String,
     pub workspace_id: String,
@@ -145,7 +174,7 @@ pub struct Tab {
 /// `label` is the pane's declared label, `title` its stripped terminal title;
 /// either may be absent, and [`Pane::display_name`] defines the fallback used
 /// by presentation rows.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pane {
     pub location: Location,
     pub label: Option<String>,
@@ -168,7 +197,8 @@ impl Pane {
 /// or tool call is in flight, `Blocked` says the assignment waits on its owner,
 /// and `Waiting` says the turn has yielded while work it depends on is
 /// unresolved. Values are additive, so an unrecognised one is preserved.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SemanticState {
     Idle,
     Working,
@@ -215,7 +245,8 @@ impl SemanticState {
 ///
 /// Kept apart from [`RuntimeStatus`] so the details panel can say which source
 /// a state came from, while presentation has one vocabulary to draw.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentState {
     Idle,
     Working,
@@ -293,7 +324,7 @@ impl From<&RuntimeStatus> for AgentState {
 /// additive, so an absent key means unavailable rather than a default.
 /// [`Self::session_name`] is the source's human name and is deliberately not an
 /// identity — identity lives in [`AgentObservation::session`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HerdsmanFacts {
     /// The role the agent runs as: a lead role, or a worker's agent definition.
     pub role: Option<String>,
@@ -325,6 +356,7 @@ pub struct HerdsmanFacts {
     /// How long the active assignment had been running when it was observed.
     /// Measured at observation time from Herdsman's own start, because a
     /// presentation that had to interpret a timestamp would need a clock.
+    #[serde(with = "option_duration_millis")]
     pub assigned_for: Option<Duration>,
     /// The owner's projection of this agent's state, while it is published.
     pub state: Option<SemanticState>,
@@ -446,7 +478,7 @@ impl HerdsmanFacts {
 }
 
 /// A normalized observation of one agent, keyed in the inventory by its pane.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentObservation {
     pub location: Location,
     /// Reported agent name (for example `"pi"`), if any.
@@ -515,7 +547,7 @@ impl AgentObservation {
 }
 
 /// One successful inventory: all workspaces, tabs, panes and reported agents.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetObservation {
     pub workspaces: Vec<Workspace>,
     pub tabs: Vec<Tab>,
@@ -549,7 +581,8 @@ impl FleetObservation {
 // pane's evidence for a difference no held-in-memory set notices: there is one
 // of these per pane, not one per process sampled.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ForegroundEvidence {
     /// The pane shell owns the foreground process group (shell PID evidence).
     Shell,
@@ -574,10 +607,11 @@ fn base_name(value: &str) -> &str {
 
 /// What this machine knows about the process holding a pane's foreground,
 /// beyond what the runtime reports.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalFacts {
     /// How long the process has been alive, measured from its own start time
     /// rather than from when Radar first saw it.
+    #[serde(with = "option_duration_millis")]
     pub running_for: Option<Duration>,
     /// What it has done to the terminal.
     pub terminal: TerminalMode,
@@ -598,7 +632,7 @@ pub struct LocalFacts {
 /// are what make two readings comparable — counters may only be subtracted
 /// from an earlier reading of the same identity, and a difference taken across
 /// two of them measures neither process.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     /// The boot this process started in, as the kernel reports it.
     pub boot_id: String,
@@ -618,7 +652,7 @@ pub struct ProcessIdentity {
 /// the process, so a sample never mixes two incarnations; RSS is that process's
 /// resident set, in which pages shared with another process are counted here as
 /// well.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessResources {
     /// The incarnation these readings belong to.
     pub identity: ProcessIdentity,
@@ -644,7 +678,8 @@ pub struct ProcessResources {
 /// difference, so an incomplete total can never be read as a complete zero, and
 /// the reason travels with it because the reader has to know which members are
 /// missing to know what the number is worth.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Total<T> {
     /// Every member of the set contributed to it.
     Complete(T),
@@ -663,7 +698,7 @@ pub enum Total<T> {
 /// incarnation, since a pid alone names a different process once the kernel
 /// reuses it. The name is the kernel's own short name for the process, which is
 /// neither the arguments it was started with nor a claim about what started it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescendantSample {
     /// The incarnation this reading belongs to.
     pub identity: ProcessIdentity,
@@ -692,7 +727,7 @@ pub struct DescendantSample {
 /// read once, and RSS is summed per process, so pages shared between two
 /// descendants, or between a descendant and its ancestor, are counted once for
 /// every process that maps them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescendantResources {
     /// How many processes the scan observed beneath the root. `None` when none
     /// could be enumerated at all.
@@ -716,7 +751,8 @@ pub struct DescendantResources {
 /// test can assert. `12.5%` of one CPU is `1_250`. It measures the process
 /// rather than the machine, so a process that used two CPUs for a whole
 /// interval is `20_000`, not `100%`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CpuPercent(u32);
 
 impl CpuPercent {
@@ -737,7 +773,8 @@ impl CpuPercent {
 /// only what the scheduler is doing with it: a sleeping process may be waiting
 /// on a socket or on nothing, and a zombie has already exited. It is not
 /// activity, not progress and not a verdict on the work underneath.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ProcessState {
     /// Running, or waiting its turn on a CPU.
     Running,
@@ -779,7 +816,8 @@ impl ProcessState {
 
 /// How a foreground process's running executable compares with the installed
 /// program it would run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BinaryFreshness {
     /// The running executable is the installed program, or another file inside
     /// the same installation as the one installed now.
@@ -800,7 +838,8 @@ pub enum BinaryFreshness {
 /// not installed, an installed entrypoint whose payload cannot be identified,
 /// an executable that cannot be read, or a running file that is not the program
 /// in question. The words a row uses are the row's, not this type's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BinaryUnknown {
     /// No installed counterpart of that name is on the search path.
     NoCounterpart,
@@ -824,7 +863,7 @@ pub enum BinaryUnknown {
 /// by file name and keeps the earlier meaning. `executable` is the running file
 /// itself, which the kernel reports and nobody invokes, kept so a row can name
 /// what is running even when no verdict was reached.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryIdentity {
     pub freshness: BinaryFreshness,
     /// The installation the running executable belongs to. `None` when its
@@ -846,7 +885,8 @@ pub struct BinaryIdentity {
 /// command that prints and exits leaves them alone however long it runs. That
 /// is the difference between an editor someone is working in and a build in
 /// progress, and it is the only signal of the kind the kernel offers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TerminalMode {
     /// Raw mode, no echo: the program is drawing the screen itself.
     FullScreen,

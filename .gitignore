@@ -1,6 +1,10 @@
 # Cargo build output
 /target
 
+# Python example/test bytecode
+__pycache__/
+*.pyc
+
 # Delegation briefs and evidence written by agents working in this repo
 /.pi-herdsman
 

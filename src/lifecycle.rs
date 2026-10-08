@@ -23,12 +23,14 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::control::{self, ControlRequest, ControlResult, NewRequest, OwnerControl, RequestState};
 use crate::model::{
     AgentObservation, AgentState, FleetObservation, Lineage, SemanticState, SessionIdentity,
 };
 use crate::observation::RetainedAgent;
-use crate::runtime::{CloseTarget, RuntimeProvider};
+use crate::runtime::{CloseOutcome, CloseTarget, RuntimeProvider};
 use crate::theme;
 
 /// Whether a location is known to be outside Pi Herdsman's ownership.
@@ -126,7 +128,7 @@ fn stricter(a: Containment, b: Containment) -> Containment {
 }
 
 /// A confirmed direct close, frozen at confirmation time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseRequest {
     pub target: CloseTarget,
     /// The observed identity frozen when the operator confirmed. The worker
@@ -140,7 +142,7 @@ pub struct CloseRequest {
 /// Only identity-bearing fields: the agent kind, its session, its ownership
 /// lineage and its owner-published label and run. Display titles are
 /// deliberately absent, so a cosmetic retitle is not a new occupant.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentIdentity {
     pub name: Option<String>,
     pub session: Option<SessionIdentity>,
@@ -151,7 +153,7 @@ pub struct AgentIdentity {
 }
 
 /// One pane and what occupied it when the target was frozen.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneIdentity {
     pub pane_id: String,
     pub occupant: Option<AgentIdentity>,
@@ -162,7 +164,8 @@ pub struct PaneIdentity {
 /// A pane target carries that pane's occupant; a tab target carries the whole
 /// observed member set, so a member added, removed or replaced is drift even
 /// when every member is individually unmanaged.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TargetIdentity {
     Pane(PaneIdentity),
     Tab {
@@ -310,14 +313,32 @@ impl Drop for Closer {
     }
 }
 
-/// One confirmed close: take a fresh inventory, prove the target is still
-/// positively unmanaged, then ask the runtime to close it.
-fn run(
-    provider: &dyn RuntimeProvider,
-    request: &CloseRequest,
-    cancel: &AtomicBool,
-) -> Result<String, String> {
-    let inventory = provider.inventory(cancel)?;
+/// What one guarded direct close established.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectClose {
+    /// The runtime reported the close performed.
+    Completed,
+    /// Refused before dispatch, or positively rejected by the runtime.
+    Refused(String),
+    /// Dispatch or completion may have happened without a trustworthy answer.
+    Unknown(String),
+}
+
+/// The policy a guarded direct close applies to one fresh inventory: the target
+/// still exists, still holds the frozen identity, and is still positively
+/// unmanaged. `Err` is the message a user reads; nothing here dispatches.
+///
+/// The check and the close are not atomic: a location can become managed
+/// between this verdict and the runtime acting on it.
+pub fn guard(inventory: &FleetObservation, request: &CloseRequest) -> Result<(), String> {
+    let described = request.target.description();
+    // A wire caller can name a target and an identity that disagree; every
+    // later check reads the identity, so they must describe one location.
+    if request.identity.target() != request.target {
+        return Err(format!(
+            "{described} does not match the frozen identity's target: not closing"
+        ));
+    }
     match &request.target {
         CloseTarget::Pane(pane_id) if inventory.pane(pane_id).is_none() => {
             return Err(format!("pane {pane_id} is gone: nothing to close"));
@@ -327,20 +348,51 @@ fn run(
         }
         _ => {}
     }
-    let described = request.target.description();
-    if !matches(&inventory, &request.identity) {
+    if !matches(inventory, &request.identity) {
         return Err(format!("{described} changed: nothing was closed"));
     }
-    match target(&inventory, &request.target) {
-        Containment::Unmanaged => provider
-            .close(&request.target, cancel)
-            .map(|()| format!("closed {described}")),
+    match target(inventory, &request.target) {
+        Containment::Unmanaged => Ok(()),
         Containment::Managed => Err(format!(
             "{described} is managed by its owner: direct close refused"
         )),
         Containment::Uncertain => Err(format!(
             "{described} cannot be verified as unmanaged: not closing"
         )),
+    }
+}
+
+/// One confirmed close: take a fresh inventory, prove the target is still
+/// positively unmanaged, then ask the runtime to close it.
+pub fn close_unmanaged(
+    provider: &dyn RuntimeProvider,
+    request: &CloseRequest,
+    cancel: &AtomicBool,
+) -> DirectClose {
+    let inventory = match provider.inventory(cancel) {
+        Ok(inventory) => inventory,
+        Err(message) => return DirectClose::Refused(message),
+    };
+    if let Err(message) = guard(&inventory, request) {
+        return DirectClose::Refused(message);
+    }
+    match provider.close_outcome(&request.target, cancel) {
+        CloseOutcome::Completed => DirectClose::Completed,
+        CloseOutcome::Refused(message) => DirectClose::Refused(message),
+        CloseOutcome::Unknown(message) => DirectClose::Unknown(message),
+    }
+}
+
+/// The operator-facing form of [`close_unmanaged`]: the same policy and the
+/// same messages, collapsed to what Radar's own close worker reports.
+fn run(
+    provider: &dyn RuntimeProvider,
+    request: &CloseRequest,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    match close_unmanaged(provider, request, cancel) {
+        DirectClose::Completed => Ok(format!("closed {}", request.target.description())),
+        DirectClose::Refused(message) | DirectClose::Unknown(message) => Err(message),
     }
 }
 

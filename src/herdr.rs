@@ -8,12 +8,14 @@
 //!
 //! [`HerdrRuntime`] is the production [`RuntimeProvider`], owning what only
 //! Herdr needs: the executable and the command deadline (`HerdrConfig`), the
-//! CLI arguments and decoders, socket discovery, the `pane.focus` request and
-//! its answer, and the bounded runner that drains both pipes and kills and
-//! reaps a command that stalls or is cancelled. Everything above the seam
-//! passes a provider around instead.
+//! CLI arguments and decoders, socket discovery, the socket requests that
+//! focus, create, send input and read pane output with their answers, and the
+//! bounded runner that drains both pipes and kills and reaps a command that
+//! stalls or is cancelled. Everything above the seam passes a provider around
+//! instead.
 
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -27,7 +29,12 @@ use crate::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Location, Pane,
     RuntimeStatus, SemanticState, SessionIdentity, SessionUuid, Tab, Workspace,
 };
-use crate::runtime::{CloseTarget, RuntimeProvider, Target};
+use crate::runtime::{
+    CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation, FocusOutcome,
+    InputOutcome, InputPayload, InputRequest, OutputOutcome, OutputRead, OutputRequest,
+    OutputSource, ReportOutcome, ReportRequest, ReportTarget, RuntimeProvider, SplitDirection,
+    Target,
+};
 
 /// Metadata tokens carrying explicit pi-herdsman ownership UUIDs.
 const LINEAGE_SESSION_TOKEN: &str = "pi_herdsman_session";
@@ -480,6 +487,27 @@ impl HerdrRuntime {
 }
 
 impl RuntimeProvider for HerdrRuntime {
+    /// What this adapter implements. Creation, input and output reads are the
+    /// schema's `workspace.create`/`tab.create`/`pane.split`,
+    /// `pane.send_text`/`pane.send_keys` and `pane.read`; a read is a snapshot
+    /// with a revision and a truncation flag and no cursor, so it consumes
+    /// nothing and advertising it is honest. Reporting is the schema's
+    /// `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`
+    /// and `workspace.report_metadata`, each a caller's own facts forwarded with
+    /// nothing derived from them.
+    fn capabilities(&self) -> &'static [&'static str] {
+        &[
+            "observe",
+            "process_info",
+            "focus",
+            "close",
+            "creation",
+            "input",
+            "output",
+            "reporting",
+        ]
+    }
+
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {
         let stdout = run(&self.config, &["api", "snapshot"], cancel)?;
         decode_snapshot(&stdout)
@@ -498,29 +526,230 @@ impl RuntimeProvider for HerdrRuntime {
     }
 
     fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
-        match target {
-            // A workspace is focused by id through the CLI.
-            Target::Workspace(workspace_id) => {
-                run(&self.config, &["workspace", "focus", workspace_id], cancel).map(|_| ())
-            }
-            // Pane focus has no CLI form by id (`herdr pane focus` moves by
-            // direction), so it uses the socket API's `pane.focus` request.
+        self.focus_outcome(target, cancel)
+            .diagnostic()
+            .map_or(Ok(()), |message| Err(message.to_string()))
+    }
+
+    fn focus_outcome(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
+        let outcome = match target {
+            Target::Workspace(workspace_id) => self.focus_workspace(workspace_id, cancel),
             Target::Pane(pane_id) => self.focus_pane(pane_id, cancel),
-        }
+        };
+        outcome.unwrap_or_else(Failure::into_focus)
     }
 
     fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
+        self.close_outcome(target, cancel)
+            .diagnostic()
+            .map_or(Ok(()), |message| Err(message.to_string()))
+    }
+
+    fn close_outcome(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
         // Herdr's documented grammar closes a location by id: `pane close` or
         // `tab close`. The adapter owns the grammar; the seam only names which
-        // normalized location.
-        match target {
-            CloseTarget::Pane(pane_id) => {
-                run(&self.config, &["pane", "close", pane_id], cancel).map(|_| ())
-            }
-            CloseTarget::Tab(tab_id) => {
-                run(&self.config, &["tab", "close", tab_id], cancel).map(|_| ())
-            }
+        // normalized location. The CLI both connects and dispatches, so a
+        // failure cannot prove the close was never applied: it is unknown.
+        let closed = match target {
+            CloseTarget::Pane(pane_id) => run(&self.config, &["pane", "close", pane_id], cancel),
+            CloseTarget::Tab(tab_id) => run(&self.config, &["tab", "close", tab_id], cancel),
+        };
+        closed
+            .map(|_| CloseOutcome::Completed)
+            .unwrap_or_else(CloseOutcome::Unknown)
+    }
+
+    fn create(&self, request: &CreateRequest, cancel: &AtomicBool) -> CreateOutcome {
+        // The schema's creation requests, each answering with the identities it
+        // created. The caller's `focus` is passed as a boolean rather than left
+        // to the CLI, so "do not steal the operator's focus" is stated once.
+        let (method, params) = match request {
+            CreateRequest::Workspace { focus } => ("workspace.create", json!({ "focus": focus })),
+            CreateRequest::Tab {
+                workspace_id,
+                focus,
+            } => (
+                "tab.create",
+                json!({ "workspace_id": workspace_id, "focus": focus }),
+            ),
+            CreateRequest::PaneSplit {
+                pane_id,
+                direction,
+                focus,
+            } => (
+                "pane.split",
+                json!({
+                    "target_pane_id": pane_id,
+                    "direction": match direction {
+                        SplitDirection::Right => "right",
+                        SplitDirection::Down => "down",
+                    },
+                    "focus": focus,
+                }),
+            ),
+        };
+        match self.exchange(method, params, cancel) {
+            Ok(answer) => CreateOutcome::Completed(created_from(&answer)),
+            Err(failure) => failure.into_create(),
         }
+    }
+
+    fn input(&self, request: &InputRequest, cancel: &AtomicBool) -> InputOutcome {
+        // Literal text and named keys are separate schema requests, and neither
+        // is read by a shell: `pane.send_text` writes bytes to the pane,
+        // `pane.send_keys` presses keys Herdr names.
+        let (method, params) = match &request.payload {
+            InputPayload::Text { text } => (
+                "pane.send_text",
+                json!({ "pane_id": request.pane_id, "text": text }),
+            ),
+            InputPayload::Keys { keys } => (
+                "pane.send_keys",
+                json!({ "pane_id": request.pane_id, "keys": keys }),
+            ),
+        };
+        match self.exchange(method, params, cancel) {
+            Ok(_) => InputOutcome::Completed,
+            Err(failure) => failure.into_input(),
+        }
+    }
+
+    fn output(&self, request: &OutputRequest, cancel: &AtomicBool) -> OutputOutcome {
+        let mut params = json!({
+            "pane_id": request.pane_id,
+            "source": match request.source {
+                OutputSource::Visible => "visible",
+                OutputSource::Recent => "recent",
+                OutputSource::RecentUnwrapped => "recent_unwrapped",
+                OutputSource::Detection => "detection",
+            },
+            "format": if request.ansi { "ansi" } else { "text" },
+            // Plain text is asked for unstyled rather than stripped afterwards,
+            // so the answer is exactly what the read was for.
+            "strip_ansi": !request.ansi,
+        });
+        if let Some(lines) = request.lines {
+            params["lines"] = json!(lines);
+        }
+        match self.exchange("pane.read", params, cancel) {
+            Ok(answer) => decode_read(&answer, &request.pane_id),
+            Err(failure) => failure.into_output(),
+        }
+    }
+
+    fn report(&self, request: &ReportRequest, cancel: &AtomicBool) -> ReportOutcome {
+        // The schema's reporting requests, one per family. Every value is the
+        // caller's: an absent optional is left out rather than sent as a guess,
+        // and the sequence travels as the schema's `seq`.
+        let (method, params) = match request {
+            ReportRequest::State(report) => {
+                let mut params = json!({
+                    "pane_id": report.pane_id,
+                    "source": report.source,
+                    "agent": report.agent,
+                    "state": report.state.as_str(),
+                });
+                set(&mut params, "message", report.message.as_deref());
+                set_sequence(&mut params, report.sequence);
+                ("pane.report_agent", params)
+            }
+            ReportRequest::Session(report) => {
+                let mut params = json!({
+                    "pane_id": report.pane_id,
+                    "source": report.source,
+                    "agent": report.agent,
+                });
+                set(
+                    &mut params,
+                    "agent_session_id",
+                    report.session_id.as_deref(),
+                );
+                set(
+                    &mut params,
+                    "agent_session_path",
+                    report.session_path.as_deref(),
+                );
+                set(
+                    &mut params,
+                    "session_start_source",
+                    report.session_start_source.as_deref(),
+                );
+                set_sequence(&mut params, report.sequence);
+                ("pane.report_agent_session", params)
+            }
+            ReportRequest::Metadata(report) => {
+                let (location, id) = match &report.target {
+                    ReportTarget::Pane { pane_id } => ("pane_id", pane_id),
+                    ReportTarget::Workspace { workspace_id } => ("workspace_id", workspace_id),
+                };
+                let pane = matches!(report.target, ReportTarget::Pane { .. });
+                let mut params = json!({
+                    "source": report.source,
+                    "tokens": report.tokens,
+                });
+                params[location] = json!(id);
+                if pane {
+                    set(&mut params, "agent", report.agent.as_deref());
+                    set(
+                        &mut params,
+                        "applies_to_source",
+                        report.applies_to_source.as_deref(),
+                    );
+                    set(&mut params, "title", report.title.as_deref());
+                    set(
+                        &mut params,
+                        "display_agent",
+                        report.display_agent.as_deref(),
+                    );
+                    if !report.state_labels.is_empty() {
+                        params["state_labels"] = json!(report.state_labels);
+                    }
+                    // A clear flag says "take this back"; `false` is the schema's
+                    // own default, so only a set flag travels.
+                    for (flag, cleared) in [
+                        ("clear_title", report.clear_title),
+                        ("clear_display_agent", report.clear_display_agent),
+                        ("clear_state_labels", report.clear_state_labels),
+                    ] {
+                        if cleared {
+                            params[flag] = json!(true);
+                        }
+                    }
+                    set_ttl(&mut params, report.ttl_ms);
+                    set_sequence(&mut params, report.sequence);
+                    ("pane.report_metadata", params)
+                } else {
+                    set_ttl(&mut params, report.ttl_ms);
+                    set_sequence(&mut params, report.sequence);
+                    ("workspace.report_metadata", params)
+                }
+            }
+        };
+        match self.exchange(method, params, cancel) {
+            Ok(_) => ReportOutcome::Completed,
+            Err(failure) => failure.into_report(),
+        }
+    }
+}
+
+/// A reported optional string, present on the wire only when the caller sent it.
+fn set(params: &mut serde_json::Value, name: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        params[name] = json!(value);
+    }
+}
+
+/// The caller's own sequence number, under the schema's `seq`.
+fn set_sequence(params: &mut serde_json::Value, sequence: Option<u64>) {
+    if let Some(sequence) = sequence {
+        params["seq"] = json!(sequence);
+    }
+}
+
+/// How long the reported metadata stays valid, when the caller said.
+fn set_ttl(params: &mut serde_json::Value, ttl_ms: Option<u64>) {
+    if let Some(ttl_ms) = ttl_ms {
+        params["ttl_ms"] = json!(ttl_ms);
     }
 }
 
@@ -532,37 +761,132 @@ impl RuntimeProvider for HerdrRuntime {
 /// enough that a cancelled request rejoins quickly, large enough not to spin.
 const SOCKET_WAIT_GRANULARITY: Duration = Duration::from_millis(10);
 
+#[derive(Clone, Copy)]
+enum Certainty {
+    Refused,
+    Unknown,
+}
+
+/// One socket request that did not succeed, and what its failure establishes.
+struct Failure {
+    message: String,
+    certainty: Certainty,
+}
+
+impl Failure {
+    /// Nothing was dispatched: the request was never written.
+    fn refused(message: String) -> Self {
+        Self {
+            message,
+            certainty: Certainty::Refused,
+        }
+    }
+
+    /// The request may have been dispatched, so its effect is unestablished.
+    fn unknown(message: String) -> Self {
+        Self {
+            message,
+            certainty: Certainty::Unknown,
+        }
+    }
+
+    fn into_focus(self) -> FocusOutcome {
+        match self.certainty {
+            Certainty::Refused => FocusOutcome::Refused(self.message),
+            Certainty::Unknown => FocusOutcome::Unknown(self.message),
+        }
+    }
+
+    fn into_create(self) -> CreateOutcome {
+        match self.certainty {
+            Certainty::Refused => CreateOutcome::Refused(self.message),
+            Certainty::Unknown => CreateOutcome::Unknown(self.message),
+        }
+    }
+
+    fn into_input(self) -> InputOutcome {
+        match self.certainty {
+            Certainty::Refused => InputOutcome::Refused(self.message),
+            Certainty::Unknown => InputOutcome::Unknown(self.message),
+        }
+    }
+
+    fn into_output(self) -> OutputOutcome {
+        match self.certainty {
+            Certainty::Refused => OutputOutcome::Refused(self.message),
+            Certainty::Unknown => OutputOutcome::Unknown(self.message),
+        }
+    }
+
+    fn into_report(self) -> ReportOutcome {
+        match self.certainty {
+            Certainty::Refused => ReportOutcome::Refused(self.message),
+            Certainty::Unknown => ReportOutcome::Unknown(self.message),
+        }
+    }
+}
+
 impl HerdrRuntime {
-    /// Focuses one pane: the CLI reports the socket, the schema's `pane.focus`
-    /// request does the rest. Focusing a pane raises its workspace and tab with
-    /// it, so one request covers all three levels.
-    fn focus_pane(&self, pane_id: &str, cancel: &AtomicBool) -> Result<(), String> {
-        let status = run(&self.config, &["status", "--json"], cancel)?;
-        let socket = socket_path(&status)?;
+    /// Focuses a workspace through the CLI. The CLI both connects and dispatches,
+    /// so a nonzero exit cannot prove the request was never applied: any failure
+    /// is [`FocusOutcome::Unknown`], never a refusal.
+    fn focus_workspace(
+        &self,
+        workspace_id: &str,
+        cancel: &AtomicBool,
+    ) -> Result<FocusOutcome, Failure> {
+        run(&self.config, &["workspace", "focus", workspace_id], cancel)
+            .map(|_| FocusOutcome::Completed)
+            .map_err(Failure::unknown)
+    }
+
+    /// Focuses one pane through the socket request the schema defines. Focusing
+    /// a pane raises its workspace and tab with it, so one request covers all
+    /// three levels.
+    fn focus_pane(&self, pane_id: &str, cancel: &AtomicBool) -> Result<FocusOutcome, Failure> {
+        self.exchange("pane.focus", json!({ "pane_id": pane_id }), cancel)
+            .map(|_| FocusOutcome::Completed)
+    }
+
+    /// One request over the server socket, returning the whole answer.
+    ///
+    /// The socket comes from `herdr status --json`, so the request reaches the
+    /// server the CLI itself is talking to. A failure before the request was
+    /// written proves nothing was dispatched; one after it does not, and is
+    /// reported as unknown.
+    fn exchange(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        cancel: &AtomicBool,
+    ) -> Result<serde_json::Value, Failure> {
+        let status = run(&self.config, &["status", "--json"], cancel).map_err(Failure::refused)?;
+        let socket = socket_path(&status).map_err(Failure::refused)?;
         let budget = Budget::of(self.config.command_timeout);
-        let mut stream = UnixStream::connect(&socket)
-            .map_err(|error| format!("could not reach herdr at {}: {error}", socket.display()))?;
+        let mut stream = UnixStream::connect(&socket).map_err(|error| {
+            Failure::refused(format!(
+                "could not reach herdr at {}: {error}",
+                socket.display()
+            ))
+        })?;
         for setting in [
             stream.set_read_timeout(Some(SOCKET_WAIT_GRANULARITY)),
             stream.set_write_timeout(Some(SOCKET_WAIT_GRANULARITY)),
         ] {
-            setting.map_err(|error| format!("herdr socket could not be read: {error}"))?;
+            setting.map_err(|error| {
+                Failure::refused(format!("herdr socket could not be read: {error}"))
+            })?;
         }
-        // The schema's `pane.focus` params are `{"pane_id": "..."}`; focusing
-        // the pane raises its workspace and tab, so one request does all three.
-        let request = serde_json::json!({
-            "id": "radar:focus",
-            "method": "pane.focus",
-            "params": { "pane_id": pane_id },
+        let request = json!({
+            "id": format!("radar:{method}"),
+            "method": method,
+            "params": params,
         });
-        write_request(
-            &mut stream,
-            format!("{request}\n").as_bytes(),
-            budget,
-            cancel,
-        )?;
-        let answer = read_answer(&mut stream, budget, cancel)?;
-        decode_answer(&answer)
+        let request_bytes = format!("{request}\n");
+        write_request(&mut stream, request_bytes.as_bytes(), budget, cancel)
+            .map_err(Failure::unknown)?;
+        let answer = read_answer(&mut stream, budget, cancel).map_err(Failure::unknown)?;
+        decode_answer(&answer, method)
     }
 }
 
@@ -599,7 +923,7 @@ impl Budget {
     /// deadline has passed.
     fn wait(&self, cancel: &AtomicBool) -> Result<(), String> {
         if cancel.load(Ordering::SeqCst) {
-            return Err("focus cancelled".to_string());
+            return Err("herdr request cancelled".to_string());
         }
         if Instant::now() >= self.deadline {
             return Err(format!("herdr timed out after {:?}", self.timeout));
@@ -629,6 +953,11 @@ fn write_request(
     Ok(())
 }
 
+/// Most of one answer line this adapter will hold. A read's text is bounded by
+/// its request, so a server that streams past this is not answering the request
+/// that was sent.
+const ANSWER_CAP: usize = 4 * 1024 * 1024;
+
 /// Reads one answer line, waiting out a socket that is momentarily empty.
 fn read_answer(
     stream: &mut UnixStream,
@@ -645,6 +974,9 @@ fn read_answer(
                 if let Some(end) = answer.iter().position(|byte| *byte == b'\n') {
                     return Ok(String::from_utf8_lossy(&answer[..end]).trim().to_string());
                 }
+                if answer.len() > ANSWER_CAP {
+                    return Err(format!("herdr answered more than {ANSWER_CAP} bytes"));
+                }
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) if is_timeout(&error) => budget.wait(cancel)?,
@@ -657,22 +989,81 @@ fn is_timeout(error: &std::io::Error) -> bool {
     matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-/// One answer: `result` is success, `error` is Herdr refusing the request.
-fn decode_answer(answer: &str) -> Result<(), String> {
+/// One answer: `result` is success, `error` is Herdr refusing the request. Both
+/// are definitive, so the answer decides the certainty and nothing is assumed.
+fn decode_answer(answer: &str, method: &str) -> Result<serde_json::Value, Failure> {
     let answer: serde_json::Value = serde_json::from_str(answer)
-        .map_err(|error| format!("herdr sent an unreadable answer: {error}"))?;
+        .map_err(|error| Failure::unknown(format!("herdr sent an unreadable answer: {error}")))?;
     if let Some(error) = answer.get("error") {
         let reason = error
             .get("message")
             .and_then(|message| message.as_str())
             .or_else(|| error.get("code").and_then(|code| code.as_str()))
             .unwrap_or("no reason given");
-        return Err(format!("herdr refused to focus: {reason}"));
+        return Err(Failure::refused(format!(
+            "herdr refused `{method}`: {reason}"
+        )));
     }
-    answer
-        .get("result")
-        .map(|_| ())
-        .ok_or_else(|| "herdr sent an unreadable answer".to_string())
+    if answer.get("result").is_none() {
+        return Err(Failure::unknown(
+            "herdr sent an unreadable answer".to_string(),
+        ));
+    }
+    Ok(answer)
+}
+
+/// The identities one creation answer reported, as the answer named them.
+///
+/// The schema's creations answer `workspace_created` (`workspace`, `tab`,
+/// `root_pane`), `tab_created` (`tab`, `root_pane`) and a split with the new
+/// pane as `pane`. Whichever fields the answer carries are reported; a field it
+/// omits stays absent rather than being guessed.
+fn created_from(answer: &serde_json::Value) -> CreatedLocation {
+    let named = |pointer: &str| {
+        answer
+            .pointer(pointer)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    CreatedLocation {
+        workspace_id: named("/result/workspace/workspace_id"),
+        tab_id: named("/result/tab/tab_id"),
+        pane_id: named("/result/root_pane/pane_id").or_else(|| named("/result/pane/pane_id")),
+    }
+}
+
+/// One `pane.read` answer as a snapshot.
+///
+/// The schema answers `pane_read` with the read under `read`, so the text, the
+/// revision it belongs to and the pane it came from travel together.
+fn decode_read(answer: &serde_json::Value, pane_id: &str) -> OutputOutcome {
+    let read = answer.pointer("/result/read");
+    let Some(text) = read
+        .and_then(|read| read.pointer("/text"))
+        .and_then(|text| text.as_str())
+    else {
+        return OutputOutcome::Unknown("herdr sent a read with no text".to_string());
+    };
+    // A read of another pane is not this pane's output, whatever it says.
+    if let Some(named) = read
+        .and_then(|read| read.pointer("/pane_id"))
+        .and_then(|pane_id| pane_id.as_str())
+        && named != pane_id
+    {
+        return OutputOutcome::Unknown(format!(
+            "herdr answered for pane {named} instead of {pane_id}"
+        ));
+    }
+    OutputOutcome::Completed(OutputRead {
+        text: text.to_string(),
+        truncated: read
+            .and_then(|read| read.pointer("/truncated"))
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false),
+        revision: read
+            .and_then(|read| read.pointer("/revision"))
+            .and_then(|revision| revision.as_u64()),
+    })
 }
 
 // ---------------------------------------------------------------------------

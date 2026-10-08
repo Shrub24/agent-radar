@@ -9,7 +9,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -18,8 +18,12 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use agent_radar::control_plane::{PROTOCOL_VERSION, random_uuid};
 use agent_radar::model::{ForegroundEvidence, LocalFacts};
-use agent_radar::{CloseTarget, HerdrConfig, HerdrRuntime, RuntimeProvider, Target};
+use agent_radar::runtime::CloseOutcome;
+use agent_radar::{
+    CloseTarget, Daemon, FocusOutcome, HerdrConfig, HerdrRuntime, RuntimeProvider, Target,
+};
 
 /// A successful snapshot of one pane in one workspace, without agents.
 const SNAPSHOT_ONE_PANE: &str = r#"{"id":"cli:api:snapshot","result":{"type":"snapshot","snapshot":{"workspaces":[{"workspace_id":"wA","label":"main","number":1}],"tabs":[{"tab_id":"wA:t1","workspace_id":"wA","label":"agent tab","number":1}],"panes":[{"pane_id":"wA:p1","tab_id":"wA:t1","workspace_id":"wA"}],"agents":[]}}}"#;
@@ -392,8 +396,42 @@ exit 9"#,
     })
 }
 
+/// A stub API socket that serves a whole scripted session: one connection per
+/// request, each answer chosen by the method the request names, `ok` where the
+/// test staged nothing. The recorder holds every request it was sent.
+fn answering_stub_at(
+    path: &Path,
+    answers: &'static [(&'static str, &'static str)],
+) -> Arc<Mutex<Vec<String>>> {
+    let listener = UnixListener::bind(path).expect("stub socket binds");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("stub stream"));
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let trimmed = line.trim().to_string();
+            let answer = answers
+                .iter()
+                .find(|(method, _)| trimmed.contains(&format!("\"method\":\"{method}\"")))
+                .map(|(_, answer)| *answer)
+                .unwrap_or(r#"{"id":"radar","result":{"type":"ok"}}"#);
+            recorder.lock().expect("recorder").push(trimmed);
+            let _ = stream.write_all(format!("{answer}\n").as_bytes());
+        }
+    });
+    seen
+}
+
 /// A stub API socket at `path` that records the request it is sent and answers
-/// with `answer` — or, with `None`, accepts and never answers.
+/// with `answer` for a single connection — or, with `None`, accepts and never
+/// answers. For a scripted session of several requests, use `answering_stub_at`.
 fn stub_server_at(path: &Path, answer: Option<&'static str>) -> Arc<Mutex<Vec<String>>> {
     let listener = UnixListener::bind(path).expect("stub socket binds");
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -439,20 +477,23 @@ esac"#,
         )
     });
     let runtime = fake.runtime(Duration::from_secs(2));
-    runtime
-        .focus(&Target::Workspace("wA".into()), &cancel())
-        .expect("the workspace focus CLI runs");
+    assert_eq!(
+        runtime.focus_outcome(&Target::Workspace("wA".into()), &cancel()),
+        FocusOutcome::Completed
+    );
     assert_eq!(fake.read("focused"), "wA");
 }
 
 #[test]
-fn a_refused_workspace_focus_reports_why() {
+fn a_failed_workspace_focus_is_unknown() {
     let _serial = serial();
     let fake = Fake::new(|_| "printf 'controlled refusal\\n' >&2\nexit 3".to_string());
     let runtime = fake.runtime(Duration::from_secs(2));
-    let message = runtime
-        .focus(&Target::Workspace("wA".into()), &cancel())
-        .expect_err("a nonzero exit is a failure");
+    let FocusOutcome::Unknown(message) =
+        runtime.focus_outcome(&Target::Workspace("wA".into()), &cancel())
+    else {
+        panic!("a CLI that may have dispatched cannot prove a refusal")
+    };
     assert!(message.contains("status 3"), "{message}");
     assert!(message.contains("controlled refusal"), "{message}");
 }
@@ -466,9 +507,10 @@ fn a_pane_focus_asks_the_socket() {
         Some(r#"{"id":"radar:focus","result":{"type":"ok"}}"#),
     );
     let runtime = fake.runtime(Duration::from_secs(5));
-    runtime
-        .focus(&Target::Pane("wA:p1".into()), &cancel())
-        .expect("the socket answers");
+    assert_eq!(
+        runtime.focus_outcome(&Target::Pane("wA:p1".into()), &cancel()),
+        FocusOutcome::Completed
+    );
     let request = seen.lock().expect("recorder").join(" ");
     assert!(request.contains("\"method\":\"pane.focus\""), "{request}");
     assert!(request.contains("\"pane_id\":\"wA:p1\""), "{request}");
@@ -485,9 +527,11 @@ fn a_refused_pane_focus_reports_the_refusal() {
         ),
     );
     let runtime = fake.runtime(Duration::from_secs(5));
-    let message = runtime
-        .focus(&Target::Pane("wA:p1".into()), &cancel())
-        .expect_err("a refusal is a failure");
+    let FocusOutcome::Refused(message) =
+        runtime.focus_outcome(&Target::Pane("wA:p1".into()), &cancel())
+    else {
+        panic!("socket error answer is a known rejection")
+    };
     assert!(message.contains("pane wA:p1 not found"), "{message}");
 }
 
@@ -498,9 +542,11 @@ fn a_stalled_focus_answer_times_out() {
     let _ = stub_server_at(&fake.path("herdr.sock"), None);
     let runtime = fake.runtime(Duration::from_millis(300));
     let started = Instant::now();
-    let message = runtime
-        .focus(&Target::Pane("wA:p1".into()), &cancel())
-        .expect_err("a stalled request is a failure");
+    let FocusOutcome::Unknown(message) =
+        runtime.focus_outcome(&Target::Pane("wA:p1".into()), &cancel())
+    else {
+        panic!("lost socket reply must be unknown")
+    };
     assert!(message.contains("timed out"), "{message}");
     assert!(
         started.elapsed() < Duration::from_secs(10),
@@ -609,6 +655,20 @@ fn a_tab_close_uses_the_tab_grammar() {
     assert_eq!(fake.read("args").trim(), "tab close wA:t1");
 }
 
+/// The Herdr CLI both connects and dispatches, so a nonzero exit cannot prove
+/// the close was never applied: the certainty is unknown, and the diagnostic is
+/// still what herdr said.
+#[test]
+fn a_failed_close_is_unknown_rather_than_refused() {
+    let _serial = serial();
+    let fake = Fake::new(|_| "echo 'herdr: pane wA:p3 not found' >&2\nexit 1".to_string());
+    let runtime = fake.runtime(Duration::from_secs(2));
+    match runtime.close_outcome(&CloseTarget::Pane("wA:p3".into()), &cancel()) {
+        CloseOutcome::Unknown(message) => assert!(message.contains("not found"), "{message}"),
+        other => panic!("a failed close is unknown, not {other:?}"),
+    }
+}
+
 #[test]
 fn a_refused_close_is_a_diagnostic_that_quotes_stderr() {
     let _serial = serial();
@@ -673,4 +733,294 @@ fn a_stalled_close_times_out_and_is_reaped() {
         .then(|| fake.read("pid").trim().parse::<i32>().expect("fake pid"))
         .expect("the fake wrote its pid");
     assert!(!process_exists(pid), "the stalled close was not reaped");
+}
+
+/// One control-plane request over a fresh connection, for the composed test.
+fn control_call(
+    socket: &Path,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let stream = UnixStream::connect(socket).expect("dial the control socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("a read deadline");
+    let mut writer = stream.try_clone().expect("a writer");
+    let mut reader = BufReader::new(stream);
+    let line = serde_json::json!({
+        "version": PROTOCOL_VERSION,
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+    writer
+        .write_all(line.as_bytes())
+        .expect("write the request");
+    writer.write_all(b"\n").expect("terminate the request");
+    writer.flush().expect("flush the request");
+    let mut response = String::new();
+    reader.read_line(&mut response).expect("read the answer");
+    serde_json::from_str(&response).unwrap_or_else(|error| panic!("{response:?}: {error}"))
+}
+
+/// The control daemon and the real Herdr adapter together: `observe`,
+/// `process_info`, `focus`, guarded `close`, creation, input and a bounded read
+/// reach the scripted `herdr` through `HerdrRuntime` and come back normalized
+/// over the real control socket.
+#[test]
+fn the_daemon_serves_a_scripted_herdr_runtime() {
+    let _serial = serial();
+    let fake = Fake::new(|dir| {
+        format!(
+            r#"case "$1 $2" in
+"api snapshot")
+  printf '%s\n' '{snapshot}'
+  ;;
+"status --json")
+  printf '{{"server":{{"socket":"{socket}"}}}}\n'
+  ;;
+"pane process-info")
+  printf '%s\n' '{evidence}'
+  ;;
+"pane close")
+  printf '%s\n' "$*" > "{close_args}"
+  ;;
+*)
+  echo "unexpected subcommand: $1 $2" >&2
+  exit 9
+  ;;
+esac"#,
+            snapshot = SNAPSHOT_ONE_PANE,
+            socket = dir.join("herdr.sock").display(),
+            evidence = NON_SHELL_EVIDENCE,
+            close_args = dir.join("close-args").display(),
+        )
+    });
+    let seen = answering_stub_at(
+        &fake.path("herdr.sock"),
+        &[
+            (
+                "pane.focus",
+                r#"{"id":"radar:pane.focus","result":{"type":"ok"}}"#,
+            ),
+            (
+                "pane.split",
+                r#"{"id":"radar:pane.split","result":{"type":"pane_info","pane":{"pane_id":"wA:p2"}}}"#,
+            ),
+            (
+                "pane.send_text",
+                r#"{"id":"radar:pane.send_text","result":{"type":"ok"}}"#,
+            ),
+            (
+                "pane.read",
+                r#"{"id":"radar:pane.read","result":{"type":"pane_read","read":{"pane_id":"wA:p1","workspace_id":"wA","tab_id":"wA:t1","source":"visible","format":"text","text":"$ ls\n","revision":3,"truncated":false}}}"#,
+            ),
+            (
+                "pane.report_agent",
+                r#"{"id":"radar:pane.report_agent","result":{"type":"ok"}}"#,
+            ),
+            (
+                "pane.report_metadata",
+                r#"{"id":"radar:pane.report_metadata","result":{"type":"ok"}}"#,
+            ),
+        ],
+    );
+    let control = fake.path("control");
+    fs::create_dir_all(&control).expect("control directory");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    let socket = control.join("control.sock");
+    let mut daemon = Daemon::bind_herdr_at(
+        &socket,
+        &control.join("state"),
+        HerdrConfig {
+            executable: fake.executable.clone(),
+            command_timeout: Duration::from_secs(5),
+        },
+    )
+    .expect("bind the daemon over the scripted runtime");
+
+    let observed = control_call(&socket, &random_uuid(), "observe", serde_json::json!({}));
+    assert_eq!(
+        observed["result"]["inventory"]["panes"][0]["location"]["pane_id"],
+        "wA:p1"
+    );
+    let evidence = control_call(
+        &socket,
+        &random_uuid(),
+        "process_info",
+        serde_json::json!({"pane_id": "wA:p1"}),
+    );
+    assert_eq!(evidence["result"]["evidence"]["kind"], "non_shell");
+    assert_eq!(evidence["result"]["evidence"]["pid"], 200);
+    let focused = control_call(
+        &socket,
+        &random_uuid(),
+        "focus",
+        serde_json::json!({"target": "wA:p1", "target_kind": "pane"}),
+    );
+    assert_eq!(focused["result"]["request"]["outcome"], "completed");
+    let request = seen.lock().expect("recorder").join(" ");
+    assert!(request.contains("\"method\":\"pane.focus\""), "{request}");
+
+    // The whole production close path, not a fake backend: the wire form crosses
+    // the socket, the lifecycle guard re-observes through this same runtime, and
+    // the adapter runs its documented grammar against the scripted herdr.
+    let closed = control_call(
+        &socket,
+        &random_uuid(),
+        "close",
+        serde_json::json!({
+            "request": {
+                "target": {"pane": "wA:p1"},
+                "identity": {"pane": {"pane_id": "wA:p1", "occupant": null}},
+            }
+        }),
+    );
+    assert_eq!(closed["result"]["request"]["outcome"], "completed");
+    assert_eq!(
+        closed["result"]["request"]["effects"],
+        serde_json::json!(["close"])
+    );
+    let grammar = fs::read_to_string(fake.path("close-args")).expect("the close invocation");
+    assert_eq!(grammar.trim(), "pane close wA:p1");
+
+    // The mux primitives through the same real adapter: the daemon asks for the
+    // schema's method, the adapter owns the wire params, and the identities the
+    // answer named are what the record reports.
+    let created = control_call(
+        &socket,
+        &random_uuid(),
+        "create",
+        serde_json::json!({
+            "request": {
+                "kind": "pane_split",
+                "pane_id": "wA:p1",
+                "direction": "down",
+                "focus": false,
+            }
+        }),
+    );
+    assert_eq!(created["result"]["request"]["outcome"], "completed");
+    assert_eq!(created["result"]["request"]["target"], "wA:p1");
+    // The split's own identity reaches the client as data, from the adapter's
+    // decode of the answer rather than from the effect prose.
+    assert_eq!(
+        created["result"]["request"]["created"],
+        serde_json::json!({"kind": "pane", "id": "wA:p2"})
+    );
+    assert_eq!(
+        created["result"]["request"]["effects"],
+        serde_json::json!(["created pane wA:p2"])
+    );
+
+    let sent = control_call(
+        &socket,
+        &random_uuid(),
+        "input",
+        serde_json::json!({
+            "request": {
+                "pane_id": "wA:p1",
+                "payload": {"kind": "text", "text": "ls\n"},
+            }
+        }),
+    );
+    assert_eq!(sent["result"]["request"]["outcome"], "completed");
+    assert_eq!(
+        sent["result"]["request"]["effects"],
+        serde_json::json!(["sent text"])
+    );
+
+    let read = control_call(
+        &socket,
+        &random_uuid(),
+        "output",
+        serde_json::json!({"pane_id": "wA:p1", "source": "visible", "lines": 5}),
+    );
+    assert_eq!(read["result"]["output"]["text"], "$ ls\n");
+    assert_eq!(read["result"]["output"]["revision"], 3);
+    assert_eq!(read["result"]["output"]["truncated"], false);
+
+    // Reporting through the same adapter: the schema's own methods, the caller's
+    // values under the schema's own names, and nothing derived from them.
+    let reported = control_call(
+        &socket,
+        &random_uuid(),
+        "report",
+        serde_json::json!({"request": {
+            "kind": "state",
+            "pane_id": "wA:p1",
+            "source": "pi-herdsman",
+            "agent": "worker",
+            "state": "working",
+            "message": "2 tasks",
+            "sequence": 4,
+        }}),
+    );
+    assert_eq!(reported["result"]["request"]["outcome"], "completed");
+    assert_eq!(
+        reported["result"]["request"]["effects"],
+        serde_json::json!(["reported state working"])
+    );
+
+    let display = control_call(
+        &socket,
+        &random_uuid(),
+        "report",
+        serde_json::json!({"request": {
+            "kind": "metadata",
+            "target": {"kind": "pane", "pane_id": "wA:p1"},
+            "source": "herdsman",
+            "tokens": {"summary": "3 tasks", "title-suffix": null},
+            "applies_to_source": "herdr:pi",
+            "state_labels": {"working": "thinking"},
+            "clear_display_agent": true,
+            "ttl_ms": 30000,
+            "sequence": 6,
+        }}),
+    );
+    assert_eq!(display["result"]["request"]["outcome"], "completed");
+    assert_eq!(display["result"]["request"]["target"], "wA:p1");
+
+    let requests = seen.lock().expect("recorder").join("\n");
+    for method in [
+        "pane.focus",
+        "pane.split",
+        "pane.send_text",
+        "pane.read",
+        "pane.report_agent",
+        "pane.report_metadata",
+    ] {
+        assert!(
+            requests.contains(&format!("\"method\":\"{method}\"")),
+            "{method} never reached the adapter: {requests}"
+        );
+    }
+    assert!(
+        requests.contains(r#""target_pane_id":"wA:p1""#)
+            && requests.contains(r#""direction":"down""#),
+        "the split was not named on the wire: {requests}"
+    );
+    assert!(
+        requests.contains(r#""text":"ls\n""#),
+        "the literal text was not sent as itself: {requests}"
+    );
+    // The report grammar: the schema's `seq`, the token map with a withdrawn
+    // token as null, and the TTL, unchanged from what the caller sent.
+    assert!(
+        requests.contains(r#""state":"working""#)
+            && requests.contains(r#""message":"2 tasks""#)
+            && requests.contains(r#""seq":4"#),
+        "the state report was not forwarded as given: {requests}"
+    );
+    assert!(
+        requests.contains(r#""tokens":{"summary":"3 tasks","title-suffix":null}"#)
+            && requests.contains(r#""state_labels":{"working":"thinking"}"#)
+            && requests.contains(r#""applies_to_source":"herdr:pi""#)
+            && requests.contains(r#""clear_display_agent":true"#)
+            && requests.contains(r#""ttl_ms":30000"#),
+        "the display report was not forwarded as given: {requests}"
+    );
+    daemon.stop();
 }
