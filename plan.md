@@ -44,12 +44,13 @@ implemented, verified and archived. Its gates are recorded in that change's
 `verification.md`. Keep the next work separate from lifecycle and state
 contracts.
 
-`mux-control-plane` and `daemon-agent-lifecycle` are implemented, verified,
-pushed (implementation `92ea9d37`, reference correction `4af0ff6b`), synced and
-archived as `openspec/changes/archive/2026-10-09-*`. The daemon provides physical mux wrappers plus independent
-durable registration, execution/assignment channels, writer fencing, freshness,
-process verification and private inert launch specifications. See
-`docs/daemon.md` for the consumer entry point and linked wire references.
+`mux-control-plane`, `daemon-agent-lifecycle` and `mutable-session-context` are
+implemented, verified, pushed, synced and archived. The daemon foundations are
+at `92ea9d37`; mutable session context is `4e376978`. See each archived change's
+verification record and `docs/daemon.md`. The daemon provides physical mux wrappers plus independent durable registration,
+execution/assignment channels, fenced mutable session context, process verification
+and private inert launch specifications. See `docs/daemon.md` for the consumer
+entry point and linked wire references.
 
 Registry publication does not yet feed Radar's TUI. Launch/stop/resume are not
 implemented. Existing managed controls remain owner-routed; the direct adapter
@@ -62,14 +63,17 @@ In priority order:
    pi-extensions main `f5eedd29` (ADR 0031), verified 24/24 against an isolated
    daemon. It publishes execution and owner assignment directly, uses a local
    exact-`agent_id` binding, and persists/replays pending content. It does not
-   mirror to Herdr or perform lifecycle actions. Not yet live-deployed; existing
-   Herdr readiness/presence remains until physical execution cutover.
+   mirror to Herdr or perform lifecycle actions. Radar's mutable session-context
+   contract is now available at `4e376978`; adoption is the next concrete step.
+   Not yet live-deployed; existing Herdr readiness/presence remains until physical
+   execution cutover.
 2. **Consume direct registry state in Radar.** The daemon contract is ready:
-   paginated registration/execution/assignment facts, process verification and
-   mutable session context, each with provenance and freshness. Prepare disposable
-   publishers, then replace existing token observations only after live adoption
-   is verified. Define exact joins, source precedence and retained/disconnected
-   behavior before wiring the TUI. Preserve execution/assignment separation.
+   paginated registration/execution/assignment facts, fenced current-session
+   context and process verification, each with provenance and freshness. Prepare
+   disposable publishers, then replace existing token observations only after
+   live adoption is verified. Define exact joins, source precedence and
+   retained/disconnected behavior before wiring the TUI. Preserve
+   execution/assignment separation.
 3. **Daemon physical lifecycle and managed-child topology.** Extend the daemon
    from mux wrappers to orchestration: Herdsman asks it to spawn a child subject,
    and the daemon records the managed runtime parent/child relation plus observed
