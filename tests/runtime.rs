@@ -1300,3 +1300,333 @@ fn a_real_herdr_launch_runs_the_resolved_command_in_its_pane() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A tab this smoke created, closed on the way out however the run ends.
+///
+/// A live Herdr is the operator's own multiplexer, so a failed assertion must
+/// not leave a tab behind: the tab is closed by a guard rather than by the last
+/// line of a passing run. Closing the tab closes the parent pane this smoke
+/// registered and any child pane the spawn left, and nothing that was there
+/// before the run.
+struct DisposableTab {
+    config: HerdrConfig,
+    tab: String,
+    closed: bool,
+}
+
+impl DisposableTab {
+    fn close(&mut self) {
+        if !self.closed {
+            let _ = HerdrRuntime::new(self.config.clone())
+                .close(&CloseTarget::Tab(self.tab.clone()), &cancel());
+            self.closed = true;
+        }
+    }
+}
+
+impl Drop for DisposableTab {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Reads a JSON file the smoke waited for.
+fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("the child wrote its record"))
+        .expect("the child wrote a JSON record")
+}
+
+/// Whether a fresh inventory still holds one pane.
+fn pane_is_present(runtime: &HerdrRuntime, pane_id: &str) -> bool {
+    runtime
+        .inventory(&cancel())
+        .expect("a live Herdr answers its snapshot")
+        .pane(pane_id)
+        .is_some()
+}
+
+/// The whole managed-child close against a real Herdr and a real child.
+///
+/// The daemon is driven only through its public socket: it registers a
+/// disposable parent, spawns the child beside that parent's own pane, and the
+/// launched command registers itself from its own `(pid, boot_id, start_ticks)`
+/// under the token the launch carried. Nothing here fabricates an identity, a
+/// pane or a token, so `child.close` is admitted, verified and dispatched
+/// exactly as it is in production, and the pane it closes is the one the spawn
+/// created.
+#[test]
+fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
+    if std::env::var("RADAR_HERDR_SMOKE").as_deref() != Ok("1") {
+        eprintln!("skipped: set RADAR_HERDR_SMOKE=1 to close a real disposable Herdr child");
+        return;
+    }
+    let _serial = serial();
+    let config = HerdrConfig {
+        executable: PathBuf::from("herdr"),
+        command_timeout: Duration::from_secs(10),
+    };
+    let runtime = HerdrRuntime::new(config.clone());
+    let workspace = runtime
+        .inventory(&cancel())
+        .expect("a live Herdr answers its snapshot")
+        .workspaces
+        .first()
+        .expect("a live Herdr has a workspace")
+        .workspace_id
+        .clone();
+    let CreateOutcome::Completed(created) = runtime.create(
+        &CreateRequest::Tab {
+            workspace_id: workspace,
+            focus: false,
+        },
+        &cancel(),
+    ) else {
+        panic!("the disposable tab was not created")
+    };
+    let tab = created.tab_id.clone().expect("the tab was named");
+    let parent_pane = created.pane_id.clone().expect("its pane was named");
+    let mut disposable = DisposableTab {
+        config: config.clone(),
+        tab,
+        closed: false,
+    };
+
+    let dir = std::env::temp_dir().join(format!("radar-herdr-close-smoke-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("smoke directory");
+    // The daemon refuses a control socket in a directory another user could
+    // reach, so the smoke keeps its own directory private.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("private smoke directory");
+    let socket = dir.join("control.sock");
+    let state = dir.join("state");
+    let child_record = dir.join("child.json");
+    let mut daemon = Daemon::bind_herdr_at(&socket, &state, config).expect("bind the daemon");
+
+    // The parent is disposable too: a fresh registry under a fresh state root,
+    // named under the pane this smoke just created.
+    let parent = control_call(
+        &socket,
+        &random_uuid(),
+        "agent.register",
+        serde_json::json!({
+            "source": "radar-live-close-smoke-parent",
+            "incarnation": random_uuid(),
+            "label": "live child-close smoke",
+            "location": {"backend": "runtime", "pane": parent_pane},
+        }),
+    );
+    let parent_id = parent["result"]["registration"]["agent_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the parent was not registered: {parent}"))
+        .to_owned();
+
+    let command =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/live-managed-child.sh");
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+        .expect("make the child runnable");
+    let spawn_id = random_uuid();
+    let spawned = control_call(
+        &socket,
+        &spawn_id,
+        "spawn",
+        serde_json::json!({
+            "request": {
+                "parent": parent_id,
+                "executable": command.to_string_lossy(),
+                "argv": [socket.to_string_lossy(), child_record.to_string_lossy()],
+            },
+            "requester": "runtime-live-smoke",
+        }),
+    );
+    assert_eq!(
+        spawned["result"]["request"]["outcome"], "completed",
+        "{spawned}"
+    );
+    let child_pane = spawned["result"]["spawn"]["location"]["pane"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the spawn recorded no pane: {spawned}"))
+        .to_owned();
+    assert_ne!(child_pane, parent_pane, "the child must be its own pane");
+    // The child pane is created inside the disposable tab, beside its parent's
+    // pane: the smoke may close this pane and no other.
+    let containment_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pane) = runtime
+            .inventory(&cancel())
+            .expect("a live Herdr answers its snapshot")
+            .pane(&child_pane)
+            .cloned()
+        {
+            assert_eq!(
+                pane.location.tab_id, disposable.tab,
+                "the child pane must live in the tab this smoke created"
+            );
+            assert_eq!(
+                pane.location.pane_id, child_pane,
+                "the child pane must be the one the spawn recorded"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < containment_deadline,
+            "the spawned child pane never appeared in a fresh inventory"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // The launched child registers itself, under the token the launch carried
+    // and the identity procfs reports for the process the pane is running.
+    assert!(
+        wait_for_file(&child_record, Duration::from_secs(20)),
+        "the launched child did not register"
+    );
+    let child = read_json(&child_record);
+    let child_source = child["source"].as_str().expect("the child's source");
+    let child_incarnation = child["incarnation"].as_str().expect("its incarnation");
+    let child_pid = child["pid"].as_i64().expect("its real pid") as i32;
+    assert!(child_pid > 0, "{child}");
+
+    // A publication on each channel, so "unchanged" means a report that is
+    // actually there rather than one that never existed.
+    for channel in ["assignment", "execution"] {
+        let acquired = control_call(
+            &socket,
+            &random_uuid(),
+            "agent.acquire",
+            serde_json::json!({
+                "agent_id": child["agent_id"],
+                "channel": channel,
+                "publisher": {"source": format!("live-smoke-{channel}"), "incarnation": random_uuid()},
+            }),
+        );
+        let handle = acquired["result"]["writer"]["handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no writer for {channel}: {acquired}"))
+            .to_owned();
+        let published = control_call(
+            &socket,
+            &random_uuid(),
+            "agent.publish",
+            serde_json::json!({
+                "agent_id": child["agent_id"],
+                "channel": channel,
+                "writer_handle": handle,
+                "sequence": 1,
+                "snapshot": {"activity": "before the close", "actions": ["inspect"]},
+            }),
+        );
+        assert_eq!(
+            published["result"]["channel"]["channel"], channel,
+            "{published}"
+        );
+    }
+
+    let child_id = child["agent_id"].clone();
+    // The recorded edge, not the read's own state and freshness: those are
+    // evidence about the pane, and closing it changes the evidence.
+    let topology_before = control_call(
+        &socket,
+        &random_uuid(),
+        "spawn.get",
+        serde_json::json!({"request_id": spawn_id}),
+    )["result"]["spawn"]["edge"]
+        .clone();
+    let child_before = control_call(
+        &socket,
+        &random_uuid(),
+        "agent.get",
+        serde_json::json!({"agent_id": child_id}),
+    )["result"]["agent"]
+        .clone();
+    assert!(
+        child_before["execution"].is_object() && child_before["assignment"].is_object(),
+        "the smoke must publish before it closes: {child_before}"
+    );
+
+    let close_id = random_uuid();
+    let params = serde_json::json!({
+        "spawn_request_id": spawn_id,
+        "source": child_source,
+        "incarnation": child_incarnation,
+        "intent": "complete",
+    });
+    let first = control_call(&socket, &close_id, "child.close", params.clone());
+    assert_eq!(first["result"]["close"]["outcome"], "completed", "{first}");
+    assert_eq!(
+        first["result"]["close"]["pane"],
+        serde_json::json!(child_pane)
+    );
+    assert_eq!(
+        first["result"]["close"]["intent"], "complete",
+        "the caller's intent is recorded as asked, not as decided"
+    );
+
+    // The outcome is durable, and the pane is really gone while its parent's
+    // pane is not: the close closed the one pane the spawn created.
+    let durable = read_json(&state.join("closes").join(format!("{close_id}.json")));
+    assert_eq!(durable["outcome"], "completed", "{durable}");
+    assert_eq!(durable["request_id"], serde_json::json!(close_id));
+    assert_eq!(durable["intent"], "complete");
+    assert_eq!(durable["location"]["pane"], serde_json::json!(child_pane));
+    assert!(
+        durable.get("message").is_none(),
+        "a confirmed close carries no diagnostic: {durable}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pane_is_present(&runtime, &child_pane) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !pane_is_present(&runtime, &child_pane),
+        "the child pane survived the close"
+    );
+    assert!(
+        pane_is_present(&runtime, &parent_pane),
+        "the close must close the child pane and nothing else"
+    );
+
+    // The same request id is answered from that record: the pane is closed once,
+    // and no read the close could have written has moved.
+    let replay = control_call(&socket, &close_id, "child.close", params);
+    assert_eq!(
+        replay["result"]["close"], first["result"]["close"],
+        "{replay}"
+    );
+    assert_eq!(
+        fs::read_dir(state.join("closes"))
+            .expect("the closes directory")
+            .count(),
+        1,
+        "a replay must not record a second close"
+    );
+    let topology_after = control_call(
+        &socket,
+        &random_uuid(),
+        "spawn.get",
+        serde_json::json!({"request_id": spawn_id}),
+    )["result"]["spawn"]["edge"]
+        .clone();
+    assert_eq!(
+        topology_after, topology_before,
+        "a close settles no spawn edge"
+    );
+    let child_after = control_call(
+        &socket,
+        &random_uuid(),
+        "agent.get",
+        serde_json::json!({"agent_id": child_id}),
+    )["result"]["agent"]
+        .clone();
+    // The stored reports, not the whole read: `process.verification` is fresh
+    // procfs evidence, and closing the pane really does end the process it
+    // names, which is exactly the consequence a close records nothing about.
+    for channel in ["assignment", "execution", "context"] {
+        assert_eq!(
+            child_after[channel], child_before[channel],
+            "a close rewrites no {channel} fact"
+        );
+    }
+
+    disposable.close();
+    daemon.stop();
+    let _ = fs::remove_dir_all(&dir);
+}

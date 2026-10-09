@@ -23,6 +23,7 @@ pub use protocol::{
     Code, ErrorBody, MAX_LINE_BYTES, PROTOCOL_VERSION, Refusal, Request, Response, decode_request,
 };
 pub use registry::{
+    CHILD_CLOSE_VERSION, ChildClose, ChildCloseRequest, CloseAdmission, CloseIntent,
     ContextRequest, ContextValue, LaunchSession, LaunchSpec, LocalProcfsVerifier,
     ProcessVerification, ProcessVerifier, PublicContext, PublicLaunch, PublicRegistration,
     Registration, RegistrationRequest, Registry, RegistryLocation, SessionContext,

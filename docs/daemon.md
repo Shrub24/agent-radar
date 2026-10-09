@@ -21,13 +21,17 @@ forwards state/session/metadata to the backend; it is **not** direct registry
 publication.
 
 The daemon can create and launch a child through `spawn`, and records a durable
-edge to its named parent. This does not make the daemon a lifecycle manager:
-there is no stop, resume, restart, recovery, or adoption of panes launched
-outside the daemon. A created pane is not a bound child until that child
-registers with the private spawn token. Private launch/resume specifications
-stored on registrations remain inert unless explicitly used by a supported
-operation. The current Radar TUI still uses its existing observation path;
-registering an agent is not yet a way to make it appear there.
+edge to its named parent. For children bound to that edge, `child.close` can
+close only the edge's recorded pane after fresh occupant verification. This is
+not a process stop or assignment transition: it never claims process or
+process-group exit and never writes execution or assignment facts. The daemon
+does not make itself a lifecycle manager: there is no resume, restart, recovery,
+or adoption of panes launched outside the daemon. A created pane is not a bound
+child until that child registers with the private spawn token. Private
+launch/resume specifications stored on registrations remain inert unless
+explicitly used by a supported operation. The current Radar TUI still uses its
+existing observation path; registering an agent is not yet a way to make it
+appear there.
 
 ## Connect and negotiate
 
@@ -64,6 +68,7 @@ processes running as the same user. Do not expose this socket remotely.
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `agent_registry` |
 | Public registry reads | `agent.get`, `agent.list` | `agent_registry` |
 | Spawn topology reads | `spawn.get`, `spawn.list` | `agent_registry`; location confirmation additionally uses `observe` when available |
+| Close a daemon-created child pane | `child.close` | `agent_registry` plus mux `observe` and `close` |
 
 Use the method references for parameter and result shapes rather than treating
 this table as a second schema. Unsupported methods/capabilities are not an
@@ -113,10 +118,29 @@ adapter. Same-ID replay retrieves the existing record rather than repeating the
 effect. Registry publication uses its own identity/sequence rules; it does not
 share the mux mutation lane.
 
-`close` currently accepts only positively unmanaged targets with a frozen
-identity that the daemon rechecks. Existing managed-worker close/restart still
-routes through the owner contract. Registration or advertised actions do not
-make a managed target eligible for mux close.
+`close` accepts only positively unmanaged targets with a frozen identity that
+the daemon rechecks. `child.close` is separate: it requires a daemon-authored
+spawn edge with a bound child, that child's process identity claim, a fresh pane
+and containment match, and an exact foreground birth-identity match. It requires
+the backend's `observe` and `close` capabilities, and foreground evidence is an
+adapter-side process read: evidence the adapter cannot provide refuses here
+rather than being assumed from pane presence. It refuses before recording or
+dispatch if any preflight evidence or capability is missing. It closes only that
+pane, never the process group, and never changes the spawn edge, registration,
+assignment or execution publications.
+
+The `child.close` request id is its durable operation identity. The target pane
+and intent (`complete` or `cancel`, audit/display labels only) are recorded
+before dispatch. A confirmed mux close is `completed`; a positive backend
+pre-dispatch refusal is `refused`; any possibly-dispatched close without
+confirmation is `unknown`. Same-id identical replay returns the stored result
+without redispatch; changed content under that id is refused. Never retry an
+unknown result under another id or route it through the direct adapter: the pane
+may already be closed. `unknown` and later missing-pane topology remain
+unresolved, not evidence of process exit or assignment completion. The daemon
+does not advertise a separate managed-close capability. See the exact
+[method contract](control-plane.md#managed-child-close) and its
+[registration/topology context](agent-registration.md#managed-child-close).
 
 ## Herdsman adoption
 
@@ -135,19 +159,22 @@ The first port can be small:
   daemon does not implement the method; keep the existing Herdsman path. Never
   fall back to another launch path after an uncertain/unknown spawn outcome,
   since the child may already have been created or launched.
-- Until Herdsman deliberately adopts this path, its existing create/reuse and
-  launch path remains unchanged. Do not infer adoption from merely registering
-  agents or reading topology. Existing owner assignment and child execution
-  publication remain separate from the spawn operation.
+- Until Herdsman deliberately adopts the managed-close method, its existing
+  lifecycle contract is unchanged. `child.close` can target only a child bound to
+  a daemon-authored spawn edge; registration or advertised actions do not make
+  another managed target eligible. A close intent is an audit label: the
+  assignment owner still decides and publishes completion.
 
 Today, Pi supplies execution evidence, Herdsman supplies assignment/run facts,
-and the daemon supplies physical observations/controls and an opt-in managed
-spawn operation. This is the starting seam, not a prohibition on consolidating
-more lifecycle work later. Spawn creates and launches; registration with its
-token establishes the child identity. Neither topology freshness nor a missing
-pane establishes process exit or authorizes lifecycle action. Stop, resume,
-restart, recovery, and adoption of foreign panes are not provided; recovery of
-children, pending asks and results must be specified and verified separately.
+and the daemon supplies physical observations/controls plus opt-in managed
+spawn and verified child-pane close operations. This is the starting seam, not a
+prohibition on consolidating more lifecycle work later. Spawn creates and
+launches; registration with its token establishes the child identity. `child.close`
+closes only the verified pane, not the child process. Neither topology freshness
+nor a missing pane establishes process exit or authorizes lifecycle action.
+Resume, restart, recovery, and adoption of foreign panes are not provided;
+recovery of children, pending asks and results must be specified and verified
+separately.
 
 ## Examples and compatibility
 

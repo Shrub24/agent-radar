@@ -47,14 +47,20 @@ contracts.
 `mux-control-plane`, `daemon-agent-lifecycle` and `mutable-session-context` are
 implemented, verified, pushed, synced and archived. The daemon foundations are
 at `92ea9d37`; mutable session context is `4e376978`. See each archived change's
-verification record and `docs/daemon.md`. The daemon provides physical mux wrappers plus independent durable registration,
-execution/assignment channels, fenced mutable session context, process verification
-and private inert launch specifications. See `docs/daemon.md` for the consumer
-entry point and linked wire references.
+verification record and `docs/daemon.md`. The daemon provides physical mux
+wrappers plus independent durable registration, execution/assignment channels,
+fenced mutable session context, process verification, private inert launch
+specifications and daemon-authored managed-child spawn edges.
+See `docs/daemon.md` for the consumer entry point and linked wire references.
+`managed-child-stop` is implemented, verified and archived: safe pane closure
+for an exact bound daemon-spawned child with durable outcomes. It is not process
+termination, resume, restart or assignment completion.
 
-Registry publication does not yet feed Radar's TUI. Launch/stop/resume are not
-implemented. Existing managed controls remain owner-routed; the direct adapter
-remains an explicit mode/startup fallback, never a retry after uncertain dispatch.
+Registry publication does not yet feed Radar's TUI. General launch, process
+termination, resume and restart remain unimplemented. Existing managed controls
+remain owner-routed except the daemon's opt-in close for its own bound children;
+the direct adapter remains an explicit mode/startup fallback, never a retry after
+uncertain dispatch.
 Linux-only is accepted; cross-platform support is not a prerequisite.
 
 In priority order:
@@ -74,25 +80,34 @@ In priority order:
    live adoption is verified. Define exact joins, source precedence and
    retained/disconnected behavior before wiring the TUI. Preserve
    execution/assignment separation.
-3. **Managed child spawn (`managed-child-spawn`, drafted and strict-valid).**
+3. **Managed child spawn (`managed-child-spawn`, landed and archived at `e0f0e7b9`).**
    Herdsman asks the daemon to create a child, and the daemon performs it: create
-the pane under a named parent, launch the resolved command, and record one
-durable parent/child runtime edge. The child binds through a private single-use
-spawn token carried into its launch environment and presented at registration,
-so nothing is inferred from pane titles, aliases or session UUIDs. Herdr launch
-is terminal input under the quoting rules ADR 0029 measured, behind a declared
-`launch` capability. Out of scope: stop, resume, restart, lead recovery and
-adoption of panes the daemon did not create. This is the foundation for safe
-lead recovery, not restart itself.
-4. **Lead recovery, then stale-lead restart plans.** Reconcile managed child
+   the pane under a named parent, launch the resolved command, and record one
+   durable parent/child runtime edge. The child binds through a private single-use
+   spawn token carried into its launch environment and presented at registration,
+   so nothing is inferred from pane titles, aliases or session UUIDs. Herdr launch
+   is terminal input under the quoting rules ADR 0029 measured, behind a declared
+   `launch` capability. Stop, resume, restart, lead recovery and adoption of panes
+   not created by the daemon were out of scope at landing; managed-child-stop is
+   the next incremental operation over those edges.
+4. **Managed-child-stop.** Implemented, verified and archived as
+   `openspec/changes/archive/2026-10-10-managed-child-stop/`. `child.close`
+   targets an exact bound daemon-spawned child, requires fresh pane/containment
+   evidence and matching foreground process birth identity (`pid`, `boot_id`,
+   `start_ticks`), and persists completed/refused/unknown pane-close outcomes
+   without retry. It is pane closure only: no process-exit claim and no
+   assignment/execution transition. Scripted fixture and live disposable-Herdr
+   smoke pass. The method is not separately advertised; coordinate explicit
+   pi-extensions adoption before Herdsman uses it.
+5. **Lead recovery, then stale-lead restart plans.** Reconcile managed child
    topology, pending requests/asks, task results and control outcomes; confirm old
    process exit before resume. Session UUID continuity alone is not proof. Then
    add confirmed stale-lead batches and startup plans before opt-in automation.
    Do not restart all panes indiscriminately.
-5. **Herdsman/Herdr agnosticity and tmux-parity audit.** Cover Radar, pi-herdsman,
+6. **Herdsman/Herdr agnosticity and tmux-parity audit.** Cover Radar, pi-herdsman,
    publishers and launchers. Record parity gaps before implementing a second
    backend; the daemon seam alone does not establish parity.
-6. **Further TUI and information surfaces.** Review fleet density; then consider
+7. **Further TUI and information surfaces.** Review fleet density; then consider
    non-consuming preview, session statistics/search and fleet failure summaries.
 
 Separate daemon follow-ups: retention/pruning for accumulated process-incarnation
@@ -220,12 +235,13 @@ The initial migration complements Herdr:
 - Background-task observation remains non-consuming. Neither state display nor
   a new transport may acknowledge a result or compete with the agent's `get`.
 
-The physical wrappers and direct registry foundation are landed. pi-extensions
-is preparing direct publication; Radar still needs mutable session context and
-registry consumption. Physical lifecycle execution and assignment-aware recovery
-follow those seams. This sequence is a working migration path, not a permanent
-allocation of lifecycle responsibilities. Migrate one surface at a time; do not
-silently turn the metadata-only task bus into a lifecycle command channel.
+The physical wrappers, direct registry, mutable session context, managed
+child-spawn and managed-child-stop foundations are landed. Herdsman adoption of
+`child.close` remains an explicit next coordination step. pi-extensions will
+revisit an incarnation-scoped pane token when adopting close; for now the daemon
+uses fail-closed procfs birth-identity verification. Physical lead restart still
+waits for lifecycle execution and reconciliation contracts, not merely publisher
+adoption.
 
 ### Verification and shipping gates
 

@@ -304,6 +304,7 @@ fn frozen_from(inventory: &FleetObservation, target: CloseTarget) -> Value {
 #[derive(Clone)]
 enum CloseAnswer {
     Completed,
+    Refused(String),
     Unknown(String),
 }
 
@@ -375,6 +376,7 @@ impl RuntimeProvider for CloseBackend {
         }
         match &self.answer {
             CloseAnswer::Completed => CloseOutcome::Completed,
+            CloseAnswer::Refused(message) => CloseOutcome::Refused(message.clone()),
             CloseAnswer::Unknown(message) => CloseOutcome::Unknown(message.clone()),
         }
     }
@@ -400,6 +402,7 @@ const SPAWN_CAPABILITIES: &[&str] = &[
     "output",
     "reporting",
     "launch",
+    "close",
 ];
 
 /// The daemon's own registry capability is advertised alongside whatever mux
@@ -437,6 +440,9 @@ struct MuxBackend {
     /// What this backend reports as its panes: what a topology read consults to
     /// confirm a recorded location.
     inventory: FleetObservation,
+    foreground: ForegroundEvidence,
+    closed: Mutex<Vec<CloseTarget>>,
+    close_answer: CloseAnswer,
     created_requests: Mutex<Vec<CreateRequest>>,
     input_requests: Mutex<Vec<InputRequest>>,
     output_requests: Mutex<Vec<OutputRequest>>,
@@ -474,6 +480,9 @@ impl MuxBackend {
             report: report.unwrap_or(ReportAnswer::Completed),
             launch: LaunchAnswer::Completed,
             inventory: empty_inventory(),
+            foreground: ForegroundEvidence::Inconclusive,
+            closed: Mutex::new(Vec::new()),
+            close_answer: CloseAnswer::Completed,
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
@@ -484,6 +493,50 @@ impl MuxBackend {
     }
 
     /// The same backend answering an output read with this snapshot.
+    fn closing(self: &Arc<Self>, close: CloseAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            capabilities: self.capabilities,
+            created: self.created.clone(),
+            output: self.output.clone(),
+            report: self.report.clone(),
+            launch: self.launch.clone(),
+            inventory: self.inventory.clone(),
+            foreground: self.foreground.clone(),
+            closed: Mutex::new(Vec::new()),
+            close_answer: close,
+            created_requests: Mutex::new(Vec::new()),
+            input_requests: Mutex::new(Vec::new()),
+            output_requests: Mutex::new(Vec::new()),
+            report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
+            gate: None,
+        })
+    }
+
+    fn with_foreground(self: &Arc<Self>, evidence: ForegroundEvidence) -> Arc<Self> {
+        Arc::new(Self {
+            capabilities: self.capabilities,
+            created: self.created.clone(),
+            output: self.output.clone(),
+            report: self.report.clone(),
+            launch: self.launch.clone(),
+            inventory: self.inventory.clone(),
+            foreground: evidence,
+            closed: Mutex::new(Vec::new()),
+            close_answer: self.close_answer.clone(),
+            created_requests: Mutex::new(Vec::new()),
+            input_requests: Mutex::new(Vec::new()),
+            output_requests: Mutex::new(Vec::new()),
+            report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
+            gate: None,
+        })
+    }
+
+    fn closed_targets(&self) -> Vec<CloseTarget> {
+        self.closed.lock().expect("the close list").clone()
+    }
+
     fn reading(self: &Arc<Self>, output: OutputRead) -> Arc<Self> {
         Arc::new(Self {
             capabilities: self.capabilities,
@@ -492,6 +545,9 @@ impl MuxBackend {
             report: self.report.clone(),
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
+            foreground: self.foreground.clone(),
+            closed: Mutex::new(Vec::new()),
+            close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
@@ -510,6 +566,9 @@ impl MuxBackend {
             report: self.report.clone(),
             launch,
             inventory: self.inventory.clone(),
+            foreground: self.foreground.clone(),
+            closed: Mutex::new(Vec::new()),
+            close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
@@ -528,6 +587,9 @@ impl MuxBackend {
             report: self.report.clone(),
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
+            foreground: self.foreground.clone(),
+            closed: Mutex::new(Vec::new()),
+            close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
@@ -546,6 +608,9 @@ impl MuxBackend {
             report: self.report.clone(),
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
+            foreground: self.foreground.clone(),
+            closed: Mutex::new(Vec::new()),
+            close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
@@ -580,6 +645,9 @@ impl MuxBackend {
                     .collect(),
                 agents: Vec::new(),
             },
+            foreground: self.foreground.clone(),
+            closed: Mutex::new(Vec::new()),
+            close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
@@ -619,13 +687,26 @@ impl RuntimeProvider for MuxBackend {
         Ok(self.inventory.clone())
     }
     fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
-        ForegroundEvidence::Inconclusive
+        self.foreground.clone()
     }
     fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
         unreachable!("the mux backend is never asked to focus")
     }
-    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
-        unreachable!("the mux backend is never asked to close")
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
+        self.close_outcome(target, cancel)
+            .diagnostic()
+            .map_or(Ok(()), |message| Err(message.to_string()))
+    }
+    fn close_outcome(&self, target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
+        self.closed
+            .lock()
+            .expect("the close list")
+            .push(target.clone());
+        match &self.close_answer {
+            CloseAnswer::Completed => CloseOutcome::Completed,
+            CloseAnswer::Refused(message) => CloseOutcome::Refused(message.clone()),
+            CloseAnswer::Unknown(message) => CloseOutcome::Unknown(message.clone()),
+        }
     }
     fn create(&self, request: &CreateRequest, _cancel: &AtomicBool) -> CreateOutcome {
         self.created_requests
@@ -1073,6 +1154,20 @@ impl GatedVerifier {
     /// Blocks newly arriving calls again, so a released verifier can be reused.
     fn block_again(&self) {
         *self.open.lock().expect("verifier gate") = false;
+    }
+}
+
+struct MatchingVerifier {
+    pid: i32,
+    identity: ProcessIdentity,
+}
+
+impl ProcessVerifier for MatchingVerifier {
+    fn inspect(&self, pid: i32) -> Result<Option<ProcessIdentity>, String> {
+        (pid == self.pid)
+            .then(|| self.identity.clone())
+            .map(Some)
+            .ok_or_else(|| "wrong pid".into())
     }
 }
 
@@ -1919,6 +2014,31 @@ const THIRD_EDGE: &str = "33333333-3333-4333-8333-333333333333";
 
 /// Registers a child that presents the token its launch carried, which is what
 /// the launched process does when it starts.
+fn child_close_params(spawn_request_id: &str, source: &str, incarnation: &str) -> Value {
+    json!({
+        "spawn_request_id": spawn_request_id,
+        "source": source,
+        "incarnation": incarnation,
+        "intent": "cancel",
+    })
+}
+
+fn register_close_child(client: &mut Client, token: &str, process: ProcessIdentity) -> Value {
+    let mut body = registration_body(CHILD_INCARNATION, Some(process), None);
+    body["spawn_token"] = json!(token);
+    client.call("agent.register", body)
+}
+
+fn closes_directory(state: &Path) -> PathBuf {
+    state.join("closes")
+}
+
+/// One recorded close, read back as the daemon wrote it.
+fn close_record(state: &Path, close_id: &str) -> Value {
+    let path = closes_directory(state).join(format!("{close_id}.json"));
+    serde_json::from_str(&fs::read_to_string(path).expect("a close record")).expect("a record")
+}
+
 fn registering_with_token(client: &mut Client, incarnation: &str, token: &str) -> Value {
     let mut body = registration_body(incarnation, None, None);
     body["spawn_token"] = json!(token);
@@ -1999,6 +2119,31 @@ fn ping_answers_the_version_backend_and_registry_capability_without_mux() {
     assert_eq!(response["result"]["protocol"], PROTOCOL_VERSION);
     assert_eq!(response["result"]["backend"], "none");
     assert_eq!(response["result"]["capabilities"], advertised(&[]));
+    let unsupported = client.call(
+        "child.close",
+        json!({
+            "spawn_request_id": FIRST_EDGE,
+            "source": "herdsman",
+            "incarnation": CHILD_INCARNATION,
+            "intent": "cancel",
+        }),
+    );
+    assert_eq!(error_code(&unsupported), "refused");
+    assert!(
+        unsupported["error"]["message"]
+            .as_str()
+            .expect("a reason")
+            .contains("no recorded edge")
+    );
+    assert!(
+        !sandbox
+            .state()
+            .join("closes")
+            .join(format!("{FIRST_EDGE}.json"))
+            .exists(),
+        "an unsupported managed close creates no accepted close record"
+    );
+
     daemon.stop();
 }
 
@@ -3370,6 +3515,393 @@ fn the_wire_shapes_of_spawn_are_validated_before_dispatch() {
 }
 
 #[test]
+fn child_close_dispatches_only_the_verified_spawn_child_pane() {
+    let sandbox = Sandbox::new("managed-close-success");
+    let edge_id = random_uuid();
+    let process = ProcessIdentity {
+        boot_id: "boot-test".into(),
+        pid: 200,
+        start_ticks: 400,
+    };
+    let verifier: Arc<dyn ProcessVerifier> = Arc::new(MatchingVerifier {
+        pid: 200,
+        identity: process.clone(),
+    });
+    let base = MuxBackend::new(SPAWN_CAPABILITIES)
+        .observing(&["wA:p2"])
+        .with_foreground(ForegroundEvidence::command(200, Some("pi".into()), None));
+    let backend = base.closing(CloseAnswer::Completed);
+    let mut daemon = Daemon::bind_with_backend_and_verifier(
+        &sandbox.socket(),
+        &sandbox.state(),
+        Some(backend.clone()),
+        verifier,
+    )
+    .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    // Create the edge through the real socket path; then bind the child process claim.
+    let spawned = client.call_id(&edge_id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    assert_eq!(result_record(&spawned)["outcome"], "completed");
+    let edge = recorded_edge(&sandbox.state(), &edge_id);
+    let token = edge["token"]
+        .as_str()
+        .expect("private spawn token")
+        .to_owned();
+    let registered = register_close_child(&mut client, &token, process);
+    assert!(
+        registered["result"]["registration"]["agent_id"].is_string(),
+        "{registered}"
+    );
+    let agent_id = registered["result"]["registration"]["agent_id"]
+        .as_str()
+        .expect("the child's registration")
+        .to_owned();
+    let registration = client.call("agent.get", json!({"agent_id": &agent_id}));
+    let close_id = random_uuid();
+    let first = client.call_id(
+        &close_id,
+        "child.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(first["result"]["close"]["outcome"], "completed", "{first}");
+    assert_eq!(first["result"]["close"]["intent"], "cancel");
+    assert_eq!(first["result"]["close"]["pane"], "wA:p2");
+    assert_eq!(
+        backend.closed_targets(),
+        vec![CloseTarget::Pane("wA:p2".into())]
+    );
+    // The pane result is durable, and it is the whole of what a close claims: the
+    // recorded pane, the caller's intent, a confirmed mux closure, and no process
+    // or assignment fact.
+    let record = close_record(&sandbox.state(), &close_id);
+    assert_eq!(record["outcome"], "completed", "{record}");
+    assert_eq!(record["intent"], "cancel");
+    assert_eq!(record["location"]["pane"], "wA:p2");
+    assert!(record.get("message").is_none(), "{record}");
+    assert!(
+        !fs::read_to_string(closes_directory(&sandbox.state()).join(format!("{close_id}.json")))
+            .expect("a reading")
+            .contains(&token),
+        "a close record never carries the spawn token"
+    );
+
+    // The same request id is answered from that record: the pane was closed once,
+    // and the edge, its binding and the child's registration read as they did.
+    let replay = client.call_id(
+        &close_id,
+        "child.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(
+        replay["result"]["close"]["outcome"], "completed",
+        "{replay}"
+    );
+    assert_eq!(replay["result"]["close"]["pane"], "wA:p2");
+    assert_eq!(
+        backend.closed_targets().len(),
+        1,
+        "a replay must not dispatch again"
+    );
+    let topology = client.call("spawn.get", json!({"request_id": &edge_id}));
+    assert_eq!(topology["result"]["spawn"]["state"], "bound", "{topology}");
+    assert_eq!(
+        topology["result"]["spawn"]["bound"]["incarnation"],
+        CHILD_INCARNATION
+    );
+    assert_eq!(topology["result"]["spawn"]["location"]["pane"], "wA:p2");
+    assert_eq!(topology["result"]["spawn"]["created"], "completed");
+    assert_eq!(topology["result"]["spawn"]["launched"], "completed");
+    assert_eq!(
+        client.call("agent.get", json!({"agent_id": &agent_id}))["result"]["agent"],
+        registration["result"]["agent"],
+        "a close rewrites no registration of the child it closed"
+    );
+    let ping = client.call("ping", json!({}));
+    assert!(
+        !ping["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("managed_child_close"))
+    );
+    daemon.stop();
+}
+
+/// A backend refusal is an outcome like any other: it is durable, it is replayed
+/// without a second dispatch, and a conflicting use of its request id is refused.
+#[test]
+fn child_close_persists_a_backend_refusal_and_replays_it_without_dispatching() {
+    let sandbox = Sandbox::new("managed-close-refused");
+    let edge_id = random_uuid();
+    let process = ProcessIdentity {
+        boot_id: "boot-test".into(),
+        pid: 200,
+        start_ticks: 400,
+    };
+    let verifier: Arc<dyn ProcessVerifier> = Arc::new(MatchingVerifier {
+        pid: 200,
+        identity: process.clone(),
+    });
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+        .observing(&["wA:p2"])
+        .with_foreground(ForegroundEvidence::command(200, Some("pi".into()), None))
+        .closing(CloseAnswer::Refused("no such pane".into()));
+    let mut daemon = Daemon::bind_with_backend_and_verifier(
+        &sandbox.socket(),
+        &sandbox.state(),
+        Some(backend.clone()),
+        verifier,
+    )
+    .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let spawned = client.call_id(&edge_id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    assert_eq!(result_record(&spawned)["outcome"], "completed");
+    let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
+        .as_str()
+        .expect("private spawn token")
+        .to_owned();
+    register_close_child(&mut client, &token, process);
+
+    let close_id = random_uuid();
+    let refused = client.call_id(
+        &close_id,
+        "child.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+    assert_eq!(refused["error"]["message"], "no such pane", "{refused}");
+    assert_eq!(
+        backend.closed_targets(),
+        vec![CloseTarget::Pane("wA:p2".into())]
+    );
+    // The refusal is durable and carries the backend's own words, so a replay can
+    // answer the same way after the backend is gone.
+    let record = close_record(&sandbox.state(), &close_id);
+    assert_eq!(record["outcome"], "refused", "{record}");
+    assert_eq!(record["message"], "no such pane");
+    let replay = client.call_id(
+        &close_id,
+        "child.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&replay), "refused", "{replay}");
+    assert_eq!(replay["error"]["message"], "no such pane");
+    assert_eq!(
+        backend.closed_targets().len(),
+        1,
+        "a replay must not dispatch again"
+    );
+
+    // One request id names one close: the same id with different content is
+    // refused, and the recorded refusal stands.
+    let conflict = client.call_id(
+        &close_id,
+        "child.close",
+        json!({
+            "spawn_request_id": &edge_id,
+            "source": "test-publisher",
+            "incarnation": CHILD_INCARNATION,
+            "intent": "complete",
+        }),
+    );
+    assert_eq!(error_code(&conflict), "refused", "{conflict}");
+    assert!(
+        conflict["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("already names different contents"),
+        "{conflict}"
+    );
+    assert_eq!(backend.closed_targets().len(), 1);
+    assert_eq!(close_record(&sandbox.state(), &close_id), record);
+    daemon.stop();
+}
+
+/// A close outlives the daemon that dispatched it: a restart reads the recorded
+/// outcome, dispatches nothing, and infers no process exit from it.
+#[test]
+fn a_restarted_daemon_reads_the_recorded_close_outcome_without_dispatching() {
+    let sandbox = Sandbox::new("managed-close-restart");
+    let edge_id = random_uuid();
+    let close_id = random_uuid();
+    let process = ProcessIdentity {
+        boot_id: "boot-test".into(),
+        pid: 200,
+        start_ticks: 400,
+    };
+    {
+        let verifier: Arc<dyn ProcessVerifier> = Arc::new(MatchingVerifier {
+            pid: 200,
+            identity: process.clone(),
+        });
+        let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+            .observing(&["wA:p2"])
+            .with_foreground(ForegroundEvidence::command(200, Some("pi".into()), None))
+            .closing(CloseAnswer::Unknown("the reply was lost".into()));
+        let mut daemon = Daemon::bind_with_backend_and_verifier(
+            &sandbox.socket(),
+            &sandbox.state(),
+            Some(backend.clone()),
+            verifier,
+        )
+        .expect("daemon");
+        let mut client = Client::dial(daemon.path());
+        let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+        let spawned = client.call_id(&edge_id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+        assert_eq!(result_record(&spawned)["outcome"], "completed");
+        let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
+            .as_str()
+            .expect("private spawn token")
+            .to_owned();
+        register_close_child(&mut client, &token, process.clone());
+
+        let lost = client.call_id(
+            &close_id,
+            "child.close",
+            child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+        );
+        assert_eq!(error_code(&lost), "backend_unavailable", "{lost}");
+        assert_eq!(lost["error"]["message"], "the reply was lost", "{lost}");
+        assert_eq!(
+            backend.closed_targets(),
+            vec![CloseTarget::Pane("wA:p2".into())]
+        );
+        daemon.stop();
+    }
+
+    // The restarted daemon has the same records and a backend it could dispatch
+    // to. It answers from the record: no second close, and no reading of the pane
+    // or the process behind it as gone.
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+        .observing(&["wA:p2"])
+        .with_foreground(ForegroundEvidence::command(200, Some("pi".into()), None));
+    let verifier: Arc<dyn ProcessVerifier> = Arc::new(MatchingVerifier {
+        pid: 200,
+        identity: process,
+    });
+    let mut restarted = Daemon::bind_with_backend_and_verifier(
+        &sandbox.socket(),
+        &sandbox.state(),
+        Some(backend.clone()),
+        verifier,
+    )
+    .expect("a restart");
+    let mut client = Client::dial(restarted.path());
+    let replay = client.call_id(
+        &close_id,
+        "child.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&replay), "backend_unavailable", "{replay}");
+    assert_eq!(replay["error"]["message"], "the reply was lost", "{replay}");
+    assert!(
+        backend.closed_targets().is_empty(),
+        "a restart re-dispatches nothing"
+    );
+    let topology = client.call("spawn.get", json!({"request_id": &edge_id}));
+    assert_eq!(topology["result"]["spawn"]["state"], "bound", "{topology}");
+    assert_eq!(topology["result"]["spawn"]["location"]["pane"], "wA:p2");
+    restarted.stop();
+}
+
+#[test]
+fn child_close_refuses_foreground_and_containment_mismatches_without_recording() {
+    for (name, evidence, panes, verification) in [
+        ("shell", ForegroundEvidence::Shell, vec!["wA:p2"], true),
+        (
+            "inconclusive",
+            ForegroundEvidence::Inconclusive,
+            vec!["wA:p2"],
+            true,
+        ),
+        (
+            "missing",
+            ForegroundEvidence::command(200, Some("pi".into()), None),
+            vec!["wA:p9"],
+            true,
+        ),
+        (
+            "different-pid",
+            ForegroundEvidence::command(201, Some("pi".into()), None),
+            vec!["wA:p2"],
+            false,
+        ),
+        (
+            "invalid-pid",
+            ForegroundEvidence::command(0, Some("pi".into()), None),
+            vec!["wA:p2"],
+            true,
+        ),
+        (
+            "mismatched-birth",
+            ForegroundEvidence::command(200, Some("pi".into()), None),
+            vec!["wA:p2"],
+            false,
+        ),
+    ] {
+        let sandbox = Sandbox::new(&format!("managed-close-{name}"));
+        let id = random_uuid();
+        let process = ProcessIdentity {
+            boot_id: "boot-test".into(),
+            pid: 200,
+            start_ticks: 400,
+        };
+        let verifier: Arc<dyn ProcessVerifier> = Arc::new(MatchingVerifier {
+            pid: if verification { 200 } else { 201 },
+            identity: if verification {
+                process.clone()
+            } else if name == "mismatched-birth" {
+                ProcessIdentity {
+                    start_ticks: 401,
+                    ..process.clone()
+                }
+            } else {
+                ProcessIdentity {
+                    pid: 201,
+                    ..process.clone()
+                }
+            },
+        });
+        let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+            .observing(&panes)
+            .with_foreground(evidence);
+        let mut daemon = Daemon::bind_with_backend_and_verifier(
+            &sandbox.socket(),
+            &sandbox.state(),
+            Some(backend.clone()),
+            verifier,
+        )
+        .expect("daemon");
+        let mut client = Client::dial(daemon.path());
+        let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+        client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+        let token = recorded_edge(&sandbox.state(), &id)["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        register_close_child(&mut client, &token, process);
+        let close_id = random_uuid();
+        let response = client.call_id(
+            &close_id,
+            "child.close",
+            child_close_params(&id, "test-publisher", CHILD_INCARNATION),
+        );
+        assert!(
+            response.get("error").is_some(),
+            "a refusal must be an error, not an accepted close: {response}"
+        );
+        assert!(
+            !closes_directory(&sandbox.state())
+                .join(format!("{close_id}.json"))
+                .exists()
+        );
+        assert!(backend.closed_targets().is_empty());
+        daemon.stop();
+    }
+}
+
+#[test]
 fn the_topology_read_reports_the_edge_its_own_operation_recorded() {
     let sandbox = Sandbox::new("spawn-read");
     let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p1", "wA:p2"]);
@@ -4155,6 +4687,7 @@ impl RuntimeProvider for ClientBackend {
             .push(target.clone());
         match &self.close {
             CloseAnswer::Completed => CloseOutcome::Completed,
+            CloseAnswer::Refused(message) => CloseOutcome::Refused(message.clone()),
             CloseAnswer::Unknown(message) => CloseOutcome::Unknown(message.clone()),
         }
     }

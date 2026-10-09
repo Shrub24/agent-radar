@@ -11,13 +11,19 @@ stdlib-only reconnecting owner publisher is
 exercised against a disposable daemon by
 [`tests/agent_publisher.py`](../tests/agent_publisher.py). The fixture uses
 `<daemon-time>`, `<daemon-time-plus-1s>`, `<daemon-time-plus-30s>`,
-`<opaque-uuid>`, `<replacement-opaque-uuid>` and `<replay-warning>`
-placeholders for generated values. Fixture validation replays registry exchanges
-against a disposable daemon and compares each response against its template,
-substituting only generated and clock-derived fields. The final spawn exchanges
-use a disposable scripted Herdr socket; those validate the served daemon's
-operation, token binding and public redaction without a live mux or partial
-whole-object comparison. The `agent.list` entry is a shape reference, compared
+`<opaque-uuid>`, `<replacement-opaque-uuid>`, `<replay-warning>`,
+`<spawn-request-id>`, `<child-agent-id>`, `<child-incarnation>`, `<boot-id>`
+and `<private-spawn-token>` placeholders for generated values, identities and
+timestamps. Fixture validation replays registry exchanges against a disposable daemon and
+compares each response against its template, substituting only generated and
+clock-derived fields. The spawn exchanges use a disposable scripted Herdr
+socket; these validate the served daemon's operation, token binding and public
+redaction without a live mux or partial whole-object comparison. The final
+`child.close` exchanges close the spawned child pane after a scripted
+foreground-process identity match and replay the same request id, which must
+return the recorded result instead of dispatching again. The smoke publishes
+both child channels first and asserts those publications and the spawn edge are
+unchanged afterwards. The `agent.list` entry is a shape reference, compared
 against the validated `agent.get` template. `agent.get` and `agent.list`
 differ intentionally: writer-facing channel/context replies return the writer
 binding to the publisher, whereas public get/list facts omit writer handles (and
@@ -106,13 +112,18 @@ root are unsupported for concurrent writes.
 
 The trusted control socket serves `agent.register`, `agent.acquire`,
 `agent.publish`, `agent.retire`, `agent.context`, `agent.get`, `agent.list`,
-`spawn`, `spawn.get` and `spawn.list`. `ping` advertises `agent_registry`
-regardless of mux backend. The `agent.*` methods are independent of the physical
-backend and do not call Herdr. `spawn` is different: it requires both backend
-capabilities `creation` and `launch`; `spawn.get` and `spawn.list` are registry
-reads, available with `agent_registry` even when no backend is wired. All method
-parameter objects reject unknown fields. The exact canonical exchanges are in
-the JSONL fixture; field semantics and transitions follow.
+`spawn`, `spawn.get`, `spawn.list` and `child.close`. `ping` advertises
+`agent_registry` regardless of mux backend. The `agent.*` methods are
+independent of the physical backend and do not call Herdr. `spawn` is
+different: it requires both backend capabilities `creation` and `launch`;
+`spawn.get` and `spawn.list` are registry reads, available with
+`agent_registry` even when no backend is wired. `child.close` requires a bound
+child on a daemon-authored spawn edge, fresh foreground evidence, and the
+backend capabilities `observe` and `close`; it refuses before recording when a
+capability or verification evidence is missing. All method parameter objects
+reject unknown fields. The exact canonical exchanges, including a successful
+managed close and its same-ID replay, are in the JSONL fixture; field semantics
+and transitions follow.
 
 ### Spawn operation
 
@@ -187,6 +198,40 @@ check protocol compatibility plus both `creation` and `launch` before attempting
 `spawn`; if the daemon answers `unknown_method`, keep the prior path. Never
 fallback after timeout, malformed reply, internal error, or any otherwise
 uncertain spawn result.
+
+### Managed child close
+
+`child.close` takes a daemon-authored spawn request id, its exact bound child
+identity and an audit intent; the caller does not supply a pane id. The exact
+parameters and response are in the
+[canonical fixture](agent-registration.fixture.jsonl). A child is eligible only
+when its edge is present and bound to that `(source, incarnation)`, the edge has
+a recorded pane, and the bound registration has a process identity claim.
+Immediately before admission, the daemon requires fresh inventory showing that
+pane in its recorded workspace/tab containment, then a positive non-shell
+foreground PID whose procfs birth identity exactly matches the child's
+registered `(pid, boot_id, start_ticks)`. It refuses before recording or
+dispatch for an absent/unbound/mismatched edge or pane, missing process claim,
+missing or inconclusive foreground evidence, changed containment, or failed
+identity verification. It requires the mux capabilities `observe` and `close`;
+a missing capability refuses before record or backend effect. Foreign or
+caller-selected panes, children outside daemon-authored spawn edges, labels,
+titles and pane positions are never targets.
+
+A successful admission persists the target and `complete` or `cancel` intent
+before dispatch. The intent is an audit/display label only. The durable close
+outcome is `completed` only on backend confirmation, `refused` only on a positive
+backend refusal before applying the close, and `unknown` if dispatch may have
+occurred without confirmation (including lost or timed-out replies). A replay
+with the same id and content returns that stored result without re-verification
+or redispatch; conflicting content under the same id is refused. Unknown is
+never retried automatically or through another backend. The close reports only
+the mux pane-close result: it never claims foreground-process or process-group
+exit and never writes assignment or execution facts. A vanished pane after an
+unknown close remains unresolved; topology preserves the original spawn edge
+and binding, and missing-pane freshness is not process-exit evidence. The daemon
+does not advertise a separate managed-close capability. Existing managed
+lifecycle decisions remain with their owner.
 
 ### Public discovery and pagination
 

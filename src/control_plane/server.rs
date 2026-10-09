@@ -32,8 +32,8 @@ use serde_json::json;
 use crate::control_plane::ops::{self, Method};
 use crate::control_plane::protocol::{self, Code, PROTOCOL_VERSION, Refusal, Request, Response};
 use crate::control_plane::registry::{
-    self, AcquireRequest, Channel, LocalProcfsVerifier, LocationEvidence, ProcessVerifier,
-    RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
+    self, AcquireRequest, Channel, CloseAdmission, LocalProcfsVerifier, LocationEvidence,
+    ProcessVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
 };
 use crate::control_plane::store::{self, Category, RequestOutcome, RequestRecord, Store};
 use crate::lifecycle::{self, CloseRequest, DirectClose};
@@ -766,6 +766,15 @@ struct SpawnGetParams {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ChildCloseParams {
+    spawn_request_id: String,
+    source: String,
+    incarnation: String,
+    intent: registry::CloseIntent,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpawnListParams {
     #[serde(default)]
     after: Option<String>,
@@ -865,6 +874,124 @@ fn verify_bounded(
     }
 }
 
+/// Run one evidence read on a bounded worker. The same global budget bounds
+/// backend inventory, foreground evidence and procfs verification for close.
+fn run_bounded<T: Send + 'static>(
+    budget: &Arc<VerificationBudget>,
+    stopping: &Arc<AtomicBool>,
+    deadline: Instant,
+    name: &'static str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ()> {
+    if deadline.saturating_duration_since(Instant::now()).is_zero()
+        || stopping.load(Ordering::SeqCst)
+    {
+        return Err(());
+    }
+    budget.reap();
+    let Some(permit) = budget.acquire() else {
+        return Err(());
+    };
+    let (send, receive) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _permit = permit;
+            let result = work();
+            let _ = send.send(result);
+        })
+        .map_err(|_| ())?;
+    budget.track(worker);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || stopping.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        match receive.recv_timeout(remaining.min(VERIFY_POLL)) {
+            Ok(result) => return Ok(result),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn bounded_close_dispatch(
+    backend: &Arc<dyn RuntimeProvider>,
+    pane_id: &str,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+    deadline: Instant,
+) -> Result<crate::runtime::CloseOutcome, ()> {
+    let backend = Arc::clone(backend);
+    let pane_id = pane_id.to_string();
+    let cancel = Arc::clone(stopping);
+    run_bounded(
+        budget,
+        stopping,
+        deadline,
+        "radar-child-close-dispatch",
+        move || backend.close_outcome(&crate::runtime::CloseTarget::Pane(pane_id), &cancel),
+    )
+}
+
+fn bounded_inventory(
+    backend: &Arc<dyn RuntimeProvider>,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+    deadline: Instant,
+) -> Result<FleetObservation, ()> {
+    let backend = Arc::clone(backend);
+    let cancel = Arc::clone(stopping);
+    run_bounded(
+        budget,
+        stopping,
+        deadline,
+        "radar-close-inventory",
+        move || backend.inventory(&cancel),
+    )?
+    .map_err(|_| ())
+}
+
+fn bounded_foreground(
+    backend: &Arc<dyn RuntimeProvider>,
+    pane_id: &str,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+    deadline: Instant,
+) -> Result<crate::model::ForegroundEvidence, ()> {
+    let backend = Arc::clone(backend);
+    let pane_id = pane_id.to_string();
+    let cancel = Arc::clone(stopping);
+    run_bounded(
+        budget,
+        stopping,
+        deadline,
+        "radar-close-foreground",
+        move || backend.foreground_evidence(&pane_id, &cancel),
+    )
+}
+
+fn verify_foreground_bounded(
+    pid: i32,
+    verifier: &Arc<dyn ProcessVerifier>,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+    deadline: Instant,
+) -> Result<crate::model::ProcessIdentity, registry::ProcessVerification> {
+    let verifier = Arc::clone(verifier);
+    match run_bounded(
+        budget,
+        stopping,
+        deadline,
+        "radar-child-close-verify",
+        move || verifier.inspect(pid),
+    ) {
+        Ok(Ok(Some(identity))) => Ok(identity),
+        Ok(Ok(None)) => Err(registry::ProcessVerification::Absent),
+        Ok(Err(_)) | Err(()) => Err(registry::ProcessVerification::Unavailable),
+    }
+}
+
 fn process_evidence(
     registration: &registry::Registration,
     verification: registry::ProcessVerification,
@@ -916,6 +1043,277 @@ fn location_evidence(inventory: Option<&FleetObservation>, edge: &SpawnEdge) -> 
         }
         (Some(_), Some(_)) => LocationEvidence::Absent,
         _ => LocationEvidence::Unavailable,
+    }
+}
+
+/// Revalidate the exact managed child against fresh pane and process evidence,
+/// persist the request only after the checks succeed, then dispatch one pane
+/// close. No outcome here says the foreground process exited.
+fn execute_child_close(
+    close: &registry::ChildCloseRequest,
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    budget: &Arc<VerificationBudget>,
+) -> Response {
+    let (registry, backend, verifier, stopping) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            core.backend.clone(),
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.stopping),
+        )
+    };
+    // A recorded close is answered from its own record before anything is
+    // re-verified or dispatched: a replay repeats the one outcome this request id
+    // reached, even when the pane it closed is no longer there to verify.
+    if let Some(existing) = match registry.child_close(&close.request_id) {
+        Ok(existing) => existing,
+        Err(error) => return registry_error(request, error),
+    } {
+        if !existing.answers(close) {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::Refused,
+                    "child close request id already names different contents",
+                ),
+            );
+        }
+        return close_response(request, &existing);
+    }
+    let location = match registry.validate_child_close_target(close) {
+        Ok(location) => location,
+        Err(error) => return registry_error(request, error),
+    };
+    let pane_id = location.pane.as_deref().expect("validated pane target");
+    let registration = match registry.child_registration(&close.source, &close.incarnation) {
+        Ok(Some(registration)) => registration,
+        Ok(None) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::NotFound, "bound child registration is not recorded"),
+            );
+        }
+        Err(error) => return registry_error(request, error),
+    };
+    let Some(claim) = registration.request.process.clone() else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "bound child registration has no process identity claim",
+            ),
+        );
+    };
+    let Some(backend) = backend else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BackendUnavailable,
+                "child.close requires a mux backend",
+            ),
+        );
+    };
+    if stopping.load(Ordering::SeqCst) {
+        return Response::refused(&request.id, &Refusal::new(Code::Busy, "daemon is stopping"));
+    }
+    if let Some(refusal) = capabilities_refuse(&backend, "observe") {
+        return Response::refused(&request.id, &refusal);
+    }
+    let inventory = match bounded_inventory(
+        &backend,
+        &stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(inventory) => inventory,
+        Err(_) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BackendUnavailable,
+                    "fresh mux inventory is unavailable",
+                ),
+            );
+        }
+    };
+    let Some(pane) = inventory.pane(pane_id) else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "recorded child pane is absent from fresh inventory",
+            ),
+        );
+    };
+    if location
+        .workspace
+        .as_deref()
+        .is_some_and(|id| id != pane.location.workspace_id)
+        || location
+            .tab
+            .as_deref()
+            .is_some_and(|id| id != pane.location.tab_id)
+    {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(Code::Refused, "recorded child pane containment changed"),
+        );
+    }
+    let foreground = bounded_foreground(
+        &backend,
+        pane_id,
+        &stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    );
+    let foreground = match foreground {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BackendUnavailable,
+                    "foreground process evidence is unavailable",
+                ),
+            );
+        }
+    };
+    let pid = match foreground {
+        crate::model::ForegroundEvidence::NonShell { pid, .. } if pid > 0 => pid,
+        crate::model::ForegroundEvidence::NonShell { .. } => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::Refused, "foreground process PID is invalid"),
+            );
+        }
+        crate::model::ForegroundEvidence::Shell
+        | crate::model::ForegroundEvidence::Inconclusive => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::Refused, "foreground process evidence is inconclusive"),
+            );
+        }
+    };
+    let observed = verify_foreground_bounded(
+        pid,
+        &verifier,
+        &stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    );
+    match observed {
+        Ok(observed)
+            if pid == claim.pid
+                && observed.pid == pid
+                && observed.boot_id == claim.boot_id
+                && observed.start_ticks == claim.start_ticks => {}
+        _ => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::Refused,
+                    "foreground process birth identity is unavailable or changed",
+                ),
+            );
+        }
+    }
+    // A close backend is required before recording admission; otherwise this
+    // request cannot reach a truthful dispatch result.
+    if !backend.capabilities().contains(&"close") {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BackendUnavailable,
+                "child.close needs the `close` capability; this backend does not provide it",
+            ),
+        );
+    }
+    if stopping.load(Ordering::SeqCst) {
+        return Response::refused(&request.id, &Refusal::new(Code::Busy, "daemon is stopping"));
+    }
+    // Admission decides the one dispatch this request id may make: a caller that
+    // raced this one for the same id dispatches nothing, and reads the outcome
+    // recorded here instead.
+    match registry.record_child_close(close, store::now_ms()) {
+        Ok(CloseAdmission::Admitted(_)) => {}
+        Ok(CloseAdmission::Recorded(recorded)) => return close_response(request, &recorded),
+        Err(error) => return registry_error(request, error),
+    }
+
+    let (outcome, message) = match bounded_close_dispatch(
+        &backend,
+        pane_id,
+        &stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(crate::runtime::CloseOutcome::Completed) => (RequestOutcome::Completed, None),
+        Ok(crate::runtime::CloseOutcome::Refused(message)) => {
+            (RequestOutcome::Refused, Some(message))
+        }
+        Ok(crate::runtime::CloseOutcome::Unknown(message)) => {
+            (RequestOutcome::Unknown, Some(message))
+        }
+        // The dispatch may have reached the backend and its answer was lost.
+        Err(()) => (RequestOutcome::Unknown, None),
+    };
+    // The outcome is durable before this call answers: the effect is claimed only
+    // from what the backend said, and a dispatch that said nothing leaves the
+    // record unknown for every later replay to read.
+    let recorded =
+        match registry.record_child_close_outcome(&close.request_id, outcome, message.as_deref()) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(
+                        Code::Internal,
+                        format!("the child close outcome was not recorded: {error}"),
+                    ),
+                );
+            }
+        };
+    close_response(request, &recorded)
+}
+
+/// The daemon's answer for one recorded close.
+///
+/// The durable outcome decides the shape, so a replay — including one after a
+/// restart — answers as the original call did. A confirmed close reports the mux
+/// pane closure and nothing else: no answer here claims a process or process
+/// group exit, and an unknown outcome stays unknown rather than being retried.
+fn close_response(request: &Request, close: &registry::ChildClose) -> Response {
+    match close.outcome {
+        RequestOutcome::Completed => Response::ok(
+            &request.id,
+            json!({"close": {
+                "outcome": "completed",
+                "intent": close.intent,
+                "pane": close.location.pane.as_deref(),
+            }}),
+        ),
+        RequestOutcome::Refused => Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                close
+                    .message
+                    .as_deref()
+                    .unwrap_or("the backend refused the close"),
+            ),
+        ),
+        RequestOutcome::Unknown => Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BackendUnavailable,
+                close
+                    .message
+                    .as_deref()
+                    .unwrap_or("managed child close outcome is unknown"),
+            ),
+        ),
     }
 }
 
@@ -1189,6 +1587,23 @@ fn registry_request(
             let inventory = observed_inventory(core);
             let evidence = location_evidence(inventory.as_ref(), &stored);
             Response::ok(&request.id, json!({"spawn": stored.topology(evidence)}))
+        }
+        "child.close" => {
+            let params: ChildCloseParams = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let close = registry::ChildCloseRequest {
+                request_id: request.id.clone(),
+                spawn_request_id: params.spawn_request_id,
+                source: params.source,
+                incarnation: params.incarnation,
+                intent: params.intent,
+            };
+            if let Err(error) = close.validate() {
+                return Response::refused(&request.id, &Refusal::new(Code::BadParams, error));
+            }
+            execute_child_close(&close, request, core, verification)
         }
         "spawn.list" => {
             let params: SpawnListParams = match decode_params(request) {

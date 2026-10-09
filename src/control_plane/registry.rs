@@ -19,6 +19,10 @@
 //! a child was created for, the private token that binds it and each effect the
 //! daemon confirmed. Its storage lives in [`spawn`].
 //!
+//! A child close is a fourth: one file per close request, naming the spawn edge
+//! and bound child it targets and the pane recorded there, without touching the
+//! edge itself. Its storage lives in [`child_close`].
+//!
 //! Only the fact that a process identity was *supplied* is public here. Whether
 //! it is live is a separate answer that arrives with the process verifier; a
 //! caller's claim is never promoted to verification by being stored.
@@ -387,6 +391,9 @@ pub struct Registry {
     admission: Mutex<()>,
 }
 
+/// Durable managed-child close requests: the edge and child they target, the
+/// recorded pane, the intent and the outcome. The details live in [`child_close`].
+pub mod child_close;
 /// The mutable current-session context lives beside the channels; the details
 /// live in [`context`].
 pub mod context;
@@ -399,6 +406,10 @@ pub mod publication;
 /// recorded. The details live in [`spawn`].
 pub mod spawn;
 
+pub use child_close::{
+    CHILD_CLOSE_VERSION, ChildClose, ChildCloseRequest, CloseAdmission, CloseIntent,
+    MAX_CHILD_CLOSE_BYTES,
+};
 pub use context::{
     AcceptedContext, CONTEXT_VERSION, ContextRequest, ContextValue, ContextWrite,
     MAX_CONTEXT_BYTES, PublicContext, PublicSession, SessionContext,
@@ -419,7 +430,7 @@ pub use spawn::{
 
 impl Registry {
     /// Opens the registry under `root`, creating `root` and its `agents`,
-    /// `publications` and `spawns` directories if they are missing.
+    /// `publications`, `spawns` and `closes` directories if they are missing.
     ///
     /// The directory must be a real `0700` directory of this user. A registration
     /// names publisher incarnations and holds the private launch information
@@ -447,6 +458,8 @@ impl Registry {
         prepare_directory(&publications)?;
         let spawns = root.join(spawn::SPAWNS);
         prepare_directory(&spawns)?;
+        let closes = root.join(child_close::CLOSES);
+        prepare_directory(&closes)?;
         Ok(Self {
             directory,
             root: root.to_path_buf(),
@@ -469,6 +482,54 @@ impl Registry {
     /// The `spawns` directory.
     pub fn spawns(&self) -> PathBuf {
         self.root.join(spawn::SPAWNS)
+    }
+
+    /// The `closes` directory.
+    pub fn closes(&self) -> PathBuf {
+        self.root.join(child_close::CLOSES)
+    }
+
+    /// The registration for one source incarnation.
+    pub fn child_registration(
+        &self,
+        source: &str,
+        incarnation: &str,
+    ) -> Result<Option<Registration>, String> {
+        self.find_incarnation(source, incarnation)
+    }
+
+    /// Checks that a close request names an exact bound child and recorded pane.
+    /// Does not persist anything; a fresh verification must precede admission.
+    pub fn validate_child_close_target(
+        &self,
+        request: &ChildCloseRequest,
+    ) -> Result<RegistryLocation, String> {
+        child_close::validate_target(self, request)
+    }
+
+    /// Admits one managed-child close request, or answers with the record this
+    /// request id already has.
+    pub fn record_child_close(
+        &self,
+        request: &ChildCloseRequest,
+        now_ms: i64,
+    ) -> Result<CloseAdmission, String> {
+        child_close::record(self, request, now_ms)
+    }
+
+    /// Records what the dispatch of one admitted close did.
+    pub fn record_child_close_outcome(
+        &self,
+        request_id: &str,
+        outcome: RequestOutcome,
+        message: Option<&str>,
+    ) -> Result<ChildClose, String> {
+        child_close::record_outcome(self, request_id, outcome, message)
+    }
+
+    /// One recorded close request, if the daemon has one.
+    pub fn child_close(&self, request_id: &str) -> Result<Option<ChildClose>, String> {
+        child_close::close(self, request_id)
     }
 
     /// Records one spawn edge for a caller, minting its private token, or

@@ -69,7 +69,14 @@ Operation records SHALL distinguish pending, completed, refused and unknown. Bac
 - **THEN** the record names the refusal and no backend mutation occurs
 
 ### Requirement: Close preserves current identity and containment safeguards
-Close SHALL require a frozen expected target identity, fresh observation and the existing positive-unmanaged containment checks. A changed target SHALL refuse. Managed or uncertain panes and containers with such members SHALL not use direct mux close. Existing managed close/restart SHALL remain owner-routed, with no owner-refusal fallback into a daemon operation.
+
+Close SHALL require a frozen expected target identity and fresh observation.
+Direct mux close SHALL retain the positive-unmanaged containment checks and
+SHALL NOT close managed or uncertain panes. A distinct managed-child close MAY
+close a daemon-spawned pane only when its durable edge names a bound child and
+fresh evidence verifies that location, containment and occupant. It SHALL
+report the pane outcome only. Owner-routed managed close/restart is unchanged,
+with no fallback between the routes.
 
 #### Scenario: Replacement occupant
 - **WHEN** a different session or run occupies the requested pane at execution
@@ -78,6 +85,14 @@ Close SHALL require a frozen expected target identity, fresh observation and the
 #### Scenario: Mixed tab
 - **WHEN** any tab member is managed or uncertain
 - **THEN** the whole direct close refuses without partially closing members
+
+#### Scenario: Unmanaged safeguards unchanged
+- **WHEN** a direct close targets a managed, uncertain or mixed-container target
+- **THEN** it refuses before dispatch
+
+#### Scenario: Verified daemon-managed child
+- **WHEN** managed close targets a bound child whose recorded pane and containment still match current observation
+- **THEN** it may request pane closure and records that effect separately, without claiming the process exited
 
 ### Requirement: Reporting is a backend bridge
 The control plane SHALL wrap source-provided state, session and display metadata without claiming a new registry or lifecycle authority. Caller source, sequence, TTL and reported values SHALL be preserved where the backend supports them; unsupported reporting SHALL refuse. No report SHALL imply recovered assignments, children or pending work.

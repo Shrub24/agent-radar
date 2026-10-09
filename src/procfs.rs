@@ -677,7 +677,7 @@ impl Stat {
         })
     }
 
-    /// Extracts the process birth stamp from a stat line. This shares the
+    /// Extracts the process birth identity from a stat line. This shares the
     /// sampler's proc(5) parser so verification and sampling interpret PID reuse
     /// identically.
     pub(crate) fn birth_identity(text: &str) -> Option<(i32, u64)> {

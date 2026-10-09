@@ -142,7 +142,7 @@ pub fn classify(method: &str) -> Option<Method> {
         // A spawn read reports the daemon's own edge records; whether the backend
         // still reports a recorded location changes its freshness, never whether
         // the read is served.
-        "spawn.get" | "spawn.list" => Method::Registry,
+        "spawn.get" | "spawn.list" | "child.close" => Method::Registry,
         "observe" | "process_info" | "output" => Method::Read,
         other => Method::Operation(Operation::from_method(other)?),
     })

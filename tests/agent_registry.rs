@@ -20,12 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use agent_radar::control_plane::registry::{
-    AcquireRequest, Channel, ContextRequest, ContextValue, ExpectedWriter, Freshness,
-    LaunchSession, LaunchSpec, LocalProcfsVerifier, LocationEvidence, MAX_CONTEXT_BYTES,
-    MAX_LISTED, MAX_REGISTRATION_BYTES, MAX_SPAWN_BYTES, MAX_TEXT_BYTES, Outcome,
-    ProcessVerification, ProcessVerifier, PublicChannel, PublicContext, PublishRequest,
-    PublisherIdentity, RegistrationRequest, Registry, RegistryLocation, Snapshot, SpawnBindRequest,
-    SpawnEdge, SpawnRequest, SpawnState, WriterBinding,
+    AcquireRequest, Channel, ChildCloseRequest, CloseAdmission, CloseIntent, ContextRequest,
+    ContextValue, ExpectedWriter, Freshness, LaunchSession, LaunchSpec, LocalProcfsVerifier,
+    LocationEvidence, MAX_CHILD_CLOSE_BYTES, MAX_CONTEXT_BYTES, MAX_LISTED, MAX_REGISTRATION_BYTES,
+    MAX_SPAWN_BYTES, MAX_TEXT_BYTES, Outcome, ProcessVerification, ProcessVerifier, PublicChannel,
+    PublicContext, PublishRequest, PublisherIdentity, RegistrationRequest, Registry,
+    RegistryLocation, Snapshot, SpawnBindRequest, SpawnEdge, SpawnRequest, SpawnState,
+    WriterBinding,
 };
 use agent_radar::control_plane::{RequestOutcome, random_uuid};
 use agent_radar::model::{ProcessIdentity, SessionUuid};
@@ -3079,4 +3080,488 @@ fn spawn_edges_page_in_key_order_without_repeating_one() {
         "{escaped}"
     );
     drop_root(&root);
+}
+
+// --- Durable managed-child close requests ------------------------------------
+
+const CHILD_CLOSE_REQUEST: &str = "aa11bb22-cc33-4d44-8e55-ff66778899aa";
+const OTHER_CHILD_CLOSE_REQUEST: &str = "bb22cc33-dd44-4e55-8f66-001122334455";
+
+fn close_request(
+    request_id: &str,
+    spawn_request_id: &str,
+    source: &str,
+    incarnation: &str,
+    intent: CloseIntent,
+) -> ChildCloseRequest {
+    ChildCloseRequest {
+        request_id: request_id.into(),
+        spawn_request_id: spawn_request_id.into(),
+        source: source.into(),
+        incarnation: incarnation.into(),
+        intent,
+    }
+}
+
+fn paned_location() -> RegistryLocation {
+    RegistryLocation {
+        backend: "herdr".into(),
+        instance: Some("default".into()),
+        workspace: Some("w1".into()),
+        tab: Some("t1".into()),
+        pane: Some("w1:p2".into()),
+    }
+}
+
+/// A spawn edge with a bound child and a recorded pane: the only shape a close
+/// may target, returned with its private token for the privacy check.
+fn managed_edge(registry: &Registry, now_ms: i64) -> SpawnEdge {
+    let parent = spawn_parent(registry, INCARNATION, now_ms);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), now_ms)
+        .expect("a spawn");
+    registry
+        .record_spawn_created(
+            SPAWN_REQUEST,
+            RequestOutcome::Completed,
+            Some(paned_location()),
+        )
+        .expect("a create");
+    registry
+        .bind_spawn(
+            &spawn_bind(&edge.token, "herdsman", CHILD_INCARNATION),
+            now_ms,
+        )
+        .expect("a bind")
+}
+
+fn child_close_path(registry: &Registry, request_id: &str) -> PathBuf {
+    registry.closes().join(format!("{request_id}.json"))
+}
+
+fn child_close_files(registry: &Registry) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(registry.closes())
+        .expect("a directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[test]
+fn a_child_close_request_is_durable_and_idempotent() {
+    let root = temp_root("close-record");
+    let admitted;
+    {
+        let registry = Registry::open_at(&root, 1_000).expect("a registry");
+        managed_edge(&registry, 1_000);
+        let request = close_request(
+            CHILD_CLOSE_REQUEST,
+            SPAWN_REQUEST,
+            "herdsman",
+            CHILD_INCARNATION,
+            CloseIntent::Complete,
+        );
+        let CloseAdmission::Admitted(recorded) = registry
+            .record_child_close(&request, 2_000)
+            .expect("a recorded close")
+        else {
+            panic!("a fresh request id admits its close");
+        };
+        admitted = recorded;
+
+        // The close copies the edge's recorded pane, keeps the intent as an audit
+        // label and claims no effect before one is dispatched.
+        assert_eq!(admitted.version, 1);
+        assert_eq!(admitted.spawn_request_id, SPAWN_REQUEST);
+        assert_eq!(admitted.source, "herdsman");
+        assert_eq!(admitted.incarnation, CHILD_INCARNATION);
+        assert_eq!(admitted.location, paned_location());
+        assert_eq!(admitted.intent, CloseIntent::Complete);
+        assert_eq!(admitted.outcome, RequestOutcome::Unknown);
+        assert_eq!(admitted.message, None);
+        assert_eq!(admitted.recorded_at, format_millis(2_000));
+
+        // The same request id with identical content is answered from the record
+        // rather than admitted twice: no second file, no rewritten timestamp.
+        let stored = fs::read(child_close_path(&registry, CHILD_CLOSE_REQUEST)).expect("a read");
+        let replay = registry
+            .record_child_close(&request, 9_000)
+            .expect("a replay");
+        assert_eq!(replay, CloseAdmission::Recorded(admitted.clone()));
+        assert_eq!(
+            fs::read(child_close_path(&registry, CHILD_CLOSE_REQUEST)).expect("a read"),
+            stored
+        );
+        assert_eq!(
+            child_close_files(&registry).len(),
+            1,
+            "a replay writes nothing"
+        );
+
+        // Different content under one request id is refused, and the recorded
+        // target is left alone.
+        let conflict = close_request(
+            CHILD_CLOSE_REQUEST,
+            SPAWN_REQUEST,
+            "herdsman",
+            CHILD_INCARNATION,
+            CloseIntent::Cancel,
+        );
+        let error = registry
+            .record_child_close(&conflict, 9_001)
+            .expect_err("a refusal");
+        assert!(error.contains("already names another target"), "{error}");
+        assert_eq!(
+            fs::read(child_close_path(&registry, CHILD_CLOSE_REQUEST)).expect("a read"),
+            stored
+        );
+    }
+
+    // The record is durable across a reopen, and the pane it names is private.
+    let reopened = Registry::open_at(&root, 3_000).expect("a reopening");
+    let restored = reopened
+        .child_close(CHILD_CLOSE_REQUEST)
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(restored, admitted);
+    assert_eq!(
+        fs::metadata(child_close_path(&reopened, CHILD_CLOSE_REQUEST))
+            .expect("a record")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "a close request is private"
+    );
+    assert!(
+        reopened
+            .child_close(OTHER_CHILD_CLOSE_REQUEST)
+            .expect("a read")
+            .is_none(),
+        "an unrecorded request id is an absence"
+    );
+    drop_root(&root);
+}
+
+#[test]
+fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
+    let root = temp_root("close-outcome");
+    {
+        let registry = Registry::open_at(&root, 1_000).expect("a registry");
+        let edge = managed_edge(&registry, 1_000);
+        let parent = edge.parent.clone();
+        let request = close_request(
+            CHILD_CLOSE_REQUEST,
+            SPAWN_REQUEST,
+            "herdsman",
+            CHILD_INCARNATION,
+            CloseIntent::Complete,
+        );
+        registry
+            .record_child_close(&request, 2_000)
+            .expect("a close");
+
+        // The outcome is written onto the recorded request and lands nowhere else:
+        // the edge that named the child and the registration it was admitted
+        // against are the facts they were, so a settled close is a pane result
+        // rather than a topology or registration change.
+        let registration = registry
+            .get(&parent)
+            .expect("a read")
+            .expect("a registration");
+        let settled = registry
+            .record_child_close_outcome(CHILD_CLOSE_REQUEST, RequestOutcome::Completed, None)
+            .expect("a settled outcome");
+        assert_eq!(settled.outcome, RequestOutcome::Completed);
+        assert_eq!(settled.message, None);
+        assert_eq!(settled.intent, CloseIntent::Complete);
+        assert_eq!(settled.location, paned_location());
+        assert_eq!(
+            registry.spawn_edge(SPAWN_REQUEST).expect("a read"),
+            Some(edge),
+            "a settled close preserves the spawn edge"
+        );
+        assert_eq!(
+            registry.get(&parent).expect("a read"),
+            Some(registration),
+            "a settled close preserves the registration"
+        );
+
+        // The settled record is what a later call with the same id answers with,
+        // and it is never admitted a second time.
+        let CloseAdmission::Recorded(replay) = registry
+            .record_child_close(&request, 9_000)
+            .expect("a replay")
+        else {
+            panic!("a settled close is not admitted twice");
+        };
+        assert_eq!(replay, settled);
+        assert_eq!(
+            registry.child_close(CHILD_CLOSE_REQUEST).expect("a read"),
+            Some(settled.clone())
+        );
+
+        // An unconfirmed outcome keeps the backend's own words, made storable: a
+        // message a terminal would act on cannot be written into a record this
+        // daemon would then refuse to read back.
+        let unconfirmed = registry
+            .record_child_close_outcome(
+                CHILD_CLOSE_REQUEST,
+                RequestOutcome::Unknown,
+                Some("herdr timed out\u{7} after 5s\n"),
+            )
+            .expect("a settled outcome");
+        assert_eq!(unconfirmed.outcome, RequestOutcome::Unknown);
+        assert_eq!(
+            unconfirmed.message.as_deref(),
+            Some("herdr timed out after 5s")
+        );
+
+        // An outcome belongs to a request that was admitted: there is nothing
+        // else to settle, and asking mints no request.
+        let error = registry
+            .record_child_close_outcome(OTHER_CHILD_CLOSE_REQUEST, RequestOutcome::Refused, None)
+            .expect_err("a refusal");
+        assert!(error.contains("no recorded request"), "{error}");
+        assert!(
+            registry
+                .child_close(OTHER_CHILD_CLOSE_REQUEST)
+                .expect("a read")
+                .is_none()
+        );
+    }
+
+    // The outcome is durable: a restarted daemon reads what the dispatch reached,
+    // and neither the pane result nor the intent is re-derived.
+    let reopened = Registry::open_at(&root, 3_000).expect("a reopening");
+    let restored = reopened
+        .child_close(CHILD_CLOSE_REQUEST)
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(restored.outcome, RequestOutcome::Unknown);
+    assert_eq!(
+        restored.message.as_deref(),
+        Some("herdr timed out after 5s")
+    );
+    assert_eq!(restored.spawn_request_id, SPAWN_REQUEST);
+    assert_eq!(restored.location, paned_location());
+    drop_root(&root);
+}
+
+#[test]
+fn a_child_close_targets_only_a_bound_child_with_a_recorded_pane() {
+    let root = temp_root("close-admission");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a spawn");
+    let request = close_request(
+        CHILD_CLOSE_REQUEST,
+        SPAWN_REQUEST,
+        "herdsman",
+        CHILD_INCARNATION,
+        CloseIntent::Cancel,
+    );
+
+    // An edge with no bound child has no identity to close.
+    let error = registry
+        .record_child_close(&request, 2_100)
+        .expect_err("a refusal");
+    assert!(error.contains("no bound child"), "{error}");
+
+    // Bound, but nothing was created yet: there is no pane to target.
+    registry
+        .bind_spawn(
+            &spawn_bind(&edge.token, "herdsman", CHILD_INCARNATION),
+            2_200,
+        )
+        .expect("a bind");
+    let error = registry
+        .record_child_close(&request, 2_300)
+        .expect_err("a refusal");
+    assert!(error.contains("no pane to close"), "{error}");
+
+    // A location that names no pane is not a closeable target either.
+    registry
+        .record_spawn_created(
+            SPAWN_REQUEST,
+            RequestOutcome::Completed,
+            Some(RegistryLocation {
+                backend: "herdr".into(),
+                instance: None,
+                workspace: Some("w1".into()),
+                tab: None,
+                pane: None,
+            }),
+        )
+        .expect("a create");
+    let error = registry
+        .record_child_close(&request, 2_400)
+        .expect_err("a refusal");
+    assert!(error.contains("no pane to close"), "{error}");
+
+    registry
+        .record_spawn_created(
+            SPAWN_REQUEST,
+            RequestOutcome::Completed,
+            Some(paned_location()),
+        )
+        .expect("a create");
+
+    // The named child must be the one the edge bound.
+    let wrong_child = close_request(
+        CHILD_CLOSE_REQUEST,
+        SPAWN_REQUEST,
+        "herdsman",
+        OTHER_INCARNATION,
+        CloseIntent::Cancel,
+    );
+    let error = registry
+        .record_child_close(&wrong_child, 2_500)
+        .expect_err("a refusal");
+    assert!(error.contains("did not bind"), "{error}");
+
+    // A spawn edge that was never recorded is refused too.
+    let no_edge = close_request(
+        CHILD_CLOSE_REQUEST,
+        OTHER_SPAWN_REQUEST,
+        "herdsman",
+        CHILD_INCARNATION,
+        CloseIntent::Cancel,
+    );
+    let error = registry
+        .record_child_close(&no_edge, 2_600)
+        .expect_err("a refusal");
+    assert!(error.contains("no recorded edge"), "{error}");
+
+    assert!(
+        child_close_files(&registry).is_empty(),
+        "a refused close writes nothing"
+    );
+
+    // The exact bound child on the edge is admitted.
+    let CloseAdmission::Admitted(admitted) = registry
+        .record_child_close(&request, 2_700)
+        .expect("an admitted close")
+    else {
+        panic!("a fresh request id admits its close");
+    };
+    assert_eq!(admitted.incarnation, CHILD_INCARNATION);
+    assert_eq!(admitted.location.pane.as_deref(), Some("w1:p2"));
+    drop_root(&root);
+}
+
+#[test]
+fn a_child_close_never_carries_the_spawn_token() {
+    let root = temp_root("close-token");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let edge = managed_edge(&registry, 1_000);
+    let request = close_request(
+        CHILD_CLOSE_REQUEST,
+        SPAWN_REQUEST,
+        "herdsman",
+        CHILD_INCARNATION,
+        CloseIntent::Complete,
+    );
+    registry
+        .record_child_close(&request, 2_000)
+        .expect("a close");
+
+    // The token that bound the edge is a private credential of the spawn and is
+    // not needed to identify the target, so no close record holds it.
+    let on_disk =
+        fs::read_to_string(child_close_path(&registry, CHILD_CLOSE_REQUEST)).expect("a read");
+    assert!(!on_disk.contains(&edge.token), "{on_disk}");
+
+    // A caller cannot smuggle one in either: the request wire is closed.
+    let json = format!(
+        r#"{{"request_id":"{CHILD_CLOSE_REQUEST}","spawn_request_id":"{SPAWN_REQUEST}","source":"herdsman","incarnation":"{CHILD_INCARNATION}","intent":"cancel","token":"{}"}}"#,
+        edge.token
+    );
+    let error = serde_json::from_str::<ChildCloseRequest>(&json).expect_err("a refusal");
+    assert!(error.to_string().contains("unknown field"), "{error}");
+    drop_root(&root);
+}
+
+#[test]
+fn a_malformed_or_symlinked_or_oversized_child_close_is_not_read() {
+    let root = temp_root("close-shape");
+    let elsewhere = temp_root("close-shape-target");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    managed_edge(&registry, 1_000);
+    let request = close_request(
+        CHILD_CLOSE_REQUEST,
+        SPAWN_REQUEST,
+        "herdsman",
+        CHILD_INCARNATION,
+        CloseIntent::Complete,
+    );
+    registry
+        .record_child_close(&request, 2_000)
+        .expect("a close");
+    let path = child_close_path(&registry, CHILD_CLOSE_REQUEST);
+    let whole = fs::read(&path).expect("a read");
+
+    // A write that did not complete is never a close with no target.
+    fs::write(&path, &whole[..whole.len() / 2]).expect("a partial record");
+    let error = registry
+        .child_close(CHILD_CLOSE_REQUEST)
+        .expect_err("a refusal");
+    assert!(error.contains("not a child close"), "{error}");
+
+    // A record of another version is refused rather than read as this one.
+    let mut foreign: serde_json::Value = serde_json::from_slice(&whole).expect("a decoding");
+    foreign["version"] = serde_json::json!(2);
+    fs::write(&path, serde_json::to_vec(&foreign).expect("an encoding")).expect("a write");
+    let error = registry
+        .child_close(CHILD_CLOSE_REQUEST)
+        .expect_err("a refusal");
+    assert!(error.contains("is not served"), "{error}");
+
+    // A record whose id is not its filename is refused.
+    fs::write(
+        child_close_path(&registry, OTHER_CHILD_CLOSE_REQUEST),
+        &whole,
+    )
+    .expect("a copy");
+    let error = registry
+        .child_close(OTHER_CHILD_CLOSE_REQUEST)
+        .expect_err("a refusal");
+    assert!(error.contains("does not match its filename"), "{error}");
+
+    // A planted record naming a malformed spawn request is not a target.
+    let mut garbled: serde_json::Value = serde_json::from_slice(&whole).expect("a decoding");
+    garbled["spawn_request_id"] = serde_json::json!("not-a-spawn");
+    fs::write(&path, serde_json::to_vec(&garbled).expect("an encoding")).expect("a write");
+    let error = registry
+        .child_close(CHILD_CLOSE_REQUEST)
+        .expect_err("a refusal");
+    assert!(error.contains("malformed spawn request"), "{error}");
+
+    // A symlinked record is not a close the daemon wrote.
+    fs::remove_file(&path).expect("a removal");
+    let target = elsewhere.join("real.json");
+    fs::write(&target, b"{}").expect("a file");
+    symlink(&target, &path).expect("a symlink");
+    let error = registry
+        .child_close(CHILD_CLOSE_REQUEST)
+        .expect_err("a refusal");
+    assert!(error.contains("not a regular file"), "{error}");
+    fs::remove_file(&path).expect("a removal");
+
+    // A planted file larger than the record bound fails before being read whole.
+    fs::write(
+        child_close_path(&registry, OTHER_CHILD_CLOSE_REQUEST),
+        vec![b'x'; MAX_CHILD_CLOSE_BYTES + 1],
+    )
+    .expect("a planted file");
+    let error = registry
+        .child_close(OTHER_CHILD_CLOSE_REQUEST)
+        .expect_err("a refusal");
+    assert!(error.contains("exceeds"), "{error}");
+    drop_root(&root);
+    drop_root(&elsewhere);
 }

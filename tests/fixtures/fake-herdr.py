@@ -18,6 +18,23 @@ elif sys.argv[1:3] == ["api", "snapshot"]:
         panes.append({"pane_id": "wA:p2", "tab_id": "wA:t1", "workspace_id": "wA"})
     print(json.dumps({"result": {"snapshot": {"workspaces": [], "tabs": [], "panes": panes, "agents": []}}}))
     raise SystemExit(0)
+elif sys.argv[1:3] == ["pane", "process-info"]:
+    assert sys.argv[3:5] == ["--pane", "wA:p2"], sys.argv
+    pid = int((state / "foreground-pid").read_text())
+    # The shell PID differs from the foreground group, so the pane reports a
+    # running command rather than a shell prompt.
+    print(json.dumps({"result": {"process_info": {
+        "shell_pid": 999999,
+        "foreground_process_group_id": pid,
+        "foreground_processes": [{"pid": pid, "name": "pi", "cmdline": "pi --child"}],
+    }}}))
+    raise SystemExit(0)
+elif sys.argv[1:3] == ["pane", "close"]:
+    assert sys.argv[3:4] == ["wA:p2"], sys.argv
+    count_path = state / "close-count"
+    count = int(count_path.read_text()) if count_path.exists() else 0
+    count_path.write_text(str(count + 1))
+    raise SystemExit(0)
 elif sys.argv[1:2] == ["__serve"]:
     pass
 else:
