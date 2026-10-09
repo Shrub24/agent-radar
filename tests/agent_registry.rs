@@ -18,10 +18,11 @@ use std::thread;
 
 use agent_radar::control_plane::random_uuid;
 use agent_radar::control_plane::registry::{
-    AcquireRequest, Channel, ExpectedWriter, Freshness, LaunchSession, LaunchSpec,
-    LocalProcfsVerifier, MAX_LISTED, MAX_REGISTRATION_BYTES, MAX_TEXT_BYTES, Outcome,
-    ProcessVerification, ProcessVerifier, PublicChannel, PublishRequest, PublisherIdentity,
-    RegistrationRequest, Registry, RegistryLocation, Snapshot, WriterBinding,
+    AcquireRequest, Channel, ContextRequest, ContextValue, ExpectedWriter, Freshness,
+    LaunchSession, LaunchSpec, LocalProcfsVerifier, MAX_CONTEXT_BYTES, MAX_LISTED,
+    MAX_REGISTRATION_BYTES, MAX_TEXT_BYTES, Outcome, ProcessVerification, ProcessVerifier,
+    PublicChannel, PublicContext, PublishRequest, PublisherIdentity, RegistrationRequest, Registry,
+    RegistryLocation, Snapshot, WriterBinding,
 };
 use agent_radar::model::ProcessIdentity;
 
@@ -1445,6 +1446,696 @@ fn restart_epoch_stales_restored_facts_even_when_clock_repeats_or_goes_back() {
             .unwrap()
             .freshness,
         Freshness::Stale
+    );
+    drop_root(&root);
+}
+
+// --- Mutable current-session context ---------------------------------------------
+
+const NEXT_SESSION: &str = "e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b";
+
+fn context_request(
+    agent_id: &str,
+    publisher: PublisherIdentity,
+    handle: Option<&str>,
+    sequence: u64,
+    session: Option<&str>,
+) -> ContextRequest {
+    ContextRequest {
+        agent_id: agent_id.into(),
+        publisher,
+        writer_handle: handle.map(str::to_string),
+        replace: None,
+        sequence,
+        lease_ms: Some(10_000),
+        observed_at: None,
+        context: ContextValue {
+            session: session.map(str::to_string),
+        },
+    }
+}
+
+/// A takeover: it presents no handle and names the incumbent it observed.
+fn context_replacement(
+    agent_id: &str,
+    publisher: PublisherIdentity,
+    expected: &WriterBinding,
+    sequence: u64,
+    session: Option<&str>,
+) -> ContextRequest {
+    ContextRequest {
+        replace: Some(ExpectedWriter {
+            generation: expected.generation,
+            handle: expected.handle.clone(),
+        }),
+        ..context_request(agent_id, publisher, None, sequence, session)
+    }
+}
+
+fn context_path(registry: &Registry, agent_id: &str) -> PathBuf {
+    registry
+        .publications()
+        .join(format!("{agent_id}.context.json"))
+}
+
+fn context_of(registry: &Registry, agent_id: &str, now_ms: i64) -> PublicContext {
+    registry
+        .context(agent_id, now_ms)
+        .expect("a read")
+        .expect("a context")
+}
+
+fn format_millis(value: i64) -> String {
+    agent_radar::control_plane::store::format_millis(value)
+}
+
+#[test]
+fn a_context_switch_republishes_without_changing_identity_or_generation() {
+    let root = temp_root("context-switch");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let me = publisher(&agent.request.source, &agent.request.incarnation);
+
+    let first = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me.clone(), None, 1, Some(SESSION)),
+            1_000,
+        )
+        .expect("a first publish");
+    assert!(first.warning.is_none());
+    assert_eq!(first.record.writer.generation, 1);
+    let handle = first.record.writer.handle.clone();
+    let path = context_path(&registry, &agent.agent_id);
+    assert_eq!(
+        fs::metadata(&path).expect("a record").permissions().mode() & 0o777,
+        0o600,
+        "a context record is private"
+    );
+
+    // A session switch is a newer sequence under the same writer: not a new
+    // subject, not a new agent id and not a new generation.
+    let switched = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me, Some(&handle), 2, Some(NEXT_SESSION)),
+            1_001,
+        )
+        .expect("a switch");
+    assert_eq!(switched.record.writer.generation, 1);
+    assert_eq!(switched.record.writer.handle, handle);
+    assert_eq!(switched.record.writer.sequence, 2);
+    assert_eq!(
+        switched.record.context.session.as_deref(),
+        Some(NEXT_SESSION)
+    );
+
+    let read = context_of(&registry, &agent.agent_id, 1_002);
+    assert_eq!(read.agent_id, agent.agent_id);
+    assert_eq!(read.writer.generation, 1);
+    assert_eq!(read.writer.sequence, 2);
+    assert_eq!(read.context.generation, 1);
+    assert_eq!(read.context.sequence, 2);
+    assert_eq!(read.context.session.as_deref(), Some(NEXT_SESSION));
+    assert_eq!(read.context.freshness, Freshness::Fresh);
+    assert!(!read.context.restored);
+    assert_eq!(
+        registry
+            .get(&agent.agent_id)
+            .expect("a read")
+            .expect("a record"),
+        agent,
+        "publishing context changes no registration"
+    );
+
+    // The lease is bounded on the daemon's clock and nothing else.
+    assert_eq!(
+        context_of(&registry, &agent.agent_id, 11_000)
+            .context
+            .freshness,
+        Freshness::Fresh
+    );
+    assert_eq!(
+        context_of(&registry, &agent.agent_id, 11_001)
+            .context
+            .freshness,
+        Freshness::Stale
+    );
+
+    // One agent context is one record: no second file a partial write could
+    // leave behind.
+    let records: Vec<_> = fs::read_dir(registry.publications())
+        .expect("a directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect();
+    assert_eq!(records.len(), 1, "one agent context is one record");
+    drop_root(&root);
+}
+
+#[test]
+fn an_identical_context_replay_warns_and_refreshes_no_lease() {
+    let root = temp_root("context-replay");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let me = publisher(&agent.request.source, &agent.request.incarnation);
+    let request = context_request(&agent.agent_id, me, None, 1, Some(SESSION));
+    let first = registry
+        .publish_context(&request, 1_000)
+        .expect("a first publish");
+    let replay_request = ContextRequest {
+        writer_handle: Some(first.record.writer.handle.clone()),
+        ..request
+    };
+
+    // A replay is answered, not refused — and it says what it did not do.
+    let replay = registry
+        .publish_context(&replay_request, 9_000)
+        .expect("a replay is answered");
+    let warning = replay.warning.expect("a replay warns");
+    assert!(warning.contains("not refreshed"), "{warning}");
+    assert_eq!(replay.record, first.record, "a replay stores nothing new");
+    assert_eq!(replay.record.context.expires_at, format_millis(11_000));
+
+    // The lease still ends where the first report put it.
+    assert_eq!(
+        context_of(&registry, &agent.agent_id, 10_999)
+            .context
+            .freshness,
+        Freshness::Fresh
+    );
+    assert_eq!(
+        context_of(&registry, &agent.agent_id, 11_000)
+            .context
+            .freshness,
+        Freshness::Stale
+    );
+    drop_root(&root);
+}
+
+#[test]
+fn context_sequence_conflicts_and_older_reports_are_refused() {
+    let root = temp_root("context-sequence");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let me = publisher(&agent.request.source, &agent.request.incarnation);
+    let first = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me.clone(), None, 1, Some(SESSION)),
+            1_000,
+        )
+        .expect("a first publish");
+    let handle = first.record.writer.handle.clone();
+    registry
+        .publish_context(
+            &context_request(
+                &agent.agent_id,
+                me.clone(),
+                Some(&handle),
+                2,
+                Some(NEXT_SESSION),
+            ),
+            1_001,
+        )
+        .expect("a switch");
+
+    // The stored sequence, re-sent with different content, is a conflict — and
+    // a different lease is content.
+    let conflicting = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me.clone(), Some(&handle), 2, Some(SESSION)),
+            1_002,
+        )
+        .expect_err("a conflict");
+    assert!(conflicting.contains("conflicting"), "{conflicting}");
+    let lease_conflict = ContextRequest {
+        lease_ms: Some(20_000),
+        ..context_request(
+            &agent.agent_id,
+            me.clone(),
+            Some(&handle),
+            2,
+            Some(NEXT_SESSION),
+        )
+    };
+    assert!(
+        registry
+            .publish_context(&lease_conflict, 1_003)
+            .expect_err("a conflict")
+            .contains("conflicting")
+    );
+
+    // An older sequence is refused even when its session matches the incumbent's.
+    let older = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me, Some(&handle), 1, Some(SESSION)),
+            1_004,
+        )
+        .expect_err("a refusal");
+    assert!(older.contains("older than stored sequence"), "{older}");
+
+    let read = context_of(&registry, &agent.agent_id, 1_005);
+    assert_eq!(read.context.sequence, 2);
+    assert_eq!(read.context.session.as_deref(), Some(NEXT_SESSION));
+    assert_eq!(read.context.expires_at, format_millis(11_001));
+    drop_root(&root);
+}
+
+#[test]
+fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
+    let root = temp_root("context-incumbent");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let me = publisher(&agent.request.source, &agent.request.incarnation);
+    let first = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me.clone(), None, 1, Some(SESSION)),
+            1_000,
+        )
+        .expect("a first publish");
+    let handle = first.record.writer.handle.clone();
+    let path = context_path(&registry, &agent.agent_id);
+    let before = fs::read(&path).expect("the stored record");
+    let other = publisher(&agent.request.source, OTHER_INCARNATION);
+    let incumbent = format!("the incumbent is generation 1 handle {handle}");
+
+    // A stale handshake names both its reason and the writer to contend with.
+    let stale = registry
+        .publish_context(
+            &context_request(
+                &agent.agent_id,
+                other.clone(),
+                Some(&random_uuid()),
+                2,
+                Some(NEXT_SESSION),
+            ),
+            2_000,
+        )
+        .expect_err("a refusal");
+    assert!(
+        stale.contains("stale or belongs to another generation"),
+        "{stale}"
+    );
+    assert!(stale.contains(&incumbent), "{stale}");
+    let unreported = registry
+        .publish_context(
+            &context_request(&agent.agent_id, other.clone(), None, 2, Some(NEXT_SESSION)),
+            2_000,
+        )
+        .expect_err("a refusal");
+    assert!(unreported.contains("did not present"), "{unreported}");
+    assert!(unreported.contains(&incumbent), "{unreported}");
+
+    // Naming the incumbent is not enough while its lease is live.
+    let takeover = registry
+        .publish_context(
+            &context_replacement(
+                &agent.agent_id,
+                other.clone(),
+                &first.record.writer,
+                2,
+                Some(NEXT_SESSION),
+            ),
+            2_000,
+        )
+        .expect_err("a refusal");
+    assert!(
+        takeover.contains("fresh writer takeover is refused"),
+        "{takeover}"
+    );
+    assert!(takeover.contains(&incumbent), "{takeover}");
+
+    assert_eq!(
+        fs::read(&path).expect("the stored record"),
+        before,
+        "a refused write changes nothing"
+    );
+    let next = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me, Some(&handle), 2, Some(NEXT_SESSION)),
+            2_001,
+        )
+        .expect("the incumbent is unaffected");
+    assert_eq!(next.record.writer.handle, handle);
+    assert_eq!(next.record.context.session.as_deref(), Some(NEXT_SESSION));
+    drop_root(&root);
+}
+
+#[test]
+fn context_replacement_after_retirement_advances_the_generation() {
+    let root = temp_root("context-retire");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let me = publisher(&agent.request.source, &agent.request.incarnation);
+    let first = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me.clone(), None, 1, Some(SESSION)),
+            1_000,
+        )
+        .expect("a first publish");
+    let old = first.record.writer.clone();
+    let successor = publisher(&agent.request.source, OTHER_INCARNATION);
+
+    registry
+        .retire_context(&agent.agent_id, &old.handle, 1_500)
+        .expect("a retirement");
+
+    // A replacement must name the exact incumbent it observed.
+    let wrong = WriterBinding {
+        handle: random_uuid(),
+        ..old.clone()
+    };
+    let mismatch = registry
+        .publish_context(
+            &context_replacement(
+                &agent.agent_id,
+                successor.clone(),
+                &wrong,
+                1,
+                Some(NEXT_SESSION),
+            ),
+            1_500,
+        )
+        .expect_err("a refusal");
+    assert!(
+        mismatch.contains("replacement does not apply"),
+        "{mismatch}"
+    );
+    assert!(
+        mismatch.contains(&format!("generation 1 handle {}", old.handle)),
+        "{mismatch}"
+    );
+
+    let replacement = registry
+        .publish_context(
+            &context_replacement(
+                &agent.agent_id,
+                successor.clone(),
+                &old,
+                1,
+                Some(NEXT_SESSION),
+            ),
+            1_500,
+        )
+        .expect("a replacement");
+    assert_eq!(replacement.record.writer.generation, 2);
+    assert_ne!(replacement.record.writer.handle, old.handle);
+    assert_eq!(replacement.record.writer.sequence, 1);
+    assert_eq!(replacement.record.context.incarnation, OTHER_INCARNATION);
+    assert_eq!(
+        replacement.record.context.session.as_deref(),
+        Some(NEXT_SESSION)
+    );
+
+    // The old handle is fenced for good, and a delayed replay of the same
+    // replacement no longer applies.
+    let fenced = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me, Some(&old.handle), 2, Some(SESSION)),
+            1_600,
+        )
+        .expect_err("a refusal");
+    assert!(
+        fenced.contains("stale or belongs to another generation"),
+        "{fenced}"
+    );
+    let delayed = registry
+        .publish_context(
+            &context_replacement(&agent.agent_id, successor, &old, 2, Some(SESSION)),
+            1_700,
+        )
+        .expect_err("a refusal");
+    assert!(delayed.contains("replacement does not apply"), "{delayed}");
+
+    let read = context_of(&registry, &agent.agent_id, 1_700);
+    assert_eq!(read.writer.generation, 2);
+    assert_eq!(read.context.session.as_deref(), Some(NEXT_SESSION));
+    let records: Vec<_> = fs::read_dir(registry.publications())
+        .expect("a directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect();
+    assert_eq!(records.len(), 1, "replacement rewrites the one record");
+    drop_root(&root);
+}
+
+#[test]
+fn context_replacement_after_lease_expiry_advances_the_generation() {
+    let root = temp_root("context-expiry");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let me = publisher(&agent.request.source, &agent.request.incarnation);
+    let first = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me, None, 1, Some(SESSION)),
+            1_000,
+        )
+        .expect("a first publish");
+    let successor = publisher(&agent.request.source, OTHER_INCARNATION);
+
+    // While the lease is live the incumbent still rules.
+    let fresh = registry
+        .publish_context(
+            &context_replacement(
+                &agent.agent_id,
+                successor.clone(),
+                &first.record.writer,
+                1,
+                Some(NEXT_SESSION),
+            ),
+            10_999,
+        )
+        .expect_err("a refusal");
+    assert!(
+        fresh.contains("fresh writer takeover is refused"),
+        "{fresh}"
+    );
+
+    // At expiry the reader sees stale facts and the record may be succeeded.
+    assert_eq!(
+        context_of(&registry, &agent.agent_id, 11_000)
+            .context
+            .freshness,
+        Freshness::Stale
+    );
+    let replacement = registry
+        .publish_context(
+            &context_replacement(
+                &agent.agent_id,
+                successor,
+                &first.record.writer,
+                1,
+                Some(NEXT_SESSION),
+            ),
+            11_000,
+        )
+        .expect("a replacement");
+    assert_eq!(replacement.record.writer.generation, 2);
+    let read = context_of(&registry, &agent.agent_id, 11_000);
+    assert_eq!(read.writer.generation, 2);
+    assert_eq!(read.context.freshness, Freshness::Fresh);
+    drop_root(&root);
+}
+
+#[test]
+fn a_malformed_context_record_fails_explicitly() {
+    let root = temp_root("context-corrupt");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let me = publisher(&agent.request.source, &agent.request.incarnation);
+    registry
+        .publish_context(
+            &context_request(&agent.agent_id, me, None, 1, Some(SESSION)),
+            1_000,
+        )
+        .expect("a first publish");
+    let path = context_path(&registry, &agent.agent_id);
+    let valid = fs::read(&path).expect("a read");
+    let planted = |value: &serde_json::Value| {
+        fs::write(&path, serde_json::to_vec(value).expect("an encoding")).expect("a write")
+    };
+
+    fs::write(&path, b"not json").expect("a planted file");
+    let error = registry
+        .context(&agent.agent_id, 1_000)
+        .expect_err("a malformed record is an error, not an absence");
+    assert!(error.contains("not a context record"), "{error}");
+
+    let mut value: serde_json::Value = serde_json::from_slice(&valid).expect("a decoding");
+    value["version"] = serde_json::json!(2);
+    planted(&value);
+    let error = registry
+        .context(&agent.agent_id, 1_000)
+        .expect_err("a foreign version");
+    assert!(error.contains("is not served"), "{error}");
+
+    let mut value: serde_json::Value = serde_json::from_slice(&valid).expect("a decoding");
+    value["context"]["generation"] = serde_json::json!(2);
+    planted(&value);
+    let error = registry
+        .context(&agent.agent_id, 1_000)
+        .expect_err("a report ahead of its writer");
+    assert!(
+        error.contains("not the current writer generation"),
+        "{error}"
+    );
+
+    let mut value: serde_json::Value = serde_json::from_slice(&valid).expect("a decoding");
+    value["context"]["session"] = serde_json::json!("not-a-uuid");
+    planted(&value);
+    let error = registry
+        .context(&agent.agent_id, 1_000)
+        .expect_err("a malformed session");
+    assert!(error.contains("malformed session"), "{error}");
+
+    // A planted file larger than the record bound fails before being read whole.
+    fs::write(&path, vec![b'x'; MAX_CONTEXT_BYTES + 1]).expect("a planted file");
+    let error = registry
+        .context(&agent.agent_id, 1_000)
+        .expect_err("a refusal");
+    assert!(error.contains("exceeds"), "{error}");
+    fs::remove_file(&path).expect("a removal");
+
+    // A symlink is never followed, and a missing record is an absence.
+    let elsewhere = temp_root("context-symlink-target");
+    let target = elsewhere.join("real.json");
+    fs::write(&target, &valid).expect("a file");
+    symlink(&target, &path).expect("a symlink");
+    let error = registry
+        .context(&agent.agent_id, 1_000)
+        .expect_err("a refusal");
+    assert!(error.contains("not a regular file"), "{error}");
+    fs::remove_file(&path).expect("a removal");
+    assert_eq!(
+        registry.context(&agent.agent_id, 1_000).expect("a read"),
+        None
+    );
+    drop_root(&root);
+    drop_root(&elsewhere);
+}
+
+#[test]
+fn an_absent_context_and_an_explicit_null_stay_distinguishable() {
+    let root = temp_root("context-null");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let silent = registry_agent(&registry, INCARNATION, None);
+    assert_eq!(
+        registry.context(&silent.agent_id, 1_000).expect("a read"),
+        None,
+        "never published is an absence, not a null"
+    );
+
+    let agent = registry_agent(&registry, OTHER_INCARNATION, None);
+    let me = publisher(&agent.request.source, &agent.request.incarnation);
+    let first = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me.clone(), None, 1, None),
+            1_000,
+        )
+        .expect("an explicit null");
+    assert_eq!(first.record.context.session, None);
+
+    let cleared = context_of(&registry, &agent.agent_id, 1_000);
+    assert_eq!(cleared.context.session, None, "no current session");
+    let json = serde_json::to_string(&cleared).expect("an encoding");
+    assert!(json.contains("\"session\":null"), "{json}");
+    assert!(!json.contains("handle"), "{json}");
+    assert!(!json.contains("serving_epoch"), "{json}");
+    assert!(!json.contains("context.json"), "{json}");
+
+    // A publisher that later gains a session republishes it under the same
+    // record, and still nothing private appears in the read.
+    let handle = first.record.writer.handle.clone();
+    let switched = registry
+        .publish_context(
+            &context_request(&agent.agent_id, me, Some(&handle), 2, Some(SESSION)),
+            1_001,
+        )
+        .expect("a switch");
+    assert_eq!(switched.record.context.session.as_deref(), Some(SESSION));
+    let json =
+        serde_json::to_string(&context_of(&registry, &agent.agent_id, 1_001)).expect("an encoding");
+    assert!(json.contains(SESSION), "{json}");
+    assert!(!json.contains(&handle), "{json}");
+
+    // Context belongs to a registered agent, and only a first publish binds a
+    // writer: neither a stranger nor a replacement with nothing to replace is
+    // accepted.
+    let stranger = registry.publish_context(
+        &context_request(
+            &random_uuid(),
+            publisher("herdsman", INCARNATION),
+            None,
+            1,
+            Some(SESSION),
+        ),
+        1_000,
+    );
+    assert!(
+        stranger
+            .expect_err("a refusal")
+            .contains("is not registered")
+    );
+    let nothing = registry.publish_context(
+        &context_replacement(
+            &silent.agent_id,
+            publisher("herdsman", INCARNATION),
+            &first.record.writer,
+            1,
+            Some(SESSION),
+        ),
+        1_000,
+    );
+    assert!(
+        nothing
+            .expect_err("a refusal")
+            .contains("first publish binds one")
+    );
+    drop_root(&root);
+}
+
+#[test]
+fn a_restored_context_reads_stale_until_republished() {
+    let root = temp_root("context-epoch");
+    let agent_id;
+    let handle;
+    let me = publisher("herdsman", INCARNATION);
+    {
+        let registry = Registry::open_at(&root, 5_000).expect("a registry");
+        let agent = registry_agent(&registry, INCARNATION, None);
+        agent_id = agent.agent_id.clone();
+        let first = registry
+            .publish_context(
+                &context_request(&agent_id, me.clone(), None, 1, Some(SESSION)),
+                5_000,
+            )
+            .expect("a first publish");
+        handle = first.record.writer.handle.clone();
+    }
+
+    let restarted = Registry::open_at(&root, 5_000).expect("a reopen at the same clock");
+    let restored = context_of(&restarted, &agent_id, 4_000);
+    assert!(restored.context.restored);
+    assert_eq!(restored.context.freshness, Freshness::Stale);
+    assert_eq!(restored.context.session.as_deref(), Some(SESSION));
+    assert!(
+        !serde_json::to_string(&restored)
+            .expect("an encoding")
+            .contains(&handle),
+        "no public read names the writer handle"
+    );
+
+    // The unreplaced handle reconnects with a newer sequence and becomes fresh,
+    // without a replacement and without a new generation.
+    let refreshed = restarted
+        .publish_context(
+            &context_request(&agent_id, me, Some(&handle), 2, Some(NEXT_SESSION)),
+            4_000,
+        )
+        .expect("a reconnect");
+    assert_eq!(refreshed.record.writer.generation, 1);
+    assert_eq!(refreshed.record.writer.handle, handle);
+    assert_eq!(
+        context_of(&restarted, &agent_id, 4_001).context.freshness,
+        Freshness::Fresh
     );
     drop_root(&root);
 }

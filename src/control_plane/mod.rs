@@ -23,9 +23,9 @@ pub use protocol::{
     Code, ErrorBody, MAX_LINE_BYTES, PROTOCOL_VERSION, Refusal, Request, Response, decode_request,
 };
 pub use registry::{
-    LaunchSession, LaunchSpec, LocalProcfsVerifier, ProcessVerification, ProcessVerifier,
-    PublicLaunch, PublicRegistration, Registration, RegistrationRequest, Registry,
-    RegistryLocation,
+    ContextRequest, ContextValue, LaunchSession, LaunchSpec, LocalProcfsVerifier,
+    ProcessVerification, ProcessVerifier, PublicContext, PublicLaunch, PublicRegistration,
+    Registration, RegistrationRequest, Registry, RegistryLocation, SessionContext,
 };
 pub use server::{
     Daemon, MAX_VERIFICATION_JOBS, install_signal_handlers, socket_path, socket_path_in, state_dir,

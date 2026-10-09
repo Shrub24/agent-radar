@@ -47,7 +47,7 @@ Lines are capped at 1 MiB excluding newline; an oversized line is drained and re
 | `report` | `reporting` |
 | Agent registry methods | `agent_registry` |
 
-`agent_registry` is advertised independently of backend capabilities, including when the backend is `none`. Radar requires the first four at startup; other missing capabilities do not prevent handshake and refuse only their method. Current production backend is Herdr. There is no production tmux backend. `registry` and `resume` (and other unknown names) return `unknown_method`. Registry request schemas are documented once in the [agent-registration contract](agent-registration.md); methods are `agent.register`, `agent.acquire`, `agent.publish`, `agent.retire`, `agent.get` and `agent.list`.
+`agent_registry` is advertised independently of backend capabilities, including when the backend is `none`. Radar requires the first four at startup; other missing capabilities do not prevent handshake and refuse only their method. Current production backend is Herdr. There is no production tmux backend. `registry` and `resume` (and other unknown names) return `unknown_method`. Registry request schemas are documented once in the [agent-registration contract](agent-registration.md); methods are `agent.register`, `agent.acquire`, `agent.publish`, `agent.retire`, `agent.context`, `agent.get` and `agent.list`.
 
 ## Methods
 

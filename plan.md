@@ -44,43 +44,60 @@ implemented, verified and archived. Its gates are recorded in that change's
 `verification.md`. Keep the next work separate from lifecycle and state
 contracts.
 
-The active `mux-control-plane` change starts with Herdr wrapping: a Radar-owned
-daemon exposes inventory, focus, guarded close, creation/splitting, input, output
-reads and metadata reporting behind a backend-neutral interface. Durable requests
-avoid replay after ambiguous effects; current owner controls stay intact. Radar
-keeps its direct adapter as an explicit mode/startup fallback, never as a retry
-of an uncertain operation. pi-extensions can port mux calls onto this interface.
+`mux-control-plane` and `daemon-agent-lifecycle` are implemented, verified,
+pushed (implementation `92ea9d37`, reference correction `4af0ff6b`), synced and
+archived as `openspec/changes/archive/2026-10-09-*`. The daemon provides physical mux wrappers plus independent
+durable registration, execution/assignment channels, writer fencing, freshness,
+process verification and private inert launch specifications. See
+`docs/daemon.md` for the consumer entry point and linked wire references.
 
-Agent/session awareness, lead recovery, stale restart plans, a publisher registry
-and parent/child topology remain future work over this seam. tmux is a later backend,
-not a prerequisite for the Herdr wrapper. The daemon's existence does not settle
-assignment authority or prove that a relaunched process recovered its children.
+Registry publication does not yet feed Radar's TUI. Launch/stop/resume are not
+implemented. Existing managed controls remain owner-routed; the direct adapter
+remains an explicit mode/startup fallback, never a retry after uncertain dispatch.
+Linux-only is accepted; cross-platform support is not a prerequisite.
 
 In priority order:
 
-1. **Lead restart and recovery.** Establish safe lead/standalone restart and
-   recovery of existing children, pending requests and task results. Keeping a
-   session UUID is necessary but does not prove recovery. This is the foundation
-   for stale restarts, not a direct Herdr relaunch fallback.
-2. **Structured waiting and failure reporting.** Publish activity, waiting
-   reason, last outcome and available action separately. Distinguish a question
-   awaiting an answer, a permission request, a scheduled rate-limit retry and a
-   failed turn with no retry. Coordinate this contract with lead recovery.
-3. **Stale-lead restart plans and batches.** Build on the recovery contract:
-   detect eligible stale leads, show a confirmed plan, execute through the owner
-   and report each result. Prefer leads over indiscriminately restarting all
-   panes. Startup detection and a restart offer come before opt-in automation.
-4. **Owner lifecycle/state daemon.** Complement Herdr first with direct owner
-   reporting, durable registration, reconnect/recovery and control routing.
-   Replacing Herdr's state/lifecycle role is a later migration, not a requirement
-   to replace its pane inventory and focus at the same time. Design this seam
-   alongside priorities 1–2; migrate transport incrementally.
-5. **Herdr-agnosticity and tmux-parity audit.** Cover Radar, pi-herdsman,
-   publishers and launchers. Record actual parity gaps before starting another
-   mux backend; use the daemon separation rather than assuming it fixes parity.
-6. **Further TUI and information surfaces.** Review the completed Processes
-   table and fleet density with the operator, then add non-consuming preview,
-   session statistics/search and fleet failure summaries in that order.
+1. **Herdsman direct-publication adoption (pi-extensions).** Stages 1-3 landed on
+   pi-extensions main `f5eedd29` (ADR 0031), verified 24/24 against an isolated
+   daemon. It publishes execution and owner assignment directly, uses a local
+   exact-`agent_id` binding, and persists/replays pending content. It does not
+   mirror to Herdr or perform lifecycle actions. Not yet live-deployed; existing
+   Herdr readiness/presence remains until physical execution cutover.
+2. **Consume direct registry state in Radar.** The daemon contract is ready:
+   paginated registration/execution/assignment facts, process verification and
+   mutable session context, each with provenance and freshness. Prepare disposable
+   publishers, then replace existing token observations only after live adoption
+   is verified. Define exact joins, source precedence and retained/disconnected
+   behavior before wiring the TUI. Preserve execution/assignment separation.
+3. **Daemon physical lifecycle and managed-child topology.** Extend the daemon
+   from mux wrappers to orchestration: Herdsman asks it to spawn a child subject,
+   and the daemon records the managed runtime parent/child relation plus observed
+   mux placement. Keep assignment lineage distinct from runtime creation and
+   current containment. Reconcile observations after daemon/lead restart; unknown
+   links stay unknown. This is the foundation for safe lead recovery, not restart
+   itself.
+4. **Lead recovery, then stale-lead restart plans.** Reconcile managed child
+   topology, pending requests/asks, task results and control outcomes; confirm old
+   process exit before resume. Session UUID continuity alone is not proof. Then
+   add confirmed stale-lead batches and startup plans before opt-in automation.
+   Do not restart all panes indiscriminately.
+5. **Herdsman/Herdr agnosticity and tmux-parity audit.** Cover Radar, pi-herdsman,
+   publishers and launchers. Record parity gaps before implementing a second
+   backend; the daemon seam alone does not establish parity.
+6. **Further TUI and information surfaces.** Review fleet density; then consider
+   non-consuming preview, session statistics/search and fleet failure summaries.
+
+Separate daemon follow-ups: retention/pruning for accumulated process-incarnation
+records and a push/event surface. Polling is accepted for now; neither blocks the
+state consumer. Launch specs and mux locations remain optional and unpublished by
+Herdsman until a consumer exists. pi-subagents is removed and excluded.
+
+Linux-only is accepted; cross-platform support is not a prerequisite. Background
+task metrics still require publisher-captured process birth identity. Physical
+lead restart waits for lifecycle execution and reconciliation contracts, not
+merely publisher adoption. Cooperative whole-fleet restart follows safe lead-only
+restart; it must not become a bulk kill.
 
 Background-task resource enrichment still needs publisher-captured birth
 identity; it is not a prerequisite for lead recovery. Command-specific actions,
@@ -196,20 +213,24 @@ The initial migration complements Herdr:
 - Background-task observation remains non-consuming. Neither state display nor
   a new transport may acknowledge a result or compete with the agent's `get`.
 
-Start with the physical mux wrappers in `mux-control-plane`; develop direct
-execution reporting and assignment-aware recovery with pi-extensions afterwards.
-Migrate one surface at a time with an explicit fallback; do not silently turn the
-current metadata-only task bus into a lifecycle command channel.
+The physical wrappers and direct registry foundation are landed. pi-extensions
+is preparing direct publication; Radar still needs mutable session context and
+registry consumption. Physical lifecycle execution and assignment-aware recovery
+follow those seams. This sequence is a working migration path, not a permanent
+allocation of lifecycle responsibilities. Migrate one surface at a time; do not
+silently turn the metadata-only task bus into a lifecycle command channel.
 
 ### Verification and shipping gates
 
-- Complete the descendant-table source, PTY and checked Nix gates.
+- Descendant-table and daemon source/PTY/checked Nix gates are complete; daemon
+  publisher verification uses a disposable daemon, not live Herdsman integration.
+- Sync/archive both completed daemon changes and keep the roadmap reconciled.
+- Validate the real Herdsman publication port before claiming live adoption.
 - Run an operator-approved live lifecycle smoke against owners that loaded the
   supported contract; stub-owner tests do not prove live recovery.
-- Confirm real background-task publisher integration separately from the stub
-  publisher PTY tests.
-- Resolve inherited requirement-length warnings exposed by OpenSpec 1.14.1
-  before the next all-spec strict shipping gate, without changing behavior.
+- Confirm real background-task publisher integration separately from stub tests.
+- Inherited requirement-length warnings were resolved; keep all-spec strict
+  validation warning-free as new requirements land.
 
 ### Nix distribution (done)
 

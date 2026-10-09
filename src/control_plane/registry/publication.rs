@@ -25,6 +25,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -131,7 +132,7 @@ pub struct PublisherIdentity {
 }
 
 impl PublisherIdentity {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         bounded_text("publisher.source", &self.source, false)?;
         if SessionUuid::parse(&self.incarnation).is_none() {
             return Err("`publisher.incarnation` must be a canonical UUID".into());
@@ -156,7 +157,7 @@ pub struct ExpectedWriter {
 }
 
 impl ExpectedWriter {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.generation == 0 {
             return Err("`replace.generation` must be at least 1".into());
         }
@@ -253,17 +254,17 @@ impl AcceptedSnapshot {
     /// is stale even when its lease has not run out: the report was true when it
     /// was made, but it is no longer the current writer's report.
     fn freshness(&self, now_ms: i64, serving_epoch: &str, writer: &WriterBinding) -> Freshness {
-        if self.serving_epoch != serving_epoch
-            || self.handle != writer.handle
-            || self.generation != writer.generation
-            || writer.retired_at.is_some()
-        {
-            return Freshness::Stale;
-        }
-        match timestamp_millis(&self.expires_at) {
-            Some(expires) if now_ms < expires => Freshness::Fresh,
-            _ => Freshness::Stale,
-        }
+        freshness_of(
+            &AcceptedLease {
+                serving_epoch: &self.serving_epoch,
+                handle: &self.handle,
+                generation: self.generation,
+                expires_at: &self.expires_at,
+            },
+            writer,
+            now_ms,
+            serving_epoch,
+        )
     }
 }
 
@@ -297,18 +298,11 @@ impl ChannelRecord {
     /// reported — including a successor sitting beside the previous generation's
     /// stale facts — has no live lease and may be replaced explicitly.
     fn incumbent_is_fresh(&self, now_ms: i64) -> bool {
-        if self.writer.retired_at.is_some() {
-            return false;
-        }
-        let live = self
+        let accepted = self
             .snapshot
             .as_ref()
-            .filter(|snapshot| snapshot.generation == self.writer.generation)
-            .and_then(|snapshot| timestamp_millis(&snapshot.expires_at));
-        match live {
-            Some(expires) => now_ms < expires,
-            None => false,
-        }
+            .map(|snapshot| (snapshot.generation, snapshot.expires_at.as_str()));
+        incumbent_live(&self.writer, accepted, now_ms)
     }
 
     /// The channel as an unrelated reader sees it: [`PublicChannel`] with every
@@ -385,6 +379,62 @@ pub enum Freshness {
     Fresh,
     /// Restored, reported by a replaced writer, retired, or expired.
     Stale,
+}
+
+/// The serving epoch, handle, generation and lease of one accepted report: the
+/// four facts every freshness decision needs, from the channel records and the
+/// context record alike.
+pub(crate) struct AcceptedLease<'a> {
+    pub serving_epoch: &'a str,
+    pub handle: &'a str,
+    pub generation: u64,
+    pub expires_at: &'a str,
+}
+
+/// The one freshness rule every published record uses.
+///
+/// A report is fresh only when this serving epoch accepted it, the current
+/// writer still holds the generation and handle it carries, that writer has not
+/// retired, and its lease has not expired on the daemon's clock. Otherwise it is
+/// stale — which is never evidence of exit, idleness or completion.
+pub(crate) fn freshness_of(
+    accepted: &AcceptedLease<'_>,
+    writer: &WriterBinding,
+    now_ms: i64,
+    serving_epoch: &str,
+) -> Freshness {
+    if accepted.serving_epoch != serving_epoch
+        || accepted.handle != writer.handle
+        || accepted.generation != writer.generation
+        || writer.retired_at.is_some()
+    {
+        return Freshness::Stale;
+    }
+    match timestamp_millis(accepted.expires_at) {
+        Some(expires) if now_ms < expires => Freshness::Fresh,
+        _ => Freshness::Stale,
+    }
+}
+
+/// Whether a writer still holds a live lease *of its own generation*.
+///
+/// `accepted` is the generation and expiry of the record's last report, when it
+/// has one. A writer that never reported — or whose report belongs to an earlier
+/// generation — has no live lease and may be replaced explicitly.
+pub(crate) fn incumbent_live(
+    writer: &WriterBinding,
+    accepted: Option<(u64, &str)>,
+    now_ms: i64,
+) -> bool {
+    if writer.retired_at.is_some() {
+        return false;
+    }
+    match accepted {
+        Some((generation, expires_at)) if generation == writer.generation => {
+            timestamp_millis(expires_at).is_some_and(|expires| now_ms < expires)
+        }
+        _ => false,
+    }
 }
 
 /// The current writer as a client reads it.
@@ -709,7 +759,7 @@ pub fn retire(
     Ok(updated)
 }
 
-fn new_binding(publisher: &PublisherIdentity, generation: u64) -> WriterBinding {
+pub(crate) fn new_binding(publisher: &PublisherIdentity, generation: u64) -> WriterBinding {
     WriterBinding {
         handle: random_uuid(),
         source: publisher.source.clone(),
@@ -798,17 +848,39 @@ fn write_record_at(
     }
 }
 
-fn write_record_at_inner(
-    registry: &Registry,
-    record: &ChannelRecord,
-    path: &std::path::Path,
+/// Writes one bounded registry record atomically: a mode-`0600` temporary
+/// sibling of `path`, flushed, renamed into place, and the containing directory
+/// synced so the acknowledgment claims durability and not just a visible rename.
+///
+/// Every registry record kind — channel and context alike — writes through this
+/// one helper so the discipline cannot drift between them. The failure-injection
+/// seam the channel tests use stays private to this module.
+pub(crate) fn write_atomic(
+    directory: &Path,
+    path: &Path,
+    bytes: &[u8],
+    bound: usize,
+) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        write_atomic_inner(directory, path, bytes, bound, false)
+    }
+    #[cfg(not(test))]
+    {
+        write_atomic_inner(directory, path, bytes, bound)
+    }
+}
+
+fn write_atomic_inner(
+    directory: &Path,
+    path: &Path,
+    bytes: &[u8],
+    bound: usize,
     #[cfg(test)] fail_before_rename: bool,
 ) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_PUBLICATION_BYTES {
-        return Err("channel record exceeds record bound".into());
+    if bytes.len() > bound {
+        return Err("record exceeds record bound".into());
     }
-    let directory = registry.publications();
     let temporary = directory.join(format!(".tmp-{}", random_uuid()));
     let result = (|| -> std::io::Result<()> {
         let mut file = OpenOptions::new()
@@ -816,7 +888,7 @@ fn write_record_at_inner(
             .create_new(true)
             .mode(0o600)
             .open(&temporary)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         #[cfg(test)]
@@ -824,13 +896,37 @@ fn write_record_at_inner(
             return Err(std::io::Error::other("injected write failure"));
         }
         fs::rename(&temporary, path)?;
-        File::open(&directory)?.sync_all()
+        File::open(directory)?.sync_all()
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&temporary);
-        return Err(format!("channel record: {error}"));
+        return Err(format!("record {}: {error}", path.display()));
     }
     Ok(())
+}
+
+fn write_record_at_inner(
+    registry: &Registry,
+    record: &ChannelRecord,
+    path: &Path,
+    #[cfg(test)] fail_before_rename: bool,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?;
+    let directory = registry.publications();
+    #[cfg(test)]
+    {
+        write_atomic_inner(
+            &directory,
+            path,
+            &bytes,
+            MAX_PUBLICATION_BYTES,
+            fail_before_rename,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        write_atomic_inner(&directory, path, &bytes, MAX_PUBLICATION_BYTES)
+    }
 }
 
 #[cfg(test)]

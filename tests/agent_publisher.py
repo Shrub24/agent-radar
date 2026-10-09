@@ -35,6 +35,7 @@ def fixture_pairs():
     check(len(rows) % 2 == 0, "fixture must contain request/response pairs")
     pairs = list(zip(rows[::2], rows[1::2]))
     expected = ["agent.register", "agent.acquire", "agent.publish",
+                "agent.context", "agent.context", "agent.context", "agent.context",
                 "agent.get", "agent.list", "agent.retire"]
     actual = []
     for request, response in pairs:
@@ -54,22 +55,26 @@ def validate_fixture(path):
     """Run fixture requests and compare stable response schema/content live."""
     pairs = fixture_pairs()
     ids, handles, agent_id = {}, {}, None
-    get_template = pairs[3][1]["result"]["agent"]
+    previous_context = None
+    get_template = pairs[7][1]["result"]["agent"]
     for request, response in pairs:
         method = request["method"]
         params = json.loads(json.dumps(request["params"]))
-        if method in ("agent.acquire", "agent.publish", "agent.get", "agent.retire"):
+        if method in ("agent.acquire", "agent.publish", "agent.context", "agent.get", "agent.retire"):
             params["agent_id"] = agent_id
         if method == "agent.publish":
             params["writer_handle"] = handles["assignment"]
         if method == "agent.retire":
             params["writer_handle"] = handles["assignment"]
+        if method == "agent.context" and params.get("writer_handle") == "<opaque-uuid>":
+            params["writer_handle"] = handles["context"]
         actual = call(path, method, params)
         expected = json.loads(json.dumps(response["result"]))
         if method == "agent.register":
             agent_id = actual["registration"]["agent_id"]
             expected["registration"]["agent_id"] = agent_id
             expected["registration"]["registered_at"] = actual["registration"]["registered_at"]
+            expected["registration"]["session"] = actual["registration"]["session"]
         elif method == "agent.acquire":
             handles["assignment"] = actual["writer"]["handle"]
             expected["writer"]["handle"] = handles["assignment"]
@@ -81,6 +86,31 @@ def validate_fixture(path):
             expected["channel"]["snapshot"]["received_at"] = channel["snapshot"]["received_at"]
             expected["channel"]["snapshot"]["expires_at"] = channel["snapshot"]["expires_at"]
             check(channel["snapshot"]["lease_ms"] == publisher.DEFAULT_LEASE_MS, str(channel))
+        elif method == "agent.context":
+            context = actual["context"]
+            expected["context"]["writer"].pop("handle", None)
+            if "context" not in handles:
+                handles["context"] = actual["writer"]["handle"]
+            expected["writer"]["handle"] = handles["context"]
+            expected["context"]["agent_id"] = agent_id
+            expected["context"]["writer"]["source"] = params["publisher"]["source"]
+            expected["context"]["writer"]["incarnation"] = params["publisher"]["incarnation"]
+            expected["context"]["context"]["source"] = params["publisher"]["source"]
+            expected["context"]["context"]["incarnation"] = params["publisher"]["incarnation"]
+            expected["context"]["context"]["received_at"] = context["context"]["received_at"]
+            expected["context"]["context"]["expires_at"] = context["context"]["expires_at"]
+            check(context["context"]["session"] == params["context"]["session"], str(context))
+            replay = previous_context == params
+            if replay:
+                check(isinstance(actual["warning"], str) and "not refreshed" in actual["warning"],
+                      f"identical replay did not warn: {actual}")
+            else:
+                check(actual["warning"] is None, str(actual))
+            previous_context = json.loads(json.dumps(params))
+            check(actual["writer"]["handle"] == handles["context"], str(actual))
+            check(actual["context"]["context"]["freshness"] == "fresh", str(actual))
+            check("handle" not in actual["context"]["writer"], str(actual))
+            continue
         elif method == "agent.get":
             expected["agent"]["registration"]["agent_id"] = agent_id
             expected["agent"]["registration"]["registered_at"] = actual["agent"]["registration"]["registered_at"]
@@ -89,6 +119,9 @@ def validate_fixture(path):
             expected["agent"]["assignment"]["snapshot"].pop("handle", None)
             expected["agent"]["assignment"]["snapshot"]["received_at"] = actual["agent"]["assignment"]["snapshot"]["received_at"]
             expected["agent"]["assignment"]["snapshot"]["expires_at"] = actual["agent"]["assignment"]["snapshot"]["expires_at"]
+            expected["agent"]["context"]["context"]["received_at"] = actual["agent"]["context"]["context"]["received_at"]
+            expected["agent"]["context"]["context"]["expires_at"] = actual["agent"]["context"]["context"]["expires_at"]
+            expected["agent"]["context"]["agent_id"] = agent_id
         elif method == "agent.list":
             expected_agent = json.loads(json.dumps(get_template))
             expected_agent["registration"]["agent_id"] = agent_id
@@ -97,6 +130,9 @@ def validate_fixture(path):
             expected_agent["assignment"]["snapshot"].pop("handle", None)
             expected_agent["assignment"]["snapshot"]["received_at"] = actual["agents"][0]["assignment"]["snapshot"]["received_at"]
             expected_agent["assignment"]["snapshot"]["expires_at"] = actual["agents"][0]["assignment"]["snapshot"]["expires_at"]
+            expected_agent["context"]["context"]["received_at"] = actual["agents"][0]["context"]["context"]["received_at"]
+            expected_agent["context"]["context"]["expires_at"] = actual["agents"][0]["context"]["context"]["expires_at"]
+            expected_agent["context"]["agent_id"] = agent_id
             check(actual["agents"] == [expected_agent], f"fixture agent.list mismatch: {actual}")
             check(actual["next"] is None, str(actual))
             continue
@@ -187,13 +223,43 @@ def main():
             check(channel["snapshot"]["freshness"] == "fresh", str(channel))
             check(channel["snapshot"]["lease_ms"] == 1000, str(channel))
             check(channel["snapshot"]["snapshot"] == snapshot, str(channel))
+            initial_context = call(socket_path, "agent.context", {
+                "agent_id": agent_id, "publisher": identity, "sequence": 1,
+                "lease_ms": 1000, "context": {"session": "c1a2b3d4-e5f6-4a7b-8c9d-0e1a2b3c4d5e"},
+            })
+            context_writer = initial_context["writer"]
+            context_sequence = 1
             get = get_agent(socket_path, agent_id)
             listed = call(socket_path, "agent.list", {"limit": 10})["agents"]
             public = json.dumps([get, listed], sort_keys=True)
             check(sentinel not in public, "private launch sentinel leaked in public get/list")
+            check(context_writer["handle"] not in public, "context writer handle leaked")
+            check(get["context"]["context"]["session"] == initial_context["context"]["context"]["session"], str(get))
             check(get["registration"]["launch"] == {"available": True, "revision": "r1"}, str(get))
             check(get["assignment"]["snapshot"]["snapshot"] == snapshot, str(get))
             check(get["execution"] is None, "assignment merged into execution")
+
+            # Session switch uses the same context writer and generation, and
+            # never republishes the immutable registration or private launch path.
+            switched_session = "e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b"
+            switched = call(socket_path, "agent.context", {
+                "agent_id": agent_id, "publisher": identity,
+                "writer_handle": context_writer["handle"], "sequence": 2,
+                "lease_ms": 1000, "context": {"session": switched_session},
+            })
+            check(switched["writer"]["generation"] == context_writer["generation"], str(switched))
+            check(get_agent(socket_path, agent_id)["context"]["context"]["session"] == switched_session,
+                  "session switch was not visible in agent.get")
+            cleared = call(socket_path, "agent.context", {
+                "agent_id": agent_id, "publisher": identity,
+                "writer_handle": context_writer["handle"], "sequence": 3,
+                "lease_ms": 1000, "context": {"session": None},
+            })
+            check(cleared["context"]["context"]["session"] is None, str(cleared))
+            public_clear = get_agent(socket_path, agent_id)
+            check(public_clear["context"]["context"]["session"] is None, str(public_clear))
+            check(context_writer["handle"] not in json.dumps(public_clear), "context writer handle leaked")
+            check(sentinel not in json.dumps(public_clear), "launch data leaked after context update")
 
             registered2, heartbeat = publisher.publish_assignment(
                 socket_path, registration, identity, snapshot, 2, lease_ms=1000)
@@ -257,8 +323,9 @@ def main():
             })["channel"]
             check(retired["writer"]["retired_at"] is not None, str(retired))
             print("PASS: live fixture response schemas; trusted disposable daemon; "
-                  "register/acquire/publish/get/list/retire; unknown vocabulary; launch privacy; "
-                  "replay/heartbeat; expiry replacement; old-writer fencing; restart freshness; no Herdr")
+                  "register/acquire/publish/context/get/list/retire; session switch and explicit null; "
+                  "credential and launch privacy; replay/heartbeat; expiry replacement; "
+                  "old-writer fencing; restart freshness; no Herdr")
         finally:
             stop_daemon(daemon)
 

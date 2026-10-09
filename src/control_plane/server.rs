@@ -890,6 +890,27 @@ fn registry_request(
                 Err(error) => registry_error(request, error),
             }
         }
+        "agent.context" => {
+            let publish: registry::ContextRequest = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let core = locked(core);
+            let now_ms = store::now_ms();
+            match core.registry.publish_context(&publish, now_ms) {
+                Ok(result) => Response::ok(
+                    &request.id,
+                    json!({
+                        // The write response returns the credential only to its
+                        // publisher; agent.get/list use the credential-free projection.
+                        "writer": result.record.writer,
+                        "context": result.record.public(now_ms, core.registry.serving_epoch()),
+                        "warning": result.warning,
+                    }),
+                ),
+                Err(error) => registry_error(request, error),
+            }
+        }
         "agent.retire" => {
             let params: AgentRetireParams = match decode_params(request) {
                 Ok(value) => value,
@@ -955,12 +976,16 @@ fn registry_request(
                     Ok(value) => value,
                     Err(error) => return registry_error(request, error),
                 };
+            let context = match registry.context(&params.agent_id, now_ms) {
+                Ok(value) => value,
+                Err(error) => return registry_error(request, error),
+            };
             Response::ok(
                 &request.id,
                 json!({"agent": {
                     "registration": registration.public(),
                     "process": process_evidence(&registration, verified),
-                    "execution": execution, "assignment": assignment,
+                    "execution": execution, "assignment": assignment, "context": context,
                 }}),
             )
         }
@@ -1031,11 +1056,16 @@ fn registry_request(
                     Ok(value) => value,
                     Err(error) => return registry_error(request, error),
                 };
+                let context = match registry.context(&registration.agent_id, now_ms) {
+                    Ok(value) => value,
+                    Err(error) => return registry_error(request, error),
+                };
                 let entry = json!({
                     "registration": registration.public(),
                     "process": process_evidence(registration, verified),
                     "execution": execution,
                     "assignment": assignment,
+                    "context": context,
                 });
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
                 if used + size > MAX_AGENT_RESPONSE_BYTES {

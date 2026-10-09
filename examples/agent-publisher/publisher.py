@@ -92,6 +92,20 @@ def publish_assignment(path: Path, registration: dict, publisher: dict,
     return registered, channel
 
 
+def publish_context(path: Path, agent_id: str, publisher: dict,
+                    writer: dict | None, sequence: int, session: str | None,
+                    *, lease_ms: int | None = None) -> tuple[dict, dict]:
+    """Publish a changed current session; explicit null clears the association."""
+    params = {"agent_id": agent_id, "publisher": publisher, "sequence": sequence,
+              "context": {"session": session}}
+    if writer is not None:
+        params["writer_handle"] = writer["handle"]
+    if lease_ms is not None:
+        params["lease_ms"] = lease_ms
+    result = call(path, "agent.context", params)
+    return result["writer"], result["context"]
+
+
 def owner_snapshot(activity: str, waiting_reason: str | None = None,
                    last_outcome: dict | None = None, actions: list[str] | None = None) -> dict:
     """Map Herdsman's existing owner projection without importing its tokens."""
@@ -110,6 +124,7 @@ def main() -> int:
     parser.add_argument("socket", type=Path, help="trusted Radar daemon socket")
     parser.add_argument("--owner", default="example-owner")
     parser.add_argument("--label", default="Herdsman owner projection")
+    parser.add_argument("--session", help="current session UUID; omit to publish an explicit null")
     parser.add_argument("--once", action="store_true", help="publish one snapshot")
     parser.add_argument("--interval", type=float, default=10.0,
                         help="seconds between newer-sequence heartbeats")
@@ -126,6 +141,9 @@ def main() -> int:
     publisher = {"source": "herdsman-owner-example", "incarnation": incarnation,
                  "reporting_owner": args.owner}
     sequence = 0
+    context_writer = None
+    context_sequence = 0
+    published_session = object()
     snapshot = owner_snapshot("waiting", "awaiting-child", actions=["assign", "cancel"])
     while True:
         attempted_sequence = sequence + 1
@@ -134,10 +152,18 @@ def main() -> int:
                 args.socket, registration, publisher, snapshot, attempted_sequence,
                 lease_ms=DEFAULT_LEASE_MS)
             sequence = attempted_sequence
+            current_session = args.session
+            if current_session != published_session:
+                context_writer, context = publish_context(
+                    args.socket, registered["agent_id"], publisher, context_writer,
+                    context_sequence + 1, current_session, lease_ms=DEFAULT_LEASE_MS)
+                context_sequence += 1
+                published_session = current_session
             print(json.dumps({"agent_id": registered["agent_id"],
                               "generation": channel["writer"]["generation"],
                               "sequence": sequence,
-                              "freshness": channel.get("snapshot", {}).get("freshness")}),
+                              "freshness": channel.get("snapshot", {}).get("freshness"),
+                              "context_session": context.get("context", {}).get("session")}),
                   flush=True)
         except RegistryError as error:
             # A successor has fenced this incarnation. Never silently replace it.

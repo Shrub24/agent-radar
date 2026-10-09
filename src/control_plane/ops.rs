@@ -111,8 +111,8 @@ pub fn classify(method: &str) -> Option<Method> {
         "ping" => Method::Ping,
         "request" => Method::Request,
         "requests" => Method::Requests,
-        "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.get"
-        | "agent.list" => Method::Registry,
+        "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
+        | "agent.get" | "agent.list" => Method::Registry,
         "observe" | "process_info" | "output" => Method::Read,
         other => Method::Operation(Operation::from_method(other)?),
     })
@@ -161,6 +161,7 @@ mod tests {
         assert_eq!(classify("ping"), Some(Method::Ping));
         assert_eq!(classify("request"), Some(Method::Request));
         assert_eq!(classify("requests"), Some(Method::Requests));
+        assert_eq!(classify("agent.context"), Some(Method::Registry));
         assert_eq!(classify("observe"), Some(Method::Read));
         assert_eq!(classify("process_info"), Some(Method::Read));
         assert_eq!(classify("output"), Some(Method::Read));

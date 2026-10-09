@@ -10,9 +10,9 @@ stdlib-only reconnecting owner publisher is
 [`examples/agent-publisher/publisher.py`](../examples/agent-publisher/publisher.py),
 exercised against a disposable daemon by
 [`tests/agent_publisher.py`](../tests/agent_publisher.py). The fixture uses
-`<daemon-time>` and `<opaque-uuid>` placeholders for generated values; fixture
+`<daemon-time>`, `<daemon-time-plus-30s>`, `<opaque-uuid>` and `<replay-warning>` placeholders for generated values; fixture
 validation executes its request shapes against the daemon and checks those
-response templates. `agent.get` and `agent.list` differ intentionally: writer-facing channel replies expose `writer.handle`, whereas public get/list channel facts omit both the current writer handle and accepted-snapshot handle.
+response templates. `agent.get` and `agent.list` differ intentionally: writer-facing channel/context replies return the writer binding to the publisher, whereas public get/list facts omit writer handles (and channel accepted-snapshot handles).
 
 This documents the durable agent-registration records and direct publication
 channels served on the trusted control socket. They are a **foundation**: private
@@ -21,9 +21,9 @@ operations are independent of mux capabilities and make no Herdr calls. They
 perform no lifecycle controls.
 
 The registry is backend-independent. It holds agent identity separately from
-mux inventory and durable mutation records, and mutable channels separately from
-identity. Writing or publishing dispatches no physical control and enters no mux
-mutation lane.
+mux inventory and durable mutation records, and mutable channels and current
+session context separately from identity. Writing or publishing dispatches no
+physical control and enters no mux mutation lane.
 
 ## Registration record
 
@@ -87,7 +87,7 @@ root are unsupported for concurrent writes.
 ## Socket methods
 
 The trusted control socket serves `agent.register`, `agent.acquire`,
-`agent.publish`, `agent.retire`, `agent.get` and `agent.list`. `ping` advertises
+`agent.publish`, `agent.retire`, `agent.context`, `agent.get` and `agent.list`. `ping` advertises
 `agent_registry` regardless of mux backend. The methods are independent of the
 physical backend and do not call Herdr. All method parameter objects reject
 unknown fields. The exact canonical exchanges are in the JSONL fixture; field
@@ -106,15 +106,17 @@ before a cursor can be seen on a subsequent full scan. Corrupt records fail the
 read explicitly. Retirement does not prune registrations.
 
 For owner/child correlation, pass the exact returned `agent_id`; session UUID or
-pane identity alone cannot identify a subject. If a live process changes session
-context, do not register it as a new process: omit context fields that are not
-immutable for that registration. Mutable session/location context is not yet a
-publication field in v1 and should not be smuggled into activity/reason strings.
+pane identity alone cannot identify a subject. If a live process changes session,
+do not register it as a new process: registration is immutable. Publish the
+current session through `agent.context` instead. Session context is a UUID-only
+association and does not carry paths or other launch/private data.
 
 ### One channel is one record
 
 A channel is one file, `<state root>/publications/<agent_id>.<channel>.json`,
-holding the current `writer` binding and an optional `snapshot`. **Acquire,
+holding the current `writer` binding and an optional `snapshot`. Current session
+context is a separate file, `<state root>/publications/<agent_id>.context.json`.
+**Acquire,
 publish and retire each rewrite that single record atomically**: a mode-`0600`
 temporary sibling is flushed, renamed into place, and the containing directory is
 synced before the call returns. There is no separate writer file a partial write
@@ -170,6 +172,44 @@ handle, generation and sequence, and reads `freshness: "stale"`: the report was
 true when made and is never relabelled as the successor's. Before its first
 accepted snapshot the successor's sequence is zero.
 
+### Mutable current-session context
+
+`agent.context` publishes the current session UUID independently of registration
+and execution/assignment snapshots. Its params are
+`{"agent_id":"<registered UUID>","publisher":{"source":"…","incarnation":"<UUID>"},"sequence":1,"context":{"session":"<session UUID>"}}`;
+`lease_ms` (1–300 seconds, default 30 seconds) and `observed_at` are optional.
+On the first publish the daemon returns a generation-1 writer binding. Subsequent
+publishes include that binding's `writer_handle`; a session switch uses a newer
+sequence under the same writer and leaves `agent_id`, registration and generation
+unchanged. To replace a retired or expired writer, include `replace` with the
+observed incumbent `generation` and `handle`, and publish as the successor
+publisher. Fresh takeover is refused; a successful replacement advances the
+generation and fences the old handle. A stale handshake refusal names the reason
+and the incumbent generation/handle.
+
+The request's `context` object has exactly one field, `session`: a canonical UUID
+or explicit `null` meaning "no current session". Do not send a session-file path,
+launch arguments, environment or provider error text. A lost response may be
+retried at the same sequence with identical content; the daemon returns the
+stored context with a warning and does not renew the lease. Conflicting content
+at an already-stored sequence and older sequences are refused.
+
+`agent.context` returns `{ "writer": <binding>, "context": <public context>,
+"warning": null-or-string }`; the binding is returned only to the publishing
+caller so it can retain its credential. A non-null `warning` is human-readable
+prose explaining an answered replay; do not parse it. `agent.get` and every `agent.list` entry
+contain a `context` key: it is `null` when never published, and otherwise the
+credential-free public projection with source/incarnation, generation/sequence,
+lease timestamps, `restored`, `freshness` and `session`. A present record with
+`session: null` means explicitly unassociated, distinct from a null context key
+meaning never reported. Get/list never expose a writer handle or serving epoch.
+
+Long leases are allowed up to the same 300-second bound, but are discouraged:
+when a publisher disappears, context may remain `fresh` until that lease expires.
+Freshness is only daemon receipt time plus the serving epoch, not process
+liveness. Stale or absent context is unknown, never evidence of process exit,
+idleness or completion.
+
 ### Sequences, leases and freshness
 
 A publish requires a positive per-generation sequence. Lease defaults to 30
@@ -202,9 +242,9 @@ retired: neither proves process exit, assignment completion or safe restart.
 
 ### Persistence, ownership and bounds
 
-The channel record is a bounded (64 KiB), versioned private JSON file written by
-atomic sibling-temporary replacement, mode `0600`, file and directory flushed
-before acknowledgment. Each snapshot has at most 16 actions and text fields at
+Channel records and current-session context are bounded (64 KiB), versioned
+private JSON files written by atomic sibling-temporary replacement, mode `0600`,
+file and directory flushed before acknowledgment. Each snapshot has at most 16 actions and text fields at
 most 1 KiB. Corrupt records are errors, not successful empty reads. A local
 transition mutex serializes writers within one `Registry`; the state root has one
 owning daemon, with no cross-process locking or cross-user authorization system.
@@ -240,8 +280,9 @@ operation. Tests inject a deterministic verifier; no live mux or process-control
 operation is performed.
 
 The endpoint contract exposes explicit writer acquire and replace (with expected
-generation/handle), publish and retire under the opaque handle, plus bounded
-public channel reads/listing and separately labelled process verification. Do
+generation/handle), channel publish/retire under the opaque handle, mutable context
+publish/replace, plus bounded public channel/context reads/listing and separately
+labelled process verification. Do
 not overload immutable `agent.register` with succession. Automatic replacement
 policy, process-death inference from a stale lease, launch/stop/resume,
 task-completion certification and physical mux controls remain out of scope.
@@ -255,8 +296,8 @@ the daemon's trust check:
 python3 examples/agent-publisher/publisher.py /run/user/1000/agent-radar/control.sock --once
 ```
 
-The script is dependency-free Python 3.10+ and demonstrates only owner assignment
-projection. A production publisher stores its immutable registration and
+The script is dependency-free Python 3.10+ and demonstrates owner assignment
+projection plus current-session context publication when its session changes. A production publisher stores its immutable registration and
 publisher-incarnation identity outside the process, repeats identical
 `agent.register` content after reconnect, and calls `agent.acquire` without
 `replace` to recover the same current writer. The example process generates an
@@ -265,6 +306,14 @@ state. It publishes a complete snapshot and uses a newer sequence for every
 heartbeat. A lost response may be retried with exactly the same sequence,
 snapshot, lease and `observed_at`; identical replay returns the accepted report
 unchanged and does not extend expiry. Advance sequence to renew the lease.
+
+The example accepts `--session <canonical-UUID>`; omitting it publishes explicit
+null. It sends a context update only when its current session changes, using a
+separate increasing context sequence under its context writer. A production
+publisher obtains the current UUID from its host integration; it must never send
+session-file paths, launch arguments, environment or raw provider error details.
+Long leases remain allowed, but production publishers should keep a bounded lease
+that reflects the expected update cadence and should republish changes promptly.
 
 A different writer is never adopted implicitly. A publisher may replace only
 when it has explicitly observed incumbent generation and handle and sends both
@@ -284,14 +333,16 @@ python3 tests/agent_publisher.py
 ```
 
 It uses a private temporary socket/state root, starts and bounds daemon children,
-checks public launch redaction and unknown vocabulary, exercises replay,
-heartbeat, lease-expiry replacement, old-writer fencing and restart epoch
-freshness/reconnect, then stops the child in `finally`. It is not live publisher
-or fleet integration. The pi-extensions port is a separate follow-up: map
-Herdsman's current owner projection to assignment and its child execution facts
-to their separate channel, retain optional legacy metadata reporting only as an
-intentional compatibility bridge, and do not add process execution or recovery
-policy here.
+checks public launch/context redaction and unknown vocabulary, exercises
+assignment replay/heartbeat, context session switch and explicit null,
+context privacy, channel lease-expiry replacement, old-writer fencing and restart
+epoch freshness/reconnect, then stops the child in `finally`. It is not live
+publisher or fleet integration. The pi-extensions port is a separate follow-up:
+Herdsman must adopt `agent.context` on session start/switch/fork under its existing
+publisher/writer handling. Map its current owner projection to assignment and
+its child execution facts to their separate channel, retain optional legacy
+metadata reporting only as an intentional compatibility bridge, and do not add
+process execution or recovery policy here.
 
 ## Errors, trust and limits
 

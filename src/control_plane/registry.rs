@@ -373,12 +373,19 @@ pub struct Registry {
     admission: Mutex<()>,
 }
 
+/// The mutable current-session context lives beside the channels; the details
+/// live in [`context`].
+pub mod context;
 /// Injectable local process birth-identity verification.
 pub mod process;
 /// Publication channels live alongside the registry; the details live in
 /// [`publication`].
 pub mod publication;
 
+pub use context::{
+    AcceptedContext, CONTEXT_VERSION, ContextRequest, ContextValue, ContextWrite,
+    MAX_CONTEXT_BYTES, PublicContext, PublicSession, SessionContext,
+};
 pub use process::{
     LocalProcfsVerifier, ProcessVerification, ProcessVerifier, verify_identity, verify_registration,
 };
@@ -503,6 +510,32 @@ impl Registry {
         now_ms: i64,
     ) -> Result<ChannelRecord, String> {
         publication::retire(self, agent_id, channel, writer_handle, now_ms)
+    }
+
+    /// Publish one agent record's current session, binding a first writer or
+    /// explicitly succeeding a retired or expired one.
+    pub fn publish_context(
+        &self,
+        request: &ContextRequest,
+        now_ms: i64,
+    ) -> Result<ContextWrite, String> {
+        context::publish(self, request, now_ms)
+    }
+
+    /// Retire this agent's context writer without retracting its last report.
+    pub fn retire_context(
+        &self,
+        agent_id: &str,
+        writer_handle: &str,
+        now_ms: i64,
+    ) -> Result<SessionContext, String> {
+        context::retire(self, agent_id, writer_handle, now_ms)
+    }
+
+    /// Read one agent record's current session as a client sees it, or `None`
+    /// when this agent has never published one.
+    pub fn context(&self, agent_id: &str, now_ms: i64) -> Result<Option<PublicContext>, String> {
+        context::published(self, agent_id, now_ms)
     }
 
     fn transition(&self) -> std::sync::MutexGuard<'_, ()> {

@@ -1245,11 +1245,13 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
         "idle"
     );
     assert!(get["result"]["agent"]["execution"]["writer"]["handle"].is_null());
+    assert!(get["result"]["agent"]["context"].is_null());
     no_secret(&get, launch_secret);
     let list = client.call("agent.list", json!({"limit":1}));
     assert_eq!(list["result"]["agents"].as_array().unwrap().len(), 1);
     no_secret(&list, launch_secret);
     assert!(list["result"]["agents"][0]["execution"]["writer"]["handle"].is_null());
+    assert!(list["result"]["agents"][0]["context"].is_null());
     let retired = client.call(
         "agent.retire",
         json!({"agent_id":agent_id,"channel":"execution","writer_handle":handle}),
@@ -1263,6 +1265,215 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
         }),
     );
     assert_eq!(error_code(&fenced), "refused");
+    daemon.stop();
+}
+
+#[test]
+fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
+    const SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    const NEXT_SESSION: &str = "e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b";
+    let sandbox = Sandbox::new("agent-context");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let launch_secret = "/private/SESSION-CONTEXT-SECRET.json";
+    let registered = client.call(
+        "agent.register",
+        registration_body(
+            "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
+            None,
+            Some(json!({"executable":"/usr/bin/pi","argv":[launch_secret],"cwd":"/tmp","session":{"path":launch_secret},"provenance":"test","revision":"r1"})),
+        ),
+    );
+    let id = agent_id(&registered);
+    let absent = client.call("agent.get", json!({"agent_id":id}));
+    assert!(absent["result"]["agent"]["context"].is_null(), "{absent}");
+    let list_absent = client.call("agent.list", json!({"limit":1}));
+    assert!(
+        list_absent["result"]["agents"][0]["context"].is_null(),
+        "{list_absent}"
+    );
+
+    // First report implicitly binds a generation-1 writer. The live response is
+    // a credential-free projection and retains explicit null distinctly from
+    // never-published read absence.
+    let first = client.call(
+        "agent.context",
+        json!({"agent_id":id,"publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},"sequence":1,"lease_ms":10000,"context":{"session":SESSION}}),
+    );
+    assert!(first["result"]["context"].is_object(), "{first}");
+    assert_eq!(first["result"]["context"]["context"]["session"], SESSION);
+    assert_eq!(first["result"]["context"]["writer"]["generation"], 1);
+    assert!(first["result"]["writer"]["handle"].is_string());
+    assert!(first["result"]["warning"].is_null());
+    no_secret(&first, launch_secret);
+
+    let writer = first["result"]["writer"]["handle"]
+        .as_str()
+        .expect("first writer handle")
+        .to_owned();
+
+    let switched = client.call(
+        "agent.context",
+        json!({
+            "agent_id":id,
+            "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "writer_handle":writer,
+            "sequence":2,
+            "context":{"session":NEXT_SESSION}
+        }),
+    );
+    assert_eq!(
+        switched["result"]["context"]["context"]["session"],
+        NEXT_SESSION
+    );
+    assert_eq!(switched["result"]["context"]["writer"]["generation"], 1);
+
+    let replay = client.call(
+        "agent.context",
+        json!({
+            "agent_id":id,
+            "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "writer_handle":writer,
+            "sequence":2,
+            "context":{"session":NEXT_SESSION}
+        }),
+    );
+    assert!(replay["result"]["warning"].as_str().is_some(), "{replay}");
+    assert!(
+        replay["result"]["warning"]
+            .as_str()
+            .unwrap()
+            .contains("not refreshed")
+    );
+
+    // Explicit null means no current session; unlike an absent record it is an
+    // object with `session: null`. The registration remains unchanged.
+    let cleared = client.call(
+        "agent.context",
+        json!({
+            "agent_id":id,
+            "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "writer_handle":writer,
+            "sequence":3,
+            "context":{"session":null}
+        }),
+    );
+    assert!(
+        cleared["result"]["context"]["context"]["session"].is_null(),
+        "{cleared}"
+    );
+    let get = client.call("agent.get", json!({"agent_id":id}));
+    assert!(get["result"]["agent"]["context"].is_object(), "{get}");
+    assert!(get["result"]["agent"]["context"]["context"]["session"].is_null());
+    assert!(get["result"]["agent"]["context"]["context"]["freshness"] == "fresh");
+    assert!(get["result"]["agent"]["context"]["writer"]["handle"].is_null());
+    let list = client.call("agent.list", json!({"limit":1}));
+    assert!(list["result"]["agents"][0]["context"].is_object(), "{list}");
+    assert!(list["result"]["agents"][0]["context"]["context"]["session"].is_null());
+    assert!(list["result"]["agents"][0]["context"]["writer"]["handle"].is_null());
+    no_secret(&get, launch_secret);
+    no_secret(&list, launch_secret);
+    for response in [&get, &list, &cleared["result"]["context"]] {
+        assert!(
+            !response.to_string().contains(&writer),
+            "writer handle leaked: {response}"
+        );
+        assert!(
+            !response.to_string().contains("serving_epoch"),
+            "{response}"
+        );
+    }
+
+    // Restarting changes the serving epoch, making the restored context stale
+    // while preserving the last explicit null.
+    daemon.stop();
+    drop(client);
+    let mut daemon =
+        Daemon::bind_without_backend(&sandbox.socket(), &sandbox.state()).expect("restart daemon");
+    let mut client = Client::dial(daemon.path());
+    let stale = client.call("agent.get", json!({"agent_id":id}));
+    assert_eq!(
+        stale["result"]["agent"]["context"]["context"]["freshness"],
+        "stale"
+    );
+    assert!(
+        stale["result"]["agent"]["context"]["context"]["restored"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(stale["result"]["agent"]["context"]["context"]["session"].is_null());
+    no_secret(&stale, launch_secret);
+    daemon.stop();
+}
+
+#[test]
+fn agent_context_socket_expiry_and_replacement_keep_writer_fenced() {
+    let sandbox = Sandbox::new("agent-context-replace");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let registered = client.call(
+        "agent.register",
+        registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
+    );
+    let id = agent_id(&registered);
+    let first = client.call(
+        "agent.context",
+        json!({
+            "agent_id":id,
+            "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "sequence":1,
+            "lease_ms":1000,
+            "context":{"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}
+        }),
+    );
+    assert!(first["result"]["context"].is_object(), "{first}");
+    // Wait only for the deliberately minimum-length lease. Reads retain the
+    // report but mark it stale; an explicit observed-generation replacement
+    // advances the writer generation and fences the previous handle.
+    thread::sleep(Duration::from_millis(1100));
+    let list_stale = client.call("agent.list", json!({"limit":1}));
+    assert_eq!(
+        list_stale["result"]["agents"][0]["context"]["context"]["freshness"],
+        "stale"
+    );
+    let stale = client.call("agent.get", json!({"agent_id":id}));
+    assert_eq!(
+        stale["result"]["agent"]["context"]["context"]["freshness"],
+        "stale"
+    );
+    let old = first["result"]["writer"].clone();
+    let replacement = client.call(
+        "agent.context",
+        json!({
+            "agent_id":id,
+            "publisher":{"source":"herdsman","incarnation":"4c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "replace":{"generation":old["generation"],"handle":old["handle"]},
+            "sequence":1,
+            "context":{"session":"e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b"}
+        }),
+    );
+    assert_eq!(replacement["result"]["writer"]["generation"], 2);
+    assert_ne!(replacement["result"]["writer"]["handle"], old["handle"]);
+    let fenced = client.call(
+        "agent.context",
+        json!({
+            "agent_id":id,
+            "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "writer_handle":old["handle"],
+            "sequence":2,
+            "context":{"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}
+        }),
+    );
+    assert_eq!(error_code(&fenced), "refused");
+    let accepted = client.call("agent.get", json!({"agent_id":id}));
+    assert_eq!(
+        accepted["result"]["agent"]["context"]["writer"]["generation"],
+        2
+    );
+    assert_eq!(
+        accepted["result"]["agent"]["context"]["context"]["session"],
+        "e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b"
+    );
     daemon.stop();
 }
 
