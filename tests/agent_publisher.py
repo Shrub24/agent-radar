@@ -36,7 +36,7 @@ def fixture_pairs():
     pairs = list(zip(rows[::2], rows[1::2]))
     expected = ["agent.register", "agent.acquire", "agent.publish",
                 "agent.context", "agent.context", "agent.context", "agent.context",
-                "agent.get", "agent.list", "agent.retire"]
+                "agent.get", "agent.list", "agent.context", "agent.retire"]
     actual = []
     for request, response in pairs:
         check(request["kind"] == "request" and response["kind"] == "response",
@@ -56,7 +56,8 @@ def validate_fixture(path):
     pairs = fixture_pairs()
     ids, handles, agent_id = {}, {}, None
     previous_context = None
-    get_template = pairs[7][1]["result"]["agent"]
+    get_template = next(response["result"]["agent"] for request, response in pairs
+                        if request["method"] == "agent.get")
     for request, response in pairs:
         method = request["method"]
         params = json.loads(json.dumps(request["params"]))
@@ -68,6 +69,11 @@ def validate_fixture(path):
             params["writer_handle"] = handles["assignment"]
         if method == "agent.context" and params.get("writer_handle") == "<opaque-uuid>":
             params["writer_handle"] = handles["context"]
+        if method == "agent.context" and "replace" in params:
+            params["replace"]["handle"] = handles["context"]
+            # The fixture uses a 1s incumbent lease so this validates the
+            # documented expiry-gated replacement without inventing retire API.
+            time.sleep(1.05)
         actual = call(path, method, params)
         expected = json.loads(json.dumps(response["result"]))
         if method == "agent.register":
@@ -89,9 +95,16 @@ def validate_fixture(path):
         elif method == "agent.context":
             context = actual["context"]
             expected["context"]["writer"].pop("handle", None)
-            if "context" not in handles:
+            if "replace" in params:
                 handles["context"] = actual["writer"]["handle"]
-            expected["writer"]["handle"] = handles["context"]
+                expected["writer"]["handle"] = handles["context"]
+                expected["writer"]["generation"] = actual["writer"]["generation"]
+                expected["context"]["writer"]["source"] = params["publisher"]["source"]
+                expected["context"]["writer"]["incarnation"] = params["publisher"]["incarnation"]
+            else:
+                if "context" not in handles:
+                    handles["context"] = actual["writer"]["handle"]
+                expected["writer"]["handle"] = handles["context"]
             expected["context"]["agent_id"] = agent_id
             expected["context"]["writer"]["source"] = params["publisher"]["source"]
             expected["context"]["writer"]["incarnation"] = params["publisher"]["incarnation"]
@@ -121,6 +134,7 @@ def validate_fixture(path):
             expected["agent"]["assignment"]["snapshot"]["expires_at"] = actual["agent"]["assignment"]["snapshot"]["expires_at"]
             expected["agent"]["context"]["context"]["received_at"] = actual["agent"]["context"]["context"]["received_at"]
             expected["agent"]["context"]["context"]["expires_at"] = actual["agent"]["context"]["context"]["expires_at"]
+            expected["agent"]["context"]["context"]["freshness"] = actual["agent"]["context"]["context"]["freshness"]
             expected["agent"]["context"]["agent_id"] = agent_id
         elif method == "agent.list":
             expected_agent = json.loads(json.dumps(get_template))
@@ -132,6 +146,7 @@ def validate_fixture(path):
             expected_agent["assignment"]["snapshot"]["expires_at"] = actual["agents"][0]["assignment"]["snapshot"]["expires_at"]
             expected_agent["context"]["context"]["received_at"] = actual["agents"][0]["context"]["context"]["received_at"]
             expected_agent["context"]["context"]["expires_at"] = actual["agents"][0]["context"]["context"]["expires_at"]
+            expected_agent["context"]["context"]["freshness"] = actual["agents"][0]["context"]["context"]["freshness"]
             expected_agent["context"]["agent_id"] = agent_id
             check(actual["agents"] == [expected_agent], f"fixture agent.list mismatch: {actual}")
             check(actual["next"] is None, str(actual))

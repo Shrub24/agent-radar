@@ -183,8 +183,15 @@ publishes include that binding's `writer_handle`; a session switch uses a newer
 sequence under the same writer and leaves `agent_id`, registration and generation
 unchanged. To replace a retired or expired writer, include `replace` with the
 observed incumbent `generation` and `handle`, and publish as the successor
-publisher. Fresh takeover is refused; a successful replacement advances the
-generation and fences the old handle. A stale handshake refusal names the reason
+publisher. For example:
+
+```json
+{"agent_id":"<agent-id>","publisher":{"source":"herdsman","incarnation":"<new-incarnation>"},"replace":{"generation":1,"handle":"<observed-incumbent-handle>"},"sequence":1,"context":{"session":"<session-uuid>"}}
+```
+
+This is the same `ExpectedWriter` shape used by `agent.acquire`. Fresh takeover
+is refused; a successful replacement advances the generation and fences the old
+handle. The fixture includes a complete replacement exchange. A stale handshake refusal names the reason
 and the incumbent generation/handle.
 
 The request's `context` object has exactly one field, `session`: a canonical UUID
