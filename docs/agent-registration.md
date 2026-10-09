@@ -92,6 +92,25 @@ The trusted control socket serves `agent.register`, `agent.acquire`,
 physical backend and do not call Herdr. All method parameter objects reject
 unknown fields. The exact canonical exchanges are in the JSONL fixture; field
 semantics and transitions follow.
+### Public discovery and pagination
+
+`agent.get` takes `{"agent_id":"<registered UUID>"}`. `agent.list` takes
+`{"limit":50,"after":"<last returned agent_id>"}`; both fields are optional.
+The default limit is 50; accepted limits are 1–100. Listing returns
+`{"agents":[...],"next":"<continuation UUID>"}` or `"next": null` when complete.
+Pass `next` as `after` for the next page. Responses are also byte-bounded and may
+contain fewer entries than requested: completion is determined by `next`, not
+the number of entries. Ordering is lexical by stable agent UUID, not receipt
+time. Pages are current reads, not a frozen fleet snapshot; concurrent insertion
+before a cursor can be seen on a subsequent full scan. Corrupt records fail the
+read explicitly. Retirement does not prune registrations.
+
+For owner/child correlation, pass the exact returned `agent_id`; session UUID or
+pane identity alone cannot identify a subject. If a live process changes session
+context, do not register it as a new process: omit context fields that are not
+immutable for that registration. Mutable session/location context is not yet a
+publication field in v1 and should not be smuggled into activity/reason strings.
+
 ### One channel is one record
 
 A channel is one file, `<state root>/publications/<agent_id>.<channel>.json`,
