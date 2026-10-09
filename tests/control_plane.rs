@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 use agent_radar::Daemon;
 use agent_radar::HerdrConfig;
 use agent_radar::config::{RuntimeBackend, RuntimeConfig};
-use agent_radar::control_plane::registry::{MAX_TEXT_BYTES, ProcessVerifier};
+use agent_radar::control_plane::ops::Operation;
+use agent_radar::control_plane::registry::{MAX_LISTED, MAX_TEXT_BYTES, ProcessVerifier};
 use agent_radar::control_plane::{
     Category, DaemonRuntime, Derived, MAX_LINE_BYTES, MAX_VERIFICATION_JOBS, PROTOCOL_VERSION,
     RecordState, RequestOutcome, RequestRecord, Store, now_ms, random_uuid, select,
@@ -42,9 +43,9 @@ use agent_radar::model::{
 };
 use agent_radar::runtime::{
     CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation, FocusOutcome,
-    InputOutcome, InputPayload, InputRequest, MAX_REPORTED_TEXT_BYTES, OutputOutcome, OutputRead,
-    OutputRequest, OutputSource, ReportOutcome, ReportRequest, ReportedState, RuntimeProvider,
-    SplitDirection, StateReport, Target,
+    InputOutcome, InputPayload, InputRequest, LaunchOutcome, LaunchRequest,
+    MAX_REPORTED_TEXT_BYTES, OutputOutcome, OutputRead, OutputRequest, OutputSource, ReportOutcome,
+    ReportRequest, ReportedState, RuntimeProvider, SplitDirection, StateReport, Target,
 };
 use serde_json::{Value, json};
 
@@ -389,6 +390,18 @@ const MUX_CAPABILITIES: &[&str] = &[
     "reporting",
 ];
 
+/// The same, plus `launch`: a backend that can serve a spawn, because it can
+/// both create a pane and run a command in it.
+const SPAWN_CAPABILITIES: &[&str] = &[
+    "observe",
+    "process_info",
+    "creation",
+    "input",
+    "output",
+    "reporting",
+    "launch",
+];
+
 /// The daemon's own registry capability is advertised alongside whatever mux
 /// capabilities the backend declares.
 fn advertised(backend: &[&str]) -> Value {
@@ -405,6 +418,14 @@ enum ReportAnswer {
     Unknown(String),
 }
 
+/// What a fake backend answers to a launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LaunchAnswer {
+    Completed,
+    Refused(String),
+    Unknown(String),
+}
+
 /// A fake backend for the mux primitives: what the test staged it answers, and
 /// what the daemon asked it for. Nothing here is a mux.
 struct MuxBackend {
@@ -412,10 +433,15 @@ struct MuxBackend {
     created: CreatedLocation,
     output: OutputRead,
     report: ReportAnswer,
+    launch: LaunchAnswer,
+    /// What this backend reports as its panes: what a topology read consults to
+    /// confirm a recorded location.
+    inventory: FleetObservation,
     created_requests: Mutex<Vec<CreateRequest>>,
     input_requests: Mutex<Vec<InputRequest>>,
     output_requests: Mutex<Vec<OutputRequest>>,
     report_requests: Mutex<Vec<ReportRequest>>,
+    launch_requests: Mutex<Vec<LaunchRequest>>,
     /// When set, a create waits inside the gate, so a test can observe the
     /// daemon while the request is in flight. Every wait here is a rendezvous,
     /// never a sleep.
@@ -446,10 +472,13 @@ impl MuxBackend {
                 revision: Some(7),
             },
             report: report.unwrap_or(ReportAnswer::Completed),
+            launch: LaunchAnswer::Completed,
+            inventory: empty_inventory(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
             gate: None,
         })
     }
@@ -461,10 +490,31 @@ impl MuxBackend {
             created: self.created.clone(),
             output,
             report: self.report.clone(),
+            launch: self.launch.clone(),
+            inventory: self.inventory.clone(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
+            gate: None,
+        })
+    }
+
+    /// The same backend, answering a launch with this outcome.
+    fn launching(self: &Arc<Self>, launch: LaunchAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            capabilities: self.capabilities,
+            created: self.created.clone(),
+            output: self.output.clone(),
+            report: self.report.clone(),
+            launch,
+            inventory: self.inventory.clone(),
+            created_requests: Mutex::new(Vec::new()),
+            input_requests: Mutex::new(Vec::new()),
+            output_requests: Mutex::new(Vec::new()),
+            report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
             gate: None,
         })
     }
@@ -476,10 +526,13 @@ impl MuxBackend {
             created,
             output: self.output.clone(),
             report: self.report.clone(),
+            launch: self.launch.clone(),
+            inventory: self.inventory.clone(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
             gate: None,
         })
     }
@@ -491,17 +544,70 @@ impl MuxBackend {
             created: self.created.clone(),
             output: self.output.clone(),
             report: self.report.clone(),
+            launch: self.launch.clone(),
+            inventory: self.inventory.clone(),
             created_requests: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
             gate: Some(gate),
+        })
+    }
+
+    /// The same backend, reporting exactly these panes as its inventory.
+    fn observing(self: &Arc<Self>, panes: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            capabilities: self.capabilities,
+            created: self.created.clone(),
+            output: self.output.clone(),
+            report: self.report.clone(),
+            launch: self.launch.clone(),
+            inventory: FleetObservation {
+                workspaces: Vec::new(),
+                tabs: Vec::new(),
+                panes: panes
+                    .iter()
+                    .map(|pane_id| Pane {
+                        location: Location {
+                            workspace_id: "wA".into(),
+                            tab_id: "wA:t1".into(),
+                            pane_id: (*pane_id).into(),
+                        },
+                        label: None,
+                        title: None,
+                    })
+                    .collect(),
+                agents: Vec::new(),
+            },
+            created_requests: Mutex::new(Vec::new()),
+            input_requests: Mutex::new(Vec::new()),
+            output_requests: Mutex::new(Vec::new()),
+            report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
+            gate: None,
         })
     }
 
     /// How many reports this backend has been asked to forward.
     fn reports_seen(&self) -> usize {
         self.report_requests.lock().expect("the report list").len()
+    }
+
+    /// What this backend was asked to launch, in order.
+    fn launches(&self) -> Vec<LaunchRequest> {
+        self.launch_requests
+            .lock()
+            .expect("the launch list")
+            .clone()
+    }
+
+    /// What this backend was asked to create, in order.
+    fn creates(&self) -> Vec<CreateRequest> {
+        self.created_requests
+            .lock()
+            .expect("the create list")
+            .clone()
     }
 }
 
@@ -510,7 +616,7 @@ impl RuntimeProvider for MuxBackend {
         self.capabilities
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
-        Ok(empty_inventory())
+        Ok(self.inventory.clone())
     }
     fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
         ForegroundEvidence::Inconclusive
@@ -554,6 +660,17 @@ impl RuntimeProvider for MuxBackend {
             ReportAnswer::Completed => ReportOutcome::Completed,
             ReportAnswer::Refused(message) => ReportOutcome::Refused(message.clone()),
             ReportAnswer::Unknown(message) => ReportOutcome::Unknown(message.clone()),
+        }
+    }
+    fn launch(&self, request: &LaunchRequest, _cancel: &AtomicBool) -> LaunchOutcome {
+        self.launch_requests
+            .lock()
+            .expect("the launch list")
+            .push(request.clone());
+        match &self.launch {
+            LaunchAnswer::Completed => LaunchOutcome::Completed,
+            LaunchAnswer::Refused(message) => LaunchOutcome::Refused(message.clone()),
+            LaunchAnswer::Unknown(message) => LaunchOutcome::Unknown(message.clone()),
         }
     }
 }
@@ -1758,6 +1875,104 @@ fn registration_body(
     body
 }
 
+/// Two canonical incarnations: a registration names its own incarnation as a
+/// UUID, and a spawn names the record the daemon issued for it.
+const PARENT_INCARNATION: &str = "3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b22";
+const OTHER_INCARNATION: &str = "5b2e8c41-0a7d-4f36-b1d9-6c3a7e5f8b1d";
+
+/// Registers one runtime subject that names where it lives, so a spawn can be
+/// asked for under the pane it registered.
+fn registered_parent(client: &mut Client, incarnation: &str, pane: &str) -> String {
+    let mut body = registration_body(incarnation, None, None);
+    body["location"] = json!({
+        "backend": "herdr",
+        "workspace": "wA",
+        "tab": "wA:t1",
+        "pane": pane,
+    });
+    let response = client.call("agent.register", body);
+    agent_id(&response)
+}
+
+/// The spawn request one caller sends: a parent subject and the command it
+/// resolved for the child.
+fn spawn_params(parent: &str, executable: &str, argv: &[&str]) -> Value {
+    json!({
+        "request": {
+            "parent": parent,
+            "executable": executable,
+            "argv": argv,
+        },
+        "requester": "test",
+    })
+}
+
+/// The incarnation of a child process that registers with the token its launch
+/// carried.
+const CHILD_INCARNATION: &str = "9d8c7b6a-5f4e-4d3c-9b2a-1809f7e6d5c4";
+
+/// Three request ids whose order is the durable key's, not the order they were
+/// spawned in.
+const FIRST_EDGE: &str = "11111111-1111-4111-8111-111111111111";
+const SECOND_EDGE: &str = "22222222-2222-4222-8222-222222222222";
+const THIRD_EDGE: &str = "33333333-3333-4333-8333-333333333333";
+
+/// Registers a child that presents the token its launch carried, which is what
+/// the launched process does when it starts.
+fn registering_with_token(client: &mut Client, incarnation: &str, token: &str) -> Value {
+    let mut body = registration_body(incarnation, None, None);
+    body["spawn_token"] = json!(token);
+    client.call("agent.register", body)
+}
+
+/// Spawns one child of `parent` under an exact request id.
+fn spawned_edge(client: &mut Client, id: &str, parent: &str) -> Value {
+    let response = client.call_id(
+        id,
+        "spawn",
+        spawn_params(parent, "/usr/bin/pi", &["--child"]),
+    );
+    assert_eq!(
+        result_record(&response)["outcome"],
+        "completed",
+        "{response}"
+    );
+    response
+}
+
+/// The request ids one `spawn.list` page carries, in the order they arrived.
+fn request_ids(response: &Value) -> Vec<String> {
+    response["result"]["spawns"]
+        .as_array()
+        .expect("a page")
+        .iter()
+        .map(|edge| {
+            edge["request_id"]
+                .as_str()
+                .expect("a public request id")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// One recorded spawn edge, as the daemon wrote it: the private token included,
+/// because a test needs to know the secret that must not travel.
+fn recorded_edge(state: &Path, request_id: &str) -> Value {
+    serde_json::from_slice(&fs::read(edge_path(state, request_id)).expect("a recorded edge"))
+        .expect("a spawn edge")
+}
+
+fn edge_path(state: &Path, request_id: &str) -> PathBuf {
+    state.join("spawns").join(format!("{request_id}.json"))
+}
+
+fn edges_written(state: &Path) -> usize {
+    match fs::read_dir(state.join("spawns")) {
+        Ok(entries) => entries.count(),
+        Err(_) => 0,
+    }
+}
+
 fn channel_snapshot(activity: &str) -> Value {
     json!({"activity":activity,"waiting_reason":"waiting-for-owner","last_outcome":{"result":"failed-tool-timeout"},"actions":["retry"]})
 }
@@ -2753,6 +2968,621 @@ fn stopping_the_daemon_cancels_an_in_flight_close_into_a_durable_unknown() {
 /// One create, one input in each of its two shapes, and one bounded read, all
 /// through the real socket: the backend is asked for the normalized request and
 /// the operation records say what happened. The read leaves no record at all.
+#[test]
+fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertisement() {
+    let sandbox = Sandbox::new("launch-readiness");
+    let backend = MuxBackend::new(MUX_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let ping = client.call("ping", json!({}));
+    assert_eq!(
+        ping["result"]["capabilities"],
+        advertised(MUX_CAPABILITIES),
+        "a backend that does not implement launch advertises only its actual capabilities"
+    );
+    let refusal = Operation::readiness("spawn", "launch", backend.capabilities)
+        .expect_err("launch is not implemented by this backend");
+    assert_eq!(
+        refusal,
+        "spawn needs the `launch` capability; this backend does not provide it"
+    );
+    assert!(
+        backend
+            .created_requests
+            .lock()
+            .expect("the create list")
+            .is_empty(),
+        "readiness must fail before any creation or dispatch"
+    );
+
+    // Other operations keep their own capability gates; they do not inherit
+    // launch merely because a backend can create or accept terminal input.
+    assert!(Operation::readiness("create", "creation", backend.capabilities).is_ok());
+    assert!(Operation::readiness("input", "input", backend.capabilities).is_ok());
+    let no_launch = ["creation", "input"];
+    assert!(Operation::readiness("spawn", "launch", &no_launch).is_err());
+    daemon.stop();
+}
+
+/// A spawn the backend can serve creates under the parent's own pane, launches
+/// the command the caller resolved, and answers with the two records it wrote.
+#[test]
+fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effects() {
+    let sandbox = Sandbox::new("spawn-served");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+
+    let id = random_uuid();
+    let params = spawn_params(&parent, "/usr/bin/pi", &["--child", "row one"]);
+    let response = client.call_id(&id, "spawn", params.clone());
+
+    let record = result_record(&response);
+    assert_eq!(record["method"], "spawn");
+    assert_eq!(record["outcome"], "completed");
+    // The record's target is the location the request changed: the pane the child
+    // was created beside, so a competing mutation of it cannot run alongside.
+    assert_eq!(record["target"], "wA:p1");
+    assert_eq!(record["created"], json!({"kind": "pane", "id": "wA:p2"}));
+    assert_eq!(
+        record["effects"],
+        json!(["created pane wA:p2", "launched child"])
+    );
+
+    // The edge is the second record: the three effects separately, and the parent
+    // the child was created for.
+    let spawn = &response["result"]["spawn"];
+    assert_eq!(spawn["parent"], json!(parent));
+    assert_eq!(spawn["created"], "completed");
+    assert_eq!(spawn["launched"], "completed");
+    assert_eq!(
+        spawn["location"],
+        json!({"backend": "runtime", "pane": "wA:p2"})
+    );
+    assert!(
+        spawn.get("bound").is_none(),
+        "no child is claimed before one registers with the token"
+    );
+
+    // The child was created beside the parent's own pane and unfocused: a spawn
+    // never lands wherever the multiplexer happens to have focus.
+    let creates = backend.creates();
+    assert_eq!(creates.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&creates[0]).expect("the create"),
+        json!({
+            "kind": "pane_split",
+            "pane_id": "wA:p1",
+            "direction": "right",
+            "focus": false,
+        })
+    );
+
+    // The command launched is the caller's own, unchanged, in the pane the create
+    // named, carrying the token the edge minted.
+    let launches = backend.launches();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].pane_id, "wA:p2");
+    assert_eq!(launches[0].executable, "/usr/bin/pi");
+    assert_eq!(
+        launches[0].argv,
+        vec!["--child".to_string(), "row one".into()]
+    );
+    let token = recorded_edge(&sandbox.state(), &id)["token"]
+        .as_str()
+        .expect("a minted token")
+        .to_string();
+    assert_eq!(launches[0].spawn_token, token);
+    // The token is the only thing that binds the edge to its child, so it is a
+    // credential: it travels to the pane and appears in no answer.
+    no_secret(&response, &token);
+    no_secret(&client.call("request", json!({"id": id})), &token);
+
+    // A spawn types nothing of its own and touches no lifecycle: the launch is the
+    // only thing written to the pane.
+    assert!(
+        backend
+            .input_requests
+            .lock()
+            .expect("the input list")
+            .is_empty(),
+        "a spawn launches; it does not compose input"
+    );
+    // It writes two records and no other fact: one edge for one spawn, and no
+    // publication, so no assignment or execution fact was authored.
+    assert_eq!(edges_written(&sandbox.state()), 1);
+    assert_eq!(
+        fs::read_dir(sandbox.state().join("publications"))
+            .expect("the publications directory")
+            .count(),
+        0,
+        "a spawn authors no assignment fact"
+    );
+    daemon.stop();
+}
+
+/// The wire-level proof the launch capability gate was delivered for: a spawn
+/// against a backend that cannot launch is refused before any effect.
+#[test]
+fn a_backend_without_launch_refuses_a_spawn_before_any_effect() {
+    let sandbox = Sandbox::new("spawn-without-launch");
+    let backend = MuxBackend::new(MUX_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+
+    let id = random_uuid();
+    let response = client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    // The record is the answer: an operation this backend cannot serve is
+    // refused in a record a client can read, not answered as a bare error.
+    let record = result_record(&response);
+    assert_eq!(record["outcome"], "refused");
+    assert_eq!(record["category"], "backend_unavailable");
+    assert!(
+        record["message"]
+            .as_str()
+            .expect("a message")
+            .contains("the `launch` capability"),
+        "the refusal names what this backend cannot do: {response}"
+    );
+    assert_eq!(record["effects"], json!([]));
+    assert!(record["created"].is_null());
+    assert!(
+        response["result"].get("spawn").is_none(),
+        "a spawn this backend cannot serve authors no edge: {response}"
+    );
+    assert!(backend.creates().is_empty(), "nothing was created");
+    assert!(backend.launches().is_empty(), "nothing was launched");
+    assert_eq!(
+        edges_written(&sandbox.state()),
+        0,
+        "a spawn this backend cannot serve records no intent and mints no token"
+    );
+
+    // The refusal outlives the answer, and still claims no effect.
+    let recorded = client.call("request", json!({"id": id}));
+    assert_eq!(result_record(&recorded)["outcome"], "refused");
+
+    // Capability advertisement is unchanged: this backend implements what it
+    // says it does, and its refusal adds nothing to it.
+    let ping = client.call("ping", json!({}));
+    assert_eq!(ping["result"]["capabilities"], advertised(MUX_CAPABILITIES));
+    daemon.stop();
+}
+
+/// A replayed request id answers what the first attempt recorded, and performs
+/// no second effect.
+#[test]
+fn a_replayed_spawn_request_id_answers_the_recorded_effects_once() {
+    let sandbox = Sandbox::new("spawn-replay");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+
+    let id = random_uuid();
+    let params = spawn_params(&parent, "/usr/bin/pi", &["--child"]);
+    let first = client.call_id(&id, "spawn", params.clone());
+    let written = fs::read(edge_path(&sandbox.state(), &id)).expect("the edge file");
+
+    let second = client.call_id(&id, "spawn", params.clone());
+    assert_eq!(
+        second, first,
+        "a replay is answered from the records the first attempt wrote"
+    );
+    assert_eq!(backend.creates().len(), 1, "one create, once");
+    assert_eq!(backend.launches().len(), 1, "one launch, once");
+    assert_eq!(
+        fs::read(edge_path(&sandbox.state(), &id)).expect("the edge file"),
+        written,
+        "a replay mints no second token and rewrites no effect"
+    );
+
+    // The same id with different contents is a different request, and is refused
+    // rather than served as a second effect.
+    let different = client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/other", &[]));
+    assert_eq!(error_code(&different), "refused");
+    assert_eq!(backend.creates().len(), 1);
+    assert_eq!(backend.launches().len(), 1);
+    daemon.stop();
+}
+
+/// A refused launch leaves the pane the daemon created named, and removes
+/// nothing.
+#[test]
+fn a_refused_spawn_launch_leaves_the_created_pane_named() {
+    let sandbox = Sandbox::new("spawn-launch-refused");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+        .launching(LaunchAnswer::Refused("the pane refused the line".into()));
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+
+    let id = random_uuid();
+    let response = client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let record = result_record(&response);
+    assert_eq!(record["outcome"], "refused");
+    assert_eq!(record["category"], "backend_refused");
+    assert_eq!(record["message"], "the pane refused the line");
+    assert_eq!(
+        record["created"],
+        json!({"kind": "pane", "id": "wA:p2"}),
+        "the pane it created is named even though the launch failed"
+    );
+    assert_eq!(record["effects"], json!(["created pane wA:p2"]));
+
+    let spawn = &response["result"]["spawn"];
+    assert_eq!(spawn["created"], "completed");
+    assert_eq!(spawn["launched"], "refused");
+    assert_eq!(spawn["location"]["pane"], "wA:p2");
+    // The daemon does not clean up a pane it can see and the operator may want:
+    // the edge still names it, and the backend was asked to close nothing (the
+    // harness panics if it ever is).
+    assert_eq!(
+        recorded_edge(&sandbox.state(), &id)["location"]["pane"],
+        "wA:p2"
+    );
+    assert_eq!(backend.launches().len(), 1);
+    daemon.stop();
+}
+
+/// An unconfirmed launch is unknown, is never reported as launched, and still
+/// names the pane the create confirmed.
+#[test]
+fn an_unconfirmed_spawn_launch_reads_unknown_and_is_never_claimed_launched() {
+    let sandbox = Sandbox::new("spawn-launch-unknown");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+        .launching(LaunchAnswer::Unknown("the pane never answered".into()));
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+
+    let id = random_uuid();
+    let response = client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let record = result_record(&response);
+    assert_eq!(record["outcome"], "unknown");
+    assert_eq!(record["category"], "backend_unavailable");
+    assert_eq!(record["message"], "the pane never answered");
+    assert_eq!(record["created"], json!({"kind": "pane", "id": "wA:p2"}));
+    assert_eq!(
+        record["effects"],
+        json!(["created pane wA:p2"]),
+        "an unconfirmed launch is not an effect"
+    );
+
+    let spawn = &response["result"]["spawn"];
+    assert_eq!(spawn["created"], "completed");
+    assert_eq!(spawn["launched"], "unknown");
+    assert_eq!(spawn["location"]["pane"], "wA:p2");
+    assert_eq!(
+        recorded_edge(&sandbox.state(), &id)["launched"],
+        "unknown",
+        "the edge records the uncertainty rather than a launch"
+    );
+    daemon.stop();
+}
+
+/// A spawn under a parent the daemon has no runtime subject for, or one that
+/// registered no pane, is refused before anything is created.
+#[test]
+fn a_spawn_without_a_parent_pane_is_refused_before_any_effect() {
+    let sandbox = Sandbox::new("spawn-parent");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let unknown = client.call("spawn", spawn_params(&random_uuid(), "/usr/bin/pi", &[]));
+    assert_eq!(error_code(&unknown), "not_found");
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("is not a registered agent"),
+        "{unknown}"
+    );
+
+    // A registered subject that named no pane is refused too: the daemon creates
+    // under a pane it was told about, never under an inferred one.
+    registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let unlocatable = client.call(
+        "agent.register",
+        registration_body(OTHER_INCARNATION, None, None),
+    );
+    let unlocatable = agent_id(&unlocatable);
+    let no_pane = client.call("spawn", spawn_params(&unlocatable, "/usr/bin/pi", &[]));
+    assert_eq!(error_code(&no_pane), "refused");
+    assert!(
+        no_pane["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("names no pane"),
+        "{no_pane}"
+    );
+
+    assert!(backend.creates().is_empty());
+    assert!(backend.launches().is_empty());
+    assert_eq!(edges_written(&sandbox.state()), 0);
+    daemon.stop();
+}
+
+/// The wire shapes of a spawn are validated before anything is recorded.
+#[test]
+fn the_wire_shapes_of_spawn_are_validated_before_dispatch() {
+    let sandbox = Sandbox::new("spawn-shapes");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+
+    let cases = [
+        (
+            "a command that is not absolute",
+            spawn_params(&parent, "pi", &[]),
+            "must be an absolute printable path",
+        ),
+        (
+            "an argument a terminal would act on",
+            spawn_params(&parent, "/usr/bin/pi", &["bell\u{7}"]),
+            "cannot contain terminal control characters",
+        ),
+        (
+            "a parent that is not a runtime subject id",
+            spawn_params("parent", "/usr/bin/pi", &[]),
+            "`parent` must be a canonical UUID",
+        ),
+        (
+            "a field this request does not have",
+            json!({"request": {
+                "parent": &parent,
+                "executable": "/usr/bin/pi",
+                "command": "pi",
+            }}),
+            "unknown field",
+        ),
+        (
+            "a request with no command",
+            json!({"request": {"parent": &parent}}),
+            "missing field `executable`",
+        ),
+        (
+            "no request at all",
+            json!({"requester": "test"}),
+            "`request` is required",
+        ),
+    ];
+    for (case, params, expected) in cases {
+        let response = client.call("spawn", params);
+        assert_eq!(error_code(&response), "bad_params", "{case}: {response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .expect("a message")
+                .contains(expected),
+            "{case}: {response}"
+        );
+    }
+    assert!(backend.creates().is_empty());
+    assert!(backend.launches().is_empty());
+    assert_eq!(edges_written(&sandbox.state()), 0);
+    daemon.stop();
+}
+
+#[test]
+fn the_topology_read_reports_the_edge_its_own_operation_recorded() {
+    let sandbox = Sandbox::new("spawn-read");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p1", "wA:p2"]);
+    let mut daemon = sandbox.daemon_with(backend);
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let id = random_uuid();
+    spawned_edge(&mut client, &id, &parent);
+
+    let response = client.call("spawn.get", json!({"request_id": id}));
+    let spawn = &response["result"]["spawn"];
+    assert_eq!(spawn["request_id"], json!(id));
+    assert_eq!(spawn["parent"], json!(parent));
+    assert_eq!(spawn["created"], "completed");
+    assert_eq!(spawn["launched"], "completed");
+    assert_eq!(spawn["location"]["pane"], "wA:p2");
+    assert_eq!(
+        spawn["state"], "unbound",
+        "no child has presented the token"
+    );
+    assert_eq!(
+        spawn["freshness"], "fresh",
+        "the backend reports the recorded pane now"
+    );
+    assert!(spawn.get("bound").is_none());
+    no_secret(
+        &response,
+        recorded_edge(&sandbox.state(), &id)["token"]
+            .as_str()
+            .expect("a minted token"),
+    );
+
+    // An edge the daemon never authored is refused rather than invented, and the
+    // refusal names no other edge.
+    let unknown = client.call("spawn.get", json!({"request_id": random_uuid()}));
+    assert_eq!(error_code(&unknown), "not_found");
+    daemon.stop();
+}
+
+#[test]
+fn a_location_the_backend_no_longer_reports_reads_unresolved_without_revising_the_edge() {
+    let sandbox = Sandbox::new("spawn-unresolved");
+    // The backend reports the parent's pane and not the pane the child was
+    // created in: the recorded location is gone, and the record says nothing
+    // about what became of the child.
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p1"]);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let id = random_uuid();
+    spawned_edge(&mut client, &id, &parent);
+    let written = fs::read(edge_path(&sandbox.state(), &id)).expect("the edge file");
+
+    let response = client.call("spawn.get", json!({"request_id": id}));
+    let spawn = &response["result"]["spawn"];
+    assert_eq!(spawn["state"], "unresolved");
+    assert_eq!(spawn["freshness"], "stale");
+    assert_eq!(
+        spawn["location"]["pane"], "wA:p2",
+        "the recorded location is reported, not dropped"
+    );
+    assert_eq!(spawn["created"], "completed");
+    assert_eq!(spawn["launched"], "completed");
+    assert!(
+        spawn.get("stopped").is_none(),
+        "a missing pane is not a report that the child stopped"
+    );
+    assert_eq!(
+        fs::read(edge_path(&sandbox.state(), &id)).expect("the edge file"),
+        written,
+        "a read re-verifies; it never revises the record"
+    );
+    // The read consulted the backend's own report and touched nothing else: this
+    // fake is never asked to close or focus, and only the spawn created a pane.
+    assert_eq!(backend.creates().len(), 1);
+    daemon.stop();
+}
+
+#[test]
+fn a_restarted_daemon_reads_its_edges_and_never_confirms_an_unchecked_location() {
+    let sandbox = Sandbox::new("spawn-restart");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p2"]);
+    let mut daemon = sandbox.daemon_with(backend);
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let id = random_uuid();
+    spawned_edge(&mut client, &id, &parent);
+    // The child the launch started registers with the token it was given, so the
+    // edge names an exact identity across the restart.
+    let token = recorded_edge(&sandbox.state(), &id)["token"]
+        .as_str()
+        .expect("a minted token")
+        .to_owned();
+    registering_with_token(&mut client, CHILD_INCARNATION, &token);
+    let live = client.call("spawn.get", json!({"request_id": &id}));
+    assert_eq!(live["result"]["spawn"]["state"], "bound");
+    assert_eq!(live["result"]["spawn"]["freshness"], "fresh");
+    daemon.stop();
+
+    // The restarted daemon has no backend to consult. The edges are its own
+    // records, so the read is served and the location is left unconfirmed —
+    // never refused, and never presented as current.
+    let mut restarted = sandbox.daemon();
+    let mut client = Client::dial(restarted.path());
+    let response = client.call("spawn.get", json!({"request_id": &id}));
+    let spawn = &response["result"]["spawn"];
+    assert_eq!(
+        spawn["state"], "bound",
+        "a binding is a stored fact; a restart does not revise it"
+    );
+    assert_eq!(spawn["bound"]["incarnation"], CHILD_INCARNATION);
+    assert_eq!(spawn["created"], "completed");
+    assert_eq!(spawn["launched"], "completed");
+    assert_eq!(spawn["location"]["pane"], "wA:p2");
+    assert_eq!(
+        spawn["freshness"], "stale",
+        "no live backend confirmed this location"
+    );
+    no_secret(&response, &token);
+    restarted.stop();
+}
+
+#[test]
+fn spawn_edges_page_in_key_order_and_a_client_can_read_one_it_lost_the_answer_for() {
+    let sandbox = Sandbox::new("spawn-page");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p2"]);
+    let mut daemon = sandbox.daemon_with(backend);
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    // Spawned out of order: a page's order is the durable key's.
+    for id in [SECOND_EDGE, THIRD_EDGE, FIRST_EDGE] {
+        spawned_edge(&mut client, id, &parent);
+    }
+
+    let first = client.call("spawn.list", json!({"limit": 2}));
+    // The whole line a client reads, envelope included, is what must fit.
+    assert!(format!("{first}\n").len() < MAX_LINE_BYTES);
+    assert_eq!(request_ids(&first), vec![FIRST_EDGE, SECOND_EDGE]);
+    assert_eq!(first["result"]["next"], json!(SECOND_EDGE));
+    // Each entry is the shape `spawn.get` answers with, so a client reads one
+    // edge the same way it reads a page of them.
+    assert_eq!(first["result"]["spawns"][0]["state"], "unbound");
+    assert_eq!(first["result"]["spawns"][0]["freshness"], "fresh");
+
+    let second = client.call("spawn.list", json!({"limit": 2, "after": SECOND_EDGE}));
+    assert_eq!(request_ids(&second), vec![THIRD_EDGE]);
+    assert_eq!(second["result"]["next"], Value::Null);
+    let done = client.call("spawn.list", json!({"after": THIRD_EDGE}));
+    assert!(request_ids(&done).is_empty());
+    assert_eq!(done["result"]["next"], Value::Null);
+
+    // A page is bounded, so no answer can be grown by asking for one: no page is
+    // unbounded, and a cursor that is not a key is refused rather than ignored.
+    assert_eq!(
+        error_code(&client.call("spawn.list", json!({"limit": 0}))),
+        "bad_params"
+    );
+    assert_eq!(
+        error_code(&client.call("spawn.list", json!({"limit": MAX_LISTED + 1}))),
+        "bad_params"
+    );
+    assert_eq!(
+        error_code(&client.call("spawn.list", json!({"after": "not-a-key"}))),
+        "refused"
+    );
+    no_secret(
+        &first,
+        recorded_edge(&sandbox.state(), FIRST_EDGE)["token"]
+            .as_str()
+            .expect("a minted token"),
+    );
+    daemon.stop();
+}
+
+#[test]
+fn an_agent_the_daemon_did_not_spawn_has_no_edge_and_is_not_an_error() {
+    let sandbox = Sandbox::new("spawn-external");
+    // The backend reports a pane the daemon never created: a read must not adopt
+    // it into the topology from what it observes, and the second pane is the
+    // decoy that would show up if it did.
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p2", "wA:p9"]);
+    let mut daemon = sandbox.daemon_with(backend);
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+
+    // An empty topology is a page with nothing in it, not an error.
+    let empty = client.call("spawn.list", json!({}));
+    assert_eq!(empty["result"]["spawns"], json!([]));
+    assert_eq!(empty["result"]["next"], Value::Null);
+
+    let id = random_uuid();
+    spawned_edge(&mut client, &id, &parent);
+    // A child Herdsman launched through the backend directly: it registers, the
+    // daemon authors no edge for it, and it never binds the pending one.
+    let external = registered_parent(&mut client, OTHER_INCARNATION, "wA:p9");
+    assert_eq!(
+        edges_written(&sandbox.state()),
+        1,
+        "no edge is authored from observation"
+    );
+
+    let response = client.call("spawn.list", json!({}));
+    assert_eq!(
+        request_ids(&response),
+        vec![id.clone()],
+        "the topology holds the edge the daemon authored, and only it"
+    );
+    assert_eq!(response["result"]["spawns"][0]["state"], "unbound");
+    assert!(!response.to_string().contains(&external));
+    assert!(!response.to_string().contains(OTHER_INCARNATION));
+    daemon.stop();
+}
+
 #[test]
 fn the_mux_primitives_are_served_and_recorded() {
     let sandbox = Sandbox::new("mux-primitives");

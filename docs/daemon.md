@@ -20,11 +20,14 @@ backend and do not publish through Herdr. The older mux `report` method still
 forwards state/session/metadata to the backend; it is **not** direct registry
 publication.
 
-The daemon does not yet launch, stop, resume or restart registered agents.
-Creating a pane creates a terminal surface, not an agent. Private launch/resume
-specifications can be stored, but are inert. The current Radar TUI still uses
-its existing observation path; registering an agent is not yet a way to make it
-appear there.
+The daemon can create and launch a child through `spawn`, and records a durable
+edge to its named parent. This does not make the daemon a lifecycle manager:
+there is no stop, resume, restart, recovery, or adoption of panes launched
+outside the daemon. A created pane is not a bound child until that child
+registers with the private spawn token. Private launch/resume specifications
+stored on registrations remain inert unless explicitly used by a supported
+operation. The current Radar TUI still uses its existing observation path;
+registering an agent is not yet a way to make it appear there.
 
 ## Connect and negotiate
 
@@ -54,12 +57,13 @@ processes running as the same user. Do not expose this socket remotely.
 |---|---|---|
 | Handshake | `ping` | None |
 | Physical observations | `observe`, `process_info`, `output` | Respective mux capability |
-| Physical mutations | `focus`, `close`, `create`, `input`, `report` | Respective mux capability |
+| Physical mutations | `focus`, `close`, `create`, `input`, `report`, `spawn` | Respective mux capabilities (`spawn`: `creation` + `launch`) |
 | Mutation readback | `request`, `requests` | None |
 | Register a subject | `agent.register` | `agent_registry` |
 | Acquire or explicitly replace a channel writer | `agent.acquire` | `agent_registry` |
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `agent_registry` |
 | Public registry reads | `agent.get`, `agent.list` | `agent_registry` |
+| Spawn topology reads | `spawn.get`, `spawn.list` | `agent_registry`; location confirmation additionally uses `observe` when available |
 
 Use the method references for parameter and result shapes rather than treating
 this table as a second schema. Unsupported methods/capabilities are not an
@@ -123,28 +127,42 @@ The first port can be small:
   execution evidence separately on `execution`.
 - Keep optional Herdr metadata mirroring only where an existing consumer needs
   it. Registry publication itself needs no Herdr commands or token parsing.
-- Use the physical surface where it already covers a caller's needs. Launch,
-  readiness, lifecycle events and exact presence correlation still need their
-  own daemon support before replacing Herdsman's complete Herdr adapter.
+- Route child creation through `spawn` only after `ping` confirms protocol v1
+  and both `creation` and `launch` capabilities. Those are the backend
+  capabilities required by the operation; the method names are part of this
+  protocol version and are not separately advertised in `ping`. Attempt
+  `spawn` once after those checks. An `unknown_method` response means this
+  daemon does not implement the method; keep the existing Herdsman path. Never
+  fall back to another launch path after an uncertain/unknown spawn outcome,
+  since the child may already have been created or launched.
+- Until Herdsman deliberately adopts this path, its existing create/reuse and
+  launch path remains unchanged. Do not infer adoption from merely registering
+  agents or reading topology. Existing owner assignment and child execution
+  publication remain separate from the spawn operation.
 
 Today, Pi supplies execution evidence, Herdsman supplies assignment/run facts,
-and the daemon supplies physical observations/controls. This is the starting
-seam, not a prohibition on consolidating more lifecycle work later. The next
-execution layer can use registered launch specifications for launch/stop/resume
-and reconcile with owner state. Recovery of children, pending asks and results
-must be specified and verified; relaunching a saved session alone does not
-establish recovery.
+and the daemon supplies physical observations/controls and an opt-in managed
+spawn operation. This is the starting seam, not a prohibition on consolidating
+more lifecycle work later. Spawn creates and launches; registration with its
+token establishes the child identity. Neither topology freshness nor a missing
+pane establishes process exit or authorizes lifecycle action. Stop, resume,
+restart, recovery, and adoption of foreign panes are not provided; recovery of
+children, pending asks and results must be specified and verified separately.
 
 ## Examples and compatibility
 
 - [Reconnecting owner publisher](../examples/agent-publisher/publisher.py)
-- [Registry exchanges](agent-registration.fixture.jsonl)
+- [Registry and spawn exchanges](agent-registration.fixture.jsonl)
 - [Mux exchanges](control-plane.fixture.jsonl)
 
 Run `cargo build --locked && python3 tests/agent_publisher.py` for the disposable
-daemon example smoke. It exercises the served contract, not live Herdsman
-integration. The example retains publisher identity for one process lifetime;
-a production port must define durable reconnect state.
+daemon smoke. It replays registry and spawn fixture exchanges; spawn uses a
+scripted backend to verify create, launch, token binding and redaction without a
+live Herdr session. The publisher example itself remains a registry-publisher
+reference and does not launch children. It retains publisher identity for one
+process lifetime; a production publisher must define durable reconnect state.
+The real Herdr launch smoke belongs to the independent final verification gate;
+there is no live user-fleet integration.
 
 Consumers should negotiate capabilities, preserve unfamiliar vocabulary, and
 switch on error codes rather than human-readable messages. Keep wire-version

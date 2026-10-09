@@ -31,9 +31,9 @@ use crate::model::{
 };
 use crate::runtime::{
     CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation, FocusOutcome,
-    InputOutcome, InputPayload, InputRequest, OutputOutcome, OutputRead, OutputRequest,
-    OutputSource, ReportOutcome, ReportRequest, ReportTarget, RuntimeProvider, SplitDirection,
-    Target,
+    InputOutcome, InputPayload, InputRequest, LAUNCH_CAPABILITY, LAUNCH_TOKEN_ENV, LaunchOutcome,
+    LaunchRequest, OutputOutcome, OutputRead, OutputRequest, OutputSource, ReportOutcome,
+    ReportRequest, ReportTarget, RuntimeProvider, SplitDirection, Target,
 };
 
 /// Metadata tokens carrying explicit pi-herdsman ownership UUIDs.
@@ -505,6 +505,7 @@ impl RuntimeProvider for HerdrRuntime {
             "input",
             "output",
             "reporting",
+            LAUNCH_CAPABILITY,
         ]
     }
 
@@ -611,6 +612,32 @@ impl RuntimeProvider for HerdrRuntime {
         match self.exchange(method, params, cancel) {
             Ok(_) => InputOutcome::Completed,
             Err(failure) => failure.into_input(),
+        }
+    }
+
+    /// Runs one child command in a created pane as one typed shell line.
+    ///
+    /// Herdr cannot start an arbitrary command of its own (`agent.start` picks
+    /// from Herdr's table), so the command reaches the pane the way Herdsman's
+    /// launch does: one line, every argv element single-quoted, plus Enter.
+    /// `pane.send_input` carries text and the named key in one request, so the
+    /// line is either accepted whole or not at all — an accepted text with a
+    /// missing Enter would leave an unexecuted line pending in the pane.
+    fn launch(&self, request: &LaunchRequest, cancel: &AtomicBool) -> LaunchOutcome {
+        if let Err(error) = request.validate() {
+            return LaunchOutcome::Refused(error);
+        }
+        let line = match launch_line(request) {
+            Ok(line) => line,
+            Err(error) => return LaunchOutcome::Refused(error),
+        };
+        match self.exchange(
+            "pane.send_input",
+            json!({ "pane_id": request.pane_id, "text": line, "keys": [ENTER_KEY] }),
+            cancel,
+        ) {
+            Ok(_) => LaunchOutcome::Completed,
+            Err(failure) => failure.into_launch(),
         }
     }
 
@@ -732,6 +759,42 @@ impl RuntimeProvider for HerdrRuntime {
     }
 }
 
+/// Builds the single shell line a launch types into its pane.
+///
+/// Each element is single-quoted, because the pane's interactive shell parses
+/// what is typed: an unquoted element would be re-split and its metacharacters
+/// would run (pi-extensions ADR 0029 measured this). The token is exported to
+/// the child on the same line.
+///
+/// An argument holding a newline is refused rather than typed. ADR 0029's
+/// fallback writes the command to a private script and types the script's path,
+/// which the daemon does not implement: retiring such a script needs a
+/// bounded, acknowledged cleanup the daemon cannot yet observe, and a
+/// self-deleting wrapper would risk removing a file the pane shell has not read.
+fn launch_line(request: &LaunchRequest) -> Result<String, String> {
+    if request.argv.iter().any(|argument| argument.contains('\n')) {
+        return Err("`argv` holds a newline, and this backend types one shell line".to_string());
+    }
+    let mut atoms = Vec::with_capacity(request.argv.len() + 2);
+    atoms.push(format!(
+        "{}={}",
+        LAUNCH_TOKEN_ENV,
+        shell_quote(&request.spawn_token)
+    ));
+    atoms.push(shell_quote(&request.executable));
+    atoms.extend(request.argv.iter().map(|argument| shell_quote(argument)));
+    Ok(atoms.join(" "))
+}
+
+/// The key a launch presses after typing the line.
+const ENTER_KEY: &str = "enter";
+
+/// POSIX single-quote an atom for the pane's shell: an embedded single quote
+/// closes the quote, escapes itself, and reopens it.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// A reported optional string, present on the wire only when the caller sent it.
 fn set(params: &mut serde_json::Value, name: &str, value: Option<&str>) {
     if let Some(value) = value {
@@ -808,6 +871,13 @@ impl Failure {
         match self.certainty {
             Certainty::Refused => InputOutcome::Refused(self.message),
             Certainty::Unknown => InputOutcome::Unknown(self.message),
+        }
+    }
+
+    fn into_launch(self) -> LaunchOutcome {
+        match self.certainty {
+            Certainty::Refused => LaunchOutcome::Refused(self.message),
+            Certainty::Unknown => LaunchOutcome::Unknown(self.message),
         }
     }
 

@@ -20,7 +20,10 @@ use std::time::{Duration, Instant};
 
 use agent_radar::control_plane::{PROTOCOL_VERSION, random_uuid};
 use agent_radar::model::{ForegroundEvidence, LocalFacts};
-use agent_radar::runtime::CloseOutcome;
+use agent_radar::runtime::{
+    CloseOutcome, CreateOutcome, CreateRequest, LAUNCH_CAPABILITY, LAUNCH_TOKEN_ENV, LaunchOutcome,
+    LaunchRequest,
+};
 use agent_radar::{
     CloseTarget, Daemon, FocusOutcome, HerdrConfig, HerdrRuntime, RuntimeProvider, Target,
 };
@@ -1023,4 +1026,277 @@ esac"#,
         "the display report was not forwarded as given: {requests}"
     );
     daemon.stop();
+}
+
+// --- the adapter's launch transport ---------------------------------------
+
+/// The argv shapes pi-extensions ADR 0029 measured as fragile in a pane shell:
+/// a space, a quote, a substitution, a `;`, a glob and a `=`-carrying argument.
+const LAUNCH_ARGV: [&str; 6] = [
+    "a b",
+    "sq'uote",
+    "$(echo INJECTED)",
+    "semi;echo SPLIT",
+    "star*glob",
+    "model=omniroute/coder-high",
+];
+
+/// A child that records the argv it was run with and the token it was given.
+fn launch_child(dir: &Path, out: &Path) -> PathBuf {
+    let script = dir.join("dump.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+{{
+  printf 'TOKEN=%s\n' "${{{}:-}}"
+  n=0
+  for a in "$@"; do
+    n=$((n + 1))
+    printf 'ARG[%s]\n' "$a"
+  done
+  printf 'COUNT=%s\n' "$n"
+}} > '{}'
+"#,
+            LAUNCH_TOKEN_ENV,
+            out.display()
+        ),
+    )
+    .expect("write the child");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("make it runnable");
+    script
+}
+
+fn launch_request(pane: &str, executable: &Path, argv: &[&str], token: &str) -> LaunchRequest {
+    LaunchRequest {
+        pane_id: pane.to_string(),
+        executable: executable.display().to_string(),
+        argv: argv.iter().map(|argument| argument.to_string()).collect(),
+        spawn_token: token.to_string(),
+    }
+}
+
+/// Waits for a file a launched child wrote.
+fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if fs::read_to_string(path).is_ok_and(|text| !text.is_empty()) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+#[test]
+fn a_launch_types_one_quoted_line_the_pane_shell_yields_the_argv_from() {
+    let _serial = serial();
+    let fake = status_fake();
+    let seen = answering_stub_at(
+        &fake.path("herdr.sock"),
+        &[(
+            "pane.send_input",
+            r#"{"id":"radar:pane.send_input","result":{"type":"ok"}}"#,
+        )],
+    );
+    let runtime = fake.runtime(Duration::from_secs(2));
+    assert!(
+        runtime.capabilities().contains(&LAUNCH_CAPABILITY),
+        "an adapter that implements launch must declare it: {:?}",
+        runtime.capabilities()
+    );
+
+    let dir = fake.path("child");
+    fs::create_dir_all(&dir).expect("child directory");
+    let out = dir.join("argv.txt");
+    let child = launch_child(&dir, &out);
+    let request = launch_request(
+        "wA:p1",
+        &child,
+        &LAUNCH_ARGV,
+        "0f8fad5b-d9cb-469f-a165-70867728950e",
+    );
+
+    assert_eq!(
+        runtime.launch(&request, &cancel()),
+        LaunchOutcome::Completed
+    );
+
+    let requests = seen.lock().expect("recorder").clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a launch is one request, so an accepted line cannot lose its Enter: {requests:?}"
+    );
+    let sent: serde_json::Value = serde_json::from_str(&requests[0]).expect("decode the request");
+    assert_eq!(sent["method"], "pane.send_input");
+    assert_eq!(sent["params"]["pane_id"], "wA:p1");
+    assert_eq!(sent["params"]["keys"], serde_json::json!(["enter"]));
+    let line = sent["params"]["text"]
+        .as_str()
+        .expect("the typed line is text")
+        .to_string();
+    // The measured rule: every element single-quoted, on one line, with the
+    // token exported to the child by the same line.
+    assert_eq!(
+        line,
+        format!(
+            "PI_RADAR_SPAWN_TOKEN='0f8fad5b-d9cb-469f-a165-70867728950e' '{}' \
+             'a b' 'sq'\\''uote' '$(echo INJECTED)' 'semi;echo SPLIT' 'star*glob' \
+             'model=omniroute/coder-high'",
+            child.display()
+        )
+    );
+    assert!(!line.contains('\n'), "a launch types one line: {line:?}");
+
+    // The oracle for the paraphrase: a shell reading that line must produce the
+    // resolved argv byte-exact, which is what the pane's own shell has to do.
+    let shell = Command::new("sh")
+        .arg("-c")
+        .arg(&line)
+        .status()
+        .expect("run the typed line in a shell");
+    assert!(shell.success(), "the typed line did not run: {line}");
+    let expected = format!(
+        "TOKEN={}\n{}COUNT={}\n",
+        request.spawn_token,
+        request
+            .argv
+            .iter()
+            .map(|argument| format!("ARG[{argument}]\n"))
+            .collect::<String>(),
+        request.argv.len()
+    );
+    assert_eq!(
+        fs::read_to_string(&out).expect("the child recorded its argv"),
+        expected,
+        "the pane shell must yield the resolved argv unchanged"
+    );
+}
+
+#[test]
+fn a_launch_whose_argv_holds_a_newline_is_refused_before_any_pane_input() {
+    let _serial = serial();
+    let fake = status_fake();
+    let seen = answering_stub_at(&fake.path("herdr.sock"), &[]);
+    let runtime = fake.runtime(Duration::from_secs(2));
+    let child = fake.path("child");
+    let request = launch_request("wA:p1", &child, &["first\nsecond"], "token");
+
+    let LaunchOutcome::Refused(message) = runtime.launch(&request, &cancel()) else {
+        panic!("a multi-line command has no fallback and must be refused")
+    };
+    assert!(message.contains("newline"), "{message}");
+    assert!(
+        seen.lock().expect("recorder").is_empty(),
+        "a refused launch may not touch the pane"
+    );
+
+    // The single-line command is the whole supported surface, and it still runs.
+    let request = launch_request("wA:p1", &child, &["line"], "token");
+    assert_eq!(
+        runtime.launch(&request, &cancel()),
+        LaunchOutcome::Completed
+    );
+}
+
+#[test]
+fn a_launch_that_may_have_been_dispatched_without_an_answer_is_unknown() {
+    let _serial = serial();
+    let fake = status_fake();
+    let _ = stub_server_at(&fake.path("herdr.sock"), None);
+    let runtime = fake.runtime(Duration::from_millis(300));
+    let request = launch_request("wA:p1", &fake.path("child"), &[], "token");
+    let LaunchOutcome::Unknown(message) = runtime.launch(&request, &cancel()) else {
+        panic!("a lost socket reply cannot prove the command was not typed")
+    };
+    assert!(message.contains("timed out"), "{message}");
+}
+
+#[test]
+fn a_launch_the_backend_refuses_reports_its_refusal() {
+    let _serial = serial();
+    let fake = status_fake();
+    let _ = stub_server_at(
+        &fake.path("herdr.sock"),
+        Some(
+            r#"{"id":"radar:pane.send_input","error":{"code":"pane_not_found","message":"pane wA:p1 not found"}}"#,
+        ),
+    );
+    let runtime = fake.runtime(Duration::from_secs(5));
+    let request = launch_request("wA:p1", &fake.path("child"), &[], "token");
+    let LaunchOutcome::Refused(message) = runtime.launch(&request, &cancel()) else {
+        panic!("a socket error answer is a known rejection")
+    };
+    assert!(message.contains("pane wA:p1 not found"), "{message}");
+}
+
+/// The adapter against the operator's live Herdr, gated on `RADAR_HERDR_SMOKE=1`
+/// because it creates a real tab in the first workspace and closes it again.
+/// The stub tests above pin the wire form; this is the check that a real pane
+/// shell — this machine's login shell, not `sh` — runs the typed line and
+/// yields the resolved argv byte-exact.
+#[test]
+fn a_real_herdr_launch_runs_the_resolved_command_in_its_pane() {
+    if std::env::var("RADAR_HERDR_SMOKE").as_deref() != Ok("1") {
+        eprintln!("skipped: set RADAR_HERDR_SMOKE=1 to launch in a real disposable Herdr tab");
+        return;
+    }
+    let _serial = serial();
+    let runtime = HerdrRuntime::new(HerdrConfig {
+        executable: PathBuf::from("herdr"),
+        command_timeout: Duration::from_secs(10),
+    });
+    let workspace = runtime
+        .inventory(&cancel())
+        .expect("a live Herdr answers its snapshot")
+        .workspaces
+        .first()
+        .expect("a live Herdr has a workspace")
+        .workspace_id
+        .clone();
+    let CreateOutcome::Completed(created) = runtime.create(
+        &CreateRequest::Tab {
+            workspace_id: workspace,
+            focus: false,
+        },
+        &cancel(),
+    ) else {
+        panic!("the disposable tab was not created")
+    };
+    let tab = created.tab_id.clone().expect("the tab was named");
+    let pane = created.pane_id.clone().expect("its pane was named");
+
+    let dir = std::env::temp_dir().join(format!("radar-herdr-smoke-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("smoke directory");
+    let out = dir.join("argv.txt");
+    let child = launch_child(&dir, &out);
+    let token = random_uuid();
+    let request = launch_request(&pane, &child, &LAUNCH_ARGV, &token);
+
+    let launched = runtime.launch(&request, &cancel());
+    let arrived = wait_for_file(&out, Duration::from_secs(15));
+    let closed = runtime.close(&CloseTarget::Tab(tab), &cancel());
+
+    assert_eq!(launched, LaunchOutcome::Completed);
+    assert!(
+        closed.is_ok(),
+        "the disposable tab was left behind: {closed:?}"
+    );
+    assert!(arrived, "the launched child wrote nothing");
+    let expected = format!(
+        "TOKEN={token}\n{}COUNT={}\n",
+        request
+            .argv
+            .iter()
+            .map(|argument| format!("ARG[{argument}]\n"))
+            .collect::<String>(),
+        request.argv.len()
+    );
+    assert_eq!(
+        fs::read_to_string(&out).expect("the child recorded its argv"),
+        expected,
+        "the pane shell must yield the resolved argv unchanged"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }

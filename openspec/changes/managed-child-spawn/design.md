@@ -51,15 +51,17 @@ children.
 
 Herdr cannot start an arbitrary command: `agent start --kind pi` picks from
 Herdr's own table, so the resolved child command reaches the pane as typed
-input under the quoting rules ADR 0029 measured (single-quoted argv on one
-line; a newline forces a private launch script typed as a path). This
-deliberately reopens the earlier "no launching through terminal input"
-exclusion for exactly the create-and-launch step, because the alternative is
-that the daemon cannot create children at all.
+input under ADR 0029's measured quoting rules (single-quoted argv on one line).
+A newline-containing argument is refused before input: the measured private
+script fallback cannot safely be cleaned up because the daemon cannot know when
+the pane shell has read it, and indefinite scripts or a TTL that can delete an
+unread script are not acceptable. Supporting that shape needs an adapter-owned
+bounded consumption acknowledgment.
 
-The exclusion stays for everything else: no stop, resume or restart through
-input, and a backend that does not declare `launch` refuses `spawn` before
-dispatch, consistent with the existing capability rule. A future tmux backend
+This deliberately reopens the earlier "no launching through terminal input"
+exclusion for exactly the create-and-launch step. The exclusion stays for
+everything else: no stop, resume or restart through input, and a backend that
+does not declare `launch` refuses `spawn` before dispatch. A future tmux backend
 may implement `launch` without typing.
 
 ### 4. Partial effects are separate outcomes
@@ -97,8 +99,11 @@ topology until Herdsman routes spawning through the daemon.
 1. Spawn edge records and token binding (1.x), then the backend `launch`
    capability (2.x), then the `spawn` operation and reads (3.x), then the
    independent gate (4.x).
-2. Herdsman routes child creation through `spawn` only when `launch` and
-   `spawn` are advertised, and keeps today's path otherwise; both paths
-   produce the same child registration, so nothing downstream changes.
+2. A consumer first checks daemon protocol compatibility and the required
+   `creation` and `launch` capabilities. Method names are versioned by the
+   compatible protocol rather than enumerated in `ping`; after preflight the
+   consumer may call `spawn`, but it must not fall back after an unknown or
+   uncertain effectful result. Herdsman keeps today's path until it adopts the
+   daemon operation explicitly.
 3. Rollback: stop calling `spawn`; existing records stay readable, and today's
    Herdsman path still works because nothing about it was removed.

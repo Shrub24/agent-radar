@@ -32,20 +32,26 @@ use serde_json::json;
 use crate::control_plane::ops::{self, Method};
 use crate::control_plane::protocol::{self, Code, PROTOCOL_VERSION, Refusal, Request, Response};
 use crate::control_plane::registry::{
-    self, AcquireRequest, Channel, LocalProcfsVerifier, ProcessVerifier, RegistrationRequest,
-    Registry,
+    self, AcquireRequest, Channel, LocalProcfsVerifier, LocationEvidence, ProcessVerifier,
+    RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
 };
 use crate::control_plane::store::{self, Category, RequestOutcome, RequestRecord, Store};
 use crate::lifecycle::{self, CloseRequest, DirectClose};
+use crate::model::FleetObservation;
 use crate::runtime::{
-    CreateOutcome, CreateRequest, FocusOutcome, InputOutcome, InputPayload, InputRequest,
-    OutputOutcome, OutputRead, OutputRequest, ReportOutcome, ReportRequest, RuntimeProvider,
-    Target,
+    CreateOutcome, CreateRequest, CreatedKind, CreatedLocation, FocusOutcome, InputOutcome,
+    InputPayload, InputRequest, LaunchOutcome, LaunchRequest, OutputOutcome, OutputRead,
+    OutputRequest, ReportOutcome, ReportRequest, RuntimeProvider, SplitDirection, Target,
+    validate_command,
 };
 use crate::{HerdrConfig, HerdrRuntime};
 
 /// The socket file's name inside the directory the daemon owns.
 const SOCKET_NAME: &str = "control.sock";
+
+/// The word the daemon reports for the mux backend it was given: what liveness
+/// answers, and what a spawn edge records as the backend of the pane it created.
+const WIRED_BACKEND: &str = "runtime";
 
 /// How many connections are served at once. A connection beyond this is closed
 /// rather than queued, so a client that opens sockets in a loop cannot grow the
@@ -64,10 +70,16 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// caller names no limit.
 const MAX_LISTED: usize = 200;
 const DEFAULT_LISTED: usize = 50;
-/// The registry returns at most this many entries in one page.
-const MAX_AGENT_PAGE: usize = registry::MAX_LISTED;
+/// The registry returns at most this many records in one page, agents and spawn
+/// edges alike.
+const MAX_REGISTRY_PAGE: usize = registry::MAX_LISTED;
 /// Keep response payloads below the protocol line limit, including JSON framing.
-const MAX_AGENT_RESPONSE_BYTES: usize = protocol::MAX_LINE_BYTES - 1024;
+///
+/// A page holds at most [`MAX_REGISTRY_PAGE`] records of a few kilobytes each, so
+/// no page reaches this bound today. It stays as the protocol's own limit, where
+/// a field allowed to grow past its current bound would otherwise push one page
+/// past what a client can read in a single line.
+const MAX_LIST_RESPONSE_BYTES: usize = protocol::MAX_LINE_BYTES - 1024;
 /// How long a socket worker may wait for injected process verification. The
 /// local procfs verifier answers in microseconds; the bound is for an injected
 /// or unresponsive source, and a verification that misses it is `unavailable`.
@@ -695,7 +707,7 @@ fn handle_line(
             let (backend, mut capabilities) = {
                 let core = locked(core);
                 match &core.backend {
-                    Some(backend) => ("runtime", backend.capabilities().to_vec()),
+                    Some(backend) => (WIRED_BACKEND, backend.capabilities().to_vec()),
                     None => ("none", Vec::new()),
                 }
             };
@@ -744,6 +756,21 @@ struct AgentRetireParams {
     agent_id: String,
     channel: Channel,
     writer_handle: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnGetParams {
+    request_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnListParams {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// Process evidence as a client reads it: whether an identity was claimed, and,
@@ -845,6 +872,50 @@ fn process_evidence(
     ProcessEvidence {
         claimed: registration.request.process.is_some(),
         verification,
+    }
+}
+
+/// What the backend reports right now, or `None` when it could not be asked.
+///
+/// A topology read is answered from the daemon's own records whether or not a
+/// backend can be consulted, so a backend that is missing, unobservable, failing
+/// or stopping leaves a recorded location unconfirmed instead of refusing the
+/// read. One observation serves one answer, and the call runs outside every
+/// registry lock because it reaches the runtime.
+fn observed_inventory(core: &Arc<Mutex<Core>>) -> Option<FleetObservation> {
+    let (backend, cancel) = {
+        let core = locked(core);
+        (core.backend.clone(), Arc::clone(&core.stopping))
+    };
+    let backend = backend?;
+    // The same capability the wire `observe` read needs: a backend that cannot
+    // answer that read cannot confirm a location here either.
+    if capabilities_refuse(&backend, "observe").is_some() || cancel.load(Ordering::SeqCst) {
+        return None;
+    }
+    match backend.inventory(&cancel) {
+        Ok(inventory) if !cancel.load(Ordering::SeqCst) => Some(inventory),
+        _ => None,
+    }
+}
+
+/// What one read's observation says about a recorded location.
+///
+/// A pane's absence is evidence about a pane, never about the process that ran
+/// in it, and an edge that recorded no pane has nothing to check — so the read
+/// reports the disagreement, or its lack of confirmation, and claims nothing
+/// else.
+fn location_evidence(inventory: Option<&FleetObservation>, edge: &SpawnEdge) -> LocationEvidence {
+    let recorded = edge
+        .location
+        .as_ref()
+        .and_then(|location| location.pane.as_deref());
+    match (inventory, recorded) {
+        (Some(inventory), Some(pane)) if inventory.pane(pane).is_some() => {
+            LocationEvidence::Present
+        }
+        (Some(_), Some(_)) => LocationEvidence::Absent,
+        _ => LocationEvidence::Unavailable,
     }
 }
 
@@ -1001,12 +1072,12 @@ fn registry_request(
                         &Refusal::new(Code::BadParams, "`limit` must be positive"),
                     );
                 }
-                Some(limit) if limit > MAX_AGENT_PAGE => {
+                Some(limit) if limit > MAX_REGISTRY_PAGE => {
                     return Response::refused(
                         &request.id,
                         &Refusal::new(
                             Code::BadParams,
-                            format!("`limit` must be at most {MAX_AGENT_PAGE}"),
+                            format!("`limit` must be at most {MAX_REGISTRY_PAGE}"),
                         ),
                     );
                 }
@@ -1020,7 +1091,7 @@ fn registry_request(
                     Arc::clone(&core.stopping),
                 )
             };
-            let limit = params.limit.unwrap_or(50).min(MAX_AGENT_PAGE);
+            let limit = params.limit.unwrap_or(50).min(MAX_REGISTRY_PAGE);
             // One page reads its registry entries once, then verifies each with a
             // single shared deadline so a page of blocked verifiers cannot hold
             // the worker, or the shutdown that joins it, without bound.
@@ -1068,7 +1139,7 @@ fn registry_request(
                     "context": context,
                 });
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
-                if used + size > MAX_AGENT_RESPONSE_BYTES {
+                if used + size > MAX_LIST_RESPONSE_BYTES {
                     if entries.is_empty() {
                         return Response::refused(
                             &request.id,
@@ -1095,9 +1166,104 @@ fn registry_request(
             });
             Response::ok(&request.id, json!({"agents": entries, "next": next}))
         }
+        "spawn.get" => {
+            let params: SpawnGetParams = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let stored = {
+                let core = locked(core);
+                match core.registry.spawn_edge(&params.request_id) {
+                    Ok(Some(edge)) => edge,
+                    Ok(None) => {
+                        return Response::refused(
+                            &request.id,
+                            &Refusal::new(Code::NotFound, "spawn edge is not recorded"),
+                        );
+                    }
+                    Err(error) => return registry_error(request, error),
+                }
+            };
+            // The observation is external evidence, so it runs outside every
+            // registry lock, like the process verification `agent.get` does.
+            let inventory = observed_inventory(core);
+            let evidence = location_evidence(inventory.as_ref(), &stored);
+            Response::ok(&request.id, json!({"spawn": stored.topology(evidence)}))
+        }
+        "spawn.list" => {
+            let params: SpawnListParams = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            match params.limit {
+                Some(0) => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(Code::BadParams, "`limit` must be positive"),
+                    );
+                }
+                Some(limit) if limit > MAX_REGISTRY_PAGE => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(
+                            Code::BadParams,
+                            format!("`limit` must be at most {MAX_REGISTRY_PAGE}"),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            let limit = params.limit.unwrap_or(50).min(MAX_REGISTRY_PAGE);
+            // One record beyond the page tells whether a continuation exists,
+            // without reading the whole topology to page a bounded answer.
+            let read = {
+                let core = locked(core);
+                match core
+                    .registry
+                    .spawn_edges_after(params.after.as_deref(), limit + 1)
+                {
+                    Ok(edges) => edges,
+                    Err(error) => return registry_error(request, error),
+                }
+            };
+            let has_more = read.len() > limit;
+            let candidates: Vec<_> = read.into_iter().take(limit).collect();
+            // One observation serves the whole page: the backend is asked once,
+            // however many edges the page holds.
+            let inventory = observed_inventory(core);
+            let mut edges = Vec::new();
+            let mut used = 0usize;
+            for edge in &candidates {
+                let entry = json!(edge.topology(location_evidence(inventory.as_ref(), edge)));
+                let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
+                if used + size > MAX_LIST_RESPONSE_BYTES {
+                    if edges.is_empty() {
+                        return Response::refused(
+                            &request.id,
+                            &Refusal::new(
+                                Code::Refused,
+                                "one spawn edge exceeds the topology response byte bound",
+                            ),
+                        );
+                    }
+                    break;
+                }
+                used += size;
+                edges.push(entry);
+            }
+            // The continuation follows the last key actually returned, so a page
+            // cut short by the byte bound resumes without skipping an edge.
+            let next = (edges.len() < candidates.len() || has_more).then(|| {
+                edges.last().expect("a continuation has a returned edge")["request_id"]
+                    .as_str()
+                    .expect("a public request id")
+                    .to_owned()
+            });
+            Response::ok(&request.id, json!({"spawns": edges, "next": next}))
+        }
         _ => Response::refused(
             &request.id,
-            &Refusal::new(Code::UnknownMethod, "unknown agent registry method"),
+            &Refusal::new(Code::UnknownMethod, "unknown registry method"),
         ),
     }
 }
@@ -1413,6 +1579,7 @@ fn execute(operation: ops::Operation, request: &Request, core: &Arc<Mutex<Core>>
         ops::Operation::Create => execute_create(request, core),
         ops::Operation::Input => execute_input(request, core),
         ops::Operation::Report => execute_report(request, core),
+        ops::Operation::Spawn => execute_spawn(request, core),
     }
 }
 
@@ -1489,7 +1656,7 @@ fn admit(
         let backend = core.backend.clone();
         let capable = backend
             .as_ref()
-            .is_some_and(|backend| backend.capabilities().contains(&operation.capability()));
+            .is_some_and(|backend| operation.ready_for(backend.capabilities()).is_ok());
         // Only a request that will be dispatched is recorded as started: an
         // operation this backend cannot serve leaves no claim that it ran.
         if held.is_none() && capable {
@@ -1551,10 +1718,10 @@ fn admit(
     }
     match backend {
         None => Admission::Unsupported(operation.unavailable_message()),
-        Some(backend) if !backend.capabilities().contains(&operation.capability()) => {
-            Admission::Unsupported(operation.unsupported_message())
-        }
-        Some(backend) => Admission::Dispatch(backend, cancel),
+        Some(backend) => match operation.ready_for(backend.capabilities()) {
+            Ok(()) => Admission::Dispatch(backend, cancel),
+            Err(message) => Admission::Unsupported(message),
+        },
     }
 }
 
@@ -1996,6 +2163,338 @@ fn execute_report(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
         ),
     };
     write_settled(request, done, core)
+}
+
+/// The wire shape of one spawn request: the parent runtime subject, and the
+/// command the caller resolved for the child.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnParams {
+    parent: String,
+    executable: String,
+    #[serde(default)]
+    argv: Vec<String>,
+}
+
+/// Validates, records and dispatches one managed child spawn.
+///
+/// One operation, and four durable facts in order: the intent with its private
+/// token, the pane under the parent's own registered pane, the command typed
+/// into it, and the request's record. Each is written before the next is
+/// attempted, so a spawn that stops half-way leaves what it established readable
+/// rather than an unattributable pane; nothing is cleaned up on a later failure,
+/// because an operator can see and close a pane and cannot see one deleted
+/// silently. No assignment fact and no process lifecycle is touched: creating a
+/// child says nothing about keeping it alive.
+fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
+    let frozen = match frozen_params(request) {
+        Ok(frozen) => frozen,
+        Err(response) => return response,
+    };
+    let params: SpawnParams = match serde_json::from_value(frozen) {
+        Ok(params) => params,
+        Err(error) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BadParams,
+                    format!("`request` is not a spawn request: {error}"),
+                ),
+            );
+        }
+    };
+    // The command and the parent are validated at the wire boundary, before
+    // anything is recorded: a request this seam cannot carry creates no pane.
+    if let Err(message) = validate_command(&params.executable, &params.argv) {
+        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+    }
+    let intent = registry::SpawnRequest {
+        request_id: request.id.clone(),
+        parent: params.parent.clone(),
+    };
+    if let Err(message) = intent.validate() {
+        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+    }
+    // The child is created beside the pane its parent registered: a spawn never
+    // lands wherever the multiplexer happens to have focus, and a parent with no
+    // recorded pane is refused rather than guessed from a title or a label.
+    let parent_pane = {
+        let core = locked(core);
+        let parent = match core.registry.get(&params.parent) {
+            Ok(Some(parent)) => parent,
+            Ok(None) => {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(
+                        Code::NotFound,
+                        format!("parent {} is not a registered agent", params.parent),
+                    ),
+                );
+            }
+            Err(error) => {
+                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+            }
+        };
+        match parent
+            .request
+            .location
+            .as_ref()
+            .and_then(|location| location.pane.clone())
+        {
+            Some(pane) => pane,
+            None => {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(
+                        Code::Refused,
+                        format!(
+                            "parent {} names no pane to create the child under",
+                            params.parent
+                        ),
+                    ),
+                );
+            }
+        }
+    };
+    let requester = match request.optional_string("requester") {
+        Ok(requester) => requester,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let now = store::now_ms();
+    let operation = ops::Operation::Spawn;
+    let (backend, cancel) = match admit(
+        operation,
+        request,
+        Some(&parent_pane),
+        &requester,
+        now,
+        core,
+    ) {
+        Admission::Answered(response) => return spawn_answer(request, response, core),
+        Admission::Unsupported(message) => {
+            return execute_unsupported(operation, request, &message, Some(parent_pane), core);
+        }
+        Admission::Dispatch(backend, cancel) => (backend, cancel),
+    };
+    let record = RequestRecord::new(
+        &request.id,
+        operation.as_str(),
+        requester,
+        Some(parent_pane.clone()),
+        now,
+    )
+    .with_params(request.params.clone());
+    // The intent, its parent and the token the child will present are durable
+    // before the first effect: a spawn that dies here leaves a readable intent,
+    // not nothing to reconcile.
+    if let Err(message) = locked(core).registry.record_spawn(&intent, now) {
+        let settled = record.complete(
+            RequestOutcome::Refused,
+            None,
+            Some(&message),
+            Vec::new(),
+            store::now_ms(),
+        );
+        let _ = write_settled(request, settled, core);
+        return Response::refused(&request.id, &Refusal::new(Code::Refused, message));
+    }
+    // The pane is a split of the parent's own pane, unfocused: a child is
+    // created where its parent is, and creating one must not move the operator's
+    // cursor.
+    let created = backend.create(
+        &CreateRequest::PaneSplit {
+            pane_id: parent_pane,
+            direction: SplitDirection::Right,
+            focus: false,
+        },
+        &cancel,
+    );
+    let (created_outcome, named, created_message) = match &created {
+        CreateOutcome::Completed(named) => (
+            RequestOutcome::Completed,
+            Some(named),
+            named.is_empty().then(|| {
+                "the runtime confirmed the creation without naming what it created".to_string()
+            }),
+        ),
+        CreateOutcome::Refused(message) => (RequestOutcome::Refused, None, Some(message.clone())),
+        CreateOutcome::Unknown(message) => (RequestOutcome::Unknown, None, Some(message.clone())),
+    };
+    let location = named
+        .filter(|named| !named.is_empty())
+        .map(created_location);
+    let mut effects = named.map(CreatedLocation::effects).unwrap_or_default();
+    let pane = named.and_then(|named| named.identity(CreatedKind::Pane));
+    // The create is recorded before the launch is attempted: a confirmed pane is
+    // readable even when the launch never answers.
+    let written =
+        locked(core)
+            .registry
+            .record_spawn_created(&request.id, created_outcome, location.clone());
+    let edge = match written {
+        Ok(edge) => edge,
+        Err(error) => {
+            // Recording an effect is part of doing it: the launch is not
+            // attempted past a step the edge could not write, and the store
+            // record still names the pane the create confirmed, so a pane that
+            // exists is not an unattributable one.
+            let settled = record.created(pane).complete(
+                RequestOutcome::Unknown,
+                None,
+                Some(&error),
+                effects,
+                store::now_ms(),
+            );
+            let _ = write_settled(request, settled, core);
+            return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+        }
+    };
+    // A command runs only in a pane the create named: with no pane there is
+    // nothing to type into, and a launch is never claimed for a step that did not
+    // happen.
+    let launched = location
+        .as_ref()
+        .and_then(|location| location.pane.clone())
+        .map(|pane| {
+            backend.launch(
+                &LaunchRequest {
+                    pane_id: pane,
+                    executable: params.executable.clone(),
+                    argv: params.argv.clone(),
+                    spawn_token: edge.token.clone(),
+                },
+                &cancel,
+            )
+        });
+    let (launched_outcome, launch_message) = match &launched {
+        Some(LaunchOutcome::Completed) => (Some(RequestOutcome::Completed), None),
+        Some(LaunchOutcome::Refused(message)) => {
+            (Some(RequestOutcome::Refused), Some(message.clone()))
+        }
+        Some(LaunchOutcome::Unknown(message)) => {
+            (Some(RequestOutcome::Unknown), Some(message.clone()))
+        }
+        None => (None, None),
+    };
+    let edge = match launched_outcome {
+        Some(outcome) => {
+            let written = locked(core)
+                .registry
+                .record_spawn_launched(&request.id, outcome);
+            match written {
+                Ok(edge) => edge,
+                Err(error) => {
+                    let settled = record.created(pane).complete(
+                        RequestOutcome::Unknown,
+                        None,
+                        Some(&error),
+                        effects,
+                        store::now_ms(),
+                    );
+                    let _ = write_settled(request, settled, core);
+                    return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+                }
+            }
+        }
+        None => edge,
+    };
+    // The request's own outcome is the step that stopped it: completed only when
+    // everything the daemon attempted completed, and never claiming a step that
+    // did not run.
+    let (outcome, category, message) = match (created_outcome, launched_outcome) {
+        (RequestOutcome::Completed, Some(RequestOutcome::Completed)) => {
+            (RequestOutcome::Completed, None, None)
+        }
+        (RequestOutcome::Completed, Some(RequestOutcome::Refused)) => (
+            RequestOutcome::Refused,
+            Some(Category::BACKEND_REFUSED),
+            launch_message.as_deref(),
+        ),
+        // A create that named no pane left nothing to launch into.
+        (RequestOutcome::Completed, None) => (
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            created_message.as_deref(),
+        ),
+        (RequestOutcome::Completed, Some(RequestOutcome::Unknown)) => (
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            launch_message.as_deref(),
+        ),
+        (RequestOutcome::Refused, _) => (
+            RequestOutcome::Refused,
+            Some(Category::BACKEND_REFUSED),
+            created_message.as_deref(),
+        ),
+        (RequestOutcome::Unknown, _) => (
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            created_message.as_deref(),
+        ),
+    };
+    if launched_outcome == Some(RequestOutcome::Completed) {
+        effects.push("launched child".to_string());
+    }
+    let done = record
+        .created(pane)
+        .complete(outcome, category, message, effects, store::now_ms());
+    settle_spawn(request, done, &edge, core)
+}
+
+/// The location a create answered with, in the coordinates this daemon records.
+fn created_location(named: &CreatedLocation) -> RegistryLocation {
+    RegistryLocation {
+        backend: WIRED_BACKEND.to_string(),
+        instance: None,
+        workspace: named.workspace_id.clone(),
+        tab: named.tab_id.clone(),
+        pane: named.pane_id.clone(),
+    }
+}
+
+/// Writes one settled spawn and answers with both records it authored.
+///
+/// What the request did and the edge it authored are separate durable records,
+/// and the effects a caller acts on are the edge's: created, launched and bound
+/// as they stand.
+fn settle_spawn(
+    request: &Request,
+    record: RequestRecord,
+    edge: &registry::SpawnEdge,
+    core: &Arc<Mutex<Core>>,
+) -> Response {
+    let core = locked(core);
+    match core.store.write(&record) {
+        Ok(()) => Response::ok(
+            &request.id,
+            json!({ "request": record, "spawn": edge.public() }),
+        ),
+        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    }
+}
+
+/// A spawn that was already answered: its record, and the edge that request id
+/// authored.
+///
+/// A replay, an in-flight refusal and a content conflict are all answered from
+/// the records the first attempt wrote, so a caller reads the outcomes it read
+/// the first time. A response carrying no record — a refusal, a store error — is
+/// answered as itself.
+fn spawn_answer(request: &Request, response: Response, core: &Arc<Mutex<Core>>) -> Response {
+    let (id, result) = match response {
+        Response::Result { id, result } => (id, result),
+        other => return other,
+    };
+    let edge = {
+        let core = locked(core);
+        core.registry.spawn_edge(&request.id)
+    };
+    match (edge, result.get("request").cloned()) {
+        (Ok(Some(edge)), Some(record)) => {
+            Response::ok(&id, json!({ "request": record, "spawn": edge.public() }))
+        }
+        _ => Response::ok(&id, result),
+    }
 }
 
 /// Writes one settled record and answers with it.

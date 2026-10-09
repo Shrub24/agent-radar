@@ -15,6 +15,10 @@
 //! content is answered with the handle it already has, while different content
 //! under one incarnation is refused rather than silently replacing identity.
 //!
+//! A spawn edge is a third kind of record: one file per spawn, naming the parent
+//! a child was created for, the private token that binds it and each effect the
+//! daemon confirmed. Its storage lives in [`spawn`].
+//!
 //! Only the fact that a process identity was *supplied* is public here. Whether
 //! it is live is a separate answer that arrives with the process verifier; a
 //! caller's claim is never promoted to verification by being stored.
@@ -31,7 +35,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::control_plane::store::{format_millis, random_uuid};
+use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
 use crate::model::{ProcessIdentity, SessionUuid};
 
 /// The record shape this build writes and reads. A record naming another version
@@ -209,6 +213,11 @@ pub struct RegistrationRequest {
     pub process: Option<ProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchSpec>,
+    /// The private spawn correlation token the launch carried into this child.
+    /// Kept whole because it is what an identical retry is compared against;
+    /// never in any public projection or refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_token: Option<String>,
 }
 
 /// Decodes a claimed process identity strictly.
@@ -268,6 +277,11 @@ impl RegistrationRequest {
         }
         if let Some(launch) = &self.launch {
             launch.validate()?;
+        }
+        if let Some(token) = &self.spawn_token
+            && SessionUuid::parse(token).is_none()
+        {
+            return Err("`spawn_token` must be a canonical UUID".to_string());
         }
         Ok(())
     }
@@ -358,7 +372,7 @@ pub struct PublicLaunch {
 #[derive(Debug)]
 pub struct Registry {
     directory: PathBuf,
-    /// Root that owns both identity and publication records.
+    /// Root that owns the identity, publication and spawn-edge records.
     root: PathBuf,
     /// When this registry began serving: the process instant every freshness
     /// decision is relative to. A record received before this time is restored,
@@ -381,6 +395,9 @@ pub mod process;
 /// Publication channels live alongside the registry; the details live in
 /// [`publication`].
 pub mod publication;
+/// Durable spawn edges: the parent, the private token and the effects they
+/// recorded. The details live in [`spawn`].
+pub mod spawn;
 
 pub use context::{
     AcceptedContext, CONTEXT_VERSION, ContextRequest, ContextValue, ContextWrite,
@@ -395,10 +412,14 @@ pub use publication::{
     PUBLICATION_VERSION, PublicChannel, PublicChannelFacts, PublicSnapshot, PublicSnapshotFacts,
     PublicWriter, PublicWriterFacts, PublishRequest, PublisherIdentity, Snapshot, WriterBinding,
 };
+pub use spawn::{
+    BoundChild, LocationEvidence, MAX_SPAWN_BYTES, PublicSpawnEdge, PublicSpawnTopology,
+    SPAWN_VERSION, SpawnBindRequest, SpawnEdge, SpawnRequest, SpawnState,
+};
 
 impl Registry {
-    /// Opens the registry under `root`, creating `root` and its `agents` and
-    /// `publications` directories if they are missing.
+    /// Opens the registry under `root`, creating `root` and its `agents`,
+    /// `publications` and `spawns` directories if they are missing.
     ///
     /// The directory must be a real `0700` directory of this user. A registration
     /// names publisher incarnations and holds the private launch information
@@ -424,6 +445,8 @@ impl Registry {
         prepare_directory(&directory)?;
         let publications = root.join(publication::PUBLICATIONS);
         prepare_directory(&publications)?;
+        let spawns = root.join(spawn::SPAWNS);
+        prepare_directory(&spawns)?;
         Ok(Self {
             directory,
             root: root.to_path_buf(),
@@ -441,6 +464,60 @@ impl Registry {
     /// The `publications` directory.
     pub fn publications(&self) -> PathBuf {
         self.root.join(publication::PUBLICATIONS)
+    }
+
+    /// The `spawns` directory.
+    pub fn spawns(&self) -> PathBuf {
+        self.root.join(spawn::SPAWNS)
+    }
+
+    /// Records one spawn edge for a caller, minting its private token, or
+    /// answers with the edge this request id already has.
+    pub fn record_spawn(&self, request: &SpawnRequest, now_ms: i64) -> Result<SpawnEdge, String> {
+        spawn::record(self, request, now_ms)
+    }
+
+    /// One recorded spawn edge by its request id, token included. The token is a
+    /// credential: what a client may read is [`SpawnEdge::public`].
+    pub fn spawn_edge(&self, request_id: &str) -> Result<Option<SpawnEdge>, String> {
+        spawn::edge(self, request_id)
+    }
+
+    /// One page of spawn edges in stable request-id order, at most `limit` of
+    /// them, starting after `after`. Each token is included: what a client may
+    /// read is [`SpawnEdge::topology`].
+    pub fn spawn_edges_after(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SpawnEdge>, String> {
+        spawn::list_after(self, after, limit)
+    }
+
+    /// Records what one spawn's create did, and where, before its launch is
+    /// attempted.
+    pub fn record_spawn_created(
+        &self,
+        request_id: &str,
+        created: RequestOutcome,
+        location: Option<RegistryLocation>,
+    ) -> Result<SpawnEdge, String> {
+        spawn::record_created(self, request_id, created, location)
+    }
+
+    /// Records what one spawn's launch did.
+    pub fn record_spawn_launched(
+        &self,
+        request_id: &str,
+        launched: RequestOutcome,
+    ) -> Result<SpawnEdge, String> {
+        spawn::record_launched(self, request_id, launched)
+    }
+
+    /// Binds the edge a spawn token minted to the child that presented it,
+    /// spending the token.
+    pub fn bind_spawn(&self, request: &SpawnBindRequest, now_ms: i64) -> Result<SpawnEdge, String> {
+        spawn::bind(self, request, now_ms)
     }
 
     /// The opaque serving epoch of this registry instance.
@@ -607,9 +684,17 @@ impl Registry {
     /// has.
     ///
     /// The same source incarnation asking again with identical content is the
-    /// same registration and returns its existing handle. Different content under
-    /// one incarnation is refused: identity is not silently replaced. A different
-    /// incarnation always registers, even when it shares a session UUID.
+    /// same registration and returns its existing handle — before any token is
+    /// spent, so a retried registration answers with its handle rather than a
+    /// spent-token refusal. Different content under one incarnation is refused:
+    /// identity is not silently replaced. A different incarnation always
+    /// registers, even when it shares a session UUID.
+    ///
+    /// A registration may carry the private spawn token its launch put in its
+    /// environment. A token binds one pending edge to this exact
+    /// `(source, incarnation)` and is spent by that bind: nothing about a pane
+    /// — its title, alias, label, position or session — is consulted. The token
+    /// never appears in a public read or a refusal.
     ///
     /// Admission is serialized inside this `Registry`, so callers racing on one
     /// incarnation converge on one record. See [`Registry::admission`].
@@ -622,6 +707,7 @@ impl Registry {
         let _transition = self.transition();
         if let Some(existing) = self.find_incarnation(&request.source, &request.incarnation)? {
             if existing.request == *request {
+                spawn::heal_binding(self, request, now_ms)?;
                 return Ok(existing);
             }
             return Err(format!(
@@ -636,6 +722,10 @@ impl Registry {
             request: request.clone(),
         };
         self.create(&registration)?;
+        if let Err(error) = spawn::bind_presented_token(self, request, now_ms) {
+            let _ = fs::remove_file(self.path(&registration.agent_id));
+            return Err(error);
+        }
         Ok(registration)
     }
 
@@ -893,6 +983,7 @@ mod tests {
             location: None,
             process: None,
             launch: None,
+            spawn_token: None,
         }
     }
 

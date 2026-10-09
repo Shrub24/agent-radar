@@ -961,6 +961,7 @@ mod tests {
             location: None,
             process: None,
             launch: None,
+            spawn_token: None,
         }
     }
 

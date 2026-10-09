@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import signal
 import subprocess
@@ -36,7 +37,8 @@ def fixture_pairs():
     pairs = list(zip(rows[::2], rows[1::2]))
     expected = ["agent.register", "agent.acquire", "agent.publish",
                 "agent.context", "agent.context", "agent.context", "agent.context",
-                "agent.get", "agent.list", "agent.context", "agent.retire"]
+                "agent.get", "agent.list", "agent.context", "agent.retire",
+                "spawn", "agent.register", "spawn.get", "spawn.list", "spawn"]
     actual = []
     for request, response in pairs:
         check(request["kind"] == "request" and response["kind"] == "response",
@@ -52,7 +54,7 @@ def fixture_pairs():
 
 
 def validate_fixture(path):
-    """Run fixture requests and compare stable response schema/content live."""
+    """Run registry exchanges and compare stable response schema/content live."""
     pairs = fixture_pairs()
     ids, handles, agent_id = {}, {}, None
     previous_context = None
@@ -60,7 +62,11 @@ def validate_fixture(path):
                         if request["method"] == "agent.get")
     for request, response in pairs:
         method = request["method"]
+        if method in ("spawn", "spawn.get", "spawn.list"):
+            continue
         params = json.loads(json.dumps(request["params"]))
+        if method == "agent.register" and "spawn_token" in params:
+            continue
         if method in ("agent.acquire", "agent.publish", "agent.context", "agent.get", "agent.retire"):
             params["agent_id"] = agent_id
         if method == "agent.publish":
@@ -77,6 +83,8 @@ def validate_fixture(path):
         actual = call(path, method, params)
         expected = json.loads(json.dumps(response["result"]))
         if method == "agent.register":
+            if "spawn_token" in params:
+                continue
             agent_id = actual["registration"]["agent_id"]
             expected["registration"]["agent_id"] = agent_id
             expected["registration"]["registered_at"] = actual["registration"]["registered_at"]
@@ -154,11 +162,16 @@ def validate_fixture(path):
         check(actual == expected,
               f"fixture {method} differs from served response:\nactual={actual}\nexpected={expected}")
     check(agent_id is not None, "fixture did not register an agent")
+    # The scripted-backend sequence below validates spawn wire shapes end to end.
 
 
-def spawn_daemon(binary, socket_path, state_path):
+def spawn_daemon(binary, socket_path, state_path, herdr_fake=None):
     env = {**os.environ, "RADAR_CONTROL_SOCKET": str(socket_path),
            "RADAR_CONTROL_STATE": str(state_path)}
+    if herdr_fake is not None:
+        env["PATH"] = f"{herdr_fake.parent}:{os.environ['PATH']}"
+        env["RADAR_SPAWN_FAKE_STATE"] = str(herdr_fake.parent / "fake-state")
+        env["RADAR_HERDR_FAKE_SOCKET"] = str(herdr_fake.parent / "fake-state" / "herdr.sock")
     child = subprocess.Popen([str(binary), "daemon"], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=env)
     deadline = time.monotonic() + 5
@@ -194,6 +207,69 @@ def stop_daemon(child):
 
 def get_agent(path, agent_id):
     return call(path, "agent.get", {"agent_id": agent_id})["agent"]
+
+
+def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend):
+    fake_bin = root / "fake-bin"
+    fake_state = fake_bin / "fake-state"
+    fake_state.mkdir(parents=True)
+    fake = fake_bin / "herdr"
+    fake.write_text(fake_backend)
+    fake.chmod(0o755)
+    server = subprocess.Popen([sys.executable, str(fake), "__serve"], env={**os.environ,
+                                 "RADAR_SPAWN_FAKE_STATE": str(fake_state),
+                                 "RADAR_HERDR_FAKE_SOCKET": str(fake_state / "herdr.sock")})
+    deadline = time.monotonic() + 3
+    while not (fake_state / "herdr.sock").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    daemon = spawn_daemon(binary, socket_path, state_path, fake)
+    try:
+        ping = call(socket_path, "ping", {})
+        check(ping["protocol"] == 1, str(ping))
+        check({"creation", "launch"}.issubset(ping["capabilities"]), str(ping))
+        parent = call(socket_path, "agent.register", {
+            "source": "fixture-parent", "incarnation": "11111111-1111-4111-8111-111111111111",
+            "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
+        })["registration"]["agent_id"]
+        spawn_id = "56565656-5656-4656-8656-565656565656"
+        response = call(socket_path, "spawn", {"request": {"parent": parent,
+                            "executable": "/usr/bin/pi", "argv": ["--child", "row one"]},
+                            "requester": "herdsman"})
+        edge = response["spawn"]
+        check(response["request"]["outcome"] == "completed", str(response))
+        check(edge["created"] == "completed" and edge["launched"] == "completed", str(edge))
+        check("bound" not in edge and "token" not in json.dumps(response), "spawn response leaked token")
+        private_edge = next((state_path / "spawns").glob("*.json"))
+        private_token = json.loads(private_edge.read_text())["token"]
+        check(private_token, "edge did not persist token")
+        launch = json.loads((fake_state / "launch.json").read_text())
+        check(launch["token"] == private_token, "launched environment token differs from edge token")
+        child = call(socket_path, "agent.register", {
+            "source": "fixture-child", "incarnation": "34343434-3434-4343-8343-343434343434",
+            "location": {"backend": "runtime", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p2"},
+            "spawn_token": private_token,
+        })["registration"]
+        check("spawn_token" not in json.dumps(child), "registration response leaked token")
+        get = call(socket_path, "spawn.get", {"request_id": edge["request_id"]})["spawn"]
+        check(get["state"] == "bound" and get["bound"]["incarnation"] == child["incarnation"], str(get))
+        check(get["freshness"] == "fresh" and "token" not in json.dumps(get), str(get))
+        listed = call(socket_path, "spawn.list", {"limit": 10})
+        check(listed["spawns"] == [get] and listed["next"] is None, str(listed))
+        public = json.dumps([response, child, get, listed])
+        check(private_token not in public, "token leaked through a public spawn projection")
+        # A second registration with the consumed token refuses rather than rebinding.
+        try:
+            call(socket_path, "agent.register", {
+                "source": "fixture-other-child", "incarnation": "44444444-4444-4444-8444-444444444444",
+                "spawn_token": private_token,
+            })
+            raise AssertionError("spent token bound twice")
+        except publisher.RegistryError as error:
+            check(error.code == "refused", str(error))
+    finally:
+        stop_daemon(daemon)
+        server.terminate()
+        server.wait(timeout=2)
 
 
 def main():
@@ -330,12 +406,14 @@ def main():
                 "agent_id": agent_id, "channel": "assignment", "writer_handle": binding["handle"],
             })["channel"]
             check(retired["writer"]["retired_at"] is not None, str(retired))
-            print("PASS: live fixture response schemas; trusted disposable daemon; "
-                  "register/acquire/publish/context/get/list/retire; session switch and explicit null; "
-                  "credential and launch privacy; replay/heartbeat; expiry replacement; "
-                  "old-writer fencing; restart freshness; no Herdr")
+            print("PASS: live registry fixture; trusted disposable daemon; register/acquire/publish/context/get/list/retire; "
+                  "session switch/null; privacy; replay/heartbeat; replacement/fencing; restart freshness")
         finally:
             stop_daemon(daemon)
+        spawn_socket, spawn_state = root / "spawn.sock", root / "spawn-state"
+        validate_spawn_scripted(binary, spawn_socket, spawn_state, root,
+                                (ROOT / "tests/fixtures/fake-herdr.py").read_text())
+        print("PASS: scripted Herdr spawn; child token binding; spawn.get/list freshness and redaction")
 
 
 if __name__ == "__main__":

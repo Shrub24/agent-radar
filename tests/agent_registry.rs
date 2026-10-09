@@ -7,7 +7,10 @@
 //! identity is durable, that the same retry is answered with the same handle
 //! while conflicting content is refused, that a second incarnation sharing a
 //! session stays its own record, and that private launch information reaches no
-//! public read. Every root is temporary and removed on the way out.
+//! public read. Spawn edges are exercised the same way: a request id is durable
+//! and idempotent, a token binds once and reaches no public read, and a record
+//! that is not whole fails explicitly. Every root is temporary and removed on the
+//! way out.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -16,15 +19,16 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use agent_radar::control_plane::random_uuid;
 use agent_radar::control_plane::registry::{
     AcquireRequest, Channel, ContextRequest, ContextValue, ExpectedWriter, Freshness,
-    LaunchSession, LaunchSpec, LocalProcfsVerifier, MAX_CONTEXT_BYTES, MAX_LISTED,
-    MAX_REGISTRATION_BYTES, MAX_TEXT_BYTES, Outcome, ProcessVerification, ProcessVerifier,
-    PublicChannel, PublicContext, PublishRequest, PublisherIdentity, RegistrationRequest, Registry,
-    RegistryLocation, Snapshot, WriterBinding,
+    LaunchSession, LaunchSpec, LocalProcfsVerifier, LocationEvidence, MAX_CONTEXT_BYTES,
+    MAX_LISTED, MAX_REGISTRATION_BYTES, MAX_SPAWN_BYTES, MAX_TEXT_BYTES, Outcome,
+    ProcessVerification, ProcessVerifier, PublicChannel, PublicContext, PublishRequest,
+    PublisherIdentity, RegistrationRequest, Registry, RegistryLocation, Snapshot, SpawnBindRequest,
+    SpawnEdge, SpawnRequest, SpawnState, WriterBinding,
 };
-use agent_radar::model::ProcessIdentity;
+use agent_radar::control_plane::{RequestOutcome, random_uuid};
+use agent_radar::model::{ProcessIdentity, SessionUuid};
 
 const INCARNATION: &str = "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22";
 const OTHER_INCARNATION: &str = "1c2d3e4f-5678-4abc-9def-0123456789ab";
@@ -42,6 +46,7 @@ fn request(incarnation: &str) -> RegistrationRequest {
         location: None,
         process: None,
         launch: None,
+        spawn_token: None,
     }
 }
 
@@ -2136,6 +2141,942 @@ fn a_restored_context_reads_stale_until_republished() {
     assert_eq!(
         context_of(&restarted, &agent_id, 4_001).context.freshness,
         Freshness::Fresh
+    );
+    drop_root(&root);
+}
+
+// --- Durable spawn edges ---------------------------------------------------------
+
+const SPAWN_REQUEST: &str = "f0e1d2c3-b4a5-4968-8778-99aabbccddee";
+const OTHER_SPAWN_REQUEST: &str = "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9";
+const CHILD_INCARNATION: &str = "9d8c7b6a-5f4e-4d3c-9b2a-1809f7e6d5c4";
+
+fn spawn_request(request_id: &str, parent: &str) -> SpawnRequest {
+    SpawnRequest {
+        request_id: request_id.into(),
+        parent: parent.into(),
+    }
+}
+
+fn spawn_bind(token: &str, source: &str, incarnation: &str) -> SpawnBindRequest {
+    SpawnBindRequest {
+        token: token.into(),
+        source: source.into(),
+        incarnation: incarnation.into(),
+    }
+}
+
+/// A registered runtime subject for a spawn to name as its parent.
+fn spawn_parent(registry: &Registry, incarnation: &str, now_ms: i64) -> String {
+    registry
+        .register(&request(incarnation), now_ms)
+        .expect("a parent registration")
+        .agent_id
+}
+
+fn spawn_path(registry: &Registry, request_id: &str) -> PathBuf {
+    registry.spawns().join(format!("{request_id}.json"))
+}
+
+fn spawn_files(registry: &Registry) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(registry.spawns())
+        .expect("a directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[test]
+fn a_recorded_spawn_edge_survives_reopening_with_its_private_token() {
+    let root = temp_root("spawn-record");
+    let recorded;
+    {
+        let registry = Registry::open_at(&root, 1_000).expect("a registry");
+        let parent = spawn_parent(&registry, INCARNATION, 1_000);
+        recorded = registry
+            .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+            .expect("a recorded edge");
+        assert_eq!(recorded.parent, parent);
+    }
+
+    // The intent is durable before anything is created, and it is the record
+    // itself that survives the daemon that wrote it.
+    let reopened = Registry::open_at(&root, 3_000).expect("a reopening");
+    let restored = reopened
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(restored, recorded);
+    assert_eq!(restored.version, 1);
+    assert_eq!(restored.recorded_at, format_millis(2_000));
+    assert!(
+        SessionUuid::parse(&restored.token).is_some(),
+        "a minted token is a canonical UUID: {}",
+        restored.token
+    );
+
+    // Nothing is claimed about the effects that have not happened, and there is
+    // no created location to report before a create answered.
+    assert_eq!(restored.created, RequestOutcome::Unknown);
+    assert_eq!(restored.launched, RequestOutcome::Unknown);
+    assert!(restored.bound.is_none());
+    assert!(restored.location.is_none());
+
+    // The record is private and holds the token the public projection leaves out.
+    let path = spawn_path(&reopened, SPAWN_REQUEST);
+    assert_eq!(
+        fs::metadata(&path).expect("a record").permissions().mode() & 0o777,
+        0o600,
+        "a spawn edge is private"
+    );
+    let on_disk = fs::read_to_string(&path).expect("a read");
+    assert!(on_disk.contains(&restored.token), "{on_disk}");
+
+    // An unrecorded request id is an absence, not an error.
+    assert!(
+        reopened
+            .spawn_edge(OTHER_SPAWN_REQUEST)
+            .expect("a read")
+            .is_none()
+    );
+    drop_root(&root);
+}
+
+#[test]
+fn a_replayed_spawn_request_id_performs_no_second_effect() {
+    let root = temp_root("spawn-replay");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let first = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+    let stored = fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read");
+
+    // The same request id with the same parent is answered from the record: one
+    // edge, one token, and nothing rewritten however much later it arrives.
+    let replay = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 9_000)
+        .expect("a replay");
+    assert_eq!(replay, first);
+    assert_eq!(replay.recorded_at, format_millis(2_000));
+    assert_eq!(
+        fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read"),
+        stored
+    );
+    assert_eq!(spawn_files(&registry).len(), 1, "a replay writes nothing");
+
+    // A request id that names another parent is refused, and the recorded edge
+    // keeps the parent it was created for.
+    let other_parent = spawn_parent(&registry, OTHER_INCARNATION, 1_001);
+    let error = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &other_parent), 9_001)
+        .expect_err("a refusal");
+    assert!(error.contains("already names another parent"), "{error}");
+    assert_eq!(
+        fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read"),
+        stored
+    );
+
+    // Once the edge has effects, a replay answers with what it recorded.
+    let bound = registry
+        .bind_spawn(
+            &spawn_bind(&first.token, "herdsman", CHILD_INCARNATION),
+            3_000,
+        )
+        .expect("a bind");
+    let replay = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 9_002)
+        .expect("a replay");
+    assert_eq!(replay, bound);
+    assert_eq!(
+        replay.bound.expect("a bound child").incarnation,
+        CHILD_INCARNATION
+    );
+
+    // A different request id is a different edge with its own token.
+    let second = registry
+        .record_spawn(&spawn_request(OTHER_SPAWN_REQUEST, &parent), 2_001)
+        .expect("a second record");
+    assert_ne!(second.token, first.token, "each edge mints its own token");
+    assert_eq!(spawn_files(&registry).len(), 2);
+    drop_root(&root);
+}
+
+#[test]
+fn a_spawn_token_binds_one_child_and_is_then_spent() {
+    let root = temp_root("spawn-bind");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+
+    let bound = registry
+        .bind_spawn(
+            &spawn_bind(&edge.token, "herdsman", CHILD_INCARNATION),
+            3_000,
+        )
+        .expect("a bind");
+    let child = bound.bound.clone().expect("a bound child");
+    assert_eq!(child.source, "herdsman");
+    assert_eq!(child.incarnation, CHILD_INCARNATION);
+    assert_eq!(child.bound_at, format_millis(3_000));
+    assert_eq!(
+        bound.token, edge.token,
+        "binding does not re-mint the token"
+    );
+    assert_eq!(bound.parent, edge.parent);
+    assert_eq!(
+        bound.created,
+        RequestOutcome::Unknown,
+        "a bind claims no create"
+    );
+    assert_eq!(
+        bound.launched,
+        RequestOutcome::Unknown,
+        "a bind claims no launch"
+    );
+
+    // The binding is the edge's own state, not a second record beside it, and it
+    // survives reopening.
+    assert_eq!(spawn_files(&registry).len(), 1);
+    let reopened = Registry::open_at(&root, 3_001).expect("a reopening");
+    assert_eq!(
+        reopened
+            .spawn_edge(SPAWN_REQUEST)
+            .expect("a read")
+            .expect("the edge"),
+        bound
+    );
+    let stored = fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read");
+
+    // A spent token binds no second child: not another incarnation, and not the
+    // child it already bound.
+    for incarnation in [OTHER_INCARNATION, CHILD_INCARNATION] {
+        let error = registry
+            .bind_spawn(&spawn_bind(&edge.token, "herdsman", incarnation), 4_000)
+            .expect_err("a spent token");
+        assert!(error.contains("spent"), "{error}");
+        assert_eq!(
+            fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read"),
+            stored
+        );
+    }
+    drop_root(&root);
+}
+
+#[test]
+fn a_malformed_or_unminted_spawn_token_binds_nothing() {
+    let root = temp_root("spawn-token");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+    let stored = fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read");
+
+    // A token that is not a canonical UUID is refused before any record is read:
+    // a token is a key, and a key never becomes a path.
+    for malformed in ["not-a-token", "../../spawns/../agents", &edge.token[..35]] {
+        let error = registry
+            .bind_spawn(&spawn_bind(malformed, "herdsman", INCARNATION), 3_000)
+            .expect_err("a refusal");
+        assert!(error.contains("must be a canonical UUID"), "{error}");
+    }
+
+    // A well-formed token this daemon never minted binds nothing either.
+    let error = registry
+        .bind_spawn(&spawn_bind(&random_uuid(), "herdsman", INCARNATION), 3_000)
+        .expect_err("a refusal");
+    assert!(
+        error.contains("no recorded spawn edge was minted with this token"),
+        "{error}"
+    );
+
+    // Nothing bound and nothing changed.
+    assert_eq!(
+        fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read"),
+        stored
+    );
+    assert!(
+        registry
+            .spawn_edge(SPAWN_REQUEST)
+            .expect("a read")
+            .expect("the edge")
+            .bound
+            .is_none()
+    );
+
+    // The read side validates its key the same way.
+    let error = registry.spawn_edge("../../agents").expect_err("a refusal");
+    assert!(error.contains("must be a canonical UUID"), "{error}");
+    drop_root(&root);
+}
+
+#[test]
+fn a_spawn_token_never_reaches_a_public_read() {
+    let root = temp_root("spawn-private");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+
+    // A pending edge reads as a parent with no child and no token.
+    let pending = edge.public();
+    assert_eq!(pending.request_id, SPAWN_REQUEST);
+    assert_eq!(pending.parent, parent);
+    assert!(pending.bound.is_none());
+    let json = serde_json::to_string(&pending).expect("an encoding");
+    assert!(
+        !json.contains(&edge.token),
+        "a public read leaked the token: {json}"
+    );
+    assert!(
+        !json.contains("token"),
+        "no public field carries it: {json}"
+    );
+
+    // The bound child is public; the token that bound it is not.
+    let bound = registry
+        .bind_spawn(
+            &spawn_bind(&edge.token, "herdsman", CHILD_INCARNATION),
+            3_000,
+        )
+        .expect("a bind");
+    let json = serde_json::to_string(&bound.public()).expect("an encoding");
+    assert!(json.contains(CHILD_INCARNATION), "{json}");
+    assert!(
+        !json.contains(&edge.token),
+        "a public read leaked the token: {json}"
+    );
+    assert!(
+        !json.contains("token"),
+        "no public field carries it: {json}"
+    );
+
+    // A refusal is public too, and it does not echo the token it refused.
+    let error = registry
+        .bind_spawn(
+            &spawn_bind(&edge.token, "herdsman", OTHER_INCARNATION),
+            3_001,
+        )
+        .expect_err("a refusal");
+    assert!(!error.contains(&edge.token), "{error}");
+    drop_root(&root);
+}
+
+#[test]
+fn a_spawn_edge_that_is_not_a_whole_record_fails_explicitly() {
+    let root = temp_root("spawn-partial");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+    let path = spawn_path(&registry, SPAWN_REQUEST);
+    let whole = fs::read(&path).expect("a read");
+
+    // A write that did not complete leaves a partial file. Reading it fails: it
+    // is never an edge with no parent, no token and no effects.
+    fs::write(&path, &whole[..whole.len() / 2]).expect("a planted partial record");
+    let error = registry.spawn_edge(SPAWN_REQUEST).expect_err("a refusal");
+    assert!(error.contains("not a spawn edge"), "{error}");
+
+    // A record of another version is refused rather than read as this one.
+    let mut foreign: serde_json::Value = serde_json::from_slice(&whole).expect("a decoding");
+    foreign["version"] = serde_json::json!(2);
+    fs::write(&path, serde_json::to_vec(&foreign).expect("an encoding")).expect("a write");
+    let error = registry.spawn_edge(SPAWN_REQUEST).expect_err("a refusal");
+    assert!(error.contains("is not served"), "{error}");
+
+    // A record whose id is not its filename is refused.
+    fs::write(spawn_path(&registry, OTHER_SPAWN_REQUEST), &whole).expect("a copy");
+    let error = registry
+        .spawn_edge(OTHER_SPAWN_REQUEST)
+        .expect_err("a refusal");
+    assert!(error.contains("does not match its filename"), "{error}");
+
+    // A planted record naming a malformed token is refused as well: it is not a
+    // record this daemon will bind anything to.
+    let mut garbled: serde_json::Value = serde_json::from_slice(&whole).expect("a decoding");
+    garbled["token"] = serde_json::json!("not-a-token");
+    fs::write(&path, serde_json::to_vec(&garbled).expect("an encoding")).expect("a write");
+    let error = registry.spawn_edge(SPAWN_REQUEST).expect_err("a refusal");
+    assert!(error.contains("malformed token"), "{error}");
+    drop_root(&root);
+}
+
+#[test]
+fn a_symlinked_or_oversized_spawn_edge_is_not_read() {
+    let root = temp_root("spawn-shape");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let elsewhere = temp_root("spawn-shape-target");
+    let target = elsewhere.join("real.json");
+    fs::write(&target, b"{}").expect("a file");
+    symlink(&target, spawn_path(&registry, SPAWN_REQUEST)).expect("a symlink");
+
+    let error = registry.spawn_edge(SPAWN_REQUEST).expect_err("a refusal");
+    assert!(error.contains("not a regular file"), "{error}");
+    fs::remove_file(spawn_path(&registry, SPAWN_REQUEST)).expect("a removal");
+
+    // A planted file larger than the record bound fails before being read whole.
+    fs::write(
+        spawn_path(&registry, OTHER_SPAWN_REQUEST),
+        vec![b'x'; MAX_SPAWN_BYTES + 1],
+    )
+    .expect("a planted file");
+    let error = registry
+        .spawn_edge(OTHER_SPAWN_REQUEST)
+        .expect_err("a refusal");
+    assert!(error.contains("exceeds"), "{error}");
+    drop_root(&root);
+    drop_root(&elsewhere);
+}
+
+#[test]
+fn a_spawn_request_naming_an_unknown_parent_is_refused_before_any_write() {
+    let root = temp_root("spawn-parent");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+
+    let error = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &random_uuid()), 2_000)
+        .expect_err("a refusal");
+    assert!(error.contains("is not a registered agent"), "{error}");
+    assert!(
+        spawn_files(&registry).is_empty(),
+        "nothing may be written for a refused request"
+    );
+
+    // A parent that is not a canonical UUID cannot name a record either.
+    let error = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, "wA:p1"), 2_000)
+        .expect_err("a refusal");
+    assert!(error.contains("must be a canonical UUID"), "{error}");
+    assert!(spawn_files(&registry).is_empty());
+
+    // A registered parent names the edge, and the edge is written under the
+    // request id it was recorded with.
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a recorded edge");
+    assert_eq!(
+        spawn_files(&registry),
+        vec![spawn_path(&registry, SPAWN_REQUEST)]
+    );
+    drop_root(&root);
+}
+
+// --- Registration binds its pending spawn edge through its token ------------
+
+#[test]
+fn a_registration_with_its_spawn_token_binds_the_pending_edge_once() {
+    let root = temp_root("spawn-register-bind");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+
+    let mut child = request(CHILD_INCARNATION);
+    child.spawn_token = Some(edge.token.clone());
+    let registered = registry
+        .register(&child, 3_000)
+        .expect("a registration carrying its token");
+
+    // The edge binds the registering incarnation itself: its exact source and
+    // incarnation, under the token only the daemon minted for the launch.
+    let bound = registry
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("a read")
+        .expect("the edge");
+    let named = bound.bound.as_ref().expect("a bound child");
+    assert_eq!(named.source, child.source);
+    assert_eq!(named.incarnation, CHILD_INCARNATION);
+    assert_eq!(bound.parent, parent);
+    assert_eq!(bound.token, edge.token, "binding spends, never re-mints");
+
+    // The token is spent: a second registration presenting it is refused, and
+    // the refused write leaves no registration behind and changes no edge.
+    let mut impostor = request(OTHER_INCARNATION);
+    impostor.spawn_token = Some(edge.token.clone());
+    let refusal = registry
+        .register(&impostor, 4_000)
+        .expect_err("a spent token");
+    assert!(refusal.contains("spent"), "{refusal}");
+    assert!(!refusal.contains(&edge.token), "{refusal}");
+    assert_eq!(
+        registry
+            .spawn_edge(SPAWN_REQUEST)
+            .expect("a read")
+            .expect("the edge"),
+        bound,
+        "a spent token changes nothing"
+    );
+    assert_eq!(
+        registry.list(MAX_LISTED).expect("a list").len(),
+        2,
+        "the refused write left no registration behind"
+    );
+
+    // The token the launch carried stays in the private record but reaches no
+    // public read: neither the registering agent's own projection nor a list.
+    let stored = registry
+        .get(&registered.agent_id)
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(
+        stored.request.spawn_token.as_deref(),
+        Some(edge.token.as_str())
+    );
+    let path = files(&registry)
+        .into_iter()
+        .find(|path| path.file_stem().unwrap() == registered.agent_id.as_str())
+        .expect("the registration file");
+    let on_disk = fs::read_to_string(&path).expect("a read");
+    assert!(on_disk.contains(&edge.token), "{on_disk}");
+    let json = serde_json::to_string(&registered.public()).expect("an encoding");
+    assert!(!json.contains(&edge.token), "{json}");
+    assert!(!json.contains("spawn_token"), "{json}");
+    let listed: Vec<_> = registry
+        .list(MAX_LISTED)
+        .expect("a list")
+        .iter()
+        .map(|record| record.public())
+        .collect();
+    let json = serde_json::to_string(&listed).expect("an encoding");
+    assert!(!json.contains(&edge.token), "{json}");
+
+    // An identical retry is answered with its own handle, not a spent-token
+    // refusal: registration replays before the token is ever spent.
+    let again = registry.register(&child, 5_000).expect("a retry");
+    assert_eq!(again.agent_id, registered.agent_id);
+    assert_eq!(again.registered_at, registered.registered_at);
+    drop_root(&root);
+}
+
+#[test]
+fn a_registration_reaching_a_spent_edge_it_already_bound_is_answered_not_refused() {
+    let root = temp_root("spawn-register-heal");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+
+    // The bind wrote before the answer was lost: a registration with the token
+    // on disk and an edge already bound to exactly this child.
+    let mut child = request(CHILD_INCARNATION);
+    child.spawn_token = Some(edge.token.clone());
+    let agent_id = random_uuid();
+    let written = serde_json::json!({
+        "version": 1,
+        "agent_id": agent_id,
+        "registered_at": format_millis(2_500),
+        "request": child,
+    });
+    fs::write(
+        registry.directory().join(format!("{agent_id}.json")),
+        serde_json::to_vec(&written).expect("an encoding"),
+    )
+    .expect("the registration write");
+    registry
+        .bind_spawn(
+            &spawn_bind(&edge.token, &child.source, CHILD_INCARNATION),
+            2_600,
+        )
+        .expect("the earlier bind");
+
+    // Registering again with the same request finds the record and its own
+    // binding: answered, not refused, and the edge names no other child.
+    let again = registry.register(&child, 3_000).expect("a retry");
+    assert_eq!(again.agent_id, agent_id);
+    let restored = registry
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("a read")
+        .expect("the edge");
+    let named = restored.bound.as_ref().expect("a bound child");
+    assert_eq!(named.source, child.source);
+    assert_eq!(named.incarnation, CHILD_INCARNATION);
+    drop_root(&root);
+}
+
+#[test]
+fn a_registration_refused_for_its_token_binds_nothing_and_registers_nothing() {
+    let root = temp_root("spawn-register-refuse");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+    let stored = fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read");
+
+    // A token that is not a canonical UUID is refused before anything is
+    // written: a token is a key, and a key never becomes a path or a record.
+    let mut malformed = request(CHILD_INCARNATION);
+    malformed.spawn_token = Some("not-a-token".into());
+    let refusal = registry
+        .register(&malformed, 3_000)
+        .expect_err("a malformed token");
+    assert!(refusal.contains("canonical UUID"), "{refusal}");
+    assert!(
+        !refusal.contains("not-a-token") || refusal.contains("canonical UUID"),
+        "{refusal}"
+    );
+
+    // A well-formed token this daemon never minted is refused as unminted, and
+    // the registration the daemon had already written for it is rolled back.
+    let minted_never = random_uuid();
+    let mut unminted = request(CHILD_INCARNATION);
+    unminted.spawn_token = Some(minted_never.clone());
+    let refusal = registry
+        .register(&unminted, 3_001)
+        .expect_err("an unminted token");
+    assert!(
+        refusal.contains("no recorded spawn edge was minted with this token"),
+        "{refusal}"
+    );
+    assert!(!refusal.contains(&minted_never), "{refusal}");
+
+    assert_eq!(
+        registry.list(MAX_LISTED).expect("a list").len(),
+        1,
+        "refused tokens register nothing"
+    );
+    assert_eq!(
+        fs::read(spawn_path(&registry, SPAWN_REQUEST)).expect("a read"),
+        stored,
+        "refused tokens bind nothing"
+    );
+    assert!(
+        registry
+            .spawn_edge(SPAWN_REQUEST)
+            .expect("a read")
+            .expect("the edge")
+            .bound
+            .is_none()
+    );
+    drop_root(&root);
+}
+
+#[test]
+fn no_pane_label_or_session_can_bind_a_spawn_edge() {
+    let root = temp_root("spawn-no-appearance");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a record");
+
+    // A lookalike shares everything observable about the child's pane — its
+    // label, its session, its coordinates — but carries no token.
+    let mut lookalike = request(OTHER_INCARNATION);
+    lookalike.label = Some("worker".into());
+    lookalike.session = Some(SESSION.into());
+    lookalike.location = Some(RegistryLocation {
+        backend: "herdr".into(),
+        instance: None,
+        workspace: None,
+        tab: None,
+        pane: Some("wA:p1".into()),
+    });
+    registry
+        .register(&lookalike, 3_000)
+        .expect("a registration without the token");
+    let pending = registry
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("a read")
+        .expect("the edge");
+    assert!(
+        pending.bound.is_none(),
+        "nothing observable about a pane binds an edge"
+    );
+
+    // The child that carries the token still binds, to itself, even when the
+    // lookalike registered first.
+    let mut child = request(CHILD_INCARNATION);
+    child.label = Some("worker".into());
+    child.session = Some(SESSION.into());
+    child.spawn_token = Some(edge.token.clone());
+    registry.register(&child, 3_001).expect("a binding");
+    let bound = registry
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("a read")
+        .expect("the edge");
+    let named = bound.bound.as_ref().expect("a bound child");
+    assert_eq!(named.source, child.source);
+    assert_eq!(named.incarnation, CHILD_INCARNATION);
+    drop_root(&root);
+}
+
+#[test]
+fn a_spawn_edge_records_what_each_effect_did_in_order() {
+    let root = temp_root("spawn-effects");
+    let location = RegistryLocation {
+        backend: "runtime".into(),
+        instance: None,
+        workspace: Some("wA".into()),
+        tab: Some("wA:t1".into()),
+        pane: Some("wA:p2".into()),
+    };
+    let recorded;
+    {
+        let registry = Registry::open_at(&root, 1_000).expect("a registry");
+        let parent = spawn_parent(&registry, INCARNATION, 1_000);
+        let intent = registry
+            .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+            .expect("a recorded intent");
+
+        // The create is recorded on its own, before the launch is attempted: a
+        // pane the daemon confirmed is readable even when the launch never
+        // answers.
+        let created = registry
+            .record_spawn_created(
+                SPAWN_REQUEST,
+                RequestOutcome::Completed,
+                Some(location.clone()),
+            )
+            .expect("the created effect");
+        assert_eq!(created.created, RequestOutcome::Completed);
+        assert_eq!(created.location.as_ref(), Some(&location));
+        assert_eq!(created.parent, parent);
+        assert_eq!(created.token, intent.token, "the token is minted once");
+        assert_eq!(created.launched, RequestOutcome::Unknown);
+
+        // The launch is recorded on its own too, and recording it never revises
+        // the create that came before it.
+        let launched = registry
+            .record_spawn_launched(SPAWN_REQUEST, RequestOutcome::Unknown)
+            .expect("the launch effect");
+        assert_eq!(launched.created, RequestOutcome::Completed);
+        assert_eq!(launched.location.as_ref(), Some(&location));
+        assert_eq!(launched.launched, RequestOutcome::Unknown);
+        recorded = launched.clone();
+
+        // Recording effects does not spend the token that binds the child: the
+        // binding still lands on this edge and on no other.
+        let bound = registry
+            .bind_spawn(
+                &spawn_bind(&launched.token, "herdsman", CHILD_INCARNATION),
+                4_000,
+            )
+            .expect("a binding");
+        assert_eq!(bound.launched, RequestOutcome::Unknown);
+        assert_eq!(
+            bound.bound.as_ref().expect("a bound child").incarnation,
+            CHILD_INCARNATION
+        );
+    }
+
+    // Each effect is the daemon's own record, and the record outlives the
+    // process that wrote it.
+    let reopened = Registry::open_at(&root, 5_000).expect("a reopening");
+    let stored = reopened
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("a read")
+        .expect("the edge");
+    assert_eq!(stored.created, recorded.created);
+    assert_eq!(stored.launched, recorded.launched);
+    assert_eq!(stored.location.as_ref(), Some(&location));
+    assert_eq!(stored.token, recorded.token);
+    drop_root(&root);
+}
+
+#[test]
+fn recording_an_effect_without_a_recorded_intent_is_refused() {
+    let root = temp_root("spawn-effects-unrecorded");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let location = RegistryLocation {
+        backend: "runtime".into(),
+        instance: None,
+        workspace: None,
+        tab: None,
+        pane: Some("wA:p2".into()),
+    };
+
+    // An effect is recorded on an edge that exists: without one there is nothing
+    // to attribute it to, and minting an edge here would invent the token the
+    // child's binding depends on.
+    let unrecorded = registry
+        .record_spawn_created(SPAWN_REQUEST, RequestOutcome::Completed, Some(location))
+        .expect_err("nothing to record the effect on");
+    assert!(unrecorded.contains("has no recorded edge"), "{unrecorded}");
+    let unrecorded = registry
+        .record_spawn_launched(SPAWN_REQUEST, RequestOutcome::Completed)
+        .expect_err("nothing to record the effect on");
+    assert!(unrecorded.contains("has no recorded edge"), "{unrecorded}");
+    assert!(
+        registry
+            .spawn_edge(SPAWN_REQUEST)
+            .expect("a read")
+            .is_none()
+    );
+    assert!(
+        spawn_files(&registry).is_empty(),
+        "a refused write leaves no file"
+    );
+
+    // A request id names a file, so it is checked as a key before any path is
+    // formed from it.
+    let escaped = registry
+        .record_spawn_launched("../escape", RequestOutcome::Completed)
+        .expect_err("a key, not a path");
+    assert!(
+        escaped.contains("`request_id` must be a canonical UUID"),
+        "{escaped}"
+    );
+    drop_root(&root);
+}
+
+const FIRST_SPAWN_REQUEST: &str = "11111111-1111-4111-8111-111111111111";
+const SECOND_SPAWN_REQUEST: &str = "22222222-2222-4222-8222-222222222222";
+const THIRD_SPAWN_REQUEST: &str = "33333333-3333-4333-8333-333333333333";
+
+#[test]
+fn a_topology_read_derives_state_and_freshness_from_one_observation() {
+    let root = temp_root("spawn-topology");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let location = RegistryLocation {
+        backend: "runtime".into(),
+        instance: None,
+        workspace: Some("wA".into()),
+        tab: None,
+        pane: Some("wA:p2".into()),
+    };
+
+    // A recorded intent claims no effect and names no location, so there is
+    // nothing for a read to confirm: it reports neither location nor freshness.
+    let intent = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a recorded intent");
+    let read = intent.topology(LocationEvidence::Present);
+    assert_eq!(read.state, SpawnState::Unbound);
+    assert!(read.freshness.is_none());
+    assert!(read.edge.location.is_none());
+    assert!(read.edge.bound.is_none());
+
+    let created = registry
+        .record_spawn_created(
+            SPAWN_REQUEST,
+            RequestOutcome::Completed,
+            Some(location.clone()),
+        )
+        .expect("the created effect");
+
+    // The backend reports the recorded pane now.
+    let confirmed = created.topology(LocationEvidence::Present);
+    assert_eq!(confirmed.state, SpawnState::Unbound);
+    assert_eq!(confirmed.freshness, Some(Freshness::Fresh));
+    assert_eq!(confirmed.edge.location.as_ref(), Some(&location));
+
+    // The backend answered and the pane is not in its report: the record and the
+    // world disagree, and the recorded location is retained rather than dropped.
+    let unresolved = created.topology(LocationEvidence::Absent);
+    assert_eq!(unresolved.state, SpawnState::Unresolved);
+    assert_eq!(unresolved.freshness, Some(Freshness::Stale));
+    assert_eq!(unresolved.edge.location.as_ref(), Some(&location));
+
+    // No backend could be asked: unconfirmed, which is not evidence of absence.
+    let unconfirmed = created.topology(LocationEvidence::Unavailable);
+    assert_eq!(unconfirmed.state, SpawnState::Unbound);
+    assert_eq!(unconfirmed.freshness, Some(Freshness::Stale));
+
+    // Binding is a stored fact, so a bound child is named whatever the backend
+    // reports now; only the state of the location changes with it.
+    let bound = registry
+        .bind_spawn(
+            &spawn_bind(&created.token, "herdsman", CHILD_INCARNATION),
+            3_000,
+        )
+        .expect("a binding");
+    assert_eq!(
+        bound.topology(LocationEvidence::Present).state,
+        SpawnState::Bound
+    );
+    assert_eq!(
+        bound.topology(LocationEvidence::Unavailable).state,
+        SpawnState::Bound
+    );
+    assert_eq!(
+        bound.topology(LocationEvidence::Absent).state,
+        SpawnState::Unresolved,
+        "a vanished location outranks the binding for the state a client reads"
+    );
+    assert_eq!(
+        bound
+            .topology(LocationEvidence::Absent)
+            .edge
+            .bound
+            .as_ref()
+            .expect("a bound child")
+            .incarnation,
+        CHILD_INCARNATION,
+        "the missing pane is reported beside the child, never instead of it"
+    );
+
+    // What a client reads is a projection: the private token is in none of them.
+    for evidence in [
+        LocationEvidence::Present,
+        LocationEvidence::Absent,
+        LocationEvidence::Unavailable,
+    ] {
+        let json = serde_json::to_string(&bound.topology(evidence)).expect("an encoding");
+        assert!(!json.contains(&bound.token), "{json}");
+    }
+    drop_root(&root);
+}
+
+#[test]
+fn spawn_edges_page_in_key_order_without_repeating_one() {
+    let root = temp_root("spawn-page");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    // Recorded out of order: a page's order is the durable key's, never the order
+    // the files happened to be written or read in.
+    for request_id in [
+        SECOND_SPAWN_REQUEST,
+        THIRD_SPAWN_REQUEST,
+        FIRST_SPAWN_REQUEST,
+    ] {
+        registry
+            .record_spawn(&spawn_request(request_id, &parent), 2_000)
+            .expect("a recorded edge");
+    }
+
+    let ids = |edges: Vec<SpawnEdge>| -> Vec<String> {
+        edges.into_iter().map(|edge| edge.request_id).collect()
+    };
+    assert_eq!(
+        ids(registry.spawn_edges_after(None, 2).expect("a page")),
+        vec![FIRST_SPAWN_REQUEST, SECOND_SPAWN_REQUEST]
+    );
+    // The cursor is the last key a page returned, so the next page starts after
+    // it: no edge is served twice and none is skipped.
+    assert_eq!(
+        ids(registry
+            .spawn_edges_after(Some(SECOND_SPAWN_REQUEST), 2)
+            .expect("a page")),
+        vec![THIRD_SPAWN_REQUEST]
+    );
+    assert!(
+        registry
+            .spawn_edges_after(Some(THIRD_SPAWN_REQUEST), 2)
+            .expect("a page")
+            .is_empty()
+    );
+
+    // A cursor names a file, so it is checked as a key before anything is read
+    // under it.
+    let escaped = registry
+        .spawn_edges_after(Some("../escape"), 2)
+        .expect_err("a key, not a path");
+    assert!(
+        escaped.contains("`after` must be a canonical UUID"),
+        "{escaped}"
     );
     drop_root(&root);
 }

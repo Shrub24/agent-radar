@@ -132,9 +132,6 @@ def main() -> int:
     if args.interval <= 0:
         parser.error("--interval must be positive")
 
-    # Immutable registration identity must be persisted by a real publisher if
-    # it wants to reconnect as the same incarnation. This example keeps it
-    # stable for one process lifetime; production extension state owns it.
     incarnation = str(uuid.uuid4())
     registration = {"source": "herdsman-owner-example", "incarnation": incarnation,
                     "owner": args.owner, "label": args.label}
@@ -166,14 +163,11 @@ def main() -> int:
                               "context_session": context.get("context", {}).get("session")}),
                   flush=True)
         except RegistryError as error:
-            # A successor has fenced this incarnation. Never silently replace it.
             if error.code == "refused" and ("writer" in error.message or
                                              "incumbent" in error.message):
                 raise SystemExit(f"publisher fenced; stop and reconcile explicitly: {error}")
             raise
         except (OSError, TimeoutError, json.JSONDecodeError):
-            # Reconnect by retrying identical immutable registration and
-            # reacquiring the same current writer; no takeover is attempted.
             if args.once:
                 raise
         if args.once:

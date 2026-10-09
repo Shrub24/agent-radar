@@ -16,7 +16,13 @@ pub enum Operation {
     Create,
     Input,
     Report,
+    /// A managed child: a pane created under a named parent, and the resolved
+    /// command launched in it.
+    Spawn,
 }
+
+/// The `launch` capability required to run a resolved child command.
+pub use crate::runtime::LAUNCH_CAPABILITY;
 
 impl Operation {
     /// The operation a method name denotes, if it is one.
@@ -27,6 +33,7 @@ impl Operation {
             "create" => Self::Create,
             "input" => Self::Input,
             "report" => Self::Report,
+            "spawn" => Self::Spawn,
             _ => return None,
         })
     }
@@ -39,6 +46,7 @@ impl Operation {
             Self::Create => "create",
             Self::Input => "input",
             Self::Report => "report",
+            Self::Spawn => "spawn",
         }
     }
 
@@ -50,22 +58,39 @@ impl Operation {
             Self::Create => &["creation"],
             Self::Input => &["input"],
             Self::Report => &["reporting"],
+            // A spawn does both, so a backend that can do only one of them
+            // cannot serve it: a pane with no command in it is not a child.
+            Self::Spawn => &["creation", LAUNCH_CAPABILITY],
         }
     }
 
-    /// The backend capability this operation requires.
-    pub fn capability(self) -> &'static str {
-        self.capabilities()[0]
+    /// Whether a backend declared every capability this operation needs.
+    ///
+    /// A capability is the backend's promise that it implements that part of the
+    /// operation, not an optimistic request: [`Operation::Spawn`] needs both the
+    /// creation it is asked for and the launch that follows it. The message names
+    /// the first capability that is missing.
+    pub fn ready_for(self, capabilities: &[&str]) -> Result<(), String> {
+        self.capabilities()
+            .iter()
+            .try_for_each(|capability| Self::readiness(self.as_str(), capability, capabilities))
     }
 
-    /// The message a record carries while a backend is wired that does not
-    /// implement the capability this operation needs.
-    pub fn unsupported_message(self) -> String {
-        format!(
-            "{} needs the `{}` capability; this backend does not provide it",
-            self.as_str(),
-            self.capability()
-        )
+    /// Whether a backend declared the capability required by an operation.
+    ///
+    /// Use this before recording or dispatch.
+    pub fn readiness(
+        operation: &str,
+        capability: &str,
+        capabilities: &[&str],
+    ) -> Result<(), String> {
+        if capabilities.contains(&capability) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{operation} needs the `{capability}` capability; this backend does not provide it"
+            ))
+        }
     }
 
     /// The message a record carries while no backend is wired.
@@ -98,7 +123,8 @@ pub enum Method {
     Requests,
     /// A mux read. Served from a backend, and never recorded.
     Read,
-    /// Agent registry operations, independent of the mux backend.
+    /// Registry reads and writes: the daemon's own durable records, answered
+    /// whether or not a mux backend is wired.
     Registry,
     /// An operation, served as a durable request.
     Operation(Operation),
@@ -113,6 +139,10 @@ pub fn classify(method: &str) -> Option<Method> {
         "requests" => Method::Requests,
         "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
         | "agent.get" | "agent.list" => Method::Registry,
+        // A spawn read reports the daemon's own edge records; whether the backend
+        // still reports a recorded location changes its freshness, never whether
+        // the read is served.
+        "spawn.get" | "spawn.list" => Method::Registry,
         "observe" | "process_info" | "output" => Method::Read,
         other => Method::Operation(Operation::from_method(other)?),
     })
@@ -162,6 +192,8 @@ mod tests {
         assert_eq!(classify("request"), Some(Method::Request));
         assert_eq!(classify("requests"), Some(Method::Requests));
         assert_eq!(classify("agent.context"), Some(Method::Registry));
+        assert_eq!(classify("spawn.get"), Some(Method::Registry));
+        assert_eq!(classify("spawn.list"), Some(Method::Registry));
         assert_eq!(classify("observe"), Some(Method::Read));
         assert_eq!(classify("process_info"), Some(Method::Read));
         assert_eq!(classify("output"), Some(Method::Read));
@@ -173,6 +205,7 @@ mod tests {
             Operation::Create,
             Operation::Input,
             Operation::Report,
+            Operation::Spawn,
         ] {
             assert_eq!(
                 classify(operation.as_str()),
@@ -202,14 +235,37 @@ mod tests {
     fn a_refusal_names_the_capability_it_needs() {
         assert!(Operation::Focus.unavailable_message().contains("`focus`"));
         assert!(
-            Operation::Create
-                .unsupported_message()
-                .contains("`creation`")
+            Operation::Spawn
+                .unavailable_message()
+                .contains("`creation` and `launch`"),
+            "a spawn names everything it needs"
         );
-        assert!(
-            Operation::Report
-                .unsupported_message()
-                .contains("`reporting`")
+        assert_eq!(
+            Operation::readiness("spawn", LAUNCH_CAPABILITY, &["creation", "input"]),
+            Err("spawn needs the `launch` capability; this backend does not provide it".into())
+        );
+        assert_eq!(
+            Operation::readiness("spawn", LAUNCH_CAPABILITY, &["launch"]),
+            Ok(()),
+            "readiness is separate from implementing dispatch"
+        );
+    }
+
+    #[test]
+    fn an_operation_needs_every_capability_it_lists() {
+        let able = ["creation", "launch", "reporting"];
+        assert_eq!(Operation::Spawn.ready_for(&able), Ok(()));
+        assert!(Operation::Create.ready_for(&able).is_ok());
+        assert!(Operation::Report.ready_for(&able).is_ok());
+        assert_eq!(
+            Operation::Spawn.ready_for(&["creation", "input"]),
+            Err("spawn needs the `launch` capability; this backend does not provide it".into()),
+            "creating a pane is not launching a child"
+        );
+        assert_eq!(
+            Operation::Spawn.ready_for(&["launch"]),
+            Err("spawn needs the `creation` capability; this backend does not provide it".into()),
+            "launching is not creating the pane a child runs in"
         );
     }
 }

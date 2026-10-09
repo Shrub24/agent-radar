@@ -12,11 +12,12 @@ exercised against a disposable daemon by
 [`tests/agent_publisher.py`](../tests/agent_publisher.py). The fixture uses
 `<daemon-time>`, `<daemon-time-plus-1s>`, `<daemon-time-plus-30s>`,
 `<opaque-uuid>`, `<replacement-opaque-uuid>` and `<replay-warning>`
-placeholders for generated values. Fixture validation replays every request
+placeholders for generated values. Fixture validation replays registry exchanges
 against a disposable daemon and compares each response against its template,
-substituting only those generated values and the clock-derived fields the daemon
-computes at read time; no exchange is compared partially while the rest of the
-template goes unchecked. The `agent.list` entry is a shape reference, compared
+substituting only generated and clock-derived fields. The final spawn exchanges
+use a disposable scripted Herdr socket; those validate the served daemon's
+operation, token binding and public redaction without a live mux or partial
+whole-object comparison. The `agent.list` entry is a shape reference, compared
 against the validated `agent.get` template. `agent.get` and `agent.list`
 differ intentionally: writer-facing channel/context replies return the writer
 binding to the publisher, whereas public get/list facts omit writer handles (and
@@ -31,7 +32,9 @@ perform no lifecycle controls.
 The registry is backend-independent. It holds agent identity separately from
 mux inventory and durable mutation records, and mutable channels and current
 session context separately from identity. Writing or publishing dispatches no
-physical control and enters no mux mutation lane.
+physical control and enters no mux mutation lane. The additive managed-spawn
+methods are described below: `spawn` is a physical operation requiring backend
+capabilities, while topology reads are registry reads.
 
 ## Registration record
 
@@ -65,7 +68,8 @@ One registration is one JSON file, `<state root>/agents/<agent_id>.json`, mode
       "session": { "uuid": null, "path": "/home/dev/.pi/sessions/…" },
       "provenance": "herdsman",
       "revision": "7"
-    }
+    },
+    "spawn_token": "<private token from PI_RADAR_SPAWN_TOKEN>"
   }
 }
 ```
@@ -75,9 +79,15 @@ incarnation define an idempotent registration; session is context, not identity,
 so duplicate attaches stay distinct. `owner`, `run`, `label`, backend-qualified
 location, claimed process identity and explicit private launch specification
 are optional facts. The public registration projection has no fields for launch
-executable, argv, cwd or session path; it exposes launch availability and
-revision only. Process identity is a strict registry-wire shape but a claim, not
-verification.
+executable, argv, cwd, session path, or `spawn_token`; it exposes launch
+availability and revision only. Process identity is a strict registry-wire
+shape but a claim, not verification. For a daemon-spawned child only, the child
+passes the exact `PI_RADAR_SPAWN_TOKEN` value as `spawn_token` in its own
+`agent.register` request. It is a private correlation credential: never place it
+in labels, aliases, publication facts, logs, or public read projections. A
+successful registration binds the edge once; a repeated presentation after
+binding is refused, except an identical retry of the same registration is
+answered as that earlier registration.
 
 Registration holds **identity and configuration only**. Mutable activity,
 waiting reason, last outcome and actions belong to publication, not to this
@@ -95,11 +105,89 @@ root are unsupported for concurrent writes.
 ## Socket methods
 
 The trusted control socket serves `agent.register`, `agent.acquire`,
-`agent.publish`, `agent.retire`, `agent.context`, `agent.get` and `agent.list`. `ping` advertises
-`agent_registry` regardless of mux backend. The methods are independent of the
-physical backend and do not call Herdr. All method parameter objects reject
-unknown fields. The exact canonical exchanges are in the JSONL fixture; field
-semantics and transitions follow.
+`agent.publish`, `agent.retire`, `agent.context`, `agent.get`, `agent.list`,
+`spawn`, `spawn.get` and `spawn.list`. `ping` advertises `agent_registry`
+regardless of mux backend. The `agent.*` methods are independent of the physical
+backend and do not call Herdr. `spawn` is different: it requires both backend
+capabilities `creation` and `launch`; `spawn.get` and `spawn.list` are registry
+reads, available with `agent_registry` even when no backend is wired. All method
+parameter objects reject unknown fields. The exact canonical exchanges are in
+the JSONL fixture; field semantics and transitions follow.
+
+### Spawn operation
+
+`spawn` is an effectful operation, not a composition of caller-issued `create`
+and `input`. It requires a compatible protocol version and both backend
+capabilities `creation` and `launch`; the daemon checks both before recording
+intent or dispatching a create. Its exact parameters are:
+
+```json
+{"request":{"parent":"<registered agent UUID>","executable":"/usr/bin/pi","argv":["--child","row one"]},"requester":"herdsman"}
+```
+
+`parent` names a registered runtime subject whose own registered location must
+name a pane. The daemon splits to the right of that pane without focusing it;
+it does not use whichever pane has current focus. The caller supplies the
+resolved executable and argv. The daemon does not resolve a command, write an
+assignment, or alter process lifecycle. The command is passed to the backend
+unchanged, alongside a daemon-minted, single-use token exported to the child as
+`PI_RADAR_SPAWN_TOKEN`. The child reads that environment value and includes it
+as `spawn_token` in its `agent.register` request. The token is private, stored
+only with the durable edge and consumed on binding; never return or publish it.
+
+A successful response carries the durable operation record beside its public
+edge projection:
+
+```json
+{"request":{"id":"<request UUID>","method":"spawn","outcome":"completed","created":{"kind":"pane","id":"wA:p2"},"effects":["created pane wA:p2","launched child"]},"spawn":{"request_id":"<request UUID>","parent":"<agent UUID>","created":"completed","launched":"completed","location":{"backend":"runtime","pane":"wA:p2"}}}
+```
+
+The example omits generated fields; use the fixture for complete shapes. The
+request record and edge distinguish `created`, `launched`, and `bound`; each is
+reported as `completed`, `refused`, or `unknown` where applicable. `bound` is
+absent until the child registers with its token. A launch refused after create
+leaves the named pane and edge; nothing is cleaned up silently. If a dispatch
+may have occurred but confirmation is lost, `launched` and the request outcome
+are `unknown`. Do not retry an uncertain spawn under another request id or fall
+back to another launch path: the pane or child may already exist. Same request
+id and identical request content only reads back the recorded outcome; changed
+content is refused. A backend missing either capability refuses before create,
+edge creation, or token minting. Herdr refuses argv containing a newline before
+pane input; no private-script fallback is implemented.
+
+### Spawn topology reads
+
+`spawn.get` takes `{"request_id":"<canonical spawn request UUID>"}` and
+returns `{"spawn": <topology>}` or `not_found`. `spawn.list` takes optional
+`{"after":"<last returned request UUID>","limit":50}`; default limit is
+50, accepted range 1–100. It returns `{"spawns":[<topology>,...],"next":null}`
+or a continuation request UUID. Resume with that `after`; ordering is lexical by
+the durable request id, not timestamp. An empty result is normal. A malformed
+stored edge fails the read rather than being silently omitted.
+
+Both topology methods require `agent_registry`, regardless of backend. For
+location verification, one `observe` inventory is consulted per response/page
+when a backend advertises `observe`; otherwise the durable topology is still
+returned with unconfirmed freshness. Edges persist across daemon restarts. The
+public topology contains parent, optional bound child `(source, incarnation)`,
+created/launched outcomes, optional created location, `state`, and
+`freshness`; it never contains the token. `state` is `unbound` without a child,
+`bound` after token binding, or `unresolved` when a recorded pane is absent from
+a successful inventory. `unresolved` takes precedence over `bound` in `state`,
+but the bound child remains present beside it. `freshness` is `fresh` only when
+the backend currently reports the recorded pane; it is `stale` when it cannot be
+confirmed or is absent, and omitted if there is no pane to verify. `stale` and
+`unresolved` describe location confirmation only, never process exit, idleness,
+completion, or permission to restart/stop/resume. The read never adopts an
+observed pane or binds a child by title, alias, label, position, or session UUID.
+
+`spawn` is a method of this protocol version, not a capability name. `ping`
+reports backend capabilities, not its full method table. A consumer should
+check protocol compatibility plus both `creation` and `launch` before attempting
+`spawn`; if the daemon answers `unknown_method`, keep the prior path. Never
+fallback after timeout, malformed reply, internal error, or any otherwise
+uncertain spawn result.
+
 ### Public discovery and pagination
 
 `agent.get` takes `{"agent_id":"<registered UUID>"}`. `agent.list` takes

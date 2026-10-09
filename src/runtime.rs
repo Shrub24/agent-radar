@@ -237,6 +237,83 @@ pub enum CreateOutcome {
     Unknown(String),
 }
 
+/// A resolved child command: an absolute executable, its argv, and the pane it
+/// runs in.
+///
+/// `spawn_token` is the private correlation token the child presents when it
+/// registers. The token travels to the child in its environment under
+/// [`LAUNCH_TOKEN_ENV`] and must never appear in an inventory, projection or
+/// diagnostic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchRequest {
+    pub pane_id: String,
+    pub executable: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    pub spawn_token: String,
+}
+
+/// Environment variable carrying [`LaunchRequest::spawn_token`] to the child.
+pub const LAUNCH_TOKEN_ENV: &str = "PI_RADAR_SPAWN_TOKEN";
+
+/// The capability a backend declares when it can run a resolved child command.
+pub const LAUNCH_CAPABILITY: &str = "launch";
+
+impl LaunchRequest {
+    /// Whether this is a command the seam can carry: a named pane, an absolute
+    /// printable executable, argv free of terminal control sequences, and a
+    /// non-empty printable token.
+    ///
+    /// A newline in argv is *not* refused here: it is ordinary text in an
+    /// argument, and whether it can be delivered is the backend's own limit
+    /// ([`RuntimeProvider::launch`]). Like input text, a control character that
+    /// a terminal would act on cannot be carried as an argument without
+    /// deciding for the caller what the terminal does with it, so it is refused.
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_location_identifier(&self.pane_id) {
+            return Err("`pane_id` is not a valid pane identifier".to_string());
+        }
+        validate_command(&self.executable, &self.argv)?;
+        if self.spawn_token.is_empty() || self.spawn_token.chars().any(char::is_control) {
+            return Err("`spawn_token` must be non-empty printable text".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Whether a command a caller resolved is one this seam can carry: an absolute
+/// printable executable, and argv free of terminal control sequences other than
+/// a newline, which is ordinary argument text.
+///
+/// The wire boundary and the launch it becomes share these rules, so a command a
+/// caller may ask for is exactly a command this seam accepts. What a *backend*
+/// can deliver is a separate limit, stated by that backend's own `launch`.
+pub fn validate_command(executable: &str, argv: &[String]) -> Result<(), String> {
+    if !executable.starts_with('/') || executable.chars().any(char::is_control) {
+        return Err("`executable` must be an absolute printable path".to_string());
+    }
+    if argv.iter().any(|argument| {
+        argument
+            .chars()
+            .any(|character| character.is_control() && character != '\n')
+    }) {
+        return Err("`argv` cannot contain terminal control characters".to_string());
+    }
+    Ok(())
+}
+
+/// The certainty of one launch attempt at the runtime boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchOutcome {
+    /// The backend confirmed the command was handed to the pane.
+    Completed,
+    /// The backend positively rejected the request before handing it over.
+    Refused(String),
+    /// The command may have reached the pane, but no trustworthy answer
+    /// arrived: a caller must not launch again on the assumption it did not run.
+    Unknown(String),
+}
+
 /// What a pane is asked to receive.
 ///
 /// Literal text and named keys never travel together, so "write these bytes"
@@ -792,6 +869,24 @@ pub trait RuntimeProvider: Send + Sync {
         InputOutcome::Refused("this runtime does not implement pane input".to_string())
     }
 
+    /// Runs one already-resolved child command in a pane this daemon created.
+    ///
+    /// The request has already been validated ([`LaunchRequest::validate`]), and
+    /// the command was resolved here: no shell interprets it and the adapter adds
+    /// no arguments of its own. Launch is an explicit capability, deliberately
+    /// separate from pane input: a runtime may accept both, either, or neither,
+    /// and advertising `launch` promises exactly this one create-and-run step,
+    /// never ongoing process lifecycle. Implementations report
+    /// [`LaunchOutcome::Unknown`] whenever dispatch may have happened without a
+    /// trustworthy answer, because a caller must not launch twice.
+    ///
+    /// An adapter that has to type the command into a pane shell reports
+    /// [`LaunchOutcome::Refused`] for an argv holding a newline: a multi-line
+    /// line has no consumption acknowledgement, so the daemon does not type one.
+    fn launch(&self, _request: &LaunchRequest, _cancel: &AtomicBool) -> LaunchOutcome {
+        LaunchOutcome::Refused("this runtime does not implement launch".to_string())
+    }
+
     /// Reads a bounded snapshot of one pane's output, consuming nothing.
     ///
     /// A runtime that has no non-consuming read must not advertise `output` in
@@ -850,6 +945,10 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn input(&self, request: &InputRequest, cancel: &AtomicBool) -> InputOutcome {
         (**self).input(request, cancel)
+    }
+
+    fn launch(&self, request: &LaunchRequest, cancel: &AtomicBool) -> LaunchOutcome {
+        (**self).launch(request, cancel)
     }
 
     fn output(&self, request: &OutputRequest, cancel: &AtomicBool) -> OutputOutcome {
