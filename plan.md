@@ -74,13 +74,16 @@ In priority order:
    live adoption is verified. Define exact joins, source precedence and
    retained/disconnected behavior before wiring the TUI. Preserve
    execution/assignment separation.
-3. **Daemon physical lifecycle and managed-child topology.** Extend the daemon
-   from mux wrappers to orchestration: Herdsman asks it to spawn a child subject,
-   and the daemon records the managed runtime parent/child relation plus observed
-   mux placement. Keep assignment lineage distinct from runtime creation and
-   current containment. Reconcile observations after daemon/lead restart; unknown
-   links stay unknown. This is the foundation for safe lead recovery, not restart
-   itself.
+3. **Managed child spawn (`managed-child-spawn`, drafted and strict-valid).**
+   Herdsman asks the daemon to create a child, and the daemon performs it: create
+the pane under a named parent, launch the resolved command, and record one
+durable parent/child runtime edge. The child binds through a private single-use
+spawn token carried into its launch environment and presented at registration,
+so nothing is inferred from pane titles, aliases or session UUIDs. Herdr launch
+is terminal input under the quoting rules ADR 0029 measured, behind a declared
+`launch` capability. Out of scope: stop, resume, restart, lead recovery and
+adoption of panes the daemon did not create. This is the foundation for safe
+lead recovery, not restart itself.
 4. **Lead recovery, then stale-lead restart plans.** Reconcile managed child
    topology, pending requests/asks, task results and control outcomes; confirm old
    process exit before resume. Session UUID continuity alone is not proof. Then
