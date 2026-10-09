@@ -10,9 +10,17 @@ stdlib-only reconnecting owner publisher is
 [`examples/agent-publisher/publisher.py`](../examples/agent-publisher/publisher.py),
 exercised against a disposable daemon by
 [`tests/agent_publisher.py`](../tests/agent_publisher.py). The fixture uses
-`<daemon-time>`, `<daemon-time-plus-30s>`, `<opaque-uuid>` and `<replay-warning>` placeholders for generated values; fixture
-validation executes its request shapes against the daemon and checks those
-response templates. `agent.get` and `agent.list` differ intentionally: writer-facing channel/context replies return the writer binding to the publisher, whereas public get/list facts omit writer handles (and channel accepted-snapshot handles).
+`<daemon-time>`, `<daemon-time-plus-1s>`, `<daemon-time-plus-30s>`,
+`<opaque-uuid>`, `<replacement-opaque-uuid>` and `<replay-warning>`
+placeholders for generated values. Fixture validation replays every request
+against a disposable daemon and compares each response against its template,
+substituting only those generated values and the clock-derived fields the daemon
+computes at read time; no exchange is compared partially while the rest of the
+template goes unchecked. The `agent.list` entry is a shape reference, compared
+against the validated `agent.get` template. `agent.get` and `agent.list`
+differ intentionally: writer-facing channel/context replies return the writer
+binding to the publisher, whereas public get/list facts omit writer handles (and
+channel accepted-snapshot handles).
 
 This documents the durable agent-registration records and direct publication
 channels served on the trusted control socket. They are a **foundation**: private

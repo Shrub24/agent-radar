@@ -95,21 +95,10 @@ def validate_fixture(path):
         elif method == "agent.context":
             context = actual["context"]
             expected["context"]["writer"].pop("handle", None)
-            if "replace" in params:
+            if "context" not in handles or "replace" in params:
                 handles["context"] = actual["writer"]["handle"]
-                expected["writer"]["handle"] = handles["context"]
-                expected["writer"]["generation"] = actual["writer"]["generation"]
-                expected["context"]["writer"]["source"] = params["publisher"]["source"]
-                expected["context"]["writer"]["incarnation"] = params["publisher"]["incarnation"]
-            else:
-                if "context" not in handles:
-                    handles["context"] = actual["writer"]["handle"]
-                expected["writer"]["handle"] = handles["context"]
+            expected["writer"]["handle"] = handles["context"]
             expected["context"]["agent_id"] = agent_id
-            expected["context"]["writer"]["source"] = params["publisher"]["source"]
-            expected["context"]["writer"]["incarnation"] = params["publisher"]["incarnation"]
-            expected["context"]["context"]["source"] = params["publisher"]["source"]
-            expected["context"]["context"]["incarnation"] = params["publisher"]["incarnation"]
             expected["context"]["context"]["received_at"] = context["context"]["received_at"]
             expected["context"]["context"]["expires_at"] = context["context"]["expires_at"]
             check(context["context"]["session"] == params["context"]["session"], str(context))
@@ -120,9 +109,13 @@ def validate_fixture(path):
             else:
                 check(actual["warning"] is None, str(actual))
             previous_context = json.loads(json.dumps(params))
-            check(actual["writer"]["handle"] == handles["context"], str(actual))
-            check(actual["context"]["context"]["freshness"] == "fresh", str(actual))
             check("handle" not in actual["context"]["writer"], str(actual))
+            # Compare the whole exchange so the fixture exemplar stays authoritative
+            # rather than being quietly corrected field by field.
+            check(actual["writer"] == expected["writer"],
+                  f"fixture context writer differs:\nactual={actual['writer']}\nexpected={expected['writer']}")
+            check(actual["context"] == expected["context"],
+                  f"fixture context projection differs:\nactual={actual['context']}\nexpected={expected['context']}")
             continue
         elif method == "agent.get":
             expected["agent"]["registration"]["agent_id"] = agent_id
