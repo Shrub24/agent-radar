@@ -4,7 +4,8 @@ Start here when adopting the daemon from Herdsman or another local client. This
 page describes the available surface and how its parts fit together. Exact v1
 wire schemas and bounds live in the linked references; the architecture and
 migration sequence here are a working direction, not a permanent division of
-responsibility.
+responsibility. The [mux integration contract](mux.md) describes the physical
+adapter seam, capability guarantees and second-backend boundary.
 
 ## What is available
 
@@ -20,8 +21,22 @@ backend and do not publish through Herdr. The older mux `report` method still
 forwards state/session/metadata to the backend; it is **not** direct registry
 publication.
 
-The daemon can create and launch a child through `spawn`, and records a durable
-edge to its named parent. For children bound to that edge, `child.close` can
+The daemon can create and launch a child through `spawn`, recording a durable
+edge to its named parent. Name both the exact parent agent UUID and
+`parent_session_id`; fresh context on that registration must match. A shared
+session UUID never selects among live registrations.
+
+Spawn accepts optional absolute cwd and an environment overlay, requiring the
+selected backend's `child_launch_context_v1` capability. Herdr quotes a single
+launch line and refuses unrepresentable values before creation. Public operation
+readbacks omit environment values. The child captures/removes the private
+`PI_RADAR_SPAWN_TOKEN` and registers with it; new bindings persist the returned
+`agent_id`. Read `result.spawn.bound.agent_id` from flat `spawn.get` and use that
+exact ID with `agent.get`, not aliases or a nonexistent `spawn.edge` object.
+Legacy bindings may omit the ID. New v2 edges retain process and session parent
+identities; v1 edges have no inferred session parent.
+
+For children bound to that edge, `child.close` can
 close only the edge's recorded pane after fresh occupant verification. This is
 not a process stop or assignment transition: it never claims process or
 process-group exit and never writes execution or assignment facts. The daemon
@@ -66,6 +81,7 @@ processes running as the same user. Do not expose this socket remotely.
 | Register a subject | `agent.register` | `agent_registry` |
 | Acquire or explicitly replace a channel writer | `agent.acquire` | `agent_registry` |
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `agent_registry` |
+| Update current session context | `agent.context` | `agent_registry` |
 | Public registry reads | `agent.get`, `agent.list` | `agent_registry` |
 | Spawn topology reads | `spawn.get`, `spawn.list` | `agent_registry`; location confirmation additionally uses `observe` when available |
 | Close a daemon-created child pane | `child.close` | `agent_registry` plus mux `observe` and `close` |
@@ -103,6 +119,11 @@ subject record intact, and accepted old facts retain their original provenance.
 See [registration and reconnect semantics](agent-registration.md) for details,
 including how an acquired but unreported writer is handled.
 
+Use `agent.context` for an in-process session switch/fork or explicit UUID/null
+update. It has its own fenced writer and sequence; it does not change process
+identity, launch authority or immutable registration. Never-published context and
+explicitly cleared session are distinct. No session path is published here.
+
 Public reads omit writer handles and private launch executable/argv/cwd/session
 paths. They expose launch availability/revision, publication provenance and
 freshness, and separate process verification. `fresh` does not mean alive;
@@ -112,7 +133,10 @@ evidence, not a decision that restarting is safe.
 ## Physical operation lifecycle
 
 Effectful mux requests have durable records. Keep the UUID for each operation
-and use `request`/`requests` to read it back after a lost reply. An unknown or
+and use `request`/`requests` for generic mux operation readback after a lost reply.
+For `spawn`, also read its durable edge through `spawn.get`. `child.close` has a
+separate record: repeat its identical method, UUID and params to retrieve the
+stored outcome without redispatch; generic `request`/`requests` do not index it. An unknown or
 unsettled outcome must not be retried under a new UUID or through another
 adapter. Same-ID replay retrieves the existing record rather than repeating the
 effect. Registry publication uses its own identity/sequence rules; it does not
@@ -152,7 +176,10 @@ The first port can be small:
 - Keep optional Herdr metadata mirroring only where an existing consumer needs
   it. Registry publication itself needs no Herdr commands or token parsing.
 - Route child creation through `spawn` only after `ping` confirms protocol v1
-  and both `creation` and `launch` capabilities. Those are the backend
+  and both `creation` and `launch` capabilities, plus `child_launch_context_v1`
+  when supplying cwd/environment. Capture/remove the token in the child and use
+  the returned bound `agent_id` for subsequent registry reads. Binding is not
+  application or assignment readiness. Those are the backend
   capabilities required by the operation; the method names are part of this
   protocol version and are not separately advertised in `ping`. Attempt
   `spawn` once after those checks. An `unknown_method` response means this
@@ -170,7 +197,7 @@ and the daemon supplies physical observations/controls plus opt-in managed
 spawn and verified child-pane close operations. This is the starting seam, not a
 prohibition on consolidating more lifecycle work later. Spawn creates and
 launches; registration with its token establishes the child identity. `child.close`
-closes only the verified pane, not the child process. Neither topology freshness
+closes only the verified pane; it does not certify child-process exit. Neither topology freshness
 nor a missing pane establishes process exit or authorizes lifecycle action.
 Resume, restart, recovery, and adoption of foreign panes are not provided;
 recovery of children, pending asks and results must be specified and verified

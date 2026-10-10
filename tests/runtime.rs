@@ -7,7 +7,7 @@
 //! `herdr`, so no runtime is needed and the failure boundaries are exact.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -19,14 +19,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::control_plane::{PROTOCOL_VERSION, random_uuid};
-use agent_radar::model::{ForegroundEvidence, LocalFacts};
+use agent_radar::model::{FleetObservation, ForegroundEvidence, LocalFacts};
 use agent_radar::runtime::{
     CloseOutcome, CreateOutcome, CreateRequest, LAUNCH_CAPABILITY, LAUNCH_TOKEN_ENV, LaunchOutcome,
-    LaunchRequest,
+    LaunchRequest, RuntimeProvider,
 };
-use agent_radar::{
-    CloseTarget, Daemon, FocusOutcome, HerdrConfig, HerdrRuntime, RuntimeProvider, Target,
-};
+use agent_radar::{CloseTarget, Daemon, FocusOutcome, HerdrConfig, HerdrRuntime, Target};
 
 /// A successful snapshot of one pane in one workspace, without agents.
 const SNAPSHOT_ONE_PANE: &str = r#"{"id":"cli:api:snapshot","result":{"type":"snapshot","snapshot":{"workspaces":[{"workspace_id":"wA","label":"main","number":1}],"tabs":[{"tab_id":"wA:t1","workspace_id":"wA","label":"agent tab","number":1}],"panes":[{"pane_id":"wA:p1","tab_id":"wA:t1","workspace_id":"wA"}],"agents":[]}}}"#;
@@ -1050,6 +1048,10 @@ fn launch_child(dir: &Path, out: &Path) -> PathBuf {
             r#"#!/bin/sh
 {{
   printf 'TOKEN=%s\n' "${{{}:-}}"
+  printf 'PWD=%s\n' "$PWD"
+  printf 'INHERITED=%s\n' "${{INHERITED_SENTINEL:-}}"
+  printf 'EMPTY_SET=%s EMPTY=<%s>\n' "${{EMPTY+x}}" "${{EMPTY:-}}"
+  printf 'OVERRIDE=<%s>\n' "${{OVERRIDE:-}}"
   n=0
   for a in "$@"; do
     n=$((n + 1))
@@ -1073,7 +1075,40 @@ fn launch_request(pane: &str, executable: &Path, argv: &[&str], token: &str) -> 
         executable: executable.display().to_string(),
         argv: argv.iter().map(|argument| argument.to_string()).collect(),
         spawn_token: token.to_string(),
+        cwd: None,
+        env: Default::default(),
     }
+}
+
+#[test]
+fn herdr_launch_context_is_quoted_and_preflighted_without_loss() {
+    let fake = Fake::new(|_| "exit 0".to_string());
+    let runtime = fake.runtime(Duration::from_secs(1));
+    let mut request = launch_request("p1", Path::new("/usr/bin/pi"), &["a b"], "token");
+    request.cwd = Some("/tmp/a b".into());
+    request.env = [
+        ("EMPTY".into(), String::new()),
+        ("VALUE".into(), "$(echo x)".into()),
+    ]
+    .into();
+    runtime
+        .validate_launch(&request)
+        .expect("representable launch");
+    assert!(runtime.capabilities().contains(&"child_launch_context_v1"));
+    request
+        .env
+        .insert("PI_RADAR_SPAWN_TOKEN".into(), "override".into());
+    assert!(request.validate().is_err());
+    request.env.remove("PI_RADAR_SPAWN_TOKEN");
+    request.env.insert("VALUE".into(), "line\nbreak".into());
+    assert!(runtime.validate_launch(&request).is_err());
+
+    request.env.clear();
+    request.argv = vec!["x".repeat(4096)];
+    assert!(
+        runtime.validate_launch(&request).is_err(),
+        "quoted command must fit the existing input bound"
+    );
 }
 
 /// Waits for a file a launched child wrote.
@@ -1110,12 +1145,20 @@ fn a_launch_types_one_quoted_line_the_pane_shell_yields_the_argv_from() {
     fs::create_dir_all(&dir).expect("child directory");
     let out = dir.join("argv.txt");
     let child = launch_child(&dir, &out);
-    let request = launch_request(
+    let mut request = launch_request(
         "wA:p1",
         &child,
         &LAUNCH_ARGV,
         "0f8fad5b-d9cb-469f-a165-70867728950e",
     );
+    request.cwd = Some(fake.path("work dir").display().to_string());
+    fs::create_dir_all(request.cwd.as_ref().expect("cwd")).expect("create working directory");
+    request.env = [
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("EMPTY".into(), String::new()),
+        ("OVERRIDE".into(), "overlay ' \" $() ; *".into()),
+    ]
+    .into();
 
     assert_eq!(
         runtime.launch(&request, &cancel()),
@@ -1136,16 +1179,9 @@ fn a_launch_types_one_quoted_line_the_pane_shell_yields_the_argv_from() {
         .as_str()
         .expect("the typed line is text")
         .to_string();
-    // The measured rule: every element single-quoted, on one line, with the
-    // token exported to the child by the same line.
-    assert_eq!(
-        line,
-        format!(
-            "PI_RADAR_SPAWN_TOKEN='0f8fad5b-d9cb-469f-a165-70867728950e' '{}' \
-             'a b' 'sq'\\''uote' '$(echo INJECTED)' 'semi;echo SPLIT' 'star*glob' \
-             'model=omniroute/coder-high'",
-            child.display()
-        )
+    assert!(
+        line.starts_with("cd '") && line.contains("env -u EMPTY -u OVERRIDE -u PATH"),
+        "cwd and overlay: {line}"
     );
     assert!(!line.contains('\n'), "a launch types one line: {line:?}");
 
@@ -1154,12 +1190,14 @@ fn a_launch_types_one_quoted_line_the_pane_shell_yields_the_argv_from() {
     let shell = Command::new("sh")
         .arg("-c")
         .arg(&line)
+        .env("INHERITED_SENTINEL", "inherited")
         .status()
         .expect("run the typed line in a shell");
     assert!(shell.success(), "the typed line did not run: {line}");
     let expected = format!(
-        "TOKEN={}\n{}COUNT={}\n",
+        "TOKEN={}\nPWD={}\nINHERITED=inherited\nEMPTY_SET=x EMPTY=<>\nOVERRIDE=<overlay ' \" $() ; *>\n{}COUNT={}\n",
         request.spawn_token,
+        request.cwd.as_deref().expect("cwd"),
         request
             .argv
             .iter()
@@ -1170,7 +1208,25 @@ fn a_launch_types_one_quoted_line_the_pane_shell_yields_the_argv_from() {
     assert_eq!(
         fs::read_to_string(&out).expect("the child recorded its argv"),
         expected,
-        "the pane shell must yield the resolved argv unchanged"
+        "the pane shell must preserve cwd, inherited and overlay values, and argv"
+    );
+
+    let failed_cwd = fake.path("missing cwd");
+    let marker = fake.path("must-not-run");
+    let guarded = format!(
+        "cd '{}' && touch '{}'",
+        failed_cwd.display(),
+        marker.display()
+    );
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(guarded)
+        .status()
+        .expect("run guarded cwd");
+    assert!(!status.success());
+    assert!(
+        !marker.exists(),
+        "failed cwd must prevent the following command"
     );
 }
 
@@ -1231,15 +1287,15 @@ fn a_launch_the_backend_refuses_reports_its_refusal() {
     assert!(message.contains("pane wA:p1 not found"), "{message}");
 }
 
-/// The adapter against the operator's live Herdr, gated on `RADAR_HERDR_SMOKE=1`
-/// because it creates a real tab in the first workspace and closes it again.
+/// The adapter against the configured shared Herdr server, gated on `RADAR_HERDR_SMOKE=1`.
+/// It creates and closes a nonfocused tab in the explicitly selected workspace.
 /// The stub tests above pin the wire form; this is the check that a real pane
 /// shell — this machine's login shell, not `sh` — runs the typed line and
 /// yields the resolved argv byte-exact.
 #[test]
 fn a_real_herdr_launch_runs_the_resolved_command_in_its_pane() {
     if std::env::var("RADAR_HERDR_SMOKE").as_deref() != Ok("1") {
-        eprintln!("skipped: set RADAR_HERDR_SMOKE=1 to launch in a real disposable Herdr tab");
+        eprintln!("skipped: set RADAR_HERDR_SMOKE=1 and RADAR_HERDR_SMOKE_WORKSPACE=<id>");
         return;
     }
     let _serial = serial();
@@ -1247,36 +1303,33 @@ fn a_real_herdr_launch_runs_the_resolved_command_in_its_pane() {
         executable: PathBuf::from("herdr"),
         command_timeout: Duration::from_secs(10),
     });
-    let workspace = runtime
-        .inventory(&cancel())
-        .expect("a live Herdr answers its snapshot")
-        .workspaces
-        .first()
-        .expect("a live Herdr has a workspace")
-        .workspace_id
-        .clone();
-    let CreateOutcome::Completed(created) = runtime.create(
-        &CreateRequest::Tab {
-            workspace_id: workspace,
-            focus: false,
-        },
-        &cancel(),
-    ) else {
-        panic!("the disposable tab was not created")
-    };
-    let tab = created.tab_id.clone().expect("the tab was named");
-    let pane = created.pane_id.clone().expect("its pane was named");
+    let workspace = selected_smoke_workspace();
+    let tab = create_disposable_tab(&runtime, &workspace);
+    let mut disposable = DisposableTab::new(tab.tab_id, tab.pane_id);
+    let pane = disposable.root_pane.clone();
 
     let dir = std::env::temp_dir().join(format!("radar-herdr-smoke-{}", std::process::id()));
     fs::create_dir_all(&dir).expect("smoke directory");
+    let _smoke_directory = SmokeDirectory(dir.clone());
     let out = dir.join("argv.txt");
     let child = launch_child(&dir, &out);
     let token = random_uuid();
-    let request = launch_request(&pane, &child, &LAUNCH_ARGV, &token);
+    let mut request = launch_request(&pane, &child, &LAUNCH_ARGV, &token);
+    let expected_cwd = dir.join("child cwd");
+    fs::create_dir_all(&expected_cwd).expect("create explicit launch cwd");
+    request.cwd = Some(expected_cwd.display().to_string());
+    request.env = [
+        ("EMPTY".into(), String::new()),
+        ("OVERRIDE".into(), "overlay-value".into()),
+    ]
+    .into();
 
     let launched = runtime.launch(&request, &cancel());
     let arrived = wait_for_file(&out, Duration::from_secs(15));
-    let closed = runtime.close(&CloseTarget::Tab(tab), &cancel());
+    let inventory = runtime.inventory(&cancel()).expect("containment snapshot");
+    verify_tab_containment(&inventory, &disposable.tab_id, &disposable.panes)
+        .expect("owned tab containment before cleanup");
+    let closed = disposable.close_if_contained();
 
     assert_eq!(launched, LaunchOutcome::Completed);
     assert!(
@@ -1285,7 +1338,9 @@ fn a_real_herdr_launch_runs_the_resolved_command_in_its_pane() {
     );
     assert!(arrived, "the launched child wrote nothing");
     let expected = format!(
-        "TOKEN={token}\n{}COUNT={}\n",
+        "TOKEN={token}\nPWD={}\nINHERITED={}\nEMPTY_SET=x EMPTY=<>\nOVERRIDE=<overlay-value>\n{}COUNT={}\n",
+        expected_cwd.display(),
+        std::env::var("INHERITED_SENTINEL").unwrap_or_default(),
         request
             .argv
             .iter()
@@ -1298,36 +1353,299 @@ fn a_real_herdr_launch_runs_the_resolved_command_in_its_pane() {
         expected,
         "the pane shell must yield the resolved argv unchanged"
     );
-    let _ = fs::remove_dir_all(&dir);
 }
 
-/// A tab this smoke created, closed on the way out however the run ends.
-///
-/// A live Herdr is the operator's own multiplexer, so a failed assertion must
-/// not leave a tab behind: the tab is closed by a guard rather than by the last
-/// line of a passing run. Closing the tab closes the parent pane this smoke
-/// registered and any child pane the spawn left, and nothing that was there
-/// before the run.
+/// A nonfocused tab created by this smoke in the explicitly selected workspace.
 struct DisposableTab {
-    config: HerdrConfig,
-    tab: String,
+    tab_id: String,
+    panes: std::collections::BTreeSet<String>,
+    root_pane: String,
     closed: bool,
 }
 
+struct SmokeDirectory(PathBuf);
+
+impl Drop for SmokeDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 impl DisposableTab {
-    fn close(&mut self) {
-        if !self.closed {
-            let _ = HerdrRuntime::new(self.config.clone())
-                .close(&CloseTarget::Tab(self.tab.clone()), &cancel());
-            self.closed = true;
+    fn new(tab: String, pane: String) -> Self {
+        Self {
+            tab_id: tab,
+            panes: std::collections::BTreeSet::from([pane.clone()]),
+            root_pane: pane,
+            closed: false,
         }
+    }
+
+    fn record_child_pane(&mut self, tab: &str, pane: String) {
+        assert_eq!(tab, self.tab_id, "spawned child must remain in owned tab");
+        self.panes.insert(pane);
+    }
+
+    fn pane_closed(&mut self, pane: &str) {
+        self.panes.remove(pane);
+    }
+
+    fn close_if_contained(&mut self) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        let runtime = HerdrRuntime::new(HerdrConfig {
+            executable: PathBuf::from("herdr"),
+            command_timeout: Duration::from_secs(10),
+        });
+        let inventory = runtime.inventory(&cancel())?;
+        verify_tab_containment(&inventory, &self.tab_id, &self.panes)?;
+        if !self.panes.contains(&self.root_pane) {
+            return Err("owned root pane disappeared before tab cleanup".into());
+        }
+        let output = bounded_herdr(&["tab", "close", &self.tab_id], Duration::from_secs(15))?;
+        if !output.status.success() {
+            return Err(format!(
+                "tab.close refused: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        self.closed = true;
+        Ok(())
     }
 }
 
 impl Drop for DisposableTab {
     fn drop(&mut self) {
-        self.close();
+        if !self.closed
+            && let Err(error) = self.close_if_contained()
+        {
+            eprintln!("refusing disposable workspace cleanup: {error}");
+        }
     }
+}
+
+fn bounded_herdr(args: &[&str], timeout: Duration) -> Result<std::process::Output, String> {
+    let mut child = Command::new("herdr")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run herdr: {error}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stdout)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stderr)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| "stdout reader panicked")?
+                .map_err(|e| e.to_string())?;
+            let stderr = stderr_reader
+                .join()
+                .map_err(|_| "stderr reader panicked")?
+                .map_err(|e| e.to_string())?;
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("herdr command timed out".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn selected_smoke_workspace() -> String {
+    let workspace = std::env::var("RADAR_HERDR_SMOKE_WORKSPACE")
+        .unwrap_or_else(|_| panic!("set RADAR_HERDR_SMOKE_WORKSPACE to an existing workspace ID"));
+    let runtime = HerdrRuntime::new(HerdrConfig {
+        executable: PathBuf::from("herdr"),
+        command_timeout: Duration::from_secs(10),
+    });
+    let inventory = runtime
+        .inventory(&cancel())
+        .unwrap_or_else(|error| panic!("cannot verify selected workspace {workspace}: {error}"));
+    assert_eq!(
+        inventory
+            .workspaces
+            .iter()
+            .filter(|entry| entry.workspace_id == workspace)
+            .count(),
+        1,
+        "RADAR_HERDR_SMOKE_WORKSPACE must name exactly one existing workspace"
+    );
+    workspace
+}
+
+fn create_disposable_tab(runtime: &HerdrRuntime, workspace: &str) -> DisposableTabRecord {
+    let outcome = runtime.create(
+        &CreateRequest::Tab {
+            workspace_id: workspace.to_owned(),
+            focus: false,
+        },
+        &cancel(),
+    );
+    let CreateOutcome::Completed(created) = outcome else {
+        panic!("nonfocused disposable tab creation failed: {outcome:?}");
+    };
+    DisposableTabRecord {
+        tab_id: created.tab_id.expect("tab.create returned tab ID"),
+        pane_id: created.pane_id.expect("tab.create returned root pane ID"),
+    }
+}
+
+struct DisposableTabRecord {
+    tab_id: String,
+    pane_id: String,
+}
+
+fn verify_tab_containment(
+    inventory: &FleetObservation,
+    tab_id: &str,
+    owned_panes: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    if inventory
+        .tabs
+        .iter()
+        .filter(|tab| tab.tab_id == tab_id)
+        .count()
+        != 1
+    {
+        return Err(format!("owned tab {tab_id} missing or ambiguous"));
+    }
+    let panes: std::collections::BTreeSet<_> = inventory
+        .panes
+        .iter()
+        .filter(|pane| pane.location.tab_id == tab_id)
+        .map(|pane| pane.location.pane_id.clone())
+        .collect();
+    if &panes != owned_panes {
+        return Err(format!("tab {tab_id} containment differs: panes={panes:?}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn tab_containment_ignores_other_tabs_but_refuses_foreign_panes_inside_owned_tab() {
+    let inventory = |tabs: &[(&str, &str)], panes: &[(&str, &str, &str)]| FleetObservation {
+        workspaces: vec![agent_radar::model::Workspace {
+            workspace_id: "wA".into(),
+            label: None,
+            number: None,
+        }],
+        tabs: tabs
+            .iter()
+            .map(|(id, label)| agent_radar::model::Tab {
+                tab_id: (*id).into(),
+                workspace_id: "wA".into(),
+                label: Some((*label).into()),
+                number: None,
+            })
+            .collect(),
+        panes: panes
+            .iter()
+            .map(|(id, tab, label)| agent_radar::model::Pane {
+                location: agent_radar::model::Location {
+                    workspace_id: "wA".into(),
+                    tab_id: (*tab).into(),
+                    pane_id: (*id).into(),
+                },
+                label: Some((*label).into()),
+                title: None,
+            })
+            .collect(),
+        agents: vec![],
+    };
+    let tab = "wA:t3";
+    let root_and_child = std::collections::BTreeSet::from(["wA:p4".into(), "wA:p6".into()]);
+    assert!(
+        verify_tab_containment(
+            &inventory(
+                &[("wA:t1", "main"), ("wA:t2", "anchor"), (tab, "test")],
+                &[
+                    ("wA:p1", "wA:t1", "root"),
+                    ("wA:p3", "wA:t2", "anchor"),
+                    ("wA:p4", tab, "root"),
+                    ("wA:p6", tab, "child")
+                ]
+            ),
+            tab,
+            &root_and_child
+        )
+        .is_ok()
+    );
+    let after_close = std::collections::BTreeSet::from(["wA:p4".into()]);
+    assert!(
+        verify_tab_containment(
+            &inventory(
+                &[("wA:t1", "main"), ("wA:t2", "anchor"), (tab, "test")],
+                &[
+                    ("wA:p1", "wA:t1", "root"),
+                    ("wA:p3", "wA:t2", "anchor"),
+                    ("wA:p4", tab, "root")
+                ]
+            ),
+            tab,
+            &after_close
+        )
+        .is_ok()
+    );
+    assert!(
+        verify_tab_containment(
+            &inventory(
+                &[("wA:t1", "main"), ("wA:t2", "anchor"), (tab, "test")],
+                &[
+                    ("wA:p1", "wA:t1", "root"),
+                    ("wA:p3", "wA:t2", "anchor"),
+                    ("wA:p4", tab, "root"),
+                    ("wA:p6", tab, "child"),
+                    ("wA:p7", tab, "foreign")
+                ]
+            ),
+            tab,
+            &root_and_child
+        )
+        .is_err(),
+        "foreign tabs outside the owned tab must not expand or block its containment"
+    );
+    assert!(
+        verify_tab_containment(
+            &inventory(
+                &[("wA:t1", "main"), ("wA:t2", "anchor"), (tab, "test")],
+                &[
+                    ("wA:p1", "wA:t1", "root"),
+                    ("wA:p3", "wA:t2", "anchor"),
+                    ("wA:p4", tab, "root"),
+                    ("wA:p6", tab, "child"),
+                    ("wA:p8", tab, "foreign")
+                ]
+            ),
+            tab,
+            &root_and_child
+        )
+        .is_err(),
+        "foreign pane inside the owned tab must block cleanup"
+    );
 }
 
 /// Reads a JSON file the smoke waited for.
@@ -1345,7 +1663,7 @@ fn pane_is_present(runtime: &HerdrRuntime, pane_id: &str) -> bool {
         .is_some()
 }
 
-/// The whole managed-child close against a real Herdr and a real child.
+/// The whole managed-child close against the configured shared Herdr server and a real child.
 ///
 /// The daemon is driven only through its public socket: it registers a
 /// disposable parent, spawns the child beside that parent's own pane, and the
@@ -1357,7 +1675,7 @@ fn pane_is_present(runtime: &HerdrRuntime, pane_id: &str) -> bool {
 #[test]
 fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
     if std::env::var("RADAR_HERDR_SMOKE").as_deref() != Ok("1") {
-        eprintln!("skipped: set RADAR_HERDR_SMOKE=1 to close a real disposable Herdr child");
+        eprintln!("skipped: set RADAR_HERDR_SMOKE=1 and RADAR_HERDR_SMOKE_WORKSPACE=<id>");
         return;
     }
     let _serial = serial();
@@ -1366,50 +1684,46 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         command_timeout: Duration::from_secs(10),
     };
     let runtime = HerdrRuntime::new(config.clone());
-    let workspace = runtime
-        .inventory(&cancel())
-        .expect("a live Herdr answers its snapshot")
-        .workspaces
-        .first()
-        .expect("a live Herdr has a workspace")
-        .workspace_id
-        .clone();
-    let CreateOutcome::Completed(created) = runtime.create(
-        &CreateRequest::Tab {
-            workspace_id: workspace,
-            focus: false,
-        },
-        &cancel(),
-    ) else {
-        panic!("the disposable tab was not created")
-    };
-    let tab = created.tab_id.clone().expect("the tab was named");
-    let parent_pane = created.pane_id.clone().expect("its pane was named");
-    let mut disposable = DisposableTab {
-        config: config.clone(),
-        tab,
-        closed: false,
-    };
+    let workspace = selected_smoke_workspace();
+    let tab = create_disposable_tab(&runtime, &workspace);
+    let mut disposable = DisposableTab::new(tab.tab_id, tab.pane_id);
+    let parent_pane = disposable.root_pane.clone();
 
     let dir = std::env::temp_dir().join(format!("radar-herdr-close-smoke-{}", std::process::id()));
     fs::create_dir_all(&dir).expect("smoke directory");
+    let _smoke_directory = SmokeDirectory(dir.clone());
     // The daemon refuses a control socket in a directory another user could
     // reach, so the smoke keeps its own directory private.
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("private smoke directory");
     let socket = dir.join("control.sock");
     let state = dir.join("state");
     let child_record = dir.join("child.json");
+    let launch_cwd = dir.join("child cwd");
+    fs::create_dir_all(&launch_cwd).expect("create launch cwd");
+    let smoke_env: std::collections::BTreeMap<String, String> = [
+        (
+            "RADAR_SMOKE_LITERAL".to_string(),
+            "literal ' \" $(nope); * value".to_string(),
+        ),
+        ("RADAR_SMOKE_EMPTY".to_string(), String::new()),
+        (
+            "RADAR_SMOKE_OVERRIDE".to_string(),
+            "overlay-value".to_string(),
+        ),
+    ]
+    .into();
     let mut daemon = Daemon::bind_herdr_at(&socket, &state, config).expect("bind the daemon");
 
-    // The parent is disposable too: a fresh registry under a fresh state root,
-    // named under the pane this smoke just created.
+    // The daemon uses fresh registry state and the parent is the returned root
+    // pane of the nonfocused tab created in the selected workspace.
+    let parent_incarnation_request = random_uuid();
     let parent = control_call(
         &socket,
         &random_uuid(),
         "agent.register",
         serde_json::json!({
             "source": "radar-live-close-smoke-parent",
-            "incarnation": random_uuid(),
+            "incarnation": parent_incarnation_request,
             "label": "live child-close smoke",
             "location": {"backend": "runtime", "pane": parent_pane},
         }),
@@ -1418,24 +1732,57 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         .as_str()
         .unwrap_or_else(|| panic!("the parent was not registered: {parent}"))
         .to_owned();
+    let parent_incarnation = parent["result"]["registration"]["incarnation"].clone();
+    eprintln!(
+        "sanitized parent registration: agent_id={parent_id}, pane_id={parent_pane}, incarnation={parent_incarnation}"
+    );
+    let parent_session = random_uuid();
+    let context = control_call(
+        &socket,
+        &random_uuid(),
+        "agent.context",
+        serde_json::json!({
+            "agent_id": parent_id,
+            "publisher": {"source": "radar-live-close-smoke-parent", "incarnation": parent_incarnation},
+            "sequence": 1,
+            "context": {"session": parent_session},
+        }),
+    );
+    assert_eq!(
+        context["result"]["context"]["context"]["freshness"], "fresh",
+        "{context}"
+    );
 
     let command =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/live-managed-child.sh");
     fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
         .expect("make the child runnable");
     let spawn_id = random_uuid();
-    let spawned = control_call(
-        &socket,
-        &spawn_id,
-        "spawn",
-        serde_json::json!({
-            "request": {
-                "parent": parent_id,
-                "executable": command.to_string_lossy(),
-                "argv": [socket.to_string_lossy(), child_record.to_string_lossy()],
-            },
-            "requester": "runtime-live-smoke",
-        }),
+    let spawn_params = serde_json::json!({
+        "request": {
+            "parent": parent_id,
+            "parent_session_id": parent_session,
+            "executable": command.to_string_lossy(),
+            "argv": [socket.to_string_lossy(), child_record.to_string_lossy()],
+            "cwd": launch_cwd,
+            "env": smoke_env,
+        },
+        "requester": "runtime-live-smoke",
+    });
+    let spawned = control_call(&socket, &spawn_id, "spawn", spawn_params.clone());
+    let spawn_record = state.join("spawns").join(format!("{spawn_id}.json"));
+    let spawn_edge = read_json(&spawn_record);
+    assert_eq!(spawn_edge["request_id"], spawn_id);
+    assert_eq!(spawn_edge["parent"], parent_id);
+    assert_eq!(spawn_edge["created"], "completed");
+    assert_eq!(spawn_edge["launched"], "completed");
+    eprintln!(
+        "sanitized live spawn evidence: request_id={spawn_id}, parent={parent_id}, parent_pane={parent_pane}, edge_location={}, created={}, launched={}",
+        spawn_edge["location"], spawn_edge["created"], spawn_edge["launched"]
+    );
+    eprintln!(
+        "sanitized spawn params: {}",
+        serde_json::json!({"parent": parent_id, "parent_session_id": parent_session, "cwd": launch_cwd, "env_keys": smoke_env.keys().collect::<Vec<_>>(), "executable": command})
     );
     assert_eq!(
         spawned["result"]["request"]["outcome"], "completed",
@@ -1457,9 +1804,10 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
             .cloned()
         {
             assert_eq!(
-                pane.location.tab_id, disposable.tab,
-                "the child pane must live in the tab this smoke created"
+                pane.location.workspace_id, workspace,
+                "child pane stays in owned workspace"
             );
+            disposable.record_child_pane(&pane.location.tab_id, child_pane.clone());
             assert_eq!(
                 pane.location.pane_id, child_pane,
                 "the child pane must be the one the spawn recorded"
@@ -1480,6 +1828,52 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         "the launched child did not register"
     );
     let child = read_json(&child_record);
+    assert_eq!(
+        child["cwd"],
+        launch_cwd.to_string_lossy().as_ref(),
+        "child cwd"
+    );
+    assert_eq!(
+        child["literal"], "literal ' \" $(nope); * value",
+        "literal env overlay"
+    );
+    assert_eq!(child["empty_set"], "x", "empty overlay is present");
+    assert_eq!(child["empty"], "", "empty overlay remains empty");
+    assert_eq!(
+        child["override"], "overlay-value",
+        "overlay replaces inherited value"
+    );
+    let topology_response = control_call(
+        &socket,
+        &random_uuid(),
+        "spawn.get",
+        serde_json::json!({"request_id": spawn_id}),
+    );
+    let topology = &topology_response["result"]["spawn"];
+    assert_eq!(topology["request_id"], spawn_id);
+    assert_eq!(topology["parent"], parent_id);
+    assert_eq!(topology["bound"]["agent_id"], child["agent_id"]);
+    assert_eq!(topology["bound"]["source"], child["source"]);
+    assert_eq!(topology["bound"]["incarnation"], child["incarnation"]);
+    eprintln!(
+        "sanitized child registration: agent_id={}, source={}, incarnation={}, pid={}, cwd={}",
+        child["agent_id"], child["source"], child["incarnation"], child["pid"], child["cwd"]
+    );
+    eprintln!(
+        "sanitized topology: {}",
+        serde_json::json!({"request_id": topology["request_id"], "parent": topology["parent"], "location": topology["location"], "created": topology["created"], "launched": topology["launched"], "bound": topology["bound"], "state": topology["state"], "freshness": topology["freshness"]})
+    );
+    let before_publication = control_call(
+        &socket,
+        &random_uuid(),
+        "agent.get",
+        serde_json::json!({"agent_id": child["agent_id"]}),
+    )["result"]["agent"]
+        .clone();
+    assert!(
+        before_publication["execution"].is_null(),
+        "binding alone must leave execution unknown"
+    );
     let child_source = child["source"].as_str().expect("the child's source");
     let child_incarnation = child["incarnation"].as_str().expect("its incarnation");
     let child_pid = child["pid"].as_i64().expect("its real pid") as i32;
@@ -1523,12 +1917,13 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
     let child_id = child["agent_id"].clone();
     // The recorded edge, not the read's own state and freshness: those are
     // evidence about the pane, and closing it changes the evidence.
+    disposable.pane_closed(&child_pane);
     let topology_before = control_call(
         &socket,
         &random_uuid(),
         "spawn.get",
         serde_json::json!({"request_id": spawn_id}),
-    )["result"]["spawn"]["edge"]
+    )["result"]["spawn"]
         .clone();
     let child_before = control_call(
         &socket,
@@ -1551,6 +1946,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
     });
     let first = control_call(&socket, &close_id, "child.close", params.clone());
     assert_eq!(first["result"]["close"]["outcome"], "completed", "{first}");
+    disposable.pane_closed(&child_pane);
     assert_eq!(
         first["result"]["close"]["pane"],
         serde_json::json!(child_pane)
@@ -1603,12 +1999,21 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         &random_uuid(),
         "spawn.get",
         serde_json::json!({"request_id": spawn_id}),
-    )["result"]["spawn"]["edge"]
+    )["result"]["spawn"]
         .clone();
-    assert_eq!(
-        topology_after, topology_before,
-        "a close settles no spawn edge"
-    );
+    for field in [
+        "request_id",
+        "parent",
+        "location",
+        "created",
+        "launched",
+        "bound",
+    ] {
+        assert_eq!(
+            topology_after[field], topology_before[field],
+            "close does not settle {field}"
+        );
+    }
     let child_after = control_call(
         &socket,
         &random_uuid(),
@@ -1626,7 +2031,9 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         );
     }
 
-    disposable.close();
+    disposable
+        .close_if_contained()
+        .expect("workspace remains exclusively owned before cleanup");
     daemon.stop();
     let _ = fs::remove_dir_all(&dir);
 }

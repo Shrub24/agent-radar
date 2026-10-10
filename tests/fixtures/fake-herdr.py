@@ -49,8 +49,9 @@ def serve(connection):
             answer = {"result": {"pane": {"pane_id": "wA:p2"}}}
         elif method == "pane.send_input":
             line = params["text"]
-            assert line.startswith("PI_RADAR_SPAWN_TOKEN="), line
-            token = line.split("PI_RADAR_SPAWN_TOKEN=", 1)[1].split(" ", 1)[0].strip("'")
+            token_assignment = next((part for part in line.split() if part.startswith("PI_RADAR_SPAWN_TOKEN=")), None)
+            assert token_assignment is not None, line
+            token = token_assignment.split("=", 1)[1].strip("'")
             (state / "launch.json").write_text(json.dumps({"line": line, "token": token,
                                                             "params": params}))
             answer = {"result": {"accepted": True}}

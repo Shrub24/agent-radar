@@ -495,7 +495,7 @@ impl Registry {
         source: &str,
         incarnation: &str,
     ) -> Result<Option<Registration>, String> {
-        self.find_incarnation(source, incarnation)
+        self.registration_for_incarnation(source, incarnation)
     }
 
     /// Checks that a close request names an exact bound child and recorded pane.
@@ -766,7 +766,9 @@ impl Registry {
     ) -> Result<Registration, String> {
         request.validate()?;
         let _transition = self.transition();
-        if let Some(existing) = self.find_incarnation(&request.source, &request.incarnation)? {
+        if let Some(existing) =
+            self.registration_for_incarnation(&request.source, &request.incarnation)?
+        {
             if existing.request == *request {
                 spawn::heal_binding(self, request, now_ms)?;
                 return Ok(existing);
@@ -783,7 +785,9 @@ impl Registry {
             request: request.clone(),
         };
         self.create(&registration)?;
-        if let Err(error) = spawn::bind_presented_token(self, request, now_ms) {
+        if let Err(error) =
+            spawn::bind_presented_token(self, request, &registration.agent_id, now_ms)
+        {
             let _ = fs::remove_file(self.path(&registration.agent_id));
             return Err(error);
         }
@@ -821,7 +825,7 @@ impl Registry {
     }
 
     /// The record bound to one source incarnation, if any.
-    fn find_incarnation(
+    pub(super) fn registration_for_incarnation(
         &self,
         source: &str,
         incarnation: &str,

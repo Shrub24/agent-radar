@@ -56,6 +56,16 @@ See `docs/daemon.md` for the consumer entry point and linked wire references.
 for an exact bound daemon-spawned child with durable outcomes. It is not process
 termination, resume, restart or assignment completion.
 
+`child-launch-binding` is implemented and verified (7/7 tasks; not yet committed,
+pushed or archived). Spawn carries cwd/environment overlays, validates support
+before effects, keeps environment values private, and exposes the exact token-bound
+child `agent_id` for registry lookup. New spawn edges also carry the explicitly
+named parent registration and its verified session UUID; legacy edges are not
+assigned inferred session parentage. Publisher, real disposable-tab launch/bind/close,
+PTY and checked Nix gates pass; see the change's `verification.md` for evidence and
+the pi-extensions adoption handoff. Herdsman launch migration remains external;
+binding is not application or assignment readiness.
+
 Registry publication does not yet feed Radar's TUI. General launch, process
 termination, resume and restart remain unimplemented. Existing managed controls
 remain owner-routed except the daemon's opt-in close for its own bound children;
@@ -88,8 +98,10 @@ In priority order:
    so nothing is inferred from pane titles, aliases or session UUIDs. Herdr launch
    is terminal input under the quoting rules ADR 0029 measured, behind a declared
    `launch` capability. Stop, resume, restart, lead recovery and adoption of panes
-   not created by the daemon were out of scope at landing; managed-child-stop is
-   the next incremental operation over those edges.
+   not created by the daemon were out of scope at landing. Managed-child-stop now
+   supplies pane closure over those edges; the verified child-launch-binding
+   extension adds the cwd/env and exact registry-ID contract needed for Herdsman's
+   spawn migration.
 4. **Managed-child-stop.** Implemented, verified and archived as
    `openspec/changes/archive/2026-10-10-managed-child-stop/`. `child.close`
    targets an exact bound daemon-spawned child, requires fresh pane/containment
@@ -104,9 +116,15 @@ In priority order:
    process exit before resume. Session UUID continuity alone is not proof. Then
    add confirmed stale-lead batches and startup plans before opt-in automation.
    Do not restart all panes indiscriminately.
-6. **Herdsman/Herdr agnosticity and tmux-parity audit.** Cover Radar, pi-herdsman,
-   publishers and launchers. Record parity gaps before implementing a second
-   backend; the daemon seam alone does not establish parity.
+6. **Herdsman cutover and tmux backend.** The targeted current-caller audit is
+   recorded in `docs/mux.md`: physical caller migration, explicit application
+   readiness, managed-spawn placement parity, lifecycle observation and retained
+   worker stop/resume remain. Add a tmux RuntimeProvider and explicit daemon
+   backend/server selection; run the supported launch/bind/inspect/close flows
+   without Herdr available. Registry-backed TUI observation is also required for
+   full removal. The existing seam is sufficient to start this adapter; missing
+   Herdr shell readiness and lead restart need not block tmux work. Full parity
+   still requires the used retained-worker lifecycle/recovery flows.
 7. **Further TUI and information surfaces.** Review fleet density; then consider
    non-consuming preview, session statistics/search and fleet failure summaries.
 
@@ -118,8 +136,10 @@ Herdsman until a consumer exists. pi-subagents is removed and excluded.
 Linux-only is accepted; cross-platform support is not a prerequisite. Background
 task metrics still require publisher-captured process birth identity. Physical
 lead restart waits for lifecycle execution and reconciliation contracts, not
-merely publisher adoption. Cooperative whole-fleet restart follows safe lead-only
-restart; it must not become a bulk kill.
+merely publisher adoption. Radar's TUI-only restart proposal is currently blocked
+on Herdr providing a positive readiness acknowledgement for a newly created pane;
+no timing or output heuristic may substitute. Cooperative whole-fleet restart
+follows safe lead-only restart; it must not become a bulk kill.
 
 Background-task resource enrichment still needs publisher-captured birth
 identity; it is not a prerequisite for lead recovery. Command-specific actions,
@@ -239,9 +259,9 @@ The physical wrappers, direct registry, mutable session context, managed
 child-spawn and managed-child-stop foundations are landed. Herdsman adoption of
 `child.close` remains an explicit next coordination step. pi-extensions will
 revisit an incarnation-scoped pane token when adopting close; for now the daemon
-uses fail-closed procfs birth-identity verification. Physical lead restart still
-waits for lifecycle execution and reconciliation contracts, not merely publisher
-adoption.
+uses fail-closed procfs birth-identity verification. Physical lead restart remains
+blocked until Herdr exposes positive fresh-pane shell readiness; this is a concrete
+mux capability gap, not a missing Herdsman restart API.
 
 ### Verification and shipping gates
 

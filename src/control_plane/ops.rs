@@ -23,6 +23,7 @@ pub enum Operation {
 
 /// The `launch` capability required to run a resolved child command.
 pub use crate::runtime::LAUNCH_CAPABILITY;
+pub const CHILD_LAUNCH_CONTEXT_CAPABILITY: &str = "child_launch_context_v1";
 
 impl Operation {
     /// The operation a method name denotes, if it is one.

@@ -31,7 +31,8 @@ use super::{Freshness, Registry, RegistryLocation, bounded_text, read_record_fil
 
 /// The record shape this build writes and reads. A record naming another version
 /// fails explicitly rather than being read as this one.
-pub const SPAWN_VERSION: u32 = 1;
+pub const SPAWN_VERSION: u32 = 2;
+pub const LEGACY_SPAWN_VERSION: u32 = 1;
 
 /// The largest spawn edge this daemon reads or writes, so a planted file cannot
 /// be read into memory whole.
@@ -47,15 +48,17 @@ pub struct SpawnRequest {
     /// The caller's own request id: the durable key of the edge, and the identity
     /// a retry repeats.
     pub request_id: String,
-    /// The agent record this child is created for: a runtime subject, never a
-    /// pane name.
+    /// Exact agent registration used as the live process parent.
     pub parent: String,
+    /// Stable logical parent identity, verified against this registration's fresh context.
+    pub parent_session_id: String,
 }
 
 impl SpawnRequest {
     pub fn validate(&self) -> Result<(), String> {
         canonical_uuid("request_id", &self.request_id)?;
         canonical_uuid("parent", &self.parent)?;
+        canonical_uuid("parent_session_id", &self.parent_session_id)?;
         Ok(())
     }
 }
@@ -85,6 +88,9 @@ impl SpawnBindRequest {
 pub struct BoundChild {
     pub source: String,
     pub incarnation: String,
+    /// Exact registry identity returned to the registering child. Absent in legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// When the edge bound to this incarnation.
     pub bound_at: String,
 }
@@ -101,6 +107,9 @@ pub struct SpawnEdge {
     pub version: u32,
     pub request_id: String,
     pub parent: String,
+    /// Logical session parent; absent only on legacy v1 process-parented edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     /// Private. It appears in no projection and in no refusal.
     pub token: String,
     /// Where the child was created, once a create answered.
@@ -127,6 +136,7 @@ impl SpawnEdge {
             version: self.version,
             request_id: self.request_id.clone(),
             parent: self.parent.clone(),
+            parent_session_id: self.parent_session_id.clone(),
             location: self.location.clone(),
             created: self.created,
             launched: self.launched,
@@ -170,6 +180,8 @@ pub struct PublicSpawnEdge {
     pub version: u32,
     pub request_id: String,
     pub parent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<RegistryLocation>,
     pub created: RequestOutcome,
@@ -243,7 +255,11 @@ pub fn record(
     request.validate()?;
     let _transition = registry.transition();
     if let Some(existing) = read_edge(registry, &request.request_id)? {
-        if existing.parent == request.parent {
+        if existing.parent == request.parent
+            && (existing.parent_session_id.as_deref() == Some(request.parent_session_id.as_str())
+                || (existing.version == LEGACY_SPAWN_VERSION
+                    && existing.parent_session_id.is_none()))
+        {
             return Ok(existing);
         }
         return Err(format!(
@@ -254,10 +270,22 @@ pub fn record(
     registry
         .get(&request.parent)?
         .ok_or_else(|| format!("parent {} is not a registered agent", request.parent))?;
+    let context = registry
+        .context(&request.parent, now_ms)?
+        .ok_or_else(|| format!("parent {} has no published session context", request.parent))?;
+    if context.context.freshness != Freshness::Fresh
+        || context.context.session.as_deref() != Some(&request.parent_session_id)
+    {
+        return Err(format!(
+            "parent {} has no fresh matching session context",
+            request.parent
+        ));
+    }
     let edge = SpawnEdge {
         version: SPAWN_VERSION,
         request_id: request.request_id.clone(),
         parent: request.parent.clone(),
+        parent_session_id: Some(request.parent_session_id.clone()),
         token: random_uuid(),
         location: None,
         created: RequestOutcome::Unknown,
@@ -370,7 +398,7 @@ pub fn bind(
 ) -> Result<SpawnEdge, String> {
     request.validate()?;
     let _transition = registry.transition();
-    bind_locked(registry, request, now_ms)
+    bind_locked(registry, request, now_ms, None)
 }
 
 /// Binds the edge a registration's token names to that exact registration.
@@ -382,12 +410,18 @@ pub fn bind(
 pub(super) fn bind_presented_token(
     registry: &Registry,
     request: &super::RegistrationRequest,
+    agent_id: &str,
     now_ms: i64,
 ) -> Result<(), String> {
     let Some(token) = request.spawn_token.as_deref() else {
         return Ok(());
     };
-    bind_locked(registry, &registration_bind(token, request), now_ms)?;
+    bind_locked(
+        registry,
+        &registration_bind(token, request),
+        now_ms,
+        Some(agent_id),
+    )?;
     Ok(())
 }
 
@@ -405,17 +439,11 @@ pub(super) fn heal_binding(
     let Some(token) = request.spawn_token.as_deref() else {
         return Ok(());
     };
+    let registration = registry
+        .registration_for_incarnation(&request.source, &request.incarnation)?
+        .ok_or_else(|| "registered child identity is unavailable for spawn binding".to_string())?;
     let bind = registration_bind(token, request);
-    match bind_locked(registry, &bind, now_ms) {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            if already_bound_to(registry, &bind)? {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-    }
+    bind_locked(registry, &bind, now_ms, Some(&registration.agent_id)).map(|_| ())
 }
 
 fn registration_bind(token: &str, request: &super::RegistrationRequest) -> SpawnBindRequest {
@@ -426,22 +454,12 @@ fn registration_bind(token: &str, request: &super::RegistrationRequest) -> Spawn
     }
 }
 
-/// Whether this token already bound exactly this child: the state a retry sees
-/// when the bind write survived and its answer did not.
-fn already_bound_to(registry: &Registry, request: &SpawnBindRequest) -> Result<bool, String> {
-    Ok(edges(registry)?.into_iter().any(|edge| {
-        edge.token == request.token
-            && edge.bound.as_ref().is_some_and(|child| {
-                child.source == request.source && child.incarnation == request.incarnation
-            })
-    }))
-}
-
 /// The bind itself, under the caller's admission lock.
 fn bind_locked(
     registry: &Registry,
     request: &SpawnBindRequest,
     now_ms: i64,
+    agent_id: Option<&str>,
 ) -> Result<SpawnEdge, String> {
     let mut matches = edges(registry)?
         .into_iter()
@@ -454,13 +472,38 @@ fn bind_locked(
     if matches.next().is_some() {
         return Err("this spawn token names more than one edge".into());
     }
-    if stored.bound.is_some() {
+    if let Some(bound) = &stored.bound {
+        if bound.source == request.source
+            && bound.incarnation == request.incarnation
+            && let Some(agent_id) = agent_id
+        {
+            if bound
+                .agent_id
+                .as_deref()
+                .is_some_and(|existing| existing != agent_id)
+            {
+                return Err("spawn binding names a different registry identity".into());
+            }
+            if bound.agent_id.is_none() {
+                let edge = SpawnEdge {
+                    bound: Some(BoundChild {
+                        agent_id: Some(agent_id.to_string()),
+                        ..bound.clone()
+                    }),
+                    ..stored
+                };
+                write_edge(registry, &edge)?;
+                return Ok(edge);
+            }
+            return Ok(stored);
+        }
         return Err("this spawn token is already spent".into());
     }
     let edge = SpawnEdge {
         bound: Some(BoundChild {
             source: request.source.clone(),
             incarnation: request.incarnation.clone(),
+            agent_id: agent_id.map(str::to_owned),
             bound_at: format_millis(now_ms),
         }),
         ..stored
@@ -515,11 +558,19 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
     }
     let edge: SpawnEdge =
         serde_json::from_slice(bytes).map_err(|error| format!("not a spawn edge: {error}"))?;
-    if edge.version != SPAWN_VERSION {
+    if ![LEGACY_SPAWN_VERSION, SPAWN_VERSION].contains(&edge.version) {
         return Err(format!(
-            "spawn edge version {} is not served; this daemon writes {SPAWN_VERSION}",
+            "spawn edge version {} is not served; this daemon reads v1 and writes {SPAWN_VERSION}",
             edge.version
         ));
+    }
+    if (edge.version == LEGACY_SPAWN_VERSION && edge.parent_session_id.is_some())
+        || (edge.version == SPAWN_VERSION && edge.parent_session_id.is_none())
+    {
+        return Err("spawn edge parent session identity does not match its version".into());
+    }
+    if let Some(session_id) = &edge.parent_session_id {
+        canonical_uuid("parent_session_id", session_id)?;
     }
     if edge.request_id != request_id {
         return Err("spawn edge id does not match its filename".into());
@@ -540,6 +591,9 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
         }
         if timestamp_millis(&bound.bound_at).is_none() {
             return Err("spawn edge bound_at is not a timestamp".into());
+        }
+        if let Some(agent_id) = &bound.agent_id {
+            canonical_uuid("bound.agent_id", agent_id)?;
         }
     }
     if timestamp_millis(&edge.recorded_at).is_none() {

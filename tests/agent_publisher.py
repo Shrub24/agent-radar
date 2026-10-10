@@ -259,9 +259,15 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
             "source": "fixture-parent", "incarnation": "11111111-1111-4111-8111-111111111111",
             "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
         })["registration"]["agent_id"]
-        spawn_id = "56565656-5656-4656-8656-565656565656"
+        parent_session_id = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+        call(socket_path, "agent.context", {"agent_id": parent,
+             "publisher": {"source": "fixture-parent", "incarnation": "1c2d3e4f-5678-4abc-9def-0123456789ab"},
+             "sequence": 1, "lease_ms": 30000, "context": {"session": parent_session_id}})
+        launch_env = {"PI_HERDSMAN_MAILBOX": "mailbox-smoke", "PI_HERDSMAN_OWNER": "owner-smoke"}
         response = call(socket_path, "spawn", {"request": {"parent": parent,
-                            "executable": "/usr/bin/pi", "argv": ["--child", "row one"]},
+                            "parent_session_id": parent_session_id,
+                            "executable": "/usr/bin/pi", "argv": ["--child", "row one"],
+                            "cwd": "/tmp", "env": launch_env},
                             "requester": "herdsman"})
         edge = response["spawn"]
         check(response["request"]["outcome"] == "completed", str(response))
@@ -272,21 +278,31 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
         check(private_token, "edge did not persist token")
         launch = json.loads((fake_state / "launch.json").read_text())
         check(launch["token"] == private_token, "launched environment token differs from edge token")
+        check("/tmp" in launch["line"] and "PI_HERDSMAN_MAILBOX" in launch["line"],
+              "spawn launch context was not transported")
         # The scripted pane's foreground occupant is this test process, so the
         # child's registered birth identity is the one the daemon verifies.
         (fake_state / "foreground-pid").write_text(str(os.getpid()))
+        os.environ["PI_RADAR_SPAWN_TOKEN"] = private_token
+        captured_token = publisher.consume_spawn_token()
+        check(captured_token == private_token and "PI_RADAR_SPAWN_TOKEN" not in os.environ,
+              "bootstrap must remove the token from its environment after capture")
         child = call(socket_path, "agent.register", {
             "source": "fixture-child", "incarnation": "34343434-3434-4343-8343-343434343434",
             "location": {"backend": "runtime", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p2"},
             "process": process_birth_identity(os.getpid()),
-            "spawn_token": private_token,
+            "spawn_token": captured_token,
         })["registration"]
         check("spawn_token" not in json.dumps(child), "registration response leaked token")
         get = call(socket_path, "spawn.get", {"request_id": edge["request_id"]})["spawn"]
         check(get["state"] == "bound" and get["bound"]["incarnation"] == child["incarnation"], str(get))
+        check(get["bound"]["agent_id"] == child["agent_id"], str(get))
         check(get["freshness"] == "fresh" and "token" not in json.dumps(get), str(get))
         listed = call(socket_path, "spawn.list", {"limit": 10})
         check(listed["spawns"] == [get] and listed["next"] is None, str(listed))
+        bound_child = get_agent(socket_path, get["bound"]["agent_id"])
+        check(bound_child["execution"] is None, "binding must not imply execution readiness")
+        check(bound_child["registration"]["agent_id"] == child["agent_id"], str(bound_child))
         for channel, publisher_identity in (
             ("assignment", {"source": "fixture-owner", "incarnation": "9f8e7d6c-4321-4def-8abc-0123456789ab", "reporting_owner": "owner-smoke"}),
             ("execution", {"source": "fixture-pi", "incarnation": "2f8e7d6c-4321-4def-8abc-0123456789ab"}),

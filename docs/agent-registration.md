@@ -142,8 +142,14 @@ it does not use whichever pane has current focus. The caller supplies the
 resolved executable and argv. The daemon does not resolve a command, write an
 assignment, or alter process lifecycle. The command is passed to the backend
 unchanged, alongside a daemon-minted, single-use token exported to the child as
-`PI_RADAR_SPAWN_TOKEN`. The child reads that environment value and includes it
-as `spawn_token` in its `agent.register` request. The token is private, stored
+`PI_RADAR_SPAWN_TOKEN`. The child captures that value, removes it from its
+process environment, and includes it privately as `spawn_token` in its own
+`agent.register` request. Keep the captured value only in bootstrap memory while
+an acknowledgement is uncertain; retry with identical source, incarnation,
+process claim and token. The returned `registration.agent_id` is the exact child
+identity. A parent obtains the same identity from `spawn.get`/`spawn.list` at
+`spawn.bound.agent_id`, then calls `agent.get` with that value. The token is
+private, stored
 only with the durable edge and consumed on binding; never return or publish it.
 
 A successful response carries the durable operation record beside its public
@@ -180,7 +186,7 @@ Both topology methods require `agent_registry`, regardless of backend. For
 location verification, one `observe` inventory is consulted per response/page
 when a backend advertises `observe`; otherwise the durable topology is still
 returned with unconfirmed freshness. Edges persist across daemon restarts. The
-public topology contains parent, optional bound child `(source, incarnation)`,
+public topology contains parent, optional bound child `(source, incarnation, agent_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains
 created/launched outcomes, optional created location, `state`, and
 `freshness`; it never contains the token. `state` is `unbound` without a child,
 `bound` after token binding, or `unresolved` when a recorded pane is absent from

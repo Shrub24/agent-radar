@@ -2156,6 +2156,7 @@ fn spawn_request(request_id: &str, parent: &str) -> SpawnRequest {
     SpawnRequest {
         request_id: request_id.into(),
         parent: parent.into(),
+        parent_session_id: SESSION.into(),
     }
 }
 
@@ -2169,10 +2170,17 @@ fn spawn_bind(token: &str, source: &str, incarnation: &str) -> SpawnBindRequest 
 
 /// A registered runtime subject for a spawn to name as its parent.
 fn spawn_parent(registry: &Registry, incarnation: &str, now_ms: i64) -> String {
-    registry
+    let parent = registry
         .register(&request(incarnation), now_ms)
-        .expect("a parent registration")
-        .agent_id
+        .expect("a parent registration");
+    let identity = publisher(&parent.request.source, &parent.request.incarnation);
+    registry
+        .publish_context(
+            &context_request(&parent.agent_id, identity, None, 1, Some(SESSION)),
+            now_ms,
+        )
+        .expect("a fresh parent session context");
+    parent.agent_id
 }
 
 fn spawn_path(registry: &Registry, request_id: &str) -> PathBuf {
@@ -2200,6 +2208,7 @@ fn a_recorded_spawn_edge_survives_reopening_with_its_private_token() {
             .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
             .expect("a recorded edge");
         assert_eq!(recorded.parent, parent);
+        assert_eq!(recorded.parent_session_id.as_deref(), Some(SESSION));
     }
 
     // The intent is durable before anything is created, and it is the record
@@ -2210,7 +2219,8 @@ fn a_recorded_spawn_edge_survives_reopening_with_its_private_token() {
         .expect("a read")
         .expect("the record");
     assert_eq!(restored, recorded);
-    assert_eq!(restored.version, 1);
+    assert_eq!(restored.version, 2);
+    assert_eq!(restored.parent_session_id.as_deref(), Some(SESSION));
     assert_eq!(restored.recorded_at, format_millis(2_000));
     assert!(
         SessionUuid::parse(&restored.token).is_some(),
@@ -2302,6 +2312,92 @@ fn a_replayed_spawn_request_id_performs_no_second_effect() {
         .expect("a second record");
     assert_ne!(second.token, first.token, "each edge mints its own token");
     assert_eq!(spawn_files(&registry).len(), 2);
+    drop_root(&root);
+}
+
+#[test]
+fn spawn_admission_requires_fresh_non_null_matching_context_on_the_exact_parent() {
+    const ALT_SESSION: &str = "aa2b3c4d-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    for (session, stale, label) in [
+        (None, false, "null"),
+        (Some(ALT_SESSION), false, "mismatch"),
+        (Some(SESSION), true, "stale"),
+    ] {
+        let root = temp_root(&format!("spawn-context-{label}"));
+        let registry = Registry::open_at(&root, 1_000).expect("a registry");
+        let parent = registry
+            .register(&request(INCARNATION), 1_000)
+            .expect("parent");
+        registry
+            .publish_context(
+                &context_request(
+                    &parent.agent_id,
+                    publisher(&parent.request.source, &parent.request.incarnation),
+                    None,
+                    1,
+                    session,
+                ),
+                1_000,
+            )
+            .expect("publish context");
+        let now = if stale { 12_001 } else { 1_001 };
+        let error = registry
+            .record_spawn(&spawn_request(SPAWN_REQUEST, &parent.agent_id), now)
+            .expect_err("refuse invalid context");
+        assert!(error.contains("fresh matching session context"), "{error}");
+        assert!(
+            spawn_files(&registry).is_empty(),
+            "{label} context wrote an edge"
+        );
+        drop_root(&root);
+    }
+}
+
+#[test]
+fn duplicate_session_attaches_remain_distinct_and_edges_keep_session_on_second_attach() {
+    let root = temp_root("spawn-duplicate-session");
+    let registry = Registry::open_at(&root, 1_000).expect("registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("edge");
+    let second_attach = registry
+        .register(&request(OTHER_INCARNATION), 2_001)
+        .expect("second registration");
+    assert_ne!(parent, second_attach.agent_id);
+    registry
+        .publish_context(
+            &context_request(
+                &second_attach.agent_id,
+                publisher(
+                    &second_attach.request.source,
+                    &second_attach.request.incarnation,
+                ),
+                None,
+                1,
+                Some(SESSION),
+            ),
+            2_001,
+        )
+        .expect("publish second attach context");
+    let second_context = registry
+        .context(&second_attach.agent_id, 2_002)
+        .expect("context read")
+        .expect("context");
+    assert_eq!(second_context.context.freshness, Freshness::Fresh);
+    assert_eq!(second_context.context.session.as_deref(), Some(SESSION));
+
+    let stored = registry
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("edge read")
+        .expect("edge");
+    assert_eq!(
+        stored.parent, parent,
+        "edge retains the exact supplied process"
+    );
+    assert_eq!(stored.parent_session_id.as_deref(), Some(SESSION));
+    assert_eq!(stored.parent_session_id, edge.parent_session_id);
+    assert_eq!(stored, edge, "a second attach does not rewrite the edge");
     drop_root(&root);
 }
 
@@ -2486,9 +2582,22 @@ fn a_spawn_edge_that_is_not_a_whole_record_fails_explicitly() {
     let error = registry.spawn_edge(SPAWN_REQUEST).expect_err("a refusal");
     assert!(error.contains("not a spawn edge"), "{error}");
 
+    // Legacy v1 reads stay explicitly process-parented; no session is inferred.
+    let mut legacy: serde_json::Value = serde_json::from_slice(&whole).expect("a decoding");
+    legacy["version"] = serde_json::json!(1);
+    legacy.as_object_mut().unwrap().remove("parent_session_id");
+    fs::write(&path, serde_json::to_vec(&legacy).expect("an encoding")).expect("a write");
+    let legacy_read = registry
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("legacy read")
+        .expect("legacy edge");
+    assert_eq!(legacy_read.version, 1);
+    assert_eq!(legacy_read.parent, parent);
+    assert!(legacy_read.parent_session_id.is_none());
+
     // A record of another version is refused rather than read as this one.
     let mut foreign: serde_json::Value = serde_json::from_slice(&whole).expect("a decoding");
-    foreign["version"] = serde_json::json!(2);
+    foreign["version"] = serde_json::json!(99);
     fs::write(&path, serde_json::to_vec(&foreign).expect("an encoding")).expect("a write");
     let error = registry.spawn_edge(SPAWN_REQUEST).expect_err("a refusal");
     assert!(error.contains("is not served"), "{error}");
@@ -2558,9 +2667,28 @@ fn a_spawn_request_naming_an_unknown_parent_is_refused_before_any_write() {
     assert!(error.contains("must be a canonical UUID"), "{error}");
     assert!(spawn_files(&registry).is_empty());
 
-    // A registered parent names the edge, and the edge is written under the
-    // request id it was recorded with.
-    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    // A registered parent without context is refused before writing.
+    let parent = registry
+        .register(&request(INCARNATION), 1_000)
+        .expect("parent")
+        .agent_id;
+    let error = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect_err("missing session context");
+    assert!(error.contains("session context"));
+    assert!(spawn_files(&registry).is_empty());
+    registry
+        .publish_context(
+            &context_request(
+                &parent,
+                publisher("herdsman", INCARNATION),
+                None,
+                1,
+                Some(SESSION),
+            ),
+            2_000,
+        )
+        .expect("fresh matching context");
     registry
         .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
         .expect("a recorded edge");
@@ -2597,6 +2725,10 @@ fn a_registration_with_its_spawn_token_binds_the_pending_edge_once() {
     let named = bound.bound.as_ref().expect("a bound child");
     assert_eq!(named.source, child.source);
     assert_eq!(named.incarnation, CHILD_INCARNATION);
+    assert_eq!(
+        named.agent_id.as_deref(),
+        Some(registered.agent_id.as_str())
+    );
     assert_eq!(bound.parent, parent);
     assert_eq!(bound.token, edge.token, "binding spends, never re-mints");
 
@@ -2702,6 +2834,70 @@ fn a_registration_reaching_a_spent_edge_it_already_bound_is_answered_not_refused
     let named = restored.bound.as_ref().expect("a bound child");
     assert_eq!(named.source, child.source);
     assert_eq!(named.incarnation, CHILD_INCARNATION);
+    assert_eq!(named.agent_id.as_deref(), Some(agent_id.as_str()));
+    drop_root(&root);
+}
+
+#[test]
+fn a_registration_retry_refuses_when_stored_bound_agent_id_conflicts() {
+    let root = temp_root("spawn-register-id-conflict");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("edge");
+    let mut child = request(CHILD_INCARNATION);
+    child.spawn_token = Some(edge.token.clone());
+    let registered = registry.register(&child, 3_000).expect("registration");
+    let path = spawn_path(&registry, SPAWN_REQUEST);
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("edge bytes")).unwrap();
+    stored["bound"]["agent_id"] = serde_json::Value::String(random_uuid());
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).expect("mutated edge");
+    let error = registry
+        .register(&child, 4_000)
+        .expect_err("conflicting exact ID");
+    assert!(error.contains("different registry identity"), "{error}");
+    assert_ne!(
+        registered.agent_id,
+        stored["bound"]["agent_id"].as_str().unwrap()
+    );
+    drop_root(&root);
+}
+
+#[test]
+fn a_bound_edge_rejects_malformed_optional_agent_id_but_accepts_legacy_absence() {
+    let root = temp_root("spawn-bound-id-validation");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    let edge = registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("edge");
+    registry
+        .bind_spawn(
+            &spawn_bind(&edge.token, "herdsman", CHILD_INCARNATION),
+            3_000,
+        )
+        .expect("bind");
+    let path = spawn_path(&registry, SPAWN_REQUEST);
+    let original = fs::read(&path).expect("edge bytes");
+    let mut stored: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    stored["bound"]["agent_id"] = serde_json::Value::String("not-a-uuid".into());
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).expect("malformed edge");
+    assert!(
+        registry
+            .spawn_edge(SPAWN_REQUEST)
+            .unwrap_err()
+            .contains("canonical UUID")
+    );
+    stored["bound"].as_object_mut().unwrap().remove("agent_id");
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).expect("legacy edge");
+    let legacy = registry
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("legacy read")
+        .unwrap();
+    assert!(legacy.bound.unwrap().agent_id.is_none());
+    fs::write(&path, original).expect("restore edge");
     drop_root(&root);
 }
 
@@ -3514,7 +3710,7 @@ fn a_malformed_or_symlinked_or_oversized_child_close_is_not_read() {
 
     // A record of another version is refused rather than read as this one.
     let mut foreign: serde_json::Value = serde_json::from_slice(&whole).expect("a decoding");
-    foreign["version"] = serde_json::json!(2);
+    foreign["version"] = serde_json::json!(99);
     fs::write(&path, serde_json::to_vec(&foreign).expect("an encoding")).expect("a write");
     let error = registry
         .child_close(CHILD_CLOSE_REQUEST)

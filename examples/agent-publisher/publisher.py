@@ -67,6 +67,16 @@ class RegistryError(RuntimeError):
         self.message = message
 
 
+def consume_spawn_token() -> str | None:
+    """Capture then remove the daemon credential from this process environment."""
+    return os.environ.pop("PI_RADAR_SPAWN_TOKEN", None)
+
+
+def register_spawned_child(path: Path, registration: dict, token: str) -> dict:
+    """Register this exact child; callers retry with identical content after uncertainty."""
+    return call(path, "agent.register", {**registration, "spawn_token": token})["registration"]
+
+
 def publish_assignment(path: Path, registration: dict, publisher: dict,
                        snapshot: dict, sequence: int, *, lease_ms: int | None = None,
                        replace: dict | None = None) -> tuple[dict, dict]:

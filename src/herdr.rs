@@ -506,6 +506,7 @@ impl RuntimeProvider for HerdrRuntime {
             "output",
             "reporting",
             LAUNCH_CAPABILITY,
+            "child_launch_context_v1",
         ]
     }
 
@@ -623,8 +624,18 @@ impl RuntimeProvider for HerdrRuntime {
     /// `pane.send_input` carries text and the named key in one request, so the
     /// line is either accepted whole or not at all — an accepted text with a
     /// missing Enter would leave an unexecuted line pending in the pane.
+    fn validate_launch(&self, request: &LaunchRequest) -> Result<(), String> {
+        request.validate()?;
+        let line = launch_line(request)?;
+        let input = InputRequest {
+            pane_id: request.pane_id.clone(),
+            payload: InputPayload::Text { text: line },
+        };
+        input.validate()
+    }
+
     fn launch(&self, request: &LaunchRequest, cancel: &AtomicBool) -> LaunchOutcome {
-        if let Err(error) = request.validate() {
+        if let Err(error) = self.validate_launch(request) {
             return LaunchOutcome::Refused(error);
         }
         let line = match launch_line(request) {
@@ -772,15 +783,42 @@ impl RuntimeProvider for HerdrRuntime {
 /// bounded, acknowledged cleanup the daemon cannot yet observe, and a
 /// self-deleting wrapper would risk removing a file the pane shell has not read.
 fn launch_line(request: &LaunchRequest) -> Result<String, String> {
-    if request.argv.iter().any(|argument| argument.contains('\n')) {
-        return Err("`argv` holds a newline, and this backend types one shell line".to_string());
+    if request
+        .argv
+        .iter()
+        .any(|argument| argument.chars().any(char::is_control))
+        || request
+            .env
+            .values()
+            .any(|value| value.chars().any(char::is_control))
+        || request
+            .cwd
+            .as_ref()
+            .is_some_and(|cwd| cwd.chars().any(char::is_control))
+    {
+        return Err(
+            "launch context contains a newline, and this backend types one shell line".to_string(),
+        );
     }
-    let mut atoms = Vec::with_capacity(request.argv.len() + 2);
+    let mut atoms = Vec::with_capacity(request.argv.len() + request.env.len() * 2 + 8);
+    if let Some(cwd) = &request.cwd {
+        atoms.extend(["cd".to_string(), shell_quote(cwd), "&&".to_string()]);
+    }
+    if !request.env.is_empty() {
+        atoms.push("env".to_string());
+        atoms.extend(request.env.keys().map(|name| format!("-u {name}")));
+    }
     atoms.push(format!(
         "{}={}",
         LAUNCH_TOKEN_ENV,
         shell_quote(&request.spawn_token)
     ));
+    atoms.extend(
+        request
+            .env
+            .iter()
+            .map(|(name, value)| format!("{name}={}", shell_quote(value))),
+    );
     atoms.push(shell_quote(&request.executable));
     atoms.extend(request.argv.iter().map(|argument| shell_quote(argument)));
     Ok(atoms.join(" "))

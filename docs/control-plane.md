@@ -1,9 +1,16 @@
 # Radar control-plane protocol v1
 
 For the overall surface, lifecycle and adoption path, start with the
-[daemon consumer guide](daemon.md).
+[daemon consumer guide](daemon.md). Backend implementers and migrating consumers
+should also read the [mux integration contract](mux.md).
 
-This is the wire reference for local clients, including extensions. The daemon is a backend-neutral **physical mux wrapper**. It does not grant agent assignment authority or register mux topology. Herdsman remains the owner of managed-worker lifecycle and assignment authority; Radar does not start or supervise the daemon. The daemon also serves additive direct agent-registry methods independently of the mux backend; see the versioned [agent-registration reference](agent-registration.md) for their full contract and reconnecting publisher example. These registry methods do not add restart/resume or physical lifecycle controls.
+This is the wire reference for local clients, including extensions. The daemon
+wraps physical mux operations and owns runtime edges only for children it spawns;
+it does not infer ownership of arbitrary mux resources or grant assignment
+authority. Herdsman retains assignment/run orchestration. Radar does not start or
+supervise the daemon. Independent registry methods, managed spawn and verified
+child-pane close are documented in [agent registration](agent-registration.md).
+They do not provide process stop, resume or restart.
 
 ## Start and select
 
@@ -42,6 +49,8 @@ Lines are capped at 1 MiB excluding newline; an oversized line is drained and re
 | `focus` | `focus` |
 | `close` | `close` |
 | `create` | `creation` |
+| `spawn` | `creation` + `launch` |
+| `spawn` with cwd/env | Also `child_launch_context_v1` |
 | `input` | `input` |
 | `output` | `output` |
 | `report` | `reporting` |
@@ -81,12 +90,16 @@ Effectful backend refusals can settle `outcome: refused`; confirmed actions sett
 - `create`: `{"request":{"kind":"pane_split","pane_id":"wA:p1","direction":"right","focus":false},"requester":"extension-name"}`. Tagged request variants: `{"kind":"workspace","focus":false}`, `{"kind":"tab","workspace_id":"wA","focus":false}`, `{"kind":"pane_split","pane_id":"wA:p1","direction":"down","focus":false}`. Directions `right`/`down`. Creates a mux location only; it does not launch a process or restore an agent. Record `created` is `{ "kind":"workspace|tab|pane", "id":"runtime-reported-id" }` only when backend names it; do not infer it from request or effect prose.
 - `input`: `{"request":{"pane_id":"wA:p1","payload":{"kind":"text","text":"hello\n"}},"requester":"extension-name"}`. Exactly one tagged payload: text or keys. Text is 1..=4096 bytes; control characters refused except newline/tab. Keys are 1..=16 names, each 1..=32 ASCII letters/digits/`+`/`-`/`_`. Key names are passed to backend; use only names it supports. Text is literal input, not shell evaluation.
 - `report`: `{"request":{"kind":"state","pane_id":"wA:p1","source":"publisher","agent":"pi","state":"working","sequence":4},"requester":"extension-name"}`. Tagged variants `state`, `session`, `metadata`; see schemas below. This is a curated normalized schema, not a generic Herdr RPC passthrough. Unknown fields/kinds refuse. It forwards the caller's own values; it does not merge them into a registry or establish authority. `resume_argv`, `release_agent`, and `clear_agent_authority` are unsupported.
+- `spawn`: `{"request":{"parent":"<agent-uuid>","parent_session_id":"<pi-session-uuid>","executable":"/usr/bin/pi","argv":["--child"],"cwd":"/work","env":{"NAME":"value"}},"requester":"extension-name"}`. Both UUIDs are required. Optional cwd must be absolute; env is an overlay of at most 256 conventional UTF-8 variable names/values. `PI_RADAR_SPAWN_TOKEN` is reserved for Radar. Omitted context retains legacy behavior. The selected backend must advertise `child_launch_context_v1` before context-bearing requests are accepted; Herdr refuses multiline/control values and unrepresentable command lines before pane creation. Environment values are private and omitted from public operation records. The daemon verifies fresh session context on that exact parent registration before any pane effect; it never searches registrations by session UUID. New edges are v2 and preserve both process parent and logical session parent. Legacy v1 edges remain process-parented and are not inferred or migrated.
 
 ### Managed child close
 
 `child.close` is a separate durable operation for the exact daemon-created child that registered with a spawn edge's private token. It takes the edge's `spawn_request_id`, the exact bound `(source, incarnation)` and an audit intent (`complete` or `cancel`); the caller cannot select a pane. The exact request and response are in the [canonical registry fixture](agent-registration.fixture.jsonl). The edge must exist, be bound to that child and name a pane, and the child's registration must carry a process identity claim. Immediately before admission the daemon requires fresh inventory showing the pane in its recorded workspace/tab containment, then a positive non-shell foreground PID whose procfs birth identity exactly matches the registered `(pid, boot_id, start_ticks)` tuple. A missing, unbound or mismatched edge, pane or child; no process claim; shell, invalid PID or inconclusive foreground evidence; changed containment; unavailable verification; or a backend missing `observe` or `close` refuses before admission and before any backend effect. A different managed child, a foreign pane, a caller-chosen pane id, and targets named by label, title, session UUID or pane position are never eligible. Foreground evidence is an adapter-side process read, so a backend that cannot answer it refuses here rather than being trusted on pane presence alone.
 
-The durable record stores the request ID, edge, bound child, recorded pane and intent before dispatch. Backend-confirmed pane closure is `completed`; a positive backend refusal is `refused`; a possibly dispatched close without confirmation is `unknown`. Identical same-ID replay returns the stored result without re-verification or redispatch; different content under the same ID refuses. An unknown result is never retried automatically or through another backend. The result reports the mux pane closure only: it never claims foreground-process or process-group exit and never writes assignment or execution facts. The spawn edge and binding remain; a pane that disappears after an unknown result stays unresolved, not confirmed closed. `ping` advertises no separate managed-close capability.
+The durable record stores the request ID, edge, bound child, recorded pane and intent before dispatch. Backend-confirmed pane closure is `completed`; a positive backend refusal is `refused`; a possibly dispatched close without confirmation is `unknown`. Identical same-ID replay returns the stored result without re-verification or redispatch; different content under the same ID refuses. An unknown result is never retried automatically or through another backend. The result reports the mux pane closure only: it never claims foreground-process or process-group exit and never writes assignment or execution facts. The spawn edge and binding remain; a pane that disappears after an unknown result stays unresolved, not confirmed closed. `ping` advertises no separate managed-close capability. To reconcile a lost
+reply, resend the exact same `child.close` request ID and params; it returns the
+stored close outcome without another effect. Generic `request`/`requests` read
+ordinary mux-operation records, not these separate managed-close records.
 
 ### Report schemas and bounds
 
@@ -98,7 +111,11 @@ Every report requires a valid target and nonempty `source`; state/session also r
 
 ## Security and privacy
 
-Socket and state directories are user-owned mode `0700`, real directories, not symlinks. Request record files are atomically created mode `0600` under the private `requests` directory; each record is capped at 64 KiB. Records retain **unredacted** canonical params for exact duplicate comparison, including literal terminal input and metadata; do not send secrets you do not want persisted. Records are not automatically pruned; unresolved outcomes must remain inspectable. Local filesystem trust is not client authentication: another process running as the same user is not isolated by this protocol. Do not expose the socket remotely.
+Socket and state directories are user-owned mode `0700`, real directories, not symlinks. Request record files are atomically created mode `0600` under the private `requests` directory; each record is capped at 64 KiB. Records retain **unredacted** canonical params for exact duplicate comparison,
+including literal terminal input, metadata and spawn environment overlays; do not
+send secrets you do not want persisted. Public spawn operation projections redact
+environment values and tokens; this is not general redaction of arbitrary input,
+argv or shell/application output. Records are not automatically pruned; unresolved outcomes must remain inspectable. Local filesystem trust is not client authentication: another process running as the same user is not isolated by this protocol. Do not expose the socket remotely.
 
 ## Extension examples
 

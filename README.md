@@ -40,8 +40,10 @@ source diagnostic if Herdr is unavailable. Direct Herdr access remains the
 default; an optional local `radar daemon` provides backend-neutral physical mux
 wrapping for Radar and extension clients. The operator starts it separately;
 Radar does not start or supervise it. Start with the [daemon consumer guide](docs/daemon.md)
-for the API, lifecycle and adoption path. See the [control-plane protocol and
-extension examples](docs/control-plane.md) and the direct [agent-registration
+for the API, lifecycle and adoption path. The [mux integration contract](docs/mux.md)
+covers physical guarantees, backend responsibilities and remaining cutover work.
+See the [control-plane protocol and extension examples](docs/control-plane.md)
+and the direct [agent-registration
 contract and publisher example](docs/agent-registration.md). Version control
 uses **jj**.
 

@@ -251,6 +251,10 @@ pub struct LaunchRequest {
     #[serde(default)]
     pub argv: Vec<String>,
     pub spawn_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// Environment variable carrying [`LaunchRequest::spawn_token`] to the child.
@@ -276,6 +280,27 @@ impl LaunchRequest {
         validate_command(&self.executable, &self.argv)?;
         if self.spawn_token.is_empty() || self.spawn_token.chars().any(char::is_control) {
             return Err("`spawn_token` must be non-empty printable text".to_string());
+        }
+        if let Some(cwd) = &self.cwd
+            && !cwd.starts_with('/')
+        {
+            return Err("`cwd` must be an absolute path".to_string());
+        }
+        if self.env.len() > 256 {
+            return Err("`env` names more than 256 entries".to_string());
+        }
+        if self.env.contains_key(LAUNCH_TOKEN_ENV) {
+            return Err(format!("`env` cannot set reserved `{LAUNCH_TOKEN_ENV}`"));
+        }
+        for (name, value) in &self.env {
+            if name.is_empty()
+                || !name.chars().enumerate().all(|(index, ch)| {
+                    ch.is_ascii_alphabetic() || ch == '_' || (index > 0 && ch.is_ascii_digit())
+                })
+                || value.chars().any(char::is_control)
+            {
+                return Err("`env` contains an invalid name or value".to_string());
+            }
         }
         Ok(())
     }
@@ -883,6 +908,10 @@ pub trait RuntimeProvider: Send + Sync {
     /// An adapter that has to type the command into a pane shell reports
     /// [`LaunchOutcome::Refused`] for an argv holding a newline: a multi-line
     /// line has no consumption acknowledgement, so the daemon does not type one.
+    fn validate_launch(&self, request: &LaunchRequest) -> Result<(), String> {
+        request.validate()
+    }
+
     fn launch(&self, _request: &LaunchRequest, _cancel: &AtomicBool) -> LaunchOutcome {
         LaunchOutcome::Refused("this runtime does not implement launch".to_string())
     }
@@ -945,6 +974,10 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn input(&self, request: &InputRequest, cancel: &AtomicBool) -> InputOutcome {
         (**self).input(request, cancel)
+    }
+
+    fn validate_launch(&self, request: &LaunchRequest) -> Result<(), String> {
+        (**self).validate_launch(request)
     }
 
     fn launch(&self, request: &LaunchRequest, cancel: &AtomicBool) -> LaunchOutcome {

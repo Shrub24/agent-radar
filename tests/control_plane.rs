@@ -403,12 +403,23 @@ const SPAWN_CAPABILITIES: &[&str] = &[
     "reporting",
     "launch",
     "close",
+    "child_launch_context_v1",
 ];
 
 /// The daemon's own registry capability is advertised alongside whatever mux
 /// capabilities the backend declares.
 fn advertised(backend: &[&str]) -> Value {
-    let mut capabilities: Vec<Value> = backend.iter().map(|name| json!(name)).collect();
+    let mut capabilities: Vec<Value> = backend
+        .iter()
+        .filter(|name| **name != "child_launch_context_v1")
+        .map(|name| json!(name))
+        .collect();
+    if backend.contains(&"child_launch_context_v1")
+        && backend.contains(&"creation")
+        && backend.contains(&"launch")
+    {
+        capabilities.push(json!("child_launch_context_v1"));
+    }
     capabilities.push(json!("agent_registry"));
     Value::Array(capabilities)
 }
@@ -742,6 +753,9 @@ impl RuntimeProvider for MuxBackend {
             ReportAnswer::Refused(message) => ReportOutcome::Refused(message.clone()),
             ReportAnswer::Unknown(message) => ReportOutcome::Unknown(message.clone()),
         }
+    }
+    fn validate_launch(&self, request: &LaunchRequest) -> Result<(), String> {
+        request.validate()
     }
     fn launch(&self, request: &LaunchRequest, _cancel: &AtomicBool) -> LaunchOutcome {
         self.launch_requests
@@ -1978,6 +1992,7 @@ const OTHER_INCARNATION: &str = "5b2e8c41-0a7d-4f36-b1d9-6c3a7e5f8b1d";
 /// Registers one runtime subject that names where it lives, so a spawn can be
 /// asked for under the pane it registered.
 fn registered_parent(client: &mut Client, incarnation: &str, pane: &str) -> String {
+    const SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let mut body = registration_body(incarnation, None, None);
     body["location"] = json!({
         "backend": "herdr",
@@ -1986,7 +2001,13 @@ fn registered_parent(client: &mut Client, incarnation: &str, pane: &str) -> Stri
         "pane": pane,
     });
     let response = client.call("agent.register", body);
-    agent_id(&response)
+    let id = agent_id(&response);
+    let context = client.call("agent.context", json!({"agent_id":id,"publisher":{"source":"test-publisher","incarnation":incarnation},"sequence":1,"lease_ms":10000,"context":{"session":SESSION}}));
+    assert!(
+        context.get("result").is_some(),
+        "context publish failed: {context}"
+    );
+    id
 }
 
 /// The spawn request one caller sends: a parent subject and the command it
@@ -1995,6 +2016,7 @@ fn spawn_params(parent: &str, executable: &str, argv: &[&str]) -> Value {
     json!({
         "request": {
             "parent": parent,
+            "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
             "executable": executable,
             "argv": argv,
         },
@@ -3119,12 +3141,42 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
     let backend = MuxBackend::new(MUX_CAPABILITIES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let mut unsupported = spawn_params(&parent, "/usr/bin/pi", &[]);
+    unsupported["request"]["cwd"] = json!("/private");
+    assert_eq!(error_code(&client.call("spawn", unsupported)), "bad_params");
+    assert!(backend.creates().is_empty());
+    assert!(backend.launches().is_empty());
+    assert_eq!(edges_written(&sandbox.state()), 0);
 
     let ping = client.call("ping", json!({}));
     assert_eq!(
         ping["result"]["capabilities"],
         advertised(MUX_CAPABILITIES),
         "a backend that does not implement launch advertises only its actual capabilities"
+    );
+    let duplicate = [
+        "observe",
+        "process_info",
+        "creation",
+        "input",
+        "output",
+        "reporting",
+        "child_launch_context_v1",
+        "child_launch_context_v1",
+    ];
+    let ping_again = client.call("ping", json!({}));
+    let advertised_caps = ping_again["result"]["capabilities"].as_array().unwrap();
+    assert_eq!(
+        advertised_caps
+            .iter()
+            .filter(|cap| cap.as_str() == Some("child_launch_context_v1"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        advertised_caps,
+        &advertised(&duplicate).as_array().unwrap().clone()
     );
     let refusal = Operation::readiness("spawn", "launch", backend.capabilities)
         .expect_err("launch is not implemented by this backend");
@@ -3161,7 +3213,9 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
 
     let id = random_uuid();
-    let params = spawn_params(&parent, "/usr/bin/pi", &["--child", "row one"]);
+    let mut params = spawn_params(&parent, "/usr/bin/pi", &["--child", "row one"]);
+    params["request"]["cwd"] = json!("/work dir");
+    params["request"]["env"] = json!({"SECRET": "PRIVATE_ENV_SENTINEL_8812"});
     let response = client.call_id(&id, "spawn", params.clone());
 
     let record = result_record(&response);
@@ -3180,6 +3234,10 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     // the child was created for.
     let spawn = &response["result"]["spawn"];
     assert_eq!(spawn["parent"], json!(parent));
+    assert_eq!(
+        spawn["parent_session_id"],
+        "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+    );
     assert_eq!(spawn["created"], "completed");
     assert_eq!(spawn["launched"], "completed");
     assert_eq!(
@@ -3207,6 +3265,8 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
 
     // The command launched is the caller's own, unchanged, in the pane the create
     // named, carrying the token the edge minted.
+    let response_text = response.to_string();
+    assert!(!response_text.contains("PRIVATE_ENV_SENTINEL_8812"));
     let launches = backend.launches();
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].pane_id, "wA:p2");
@@ -3215,6 +3275,8 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
         launches[0].argv,
         vec!["--child".to_string(), "row one".into()]
     );
+    assert_eq!(launches[0].cwd.as_deref(), Some("/work dir"));
+    assert_eq!(launches[0].env["SECRET"], "PRIVATE_ENV_SENTINEL_8812");
     let token = recorded_edge(&sandbox.state(), &id)["token"]
         .as_str()
         .expect("a minted token")
@@ -3224,6 +3286,33 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     // credential: it travels to the pane and appears in no answer.
     no_secret(&response, &token);
     no_secret(&client.call("request", json!({"id": id})), &token);
+
+    let secret = "PRIVATE_ENV_SENTINEL_8812";
+    let get = client.call("request", json!({"id": id}));
+    let list = client.call("requests", json!({"limit": 20}));
+    no_secret(&get, secret);
+    no_secret(&list, secret);
+    let replay = client.call_id(&id, "spawn", params.clone());
+    no_secret(&replay, secret);
+    assert_eq!(backend.creates().len(), 1);
+    assert_eq!(backend.launches().len(), 1);
+
+    let mut changed_env = params.clone();
+    changed_env["request"]["env"]["SECRET"] = json!("DIFFERENT_PRIVATE_ENV");
+    let changed_env_response = client.call_id(&id, "spawn", changed_env);
+    assert_eq!(error_code(&changed_env_response), "refused");
+    no_secret(&changed_env_response, "DIFFERENT_PRIVATE_ENV");
+    assert_eq!(backend.creates().len(), 1);
+    assert_eq!(backend.launches().len(), 1);
+
+    let mut changed = params.clone();
+    changed["request"]["cwd"] = json!("/different");
+    assert_eq!(
+        error_code(&client.call_id(&id, "spawn", changed)),
+        "refused"
+    );
+    assert_eq!(backend.creates().len(), 1);
+    assert_eq!(backend.launches().len(), 1);
 
     // A spawn types nothing of its own and touches no lifecycle: the launch is the
     // only thing written to the pane.
@@ -3242,8 +3331,8 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
         fs::read_dir(sandbox.state().join("publications"))
             .expect("the publications directory")
             .count(),
-        0,
-        "a spawn authors no assignment fact"
+        1,
+        "only the parent's session context is published"
     );
     daemon.stop();
 }
@@ -3339,18 +3428,33 @@ fn a_replayed_spawn_request_id_answers_the_recorded_effects_once() {
 #[test]
 fn a_refused_spawn_launch_leaves_the_created_pane_named() {
     let sandbox = Sandbox::new("spawn-launch-refused");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
-        .launching(LaunchAnswer::Refused("the pane refused the line".into()));
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES).launching(LaunchAnswer::Refused(
+        "echo SECRET_VALUE PI_RADAR_SPAWN_TOKEN=secret-token".into(),
+    ));
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
 
     let id = random_uuid();
-    let response = client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let mut params = spawn_params(&parent, "/usr/bin/pi", &[]);
+    params["request"]["env"] = json!({"SECRET": "SECRET_VALUE"});
+    let response = client.call_id(&id, "spawn", params);
+    let response_text = response.to_string();
+    assert!(!response_text.contains("SECRET_VALUE"));
+    assert!(!response_text.contains("secret-token"));
     let record = result_record(&response);
     assert_eq!(record["outcome"], "refused");
     assert_eq!(record["category"], "backend_refused");
-    assert_eq!(record["message"], "the pane refused the line");
+    assert_eq!(record["message"], "backend refused child launch");
+    let record_text = record.to_string();
+    assert!(!record_text.contains("SECRET_VALUE"));
+    assert!(!record_text.contains("secret-token"));
+    let fetched = client.call("request", json!({"id": id}));
+    no_secret(&fetched, "SECRET_VALUE");
+    no_secret(&fetched, "secret-token");
+    let listed = client.call("requests", json!({"limit": 20}));
+    no_secret(&listed, "SECRET_VALUE");
+    no_secret(&listed, "secret-token");
     assert_eq!(
         record["created"],
         json!({"kind": "pane", "id": "wA:p2"}),
@@ -3389,7 +3493,10 @@ fn an_unconfirmed_spawn_launch_reads_unknown_and_is_never_claimed_launched() {
     let record = result_record(&response);
     assert_eq!(record["outcome"], "unknown");
     assert_eq!(record["category"], "backend_unavailable");
-    assert_eq!(record["message"], "the pane never answered");
+    assert_eq!(
+        record["message"],
+        "child launch outcome is unknown; it will not be retried"
+    );
     assert_eq!(record["created"], json!({"kind": "pane", "id": "wA:p2"}));
     assert_eq!(
         record["effects"],
@@ -3436,6 +3543,8 @@ fn a_spawn_without_a_parent_pane_is_refused_before_any_effect() {
         registration_body(OTHER_INCARNATION, None, None),
     );
     let unlocatable = agent_id(&unlocatable);
+    let context = client.call("agent.context", json!({"agent_id":unlocatable,"publisher":{"source":"test-publisher","incarnation":OTHER_INCARNATION},"sequence":1,"lease_ms":10000,"context":{"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}}));
+    assert!(context.get("result").is_some());
     let no_pane = client.call("spawn", spawn_params(&unlocatable, "/usr/bin/pi", &[]));
     assert_eq!(error_code(&no_pane), "refused");
     assert!(
@@ -3448,6 +3557,59 @@ fn a_spawn_without_a_parent_pane_is_refused_before_any_effect() {
 
     assert!(backend.creates().is_empty());
     assert!(backend.launches().is_empty());
+    assert_eq!(edges_written(&sandbox.state()), 0);
+    daemon.stop();
+}
+
+/// Missing, stale, null and mismatched context on the named agent must not create.
+#[test]
+fn spawn_refuses_missing_stale_null_and_mismatched_exact_parent_context_before_create() {
+    const SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let sandbox = Sandbox::new("spawn-context-refusal");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = client.call(
+        "agent.register",
+        registration_body(PARENT_INCARNATION, None, None),
+    );
+    let parent = agent_id(&parent);
+
+    let missing = client.call("spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    assert_eq!(error_code(&missing), "refused");
+    assert!(edges_written(&sandbox.state()) == 0);
+
+    let mut writer_handle: Option<String> = None;
+    let mut publish = |client: &mut Client, sequence, session: Value| {
+        let mut params = json!({"agent_id":parent,"publisher":{"source":"test-publisher","incarnation":PARENT_INCARNATION},"sequence":sequence,"lease_ms":1000,"context":{"session":session}});
+        if let Some(handle) = &writer_handle {
+            params["writer_handle"] = json!(handle);
+        }
+        let response = client.call("agent.context", params);
+        if let Some(handle) = response["result"]["writer"]["handle"].as_str() {
+            writer_handle = Some(handle.to_string());
+        }
+        response
+    };
+    for (sequence, session, label) in [
+        (1, json!(null), "null"),
+        (2, json!("aa2b3c4d-e5f6-4a7b-8c9d-0e1f2a3b4c5d"), "mismatch"),
+    ] {
+        let published = publish(&mut client, sequence, session);
+        assert!(
+            published.get("result").is_some(),
+            "context rejected: {published}"
+        );
+        let refused = client.call("spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+        assert_eq!(error_code(&refused), "refused", "{label}: {refused}");
+        assert_eq!(backend.creates().len(), 0);
+        assert_eq!(edges_written(&sandbox.state()), 0);
+    }
+    publish(&mut client, 3, json!(SESSION));
+    thread::sleep(Duration::from_millis(1100));
+    let stale = client.call("spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    assert_eq!(error_code(&stale), "refused");
+    assert_eq!(backend.creates().len(), 0);
     assert_eq!(edges_written(&sandbox.state()), 0);
     daemon.stop();
 }
@@ -3484,22 +3646,44 @@ fn the_wire_shapes_of_spawn_are_validated_before_dispatch() {
                 "executable": "/usr/bin/pi",
                 "command": "pi",
             }}),
-            "unknown field",
+            "`request` is not a valid spawn request",
         ),
         (
             "a request with no command",
-            json!({"request": {"parent": &parent}}),
-            "missing field `executable`",
+            json!({"request": {"parent": &parent, "parent_session_id":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}}),
+            "`request` is not a valid spawn request",
         ),
         (
             "no request at all",
             json!({"requester": "test"}),
             "`request` is required",
         ),
+        (
+            "reserved launch token",
+            {
+                let mut value = spawn_params(&parent, "/usr/bin/pi", &[]);
+                value["request"]["env"] = json!({"PI_RADAR_SPAWN_TOKEN":"WIRE_SECRET_SENTINEL"});
+                value
+            },
+            "cannot set reserved",
+        ),
+        (
+            "invalid environment value type",
+            {
+                let mut value = spawn_params(&parent, "/usr/bin/pi", &[]);
+                value["request"]["env"] = json!({"SAFE":["WIRE_SECRET_SENTINEL"]});
+                value
+            },
+            "`request` is not a valid spawn request",
+        ),
     ];
     for (case, params, expected) in cases {
         let response = client.call("spawn", params);
         assert_eq!(error_code(&response), "bad_params", "{case}: {response}");
+        assert!(
+            !response.to_string().contains("WIRE_SECRET_SENTINEL"),
+            "{case}: {response}"
+        );
         assert!(
             response["error"]["message"]
                 .as_str()

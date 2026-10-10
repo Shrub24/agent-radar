@@ -711,6 +711,14 @@ fn handle_line(
                     None => ("none", Vec::new()),
                 }
             };
+            let launch_context_supported = capabilities
+                .contains(&ops::CHILD_LAUNCH_CONTEXT_CAPABILITY)
+                && capabilities.contains(&ops::LAUNCH_CAPABILITY)
+                && capabilities.contains(&"creation");
+            capabilities.retain(|capability| *capability != ops::CHILD_LAUNCH_CONTEXT_CAPABILITY);
+            if launch_context_supported {
+                capabilities.push(ops::CHILD_LAUNCH_CONTEXT_CAPABILITY);
+            }
             capabilities.push("agent_registry");
             answer(
                 writer,
@@ -1878,6 +1886,23 @@ fn bounded(read: OutputRead) -> OutputRead {
     }
 }
 
+/// The public operation projection omits launch environment values while the
+/// private stored record retains them for exact replay comparison.
+fn public_record(record: RequestRecord) -> serde_json::Value {
+    let mut value = serde_json::to_value(record).expect("request records serialize");
+    if let Some(params) = value.get_mut("params") {
+        if let Some(request) = params.get_mut("request")
+            && let Some(object) = request.as_object_mut()
+        {
+            object.remove("env");
+        }
+        if let Some(object) = params.as_object_mut() {
+            object.remove("env");
+        }
+    }
+    value
+}
+
 /// One record, by id.
 fn read_one(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     let id = match request.required_string("id") {
@@ -1886,7 +1911,7 @@ fn read_one(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     };
     let core = locked(core);
     match core.store.get(&id) {
-        Ok(Some(record)) => Response::ok(&request.id, json!({ "request": record })),
+        Ok(Some(record)) => Response::ok(&request.id, json!({ "request": public_record(record) })),
         Ok(None) => Response::refused(
             &request.id,
             &Refusal::new(Code::NotFound, format!("no request {id}")),
@@ -1903,7 +1928,10 @@ fn read_many(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     };
     let core = locked(core);
     match core.store.recent(limit) {
-        Ok(records) => Response::ok(&request.id, json!({ "requests": records })),
+        Ok(records) => Response::ok(
+            &request.id,
+            json!({ "requests": records.into_iter().map(public_record).collect::<Vec<_>>() }),
+        ),
         Err(message) => Response::refused(&request.id, &Refusal::new(Code::Internal, message)),
     }
 }
@@ -1928,7 +1956,7 @@ fn execute_unsupported(
             if record.method == operation.as_str()
                 && record.params.as_ref() == Some(&request.params) =>
         {
-            return Response::ok(&request.id, json!({"request": record}));
+            return Response::ok(&request.id, json!({"request": public_record(record)}));
         }
         Ok(Some(_)) => {
             return Response::refused(
@@ -1982,7 +2010,7 @@ fn execute_unsupported(
     if let Err(error) = core.store.create(&record) {
         return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
     }
-    Response::ok(&request.id, json!({"request": record}))
+    Response::ok(&request.id, json!({"request": public_record(record)}))
 }
 
 /// Validates, records and dispatches one effectful operation without holding
@@ -2046,7 +2074,7 @@ fn admit(
             if same {
                 return Admission::Answered(Response::ok(
                     &request.id,
-                    json!({ "request": record }),
+                    json!({ "request": public_record(record.clone()) }),
                 ));
             }
             let message = if record.params.is_none() {
@@ -2586,9 +2614,14 @@ fn execute_report(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
 #[serde(deny_unknown_fields)]
 struct SpawnParams {
     parent: String,
+    parent_session_id: String,
     executable: String,
     #[serde(default)]
     argv: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 
 /// Validates, records and dispatches one managed child spawn.
@@ -2608,12 +2641,12 @@ fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
     };
     let params: SpawnParams = match serde_json::from_value(frozen) {
         Ok(params) => params,
-        Err(error) => {
+        Err(_error) => {
             return Response::refused(
                 &request.id,
                 &Refusal::new(
                     Code::BadParams,
-                    format!("`request` is not a spawn request: {error}"),
+                    "`request` is not a valid spawn request".to_string(),
                 ),
             );
         }
@@ -2623,9 +2656,47 @@ fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
     if let Err(message) = validate_command(&params.executable, &params.argv) {
         return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
     }
+    let launch_context = LaunchRequest {
+        pane_id: "preflight".to_string(),
+        executable: params.executable.clone(),
+        argv: params.argv.clone(),
+        spawn_token: "00000000-0000-0000-0000-000000000000".to_string(),
+        cwd: params.cwd.clone(),
+        env: params.env.clone(),
+    };
+    let preflight = {
+        let core = locked(core);
+        core.backend.as_ref().map(|backend| {
+            if (!params.env.is_empty() || params.cwd.is_some())
+                && !backend
+                    .capabilities()
+                    .contains(&ops::CHILD_LAUNCH_CONTEXT_CAPABILITY)
+            {
+                Err("selected backend does not support launch context".to_string())
+            } else {
+                backend.validate_launch(&launch_context)
+            }
+        })
+    };
+    match preflight {
+        Some(Err(message)) => {
+            return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+        }
+        None if params.cwd.is_some() || !params.env.is_empty() => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BackendUnavailable,
+                    "selected backend does not support launch context",
+                ),
+            );
+        }
+        _ => {}
+    }
     let intent = registry::SpawnRequest {
         request_id: request.id.clone(),
         parent: params.parent.clone(),
+        parent_session_id: params.parent_session_id.clone(),
     };
     if let Err(message) = intent.validate() {
         return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
@@ -2650,6 +2721,29 @@ fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
                 return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
             }
         };
+        let context = match core.registry.context(&params.parent, store::now_ms()) {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::Refused, "parent has no published session context"),
+                );
+            }
+            Err(error) => {
+                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+            }
+        };
+        if context.context.freshness != registry::Freshness::Fresh
+            || context.context.session.as_deref() != Some(&params.parent_session_id)
+        {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::Refused,
+                    "parent session context is absent, stale or mismatched",
+                ),
+            );
+        }
         match parent
             .request
             .location
@@ -2777,18 +2871,22 @@ fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
                     executable: params.executable.clone(),
                     argv: params.argv.clone(),
                     spawn_token: edge.token.clone(),
+                    cwd: params.cwd.clone(),
+                    env: params.env.clone(),
                 },
                 &cancel,
             )
         });
     let (launched_outcome, launch_message) = match &launched {
         Some(LaunchOutcome::Completed) => (Some(RequestOutcome::Completed), None),
-        Some(LaunchOutcome::Refused(message)) => {
-            (Some(RequestOutcome::Refused), Some(message.clone()))
-        }
-        Some(LaunchOutcome::Unknown(message)) => {
-            (Some(RequestOutcome::Unknown), Some(message.clone()))
-        }
+        Some(LaunchOutcome::Refused(_)) => (
+            Some(RequestOutcome::Refused),
+            Some("backend refused child launch".to_string()),
+        ),
+        Some(LaunchOutcome::Unknown(_)) => (
+            Some(RequestOutcome::Unknown),
+            Some("child launch outcome is unknown; it will not be retried".to_string()),
+        ),
         None => (None, None),
     };
     let edge = match launched_outcome {
@@ -2882,7 +2980,7 @@ fn settle_spawn(
     match core.store.write(&record) {
         Ok(()) => Response::ok(
             &request.id,
-            json!({ "request": record, "spawn": edge.public() }),
+            json!({ "request": public_record(record), "spawn": edge.public() }),
         ),
         Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     }
@@ -2905,9 +3003,10 @@ fn spawn_answer(request: &Request, response: Response, core: &Arc<Mutex<Core>>) 
         core.registry.spawn_edge(&request.id)
     };
     match (edge, result.get("request").cloned()) {
-        (Ok(Some(edge)), Some(record)) => {
-            Response::ok(&id, json!({ "request": record, "spawn": edge.public() }))
-        }
+        (Ok(Some(edge)), Some(record)) => Response::ok(
+            &id,
+            json!({ "request": public_record(serde_json::from_value(record).expect("stored public record shape")), "spawn": edge.public() }),
+        ),
         _ => Response::ok(&id, result),
     }
 }
@@ -2916,7 +3015,7 @@ fn spawn_answer(request: &Request, response: Response, core: &Arc<Mutex<Core>>) 
 fn write_settled(request: &Request, record: RequestRecord, core: &Arc<Mutex<Core>>) -> Response {
     let core = locked(core);
     match core.store.write(&record) {
-        Ok(()) => Response::ok(&request.id, json!({ "request": record })),
+        Ok(()) => Response::ok(&request.id, json!({ "request": public_record(record) })),
         Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     }
 }
