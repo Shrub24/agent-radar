@@ -36,10 +36,10 @@ def fixture_pairs():
             (ROOT / "docs/agent-registration.fixture.jsonl").read_text().splitlines() if line]
     check(len(rows) % 2 == 0, "fixture must contain request/response pairs")
     pairs = list(zip(rows[::2], rows[1::2]))
-    expected = ["agent.register", "agent.acquire", "agent.publish",
-                "agent.context", "agent.context", "agent.context", "agent.context",
-                "agent.get", "agent.list", "agent.context", "agent.retire",
-                "spawn", "agent.register", "spawn.get", "spawn.list", "spawn",
+    expected = ["agent.register", "events.read", "events.read", "events.read",
+                "agent.acquire", "agent.publish", "agent.context", "agent.context",
+                "agent.context", "agent.context", "agent.get", "agent.list", "agent.context",
+                "agent.retire", "spawn", "agent.register", "spawn.get", "spawn.list", "spawn",
                 "child.close", "child.close"]
     actual = []
     for request, response in pairs:
@@ -52,6 +52,8 @@ def fixture_pairs():
         check(set(response) == {"kind", "id", "result"}, f"invalid response envelope: {response}")
         actual.append(request["method"])
     check(actual == expected, f"fixture methods are {actual}")
+    events = [pair for pair in pairs if pair[0]["method"] == "events.read"]
+    check(len(events) == 3, "fixture needs normal, empty-wait and expired event reads")
     close_pair = [pair for pair in pairs if pair[0]["method"] == "child.close"]
     check(len(close_pair) == 2, "fixture must contain close and identical replay")
     check(close_pair[0][0]["id"] == close_pair[1][0]["id"],
@@ -68,11 +70,36 @@ def validate_fixture(path):
     pairs = fixture_pairs()
     handles, agent_id = {}, None
     previous_context = None
+    event_epoch = None
     get_template = next(response["result"]["agent"] for request, response in pairs
                         if request["method"] == "agent.get")
     for request, response in pairs:
         method = request["method"]
         if method in ("spawn", "spawn.get", "spawn.list", "child.close"):
+            continue
+        if method == "events.read":
+            params = json.loads(json.dumps(request["params"]))
+            if params.get("epoch") == "<journal-epoch>":
+                check(event_epoch is not None,
+                      "fixture resumes from an epoch before reading one")
+                params["epoch"] = event_epoch
+            elif params.get("epoch") == "<old-journal-epoch>":
+                params["epoch"] = "old-epoch-for-fixture"
+            actual = call(path, method, params)
+            expected = json.loads(json.dumps(response["result"]))
+            if "cursor_expired" in expected:
+                expired = actual["cursor_expired"]
+                expected["cursor_expired"]["epoch"] = expired["epoch"]
+                expected["cursor_expired"]["cursor"]["epoch"] = expired["epoch"]
+            else:
+                if event_epoch is None:
+                    event_epoch = actual["epoch"]
+                expected["epoch"] = actual["epoch"]
+                expected["cursor"]["epoch"] = actual["epoch"]
+                for event, served in zip(expected["events"], actual["events"]):
+                    event["agent_id"] = agent_id
+                    event["at"] = served["at"]
+            check(actual == expected, f"fixture events.read differs:\nactual={actual}\nexpected={expected}")
             continue
         params = json.loads(json.dumps(request["params"]))
         if method == "agent.register" and "spawn_token" in params:
@@ -379,11 +406,16 @@ def main():
         daemon = spawn_daemon(binary, socket_path, state_path)
         try:
             validate_fixture(socket_path)
+            check("events_v1" in call(socket_path, "ping", {})["capabilities"],
+                  "events_v1 capability missing")
             ping = call(socket_path, "ping", {})
             check("agent_registry" in ping["capabilities"], f"capability missing: {ping}")
 
             registered, channel = publisher.publish_assignment(
                 socket_path, registration, identity, snapshot, 1, lease_ms=1000)
+            event_read = call(socket_path, "events.read", {"after": 0, "limit": 100})
+            check(any(event.get("agent_id") == registered["agent_id"] for event in event_read["events"]),
+                  "events consumer fixture did not observe the registered agent")
             agent_id, old_writer = registered["agent_id"], channel["writer"]
             check(channel["snapshot"]["freshness"] == "fresh", str(channel))
             check(channel["snapshot"]["lease_ms"] == 1000, str(channel))
@@ -487,13 +519,17 @@ def main():
                 "agent_id": agent_id, "channel": "assignment", "writer_handle": binding["handle"],
             })["channel"]
             check(retired["writer"]["retired_at"] is not None, str(retired))
-            print("PASS: live registry fixture; trusted disposable daemon; register/acquire/publish/context/get/list/retire; "
+            print("PASS: live registry and event fixtures; trusted disposable daemon; register/acquire/publish/context/get/list/retire/events.read; "
                   "session switch/null; privacy; replay/heartbeat; replacement/fencing; restart freshness")
         finally:
             stop_daemon(daemon)
         spawn_socket, spawn_state = root / "spawn.sock", root / "spawn-state"
         validate_spawn_scripted(binary, spawn_socket, spawn_state, root,
                                 (ROOT / "tests/fixtures/fake-herdr.py").read_text())
+        smoke = subprocess.run([sys.executable, str(ROOT / "tests/fixtures/events_consumer_smoke.py"),
+                                str(binary)], capture_output=True, text=True, timeout=20)
+        check(smoke.returncode == 0, f"events consumer smoke failed: {smoke.stdout} {smoke.stderr}")
+        print(smoke.stdout.strip())
         print("PASS: scripted Herdr spawn; child token binding; spawn.get/list freshness and redaction; "
               "verified child close with same-ID replay, unchanged publications and topology")
 

@@ -599,6 +599,7 @@ pub fn acquire_writer(
         .get(&request.agent_id)?
         .ok_or_else(|| format!("agent {} is not registered", request.agent_id))?;
     let existing = read_record(registry, &request.agent_id, request.channel)?;
+    let is_new = existing.is_none();
     let record = match (existing, &request.replace) {
         (None, None) => ChannelRecord {
             version: PUBLICATION_VERSION,
@@ -632,6 +633,16 @@ pub fn acquire_writer(
     };
     let binding = record.writer.clone();
     write_record(registry, &record)?;
+    registry.append_event(
+        if is_new {
+            "publication.writer"
+        } else {
+            "publication.writer_replaced"
+        },
+        Some(&request.agent_id),
+        None,
+        None,
+    );
     Ok(binding)
 }
 
@@ -727,6 +738,15 @@ pub fn publish(
         }),
     };
     write_record(registry, &updated)?;
+    registry.append_event(
+        match request.channel {
+            Channel::Execution => "execution.published",
+            Channel::Assignment => "assignment.published",
+        },
+        Some(&request.agent_id),
+        None,
+        None,
+    );
     Ok(updated)
 }
 
@@ -756,6 +776,15 @@ pub fn retire(
         ..record
     };
     write_record(registry, &updated)?;
+    registry.append_event(
+        match channel {
+            Channel::Execution => "execution.retired",
+            Channel::Assignment => "assignment.retired",
+        },
+        Some(agent_id),
+        None,
+        None,
+    );
     Ok(updated)
 }
 

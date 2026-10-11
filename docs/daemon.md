@@ -78,6 +78,7 @@ processes running as the same user. Do not expose this socket remotely.
 | Physical observations | `observe`, `process_info`, `output` | Respective mux capability |
 | Physical mutations | `focus`, `close`, `create`, `input`, `report`, `spawn` | Respective mux capabilities (`spawn`: `creation` + `launch`) |
 | Mutation readback | `request`, `requests` | None |
+| Durable lifecycle events | `events.read` | `events_v1` |
 | Register a subject | `agent.register` | `agent_registry` |
 | Acquire or explicitly replace a channel writer | `agent.acquire` | `agent_registry` |
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `agent_registry` |
@@ -85,6 +86,8 @@ processes running as the same user. Do not expose this socket remotely.
 | Public registry reads | `agent.get`, `agent.list` | `agent_registry` |
 | Spawn topology reads | `spawn.get`, `spawn.list` | `agent_registry`; location confirmation additionally uses `observe` when available |
 | Close a daemon-created child pane | `child.close` | `agent_registry` plus mux `observe` and `close` |
+
+Use `events.read` to resume ordered journal pointers with bounded long polling; it does not replace current-state reads. On `cursor_expired`, resynchronise using paged `agent.list` and `spawn.list`, plus `requests` for operation records, then resume from the returned cursor. Events may be lost between fact durability and append, so an unclean restart changes the epoch. Absence of an event is not evidence of freshness or liveness.
 
 Use the method references for parameter and result shapes rather than treating
 this table as a second schema. Unsupported methods/capabilities are not an
@@ -206,6 +209,7 @@ separately.
 ## Examples and compatibility
 
 - [Reconnecting owner publisher](../examples/agent-publisher/publisher.py)
+- [Reconnecting events consumer](../examples/agent-publisher/events_consumer.py)
 - [Registry and spawn exchanges](agent-registration.fixture.jsonl)
 - [Mux exchanges](control-plane.fixture.jsonl)
 

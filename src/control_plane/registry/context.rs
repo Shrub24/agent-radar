@@ -386,6 +386,7 @@ pub fn publish(
         context: accepted,
     };
     write_record(registry, &record)?;
+    registry.append_event("context.updated", Some(&request.agent_id), None, None);
     Ok(ContextWrite {
         record,
         warning: None,
@@ -420,6 +421,7 @@ pub fn retire(
         ..record
     };
     write_record(registry, &updated)?;
+    registry.append_event("context.retired", Some(agent_id), None, None);
     Ok(updated)
 }
 

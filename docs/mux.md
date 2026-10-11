@@ -75,8 +75,12 @@ an untracked managed launch from generic operations.
 
 The daemon persists accepted work before effectful dispatch. Clients retain the
 operation UUID and reconcile durable readbacks; they do not fall back to another
-adapter after uncertainty. Read the protocol references for the separate generic
-operation, spawn-edge and managed-close record shapes.
+adapter after uncertainty. `events.read` with `events_v1` offers bounded polling
+for lifecycle journal pointers, but does not replace exact record reads. On
+`cursor_expired`, rebuild from paged registry/topology reads and request listings;
+then resume from the returned cursor. Events can be lost after a fact is durable,
+so an unclean restart changes epoch. Read the protocol references for event,
+generic operation, spawn-edge and managed-close record shapes.
 
 ## Launch and binding
 

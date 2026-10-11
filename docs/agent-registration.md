@@ -14,11 +14,14 @@ exercised against a disposable daemon by
 `<opaque-uuid>`, `<replacement-opaque-uuid>`, `<replay-warning>`,
 `<spawn-request-id>`, `<child-agent-id>`, `<child-incarnation>`, `<boot-id>`
 and `<private-spawn-token>` placeholders for generated values, identities and
-timestamps. Fixture validation replays registry exchanges against a disposable daemon and
-compares each response against its template, substituting only generated and
-clock-derived fields. The spawn exchanges use a disposable scripted Herdr
-socket; these validate the served daemon's operation, token binding and public
-redaction without a live mux or partial whole-object comparison. The final
+timestamps, plus `<journal-epoch>` for the daemon's current journal epoch and
+`<old-journal-epoch>` for one no daemon still has, so the fixture can show
+`cursor_expired` resynchronisation. Fixture validation replays registry and
+journal exchanges against a disposable daemon and compares each response
+against its template, substituting only generated and clock-derived fields.
+The spawn exchanges use a disposable scripted Herdr socket; these validate the
+served daemon's operation, token binding and public redaction without a live
+mux or partial whole-object comparison. The final
 `child.close` exchanges close the spawned child pane after a scripted
 foreground-process identity match and replay the same request id, which must
 return the recorded result instead of dispatching again. The smoke publishes
@@ -112,8 +115,9 @@ root are unsupported for concurrent writes.
 
 The trusted control socket serves `agent.register`, `agent.acquire`,
 `agent.publish`, `agent.retire`, `agent.context`, `agent.get`, `agent.list`,
-`spawn`, `spawn.get`, `spawn.list` and `child.close`. `ping` advertises
-`agent_registry` regardless of mux backend. The `agent.*` methods are
+`spawn`, `spawn.get`, `spawn.list` and `child.close`, plus the journal read
+`events.read`. `ping` advertises `agent_registry` and `events_v1` regardless of
+mux backend. The `agent.*` methods are
 independent of the physical backend and do not call Herdr. `spawn` is
 different: it requires both backend capabilities `creation` and `launch`;
 `spawn.get` and `spawn.list` are registry reads, available with

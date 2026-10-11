@@ -124,6 +124,8 @@ pub enum Method {
     Requests,
     /// A mux read. Served from a backend, and never recorded.
     Read,
+    /// Resumable read of the durable event journal.
+    Events,
     /// Registry reads and writes: the daemon's own durable records, answered
     /// whether or not a mux backend is wired.
     Registry,
@@ -138,6 +140,7 @@ pub fn classify(method: &str) -> Option<Method> {
         "ping" => Method::Ping,
         "request" => Method::Request,
         "requests" => Method::Requests,
+        "events.read" => Method::Events,
         "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
         | "agent.get" | "agent.list" => Method::Registry,
         // A spawn read reports the daemon's own edge records; whether the backend
@@ -192,6 +195,7 @@ mod tests {
         assert_eq!(classify("ping"), Some(Method::Ping));
         assert_eq!(classify("request"), Some(Method::Request));
         assert_eq!(classify("requests"), Some(Method::Requests));
+        assert_eq!(classify("events.read"), Some(Method::Events));
         assert_eq!(classify("agent.context"), Some(Method::Registry));
         assert_eq!(classify("spawn.get"), Some(Method::Registry));
         assert_eq!(classify("spawn.list"), Some(Method::Registry));

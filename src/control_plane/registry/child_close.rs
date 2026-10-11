@@ -216,6 +216,12 @@ pub fn record(
         recorded_at: format_millis(now_ms),
     };
     write_close(registry, &close)?;
+    registry.append_event(
+        "child_close.requested",
+        None,
+        Some(&close.spawn_request_id),
+        Some(&close.request_id),
+    );
     Ok(CloseAdmission::Admitted(close))
 }
 
@@ -237,12 +243,22 @@ pub fn record_outcome(
     let stored = read_close(registry, request_id)?.ok_or_else(|| {
         format!("child close request {request_id} has no recorded request to settle")
     })?;
+    let storable = storable_message(message);
+    if stored.outcome == outcome && stored.message == storable {
+        return Ok(stored);
+    }
     let close = ChildClose {
         outcome,
-        message: storable_message(message),
+        message: storable,
         ..stored
     };
     write_close(registry, &close)?;
+    registry.append_event(
+        "child_close.outcome",
+        None,
+        Some(&close.spawn_request_id),
+        Some(&close.request_id),
+    );
     Ok(close)
 }
 

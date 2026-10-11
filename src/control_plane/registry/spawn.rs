@@ -294,6 +294,12 @@ pub fn record(
         recorded_at: format_millis(now_ms),
     };
     write_edge(registry, &edge)?;
+    registry.append_event(
+        "spawn.requested",
+        Some(&edge.parent),
+        None,
+        Some(&edge.request_id),
+    );
     Ok(edge)
 }
 
@@ -319,6 +325,7 @@ pub fn record_created(
         ..stored
     };
     write_edge(registry, &edge)?;
+    registry.append_event("spawn.create_effect", None, None, Some(request_id));
     Ok(edge)
 }
 
@@ -335,8 +342,12 @@ pub fn record_launched(
     canonical_uuid("request_id", request_id)?;
     let _transition = registry.transition();
     let stored = stored_edge(registry, request_id)?;
+    if stored.launched == launched {
+        return Ok(stored);
+    }
     let edge = SpawnEdge { launched, ..stored };
     write_edge(registry, &edge)?;
+    registry.append_event("spawn.launched", None, None, Some(request_id));
     Ok(edge)
 }
 
@@ -493,6 +504,7 @@ fn bind_locked(
                     ..stored
                 };
                 write_edge(registry, &edge)?;
+                registry.append_event("spawn.bound", Some(agent_id), None, Some(&edge.request_id));
                 return Ok(edge);
             }
             return Ok(stored);
@@ -509,6 +521,7 @@ fn bind_locked(
         ..stored
     };
     write_edge(registry, &edge)?;
+    registry.append_event("spawn.bound", agent_id, None, Some(&edge.request_id));
     Ok(edge)
 }
 

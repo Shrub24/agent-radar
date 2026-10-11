@@ -352,6 +352,7 @@ pub struct Daemon {
     verification: Arc<VerificationBudget>,
     accept: Option<JoinHandle<()>>,
     socket_identity: (u64, u64),
+    core: Arc<Mutex<Core>>,
 }
 
 impl Daemon {
@@ -425,6 +426,7 @@ impl Daemon {
                 return Err(error);
             }
         };
+        registry.attach_journal(store.clone());
         let stopping = Arc::new(AtomicBool::new(false));
         let verification = Arc::new(VerificationBudget {
             active: Mutex::new(0),
@@ -469,6 +471,7 @@ impl Daemon {
             verification,
             accept: Some(accept),
             socket_identity,
+            core,
         })
     }
 
@@ -493,6 +496,10 @@ impl Daemon {
         }
         self.stop();
         Ok(())
+    }
+
+    fn core_store(&self) -> Option<Store> {
+        Some(locked(&self.core).store.clone())
     }
 
     /// Stops accepting, ends every connection, joins their threads, and removes
@@ -524,6 +531,9 @@ impl Daemon {
             let _ = worker.join();
         }
         self.verification.detach_remaining();
+        if let Some(core) = self.core_store() {
+            let _ = core.finish_journal();
+        }
         let _ = remove_socket_if_owned(&self.path, self.socket_identity);
     }
 }
@@ -638,7 +648,9 @@ fn serve(
     let mut reader = BufReader::new(stream);
     while !stopping.load(Ordering::SeqCst) {
         match protocol::read_line(&mut reader) {
-            Ok(protocol::Line::Data(line)) => handle_line(&line, id, core, &writer, verification),
+            Ok(protocol::Line::Data(line)) => {
+                handle_line(&line, id, core, &writer, verification, stopping)
+            }
             // An over-long line is drained already, so the connection is still at
             // a line boundary and can keep serving.
             Ok(protocol::Line::TooLong) => answer(
@@ -676,6 +688,7 @@ fn handle_line(
     core: &Arc<Mutex<Core>>,
     writer: &Arc<Mutex<UnixStream>>,
     verification: &Arc<VerificationBudget>,
+    stopping: &Arc<AtomicBool>,
 ) {
     let request = match protocol::decode_request(line) {
         Ok(request) => request,
@@ -720,6 +733,7 @@ fn handle_line(
                 capabilities.push(ops::CHILD_LAUNCH_CONTEXT_CAPABILITY);
             }
             capabilities.push("agent_registry");
+            capabilities.push("events_v1");
             answer(
                 writer,
                 Response::ok(
@@ -734,6 +748,7 @@ fn handle_line(
         }
         Method::Request => answer(writer, read_one(core, &request)),
         Method::Requests => answer(writer, read_many(core, &request)),
+        Method::Events => answer(writer, read_events(core, &request, stopping)),
         Method::Registry => answer(writer, registry_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
         Method::Operation(operation) => {
@@ -1921,6 +1936,113 @@ fn read_one(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
 }
 
 /// Recent records, newest first, bounded.
+const DEFAULT_EVENT_LIMIT: usize = 100;
+const MAX_EVENT_LIMIT: usize = 500;
+const MAX_EVENT_WAIT_MS: u64 = 1_000;
+const MAX_EVENTS_RESPONSE_BYTES: usize = 512 * 1024;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventsReadParams {
+    #[serde(default)]
+    after: u64,
+    #[serde(default)]
+    epoch: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    wait_ms: Option<u64>,
+}
+
+fn read_events(core: &Arc<Mutex<Core>>, request: &Request, stopping: &Arc<AtomicBool>) -> Response {
+    let params: EventsReadParams = match decode_params(request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let limit = params.limit.unwrap_or(DEFAULT_EVENT_LIMIT);
+    if limit == 0 || limit > MAX_EVENT_LIMIT {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                format!("`limit` must be between 1 and {MAX_EVENT_LIMIT}"),
+            ),
+        );
+    }
+    let wait = params.wait_ms.unwrap_or(0);
+    if wait > MAX_EVENT_WAIT_MS {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                format!("`wait_ms` must not exceed {MAX_EVENT_WAIT_MS}"),
+            ),
+        );
+    }
+    let after = params.after;
+    let requested_epoch = params.epoch.as_deref();
+    let store = {
+        let core = locked(core);
+        core.store.clone()
+    };
+    let deadline = Instant::now() + Duration::from_millis(wait);
+    loop {
+        let generation = store.event_generation();
+        let (epoch, cursor, earliest) = match store.event_cursor() {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+            }
+        };
+        let events = match store.events() {
+            Ok(events) => events,
+            Err(error) => {
+                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+            }
+        };
+        if requested_epoch.is_some_and(|requested| requested != epoch)
+            || after > cursor
+            || after.saturating_add(1) < earliest
+        {
+            return Response::ok(
+                &request.id,
+                json!({"cursor_expired": {
+                    "epoch": epoch, "cursor": {"epoch": epoch, "sequence": cursor}, "earliest": earliest
+                }}),
+            );
+        }
+        let mut available = Vec::new();
+        let mut bytes = 0usize;
+        for event in events
+            .into_iter()
+            .filter(|event| event.seq > after)
+            .take(limit)
+        {
+            bytes += serde_json::to_vec(&event).map_or(0, |encoded| encoded.len());
+            if bytes > MAX_EVENTS_RESPONSE_BYTES {
+                break;
+            }
+            available.push(event);
+        }
+        if !available.is_empty()
+            || wait == 0
+            || stopping.load(Ordering::SeqCst)
+            || Instant::now() >= deadline
+        {
+            return Response::ok(
+                &request.id,
+                json!({
+                    "epoch": epoch, "events": available, "cursor": {"epoch": epoch, "sequence": cursor}, "earliest": earliest
+                }),
+            );
+        }
+        // Long polls occupy a bounded connection worker, but no Core/store lock.
+        // Short condvar slices make stop cancellation prompt without starving joins.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let _ = store.wait_for_event(generation, remaining.min(Duration::from_millis(25)));
+    }
+}
+
 fn read_many(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     let limit = match request.limit(DEFAULT_LISTED, MAX_LISTED) {
         Ok(limit) => limit,

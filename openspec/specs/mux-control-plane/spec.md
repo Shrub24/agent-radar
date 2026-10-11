@@ -143,3 +143,77 @@ and it SHALL NOT write a launch script.
 #### Scenario: Launch is not recovery
 - **WHEN** a launch completes
 - **THEN** nothing about a stopped, resumed or restarted process is claimed
+
+### Requirement: Committed daemon facts append ordered events
+The daemon SHALL append one event with a monotonic sequence immediately after each registry, publication, spawn or close fact it records is durable, and SHALL start a new journal epoch after an unclean stop so a possibly missing event is never silent. Events SHALL carry kind, subject identifiers and time only, never environment values, tokens or request bodies.
+
+#### Scenario: Publication committed
+- **WHEN** an execution publication is committed
+- **THEN** exactly one event with the next sequence names that agent
+
+#### Scenario: Unclean stop
+- **WHEN** the daemon restarts after a stop that did not complete cleanly
+- **THEN** the journal epoch changes and consumers resynchronise
+
+#### Scenario: Private launch data
+- **WHEN** a spawn with environment values is recorded
+- **THEN** its event contains no environment value or token
+
+### Requirement: Events are read by resumable long poll
+The daemon SHALL provide `events.read` taking a sequence `after`, optional last-seen `epoch`, bounded `limit` (1..=500, default 100) and bounded `wait_ms` (0..=1000, default 0). It returns ordered events after the cursor, or an empty list when the wait ends. The result carries current epoch, events, object cursor `{epoch, sequence}` and earliest retained sequence. It SHALL preserve JSON-lines framing and worker bounds, and advertise `events_v1`.
+
+#### Scenario: Waiting reader
+- **WHEN** a reader waits and a fact commits within the wait
+- **THEN** the reader receives that event before the wait ends
+
+#### Scenario: Shutdown during wait
+- **WHEN** the daemon stops while a reader waits
+- **THEN** the wait ends and workers are joined
+
+### Requirement: Lost history is explicit
+When retention has dropped events after the caller's sequence, or the supplied epoch differs from the journal epoch, the daemon SHALL return successful typed `cursor_expired` carrying the current epoch, cursor and earliest retained sequence, and SHALL NOT return a partial sequence as complete.
+
+#### Scenario: Expired cursor
+- **WHEN** a consumer resumes from a dropped sequence
+- **THEN** it receives `cursor_expired` and resynchronises from full reads (`agent.list`, `spawn.list` and request listings), then resumes from the returned cursor as `after` and `epoch`
+
+#### Scenario: First read after retention dropped history
+- **WHEN** a consumer reads with `after` zero after older events were dropped
+- **THEN** it may receive `cursor_expired` rather than a partial sequence
+
+#### Scenario: Stale epoch after an unclean restart
+- **WHEN** a consumer resumes with an epoch the journal no longer has
+- **THEN** it receives `cursor_expired` with the current epoch and cursor
+
+### Requirement: Events report facts, not inferences
+Events SHALL NOT report process exit, readiness or assignment outcome that the daemon has not recorded, and absence of an event SHALL NOT imply freshness or liveness.
+
+#### Scenario: Pane vanished
+- **WHEN** a launched pane disappears
+- **THEN** no exit event is appended
+
+### Requirement: Launch context support is negotiated
+The daemon SHALL advertise child_launch_context_v1 only when its spawn handler and selected backend support the cwd/environment contract. Consumers SHALL require compatible protocol, creation, launch and this feature before using extended spawn fields. A backend without support SHALL refuse supplied launch context before effects; no fallback is allowed after uncertain dispatch.
+
+#### Scenario: Older daemon
+- **WHEN** a consumer observes a compatible daemon without child_launch_context_v1
+- **THEN** it does not attempt the extended launch request and treats launch migration as unsupported
+
+#### Scenario: Backend lacks launch context
+- **WHEN** a backend cannot transport cwd or environment supplied by a spawn
+- **THEN** the daemon refuses before accepting or dispatching that spawn
+
+### Requirement: Launch values stay private across operation readback
+Environment values and spawn tokens SHALL be kept only in bounded private launch/request state. Public operation responses, request listings, topology, diagnostics and logs SHALL NOT expose them. Private exact request content SHALL still distinguish identical same-ID replay from changed cwd or environment; redacted public projections SHALL NOT be used to compare requests.
+
+#### Scenario: Secret launch value
+- **WHEN** a spawn supplies a secret environment value and its operation or topology is read
+- **THEN** no public response or diagnostic contains that value or the daemon token
+
+#### Scenario: Same ID changed environment
+- **WHEN** a request ID is repeated with a different environment value
+- **THEN** the conflict refuses without redispatch even though both public projections omit that value
+
+#### Scenario: Backend failure includes command data
+- **WHEN** a backend failure echoes launch input
+- **THEN** the daemon reports a bounded diagnostic without launch environment values or the token

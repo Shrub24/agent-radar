@@ -389,6 +389,7 @@ pub struct Registry {
     /// One local lock serializes all registry transitions; this is not a
     /// cross-process/distributed lock. The state root has one owning daemon.
     admission: Mutex<()>,
+    journal: std::sync::Mutex<Option<crate::control_plane::store::Store>>,
 }
 
 /// Durable managed-child close requests: the edge and child they target, the
@@ -466,7 +467,43 @@ impl Registry {
             served_since_ms: now_ms,
             serving_epoch: random_uuid(),
             admission: Mutex::new(()),
+            journal: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Connects the daemon-owned journal without reopening or resetting it.
+    pub(crate) fn attach_journal(&self, store: crate::control_plane::store::Store) {
+        *self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
+    }
+
+    pub(crate) fn append_event(
+        &self,
+        kind: &str,
+        agent_id: Option<&str>,
+        spawn: Option<&str>,
+        request_id: Option<&str>,
+    ) {
+        let store = self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(store) = store {
+            let event = crate::control_plane::store::Event {
+                seq: 0,
+                kind: kind.to_string(),
+                agent_id: agent_id.map(str::to_string),
+                spawn: spawn.map(str::to_string),
+                request_id: request_id.map(str::to_string),
+                at: crate::control_plane::store::now(),
+            };
+            if let Err(error) = store.append_event(event) {
+                eprintln!("event journal append failed after {kind}: {error}");
+            }
+        }
     }
 
     /// The `agents` directory.
@@ -791,6 +828,7 @@ impl Registry {
             let _ = fs::remove_file(self.path(&registration.agent_id));
             return Err(error);
         }
+        self.append_event("agent.registered", Some(&registration.agent_id), None, None);
         Ok(registration)
     }
 

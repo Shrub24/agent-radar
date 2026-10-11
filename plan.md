@@ -129,8 +129,9 @@ In priority order:
    non-consuming preview, session statistics/search and fleet failure summaries.
 
 Separate daemon follow-ups: retention/pruning for accumulated process-incarnation
-records and a push/event surface. Polling is accepted for now; neither blocks the
-state consumer. Launch specs and mux locations remain optional and unpublished by
+records. The `events.read` long-poll journal (`lifecycle-events`, archived) is the
+event surface; it reports committed daemon facts only, not backend pushes, exit or
+readiness. Next: `tmux-backend` (drafted, adds launch with exit observation). Launch specs and mux locations remain optional and unpublished by
 Herdsman until a consumer exists. pi-subagents is removed and excluded.
 
 Linux-only is accepted; cross-platform support is not a prerequisite. Background

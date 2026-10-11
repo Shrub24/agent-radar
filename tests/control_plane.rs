@@ -421,6 +421,7 @@ fn advertised(backend: &[&str]) -> Value {
         capabilities.push(json!("child_launch_context_v1"));
     }
     capabilities.push(json!("agent_registry"));
+    capabilities.push(json!("events_v1"));
     Value::Array(capabilities)
 }
 
@@ -1402,6 +1403,152 @@ fn socket_verifier_capacity_is_bounded_daemon_wide_and_released_by_completion() 
     );
     let answer = blocked.into_iter().next().unwrap().join().unwrap();
     assert_eq!(error_code(&answer), "connection_closed");
+}
+
+#[test]
+fn events_read_long_poll_expiry_validation_and_shutdown() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let sandbox = Sandbox::new("events-read");
+    let mut daemon = sandbox.daemon();
+    let path = daemon.path().to_path_buf();
+    let mut client = Client::dial(&path);
+    let initial = client.call("events.read", json!({"after":0,"limit":10}));
+    assert!(initial["result"]["events"].as_array().unwrap().is_empty());
+    let empty_wait = client.call("events.read", json!({"after":0,"wait_ms":50}));
+    assert!(
+        empty_wait["result"]["events"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (answer_tx, answer_rx) = mpsc::channel();
+    let reader_path = path.clone();
+    let waiter = std::thread::spawn(move || {
+        let mut client = Client::dial(&reader_path);
+        client.send(&request_line(
+            "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
+            "events.read",
+            json!({"after":0,"wait_ms":900}),
+        ));
+        ready_tx.send(()).unwrap();
+        answer_tx.send(client.read()).unwrap();
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("reader started");
+    std::thread::sleep(Duration::from_millis(50));
+    let registered = client.call(
+        "agent.register",
+        registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
+    );
+    assert!(registered["result"]["registration"]["agent_id"].is_string());
+    let answer = answer_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("event wakes reader");
+    assert_eq!(
+        answer["result"]["events"][0]["kind"], "agent.registered",
+        "{answer}"
+    );
+    waiter.join().unwrap();
+
+    let epoch_mismatch = client.call("events.read", json!({"after":0,"epoch":"wrong"}));
+    assert!(epoch_mismatch["result"]["cursor_expired"].is_object());
+    let future_cursor = client.call("events.read", json!({"after":99}));
+    assert!(future_cursor["result"]["cursor_expired"].is_object());
+    let unknown = client.call("events.read", json!({"unexpected":true}));
+    assert_eq!(error_code(&unknown), "bad_params");
+    let bad_limit = client.call("events.read", json!({"limit":0}));
+    assert_eq!(error_code(&bad_limit), "bad_params");
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let shutdown_path = path.clone();
+    let waiter = std::thread::spawn(move || {
+        let mut client = Client::dial(&shutdown_path);
+        client.send(&request_line(
+            "9a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
+            "events.read",
+            json!({"after":1,"wait_ms":900}),
+        ));
+        ready_tx.send(()).unwrap();
+        let start = Instant::now();
+        let result = client.read();
+        (result, start.elapsed())
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("shutdown reader started");
+    std::thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    daemon.stop();
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(
+        waiter.join().is_err(),
+        "shutdown closes the waiting response stream"
+    );
+}
+
+#[test]
+fn daemon_journals_committed_registration_once_without_private_launch_data() {
+    let sandbox = Sandbox::new("journal-registration");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let secret = "/private/journal-secret.json";
+    let registered = client.call("agent.register", registration_body(
+        "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None,
+        Some(json!({"executable":"/usr/bin/pi","argv":[secret],"cwd":"/tmp","session":{"path":secret},"provenance":"test","revision":"r1"})),
+    ));
+    assert!(registered["result"]["registration"]["agent_id"].is_string());
+    let journal: serde_json::Value = serde_json::from_slice(
+        &fs::read(sandbox.state().join("events.json")).expect("journal file"),
+    )
+    .expect("journal JSON");
+    let events = journal["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["kind"], "agent.registered");
+    assert_eq!(events[0]["agent_id"], agent_id(&registered));
+    let handle = client.call(
+        "agent.acquire",
+        json!({
+            "agent_id": agent_id(&registered), "channel": "execution",
+            "publisher": {"source":"child", "incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"}
+        }),
+    )["result"]["writer"]["handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let publish = json!({
+        "agent_id": agent_id(&registered), "channel":"execution", "writer_handle":handle,
+        "sequence":1, "snapshot":channel_snapshot("idle")
+    });
+    assert!(client.call("agent.publish", publish.clone())["result"].is_object());
+    assert!(client.call("agent.publish", publish)["result"].is_object());
+    let serialized = serde_json::to_string(&journal).unwrap();
+    assert!(!serialized.contains(secret));
+    let after_publish: serde_json::Value = serde_json::from_slice(
+        &fs::read(sandbox.state().join("events.json")).expect("journal file"),
+    )
+    .expect("journal JSON");
+    let published_events = after_publish["events"].as_array().unwrap();
+    assert_eq!(published_events.len(), 3);
+    assert_eq!(published_events[1]["kind"], "publication.writer");
+    assert_eq!(published_events[2]["kind"], "execution.published");
+    let replay = client.call("agent.register", registration_body(
+        "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None,
+        Some(json!({"executable":"/usr/bin/pi","argv":[secret],"cwd":"/tmp","session":{"path":secret},"provenance":"test","revision":"r1"})),
+    ));
+    assert_eq!(
+        replay["result"]["registration"]["agent_id"],
+        events[0]["agent_id"]
+    );
+    let after_replay: serde_json::Value = serde_json::from_slice(
+        &fs::read(sandbox.state().join("events.json")).expect("journal file"),
+    )
+    .expect("journal JSON");
+    assert_eq!(after_replay["events"].as_array().unwrap().len(), 3);
+    daemon.stop();
 }
 
 #[test]

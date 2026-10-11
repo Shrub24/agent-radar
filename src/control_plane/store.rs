@@ -22,6 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,59 @@ use crate::runtime::CreatedIdentity;
 
 /// The directory inside the state root that holds one file per request.
 const REQUESTS: &str = "requests";
+const JOURNAL: &str = "events.json";
+const JOURNAL_DIRTY: &str = "events.dirty";
+const MAX_EVENTS: usize = 512;
+const MAX_EVENT_BYTES: usize = 512 * 1024;
+static JOURNAL_LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+type EventWake = Arc<(Mutex<u64>, std::sync::Condvar)>;
+type EventWakes = Mutex<std::collections::HashMap<PathBuf, EventWake>>;
+
+static EVENT_WAKES: OnceLock<EventWakes> = OnceLock::new();
+
+fn event_wake(root: &Path) -> EventWake {
+    let wakes = EVENT_WAKES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut wakes = wakes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        wakes
+            .entry(key)
+            .or_insert_with(|| Arc::new((Mutex::new(0), std::sync::Condvar::new()))),
+    )
+}
+
+fn journal_lock(root: &Path) -> Arc<Mutex<()>> {
+    let locks = JOURNAL_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+}
+
+/// A privacy-safe pointer to a committed daemon fact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    pub seq: u64,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Journal {
+    epoch: String,
+    next_seq: u64,
+    events: Vec<Event>,
+}
 
 /// How long an operation's request stays executable, and how long a resume's
 /// does. A resume stops an agent and starts it again — several waits long — so it
@@ -256,8 +310,12 @@ impl RequestRecord {
 /// Shared by every connection, so it is used behind one mutex and never by two
 /// threads at once: the read-check-write that refuses a duplicate request is one
 /// critical section, not three.
+#[derive(Clone, Debug)]
 pub struct Store {
     directory: PathBuf,
+    root: PathBuf,
+    journal_lock: Arc<Mutex<()>>,
+    event_wake: Arc<(Mutex<u64>, std::sync::Condvar)>,
 }
 
 impl Store {
@@ -272,7 +330,186 @@ impl Store {
         prepare_directory(root)?;
         let directory = root.join(REQUESTS);
         prepare_directory(&directory)?;
-        Ok(Self { directory })
+        let store = Self {
+            directory,
+            root: root.to_path_buf(),
+            journal_lock: journal_lock(root),
+            event_wake: event_wake(root),
+        };
+        store.begin_journal_epoch()?;
+        Ok(store)
+    }
+
+    fn begin_journal_epoch(&self) -> Result<(), String> {
+        let _guard = self
+            .journal_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dirty = self.root.join(JOURNAL_DIRTY);
+        let unclean = dirty.exists();
+        let journal = self.load_journal()?;
+        let epoch = if unclean {
+            random_uuid()
+        } else {
+            journal.epoch
+        };
+        let journal = Journal { epoch, ..journal };
+        self.write_journal(&journal)?;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&dirty)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("event dirty marker: {error}"))?;
+        Ok(())
+    }
+
+    /// Marks a clean daemon stop, allowing the epoch to remain stable on reopen.
+    pub fn finish_journal(&self) -> Result<(), String> {
+        let _guard = self
+            .journal_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match fs::remove_file(self.root.join(JOURNAL_DIRTY)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("event dirty marker: {error}")),
+        }
+    }
+
+    fn load_journal(&self) -> Result<Journal, String> {
+        let path = self.root.join(JOURNAL);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).map_err(|error| format!("event journal: {error}"))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Journal {
+                epoch: random_uuid(),
+                next_seq: 1,
+                events: Vec::new(),
+            }),
+            Err(error) => Err(format!("event journal: {error}")),
+        }
+    }
+
+    fn write_journal(&self, journal: &Journal) -> Result<(), String> {
+        let bytes =
+            serde_json::to_vec(journal).map_err(|error| format!("event journal: {error}"))?;
+        let temporary = self.root.join(format!(".events.tmp-{}", random_uuid()));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, self.root.join(JOURNAL))
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(temporary);
+            return Err(format!("event journal: {error}"));
+        }
+        Ok(())
+    }
+
+    /// Appends a pointer event after its associated fact has become durable.
+    ///
+    /// Callers must treat failure as a lost event, not a failed fact: log/ignore
+    /// the error and return the durable fact. An unclean restart changes the
+    /// journal epoch so consumers know to resynchronise after such a gap.
+    pub fn append_event(&self, mut event: Event) -> Result<Event, String> {
+        if event.kind.is_empty()
+            || event.kind.len() > 64
+            || event.kind.chars().any(char::is_control)
+        {
+            return Err("event kind must be nonempty bounded text".into());
+        }
+        for identifier in [&event.agent_id, &event.spawn, &event.request_id]
+            .into_iter()
+            .flatten()
+        {
+            if identifier.is_empty()
+                || identifier.len() > 128
+                || identifier.chars().any(char::is_control)
+            {
+                return Err("event identifiers must be nonempty bounded text".into());
+            }
+        }
+        if event.at.is_empty() || event.at.len() > 64 || event.at.chars().any(char::is_control) {
+            return Err("event time must be nonempty bounded text".into());
+        }
+        let _guard = self
+            .journal_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut journal = self.load_journal()?;
+        event.seq = journal.next_seq;
+        let encoded = serde_json::to_vec(&event).map_err(|error| format!("event: {error}"))?;
+        if encoded.len() > MAX_EVENT_BYTES {
+            return Err("event exceeds journal byte limit".into());
+        }
+        journal.next_seq += 1;
+        journal.events.push(event.clone());
+        let mut journal_bytes =
+            serde_json::to_vec(&journal).map_err(|error| format!("event journal: {error}"))?;
+        while journal.events.len() > MAX_EVENTS || journal_bytes.len() > MAX_EVENT_BYTES {
+            if journal.events.len() <= 1 {
+                break;
+            }
+            journal.events.remove(0);
+            journal_bytes =
+                serde_json::to_vec(&journal).map_err(|error| format!("event journal: {error}"))?;
+        }
+        self.write_journal(&journal)?;
+        let (generation, wake) = &*self.event_wake;
+        *generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        wake.notify_all();
+        Ok(event)
+    }
+
+    pub fn event_generation(&self) -> u64 {
+        let (generation, _) = &*self.event_wake;
+        *generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn wait_for_event(
+        &self,
+        observed: u64,
+        duration: std::time::Duration,
+    ) -> std::sync::WaitTimeoutResult {
+        let (generation, wake) = &*self.event_wake;
+        let generation = generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_guard, result) = wake
+            .wait_timeout_while(generation, duration, |current| *current == observed)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        result
+    }
+
+    /// Retained events in sequence order, for internal verification and future reads.
+    pub fn events(&self) -> Result<Vec<Event>, String> {
+        Ok(self.load_journal()?.events)
+    }
+
+    /// Journal epoch, current cursor and earliest retained sequence.
+    pub fn event_cursor(&self) -> Result<(String, u64, u64), String> {
+        let journal = self.load_journal()?;
+        Ok((
+            journal.epoch,
+            journal.next_seq.saturating_sub(1),
+            journal
+                .events
+                .first()
+                .map_or(journal.next_seq, |event| event.seq),
+        ))
     }
 
     /// The `requests` directory.
@@ -660,6 +897,90 @@ mod tests {
             target.map(str::to_string),
             now_ms,
         )
+    }
+
+    #[test]
+    fn journal_is_ordered_bounded_and_persistent_and_has_safe_event_shape() {
+        let directory = tempdir("journal");
+        let store = Store::open(&directory).expect("store");
+        let epoch = store.event_cursor().unwrap().0;
+        for n in 0..MAX_EVENTS + 1 {
+            store
+                .append_event(Event {
+                    seq: 0,
+                    kind: format!("k{n}"),
+                    agent_id: Some("agent".into()),
+                    spawn: None,
+                    request_id: None,
+                    at: "now".into(),
+                })
+                .unwrap();
+        }
+        let (same_epoch, cursor, earliest) = store.event_cursor().unwrap();
+        assert_eq!(same_epoch, epoch);
+        assert_eq!(cursor, (MAX_EVENTS + 1) as u64);
+        assert_eq!(earliest, 2);
+        let serialized = fs::read_to_string(directory.join(JOURNAL)).unwrap();
+        assert!(!serialized.contains("environment"));
+        assert!(!serialized.contains("token"));
+        store.finish_journal().unwrap();
+        let reopened = Store::open(&directory).unwrap();
+        assert_eq!(reopened.event_cursor().unwrap().0, epoch);
+        let event = reopened
+            .append_event(Event {
+                seq: 0,
+                kind: "publication".into(),
+                agent_id: Some("a".into()),
+                spawn: None,
+                request_id: None,
+                at: "later".into(),
+            })
+            .unwrap();
+        assert_eq!(event.seq, (MAX_EVENTS + 2) as u64);
+        drop(reopened);
+        let unclean = Store::open(&directory).unwrap();
+        assert_ne!(unclean.event_cursor().unwrap().0, epoch);
+    }
+
+    #[test]
+    fn concurrent_journal_appends_are_serialized_across_store_handles() {
+        let directory = tempdir("journal-concurrent");
+        let store = Store::open(&directory).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let store = Store::open(&directory).unwrap();
+                std::thread::spawn(move || {
+                    for item in 0..25 {
+                        store
+                            .append_event(Event {
+                                seq: 0,
+                                kind: "concurrent".into(),
+                                agent_id: Some(format!("{worker}-{item}")),
+                                spawn: None,
+                                request_id: None,
+                                at: "now".into(),
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let (epoch, cursor, earliest) = store.event_cursor().unwrap();
+        assert_eq!(cursor, 200);
+        assert_eq!(earliest, 1);
+        assert_eq!(store.event_cursor().unwrap().0, epoch);
+        let journal = store.load_journal().unwrap();
+        assert_eq!(
+            journal
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            (1..=200).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ Lines are capped at 1 MiB excluding newline; an oversized line is drained and re
 
 ## Capabilities
 
-`ping` returns `{"protocol":1,"backend":"runtime","capabilities":[...]}` (or backend `none`). Mux capabilities come from the backend; `agent_registry` is additive and advertised regardless of backend. Known capabilities:
+`ping` returns `{"protocol":1,"backend":"runtime","capabilities":[...]}` (or backend `none`). Mux capabilities come from the backend; `agent_registry` and `events_v1` are additive and advertised regardless of backend. Known capabilities:
 
 | Method(s) | Capability |
 |---|---|
@@ -55,9 +55,10 @@ Lines are capped at 1 MiB excluding newline; an oversized line is drained and re
 | `output` | `output` |
 | `report` | `reporting` |
 | Agent registry methods | `agent_registry` |
+| `events.read` | `events_v1` |
 | `child.close` | `agent_registry` plus `observe` and `close` |
 
-`agent_registry` is advertised independently of backend capabilities, including when the backend is `none`. Radar requires the first four at startup; other missing capabilities do not prevent handshake and refuse only their method. Current production backend is Herdr. There is no production tmux backend. `registry` and `resume` (and other unknown names) return `unknown_method`. Registry request schemas are documented once in the [agent-registration contract](agent-registration.md); methods are `agent.register`, `agent.acquire`, `agent.publish`, `agent.retire`, `agent.context`, `agent.get` and `agent.list`.
+`agent_registry` and `events_v1` are advertised independently of backend capabilities, including when the backend is `none`. Radar requires the first four at startup; other missing capabilities do not prevent handshake and refuse only their method. Current production backend is Herdr. There is no production tmux backend. `registry` and `resume` (and other unknown names) return `unknown_method`. Registry request schemas are documented once in the [agent-registration contract](agent-registration.md); methods are `agent.register`, `agent.acquire`, `agent.publish`, `agent.retire`, `agent.context`, `agent.get` and `agent.list`.
 
 ## Methods
 
@@ -73,6 +74,11 @@ nonempty, at most 256 UTF-8 bytes, and contain no control characters. JSON seria
 - `output`, params `{"pane_id":"wA:p1","source":"recent","lines":100,"ansi":false}`. `source` is `visible`, `recent`, `recent_unwrapped`, or `detection`; `lines` is optional (runtime default), otherwise 1..=500; `ansi` defaults false. Result is `{ "output": {"text":"…","truncated":false,"revision":null} }`. Text is capped at 64 KiB on a UTF-8 boundary and `truncated` set. No record.
 - `request`, params `{"id":"<canonical UUID>"}`: `{ "request": RequestRecord }`, or `not_found`. No record for the lookup.
 - `requests`, params `{}` or `{"limit":50}`: `{ "requests": [RequestRecord,…] }`, newest first; default 50, maximum 200 (larger counts clamp to 200). No record.
+- `events.read`, params `{"after":12,"epoch":"<last-seen-epoch>","limit":100,"wait_ms":1000}`. `after` is a sequence number, default 0; `epoch` is optional. `limit` defaults to 100 and must be 1..=500. `wait_ms` defaults to 0 and must be 0..=1000. The successful normal result is `{ "epoch":"…", "events":[Event,…], "cursor":{"epoch":"…","sequence":12}, "earliest":1 }`; `Event` has `seq`, `kind`, optional `agent_id`, `spawn`, `request_id`, and `at`. The response cursor is an object; resume with its `sequence` as `after` and its `epoch` as `epoch`. An empty `events` array means the bounded wait ended without a new event.
+
+A lost-history result is still success, shaped as `{ "cursor_expired":{"epoch":"…","cursor":{"epoch":"…","sequence":12},"earliest":4} }`; it contains no partial event sequence. On expiry, re-read all current state: page through `agent.list` and `spawn.list` following each `next` cursor, and read ordinary operation records through `requests` (and exact `request` lookups where their IDs are known). Then resume using the returned epoch and cursor. A first read with `after:0` can itself expire after retention has dropped older history.
+
+Events are pointers, not state snapshots: fetch the exact referenced record with `agent.get`, `spawn.get`, or `request` before acting. Absence of an event does not establish freshness or liveness. Facts are written before their events, so a crash can lose an event after its fact became durable; an unclean daemon restart changes the journal epoch and forces resynchronisation.
 
 Read errors do not create operation records. Missing backend/capability returns `backend_unavailable`; backend read refusal for `output` returns `refused` and uncertain output returns `backend_unavailable`.
 
