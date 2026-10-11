@@ -41,6 +41,12 @@ Serves one JSON request and one JSON response per line on the control socket at
 `$RADAR_CONTROL_STATE`, else `$XDG_STATE_HOME/agent-radar/control`, else
 `~/.local/state/agent-radar/control`. Prints the socket it is serving on. Stops
 on SIGINT or SIGTERM, removing that socket file and leaving the records in place.
+
+The physical backend is Herdr. `$RADAR_CONTROL_BACKEND` names one explicitly —
+`herdr` or `tmux` — and `$RADAR_TMUX_SERVER` names the tmux server a `tmux`
+backend uses, never tmux's own default server. A name that is no backend, or a
+configuration a backend cannot serve, refuses startup rather than falling back
+to another backend.
 ";
 
 fn main() -> io::Result<()> {

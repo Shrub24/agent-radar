@@ -262,6 +262,42 @@ pub const LAUNCH_TOKEN_ENV: &str = "PI_RADAR_SPAWN_TOKEN";
 
 /// The capability a backend declares when it can run a resolved child command.
 pub const LAUNCH_CAPABILITY: &str = "launch";
+/// The capability a backend declares when it can observe retained pane exits.
+pub const EXIT_OBSERVATION_CAPABILITY: &str = "exit_observation_v1";
+
+/// Read-only observation of a pane's current command lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneExitObservation {
+    /// The backend could not establish the pane's current exit state.
+    Unknown,
+    /// The pane is present and its current command has not exited.
+    Running,
+    /// The pane is retained after the command exited; exactly one of code or
+    /// signal is present when the backend provides a typed result.
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+}
+
+impl PaneExitObservation {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Exited {
+                code: Some(code),
+                signal: None,
+            } if (0..=255).contains(code) => Ok(()),
+            Self::Exited {
+                code: None,
+                signal: Some(signal),
+            } if *signal > 0 => Ok(()),
+            Self::Exited { .. } => {
+                Err("exit observation must name one valid code or signal".into())
+            }
+            Self::Unknown | Self::Running => Ok(()),
+        }
+    }
+}
 
 impl LaunchRequest {
     /// Whether this is a command the seam can carry: a named pane, an absolute
@@ -916,6 +952,23 @@ pub trait RuntimeProvider: Send + Sync {
         LaunchOutcome::Refused("this runtime does not implement launch".to_string())
     }
 
+    /// Reads one bounded exit-state snapshot for each requested pane id.
+    ///
+    /// A missing pane, unreadable server, malformed record, or backend without
+    /// the capability is `Unknown`, never proof that the command exited. The
+    /// default is deliberately inconclusive.
+    fn exit_observations(
+        &self,
+        pane_ids: &[String],
+        _cancel: &AtomicBool,
+    ) -> BTreeMap<String, PaneExitObservation> {
+        pane_ids
+            .iter()
+            .cloned()
+            .map(|id| (id, PaneExitObservation::Unknown))
+            .collect()
+    }
+
     /// Reads a bounded snapshot of one pane's output, consuming nothing.
     ///
     /// A runtime that has no non-consuming read must not advertise `output` in
@@ -982,6 +1035,14 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn launch(&self, request: &LaunchRequest, cancel: &AtomicBool) -> LaunchOutcome {
         (**self).launch(request, cancel)
+    }
+
+    fn exit_observations(
+        &self,
+        pane_ids: &[String],
+        cancel: &AtomicBool,
+    ) -> BTreeMap<String, PaneExitObservation> {
+        (**self).exit_observations(pane_ids, cancel)
     }
 
     fn output(&self, request: &OutputRequest, cancel: &AtomicBool) -> OutputOutcome {

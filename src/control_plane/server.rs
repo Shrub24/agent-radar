@@ -39,12 +39,12 @@ use crate::control_plane::store::{self, Category, RequestOutcome, RequestRecord,
 use crate::lifecycle::{self, CloseRequest, DirectClose};
 use crate::model::FleetObservation;
 use crate::runtime::{
-    CreateOutcome, CreateRequest, CreatedKind, CreatedLocation, FocusOutcome, InputOutcome,
-    InputPayload, InputRequest, LaunchOutcome, LaunchRequest, OutputOutcome, OutputRead,
-    OutputRequest, ReportOutcome, ReportRequest, RuntimeProvider, SplitDirection, Target,
-    validate_command,
+    CreateOutcome, CreateRequest, CreatedKind, CreatedLocation, EXIT_OBSERVATION_CAPABILITY,
+    FocusOutcome, InputOutcome, InputPayload, InputRequest, LaunchOutcome, LaunchRequest,
+    OutputOutcome, OutputRead, OutputRequest, PaneExitObservation, ReportOutcome, ReportRequest,
+    RuntimeProvider, SplitDirection, Target, validate_command,
 };
-use crate::{HerdrConfig, HerdrRuntime};
+use crate::{HerdrConfig, HerdrRuntime, TmuxConfig, TmuxRuntime};
 
 /// The socket file's name inside the directory the daemon owns.
 const SOCKET_NAME: &str = "control.sock";
@@ -238,6 +238,109 @@ fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// The physical backend this daemon serves. A process serves exactly one.
+///
+/// This is the daemon's *physical* backend, not Radar's client transport
+/// (`[runtime] backend = "direct" | "daemon"`), which chooses how a dashboard
+/// reaches a daemon that is already running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PhysicalBackend {
+    /// Herdr, through the adapter in [`crate::herdr`]. The default.
+    Herdr,
+    /// A tmux server the operator named, never tmux's default server: a tmux
+    /// selection that names no server is refused instead of reaching the one
+    /// tmux would pick for itself.
+    Tmux { server: String },
+}
+
+/// Why a configured physical backend cannot serve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendConfigError {
+    /// The configured name matches no backend.
+    UnknownBackend { name: String },
+    /// `tmux` was selected without naming the server it may use.
+    TmuxServerMissing,
+    /// The backend is named in configuration but the adapter cannot serve that
+    /// configuration, so no effect may be attempted through it.
+    AdapterConfiguration {
+        backend: &'static str,
+        problem: String,
+    },
+}
+
+impl std::fmt::Display for BackendConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownBackend { name } => {
+                write!(
+                    f,
+                    "control backend `{name}`: not a backend; use `herdr` or `tmux`"
+                )
+            }
+            Self::TmuxServerMissing => write!(
+                f,
+                "control backend `tmux`: no server named; set `RADAR_TMUX_SERVER` (the default \
+                 tmux server is never used)"
+            ),
+            Self::AdapterConfiguration { backend, problem } => {
+                write!(f, "control backend `{backend}`: {problem}")
+            }
+        }
+    }
+}
+
+/// The physical backend `RADAR_CONTROL_BACKEND` names, else Herdr.
+///
+/// `RADAR_TMUX_SERVER` names the tmux server, and is required by the tmux
+/// backend. An unknown name is refused rather than served, and nothing here
+/// falls back to another backend.
+pub fn physical_backend() -> Result<PhysicalBackend, BackendConfigError> {
+    physical_backend_in(
+        std::env::var_os("RADAR_CONTROL_BACKEND").as_deref(),
+        std::env::var_os("RADAR_TMUX_SERVER").as_deref(),
+    )
+}
+
+/// [`physical_backend`] over an environment the caller supplies, so the rule can
+/// be read and tested without touching the process environment.
+pub fn physical_backend_in(
+    backend: Option<&std::ffi::OsStr>,
+    tmux_server: Option<&std::ffi::OsStr>,
+) -> Result<PhysicalBackend, BackendConfigError> {
+    let name = backend
+        .map(|value| value.to_string_lossy().trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match name.as_str() {
+        "" | "herdr" => Ok(PhysicalBackend::Herdr),
+        "tmux" => tmux_server
+            .map(|value| value.to_string_lossy().trim().to_string())
+            .filter(|server| !server.is_empty())
+            .map(|server| PhysicalBackend::Tmux { server })
+            .ok_or(BackendConfigError::TmuxServerMissing),
+        _ => Err(BackendConfigError::UnknownBackend { name }),
+    }
+}
+
+impl PhysicalBackend {
+    /// The adapter this backend is served through.
+    ///
+    /// Capabilities are the adapter's own declaration for the backend it
+    /// implements ([`RuntimeProvider::capabilities`]); nothing here restates
+    /// them. An adapter that cannot serve the configuration it was given is a
+    /// startup refusal, never a backend that quietly serves another one.
+    fn adapter(&self) -> Result<Arc<dyn RuntimeProvider>, BackendConfigError> {
+        match self {
+            Self::Herdr => Ok(Arc::new(HerdrRuntime::new(HerdrConfig::default()))),
+            Self::Tmux { server } => TmuxRuntime::new(TmuxConfig::for_server(server))
+                .map(|runtime| Arc::new(runtime) as Arc<dyn RuntimeProvider>)
+                .map_err(|problem| BackendConfigError::AdapterConfiguration {
+                    backend: "tmux",
+                    problem,
+                }),
+        }
+    }
+}
+
 /// The listener's shared state: every connection and every worker it started.
 #[derive(Default)]
 struct Connections {
@@ -356,10 +459,17 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Binds the socket at [`socket_path`], keeping records under [`state_dir`].
+    /// Binds the socket at [`socket_path`], keeping records under [`state_dir`],
+    /// through the physical backend [`physical_backend`] selects.
+    ///
+    /// A configured backend this build cannot serve is refused here, before the
+    /// socket is bound and before any directory is prepared: no other backend is
+    /// served in its place.
     pub fn bind() -> Result<Self, String> {
-        let backend = Arc::new(HerdrRuntime::new(HerdrConfig::default()));
-        Self::bind_with_backend(&socket_path(), &state_dir(), Some(backend))
+        let adapter = physical_backend()
+            .and_then(|backend| backend.adapter())
+            .map_err(|error| error.to_string())?;
+        Self::bind_with_backend(&socket_path(), &state_dir(), Some(adapter))
     }
 
     /// Binds a daemon with no backend, for protocol/store-only tests.
@@ -1055,6 +1165,63 @@ fn observed_inventory(core: &Arc<Mutex<Core>>) -> Option<FleetObservation> {
 /// in it, and an edge that recorded no pane has nothing to check — so the read
 /// reports the disagreement, or its lack of confirmation, and claims nothing
 /// else.
+fn observe_spawn_exits(
+    core: &Arc<Mutex<Core>>,
+    edges: &[SpawnEdge],
+) -> Result<Vec<SpawnEdge>, String> {
+    let (registry, backend, cancel) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            core.backend.clone(),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let Some(backend) = backend else {
+        return Ok(edges.to_vec());
+    };
+    if cancel.load(Ordering::SeqCst)
+        || !backend
+            .capabilities()
+            .contains(&EXIT_OBSERVATION_CAPABILITY)
+    {
+        return Ok(edges.to_vec());
+    }
+    let pending: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.version == registry::SPAWN_VERSION && edge.exit.is_none())
+        .filter_map(|edge| {
+            edge.location
+                .as_ref()
+                .and_then(|location| location.pane.as_ref())
+                .cloned()
+        })
+        .collect();
+    if pending.is_empty() {
+        return Ok(edges.to_vec());
+    }
+    let observations = backend.exit_observations(&pending, &cancel);
+    edges
+        .iter()
+        .map(|edge| {
+            if edge.version != registry::SPAWN_VERSION || edge.exit.is_some() {
+                return Ok(edge.clone());
+            }
+            let Some(pane) = edge
+                .location
+                .as_ref()
+                .and_then(|location| location.pane.as_ref())
+            else {
+                return Ok(edge.clone());
+            };
+            let Some(PaneExitObservation::Exited { code, signal }) = observations.get(pane) else {
+                return Ok(edge.clone());
+            };
+            registry.record_spawn_exit(&edge.request_id, *code, *signal, store::now_ms())
+        })
+        .collect()
+}
+
 fn location_evidence(inventory: Option<&FleetObservation>, edge: &SpawnEdge) -> LocationEvidence {
     let recorded = edge
         .location
@@ -1605,8 +1772,12 @@ fn registry_request(
                     Err(error) => return registry_error(request, error),
                 }
             };
-            // The observation is external evidence, so it runs outside every
-            // registry lock, like the process verification `agent.get` does.
+            let stored = match observe_spawn_exits(core, &[stored]) {
+                Ok(mut edges) => edges.pop().expect("one spawn edge was supplied"),
+                Err(error) => return registry_error(request, error),
+            };
+            // Location presence is separate from exit evidence: a missing pane
+            // never becomes an exit observation.
             let inventory = observed_inventory(core);
             let evidence = location_evidence(inventory.as_ref(), &stored);
             Response::ok(&request.id, json!({"spawn": stored.topology(evidence)}))
@@ -1666,8 +1837,12 @@ fn registry_request(
             };
             let has_more = read.len() > limit;
             let candidates: Vec<_> = read.into_iter().take(limit).collect();
-            // One observation serves the whole page: the backend is asked once,
-            // however many edges the page holds.
+            let candidates = match observe_spawn_exits(core, &candidates) {
+                Ok(edges) => edges,
+                Err(error) => return registry_error(request, error),
+            };
+            // One inventory serves the whole page, independently of the single
+            // batch exit-status read above.
             let inventory = observed_inventory(core);
             let mut edges = Vec::new();
             let mut used = 0usize;
@@ -3361,6 +3536,69 @@ mod tests {
             state_dir_in(None, None, None, uid),
             path_value("/tmp/agent-radar-4242")
         );
+    }
+
+    #[test]
+    fn the_physical_backend_is_herdr_unless_configuration_names_another() {
+        let value = std::ffi::OsStr::new;
+        // Unset, empty and a named default are all the default, and a server
+        // nobody selected with a backend selects nothing either.
+        for backend in [
+            None,
+            Some(value("")),
+            Some(value("herdr")),
+            Some(value(" Herdr ")),
+        ] {
+            assert_eq!(
+                physical_backend_in(backend, Some(value("probe"))),
+                Ok(PhysicalBackend::Herdr),
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tmux_backend_is_its_named_server_and_needs_one() {
+        let value = std::ffi::OsStr::new;
+        assert_eq!(
+            physical_backend_in(Some(value("tmux")), Some(value(" probe "))),
+            Ok(PhysicalBackend::Tmux {
+                server: "probe".to_string()
+            })
+        );
+        // No named server means no tmux backend: the default tmux server is
+        // never the one an unnamed selection would reach.
+        for server in [None, Some(value("")), Some(value("   "))] {
+            assert_eq!(
+                physical_backend_in(Some(value("tmux")), server),
+                Err(BackendConfigError::TmuxServerMissing),
+                "{server:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_physical_backend_names_itself() {
+        assert_eq!(
+            physical_backend_in(Some(std::ffi::OsStr::new(" Docker ")), None),
+            Err(BackendConfigError::UnknownBackend {
+                name: "docker".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_text_is_refused_rather_than_the_default() {
+        use std::os::unix::ffi::OsStrExt;
+        // Nothing that is not a backend name may be read as the default: an
+        // unreadable name is still a name that has to be refused.
+        assert!(matches!(
+            physical_backend_in(
+                Some(std::ffi::OsStr::from_bytes(b"tmux\xff")),
+                Some(std::ffi::OsStr::new("probe"))
+            ),
+            Err(BackendConfigError::UnknownBackend { .. })
+        ));
     }
 
     #[test]

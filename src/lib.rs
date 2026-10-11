@@ -17,6 +17,7 @@ pub mod procfs;
 pub mod runtime;
 pub mod theme;
 pub mod title;
+pub mod tmux;
 pub mod tree;
 pub mod ui;
 
@@ -45,6 +46,7 @@ pub use model::{
 };
 pub use observation::{ObservationState, RetainedAgent, RetentionBasis, SourceFreshness};
 pub use runtime::{CloseTarget, FocusOutcome, RuntimeProvider, Target};
+pub use tmux::{TmuxConfig, TmuxRuntime};
 pub use tree::{
     AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskProjection, TaskRow, TaskSource,
     TreeRow,

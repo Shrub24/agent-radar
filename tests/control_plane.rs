@@ -15,7 +15,7 @@
 
 use std::any::Any;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{self, AssertUnwindSafe};
@@ -2115,6 +2115,26 @@ fn no_secret(response: &Value, secret: &str) {
     );
 }
 
+fn process_identity_from_proc(pid: i32) -> ProcessIdentity {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("process stat");
+    let close = stat.rfind(')').expect("comm closing delimiter");
+    let start_ticks = stat[close + 2..]
+        .split_whitespace()
+        .nth(19)
+        .expect("stat starttime field")
+        .parse()
+        .expect("numeric starttime");
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .expect("boot id")
+        .trim()
+        .to_string();
+    ProcessIdentity {
+        boot_id,
+        pid,
+        start_ticks,
+    }
+}
+
 fn registration_body(
     incarnation: &str,
     process: Option<ProcessIdentity>,
@@ -2876,6 +2896,425 @@ fn the_daemon_subcommand_serves_prints_and_stops_cleanly_on_a_signal() {
             "{name}: the refusal survives the daemon"
         );
     }
+}
+
+/// Runs `radar daemon` with `environment` added to its own and asserts it refuses
+/// to serve: it exits non-zero, reports no greeting, and binds no socket. The
+/// operator's diagnostic, from stderr, is returned.
+fn refused_startup(name: &str, environment: &[(&str, &str)]) -> String {
+    let sandbox = Sandbox::new(name);
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    let mut child = DaemonChild::spawn_with(&socket, &state, environment);
+    let status = child.wait(DEADLINE);
+    assert_eq!(status.code(), Some(1), "{status:?}");
+
+    let mut greeting = String::new();
+    child
+        .process
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut greeting)
+        .expect("the greeting");
+    assert_eq!(greeting, "", "a refused daemon reported it was serving");
+
+    let mut diagnostic = String::new();
+    child
+        .process
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut diagnostic)
+        .expect("the diagnostic");
+    assert!(diagnostic.starts_with("radar daemon: "), "{diagnostic}");
+    assert!(!socket.exists(), "a refused daemon bound its socket");
+    diagnostic
+}
+
+/// The daemon serves the physical backend its configuration names, and refuses
+/// startup for a name that is no backend or a configuration its adapter cannot
+/// serve. Each refusal says which backend is at fault and which are supported,
+/// and none falls back: the process stops rather than serving through a backend
+/// nobody configured.
+#[test]
+fn a_physical_backend_the_daemon_cannot_serve_refuses_startup() {
+    let unknown = refused_startup("backend-unknown", &[("RADAR_CONTROL_BACKEND", "docker")]);
+    assert!(unknown.contains("docker"), "{unknown}");
+    for supported in ["herdr", "tmux"] {
+        assert!(unknown.contains(supported), "{unknown}");
+    }
+
+    let unnamed = refused_startup("backend-tmux-unnamed", &[("RADAR_CONTROL_BACKEND", "tmux")]);
+    assert!(unnamed.contains("RADAR_TMUX_SERVER"), "{unnamed}");
+
+    // The tmux adapter targets one named server and never tmux's default one,
+    // so a configuration that names the default server refuses startup.
+    let shared = refused_startup(
+        "backend-tmux-default",
+        &[
+            ("RADAR_CONTROL_BACKEND", "tmux"),
+            ("RADAR_TMUX_SERVER", "default"),
+        ],
+    );
+    assert!(shared.contains("tmux"), "{shared}");
+    assert!(shared.contains("default server"), "{shared}");
+
+    // Three different mistakes, three different diagnostics: an operator who
+    // reads one is told what to change, not handed another one's problem.
+    assert_ne!(unknown, unnamed);
+    assert_ne!(unnamed, shared);
+    assert_ne!(unknown, shared);
+}
+
+/// The tmux backend is served by the tmux adapter: the daemon starts against the
+/// server name it was given, and an observation of a server that is not running
+/// is reported as an unavailable backend rather than an unsupported operation.
+#[test]
+fn a_tmux_backend_serves_and_reports_a_server_that_is_not_running() {
+    let name = format!("radar-test-absent-{}", std::process::id());
+    let socket_file = tmux_socket(&name);
+    let sandbox = Sandbox::new("backend-tmux-served");
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    let mut child = DaemonChild::spawn_with(
+        &socket,
+        &state,
+        &[
+            ("RADAR_CONTROL_BACKEND", "tmux"),
+            ("RADAR_TMUX_SERVER", &name),
+        ],
+    );
+    let mut lines = BufReader::new(child.process.stdout.take().expect("stdout")).lines();
+    let greeting = lines
+        .next()
+        .expect("a greeting line")
+        .expect("a readable greeting");
+    assert!(
+        greeting.contains(&socket.display().to_string()),
+        "{greeting}"
+    );
+
+    let mut client = Client::dial(&socket);
+    let observed = client.call("observe", json!({}));
+    assert_eq!(error_code(&observed), "backend_unavailable", "{observed}");
+    // The adapter reaches one server and reads it: it neither starts tmux's
+    // default server nor invents the one it was pointed at.
+    assert!(
+        !socket_file.exists(),
+        "the daemon created a tmux server for an observation"
+    );
+    assert_eq!(
+        client.call("ping", json!({}))["result"]["protocol"],
+        1,
+        "a backend that cannot observe still serves the daemon"
+    );
+
+    let status = child.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A disposable tmux server for the tests that serve one through the daemon.
+struct TmuxServer {
+    name: String,
+    socket: PathBuf,
+}
+
+impl TmuxServer {
+    /// Starts one on a name of its own, or reports `None` on a machine without
+    /// tmux.
+    fn start(label: &str) -> Option<Self> {
+        let available = Command::new("tmux")
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            eprintln!("skipping {label}: tmux is not installed");
+            return None;
+        }
+        let name = format!("radar-daemon-{}-{label}", std::process::id());
+        let server = Self {
+            socket: tmux_socket(&name),
+            name,
+        };
+        server.tmux(&["new-session", "-d", "-s", "main", "-x", "100", "-y", "30"]);
+        Some(server)
+    }
+
+    /// Runs one tmux command against this server, returning its stdout.
+    fn tmux(&self, args: &[&str]) -> String {
+        let output = Command::new("tmux")
+            .arg("-f")
+            .arg("/dev/null")
+            .arg("-L")
+            .arg(&self.name)
+            .env_remove("TMUX")
+            .args(args)
+            .output()
+            .expect("run tmux");
+        assert!(
+            output.status.success(),
+            "tmux {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+}
+
+impl Drop for TmuxServer {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .arg("-L")
+            .arg(&self.name)
+            .env_remove("TMUX")
+            .args(["kill-server"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // A server that exited leaves its socket behind; only this name's own
+        // file is ever removed.
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// Serves the daemon through the tmux adapter: what the client observes is the
+/// disposable server's own objects, named the way this adapter names them, so a
+/// daemon that served another backend could not answer this.
+#[test]
+fn a_tmux_backend_observes_the_server_it_was_given() {
+    let Some(server) = TmuxServer::start("backend-tmux-observed") else {
+        return;
+    };
+    let sandbox = Sandbox::new("backend-tmux-observed");
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    let mut child = DaemonChild::spawn_with(
+        &socket,
+        &state,
+        &[
+            ("RADAR_CONTROL_BACKEND", "tmux"),
+            ("RADAR_TMUX_SERVER", &server.name),
+        ],
+    );
+    let mut lines = BufReader::new(child.process.stdout.take().expect("stdout")).lines();
+    lines.next().expect("a greeting line").expect("a greeting");
+
+    let mut client = Client::dial(&socket);
+    let observed = client.call("observe", json!({}));
+    let inventory = &observed["result"]["inventory"];
+    assert_eq!(
+        inventory["workspaces"][0]["workspace_id"],
+        json!(format!("tmux:{}:$0", server.name)),
+        "{observed}"
+    );
+    assert_eq!(
+        inventory["workspaces"][0]["label"],
+        json!("main"),
+        "{observed}"
+    );
+    let pane = inventory["panes"][0]["location"]["pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no pane in {observed}"));
+    assert!(
+        pane.starts_with(&format!("tmux:{}:%", server.name)),
+        "{pane} is not a handle this adapter qualified"
+    );
+    assert_eq!(inventory["agents"], json!([]), "{observed}");
+
+    let status = child.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[test]
+fn tmux_spawn_exit_persists_and_dead_child_close_is_refused() {
+    let Some(server) = TmuxServer::start("tmux-spawn-exit") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-spawn-exit");
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    let backend = [
+        ("RADAR_CONTROL_BACKEND", "tmux"),
+        ("RADAR_TMUX_SERVER", server.name.as_str()),
+    ];
+    let mut daemon = DaemonChild::spawn_with(&socket, &state, &backend);
+    let mut lines = BufReader::new(daemon.process.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting line").expect("greeting");
+
+    let mut client = Client::dial(&socket);
+    let ping = client.call("ping", json!({}));
+    assert!(
+        ping["result"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.contains(&json!("exit_observation_v1"))),
+        "{ping}"
+    );
+    let observed = client.call("observe", json!({}));
+    let parent_pane = observed["result"]["inventory"]["panes"][0]["location"]["pane_id"]
+        .as_str()
+        .expect("parent pane")
+        .to_string();
+    let incarnation = PARENT_INCARNATION;
+    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let mut body = registration_body(incarnation, None, None);
+    body["location"] = json!({"backend":"runtime", "pane":parent_pane});
+    let registration = client.call("agent.register", body);
+    let parent = agent_id(&registration);
+    let context = client.call(
+        "agent.context",
+        json!({
+            "agent_id": parent,
+            "publisher": {"source":"test-publisher", "incarnation":incarnation},
+            "sequence": 1,
+            "lease_ms": 10_000,
+            "context": {"session": session}
+        }),
+    );
+    assert!(context["result"].is_object(), "{context}");
+    let facts_before = client.call("agent.get", json!({"agent_id":parent}));
+
+    let spawn_id = "d2c7e861-2f21-48f0-aaf0-cb2d1b4f1327";
+    let spawned = client.call_id(
+        spawn_id,
+        "spawn",
+        json!({"request": {
+            "parent": parent,
+            "parent_session_id": session,
+            "executable": "/bin/sh",
+            "argv": ["-c", "read -r _; exit 23"]
+        }}),
+    );
+    assert!(spawned["result"].is_object(), "{spawned}");
+    let edge = recorded_edge(&state, spawn_id);
+    let token = edge["token"].as_str().expect("spawn token");
+    let child_pane = edge["location"]["pane"]
+        .as_str()
+        .expect("spawned pane")
+        .to_string();
+    let raw_pane = child_pane.rsplit(':').next().expect("raw tmux pane");
+    let pid = server
+        .tmux(&["display-message", "-p", "-t", raw_pane, "#{pane_pid}"])
+        .trim()
+        .parse::<i32>()
+        .expect("child process pid");
+    let child_process = process_identity_from_proc(pid);
+    let mut child_registration = registration_body(CHILD_INCARNATION, Some(child_process), None);
+    child_registration["spawn_token"] = json!(token);
+    let child = client.call("agent.register", child_registration);
+    let child_agent = agent_id(&child);
+    let child_facts_before = client.call("agent.get", json!({"agent_id":child_agent}));
+    let bound = client.call("spawn.get", json!({"request_id":spawn_id}));
+    assert_eq!(
+        bound["result"]["spawn"]["bound"]["agent_id"],
+        json!(child_agent)
+    );
+
+    // The direct tmux client releases the child's waiting shell only after its
+    // exact live process identity has been bound in the registry.
+    server.tmux(&["send-keys", "-t", raw_pane, "go", "Enter"]);
+    let mut topology = Value::Null;
+    for _ in 0..100 {
+        topology = client.call("spawn.get", json!({"request_id":spawn_id}));
+        if topology["result"]["spawn"]["exit_observation"]["code"] == json!(23) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let child_pane = topology["result"]["spawn"]["location"]["pane"]
+        .as_str()
+        .expect("spawn pane")
+        .to_string();
+    let output = client.call("output", json!({"pane_id":child_pane,"source":"recent"}));
+    assert!(
+        output["result"]["output"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Pane is dead (status 23")),
+        "{output}"
+    );
+    assert_eq!(
+        topology["result"]["spawn"]["exit_observation"]["state"],
+        json!("exited"),
+        "{topology}"
+    );
+    assert_eq!(
+        topology["result"]["spawn"]["exit_observation"]["code"],
+        json!(23),
+        "{topology}"
+    );
+    let listed = client.call("spawn.list", json!({"limit":10}));
+    assert_eq!(
+        listed["result"]["spawns"][0]["exit_observation"]["code"],
+        json!(23),
+        "{listed}"
+    );
+    let facts_after = client.call("agent.get", json!({"agent_id":parent}));
+    assert_eq!(
+        facts_after["result"]["agent"]["execution"],
+        facts_before["result"]["agent"]["execution"]
+    );
+    assert_eq!(
+        facts_after["result"]["agent"]["assignment"],
+        facts_before["result"]["agent"]["assignment"]
+    );
+
+    let close_id = random_uuid();
+    let close = client.call_id(
+        &close_id,
+        "child.close",
+        json!({
+            "spawn_request_id": spawn_id,
+            "source": "test-publisher",
+            "incarnation": CHILD_INCARNATION,
+            "intent": "cancel"
+        }),
+    );
+    assert_eq!(error_code(&close), "refused", "{close}");
+    assert!(
+        !closes_directory(&state)
+            .join(format!("{close_id}.json"))
+            .exists(),
+        "a dead pane without a live foreground identity is not admitted for close"
+    );
+    let child_facts_after = client.call("agent.get", json!({"agent_id":child_agent}));
+    assert_eq!(
+        child_facts_after["result"]["agent"]["execution"],
+        child_facts_before["result"]["agent"]["execution"]
+    );
+    assert_eq!(
+        child_facts_after["result"]["agent"]["assignment"],
+        child_facts_before["result"]["agent"]["assignment"]
+    );
+
+    drop(client);
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+
+    let mut daemon = DaemonChild::spawn_with(&socket, &state, &backend);
+    let mut lines = BufReader::new(daemon.process.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting line").expect("greeting");
+    let mut client = Client::dial(&socket);
+    let restored = client.call("spawn.get", json!({"request_id":spawn_id}));
+    assert_eq!(
+        restored["result"]["spawn"]["exit_observation"]["code"],
+        json!(23),
+        "{restored}"
+    );
+    drop(client);
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// Where tmux keeps the socket of a server of `name`.
+fn tmux_socket(name: &str) -> PathBuf {
+    let parent = match std::env::var_os("TMUX_TMPDIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from("/tmp"),
+    };
+    // SAFETY: `getuid` takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    parent.join(format!("tmux-{uid}")).join(name)
 }
 
 /// An uncertain outcome is not a licence to retry: the record stays `unknown`,
@@ -4248,6 +4687,7 @@ fn the_topology_read_reports_the_edge_its_own_operation_recorded() {
     assert_eq!(spawn["parent"], json!(parent));
     assert_eq!(spawn["created"], "completed");
     assert_eq!(spawn["launched"], "completed");
+    assert_eq!(spawn["exit_observation"]["state"], "unknown");
     assert_eq!(spawn["location"]["pane"], "wA:p2");
     assert_eq!(
         spawn["state"], "unbound",
@@ -4814,18 +5254,34 @@ struct DaemonChild {
 
 impl DaemonChild {
     fn spawn(socket: &Path, state: &Path) -> Self {
-        let process = Command::new(env!("CARGO_BIN_EXE_radar"))
+        Self::spawn_with(socket, state, &[])
+    }
+
+    /// Starts `radar daemon` over `socket` and `state`, with `environment`
+    /// added to the child's own.
+    fn spawn_with(socket: &Path, state: &Path, environment: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_radar"));
+        command
             .arg("daemon")
             .env("RADAR_CONTROL_SOCKET", socket)
             .env("RADAR_CONTROL_STATE", state)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start radar daemon");
+            .stderr(Stdio::piped());
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        let process = command.spawn().expect("start radar daemon");
         Self {
             process,
             exited: false,
         }
+    }
+
+    /// Waits for a child that is expected to exit on its own, under a deadline.
+    fn wait(&mut self, deadline: Duration) -> ExitStatus {
+        let status = wait_for_exit(&mut self.process, deadline);
+        self.exited = true;
+        status
     }
 
     /// Signals the daemon and waits for it to go, under a deadline.
@@ -4833,9 +5289,7 @@ impl DaemonChild {
         // SAFETY: `kill` takes the pid of a child this process started and a
         // signal number.
         unsafe { libc::kill(self.process.id() as i32, signal) };
-        let status = wait_for_exit(&mut self.process, deadline);
-        self.exited = true;
-        status
+        self.wait(deadline)
     }
 }
 

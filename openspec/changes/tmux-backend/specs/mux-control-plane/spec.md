@@ -36,9 +36,17 @@ For panes it launched with a supporting backend, the daemon SHALL record at most
 - **WHEN** a launched pane disappears without a recorded exit
 - **THEN** the location is unresolved and no exit is reported
 
+#### Scenario: Out-of-band pane respawn
+- **WHEN** a same-UID client respawns the managed pane before Radar reads its retained exit status
+- **THEN** the tmux status may be replaced, and a later observation is not proof that the originally bound agent process exited
+
 ### Requirement: Exit does not imply assignment outcome
 An exit observation SHALL NOT change execution or assignment publications and SHALL NOT trigger close, resume or restart. Closing a dead pane SHALL remain the separate guarded `child.close` operation.
 
 #### Scenario: Exited child pane
 - **WHEN** an exit is observed
 - **THEN** the pane stays until `child.close` is requested and publications are unchanged
+
+#### Scenario: Dead pane does not bypass close verification
+- **WHEN** `child.close` is requested for a dead pane with an exit observation but no current foreground-process identity
+- **THEN** the daemon refuses before durable close admission or dispatch, and leaves execution and assignment publications unchanged

@@ -425,8 +425,9 @@ pub use publication::{
     PublicWriter, PublicWriterFacts, PublishRequest, PublisherIdentity, Snapshot, WriterBinding,
 };
 pub use spawn::{
-    BoundChild, LocationEvidence, MAX_SPAWN_BYTES, PublicSpawnEdge, PublicSpawnTopology,
-    SPAWN_VERSION, SpawnBindRequest, SpawnEdge, SpawnRequest, SpawnState,
+    BoundChild, LocationEvidence, MAX_SPAWN_BYTES, PublicSpawnEdge, PublicSpawnExitObservation,
+    PublicSpawnTopology, SPAWN_VERSION, SpawnBindRequest, SpawnEdge, SpawnExitObservation,
+    SpawnRequest, SpawnState,
 };
 
 impl Registry {
@@ -610,6 +611,16 @@ impl Registry {
         launched: RequestOutcome,
     ) -> Result<SpawnEdge, String> {
         spawn::record_launched(self, request_id, launched)
+    }
+
+    pub fn record_spawn_exit(
+        &self,
+        request_id: &str,
+        code: Option<i32>,
+        signal: Option<i32>,
+        now_ms: i64,
+    ) -> Result<SpawnEdge, String> {
+        spawn::record_exit_observation(self, request_id, code, signal, now_ms)
     }
 
     /// Binds the edge a spawn token minted to the child that presented it,

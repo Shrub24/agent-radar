@@ -2594,6 +2594,13 @@ fn a_spawn_edge_that_is_not_a_whole_record_fails_explicitly() {
     assert_eq!(legacy_read.version, 1);
     assert_eq!(legacy_read.parent, parent);
     assert!(legacy_read.parent_session_id.is_none());
+    assert!(
+        serde_json::to_value(legacy_read.public())
+            .unwrap()
+            .get("exit_observation")
+            .is_none(),
+        "legacy edges do not acquire inferred exit metadata"
+    );
 
     // A record of another version is refused rather than read as this one.
     let mut foreign: serde_json::Value = serde_json::from_slice(&whole).expect("a decoding");
@@ -2616,6 +2623,64 @@ fn a_spawn_edge_that_is_not_a_whole_record_fails_explicitly() {
     fs::write(&path, serde_json::to_vec(&garbled).expect("an encoding")).expect("a write");
     let error = registry.spawn_edge(SPAWN_REQUEST).expect_err("a refusal");
     assert!(error.contains("malformed token"), "{error}");
+    drop_root(&root);
+}
+
+#[test]
+fn spawn_exit_is_typed_first_writer_wins_and_survives_reopen() {
+    let root = temp_root("spawn-exit");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let parent = spawn_parent(&registry, INCARNATION, 1_000);
+    registry
+        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .expect("a recorded edge");
+    let initial = registry
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("read initial edge")
+        .expect("edge");
+    assert_eq!(
+        serde_json::to_value(initial.public()).unwrap()["exit_observation"]["state"],
+        "unknown"
+    );
+    let first = registry
+        .record_spawn_exit(SPAWN_REQUEST, Some(23), None, 3_000)
+        .expect("typed exit");
+    assert_eq!(first.exit.as_ref().unwrap().code, Some(23));
+    assert_eq!(first.exit.as_ref().unwrap().signal, None);
+    assert_eq!(
+        first.exit.as_ref().unwrap().observed_at,
+        format_millis(3_000)
+    );
+
+    let replay = registry
+        .record_spawn_exit(SPAWN_REQUEST, None, Some(15), 4_000)
+        .expect("replayed exit");
+    assert_eq!(
+        replay.exit, first.exit,
+        "a later observation cannot revise exit"
+    );
+    drop(registry);
+
+    let reopened = Registry::open_at(&root, 5_000).expect("reopen");
+    let restored = reopened
+        .spawn_edge(SPAWN_REQUEST)
+        .expect("read")
+        .expect("edge");
+    assert_eq!(restored.exit, first.exit);
+    assert_eq!(
+        restored.public().exit_observation,
+        first.public().exit_observation
+    );
+    assert!(
+        reopened
+            .record_spawn_exit(SPAWN_REQUEST, Some(1), Some(9), 6_000)
+            .is_err()
+    );
+    assert!(
+        reopened
+            .record_spawn_exit(SPAWN_REQUEST, None, None, 6_000)
+            .is_err()
+    );
     drop_root(&root);
 }
 

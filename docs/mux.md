@@ -17,11 +17,13 @@ promised stable third-party Rust API. The daemon owns durable operation records,
 spawn correlation and target admission; the adapter performs physical effects
 and reports their certainty. Assignment decisions remain outside the adapter.
 
-The production adapter is currently Herdr. `Daemon::bind` selects `HerdrRuntime`;
-there is no production tmux adapter or daemon physical-backend selector yet.
-Radar's `[runtime] backend = "daemon"` selects its *client transport*, not a tmux
-backend. The default `direct` client mode and its startup fallback still use
-Herdr. Backend selection must be added explicitly when tmux is implemented.
+The daemon's physical adapter defaults to Herdr. Set `RADAR_CONTROL_BACKEND=tmux`
+and `RADAR_TMUX_SERVER=<name>` before starting `radar daemon` to select the
+production tmux adapter; an unknown backend or missing server name refuses startup,
+with no fallback. The adapter uses only `tmux -L <name>` and does not touch the
+default server. Radar's `[runtime] backend = "daemon"` selects its client
+transport, not the daemon's physical backend; direct mode and its startup fallback
+still use Herdr.
 
 ## Physical operations
 
@@ -36,7 +38,7 @@ Herdr. Backend selection must be added explicitly when tmux is implemented.
 | `report` | `report` | Optional forwarding to backend metadata; not direct registry publication |
 | `close` | `close_outcome` | Physical pane/tab close after the daemon's positive-unmanaged containment and identity gate |
 | `spawn` | `validate_launch`, `create`, `launch` | Daemon-managed child creation/launch with durable edge and private registration correlation |
-| `child.close` | `inventory`, `foreground_evidence`, `close_outcome` | Close only the recorded, token-bound child's pane after exact current occupant verification |
+| `child.close` | `inventory`, `foreground_evidence`, `close_outcome` | Close only the recorded, token-bound child's pane after exact current occupant verification; a dead pane fails the live foreground-identity gate |
 
 `launch` is an adapter capability used by `spawn`, **not** a public standalone
 launch endpoint. `create` only creates a terminal location. `create` plus arbitrary
@@ -48,6 +50,18 @@ parent's pane. Although generic workspace/tab creation exists, managed spawn
 into a new tab/workspace, or a caller-selected existing pane, is not implemented.
 Consumers needing that placement must request a contract extension, not assemble
 an untracked managed launch from generic operations.
+
+`spawn.get` and `spawn.list` include `exit_observation` for current v2 edges.
+`exit_observation_v1` means the selected backend can report a retained typed pane
+exit; absent that capability the field is `{"state":"unknown"}`. Tmux arms
+`remain-on-exit` before launch and records the first observed exit code or signal
+with Radar's observation time. This is tmux's retained pane-command status, not
+independent proof of the bound agent's process identity. A same-UID client can
+`respawn-pane` before Radar's first read and replace the retained status; direct
+out-of-band pane respawn is inside the existing same-UID trust boundary. Herdr
+reports unknown. A missing pane is not proof of exit, legacy v1 edges omit the
+field, and exit observation does not change agent execution/assignment facts or
+authorize `child.close`.
 
 ## Adapter duties
 
@@ -137,7 +151,7 @@ retained-worker close/restart orchestration in `extension/index.ts`.
 | Agent-kind launcher | Resolve executable/argv and required environment in Herdsman; the daemon does not own agent-definition policy |
 | Startup readiness | Preserve an explicit Pi/Herdsman application-ready predicate; token binding alone is insufficient. A positive Herdr shell-ready contract is still absent |
 | Placement parity | Add managed-spawn placement where Herdsman actually requires new-tab/existing-pane/custom-anchor behavior; generic create is not a managed launch |
-| Loss/exit watching | Replace Herdr event subscriptions with daemon-backed observation/reconciliation or a separately specified event feed; distinguish lost observation from confirmed exit |
+| Loss/exit watching | Consume resumable daemon events and page spawn topology; typed pane exit is currently available only for tmux-backed v2 spawn edges, while Herdr and missing panes remain unknown |
 | Retained-worker stop/resume/restart | Specify and implement physical stop/exit verification and replacement/resume binding while Herdsman keeps run/result/mailbox policy |
 | Backend detection and dashboard state | Remove direct Herdr environment/alias assumptions; wire registry facts into Radar's fleet view and make daemon/server selection explicit |
 
@@ -148,18 +162,18 @@ backend can solve launch transport without waiting for a Herdr shell-ready API.
 Worktree/project choice remains caller policy; pass its selected cwd to spawn.
 Keep assignment/result guards and post-close reconciliation in Herdsman.
 
-## Second-backend acceptance
+## Tmux backend status
 
-A tmux adapter should first satisfy the supported operation matrix above, not
-reimplement every Herdr feature. Add explicit daemon backend/server selection and
-keep server-scoped location identity unambiguous. Test its adapter boundary and
-run the existing daemon/publisher contracts through it: literal launch context,
-private exact binding, observation, input/output, focus and verified child close
-with durable replay and safe cleanup.
+The daemon now supports explicit Herdr/tmux physical-backend selection, named
+server-scoped tmux handles, normalized observation and mux operations, direct-argv
+spawn launch, durable child binding, and typed one-shot exit observation on v2
+spawn edges. The adapter's launch requires `remain-on-exit` before dispatch;
+uncertain effects remain unknown. `child.close` still requires a current live
+foreground-process identity match, so a recorded dead-pane exit does not authorize
+close. Herdr remains the default and reports unknown exit observations.
 
-Then prove the consumer cutover with Herdr unavailable: Herdsman delegates,
-inspects, receives results and closes a daemon-created child without Herdr CLI,
-metadata or aliases. Radar also needs a registry-backed observation path and
-backend-neutral location detection before a tmux-only fleet can use it fully.
-Resume/recovery and richer placement are separate missing contracts where the
-consumer actually requires them; do not claim those from a successful spawn.
+This backend seam does not establish full Herdsman cutover. Adoption still needs a
+consumer migration and acceptance run with Herdr unavailable; Radar also needs a
+registry-backed observation path and backend-neutral location detection before a
+tmux-only fleet can use it fully. Resume/recovery and richer placement remain
+separate missing contracts; do not claim them from a successful spawn.

@@ -95,6 +95,15 @@ pub struct BoundChild {
     pub bound_at: String,
 }
 
+/// One durable, typed exit observation for a direct-argv child.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnExitObservation {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub observed_at: String,
+}
+
 /// One durable spawn edge.
 ///
 /// The parent, the request id and the created location are recorded facts. The
@@ -123,6 +132,10 @@ pub struct SpawnEdge {
     /// The child this edge's token bound, once one registered with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound: Option<BoundChild>,
+    /// First typed process exit observed while the daemon still had the pane.
+    /// Pane disappearance alone never creates this fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<SpawnExitObservation>,
     pub recorded_at: String,
 }
 
@@ -141,6 +154,18 @@ impl SpawnEdge {
             created: self.created,
             launched: self.launched,
             bound: self.bound.clone(),
+            exit_observation: if self.version == LEGACY_SPAWN_VERSION {
+                None
+            } else {
+                Some(match &self.exit {
+                    Some(exit) => PublicSpawnExitObservation::Exited {
+                        code: exit.code,
+                        signal: exit.signal,
+                        observed_at: exit.observed_at.clone(),
+                    },
+                    None => PublicSpawnExitObservation::Unknown,
+                })
+            },
             recorded_at: self.recorded_at.clone(),
         }
     }
@@ -172,6 +197,18 @@ impl SpawnEdge {
     }
 }
 
+/// What a spawn topology read can say about a child's process exit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PublicSpawnExitObservation {
+    Unknown,
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+        observed_at: String,
+    },
+}
+
 /// A spawn edge as a client reads it: the parent, the effects, the location and
 /// the bound child, with the token that bound it left behind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +225,8 @@ pub struct PublicSpawnEdge {
     pub launched: RequestOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound: Option<BoundChild>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_observation: Option<PublicSpawnExitObservation>,
     pub recorded_at: String,
 }
 
@@ -291,6 +330,7 @@ pub fn record(
         created: RequestOutcome::Unknown,
         launched: RequestOutcome::Unknown,
         bound: None,
+        exit: None,
         recorded_at: format_millis(now_ms),
     };
     write_edge(registry, &edge)?;
@@ -348,6 +388,39 @@ pub fn record_launched(
     let edge = SpawnEdge { launched, ..stored };
     write_edge(registry, &edge)?;
     registry.append_event("spawn.launched", None, None, Some(request_id));
+    Ok(edge)
+}
+
+/// Records the first typed exit observed for a spawned pane. Repeated and
+/// concurrent observations return the original fact without rewriting it.
+pub fn record_exit_observation(
+    registry: &Registry,
+    request_id: &str,
+    code: Option<i32>,
+    signal: Option<i32>,
+    now_ms: i64,
+) -> Result<SpawnEdge, String> {
+    canonical_uuid("request_id", request_id)?;
+    match (code, signal) {
+        (Some(code), None) if (0..=255).contains(&code) => {}
+        (None, Some(signal)) if signal > 0 => {}
+        _ => return Err("exit observation must name one valid code or signal".into()),
+    }
+    let _transition = registry.transition();
+    let stored = stored_edge(registry, request_id)?;
+    if stored.exit.is_some() {
+        return Ok(stored);
+    }
+    let edge = SpawnEdge {
+        exit: Some(SpawnExitObservation {
+            code,
+            signal,
+            observed_at: format_millis(now_ms),
+        }),
+        ..stored
+    };
+    write_edge(registry, &edge)?;
+    registry.append_event("spawn.exited", None, None, Some(request_id));
     Ok(edge)
 }
 
@@ -607,6 +680,16 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
         }
         if let Some(agent_id) = &bound.agent_id {
             canonical_uuid("bound.agent_id", agent_id)?;
+        }
+    }
+    if let Some(exit) = &edge.exit {
+        match (exit.code, exit.signal) {
+            (Some(code), None) if (0..=255).contains(&code) => {}
+            (None, Some(signal)) if signal > 0 => {}
+            _ => return Err("spawn edge exit must name one valid code or signal".into()),
+        }
+        if timestamp_millis(&exit.observed_at).is_none() {
+            return Err("spawn edge exit observed_at is not a timestamp".into());
         }
     }
     if timestamp_millis(&edge.recorded_at).is_none() {

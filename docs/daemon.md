@@ -16,10 +16,11 @@ The daemon has two independent surfaces on one local control socket:
 | Physical mux adapter | Observe terminal locations/process evidence; focus, create, input, read output and guarded unmanaged close | [Control-plane protocol](control-plane.md) |
 | Direct agent registry | Register agent incarnations; publish execution and assignment facts; read current facts and process verification | [Agent registration](agent-registration.md) |
 
-The physical backend is currently Herdr. Registry calls work without a mux
-backend and do not publish through Herdr. The older mux `report` method still
-forwards state/session/metadata to the backend; it is **not** direct registry
-publication.
+The physical backend defaults to Herdr; the daemon can also select the tmux
+adapter explicitly with `RADAR_CONTROL_BACKEND=tmux` and a named
+`RADAR_TMUX_SERVER`. Registry calls work without a mux backend and do not publish
+through Herdr. The older mux `report` method still forwards state/session/metadata
+to the backend; it is **not** direct registry publication.
 
 The daemon can create and launch a child through `spawn`, recording a durable
 edge to its named parent. Name both the exact parent agent UUID and
@@ -34,13 +35,19 @@ readbacks omit environment values. The child captures/removes the private
 `agent_id`. Read `result.spawn.bound.agent_id` from flat `spawn.get` and use that
 exact ID with `agent.get`, not aliases or a nonexistent `spawn.edge` object.
 Legacy bindings may omit the ID. New v2 edges retain process and session parent
-identities; v1 edges have no inferred session parent.
+identities; v1 edges have no inferred session parent. Current v2 topology also
+reports `exit_observation`: tmux can persist a typed pane-command exit after
+arming `remain-on-exit`; Herdr and backends without exit support report unknown.
+Missing panes do not imply exit, and exit evidence never changes assignment or
+execution publications.
 
 For children bound to that edge, `child.close` can
 close only the edge's recorded pane after fresh occupant verification. This is
 not a process stop or assignment transition: it never claims process or
-process-group exit and never writes execution or assignment facts. The daemon
-does not make itself a lifecycle manager: there is no resume, restart, recovery,
+process-group exit and never writes execution or assignment facts. A recorded
+tmux exit is not a substitute for a live foreground identity; `child.close`
+refuses a dead pane before durable admission or dispatch. The daemon does not
+make itself a lifecycle manager: there is no resume, restart, recovery,
 or adoption of panes launched outside the daemon. A created pane is not a bound
 child until that child registers with the private spawn token. Private
 launch/resume specifications stored on registrations remain inert unless
@@ -63,7 +70,8 @@ Default socket resolution: `RADAR_CONTROL_SOCKET`, then
 `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then
 `/tmp/agent-radar-<uid>/control.sock`. This is separate from the background-task
 bus socket. See the [protocol reference](control-plane.md#start-and-select) for
-state-path resolution and Radar's `[runtime]` adapter selection.
+state-path resolution, Radar's `[runtime]` client transport, and the daemon's
+physical-backend selection.
 
 Before connecting, check that the socket and its parent are not symlinks, the
 parent is a user-owned real directory with mode `0700`, and the socket is a

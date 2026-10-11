@@ -56,15 +56,14 @@ See `docs/daemon.md` for the consumer entry point and linked wire references.
 for an exact bound daemon-spawned child with durable outcomes. It is not process
 termination, resume, restart or assignment completion.
 
-`child-launch-binding` is implemented and verified (7/7 tasks; not yet committed,
-pushed or archived). Spawn carries cwd/environment overlays, validates support
-before effects, keeps environment values private, and exposes the exact token-bound
-child `agent_id` for registry lookup. New spawn edges also carry the explicitly
-named parent registration and its verified session UUID; legacy edges are not
-assigned inferred session parentage. Publisher, real disposable-tab launch/bind/close,
-PTY and checked Nix gates pass; see the change's `verification.md` for evidence and
-the pi-extensions adoption handoff. Herdsman launch migration remains external;
-binding is not application or assignment readiness.
+`child-launch-binding` is implemented and verified (7/7 tasks), archived and
+pushed with the daemon launch-context work (`65f3e8e3`, docs `9d3df7f5`). Spawn
+carries cwd/environment overlays, validates support before effects, keeps
+environment values private, and exposes the exact token-bound child `agent_id`
+for registry lookup. New spawn edges also carry the explicitly named parent
+registration and its verified session UUID; legacy edges are not assigned
+inferred session parentage. Herdsman launch migration remains external; binding
+is not application or assignment readiness.
 
 Registry publication does not yet feed Radar's TUI. General launch, process
 termination, resume and restart remain unimplemented. Existing managed controls
@@ -117,22 +116,27 @@ In priority order:
    add confirmed stale-lead batches and startup plans before opt-in automation.
    Do not restart all panes indiscriminately.
 6. **Herdsman cutover and tmux backend.** The targeted current-caller audit is
-   recorded in `docs/mux.md`: physical caller migration, explicit application
-   readiness, managed-spawn placement parity, lifecycle observation and retained
-   worker stop/resume remain. Add a tmux RuntimeProvider and explicit daemon
-   backend/server selection; run the supported launch/bind/inspect/close flows
-   without Herdr available. Registry-backed TUI observation is also required for
-   full removal. The existing seam is sufficient to start this adapter; missing
-   Herdr shell readiness and lead restart need not block tmux work. Full parity
-   still requires the used retained-worker lifecycle/recovery flows.
+   recorded in `docs/mux.md`. The tmux `RuntimeProvider` and explicit named-server
+   daemon selection are implemented and locally verified in the active
+   `tmux-backend` change; Herdr remains the default. Tmux supports direct-argv
+   launch, binding and retained pane-command exit observations for daemon-created
+   children, but out-of-band same-UID pane respawn can replace an unread exit
+   status. Herdr exit remains unknown. Herdsman migration, explicit application
+   readiness, managed-spawn placement parity, lifecycle watching beyond these
+   edges, retained-worker stop/resume and registry-backed TUI observation remain.
+   Full parity still requires the used retained-worker lifecycle/recovery flows.
 7. **Further TUI and information surfaces.** Review fleet density; then consider
    non-consuming preview, session statistics/search and fleet failure summaries.
 
 Separate daemon follow-ups: retention/pruning for accumulated process-incarnation
 records. The `events.read` long-poll journal (`lifecycle-events`, archived) is the
-event surface; it reports committed daemon facts only, not backend pushes, exit or
-readiness. Next: `tmux-backend` (drafted, adds launch with exit observation). Launch specs and mux locations remain optional and unpublished by
-Herdsman until a consumer exists. pi-subagents is removed and excluded.
+event surface; it reports journaled daemon facts only, not backend pushes, exit or
+readiness. `tmux-backend` is implemented and locally verified in its active change;
+it is not yet committed, pushed or archived. It adds explicit named-server selection,
+direct-argv launch and typed pane-command exit reads, with the out-of-band respawn
+limitation recorded in its design and mux contract. Launch specs and mux locations
+remain optional and unpublished by Herdsman until a consumer exists. pi-subagents is
+removed and excluded.
 
 Linux-only is accepted; cross-platform support is not a prerequisite. Background
 task metrics still require publisher-captured process birth identity. Physical

@@ -22,3 +22,7 @@
 {"id":"ac2d3e4f-5678-4abc-9def-0123456789ab","result":{"requests":[]}}
 {"version":1,"id":"bc2d3e4f-5678-4abc-9def-0123456789ab","method":"resume","params":{}}
 {"id":"bc2d3e4f-5678-4abc-9def-0123456789ab","error":{"code":"unknown_method","message":"unknown method `resume`"}}
+{"version":1,"id":"dc2d3e4f-5678-4abc-9def-0123456789ab","method":"ping","params":{}}
+{"id":"dc2d3e4f-5678-4abc-9def-0123456789ab","result":{"protocol":1,"backend":"runtime","capabilities":["observe","process_info","focus","close","creation","input","output","launch","exit_observation_v1","child_launch_context_v1","agent_registry","events_v1"]}}
+{"version":1,"id":"ec2d3e4f-5678-4abc-9def-0123456789ab","method":"spawn.get","params":{"request_id":"fc2d3e4f-5678-4abc-9def-0123456789ab"}}
+{"id":"ec2d3e4f-5678-4abc-9def-0123456789ab","result":{"spawn":{"version":2,"request_id":"fc2d3e4f-5678-4abc-9def-0123456789ab","parent":"1c2d3e4f-5678-4abc-9def-0123456789ab","parent_session_id":"2c2d3e4f-5678-4abc-9def-0123456789ab","location":{"backend":"runtime","workspace":"tmux:work:$0","tab":"tmux:work:@0","pane":"tmux:work:%1"},"created":"completed","launched":"completed","bound":{"source":"herdsman-child","incarnation":"3c2d3e4f-5678-4abc-9def-0123456789ab","agent_id":"4c2d3e4f-5678-4abc-9def-0123456789ab","bound_at":"2026-01-01T00:00:00.000Z"},"exit_observation":{"state":"exited","code":23,"signal":null,"observed_at":"2026-01-01T00:00:01.000Z"},"recorded_at":"2026-01-01T00:00:00.000Z","state":"bound","freshness":"fresh"}}}

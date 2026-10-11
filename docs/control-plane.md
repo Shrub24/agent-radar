@@ -14,12 +14,20 @@ They do not provide process stop, resume or restart.
 
 ## Start and select
 
-Run `radar daemon` separately. It prints the socket and record directory, serves until SIGINT/SIGTERM, and removes only its own socket on shutdown. It does not start a TUI. Radar's `[runtime]` config selects its adapter:
+Run `radar daemon` separately. It prints the socket and record directory, serves until SIGINT/SIGTERM, and removes only its own socket on shutdown. It does not start a TUI. The daemon's physical adapter defaults to Herdr; select tmux explicitly with `RADAR_CONTROL_BACKEND=tmux` and `RADAR_TMUX_SERVER=<name>`. Missing server names and unknown backends refuse startup, with no fallback. The tmux adapter uses only the named `tmux -L <name>` server.
+
+Radar's `[runtime]` config selects its client transport, not the daemon's physical backend:
 
 ```toml
 [runtime]
 backend = "daemon" # or direct (the default)
 # socket = "/run/user/1000/agent-radar/control.sock"
+```
+
+For example, start a daemon on a named tmux server with:
+
+```sh
+RADAR_CONTROL_BACKEND=tmux RADAR_TMUX_SERVER=work radar daemon
 ```
 
 An omitted socket uses `RADAR_CONTROL_SOCKET`, then `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then `/tmp/agent-radar-<uid>/control.sock`. The daemon record root uses `RADAR_CONTROL_STATE`, `$XDG_STATE_HOME/agent-radar/control`, then `~/.local/state/agent-radar/control`, with `/tmp/agent-radar-<uid>` as last resort when neither state-home nor HOME exists.
@@ -51,6 +59,7 @@ Lines are capped at 1 MiB excluding newline; an oversized line is drained and re
 | `create` | `creation` |
 | `spawn` | `creation` + `launch` |
 | `spawn` with cwd/env | Also `child_launch_context_v1` |
+| `spawn.get`, `spawn.list` typed exit reads | `exit_observation_v1` (optional; absent capability reports unknown) |
 | `input` | `input` |
 | `output` | `output` |
 | `report` | `reporting` |
@@ -58,7 +67,7 @@ Lines are capped at 1 MiB excluding newline; an oversized line is drained and re
 | `events.read` | `events_v1` |
 | `child.close` | `agent_registry` plus `observe` and `close` |
 
-`agent_registry` and `events_v1` are advertised independently of backend capabilities, including when the backend is `none`. Radar requires the first four at startup; other missing capabilities do not prevent handshake and refuse only their method. Current production backend is Herdr. There is no production tmux backend. `registry` and `resume` (and other unknown names) return `unknown_method`. Registry request schemas are documented once in the [agent-registration contract](agent-registration.md); methods are `agent.register`, `agent.acquire`, `agent.publish`, `agent.retire`, `agent.context`, `agent.get` and `agent.list`.
+`agent_registry` and `events_v1` are advertised independently of backend capabilities, including when the backend is `none`. Radar checks its required client capabilities at startup; other missing capabilities do not prevent handshake and refuse only their method. Herdr is the default physical backend; tmux is selected explicitly by the daemon environment. `exit_observation_v1` is optional and does not gate spawn: without it, current v2 topology reads report unknown. `registry` and `resume` (and other unknown names) return `unknown_method`. Registry request schemas are documented once in the [agent-registration contract](agent-registration.md); methods are `agent.register`, `agent.acquire`, `agent.publish`, `agent.retire`, `agent.context`, `agent.get` and `agent.list`.
 
 ## Methods
 
@@ -72,6 +81,7 @@ nonempty, at most 256 UTF-8 bytes, and contain no control characters. JSON seria
 - `observe`, params `{}`: `{ "inventory": FleetObservation }`. No record.
 - `process_info`, params `{"pane_id":"wA:p1"}`: `{ "evidence": ForegroundEvidence }`. No record; inconclusive evidence is a valid result.
 - `output`, params `{"pane_id":"wA:p1","source":"recent","lines":100,"ansi":false}`. `source` is `visible`, `recent`, `recent_unwrapped`, or `detection`; `lines` is optional (runtime default), otherwise 1..=500; `ansi` defaults false. Result is `{ "output": {"text":"…","truncated":false,"revision":null} }`. Text is capped at 64 KiB on a UTF-8 boundary and `truncated` set. No record.
+- `spawn.get`/`spawn.list`: durable child topology and optional current backend location verification; see the [agent-registration topology contract](agent-registration.md). Current v2 edges carry an explicit `exit_observation`: `unknown`, or `exited` with code/signal and `observed_at`. Legacy v1 edges omit the field. Missing panes remain unresolved, not exited.
 - `request`, params `{"id":"<canonical UUID>"}`: `{ "request": RequestRecord }`, or `not_found`. No record for the lookup.
 - `requests`, params `{}` or `{"limit":50}`: `{ "requests": [RequestRecord,…] }`, newest first; default 50, maximum 200 (larger counts clamp to 200). No record.
 - `events.read`, params `{"after":12,"epoch":"<last-seen-epoch>","limit":100,"wait_ms":1000}`. `after` is a sequence number, default 0; `epoch` is optional. `limit` defaults to 100 and must be 1..=500. `wait_ms` defaults to 0 and must be 0..=1000. The successful normal result is `{ "epoch":"…", "events":[Event,…], "cursor":{"epoch":"…","sequence":12}, "earliest":1 }`; `Event` has `seq`, `kind`, optional `agent_id`, `spawn`, `request_id`, and `at`. The response cursor is an object; resume with its `sequence` as `after` and its `epoch` as `epoch`. An empty `events` array means the bounded wait ended without a new event.
@@ -100,7 +110,7 @@ Effectful backend refusals can settle `outcome: refused`; confirmed actions sett
 
 ### Managed child close
 
-`child.close` is a separate durable operation for the exact daemon-created child that registered with a spawn edge's private token. It takes the edge's `spawn_request_id`, the exact bound `(source, incarnation)` and an audit intent (`complete` or `cancel`); the caller cannot select a pane. The exact request and response are in the [canonical registry fixture](agent-registration.fixture.jsonl). The edge must exist, be bound to that child and name a pane, and the child's registration must carry a process identity claim. Immediately before admission the daemon requires fresh inventory showing the pane in its recorded workspace/tab containment, then a positive non-shell foreground PID whose procfs birth identity exactly matches the registered `(pid, boot_id, start_ticks)` tuple. A missing, unbound or mismatched edge, pane or child; no process claim; shell, invalid PID or inconclusive foreground evidence; changed containment; unavailable verification; or a backend missing `observe` or `close` refuses before admission and before any backend effect. A different managed child, a foreign pane, a caller-chosen pane id, and targets named by label, title, session UUID or pane position are never eligible. Foreground evidence is an adapter-side process read, so a backend that cannot answer it refuses here rather than being trusted on pane presence alone.
+`child.close` is a separate durable operation for the exact daemon-created child that registered with a spawn edge's private token. It takes the edge's `spawn_request_id`, the exact bound `(source, incarnation)` and an audit intent (`complete` or `cancel`); the caller cannot select a pane. The exact request and response are in the [canonical registry fixture](agent-registration.fixture.jsonl). The edge must exist, be bound to that child and name a pane, and the child's registration must carry a process identity claim. Immediately before admission the daemon requires fresh inventory showing the pane in its recorded workspace/tab containment, then a positive non-shell foreground PID whose procfs birth identity exactly matches the registered `(pid, boot_id, start_ticks)` tuple. A missing, unbound or mismatched edge, pane or child; no process claim; shell, invalid PID or inconclusive foreground evidence; changed containment; unavailable verification; or a backend missing `observe` or `close` refuses before admission and before any backend effect. A different managed child, a foreign pane, a caller-chosen pane id, and targets named by label, title, session UUID or pane position are never eligible. Foreground evidence is an adapter-side process read, so a backend that cannot answer it refuses here rather than being trusted on pane presence alone. A retained exit observation is not a substitute for a current foreground-process identity: `child.close` refuses a dead pane before durable admission or dispatch.
 
 The durable record stores the request ID, edge, bound child, recorded pane and intent before dispatch. Backend-confirmed pane closure is `completed`; a positive backend refusal is `refused`; a possibly dispatched close without confirmation is `unknown`. Identical same-ID replay returns the stored result without re-verification or redispatch; different content under the same ID refuses. An unknown result is never retried automatically or through another backend. The result reports the mux pane closure only: it never claims foreground-process or process-group exit and never writes assignment or execution facts. The spawn edge and binding remain; a pane that disappears after an unknown result stays unresolved, not confirmed closed. `ping` advertises no separate managed-close capability. To reconcile a lost
 reply, resend the exact same `child.close` request ID and params; it returns the

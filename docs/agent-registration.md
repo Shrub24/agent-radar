@@ -190,17 +190,28 @@ Both topology methods require `agent_registry`, regardless of backend. For
 location verification, one `observe` inventory is consulted per response/page
 when a backend advertises `observe`; otherwise the durable topology is still
 returned with unconfirmed freshness. Edges persist across daemon restarts. The
-public topology contains parent, optional bound child `(source, incarnation, agent_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains
-created/launched outcomes, optional created location, `state`, and
-`freshness`; it never contains the token. `state` is `unbound` without a child,
-`bound` after token binding, or `unresolved` when a recorded pane is absent from
-a successful inventory. `unresolved` takes precedence over `bound` in `state`,
-but the bound child remains present beside it. `freshness` is `fresh` only when
-the backend currently reports the recorded pane; it is `stale` when it cannot be
-confirmed or is absent, and omitted if there is no pane to verify. `stale` and
-`unresolved` describe location confirmation only, never process exit, idleness,
-completion, or permission to restart/stop/resume. The read never adopts an
-observed pane or binds a child by title, alias, label, position, or session UUID.
+public topology contains parent, optional bound child `(source, incarnation, agent_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains created/launched outcomes, optional created location, `state`,
+`freshness`, and `exit_observation`; it never contains the token.
+
+`state` is `unbound` without a child, `bound` after token binding, or
+`unresolved` when a recorded pane is absent from a successful inventory.
+`unresolved` takes precedence over `bound`, but the bound child remains present.
+`freshness` is `fresh` only when the backend currently reports the recorded pane;
+it is `stale` when it cannot be confirmed or is absent, and omitted if there is
+no pane to verify. These location fields never imply exit, idleness, completion,
+or permission to restart/stop/resume.
+
+Current v2 edges expose `exit_observation` as `{"state":"unknown"}` until the
+backend confirms the pane command exited, then as
+`{"state":"exited","code":23,"signal":null,"observed_at":"<daemon-time>"}`
+(the signal form has `code:null`). `exit_observation_v1` advertises backend
+support; without it, current v2 edges remain unknown. Herdr has no
+exit-observation capability, and a missing pane is never inferred to be exited.
+Legacy v1 edges omit the field. Exit evidence is the backend's pane-command
+status, not proof of the bound agent's process identity after an out-of-band
+respawn; it does not change agent execution or assignment publications. Reads
+never adopt an observed pane or bind a child by title, alias, label, position, or
+session UUID.
 
 `spawn` is a method of this protocol version, not a capability name. `ping`
 reports backend capabilities, not its full method table. A consumer should
@@ -224,9 +235,11 @@ registered `(pid, boot_id, start_ticks)`. It refuses before recording or
 dispatch for an absent/unbound/mismatched edge or pane, missing process claim,
 missing or inconclusive foreground evidence, changed containment, or failed
 identity verification. It requires the mux capabilities `observe` and `close`;
-a missing capability refuses before record or backend effect. Foreign or
-caller-selected panes, children outside daemon-authored spawn edges, labels,
-titles and pane positions are never targets.
+a missing capability refuses before record or backend effect. A recorded exit
+does not substitute for a current foreground-process identity: `child.close`
+refuses a dead pane before admission or dispatch. Foreign or caller-selected
+panes, children outside daemon-authored spawn edges, labels, titles and pane
+positions are never targets.
 
 A successful admission persists the target and `complete` or `cancel` intent
 before dispatch. The intent is an audit/display label only. The durable close
