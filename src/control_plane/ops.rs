@@ -6,6 +6,75 @@
 //!
 //! Effectful operations are recorded before dispatch. Reads are never recorded.
 //! Unsupported methods are refused as unknown methods rather than emulated.
+//!
+//! The backend capability vocabulary lives with the seam it describes
+//! (`crate::runtime`) and is re-exported here; the daemon's own contracts are
+//! derived from the capabilities their methods need rather than pushed by hand,
+//! so what the handshake advertises and what the serving paths accept cannot
+//! drift apart.
+
+pub use crate::runtime::{
+    CLOSE_CAPABILITY, CREATE_CAPABILITY, EXIT_OBSERVATION_CAPABILITY, FOCUS_CAPABILITY,
+    INPUT_CAPABILITY, LAUNCH_CAPABILITY, LAUNCH_CONTEXT_CAPABILITY, OBSERVE_CAPABILITY,
+    OUTPUT_CAPABILITY, PROCESS_INFO_CAPABILITY, REPORT_CAPABILITY,
+};
+
+/// A contract the daemon itself serves, versioned because a consumer pins it.
+///
+/// The `*.v1` names are the daemon's own, not the backend's: they say which of
+/// the daemon's methods a backend's capabilities make servable.
+pub const REGISTRY_CONTRACT: &str = "registry.v1";
+pub const EVENTS_CONTRACT: &str = "events.v1";
+pub const SPAWN_CONTRACT: &str = "spawn.v1";
+pub const SPAWN_CLOSE_CONTRACT: &str = "spawn.close.v1";
+pub const SPAWN_LAUNCH_CONTEXT_CONTRACT: &str = "spawn.launch_context.v1";
+pub const SPAWN_EXIT_OBSERVATION_CONTRACT: &str = "spawn.exit_observation.v1";
+
+/// Every daemon contract, with the backend capabilities its methods are served
+/// from.
+///
+/// Advertising a contract promises that its methods are served, so a contract
+/// appears only when every capability it names is present. The registry and the
+/// event journal are answered from the daemon's own records and need no backend.
+const CONTRACTS: &[(&str, &[&str])] = &[
+    (REGISTRY_CONTRACT, &[]),
+    (EVENTS_CONTRACT, &[]),
+    (SPAWN_CONTRACT, &[CREATE_CAPABILITY, LAUNCH_CAPABILITY]),
+    (
+        SPAWN_CLOSE_CONTRACT,
+        &[OBSERVE_CAPABILITY, CLOSE_CAPABILITY],
+    ),
+    (
+        SPAWN_LAUNCH_CONTEXT_CONTRACT,
+        &[
+            CREATE_CAPABILITY,
+            LAUNCH_CAPABILITY,
+            LAUNCH_CONTEXT_CAPABILITY,
+        ],
+    ),
+    (
+        SPAWN_EXIT_OBSERVATION_CONTRACT,
+        &[EXIT_OBSERVATION_CAPABILITY],
+    ),
+];
+
+/// What the handshake advertises: what the backend declares, then the daemon
+/// contracts those capabilities can serve.
+pub fn advertised(backend: &[&'static str]) -> Vec<&'static str> {
+    let mut advertised: Vec<&'static str> = Vec::new();
+    for capability in backend {
+        if !advertised.contains(capability) {
+            advertised.push(capability);
+        }
+    }
+    advertised.extend(
+        CONTRACTS
+            .iter()
+            .filter(|(_, needs)| needs.iter().all(|needed| backend.contains(needed)))
+            .map(|(contract, _)| *contract),
+    );
+    advertised
+}
 
 /// An operation that changes or asks something of the multiplexer, and therefore
 /// travels as a durable request.
@@ -21,20 +90,16 @@ pub enum Operation {
     Spawn,
 }
 
-/// The `launch` capability required to run a resolved child command.
-pub use crate::runtime::LAUNCH_CAPABILITY;
-pub const CHILD_LAUNCH_CONTEXT_CAPABILITY: &str = "child_launch_context_v1";
-
 impl Operation {
     /// The operation a method name denotes, if it is one.
     pub fn from_method(method: &str) -> Option<Self> {
         Some(match method {
-            "focus" => Self::Focus,
-            "close" => Self::Close,
-            "create" => Self::Create,
-            "input" => Self::Input,
-            "report" => Self::Report,
-            "spawn" => Self::Spawn,
+            "mux.focus" => Self::Focus,
+            "mux.close" => Self::Close,
+            "mux.create" => Self::Create,
+            "mux.input" => Self::Input,
+            "mux.report" => Self::Report,
+            "spawn.create" => Self::Spawn,
             _ => return None,
         })
     }
@@ -42,26 +107,26 @@ impl Operation {
     /// The wire name, which is also the record's method.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Focus => "focus",
-            Self::Close => "close",
-            Self::Create => "create",
-            Self::Input => "input",
-            Self::Report => "report",
-            Self::Spawn => "spawn",
+            Self::Focus => "mux.focus",
+            Self::Close => "mux.close",
+            Self::Create => "mux.create",
+            Self::Input => "mux.input",
+            Self::Report => "mux.report",
+            Self::Spawn => "spawn.create",
         }
     }
 
     /// The backend capabilities this operation cannot be served without.
     pub fn capabilities(self) -> &'static [&'static str] {
         match self {
-            Self::Focus => &["focus"],
-            Self::Close => &["close"],
-            Self::Create => &["creation"],
-            Self::Input => &["input"],
-            Self::Report => &["reporting"],
+            Self::Focus => &[FOCUS_CAPABILITY],
+            Self::Close => &[CLOSE_CAPABILITY],
+            Self::Create => &[CREATE_CAPABILITY],
+            Self::Input => &[INPUT_CAPABILITY],
+            Self::Report => &[REPORT_CAPABILITY],
             // A spawn does both, so a backend that can do only one of them
             // cannot serve it: a pane with no command in it is not a child.
-            Self::Spawn => &["creation", LAUNCH_CAPABILITY],
+            Self::Spawn => &[CREATE_CAPABILITY, LAUNCH_CAPABILITY],
         }
     }
 
@@ -137,17 +202,17 @@ pub enum Method {
 /// connection reports and then keeps serving.
 pub fn classify(method: &str) -> Option<Method> {
     Some(match method {
-        "ping" => Method::Ping,
-        "request" => Method::Request,
-        "requests" => Method::Requests,
+        "daemon.ping" => Method::Ping,
+        "mux.request.get" => Method::Request,
+        "mux.request.list" => Method::Requests,
         "events.read" => Method::Events,
         "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
         | "agent.get" | "agent.list" => Method::Registry,
         // A spawn read reports the daemon's own edge records; whether the backend
         // still reports a recorded location changes its freshness, never whether
         // the read is served.
-        "spawn.get" | "spawn.list" | "child.close" => Method::Registry,
-        "observe" | "process_info" | "output" => Method::Read,
+        "spawn.get" | "spawn.list" | "spawn.close" => Method::Registry,
+        "mux.observe" | "mux.process_info" | "mux.output" => Method::Read,
         other => Method::Operation(Operation::from_method(other)?),
     })
 }
@@ -159,9 +224,9 @@ pub fn classify(method: &str) -> Option<Method> {
 /// backend's own statement that this is a request it implements.
 pub fn read_capability(method: &str) -> &'static str {
     match method {
-        "process_info" => "process_info",
-        "output" => "output",
-        _ => "observe",
+        "mux.process_info" => PROCESS_INFO_CAPABILITY,
+        "mux.output" => OUTPUT_CAPABILITY,
+        _ => OBSERVE_CAPABILITY,
     }
 }
 
@@ -192,18 +257,43 @@ mod tests {
 
     #[test]
     fn every_documented_method_is_classified() {
-        assert_eq!(classify("ping"), Some(Method::Ping));
-        assert_eq!(classify("request"), Some(Method::Request));
-        assert_eq!(classify("requests"), Some(Method::Requests));
+        assert_eq!(classify("daemon.ping"), Some(Method::Ping));
+        assert_eq!(classify("mux.request.get"), Some(Method::Request));
+        assert_eq!(classify("mux.request.list"), Some(Method::Requests));
         assert_eq!(classify("events.read"), Some(Method::Events));
         assert_eq!(classify("agent.context"), Some(Method::Registry));
         assert_eq!(classify("spawn.get"), Some(Method::Registry));
         assert_eq!(classify("spawn.list"), Some(Method::Registry));
-        assert_eq!(classify("observe"), Some(Method::Read));
-        assert_eq!(classify("process_info"), Some(Method::Read));
-        assert_eq!(classify("output"), Some(Method::Read));
+        assert_eq!(classify("spawn.close"), Some(Method::Registry));
+        assert_eq!(classify("mux.observe"), Some(Method::Read));
+        assert_eq!(classify("mux.process_info"), Some(Method::Read));
+        assert_eq!(classify("mux.output"), Some(Method::Read));
         assert_eq!(classify("registry"), None);
         assert_eq!(classify("resume"), None);
+        // The names the first protocol version served are gone, and a client
+        // that still uses one is told it named no method rather than served a
+        // substituted one.
+        for removed in [
+            "ping",
+            "observe",
+            "process_info",
+            "output",
+            "focus",
+            "close",
+            "create",
+            "input",
+            "report",
+            "request",
+            "requests",
+            "spawn",
+            "child.close",
+        ] {
+            assert_eq!(
+                classify(removed),
+                None,
+                "{removed} is not served in version 2"
+            );
+        }
         for operation in [
             Operation::Focus,
             Operation::Close,
@@ -223,7 +313,7 @@ mod tests {
 
     #[test]
     fn a_reading_method_is_not_an_operation() {
-        for method in ["observe", "process_info", "output"] {
+        for method in ["mux.observe", "mux.process_info", "mux.output"] {
             assert_eq!(classify(method), Some(Method::Read));
             assert_eq!(Operation::from_method(method), None);
         }
@@ -231,26 +321,109 @@ mod tests {
 
     #[test]
     fn a_read_names_the_capability_it_needs() {
-        assert_eq!(read_capability("observe"), "observe");
-        assert_eq!(read_capability("process_info"), "process_info");
-        assert_eq!(read_capability("output"), "output");
+        assert_eq!(read_capability("mux.observe"), OBSERVE_CAPABILITY);
+        assert_eq!(read_capability("mux.process_info"), PROCESS_INFO_CAPABILITY);
+        assert_eq!(read_capability("mux.output"), OUTPUT_CAPABILITY);
+    }
+
+    /// Every contract a backend can serve is advertised, and each one needs what
+    /// its serving path checks. A hand-pushed flag is what this replaces.
+    #[test]
+    fn every_contract_needs_the_capabilities_its_methods_use() {
+        let able = [
+            OBSERVE_CAPABILITY,
+            PROCESS_INFO_CAPABILITY,
+            FOCUS_CAPABILITY,
+            CLOSE_CAPABILITY,
+            CREATE_CAPABILITY,
+            INPUT_CAPABILITY,
+            OUTPUT_CAPABILITY,
+            REPORT_CAPABILITY,
+            LAUNCH_CAPABILITY,
+            LAUNCH_CONTEXT_CAPABILITY,
+            EXIT_OBSERVATION_CAPABILITY,
+        ];
+        for (contract, needs) in CONTRACTS {
+            assert!(
+                advertised(&able).contains(contract),
+                "a backend with every capability serves {contract}"
+            );
+            for needed in *needs {
+                let without: Vec<&str> = able
+                    .iter()
+                    .copied()
+                    .filter(|capability| capability != needed)
+                    .collect();
+                assert!(
+                    !advertised(&without).contains(contract),
+                    "{contract} is not advertised without {needed}"
+                );
+            }
+        }
+        assert_eq!(
+            advertised(&[LAUNCH_CAPABILITY]),
+            vec![LAUNCH_CAPABILITY, REGISTRY_CONTRACT, EVENTS_CONTRACT],
+            "a backend that can only launch serves spawn.create no better than none"
+        );
+        assert_eq!(
+            advertised(&[]),
+            vec![REGISTRY_CONTRACT, EVENTS_CONTRACT],
+            "the daemon's own records need no backend"
+        );
+    }
+
+    #[test]
+    fn a_capability_a_backend_states_twice_is_advertised_once() {
+        assert_eq!(
+            advertised(&[OBSERVE_CAPABILITY, OBSERVE_CAPABILITY]),
+            vec![OBSERVE_CAPABILITY, REGISTRY_CONTRACT, EVENTS_CONTRACT]
+        );
+    }
+
+    /// A contract's capability list is exactly what its operation checks, so an
+    /// advertised contract is never refused for a capability it did not name.
+    #[test]
+    fn a_contract_names_what_its_operation_needs() {
+        let spawn_needs = CONTRACTS
+            .iter()
+            .find(|(contract, _)| *contract == SPAWN_CONTRACT)
+            .expect("the spawn contract")
+            .1;
+        assert_eq!(Operation::Spawn.capabilities(), spawn_needs);
+        let close_needs = CONTRACTS
+            .iter()
+            .find(|(contract, _)| *contract == SPAWN_CLOSE_CONTRACT)
+            .expect("the close contract")
+            .1;
+        assert!(close_needs.contains(&CLOSE_CAPABILITY));
     }
 
     #[test]
     fn a_refusal_names_the_capability_it_needs() {
-        assert!(Operation::Focus.unavailable_message().contains("`focus`"));
+        assert!(
+            Operation::Focus
+                .unavailable_message()
+                .contains("`mux.focus`")
+        );
         assert!(
             Operation::Spawn
                 .unavailable_message()
-                .contains("`creation` and `launch`"),
+                .contains("`mux.create` and `mux.launch`"),
             "a spawn names everything it needs"
         );
         assert_eq!(
-            Operation::readiness("spawn", LAUNCH_CAPABILITY, &["creation", "input"]),
-            Err("spawn needs the `launch` capability; this backend does not provide it".into())
+            Operation::readiness(
+                "spawn.create",
+                LAUNCH_CAPABILITY,
+                &[CREATE_CAPABILITY, INPUT_CAPABILITY]
+            ),
+            Err(
+                "spawn.create needs the `mux.launch` capability; this backend does not provide it"
+                    .into()
+            )
         );
         assert_eq!(
-            Operation::readiness("spawn", LAUNCH_CAPABILITY, &["launch"]),
+            Operation::readiness("spawn.create", LAUNCH_CAPABILITY, &[LAUNCH_CAPABILITY]),
             Ok(()),
             "readiness is separate from implementing dispatch"
         );
@@ -258,18 +431,24 @@ mod tests {
 
     #[test]
     fn an_operation_needs_every_capability_it_lists() {
-        let able = ["creation", "launch", "reporting"];
+        let able = [CREATE_CAPABILITY, LAUNCH_CAPABILITY, REPORT_CAPABILITY];
         assert_eq!(Operation::Spawn.ready_for(&able), Ok(()));
         assert!(Operation::Create.ready_for(&able).is_ok());
         assert!(Operation::Report.ready_for(&able).is_ok());
         assert_eq!(
-            Operation::Spawn.ready_for(&["creation", "input"]),
-            Err("spawn needs the `launch` capability; this backend does not provide it".into()),
+            Operation::Spawn.ready_for(&[CREATE_CAPABILITY, INPUT_CAPABILITY]),
+            Err(
+                "spawn.create needs the `mux.launch` capability; this backend does not provide it"
+                    .into()
+            ),
             "creating a pane is not launching a child"
         );
         assert_eq!(
-            Operation::Spawn.ready_for(&["launch"]),
-            Err("spawn needs the `creation` capability; this backend does not provide it".into()),
+            Operation::Spawn.ready_for(&[LAUNCH_CAPABILITY]),
+            Err(
+                "spawn.create needs the `mux.create` capability; this backend does not provide it"
+                    .into()
+            ),
             "launching is not creating the pane a child runs in"
         );
     }

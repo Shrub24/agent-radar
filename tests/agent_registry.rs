@@ -20,13 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use agent_radar::control_plane::registry::{
-    AcquireRequest, Channel, ChildCloseRequest, CloseAdmission, CloseIntent, ContextRequest,
-    ContextValue, ExpectedWriter, Freshness, LaunchSession, LaunchSpec, LocalProcfsVerifier,
-    LocationEvidence, MAX_CHILD_CLOSE_BYTES, MAX_CONTEXT_BYTES, MAX_LISTED, MAX_REGISTRATION_BYTES,
-    MAX_SPAWN_BYTES, MAX_TEXT_BYTES, Outcome, ProcessVerification, ProcessVerifier, PublicChannel,
-    PublicContext, PublishRequest, PublisherIdentity, RegistrationRequest, Registry,
-    RegistryLocation, Snapshot, SpawnBindRequest, SpawnEdge, SpawnRequest, SpawnState,
-    WriterBinding,
+    AcquireRequest, Channel, ChildCloseRequest, CloseAdmission, CloseIntent, CloseOutcome,
+    CloseResult, ContextRequest, ContextValue, ExpectedWriter, Freshness, LaunchSession,
+    LaunchSpec, LocalProcfsVerifier, LocationEvidence, MAX_CHILD_CLOSE_BYTES, MAX_CONTEXT_BYTES,
+    MAX_LISTED, MAX_REGISTRATION_BYTES, MAX_SPAWN_BYTES, MAX_TEXT_BYTES, Outcome,
+    ProcessVerification, ProcessVerifier, PublicChannel, PublicContext, PublishRequest,
+    PublisherIdentity, RegistrationRequest, Registry, RegistryLocation, Snapshot, SpawnBindRequest,
+    SpawnEdge, SpawnRequest, SpawnState, WriterBinding,
 };
 use agent_radar::control_plane::{RequestOutcome, random_uuid};
 use agent_radar::model::{ProcessIdentity, SessionUuid};
@@ -3078,7 +3078,7 @@ fn no_pane_label_or_session_can_bind_a_spawn_edge() {
 fn a_spawn_edge_records_what_each_effect_did_in_order() {
     let root = temp_root("spawn-effects");
     let location = RegistryLocation {
-        backend: "runtime".into(),
+        backend: "herdr".into(),
         instance: None,
         workspace: Some("wA".into()),
         tab: Some("wA:t1".into()),
@@ -3100,6 +3100,7 @@ fn a_spawn_edge_records_what_each_effect_did_in_order() {
                 SPAWN_REQUEST,
                 RequestOutcome::Completed,
                 Some(location.clone()),
+                None,
             )
             .expect("the created effect");
         assert_eq!(created.created, RequestOutcome::Completed);
@@ -3152,7 +3153,7 @@ fn recording_an_effect_without_a_recorded_intent_is_refused() {
     let root = temp_root("spawn-effects-unrecorded");
     let registry = Registry::open_at(&root, 1_000).expect("a registry");
     let location = RegistryLocation {
-        backend: "runtime".into(),
+        backend: "herdr".into(),
         instance: None,
         workspace: None,
         tab: None,
@@ -3163,7 +3164,12 @@ fn recording_an_effect_without_a_recorded_intent_is_refused() {
     // to attribute it to, and minting an edge here would invent the token the
     // child's binding depends on.
     let unrecorded = registry
-        .record_spawn_created(SPAWN_REQUEST, RequestOutcome::Completed, Some(location))
+        .record_spawn_created(
+            SPAWN_REQUEST,
+            RequestOutcome::Completed,
+            Some(location),
+            None,
+        )
         .expect_err("nothing to record the effect on");
     assert!(unrecorded.contains("has no recorded edge"), "{unrecorded}");
     let unrecorded = registry
@@ -3203,7 +3209,7 @@ fn a_topology_read_derives_state_and_freshness_from_one_observation() {
     let registry = Registry::open_at(&root, 1_000).expect("a registry");
     let parent = spawn_parent(&registry, INCARNATION, 1_000);
     let location = RegistryLocation {
-        backend: "runtime".into(),
+        backend: "herdr".into(),
         instance: None,
         workspace: Some("wA".into()),
         tab: None,
@@ -3226,6 +3232,7 @@ fn a_topology_read_derives_state_and_freshness_from_one_observation() {
             SPAWN_REQUEST,
             RequestOutcome::Completed,
             Some(location.clone()),
+            None,
         )
         .expect("the created effect");
 
@@ -3386,6 +3393,7 @@ fn managed_edge(registry: &Registry, now_ms: i64) -> SpawnEdge {
             SPAWN_REQUEST,
             RequestOutcome::Completed,
             Some(paned_location()),
+            None,
         )
         .expect("a create");
     registry
@@ -3440,7 +3448,7 @@ fn a_child_close_request_is_durable_and_idempotent() {
         assert_eq!(admitted.incarnation, CHILD_INCARNATION);
         assert_eq!(admitted.location, paned_location());
         assert_eq!(admitted.intent, CloseIntent::Complete);
-        assert_eq!(admitted.outcome, RequestOutcome::Unknown);
+        assert_eq!(admitted.outcome, CloseOutcome::Unknown);
         assert_eq!(admitted.message, None);
         assert_eq!(admitted.recorded_at, format_millis(2_000));
 
@@ -3533,9 +3541,9 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
             .expect("a read")
             .expect("a registration");
         let settled = registry
-            .record_child_close_outcome(CHILD_CLOSE_REQUEST, RequestOutcome::Completed, None)
+            .record_child_close_outcome(CHILD_CLOSE_REQUEST, CloseResult::Completed)
             .expect("a settled outcome");
-        assert_eq!(settled.outcome, RequestOutcome::Completed);
+        assert_eq!(settled.outcome, CloseOutcome::Completed);
         assert_eq!(settled.message, None);
         assert_eq!(settled.intent, CloseIntent::Complete);
         assert_eq!(settled.location, paned_location());
@@ -3570,11 +3578,10 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
         let unconfirmed = registry
             .record_child_close_outcome(
                 CHILD_CLOSE_REQUEST,
-                RequestOutcome::Unknown,
-                Some("herdr timed out\u{7} after 5s\n"),
+                CloseResult::Unknown(Some("herdr timed out\u{7} after 5s\n".to_string())),
             )
             .expect("a settled outcome");
-        assert_eq!(unconfirmed.outcome, RequestOutcome::Unknown);
+        assert_eq!(unconfirmed.outcome, CloseOutcome::Unknown);
         assert_eq!(
             unconfirmed.message.as_deref(),
             Some("herdr timed out after 5s")
@@ -3583,7 +3590,10 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
         // An outcome belongs to a request that was admitted: there is nothing
         // else to settle, and asking mints no request.
         let error = registry
-            .record_child_close_outcome(OTHER_CHILD_CLOSE_REQUEST, RequestOutcome::Refused, None)
+            .record_child_close_outcome(
+                OTHER_CHILD_CLOSE_REQUEST,
+                CloseResult::Refused("nothing was dispatched".to_string()),
+            )
             .expect_err("a refusal");
         assert!(error.contains("no recorded request"), "{error}");
         assert!(
@@ -3601,7 +3611,7 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
         .child_close(CHILD_CLOSE_REQUEST)
         .expect("a read")
         .expect("the record");
-    assert_eq!(restored.outcome, RequestOutcome::Unknown);
+    assert_eq!(restored.outcome, CloseOutcome::Unknown);
     assert_eq!(
         restored.message.as_deref(),
         Some("herdr timed out after 5s")
@@ -3657,6 +3667,7 @@ fn a_child_close_targets_only_a_bound_child_with_a_recorded_pane() {
                 tab: None,
                 pane: None,
             }),
+            None,
         )
         .expect("a create");
     let error = registry
@@ -3669,6 +3680,7 @@ fn a_child_close_targets_only_a_bound_child_with_a_recorded_pane() {
             SPAWN_REQUEST,
             RequestOutcome::Completed,
             Some(paned_location()),
+            None,
         )
         .expect("a create");
 

@@ -30,10 +30,12 @@ use std::time::{Duration, Instant};
 
 use crate::model::{FleetObservation, ForegroundEvidence, Location, Pane, Tab, Workspace};
 use crate::runtime::{
-    CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation,
-    EXIT_OBSERVATION_CAPABILITY, FocusOutcome, InputOutcome, InputPayload, InputRequest,
-    LAUNCH_CAPABILITY, LAUNCH_TOKEN_ENV, LaunchOutcome, LaunchRequest, OutputOutcome, OutputRead,
-    OutputRequest, OutputSource, PaneExitObservation, RuntimeProvider, SplitDirection, Target,
+    BackendIdentity, CLOSE_CAPABILITY, CREATE_CAPABILITY, CloseOutcome, CloseTarget, CreateOutcome,
+    CreateRequest, CreatedLocation, EXIT_OBSERVATION_CAPABILITY, FOCUS_CAPABILITY, FocusOutcome,
+    INPUT_CAPABILITY, InputOutcome, InputPayload, InputRequest, LAUNCH_CAPABILITY,
+    LAUNCH_CONTEXT_CAPABILITY, LAUNCH_TOKEN_ENV, LaunchOutcome, LaunchRequest, OBSERVE_CAPABILITY,
+    OUTPUT_CAPABILITY, OutputOutcome, OutputRead, OutputRequest, OutputSource,
+    PROCESS_INFO_CAPABILITY, PaneExitObservation, RuntimeProvider, SplitDirection, Target,
 };
 
 /// The backend word in every handle this adapter names.
@@ -272,18 +274,22 @@ impl Kind {
 impl RuntimeProvider for TmuxRuntime {
     /// What this adapter implements, each one a tmux command this module runs.
     ///
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::tmux(self.config.server.clone())
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
         &[
-            "observe",
-            "process_info",
-            "focus",
-            "close",
-            "creation",
-            "input",
-            "output",
+            OBSERVE_CAPABILITY,
+            PROCESS_INFO_CAPABILITY,
+            FOCUS_CAPABILITY,
+            CLOSE_CAPABILITY,
+            CREATE_CAPABILITY,
+            INPUT_CAPABILITY,
+            OUTPUT_CAPABILITY,
             LAUNCH_CAPABILITY,
+            LAUNCH_CONTEXT_CAPABILITY,
             EXIT_OBSERVATION_CAPABILITY,
-            crate::control_plane::ops::CHILD_LAUNCH_CONTEXT_CAPABILITY,
         ]
     }
 
@@ -432,6 +438,18 @@ impl RuntimeProvider for TmuxRuntime {
             Ok(read) => OutputOutcome::Completed(read),
             Err(failure) => failure.into_output(),
         }
+    }
+
+    /// The tmux server's own PID, for the daemon to read the birth identity of.
+    ///
+    /// It is the one tmux fact that does not survive a restart under the same
+    /// server name, so it is what tells one generation of this server's panes
+    /// from the next. A server that cannot be asked answers none.
+    fn server_process(&self, cancel: &AtomicBool) -> Option<i32> {
+        let text = self
+            .run_whole(&["display-message", "-p", "#{pid}"], cancel)
+            .ok()?;
+        text.trim().parse::<i32>().ok().filter(|pid| *pid > 0)
     }
 }
 
@@ -1164,6 +1182,13 @@ mod tests {
         assert_eq!(runtime.handle("%3"), "tmux:probe:%3");
         assert_eq!(runtime.handle("@1"), "tmux:probe:@1");
         assert_eq!(runtime.handle("$0"), "tmux:probe:$0");
+    }
+
+    /// The adapter names the server it was pointed at, so a recorded location
+    /// and the handshake both say which tmux instance produced it.
+    #[test]
+    fn the_adapter_names_itself_and_the_server_it_targets() {
+        assert_eq!(runtime("probe").identity(), BackendIdentity::tmux("probe"));
     }
 
     #[test]

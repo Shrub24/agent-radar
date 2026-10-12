@@ -32,26 +32,23 @@ use serde_json::json;
 use crate::control_plane::ops::{self, Method};
 use crate::control_plane::protocol::{self, Code, PROTOCOL_VERSION, Refusal, Request, Response};
 use crate::control_plane::registry::{
-    self, AcquireRequest, Channel, CloseAdmission, LocalProcfsVerifier, LocationEvidence,
-    ProcessVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
+    self, AcquireRequest, Channel, CloseAdmission, CloseOutcome, CloseResult, LocalProcfsVerifier,
+    LocationEvidence, ProcessVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
 };
 use crate::control_plane::store::{self, Category, RequestOutcome, RequestRecord, Store};
 use crate::lifecycle::{self, CloseRequest, DirectClose};
 use crate::model::FleetObservation;
 use crate::runtime::{
-    CreateOutcome, CreateRequest, CreatedKind, CreatedLocation, EXIT_OBSERVATION_CAPABILITY,
-    FocusOutcome, InputOutcome, InputPayload, InputRequest, LaunchOutcome, LaunchRequest,
-    OutputOutcome, OutputRead, OutputRequest, PaneExitObservation, ReportOutcome, ReportRequest,
-    RuntimeProvider, SplitDirection, Target, validate_command,
+    BackendIdentity, CLOSE_CAPABILITY, CreateOutcome, CreateRequest, CreatedKind, CreatedLocation,
+    EXIT_OBSERVATION_CAPABILITY, FocusOutcome, InputOutcome, InputPayload, InputRequest,
+    LAUNCH_CONTEXT_CAPABILITY, LaunchOutcome, LaunchRequest, OutputOutcome, OutputRead,
+    OutputRequest, PaneExitObservation, ReportOutcome, ReportRequest, RuntimeProvider,
+    SplitDirection, Target, validate_command,
 };
 use crate::{HerdrConfig, HerdrRuntime, TmuxConfig, TmuxRuntime};
 
 /// The socket file's name inside the directory the daemon owns.
 const SOCKET_NAME: &str = "control.sock";
-
-/// The word the daemon reports for the mux backend it was given: what liveness
-/// answers, and what a spawn edge records as the backend of the pane it created.
-const WIRED_BACKEND: &str = "runtime";
 
 /// How many connections are served at once. A connection beyond this is closed
 /// rather than queued, so a client that opens sockets in a loop cannot grow the
@@ -827,30 +824,21 @@ fn handle_line(
     };
     match method {
         Method::Ping => {
-            let (backend, mut capabilities) = {
+            let (identity, capabilities) = {
                 let core = locked(core);
                 match &core.backend {
-                    Some(backend) => (WIRED_BACKEND, backend.capabilities().to_vec()),
-                    None => ("none", Vec::new()),
+                    Some(backend) => (backend.identity(), ops::advertised(backend.capabilities())),
+                    None => (BackendIdentity::named("none"), ops::advertised(&[])),
                 }
             };
-            let launch_context_supported = capabilities
-                .contains(&ops::CHILD_LAUNCH_CONTEXT_CAPABILITY)
-                && capabilities.contains(&ops::LAUNCH_CAPABILITY)
-                && capabilities.contains(&"creation");
-            capabilities.retain(|capability| *capability != ops::CHILD_LAUNCH_CONTEXT_CAPABILITY);
-            if launch_context_supported {
-                capabilities.push(ops::CHILD_LAUNCH_CONTEXT_CAPABILITY);
-            }
-            capabilities.push("agent_registry");
-            capabilities.push("events_v1");
             answer(
                 writer,
                 Response::ok(
                     &request.id,
                     json!({
                         "protocol": PROTOCOL_VERSION,
-                        "backend": backend,
+                        "backend": identity.name,
+                        "instance": identity.instance,
                         "capabilities": capabilities,
                     }),
                 ),
@@ -862,7 +850,7 @@ fn handle_line(
         Method::Registry => answer(writer, registry_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
         Method::Operation(operation) => {
-            let response = execute(operation, &request, core);
+            let response = execute(operation, &request, core, verification);
             answer(writer, response);
         }
     }
@@ -1048,6 +1036,193 @@ fn run_bounded<T: Send + 'static>(
     }
 }
 
+/// Verifies that a pane's live foreground process is the exact process the bound
+/// child registered.
+///
+/// A pane is closed on a live occupant only when the birth identity read now is
+/// the identity that was claimed: a matching PID alone is not an identity. Any
+/// other answer is a refusal, and the caller repeats it unless dead-pane evidence
+/// replaces this gate.
+fn verify_live_occupant(
+    backend: &Arc<dyn RuntimeProvider>,
+    verifier: &Arc<dyn ProcessVerifier>,
+    pane_id: &str,
+    claim: &crate::model::ProcessIdentity,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+) -> Result<(), Refusal> {
+    let foreground = match bounded_foreground(
+        backend,
+        pane_id,
+        stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(evidence) => evidence,
+        Err(()) => {
+            return Err(Refusal::new(
+                Code::BackendUnavailable,
+                "foreground process evidence is unavailable",
+            ));
+        }
+    };
+    let pid = match foreground {
+        crate::model::ForegroundEvidence::NonShell { pid, .. } if pid > 0 => pid,
+        crate::model::ForegroundEvidence::NonShell { .. } => {
+            return Err(Refusal::new(
+                Code::Refused,
+                "foreground process PID is invalid",
+            ));
+        }
+        crate::model::ForegroundEvidence::Shell
+        | crate::model::ForegroundEvidence::Inconclusive => {
+            return Err(Refusal::new(
+                Code::Refused,
+                "foreground process evidence is inconclusive",
+            ));
+        }
+    };
+    let observed = verify_birth_identity(
+        pid,
+        verifier,
+        stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    );
+    match observed {
+        Ok(observed)
+            if pid == claim.pid
+                && observed.pid == pid
+                && observed.boot_id == claim.boot_id
+                && observed.start_ticks == claim.start_ticks =>
+        {
+            Ok(())
+        }
+        _ => Err(Refusal::new(
+            Code::Refused,
+            "foreground process birth identity is unavailable or changed",
+        )),
+    }
+}
+
+/// What the dead-pane evidence says about a pane the live gate could not verify.
+enum DeadPane {
+    /// A retained pane of this edge, in the very instance that created it: its
+    /// cleanup is defined.
+    Cleanup(registry::SpawnExitObservation),
+    /// Nothing here says the pane is dead and this edge's: the live refusal
+    /// stands.
+    Unresolved,
+    /// The instance that created the recorded pane cannot be established, which
+    /// nothing here may infer: refuse for that reason rather than adopt a pane
+    /// that merely carries the same id.
+    Unfenced(Refusal),
+}
+
+/// Evidence that this edge's recorded pane is a retained, already-dead pane whose
+/// cleanup is defined, or why it is not.
+///
+/// The live gate protects a process that may be this child's and alive; a pane
+/// reported dead now has no such occupant. What replaces the birth-identity match
+/// is that the daemon created this location (the edge names this backend and
+/// server instance and was created in it), that the pane's command exit is
+/// already a recorded fact of this edge, and that the backend reports the pane
+/// dead in a fresh read. History alone never closes anything, and a legacy or
+/// re-pointed edge is not eligible.
+fn dead_pane_evidence(
+    registry: &Arc<Registry>,
+    backend: &Arc<dyn RuntimeProvider>,
+    verifier: &Arc<dyn ProcessVerifier>,
+    close: &registry::ChildCloseRequest,
+    pane_id: &str,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+) -> DeadPane {
+    if !backend
+        .capabilities()
+        .contains(&EXIT_OBSERVATION_CAPABILITY)
+    {
+        return DeadPane::Unresolved;
+    }
+    let Ok(Some(edge)) = registry.spawn_edge(&close.spawn_request_id) else {
+        return DeadPane::Unresolved;
+    };
+    if edge.version != registry::SPAWN_VERSION {
+        return DeadPane::Unresolved;
+    }
+    let Some(location) = edge.location.as_ref() else {
+        return DeadPane::Unresolved;
+    };
+    let identity = backend.identity();
+    if location.backend != identity.name
+        || location.instance != identity.instance
+        || location.pane.as_deref() != Some(pane_id)
+    {
+        return DeadPane::Unresolved;
+    }
+    // A pane id outlives the server that answered the create, so the pane is only
+    // this edge's while the very process that served the create is still the one
+    // serving: a restart under the same name hands the same id to a pane that was
+    // never Radar's to close.
+    let Some(created_in) = edge.instance.clone() else {
+        return DeadPane::Unfenced(Refusal::new(
+            Code::Refused,
+            "the spawn edge records no verified backend instance for its pane",
+        ));
+    };
+    match serving_identity(backend, verifier, stopping, budget) {
+        Some(serving) if serving == created_in => {}
+        _ => {
+            return DeadPane::Unfenced(Refusal::new(
+                Code::Refused,
+                "the backend instance serving now is not the one that created the recorded pane",
+            ));
+        }
+    }
+    let Some(exit) = edge.exit else {
+        return DeadPane::Unresolved;
+    };
+    match bounded_exit_observation(backend, pane_id, stopping, budget) {
+        Ok(PaneExitObservation::Exited { .. }) => DeadPane::Cleanup(exit),
+        // A pane reported running, undetermined, or unreadable is not a pane whose
+        // command has exited: the live refusal stands.
+        Ok(PaneExitObservation::Running | PaneExitObservation::Unknown) | Err(()) => {
+            DeadPane::Unresolved
+        }
+    }
+}
+
+/// The verified birth identity of the process serving `backend` now, read within
+/// the daemon's verification budget.
+///
+/// Both reads — the backend's own answer for its serving process and the process
+/// behind that pid — run bounded on the shared budget, so a stalled backend or
+/// verifier is abandoned at the deadline instead of holding the worker that is
+/// answering a caller. A claim that cannot be read, a process that is gone and a
+/// pid the verifier does not confirm are all none, so neither a recorded
+/// instance nor a compared one is ever a guess.
+fn serving_identity(
+    backend: &Arc<dyn RuntimeProvider>,
+    verifier: &Arc<dyn ProcessVerifier>,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+) -> Option<crate::model::ProcessIdentity> {
+    let deadline = Instant::now() + VERIFICATION_TIMEOUT;
+    let reader = Arc::clone(backend);
+    let cancel = Arc::clone(stopping);
+    let pid = run_bounded(
+        budget,
+        stopping,
+        deadline,
+        "radar-serving-process",
+        move || reader.server_process(&cancel),
+    )
+    .ok()??;
+    verify_birth_identity(pid, verifier, stopping, budget, deadline)
+        .ok()
+        .filter(|observed| observed.pid == pid)
+}
+
 fn bounded_close_dispatch(
     backend: &Arc<dyn RuntimeProvider>,
     pane_id: &str,
@@ -1104,7 +1279,28 @@ fn bounded_foreground(
     )
 }
 
-fn verify_foreground_bounded(
+/// Reads one pane's exit state now, bounded and cancellable like every other
+/// read this path makes. A pane the backend does not answer for is unknown.
+fn bounded_exit_observation(
+    backend: &Arc<dyn RuntimeProvider>,
+    pane_id: &str,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+) -> Result<PaneExitObservation, ()> {
+    let backend = Arc::clone(backend);
+    let panes = vec![pane_id.to_string()];
+    let cancel = Arc::clone(stopping);
+    let observations = run_bounded(
+        budget,
+        stopping,
+        Instant::now() + VERIFICATION_TIMEOUT,
+        "radar-close-exit-observation",
+        move || backend.exit_observations(&panes, &cancel),
+    )?;
+    observations.get(pane_id).cloned().ok_or(())
+}
+
+fn verify_birth_identity(
     pid: i32,
     verifier: &Arc<dyn ProcessVerifier>,
     stopping: &Arc<AtomicBool>,
@@ -1116,7 +1312,7 @@ fn verify_foreground_bounded(
         budget,
         stopping,
         deadline,
-        "radar-child-close-verify",
+        "radar-verify-birth-identity",
         move || verifier.inspect(pid),
     ) {
         Ok(Ok(Some(identity))) => Ok(identity),
@@ -1148,9 +1344,11 @@ fn observed_inventory(core: &Arc<Mutex<Core>>) -> Option<FleetObservation> {
         (core.backend.clone(), Arc::clone(&core.stopping))
     };
     let backend = backend?;
-    // The same capability the wire `observe` read needs: a backend that cannot
-    // answer that read cannot confirm a location here either.
-    if capabilities_refuse(&backend, "observe").is_some() || cancel.load(Ordering::SeqCst) {
+    // The same capability the wire `mux.observe` read needs: a backend that
+    // cannot answer that read cannot confirm a location here either.
+    if capabilities_refuse(&backend, protocol::OBSERVE_METHOD).is_some()
+        || cancel.load(Ordering::SeqCst)
+    {
         return None;
     }
     match backend.inventory(&cancel) {
@@ -1238,7 +1436,13 @@ fn location_evidence(inventory: Option<&FleetObservation>, edge: &SpawnEdge) -> 
 
 /// Revalidate the exact managed child against fresh pane and process evidence,
 /// persist the request only after the checks succeed, then dispatch one pane
-/// close. No outcome here says the foreground process exited.
+/// close.
+///
+/// A live occupant is closed only after its birth identity is verified. A pane
+/// whose command has already exited has no such occupant to protect, so a failed
+/// live verification is retried against dead-pane evidence and closed as
+/// `already_exited`; without that evidence the live refusal stands. Neither
+/// outcome says the registered process exited.
 fn execute_child_close(
     close: &registry::ChildCloseRequest,
     request: &Request,
@@ -1266,7 +1470,7 @@ fn execute_child_close(
                 &request.id,
                 &Refusal::new(
                     Code::Refused,
-                    "child close request id already names different contents",
+                    "spawn.close request id already names different contents",
                 ),
             );
         }
@@ -1301,14 +1505,14 @@ fn execute_child_close(
             &request.id,
             &Refusal::new(
                 Code::BackendUnavailable,
-                "child.close requires a mux backend",
+                "spawn.close requires a mux backend",
             ),
         );
     };
     if stopping.load(Ordering::SeqCst) {
         return Response::refused(&request.id, &Refusal::new(Code::Busy, "daemon is stopping"));
     }
-    if let Some(refusal) = capabilities_refuse(&backend, "observe") {
+    if let Some(refusal) = capabilities_refuse(&backend, protocol::OBSERVE_METHOD) {
         return Response::refused(&request.id, &refusal);
     }
     let inventory = match bounded_inventory(
@@ -1351,72 +1555,32 @@ fn execute_child_close(
             &Refusal::new(Code::Refused, "recorded child pane containment changed"),
         );
     }
-    let foreground = bounded_foreground(
-        &backend,
-        pane_id,
-        &stopping,
-        budget,
-        Instant::now() + VERIFICATION_TIMEOUT,
-    );
-    let foreground = match foreground {
-        Ok(evidence) => evidence,
-        Err(_) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BackendUnavailable,
-                    "foreground process evidence is unavailable",
-                ),
-            );
-        }
-    };
-    let pid = match foreground {
-        crate::model::ForegroundEvidence::NonShell { pid, .. } if pid > 0 => pid,
-        crate::model::ForegroundEvidence::NonShell { .. } => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::Refused, "foreground process PID is invalid"),
-            );
-        }
-        crate::model::ForegroundEvidence::Shell
-        | crate::model::ForegroundEvidence::Inconclusive => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::Refused, "foreground process evidence is inconclusive"),
-            );
-        }
-    };
-    let observed = verify_foreground_bounded(
-        pid,
-        &verifier,
-        &stopping,
-        budget,
-        Instant::now() + VERIFICATION_TIMEOUT,
-    );
-    match observed {
-        Ok(observed)
-            if pid == claim.pid
-                && observed.pid == pid
-                && observed.boot_id == claim.boot_id
-                && observed.start_ticks == claim.start_ticks => {}
-        _ => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::Refused,
-                    "foreground process birth identity is unavailable or changed",
-                ),
-            );
-        }
-    }
+    let already_dead =
+        match verify_live_occupant(&backend, &verifier, pane_id, &claim, &stopping, budget) {
+            Ok(()) => None,
+            Err(refusal) => {
+                match dead_pane_evidence(
+                    &registry, &backend, &verifier, close, pane_id, &stopping, budget,
+                ) {
+                    DeadPane::Cleanup(exit) => Some(exit),
+                    DeadPane::Unresolved => return Response::refused(&request.id, &refusal),
+                    DeadPane::Unfenced(fence) => {
+                        return Response::refused(&request.id, &fence);
+                    }
+                }
+            }
+        };
     // A close backend is required before recording admission; otherwise this
     // request cannot reach a truthful dispatch result.
-    if !backend.capabilities().contains(&"close") {
+    if !backend.capabilities().contains(&CLOSE_CAPABILITY) {
         return Response::refused(
             &request.id,
             &Refusal::new(
                 Code::BackendUnavailable,
-                "child.close needs the `close` capability; this backend does not provide it",
+                format!(
+                    "spawn.close needs the `{CLOSE_CAPABILITY}` capability; this backend does not \
+                     provide it"
+                ),
             ),
         );
     }
@@ -1432,39 +1596,37 @@ fn execute_child_close(
         Err(error) => return registry_error(request, error),
     }
 
-    let (outcome, message) = match bounded_close_dispatch(
+    let result = match bounded_close_dispatch(
         &backend,
         pane_id,
         &stopping,
         budget,
         Instant::now() + VERIFICATION_TIMEOUT,
     ) {
-        Ok(crate::runtime::CloseOutcome::Completed) => (RequestOutcome::Completed, None),
-        Ok(crate::runtime::CloseOutcome::Refused(message)) => {
-            (RequestOutcome::Refused, Some(message))
-        }
-        Ok(crate::runtime::CloseOutcome::Unknown(message)) => {
-            (RequestOutcome::Unknown, Some(message))
-        }
+        Ok(crate::runtime::CloseOutcome::Completed) => match already_dead {
+            Some(exit) => CloseResult::AlreadyExited(exit),
+            None => CloseResult::Completed,
+        },
+        Ok(crate::runtime::CloseOutcome::Refused(message)) => CloseResult::Refused(message),
+        Ok(crate::runtime::CloseOutcome::Unknown(message)) => CloseResult::Unknown(Some(message)),
         // The dispatch may have reached the backend and its answer was lost.
-        Err(()) => (RequestOutcome::Unknown, None),
+        Err(()) => CloseResult::Unknown(None),
     };
     // The outcome is durable before this call answers: the effect is claimed only
     // from what the backend said, and a dispatch that said nothing leaves the
     // record unknown for every later replay to read.
-    let recorded =
-        match registry.record_child_close_outcome(&close.request_id, outcome, message.as_deref()) {
-            Ok(recorded) => recorded,
-            Err(error) => {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(
-                        Code::Internal,
-                        format!("the child close outcome was not recorded: {error}"),
-                    ),
-                );
-            }
-        };
+    let recorded = match registry.record_child_close_outcome(&close.request_id, result) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::Internal,
+                    format!("the child close outcome was not recorded: {error}"),
+                ),
+            );
+        }
+    };
     close_response(request, &recorded)
 }
 
@@ -1476,7 +1638,7 @@ fn execute_child_close(
 /// group exit, and an unknown outcome stays unknown rather than being retried.
 fn close_response(request: &Request, close: &registry::ChildClose) -> Response {
     match close.outcome {
-        RequestOutcome::Completed => Response::ok(
+        CloseOutcome::Completed => Response::ok(
             &request.id,
             json!({"close": {
                 "outcome": "completed",
@@ -1484,7 +1646,22 @@ fn close_response(request: &Request, close: &registry::ChildClose) -> Response {
                 "pane": close.location.pane.as_deref(),
             }}),
         ),
-        RequestOutcome::Refused => Response::refused(
+        CloseOutcome::AlreadyExited => Response::ok(
+            &request.id,
+            json!({"close": {
+                "outcome": "already_exited",
+                "intent": close.intent,
+                "pane": close.location.pane.as_deref(),
+                "exit_observation": close.exit.clone().map(|exit| {
+                    registry::PublicSpawnExitObservation::Exited {
+                        code: exit.code,
+                        signal: exit.signal,
+                        observed_at: exit.observed_at,
+                    }
+                }),
+            }}),
+        ),
+        CloseOutcome::Refused => Response::refused(
             &request.id,
             &Refusal::new(
                 Code::Refused,
@@ -1494,10 +1671,13 @@ fn close_response(request: &Request, close: &registry::ChildClose) -> Response {
                     .unwrap_or("the backend refused the close"),
             ),
         ),
-        RequestOutcome::Unknown => Response::refused(
+        CloseOutcome::Unknown => Response::refused(
             &request.id,
+            // A close that may have been dispatched keeps that uncertainty on the
+            // wire: `outcome_unknown` is the code a caller reads as "an effect
+            // may exist", so it is never reported as a pre-dispatch refusal.
             &Refusal::new(
-                Code::BackendUnavailable,
+                Code::OutcomeUnknown,
                 close
                     .message
                     .as_deref()
@@ -1782,7 +1962,7 @@ fn registry_request(
             let evidence = location_evidence(inventory.as_ref(), &stored);
             Response::ok(&request.id, json!({"spawn": stored.topology(evidence)}))
         }
-        "child.close" => {
+        "spawn.close" => {
             let params: ChildCloseParams = match decode_params(request) {
                 Ok(value) => value,
                 Err(response) => return response,
@@ -1904,13 +2084,18 @@ fn read_backend(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     if request.method == protocol::OUTPUT_METHOD {
         return read_output(core, request);
     }
-    if request.method == "observe" && !request.params.as_object().is_some_and(|o| o.is_empty()) {
+    if request.method == protocol::OBSERVE_METHOD
+        && !request.params.as_object().is_some_and(|o| o.is_empty())
+    {
         return Response::refused(
             &request.id,
-            &Refusal::new(Code::BadParams, "`observe` accepts no params"),
+            &Refusal::new(
+                Code::BadParams,
+                format!("`{}` accepts no params", protocol::OBSERVE_METHOD),
+            ),
         );
     }
-    let pane = if request.method == "process_info" {
+    let pane = if request.method == protocol::PROCESS_INFO_METHOD {
         let pane = match request.required_string("pane_id") {
             Ok(pane) => pane,
             Err(refusal) => return Response::refused(&request.id, &refusal),
@@ -1922,7 +2107,10 @@ fn read_backend(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         {
             return Response::refused(
                 &request.id,
-                &Refusal::new(Code::BadParams, "`process_info` accepts only pane_id"),
+                &Refusal::new(
+                    Code::BadParams,
+                    format!("`{}` accepts only pane_id", protocol::PROCESS_INFO_METHOD),
+                ),
             );
         }
         Some(pane)
@@ -1934,7 +2122,10 @@ fn read_backend(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         {
             return Response::refused(
                 &request.id,
-                &Refusal::new(Code::BadParams, "`observe` accepts no params"),
+                &Refusal::new(
+                    Code::BadParams,
+                    format!("`{}` accepts no params", protocol::OBSERVE_METHOD),
+                ),
             );
         }
         None
@@ -2163,7 +2354,7 @@ fn read_events(core: &Arc<Mutex<Core>>, request: &Request, stopping: &Arc<Atomic
     let deadline = Instant::now() + Duration::from_millis(wait);
     loop {
         let generation = store.event_generation();
-        let (epoch, cursor, earliest) = match store.event_cursor() {
+        let (epoch, tail, earliest) = match store.event_cursor() {
             Ok(cursor) => cursor,
             Err(error) => {
                 return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
@@ -2175,30 +2366,26 @@ fn read_events(core: &Arc<Mutex<Core>>, request: &Request, stopping: &Arc<Atomic
                 return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
             }
         };
+        // Expiry is measured against the journal head: an `after` past it names
+        // a position this journal never had.
         if requested_epoch.is_some_and(|requested| requested != epoch)
-            || after > cursor
+            || after > tail
             || after.saturating_add(1) < earliest
         {
             return Response::ok(
                 &request.id,
                 json!({"cursor_expired": {
-                    "epoch": epoch, "cursor": {"epoch": epoch, "sequence": cursor}, "earliest": earliest
+                    "epoch": epoch, "cursor": {"epoch": epoch, "sequence": tail}, "earliest": earliest
                 }}),
             );
         }
-        let mut available = Vec::new();
-        let mut bytes = 0usize;
-        for event in events
-            .into_iter()
-            .filter(|event| event.seq > after)
-            .take(limit)
-        {
-            bytes += serde_json::to_vec(&event).map_or(0, |encoded| encoded.len());
-            if bytes > MAX_EVENTS_RESPONSE_BYTES {
-                break;
-            }
-            available.push(event);
-        }
+        // The cursor is where a consumer resumes, so it names the last event
+        // actually delivered — or the request's own `after` when this answer
+        // delivered none. The head is reported separately, and `more` says
+        // whether a resumed read has anything left: a bounded prefix and a byte
+        // bound can no longer look like an empty journal.
+        let (available, cursor) = deliverable(events, after, limit, MAX_EVENTS_RESPONSE_BYTES);
+        let more = tail > cursor;
         if !available.is_empty()
             || wait == 0
             || stopping.load(Ordering::SeqCst)
@@ -2207,7 +2394,7 @@ fn read_events(core: &Arc<Mutex<Core>>, request: &Request, stopping: &Arc<Atomic
             return Response::ok(
                 &request.id,
                 json!({
-                    "epoch": epoch, "events": available, "cursor": {"epoch": epoch, "sequence": cursor}, "earliest": earliest
+                    "epoch": epoch, "events": available, "cursor": {"epoch": epoch, "sequence": cursor}, "tail": tail, "more": more, "earliest": earliest
                 }),
             );
         }
@@ -2216,6 +2403,35 @@ fn read_events(core: &Arc<Mutex<Core>>, request: &Request, stopping: &Arc<Atomic
         let remaining = deadline.saturating_duration_since(Instant::now());
         let _ = store.wait_for_event(generation, remaining.min(Duration::from_millis(25)));
     }
+}
+
+/// The prefix one `events.read` answer carries, and the position a consumer
+/// resumes from.
+///
+/// The prefix is bounded by the caller's `limit` and by the bytes one answer
+/// line may hold; the cursor is the last event actually delivered, so following
+/// it can never skip an event either bound held back.
+fn deliverable(
+    events: Vec<store::Event>,
+    after: u64,
+    limit: usize,
+    bytes: usize,
+) -> (Vec<store::Event>, u64) {
+    let mut available = Vec::new();
+    let mut used = 0usize;
+    for event in events
+        .into_iter()
+        .filter(|event| event.seq > after)
+        .take(limit)
+    {
+        used += serde_json::to_vec(&event).map_or(0, |encoded| encoded.len());
+        if used > bytes {
+            break;
+        }
+        available.push(event);
+    }
+    let cursor = available.last().map_or(after, |event| event.seq);
+    (available, cursor)
 }
 
 fn read_many(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
@@ -2312,14 +2528,19 @@ fn execute_unsupported(
 
 /// Validates, records and dispatches one effectful operation without holding
 /// the store lock over backend I/O.
-fn execute(operation: ops::Operation, request: &Request, core: &Arc<Mutex<Core>>) -> Response {
+fn execute(
+    operation: ops::Operation,
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
     match operation {
         ops::Operation::Focus => execute_focus(request, core),
         ops::Operation::Close => execute_close(request, core),
         ops::Operation::Create => execute_create(request, core),
         ops::Operation::Input => execute_input(request, core),
         ops::Operation::Report => execute_report(request, core),
-        ops::Operation::Spawn => execute_spawn(request, core),
+        ops::Operation::Spawn => execute_spawn(request, core, verification),
     }
 }
 
@@ -2931,7 +3152,11 @@ struct SpawnParams {
 /// because an operator can see and close a pane and cannot see one deleted
 /// silently. No assignment fact and no process lifecycle is touched: creating a
 /// child says nothing about keeping it alive.
-fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
+fn execute_spawn(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
     let frozen = match frozen_params(request) {
         Ok(frozen) => frozen,
         Err(response) => return response,
@@ -2965,9 +3190,7 @@ fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
         let core = locked(core);
         core.backend.as_ref().map(|backend| {
             if (!params.env.is_empty() || params.cwd.is_some())
-                && !backend
-                    .capabilities()
-                    .contains(&ops::CHILD_LAUNCH_CONTEXT_CAPABILITY)
+                && !backend.capabilities().contains(&LAUNCH_CONTEXT_CAPABILITY)
             {
                 Err("selected backend does not support launch context".to_string())
             } else {
@@ -3107,6 +3330,14 @@ fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
     // The pane is a split of the parent's own pane, unfocused: a child is
     // created where its parent is, and creating one must not move the operator's
     // cursor.
+    // The process serving this backend is read and verified on the daemon-wide
+    // verification budget before the create is dispatched: a pane belongs to the
+    // generation serving then, or to one that replaced it, so a later close can
+    // tell the two apart instead of trusting a reused pane id. A verifier that
+    // stalls is abandoned at the deadline, and a capture that cannot be verified
+    // records nothing.
+    let verifier = Arc::clone(&locked(core).verifier);
+    let instance = serving_identity(&backend, &verifier, &cancel, verification);
     let created = backend.create(
         &CreateRequest::PaneSplit {
             pane_id: parent_pane,
@@ -3128,15 +3359,20 @@ fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
     };
     let location = named
         .filter(|named| !named.is_empty())
-        .map(created_location);
+        .map(|named| created_location(named, &backend.identity()));
     let mut effects = named.map(CreatedLocation::effects).unwrap_or_default();
     let pane = named.and_then(|named| named.identity(CreatedKind::Pane));
+    // An instance identity is recorded only for a pane: an edge with no location
+    // has a generation no close could use.
+    let instance = if pane.is_some() { instance } else { None };
     // The create is recorded before the launch is attempted: a confirmed pane is
     // readable even when the launch never answers.
-    let written =
-        locked(core)
-            .registry
-            .record_spawn_created(&request.id, created_outcome, location.clone());
+    let written = locked(core).registry.record_spawn_created(
+        &request.id,
+        created_outcome,
+        location.clone(),
+        instance,
+    );
     let edge = match written {
         Ok(edge) => edge,
         Err(error) => {
@@ -3252,10 +3488,13 @@ fn execute_spawn(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
 }
 
 /// The location a create answered with, in the coordinates this daemon records.
-fn created_location(named: &CreatedLocation) -> RegistryLocation {
+///
+/// The backend names itself, so a location recorded through one daemon is
+/// distinguishable from the same coordinates read through another.
+fn created_location(named: &CreatedLocation, backend: &BackendIdentity) -> RegistryLocation {
     RegistryLocation {
-        backend: WIRED_BACKEND.to_string(),
-        instance: None,
+        backend: backend.name.clone(),
+        instance: backend.instance.clone(),
         workspace: named.workspace_id.clone(),
         tab: named.tab_id.clone(),
         pane: named.pane_id.clone(),
@@ -3484,6 +3723,48 @@ mod tests {
 
     fn path_value(value: &str) -> PathBuf {
         PathBuf::from(value)
+    }
+
+    fn event(seq: u64) -> store::Event {
+        store::Event {
+            seq,
+            kind: "agent.registered".to_string(),
+            agent_id: Some(format!("agent-{seq}")),
+            spawn: None,
+            request_id: None,
+            at: "2026-01-01T00:00:00.000Z".to_string(),
+        }
+    }
+
+    /// A prefix the limit or the byte bound cut short still says where to resume:
+    /// the last event it delivered, never the journal head.
+    #[test]
+    fn a_bounded_event_prefix_resumes_after_the_last_event_it_delivered() {
+        let events = vec![event(1), event(2), event(3), event(4)];
+        let (delivered, cursor) = deliverable(events.clone(), 0, 2, MAX_EVENTS_RESPONSE_BYTES);
+        assert_eq!(sequences(&delivered), vec![1, 2]);
+        assert_eq!(cursor, 2);
+
+        // The same bound in bytes: the events that fit are delivered, and the
+        // one that did not is what the next read starts from.
+        let one = serde_json::to_vec(&event(1)).expect("an event").len();
+        let (delivered, cursor) = deliverable(events.clone(), 0, 500, one * 2 + 1);
+        assert_eq!(sequences(&delivered), vec![1, 2]);
+        assert_eq!(cursor, 2);
+
+        // Nothing delivered at all: the request's own `after`, so a resumed read
+        // repeats the position rather than skipping past it.
+        let (delivered, cursor) = deliverable(events.clone(), 1, 500, one - 1);
+        assert!(delivered.is_empty());
+        assert_eq!(cursor, 1);
+
+        let (delivered, cursor) = deliverable(events, 2, 500, MAX_EVENTS_RESPONSE_BYTES);
+        assert_eq!(sequences(&delivered), vec![3, 4]);
+        assert_eq!(cursor, 4);
+    }
+
+    fn sequences(events: &[store::Event]) -> Vec<u64> {
+        events.iter().map(|event| event.seq).collect()
     }
 
     #[test]

@@ -18,6 +18,7 @@ use agent_radar::model::{
     Location, Pane, ProcessResources, ProcessState, RuntimeStatus, SessionIdentity, Total,
 };
 use agent_radar::procfs::{Procs, Sampler};
+use agent_radar::runtime::BackendIdentity;
 use agent_radar::{
     CloseTarget, Collector, CollectorConfig, ObservationState, RetentionBasis, RuntimeProvider,
     SourceFreshness, Target,
@@ -87,6 +88,10 @@ impl FakeRuntime {
 }
 
 impl RuntimeProvider for FakeRuntime {
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("fake")
+    }
+
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {
         self.enter(cancel);
         self.refreshes.fetch_add(1, Ordering::SeqCst);

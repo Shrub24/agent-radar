@@ -260,10 +260,25 @@ pub struct LaunchRequest {
 /// Environment variable carrying [`LaunchRequest::spawn_token`] to the child.
 pub const LAUNCH_TOKEN_ENV: &str = "PI_RADAR_SPAWN_TOKEN";
 
+/// What a backend declares it implements, in the protocol's own words.
+///
+/// Each name is the backend's own promise about that part of the seam: an
+/// operation whose capability is absent is refused rather than attempted, and
+/// the daemon derives its contracts from these rather than restating them.
+pub const OBSERVE_CAPABILITY: &str = "mux.observe";
+pub const PROCESS_INFO_CAPABILITY: &str = "mux.process_info";
+pub const FOCUS_CAPABILITY: &str = "mux.focus";
+pub const CLOSE_CAPABILITY: &str = "mux.close";
+pub const CREATE_CAPABILITY: &str = "mux.create";
+pub const INPUT_CAPABILITY: &str = "mux.input";
+pub const OUTPUT_CAPABILITY: &str = "mux.output";
+pub const REPORT_CAPABILITY: &str = "mux.report";
 /// The capability a backend declares when it can run a resolved child command.
-pub const LAUNCH_CAPABILITY: &str = "launch";
+pub const LAUNCH_CAPABILITY: &str = "mux.launch";
+/// The capability a backend declares when it can carry a child's launch context.
+pub const LAUNCH_CONTEXT_CAPABILITY: &str = "mux.launch_context";
 /// The capability a backend declares when it can observe retained pane exits.
-pub const EXIT_OBSERVATION_CAPABILITY: &str = "exit_observation_v1";
+pub const EXIT_OBSERVATION_CAPABILITY: &str = "mux.exit_observation";
 
 /// Read-only observation of a pane's current command lifecycle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -857,9 +872,44 @@ pub enum ReportOutcome {
     Unknown(String),
 }
 
+/// What a backend is: the name `daemon.ping` reports and a recorded pane
+/// location carries, and the server instance it targets when it names one.
+///
+/// It is the backend's own statement about itself, never an inference from
+/// configuration: a location recorded through a backend is only useful for a
+/// later join if it names the backend that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendIdentity {
+    /// `herdr`, `tmux`, or the name a test backend gives itself.
+    pub name: String,
+    /// The server instance, for a backend that addresses one.
+    pub instance: Option<String>,
+}
+
+impl BackendIdentity {
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            instance: None,
+        }
+    }
+
+    pub fn tmux(server: impl Into<String>) -> Self {
+        Self {
+            name: "tmux".to_string(),
+            instance: Some(server.into()),
+        }
+    }
+}
+
 /// What Radar asks of one runtime: its facts, the one action on it, and the mux
 /// primitives a client asks for by name.
 pub trait RuntimeProvider: Send + Sync {
+    /// What this backend is. Every backend states it: the daemon reports it in
+    /// `daemon.ping` and records it on the panes it creates, so an undeclared
+    /// backend would be a location no dashboard can join on.
+    fn identity(&self) -> BackendIdentity;
+
     /// The capabilities this runtime implements, in the protocol's words.
     ///
     /// Advertising one is a promise: an operation whose capability is absent is
@@ -868,6 +918,18 @@ pub trait RuntimeProvider: Send + Sync {
     /// credited with one.
     fn capabilities(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// The process that serves this backend's instance now, when the backend
+    /// addresses one.
+    ///
+    /// It is a claim about a pid, not evidence about it: the daemon reads the
+    /// process's own birth identity before it records or compares one, so a
+    /// recycled pid is not a recycled instance. A backend whose instance is not
+    /// a process of its own answers none, and nothing that needs an instance
+    /// identity may proceed on a guess.
+    fn server_process(&self, _cancel: &AtomicBool) -> Option<i32> {
+        None
     }
 
     /// The whole normalized inventory, or a user-facing diagnostic.
@@ -993,6 +1055,14 @@ pub trait RuntimeProvider: Send + Sync {
 /// A shared handle is a provider too, so the collector and focuser can own the
 /// seam while their caller keeps one adapter handle.
 impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
+    fn identity(&self) -> BackendIdentity {
+        (**self).identity()
+    }
+
+    fn server_process(&self, cancel: &AtomicBool) -> Option<i32> {
+        (**self).server_process(cancel)
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
         (**self).capabilities()
     }

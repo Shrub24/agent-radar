@@ -12,8 +12,12 @@ import time
 import uuid
 
 
+PROTOCOL_VERSION = 2
+
+
 def call(path: Path, method: str, params: dict) -> dict:
-    request = {"version": 1, "id": str(uuid.uuid4()), "method": method, "params": params}
+    request = {"version": PROTOCOL_VERSION, "id": str(uuid.uuid4()),
+               "method": method, "params": params}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(5)
         connection.connect(str(path))
@@ -49,17 +53,18 @@ def full_read(path: Path) -> None:
         after = page["next"]
         if after is None:
             break
-    for record in call(path, "requests", {"limit": 200})["requests"]:
+    for record in call(path, "mux.request.list", {"limit": 200})["requests"]:
         print(json.dumps({"kind": "request", "value": record}, separators=(",", ":")), flush=True)
 
 
 def consume(path: Path) -> None:
-    if "events_v1" not in call(path, "ping", {})["capabilities"]:
-        raise RuntimeError("daemon does not advertise events_v1")
+    if "events.v1" not in call(path, "daemon.ping", {})["capabilities"]:
+        raise RuntimeError("daemon does not advertise events.v1")
     epoch = None
     after = 0
+    backfilled = False
     while True:
-        params = {"after": after, "limit": 100, "wait_ms": 1000}
+        params = {"after": after, "limit": 100, "wait_ms": 0 if backfilled else 1000}
         if epoch is not None:
             params["epoch"] = epoch
         result = call(path, "events.read", params)
@@ -78,10 +83,13 @@ def consume(path: Path) -> None:
                 value = call(path, "spawn.get", {"request_id": event["spawn"]})
                 print(json.dumps({"event": event, "spawn": value.get("spawn")}, separators=(",", ":")), flush=True)
             elif event.get("request_id") is not None:
-                value = call(path, "request", {"id": event["request_id"]})
+                value = call(path, "mux.request.get", {"id": event["request_id"]})
                 print(json.dumps({"event": event, "request": value.get("request")}, separators=(",", ":")), flush=True)
             else:
                 print(json.dumps({"event": event}, separators=(",", ":")), flush=True)
+        # `cursor` is the position after the last delivered event; following it
+        # never skips one. `more` means a backlog remains, so read again now.
+        backfilled = result["more"]
         after = result["cursor"]["sequence"]
 
 

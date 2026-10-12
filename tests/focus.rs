@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::model::{FleetObservation, ForegroundEvidence};
+use agent_radar::runtime::BackendIdentity;
 use agent_radar::{CloseTarget, FocusOutcome, Focuser, RuntimeProvider, Target};
 
 /// How long one request may take before the test calls it stuck.
@@ -46,6 +47,10 @@ impl FakeRuntime {
 }
 
 impl RuntimeProvider for FakeRuntime {
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("fake")
+    }
+
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         unreachable!("the focuser reads no inventory")
     }

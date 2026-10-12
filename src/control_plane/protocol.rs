@@ -21,16 +21,20 @@ use serde_json::Value;
 use crate::model::SessionUuid;
 
 /// The only protocol version this daemon serves.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 is the namespaced scheme (`mux.*`, `agent.*`, `spawn.*`,
+/// `events.*`, `daemon.ping`); version 1's flat names are gone rather than
+/// aliased, so a client built against them is told it named no method.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Line cap in bytes, excluding the terminator. A longer line is refused and
 /// drained; it never grows the daemon's memory unboundedly.
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Public observation and foreground evidence names.
-pub const OBSERVE_METHOD: &str = "observe";
-pub const PROCESS_INFO_METHOD: &str = "process_info";
-pub const OUTPUT_METHOD: &str = "output";
+pub const OBSERVE_METHOD: &str = "mux.observe";
+pub const PROCESS_INFO_METHOD: &str = "mux.process_info";
+pub const OUTPUT_METHOD: &str = "mux.output";
 
 /// A stable refusal reason. These words are the protocol: a caller switches on
 /// them, so they do not change when a message's wording does.
@@ -51,6 +55,9 @@ pub enum Code {
     Busy,
     /// A method this build needs a mux backend for, with none wired.
     BackendUnavailable,
+    /// The daemon dispatched the request and cannot say what the backend did.
+    /// A caller must read this as an unestablished effect, never as a refusal.
+    OutcomeUnknown,
     /// The named record does not exist.
     NotFound,
     /// The daemon failed while serving: an unreadable store, a write that did
@@ -69,6 +76,7 @@ impl Code {
             Self::Refused => "refused",
             Self::Busy => "busy",
             Self::BackendUnavailable => "backend_unavailable",
+            Self::OutcomeUnknown => "outcome_unknown",
             Self::NotFound => "not_found",
             Self::Internal => "internal",
         }
@@ -364,32 +372,36 @@ mod tests {
     use super::*;
 
     fn request(id: &str, method: &str, params: &str) -> String {
-        format!(r#"{{"version":1,"id":"{id}","method":"{method}","params":{params}}}"#)
+        format!(r#"{{"version":2,"id":"{id}","method":"{method}","params":{params}}}"#)
     }
 
     const ID: &str = "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22";
 
     #[test]
     fn a_request_names_its_version_id_method_and_params() {
-        let decoded = decode_request(request(ID, "ping", "{}").as_bytes()).expect("a request");
+        let decoded =
+            decode_request(request(ID, "daemon.ping", "{}").as_bytes()).expect("a request");
         assert_eq!(decoded.id, ID);
-        assert_eq!(decoded.method, "ping");
+        assert_eq!(decoded.method, "daemon.ping");
         assert!(decoded.params.is_object());
     }
 
     #[test]
     fn a_missing_params_object_is_empty_rather_than_an_error() {
-        let line = format!(r#"{{"version":1,"id":"{ID}","method":"ping"}}"#);
+        let line = format!(r#"{{"version":2,"id":"{ID}","method":"daemon.ping"}}"#);
         let decoded = decode_request(line.as_bytes()).expect("a request");
         assert_eq!(decoded.params, Value::Object(serde_json::Map::new()));
     }
 
     #[test]
     fn another_protocol_version_is_its_own_refusal() {
-        let line = format!(r#"{{"version":2,"id":"{ID}","method":"ping","params":{{}}}}"#);
+        // A version-1 client is the one this break is aimed at: it is told the
+        // version that is served rather than answered by an old name.
+        let line = format!(r#"{{"version":1,"id":"{ID}","method":"ping","params":{{}}}}"#);
         let refusal = decode_request(line.as_bytes()).expect_err("a refusal");
         assert_eq!(refusal.code, Code::BadVersion);
-        assert!(refusal.message.contains("protocol version 2"));
+        assert!(refusal.message.contains("protocol version 1"));
+        assert!(refusal.message.contains("serves 2"), "{refusal}");
     }
 
     #[test]
@@ -397,12 +409,12 @@ mod tests {
         for line in [
             "not json",
             "[]",
-            &format!(r#"{{"id":"{ID}","method":"ping"}}"#),
-            &format!(r#"{{"version":"one","id":"{ID}","method":"ping"}}"#),
-            r#"{"version":1,"method":"ping"}"#,
-            r#"{"version":1,"id":"not-a-uuid","method":"ping"}"#,
-            &format!(r#"{{"version":1,"id":"{ID}"}}"#),
-            &format!(r#"{{"version":1,"id":"{ID}","method":""}}"#),
+            &format!(r#"{{"id":"{ID}","method":"daemon.ping"}}"#),
+            &format!(r#"{{"version":"one","id":"{ID}","method":"daemon.ping"}}"#),
+            r#"{"version":2,"method":"daemon.ping"}"#,
+            r#"{"version":2,"id":"not-a-uuid","method":"daemon.ping"}"#,
+            &format!(r#"{{"version":2,"id":"{ID}"}}"#),
+            &format!(r#"{{"version":2,"id":"{ID}","method":""}}"#),
         ] {
             let refusal = decode_request(line.as_bytes()).expect_err("a refusal");
             assert!(
@@ -414,8 +426,8 @@ mod tests {
 
     #[test]
     fn params_of_the_wrong_shape_are_named_rather_than_coerced() {
-        let decoded =
-            decode_request(request(ID, "request", r#"{"id":4}"#).as_bytes()).expect("a request");
+        let decoded = decode_request(request(ID, "mux.request.get", r#"{"id":4}"#).as_bytes())
+            .expect("a request");
         let refusal = decoded.required_string("id").expect_err("a refusal");
         assert_eq!(refusal.code, Code::BadParams);
         assert!(refusal.message.contains("`id`"));
@@ -424,7 +436,7 @@ mod tests {
 
     #[test]
     fn a_refusal_still_echoes_the_id_the_line_named() {
-        let line = format!(r#"{{"version":9,"id":"{ID}","method":"ping"}}"#);
+        let line = format!(r#"{{"version":9,"id":"{ID}","method":"daemon.ping"}}"#);
         assert_eq!(peek_id(line.as_bytes()), ID);
         assert_eq!(peek_id(b"not json"), "");
         assert_eq!(peek_id(br#"{"id":42}"#), "");
@@ -432,7 +444,7 @@ mod tests {
 
     #[test]
     fn a_response_line_is_one_json_object_and_a_terminator() {
-        let line = Response::ok(ID, serde_json::json!({"protocol": 1})).line();
+        let line = Response::ok(ID, serde_json::json!({"protocol": 2})).line();
         assert_eq!(line.last(), Some(&b'\n'));
         let decoded: Response =
             serde_json::from_slice(&line[..line.len() - 1]).expect("a response");

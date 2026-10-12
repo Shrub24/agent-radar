@@ -3,8 +3,13 @@
 For the overall surface, lifecycle and adoption path, start with the
 [daemon consumer guide](daemon.md).
 
-**Contract version 1.** This is the normative wire reference for direct agent
-registry producers. The canonical request/response exchanges are in
+**Registry contract `registry.v1`, served on protocol version 2.** This is the
+normative wire reference for direct agent
+registry producers. The records it documents carry their own `version`, which is
+independent of the control-plane protocol version: registrations, close records
+and context records are `1`, and an edge written now is `2` while a legacy edge
+is `1` — see [the version table](control-plane.md#versions). The canonical
+request/response exchanges are in
 [`agent-registration.fixture.jsonl`](agent-registration.fixture.jsonl); the
 stdlib-only reconnecting owner publisher is
 [`examples/agent-publisher/publisher.py`](../examples/agent-publisher/publisher.py),
@@ -22,9 +27,13 @@ against its template, substituting only generated and clock-derived fields.
 The spawn exchanges use a disposable scripted Herdr socket; these validate the
 served daemon's operation, token binding and public redaction without a live
 mux or partial whole-object comparison. The final
-`child.close` exchanges close the spawned child pane after a scripted
+`spawn.close` exchanges close the spawned child pane after a scripted
 foreground-process identity match and replay the same request id, which must
-return the recorded result instead of dispatching again. The smoke publishes
+return the recorded result instead of dispatching again. Those exchanges cover
+the live-pane path; the dead-pane `already_exited` path is not expressible
+against a scripted backend that cannot name its serving process — such an edge is
+never fenced — so it is covered by the isolated disposable-tmux tests instead.
+The smoke publishes
 both child channels first and asserts those publications and the spawn edge are
 unchanged afterwards. The `agent.list` entry is a shape reference, compared
 against the validated `agent.get` template. `agent.get` and `agent.list`
@@ -42,7 +51,7 @@ The registry is backend-independent. It holds agent identity separately from
 mux inventory and durable mutation records, and mutable channels and current
 session context separately from identity. Writing or publishing dispatches no
 physical control and enters no mux mutation lane. The additive managed-spawn
-methods are described below: `spawn` is a physical operation requiring backend
+methods are described below: `spawn.create` is a physical operation requiring backend
 capabilities, while topology reads are registry reads.
 
 ## Registration record
@@ -115,26 +124,31 @@ root are unsupported for concurrent writes.
 
 The trusted control socket serves `agent.register`, `agent.acquire`,
 `agent.publish`, `agent.retire`, `agent.context`, `agent.get`, `agent.list`,
-`spawn`, `spawn.get`, `spawn.list` and `child.close`, plus the journal read
-`events.read`. `ping` advertises `agent_registry` and `events_v1` regardless of
+`spawn.create`, `spawn.get`, `spawn.list` and `spawn.close`, plus the journal read
+`events.read`. `daemon.ping` advertises `registry.v1` and `events.v1` regardless of
 mux backend. The `agent.*` methods are
-independent of the physical backend and do not call Herdr. `spawn` is
-different: it requires both backend capabilities `creation` and `launch`;
+independent of the physical backend and do not call Herdr. `spawn.create` is
+different: it requires the `spawn.v1` contract, which the backend's
+`mux.create` and `mux.launch` capabilities make servable,
+and `spawn.launch_context.v1` when cwd or environment is supplied;
 `spawn.get` and `spawn.list` are registry reads, available with
-`agent_registry` even when no backend is wired. `child.close` requires a bound
-child on a daemon-authored spawn edge, fresh foreground evidence, and the
-backend capabilities `observe` and `close`; it refuses before recording when a
-capability or verification evidence is missing. All method parameter objects
+`registry.v1` even when no backend is wired. `spawn.close` requires a bound
+child on a daemon-authored spawn edge plus the `spawn.close.v1` contract
+(`mux.observe` and `mux.close`), and it needs `mux.exit_observation` and a fenced
+edge to clean up a retained dead pane; it refuses before recording when a
+capability, a fence or verification evidence is missing. All method parameter objects
 reject unknown fields. The exact canonical exchanges, including a successful
 managed close and its same-ID replay, are in the JSONL fixture; field semantics
 and transitions follow.
 
 ### Spawn operation
 
-`spawn` is an effectful operation, not a composition of caller-issued `create`
-and `input`. It requires a compatible protocol version and both backend
-capabilities `creation` and `launch`; the daemon checks both before recording
-intent or dispatching a create. Its exact parameters are:
+`spawn.create` is an effectful operation, not a composition of caller-issued
+`mux.create`
+and `mux.input`. It requires the `spawn.v1` contract (`mux.create` and
+`mux.launch`, which the daemon checks before recording
+intent or dispatching a create), plus `spawn.launch_context.v1` when cwd or
+environment is supplied. Its exact parameters are:
 
 ```json
 {"request":{"parent":"<registered agent UUID>","executable":"/usr/bin/pi","argv":["--child","row one"]},"requester":"herdsman"}
@@ -160,10 +174,13 @@ A successful response carries the durable operation record beside its public
 edge projection:
 
 ```json
-{"request":{"id":"<request UUID>","method":"spawn","outcome":"completed","created":{"kind":"pane","id":"wA:p2"},"effects":["created pane wA:p2","launched child"]},"spawn":{"request_id":"<request UUID>","parent":"<agent UUID>","created":"completed","launched":"completed","location":{"backend":"runtime","pane":"wA:p2"}}}
+{"request":{"id":"<request UUID>","method":"spawn.create","outcome":"completed","created":{"kind":"pane","id":"wA:p2"},"effects":["created pane wA:p2","launched child"]},"spawn":{"version":2,"request_id":"<request UUID>","parent":"<agent UUID>","created":"completed","launched":"completed","location":{"backend":"herdr","workspace":"wA","tab":"wA:t1","pane":"wA:p2"}}}
 ```
 
-The example omits generated fields; use the fixture for complete shapes. The
+The example omits generated fields; use the fixture for complete shapes. A
+location carries the producing backend's own name and instance, so a record made
+through one daemon is distinguishable from the same coordinates read through
+another. The
 request record and edge distinguish `created`, `launched`, and `bound`; each is
 reported as `completed`, `refused`, or `unknown` where applicable. `bound` is
 absent until the child registers with its token. A launch refused after create
@@ -176,6 +193,13 @@ content is refused. A backend missing either capability refuses before create,
 edge creation, or token minting. Herdr refuses argv containing a newline before
 pane input; no private-script fallback is implemented.
 
+Before the create is dispatched, the daemon reads the process serving the
+backend's instance and verifies its birth identity, then records that instance
+privately on the new edge. That private instance is what later fences the edge
+for dead-pane cleanup; it is never returned to callers. When the read or the
+verification cannot complete within the daemon's shared verification deadline,
+the edge records no instance and the create still proceeds unfenced.
+
 ### Spawn topology reads
 
 `spawn.get` takes `{"request_id":"<canonical spawn request UUID>"}` and
@@ -186,12 +210,13 @@ or a continuation request UUID. Resume with that `after`; ordering is lexical by
 the durable request id, not timestamp. An empty result is normal. A malformed
 stored edge fails the read rather than being silently omitted.
 
-Both topology methods require `agent_registry`, regardless of backend. For
-location verification, one `observe` inventory is consulted per response/page
-when a backend advertises `observe`; otherwise the durable topology is still
+Both topology methods require `registry.v1`, regardless of backend. For
+location verification, one `mux.observe` inventory is consulted per response/page
+when a backend advertises `mux.observe`; otherwise the durable topology is still
 returned with unconfirmed freshness. Edges persist across daemon restarts. The
 public topology contains parent, optional bound child `(source, incarnation, agent_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains created/launched outcomes, optional created location, `state`,
-`freshness`, and `exit_observation`; it never contains the token.
+`freshness`, and `exit_observation`; it never contains the token, and it never
+returns the private creating instance the dead-pane fence compares.
 
 `state` is `unbound` without a child, `bound` after token binding, or
 `unresolved` when a recorded pane is absent from a successful inventory.
@@ -204,56 +229,93 @@ or permission to restart/stop/resume.
 Current v2 edges expose `exit_observation` as `{"state":"unknown"}` until the
 backend confirms the pane command exited, then as
 `{"state":"exited","code":23,"signal":null,"observed_at":"<daemon-time>"}`
-(the signal form has `code:null`). `exit_observation_v1` advertises backend
+(the signal form has `code:null`). `spawn.exit_observation.v1` (the backend's
+`mux.exit_observation`) advertises backend
 support; without it, current v2 edges remain unknown. Herdr has no
 exit-observation capability, and a missing pane is never inferred to be exited.
 Legacy v1 edges omit the field. Exit evidence is the backend's pane-command
 status, not proof of the bound agent's process identity after an out-of-band
-respawn; it does not change agent execution or assignment publications. Reads
+respawn; it does not change agent execution or assignment publications, and it
+authorizes dead-pane cleanup only together with the edge's own recorded exit and
+the creating-instance fence. Reads
 never adopt an observed pane or bind a child by title, alias, label, position, or
 session UUID.
 
-`spawn` is a method of this protocol version, not a capability name. `ping`
-reports backend capabilities, not its full method table. A consumer should
-check protocol compatibility plus both `creation` and `launch` before attempting
-`spawn`; if the daemon answers `unknown_method`, keep the prior path. Never
+`spawn.create` is a method of this protocol version, not a capability name.
+`daemon.ping` reports the contracts those capabilities can serve, not its full
+method table. A consumer should
+check protocol compatibility plus the `spawn.v1` contract (or both `mux.create`
+and `mux.launch`) before attempting `spawn.create`; if the daemon answers
+`unknown_method`, keep the prior path. Never
 fallback after timeout, malformed reply, internal error, or any otherwise
 uncertain spawn result.
 
 ### Managed child close
 
-`child.close` takes a daemon-authored spawn request id, its exact bound child
+`spawn.close` takes a daemon-authored spawn request id, its exact bound child
 identity and an audit intent; the caller does not supply a pane id. The exact
 parameters and response are in the
 [canonical fixture](agent-registration.fixture.jsonl). A child is eligible only
 when its edge is present and bound to that `(source, incarnation)`, the edge has
 a recorded pane, and the bound registration has a process identity claim.
-Immediately before admission, the daemon requires fresh inventory showing that
+Foreign or caller-selected
+panes, children outside daemon-authored spawn edges, labels, titles and pane
+positions are never targets.
+
+For a pane that still has an occupant, the live path applies. Immediately before
+admission, the daemon requires fresh inventory showing that
 pane in its recorded workspace/tab containment, then a positive non-shell
 foreground PID whose procfs birth identity exactly matches the child's
 registered `(pid, boot_id, start_ticks)`. It refuses before recording or
 dispatch for an absent/unbound/mismatched edge or pane, missing process claim,
 missing or inconclusive foreground evidence, changed containment, or failed
-identity verification. It requires the mux capabilities `observe` and `close`;
-a missing capability refuses before record or backend effect. A recorded exit
-does not substitute for a current foreground-process identity: `child.close`
-refuses a dead pane before admission or dispatch. Foreign or caller-selected
-panes, children outside daemon-authored spawn edges, labels, titles and pane
-positions are never targets.
+identity verification.
 
-A successful admission persists the target and `complete` or `cancel` intent
-before dispatch. The intent is an audit/display label only. The durable close
-outcome is `completed` only on backend confirmation, `refused` only on a positive
+For a retained pane whose command has exited, the dead path applies, because a
+pane reported dead has no occupant to protect. It closes the pane and answers
+`already_exited` only when three things hold: the edge itself recorded the exit
+observation for that exact pane, a fresh read shows that pane `exited` now, and
+the verified birth identity of the process serving the backend equals the one
+the daemon recorded privately on the edge before its create. That last check is
+the generation fence: a pane id outlives the server that answered the create,
+and a backend restarting under the same name hands the same ids to panes Radar
+never created, so history and a pane id are both insufficient. An edge that
+records no instance — a legacy edge, or an edge on a backend that cannot name
+its serving process, such as Herdr — is unfenced and refuses before admission
+rather than inferring a generation. Dead-pane cleanup additionally needs
+`mux.exit_observation`, and reads the exit `code`/`signal` the edge stored
+rather than the code a same-UID respawn could change. Both fence reads run on
+the daemon's shared verification budget and its deadline, so a stalled backend
+or verifier fails the fence rather than holding the caller's worker. Verification is not atomic with dispatch: a same-UID process could
+respawn the pane between the read and the close, and that residual is accepted
+inside the local same-UID trust boundary. The live path requires the
+`spawn.close.v1` contract (`mux.observe` and `mux.close`); a missing capability
+refuses before record or backend effect.
+
+A successful admission persists the target and the `complete` or `cancel` intent
+before dispatch, and the outcome that follows it. The intent is an audit/display
+label only, and `completed` is a
+backend-confirmed pane closure. The durable close
+outcome is `already_exited` when the retained pane of an edge whose command had
+exited was closed, `refused` only on a positive
 backend refusal before applying the close, and `unknown` if dispatch may have
-occurred without confirmation (including lost or timed-out replies). A replay
+occurred without confirmation (including lost or timed-out replies), which the
+daemon answers with the `outcome_unknown` error code. A result is
+returned only for a close that happened, so `refused` and `outcome_unknown` come
+back as
+error objects; `already_exited` carries the exit observation the edge recorded.
+A replay
 with the same id and content returns that stored result without re-verification
 or redispatch; conflicting content under the same id is refused. Unknown is
-never retried automatically or through another backend. The close reports only
-the mux pane-close result: it never claims foreground-process or process-group
-exit and never writes assignment or execution facts. A vanished pane after an
+never retried automatically or through another backend. No outcome claims more
+than the mux pane-close result: it never claims foreground-process or process-group
+exit and never writes assignment or execution facts, and `already_exited` in
+particular is not proof that the registered process exited and is not relaunch
+authority. A vanished pane after an
 unknown close remains unresolved; topology preserves the original spawn edge
-and binding, and missing-pane freshness is not process-exit evidence. The daemon
-does not advertise a separate managed-close capability. Existing managed
+and binding, and missing-pane freshness is not process-exit evidence. `daemon.ping`
+advertises `spawn.close.v1`, so a consumer sees whether the method is servable.
+Existing managed
 lifecycle decisions remain with their owner.
 
 ### Public discovery and pagination
@@ -427,7 +489,11 @@ the verifier outside registry/store locks. Verification is bounded by a worker
 deadline; a timeout or daemon stop reports `unavailable`, never `absent`. The
 daemon runs at most `MAX_VERIFICATION_JOBS` (4) verifier calls at once, shared by
 every connection and page: exceeding the bound and waiting for a busy slot are
-also `unavailable`. A call whose deadline expires or whose connection ends keeps
+also `unavailable`. The managed-close fence and the creation-time
+serving-process capture draw on that same budget and deadline: a capture that
+misses its deadline records no instance rather than waiting, so a stalled
+verifier cannot block a create indefinitely, and an unfenced edge refuses dead
+cleanup later instead of guessing a generation. A call whose deadline expires or whose connection ends keeps
 its slot until the verifier actually returns, so repeated requests cannot
 accumulate blocked verifier threads, and a request arriving with no slot starts
 no work at all. A verifier that blocks forever therefore holds its slot, and up

@@ -17,8 +17,12 @@ ROOT = Path(__file__).resolve().parents[2]
 CONSUMER = ROOT / "examples/agent-publisher/events_consumer.py"
 
 
+PROTOCOL_VERSION = 2
+
+
 def call(path, method, params):
-    request = {"version": 1, "id": str(uuid.uuid4()), "method": method, "params": params}
+    request = {"version": PROTOCOL_VERSION, "id": str(uuid.uuid4()),
+               "method": method, "params": params}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(3)
         connection.connect(str(path))
@@ -58,7 +62,7 @@ def main():
                 if daemon.poll() is not None:
                     raise RuntimeError(daemon.stderr.read())
                 time.sleep(0.02)
-            call(sock, "ping", {})
+            call(sock, "daemon.ping", {})
             run = subprocess.Popen([sys.executable, str(CONSUMER), str(sock)],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:

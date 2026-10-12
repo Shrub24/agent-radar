@@ -34,15 +34,16 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::ops;
 use super::{MAX_LINE_BYTES, PROTOCOL_VERSION, random_uuid, socket_path, trusted_socket};
 use crate::config::{RuntimeBackend, RuntimeConfig};
 use crate::herdr::{HerdrConfig, HerdrRuntime};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::runtime::{
-    CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedIdentity, CreatedKind,
-    CreatedLocation, FocusOutcome, InputOutcome, InputRequest, OutputOutcome, OutputRead,
-    OutputRequest, ReportOutcome, ReportRequest, RuntimeProvider, Target,
+    BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedIdentity,
+    CreatedKind, CreatedLocation, FocusOutcome, InputOutcome, InputRequest, OutputOutcome,
+    OutputRead, OutputRequest, ReportOutcome, ReportRequest, RuntimeProvider, Target,
 };
 
 /// How long one exchange with the daemon may take before it is treated as not
@@ -57,25 +58,37 @@ const WAIT_GRANULARITY: Duration = Duration::from_millis(10);
 /// who asked.
 const REQUESTER: &str = "radar";
 
-/// The capability names this protocol version defines.
+/// The capability names this protocol version defines: the backend
+/// capabilities a mux adapter declares, and the daemon contracts those can
+/// serve.
 ///
 /// A daemon's answer is interned against these, so a name this build cannot
 /// implement is never credited to it.
 const KNOWN_CAPABILITIES: &[&str] = &[
-    "observe",
-    "process_info",
-    "focus",
-    "close",
-    "creation",
-    "input",
-    "output",
-    "reporting",
+    ops::OBSERVE_CAPABILITY,
+    ops::PROCESS_INFO_CAPABILITY,
+    ops::FOCUS_CAPABILITY,
+    ops::CLOSE_CAPABILITY,
+    ops::CREATE_CAPABILITY,
+    ops::INPUT_CAPABILITY,
+    ops::OUTPUT_CAPABILITY,
+    ops::REPORT_CAPABILITY,
+    ops::LAUNCH_CAPABILITY,
+    ops::LAUNCH_CONTEXT_CAPABILITY,
+    ops::EXIT_OBSERVATION_CAPABILITY,
+    ops::REGISTRY_CONTRACT,
+    ops::EVENTS_CONTRACT,
+    ops::SPAWN_CONTRACT,
+    ops::SPAWN_CLOSE_CONTRACT,
+    ops::SPAWN_LAUNCH_CONTEXT_CONTRACT,
+    ops::SPAWN_EXIT_OBSERVATION_CONTRACT,
 ];
 
 /// The daemon as a [`RuntimeProvider`].
 pub struct DaemonRuntime {
     socket: PathBuf,
     declared: &'static [&'static str],
+    identity: BackendIdentity,
 }
 
 impl DaemonRuntime {
@@ -85,7 +98,12 @@ impl DaemonRuntime {
     /// Anything beyond these is asked for and answered by the daemon: a backend
     /// that cannot create or report refuses that operation by name rather than
     /// making the whole daemon unusable.
-    pub const REQUIRED: &'static [&'static str] = &["observe", "process_info", "focus", "close"];
+    pub const REQUIRED: &'static [&'static str] = &[
+        ops::OBSERVE_CAPABILITY,
+        ops::PROCESS_INFO_CAPABILITY,
+        ops::FOCUS_CAPABILITY,
+        ops::CLOSE_CAPABILITY,
+    ];
 
     /// Pings the daemon at `socket` and proves it is one Radar can use: the path
     /// is one Radar may trust, it answers, it speaks this protocol version, and it
@@ -107,8 +125,8 @@ impl DaemonRuntime {
     pub fn handshake(socket: &Path) -> Result<Self, String> {
         trusted_socket(socket)?;
         let cancel = AtomicBool::new(false);
-        let answer =
-            exchange_at(socket, "ping", json!({}), &cancel).map_err(|failure| failure.message)?;
+        let answer = exchange_at(socket, "daemon.ping", json!({}), &cancel)
+            .map_err(|failure| failure.message)?;
         let served = answer.get("protocol").and_then(Value::as_u64);
         if served != Some(PROTOCOL_VERSION as u64) {
             let served =
@@ -135,6 +153,17 @@ impl DaemonRuntime {
         Ok(Self {
             socket: socket.to_path_buf(),
             declared: intern(&declared),
+            identity: BackendIdentity {
+                name: answer
+                    .get("backend")
+                    .and_then(Value::as_str)
+                    .unwrap_or("none")
+                    .to_string(),
+                instance: answer
+                    .get("instance")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            },
         })
     }
 
@@ -162,13 +191,19 @@ impl DaemonRuntime {
 }
 
 impl RuntimeProvider for DaemonRuntime {
+    /// The backend the daemon reports: this client asks nothing of the mux
+    /// itself, so its identity is the one behind the socket.
+    fn identity(&self) -> BackendIdentity {
+        self.identity.clone()
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
         self.declared
     }
 
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {
         let result = self
-            .call("observe", json!({}), cancel)
+            .call("mux.observe", json!({}), cancel)
             .map_err(|failure| failure.message)?;
         let inventory = result.get("inventory").cloned().unwrap_or(Value::Null);
         serde_json::from_value(inventory)
@@ -178,7 +213,7 @@ impl RuntimeProvider for DaemonRuntime {
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence {
         // Evidence that cannot be read is inconclusive, exactly as it is for the
         // direct adapter: nothing here invents a pane state.
-        let Ok(result) = self.call("process_info", json!({"pane_id": pane_id}), cancel) else {
+        let Ok(result) = self.call("mux.process_info", json!({"pane_id": pane_id}), cancel) else {
             return ForegroundEvidence::Inconclusive;
         };
         let evidence = result.get("evidence").cloned().unwrap_or(Value::Null);
@@ -199,7 +234,7 @@ impl RuntimeProvider for DaemonRuntime {
         };
         let params = json!({"target": id, "target_kind": kind, "requester": REQUESTER});
         match self
-            .call("focus", params, cancel)
+            .call("mux.focus", params, cancel)
             .and_then(|result| Settled::of(&result))
         {
             Ok(settled) => settled.focus(),
@@ -227,28 +262,28 @@ impl RuntimeProvider for DaemonRuntime {
             target: target.clone(),
             identity: lifecycle::identity(&inventory, target),
         };
-        match self.mutation("close", &request, cancel) {
+        match self.mutation("mux.close", &request, cancel) {
             Ok(settled) => settled.close(),
             Err(failure) => failure.settled().close(),
         }
     }
 
     fn create(&self, request: &CreateRequest, cancel: &AtomicBool) -> CreateOutcome {
-        match self.mutation("create", request, cancel) {
+        match self.mutation("mux.create", request, cancel) {
             Ok(settled) => settled.create(),
             Err(failure) => failure.settled().create(),
         }
     }
 
     fn input(&self, request: &InputRequest, cancel: &AtomicBool) -> InputOutcome {
-        match self.mutation("input", request, cancel) {
+        match self.mutation("mux.input", request, cancel) {
             Ok(settled) => settled.input(),
             Err(failure) => failure.settled().input(),
         }
     }
 
     fn output(&self, request: &OutputRequest, cancel: &AtomicBool) -> OutputOutcome {
-        let result = match self.call("output", json!(request), cancel) {
+        let result = match self.call("mux.output", json!(request), cancel) {
             Ok(result) => result,
             Err(failure) => return failure.into_output(),
         };
@@ -262,7 +297,7 @@ impl RuntimeProvider for DaemonRuntime {
     }
 
     fn report(&self, request: &ReportRequest, cancel: &AtomicBool) -> ReportOutcome {
-        match self.mutation("report", request, cancel) {
+        match self.mutation("mux.report", request, cancel) {
             Ok(settled) => settled.report(),
             Err(failure) => failure.settled().report(),
         }
@@ -570,8 +605,6 @@ fn exchange(
         let message = format!("refused `{method}` ({code}): {message}");
         return Err(match code {
             // The codes the daemon answers before anything is dispatched.
-            // `internal` is deliberately absent: its own contract says the
-            // request may or may not have had an effect, so it stays unknown.
             "bad_version"
             | "bad_request"
             | "unknown_method"
@@ -580,6 +613,12 @@ fn exchange(
             | "busy"
             | "backend_unavailable"
             | "not_found" => Failure::refused(message),
+            // A dispatched request whose result was not confirmed is never a
+            // refusal: `outcome_unknown` says the daemon may have acted and
+            // `internal` says it failed while serving.
+            "outcome_unknown" | "internal" => Failure::unknown(message),
+            // A code this build does not know cannot be read as "nothing
+            // happened", so it stays unknown too.
             _ => Failure::unknown(message),
         });
     }

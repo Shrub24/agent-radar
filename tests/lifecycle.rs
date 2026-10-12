@@ -17,6 +17,7 @@ use agent_radar::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Location, Pane,
     SessionIdentity, Tab,
 };
+use agent_radar::runtime::BackendIdentity;
 use agent_radar::{CloseRequest, CloseTarget, Closer, RuntimeProvider};
 
 /// How long one request may take before the test calls it stuck.
@@ -114,6 +115,10 @@ impl FakeRuntime {
 }
 
 impl RuntimeProvider for FakeRuntime {
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("fake")
+    }
+
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         *self.inventories.lock().expect("inventories") += 1;
         match self.answer {

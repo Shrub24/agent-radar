@@ -30,9 +30,11 @@ use crate::model::{
     RuntimeStatus, SemanticState, SessionIdentity, SessionUuid, Tab, Workspace,
 };
 use crate::runtime::{
-    CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation, FocusOutcome,
-    InputOutcome, InputPayload, InputRequest, LAUNCH_CAPABILITY, LAUNCH_TOKEN_ENV, LaunchOutcome,
-    LaunchRequest, OutputOutcome, OutputRead, OutputRequest, OutputSource, ReportOutcome,
+    BackendIdentity, CLOSE_CAPABILITY, CREATE_CAPABILITY, CloseOutcome, CloseTarget, CreateOutcome,
+    CreateRequest, CreatedLocation, FOCUS_CAPABILITY, FocusOutcome, INPUT_CAPABILITY, InputOutcome,
+    InputPayload, InputRequest, LAUNCH_CAPABILITY, LAUNCH_CONTEXT_CAPABILITY, LAUNCH_TOKEN_ENV,
+    LaunchOutcome, LaunchRequest, OBSERVE_CAPABILITY, OUTPUT_CAPABILITY, OutputOutcome, OutputRead,
+    OutputRequest, OutputSource, PROCESS_INFO_CAPABILITY, REPORT_CAPABILITY, ReportOutcome,
     ReportRequest, ReportTarget, RuntimeProvider, SplitDirection, Target,
 };
 
@@ -495,18 +497,22 @@ impl RuntimeProvider for HerdrRuntime {
     /// `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`
     /// and `workspace.report_metadata`, each a caller's own facts forwarded with
     /// nothing derived from them.
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("herdr")
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
         &[
-            "observe",
-            "process_info",
-            "focus",
-            "close",
-            "creation",
-            "input",
-            "output",
-            "reporting",
+            OBSERVE_CAPABILITY,
+            PROCESS_INFO_CAPABILITY,
+            FOCUS_CAPABILITY,
+            CLOSE_CAPABILITY,
+            CREATE_CAPABILITY,
+            INPUT_CAPABILITY,
+            OUTPUT_CAPABILITY,
+            REPORT_CAPABILITY,
             LAUNCH_CAPABILITY,
-            "child_launch_context_v1",
+            LAUNCH_CONTEXT_CAPABILITY,
         ]
     }
 

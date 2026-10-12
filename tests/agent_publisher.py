@@ -39,8 +39,8 @@ def fixture_pairs():
     expected = ["agent.register", "events.read", "events.read", "events.read",
                 "agent.acquire", "agent.publish", "agent.context", "agent.context",
                 "agent.context", "agent.context", "agent.get", "agent.list", "agent.context",
-                "agent.retire", "spawn", "agent.register", "spawn.get", "spawn.list", "spawn",
-                "child.close", "child.close"]
+                "agent.retire", "spawn.create", "agent.register", "spawn.get", "spawn.list",
+                "spawn.create", "spawn.close", "spawn.close"]
     actual = []
     for request, response in pairs:
         check(request["kind"] == "request" and response["kind"] == "response",
@@ -54,7 +54,7 @@ def fixture_pairs():
     check(actual == expected, f"fixture methods are {actual}")
     events = [pair for pair in pairs if pair[0]["method"] == "events.read"]
     check(len(events) == 3, "fixture needs normal, empty-wait and expired event reads")
-    close_pair = [pair for pair in pairs if pair[0]["method"] == "child.close"]
+    close_pair = [pair for pair in pairs if pair[0]["method"] == "spawn.close"]
     check(len(close_pair) == 2, "fixture must contain close and identical replay")
     check(close_pair[0][0]["id"] == close_pair[1][0]["id"],
           "close replay must repeat the original request id")
@@ -75,7 +75,7 @@ def validate_fixture(path):
                         if request["method"] == "agent.get")
     for request, response in pairs:
         method = request["method"]
-        if method in ("spawn", "spawn.get", "spawn.list", "child.close"):
+        if method in ("spawn.create", "spawn.get", "spawn.list", "spawn.close"):
             continue
         if method == "events.read":
             params = json.loads(json.dumps(request["params"]))
@@ -216,7 +216,7 @@ def spawn_daemon(binary, socket_path, state_path, herdr_fake=None):
             raise RuntimeError(f"daemon exited {child.returncode}: {out}\n{err}")
         if socket_path.exists():
             try:
-                call(socket_path, "ping", {})
+                call(socket_path, "daemon.ping", {})
                 return child
             except (OSError, RuntimeError):
                 pass
@@ -254,7 +254,8 @@ def process_birth_identity(pid):
 
 def call_with_id(path, request_id, method, params):
     """One call under a caller-chosen id, so a replay can repeat it."""
-    request = {"version": 1, "id": request_id, "method": method, "params": params}
+    request = {"version": publisher.PROTOCOL_VERSION, "id": request_id,
+               "method": method, "params": params}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.connect(str(path))
         connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
@@ -279,9 +280,9 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
         time.sleep(0.01)
     daemon = spawn_daemon(binary, socket_path, state_path, fake)
     try:
-        ping = call(socket_path, "ping", {})
-        check(ping["protocol"] == 1, str(ping))
-        check({"creation", "launch"}.issubset(ping["capabilities"]), str(ping))
+        ping = call(socket_path, "daemon.ping", {})
+        check(ping["protocol"] == publisher.PROTOCOL_VERSION, str(ping))
+        check({"mux.create", "mux.launch"}.issubset(ping["capabilities"]), str(ping))
         parent = call(socket_path, "agent.register", {
             "source": "fixture-parent", "incarnation": "11111111-1111-4111-8111-111111111111",
             "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
@@ -291,7 +292,7 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
              "publisher": {"source": "fixture-parent", "incarnation": "1c2d3e4f-5678-4abc-9def-0123456789ab"},
              "sequence": 1, "lease_ms": 30000, "context": {"session": parent_session_id}})
         launch_env = {"PI_HERDSMAN_MAILBOX": "mailbox-smoke", "PI_HERDSMAN_OWNER": "owner-smoke"}
-        response = call(socket_path, "spawn", {"request": {"parent": parent,
+        response = call(socket_path, "spawn.create", {"request": {"parent": parent,
                             "parent_session_id": parent_session_id,
                             "executable": "/usr/bin/pi", "argv": ["--child", "row one"],
                             "cwd": "/tmp", "env": launch_env},
@@ -316,7 +317,7 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
               "bootstrap must remove the token from its environment after capture")
         child = call(socket_path, "agent.register", {
             "source": "fixture-child", "incarnation": "34343434-3434-4343-8343-343434343434",
-            "location": {"backend": "runtime", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p2"},
+            "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p2"},
             "process": process_birth_identity(os.getpid()),
             "spawn_token": captured_token,
         })["registration"]
@@ -347,7 +348,7 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
         public = json.dumps([response, child, get, listed])
         check(private_token not in public, "token leaked through a public spawn projection")
         close_request, close_response = next(
-            pair for pair in fixture_pairs() if pair[0]["method"] == "child.close")
+            pair for pair in fixture_pairs() if pair[0]["method"] == "spawn.close")
         close_id = close_request["id"]
         close_params = {"spawn_request_id": edge["request_id"], "source": child["source"],
                         "incarnation": child["incarnation"], "intent": close_request["params"]["intent"]}
@@ -355,8 +356,8 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
         # The fixture's close entry and its identical replay both answer from the
         # one recorded outcome; only the first of the two may dispatch.
         for _ in range(2):
-            actual = call_with_id(socket_path, close_id, "child.close", close_params)
-            check(actual == {"close": expected_close}, f"child.close fixture differs: {actual}")
+            actual = call_with_id(socket_path, close_id, "spawn.close", close_params)
+            check(actual == {"close": expected_close}, f"spawn.close fixture differs: {actual}")
         check((fake_state / "close-count").read_text() == "1",
               "same-ID close replay dispatched more than once")
         after_agent = get_agent(socket_path, child["agent_id"])
@@ -406,10 +407,10 @@ def main():
         daemon = spawn_daemon(binary, socket_path, state_path)
         try:
             validate_fixture(socket_path)
-            check("events_v1" in call(socket_path, "ping", {})["capabilities"],
-                  "events_v1 capability missing")
-            ping = call(socket_path, "ping", {})
-            check("agent_registry" in ping["capabilities"], f"capability missing: {ping}")
+            check("events.v1" in call(socket_path, "daemon.ping", {})["capabilities"],
+                  "events.v1 capability missing")
+            ping = call(socket_path, "daemon.ping", {})
+            check("registry.v1" in ping["capabilities"], f"capability missing: {ping}")
 
             registered, channel = publisher.publish_assignment(
                 socket_path, registration, identity, snapshot, 1, lease_ms=1000)

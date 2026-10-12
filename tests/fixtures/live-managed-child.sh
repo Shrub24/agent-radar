@@ -22,7 +22,7 @@ import uuid
 
 pid, boot_id, start_ticks, token, path, record_path, cwd, literal, empty_set, empty, override = sys.argv[1:]
 request = {
-    "version": 1,
+    "version": 2,
     "id": str(uuid.uuid4()),
     "method": "agent.register",
     "params": {

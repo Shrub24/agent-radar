@@ -1039,13 +1039,8 @@ fn launch_runs_argv_with_overlay_and_preserves_immediate_exit_status() {
             signal: None,
         })
     );
-    assert!(probe.runtime.capabilities().contains(&"launch"));
-    assert!(
-        probe
-            .runtime
-            .capabilities()
-            .contains(&"child_launch_context_v1")
-    );
+    assert!(probe.runtime.capabilities().contains(&"mux.launch"));
+    assert!(probe.runtime.capabilities().contains(&"mux.launch_context"));
 }
 
 #[test]
@@ -1384,6 +1379,36 @@ fn a_killed_server_leaves_every_effect_unknown() {
     assert!(
         matches!(closed, CloseOutcome::Unknown(_)),
         "a close on a server that is gone was not unknown: {closed:?}"
+    );
+}
+
+/// The adapter names the process serving it, which is the one fact about a tmux
+/// server that a restart under the same name does not reproduce.
+#[test]
+fn the_serving_process_is_read_from_the_server_and_is_none_once_it_is_gone() {
+    let Some(probe) = Probe::start("the_serving_process_is_read_from_the_server") else {
+        return;
+    };
+    let reported = probe
+        .runtime
+        .server_process(&cancel())
+        .expect("a server that answers names its process");
+    let asked = probe
+        .tmux(&["display-message", "-p", "#{pid}"])
+        .trim()
+        .parse::<i32>()
+        .expect("the server pid tmux names");
+    assert_eq!(reported, asked, "the adapter reads the server's own pid");
+    assert_eq!(
+        probe.runtime.server_process(&cancel()),
+        Some(reported),
+        "a second client sees the same serving process"
+    );
+    probe.kill();
+    assert_eq!(
+        probe.runtime.server_process(&cancel()),
+        None,
+        "a server that is gone names no process"
     );
 }
 

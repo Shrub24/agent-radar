@@ -842,7 +842,27 @@ esac"#,
     )
     .expect("bind the daemon over the scripted runtime");
 
-    let observed = control_call(&socket, &random_uuid(), "observe", serde_json::json!({}));
+    // The daemon over the real Herdr adapter names it, and names no server
+    // instance: this adapter reaches whatever Herdr is on its own endpoint.
+    let ping = control_call(
+        &socket,
+        &random_uuid(),
+        "daemon.ping",
+        serde_json::json!({}),
+    );
+    assert_eq!(ping["result"]["backend"], "herdr", "{ping}");
+    assert_eq!(
+        ping["result"]["instance"],
+        serde_json::Value::Null,
+        "{ping}"
+    );
+
+    let observed = control_call(
+        &socket,
+        &random_uuid(),
+        "mux.observe",
+        serde_json::json!({}),
+    );
     assert_eq!(
         observed["result"]["inventory"]["panes"][0]["location"]["pane_id"],
         "wA:p1"
@@ -850,7 +870,7 @@ esac"#,
     let evidence = control_call(
         &socket,
         &random_uuid(),
-        "process_info",
+        "mux.process_info",
         serde_json::json!({"pane_id": "wA:p1"}),
     );
     assert_eq!(evidence["result"]["evidence"]["kind"], "non_shell");
@@ -858,7 +878,7 @@ esac"#,
     let focused = control_call(
         &socket,
         &random_uuid(),
-        "focus",
+        "mux.focus",
         serde_json::json!({"target": "wA:p1", "target_kind": "pane"}),
     );
     assert_eq!(focused["result"]["request"]["outcome"], "completed");
@@ -871,7 +891,7 @@ esac"#,
     let closed = control_call(
         &socket,
         &random_uuid(),
-        "close",
+        "mux.close",
         serde_json::json!({
             "request": {
                 "target": {"pane": "wA:p1"},
@@ -893,7 +913,7 @@ esac"#,
     let created = control_call(
         &socket,
         &random_uuid(),
-        "create",
+        "mux.create",
         serde_json::json!({
             "request": {
                 "kind": "pane_split",
@@ -919,7 +939,7 @@ esac"#,
     let sent = control_call(
         &socket,
         &random_uuid(),
-        "input",
+        "mux.input",
         serde_json::json!({
             "request": {
                 "pane_id": "wA:p1",
@@ -936,7 +956,7 @@ esac"#,
     let read = control_call(
         &socket,
         &random_uuid(),
-        "output",
+        "mux.output",
         serde_json::json!({"pane_id": "wA:p1", "source": "visible", "lines": 5}),
     );
     assert_eq!(read["result"]["output"]["text"], "$ ls\n");
@@ -948,7 +968,7 @@ esac"#,
     let reported = control_call(
         &socket,
         &random_uuid(),
-        "report",
+        "mux.report",
         serde_json::json!({"request": {
             "kind": "state",
             "pane_id": "wA:p1",
@@ -968,7 +988,7 @@ esac"#,
     let display = control_call(
         &socket,
         &random_uuid(),
-        "report",
+        "mux.report",
         serde_json::json!({"request": {
             "kind": "metadata",
             "target": {"kind": "pane", "pane_id": "wA:p1"},
@@ -1094,7 +1114,7 @@ fn herdr_launch_context_is_quoted_and_preflighted_without_loss() {
     runtime
         .validate_launch(&request)
         .expect("representable launch");
-    assert!(runtime.capabilities().contains(&"child_launch_context_v1"));
+    assert!(runtime.capabilities().contains(&"mux.launch_context"));
     request
         .env
         .insert("PI_RADAR_SPAWN_TOKEN".into(), "override".into());
@@ -1725,7 +1745,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
             "source": "radar-live-close-smoke-parent",
             "incarnation": parent_incarnation_request,
             "label": "live child-close smoke",
-            "location": {"backend": "runtime", "pane": parent_pane},
+            "location": {"backend": "herdr", "pane": parent_pane},
         }),
     );
     let parent_id = parent["result"]["registration"]["agent_id"]
@@ -1769,7 +1789,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         },
         "requester": "runtime-live-smoke",
     });
-    let spawned = control_call(&socket, &spawn_id, "spawn", spawn_params.clone());
+    let spawned = control_call(&socket, &spawn_id, "spawn.create", spawn_params.clone());
     let spawn_record = state.join("spawns").join(format!("{spawn_id}.json"));
     let spawn_edge = read_json(&spawn_record);
     assert_eq!(spawn_edge["request_id"], spawn_id);
@@ -1944,7 +1964,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         "incarnation": child_incarnation,
         "intent": "complete",
     });
-    let first = control_call(&socket, &close_id, "child.close", params.clone());
+    let first = control_call(&socket, &close_id, "spawn.close", params.clone());
     assert_eq!(first["result"]["close"]["outcome"], "completed", "{first}");
     disposable.pane_closed(&child_pane);
     assert_eq!(
@@ -1982,7 +2002,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
 
     // The same request id is answered from that record: the pane is closed once,
     // and no read the close could have written has moved.
-    let replay = control_call(&socket, &close_id, "child.close", params);
+    let replay = control_call(&socket, &close_id, "spawn.close", params);
     assert_eq!(
         replay["result"]["close"], first["result"]["close"],
         "{replay}"

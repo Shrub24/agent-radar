@@ -2,7 +2,7 @@
 
 This page describes the physical seam used by the Radar daemon and the boundary
 that downstream consumers should depend on. For exact JSON, limits and examples,
-use [control-plane protocol v1](control-plane.md). For agent identity, publications
+use [control-plane protocol v2](control-plane.md). For agent identity, publications
 and token binding, use [agent registration](agent-registration.md). Start with
 [the daemon consumer guide](daemon.md) if you are integrating Herdsman.
 
@@ -29,30 +29,31 @@ still use Herdr.
 
 | Daemon method | Adapter operation | Current guarantee |
 | --- | --- | --- |
-| `observe` | `inventory` | Normalized workspace/tab/pane and agent observations; no new registration or daemon-created ownership |
-| `process_info` | `foreground_evidence` | Current foreground evidence; inconclusive is a valid answer, not proof of exit |
-| `focus` | `focus_outcome` | Focus the exact named location; distinguish confirmed, refused and unknown effects |
-| `create` | `create` | Workspace, tab or pane split; report the created identity rather than choosing a nearby resource |
-| `input` | `input` | Literal text or named keys; no agent lifecycle interpretation |
-| `output` | `output` | Bounded, non-consuming output snapshot; no scrollback/cursor consumption |
-| `report` | `report` | Optional forwarding to backend metadata; not direct registry publication |
-| `close` | `close_outcome` | Physical pane/tab close after the daemon's positive-unmanaged containment and identity gate |
-| `spawn` | `validate_launch`, `create`, `launch` | Daemon-managed child creation/launch with durable edge and private registration correlation |
-| `child.close` | `inventory`, `foreground_evidence`, `close_outcome` | Close only the recorded, token-bound child's pane after exact current occupant verification; a dead pane fails the live foreground-identity gate |
+| `mux.observe` | `inventory` | Normalized workspace/tab/pane and agent observations; no new registration or daemon-created ownership |
+| `mux.process_info` | `foreground_evidence` | Current foreground evidence; inconclusive is a valid answer, not proof of exit |
+| `mux.focus` | `focus_outcome` | Focus the exact named location; distinguish confirmed, refused and unknown effects |
+| `mux.create` | `create` | Workspace, tab or pane split; report the created identity rather than choosing a nearby resource |
+| `mux.input` | `input` | Literal text or named keys; no agent lifecycle interpretation |
+| `mux.output` | `output` | Bounded, non-consuming output snapshot; no scrollback/cursor consumption |
+| `mux.report` | `report` | Optional forwarding to backend metadata; not direct registry publication |
+| `mux.close` | `close_outcome` | Physical pane/tab close after the daemon's positive-unmanaged containment and identity gate |
+| `spawn.create` | `validate_launch`, `create`, `launch` | Daemon-managed child creation/launch with durable edge and private registration correlation |
+| `spawn.close` | `inventory`, `foreground_evidence`, `exit_observation`, `server_process`, `close_outcome` | Close only the recorded, token-bound child's pane: a live occupant after exact foreground-identity verification, or a retained dead pane after the edge's recorded exit and the creating-instance fence. `server_process` is not a daemon method: it is the seam by which the daemon fences a created edge to the process that served it |
 
-`launch` is an adapter capability used by `spawn`, **not** a public standalone
-launch endpoint. `create` only creates a terminal location. `create` plus arbitrary
-`input` is not a substitute for `spawn`: it does not mint the private binding
-token or create a managed-child edge.
+`mux.launch` is an adapter capability used by `spawn.create`, **not** a public
+standalone launch endpoint. `mux.create` only creates a terminal location.
+`mux.create` plus arbitrary `mux.input` is not a substitute for `spawn.create`: it
+does not mint the private binding token or create a managed-child edge.
 
-Current `spawn` placement is a nonfocused right split of the exact registered
+Current `spawn.create` placement is a nonfocused right split of the exact registered
 parent's pane. Although generic workspace/tab creation exists, managed spawn
 into a new tab/workspace, or a caller-selected existing pane, is not implemented.
 Consumers needing that placement must request a contract extension, not assemble
 an untracked managed launch from generic operations.
 
 `spawn.get` and `spawn.list` include `exit_observation` for current v2 edges.
-`exit_observation_v1` means the selected backend can report a retained typed pane
+`spawn.exit_observation.v1` (the backend's `mux.exit_observation`) means the
+selected backend can report a retained typed pane
 exit; absent that capability the field is `{"state":"unknown"}`. Tmux arms
 `remain-on-exit` before launch and records the first observed exit code or signal
 with Radar's observation time. This is tmux's retained pane-command status, not
@@ -60,8 +61,9 @@ independent proof of the bound agent's process identity. A same-UID client can
 `respawn-pane` before Radar's first read and replace the retained status; direct
 out-of-band pane respawn is inside the existing same-UID trust boundary. Herdr
 reports unknown. A missing pane is not proof of exit, legacy v1 edges omit the
-field, and exit observation does not change agent execution/assignment facts or
-authorize `child.close`.
+field, and exit observation does not change agent execution/assignment facts. It
+authorizes dead-pane cleanup only together with the edge's own recorded exit and
+the creating-instance fence.
 
 ## Adapter duties
 
@@ -84,13 +86,21 @@ authorize `child.close`.
 - Provide foreground evidence that can be corroborated with Linux process birth
   identity when managed close needs it. Session tokens and titles do not prove
   which process incarnation occupies a pane.
+- Name the process serving the backend's instance through `server_process` when
+  the backend addresses one. It is a claim about a pid, and the daemon verifies
+  its birth identity before recording or comparing it, but a backend that answers
+  none gives the daemon nothing to fence with: the created edge records no
+  instance and cleanup of that edge's dead panes refuses rather than guessing.
 - Do not derive assignment completion, readiness or process exit from terminal
   disappearance, execution status, pane closure or a successful input call.
 
 The daemon persists accepted work before effectful dispatch. Clients retain the
 operation UUID and reconcile durable readbacks; they do not fall back to another
-adapter after uncertainty. `events.read` with `events_v1` offers bounded polling
-for lifecycle journal pointers, but does not replace exact record reads. On
+adapter after uncertainty. `events.read` with `events.v1` offers bounded polling
+for lifecycle journal pointers, but does not replace exact record reads. Resume
+from the delivered `cursor` — the position after the last delivered event — and use
+`tail`/`more` only to see whether a backlog remains: while `more` is true, read
+again without waiting. On
 `cursor_expired`, rebuild from paged registry/topology reads and request listings;
 then resume from the returned cursor. Events can be lost after a fact is durable,
 so an unclean restart changes epoch. Read the protocol references for event,
@@ -98,8 +108,9 @@ generic operation, spawn-edge and managed-close record shapes.
 
 ## Launch and binding
 
-A context-bearing spawn requires compatible protocol plus `creation`, `launch`
-and `child_launch_context_v1`. It names the exact parent `agent_id` and a fresh,
+A context-bearing `spawn.create` requires compatible protocol plus the `spawn.v1`
+and `spawn.launch_context.v1` contracts (`mux.create`, `mux.launch` and
+`mux.launch_context`). It names the exact parent `agent_id` and a fresh,
 matching `parent_session_id`; duplicate attaches are not selected by UUID alone.
 
 The request supplies a resolved executable and literal argv, optional absolute
@@ -130,8 +141,10 @@ service; filesystem permissions do not isolate it from other same-user processes
 
 No daemon operation currently provides process stop with verified exit,
 retained-session resume, lead restart, child replacement or post-owner-restart
-reconciliation. `child.close` is a pane-close fact, never an exit or assignment
-completion verdict. Stored registration launch/resume specifications are not a
+reconciliation. `spawn.close` is a pane-close fact, never an exit or assignment
+completion verdict, and `already_exited` is the pane command's recorded exit plus
+retained-pane cleanup rather than proof about the registered process. Stored
+registration launch/resume specifications are not a
 promise that the daemon can execute them.
 
 The TUI-only lead-restart change is separately blocked on positive readiness for
@@ -168,9 +181,12 @@ The daemon now supports explicit Herdr/tmux physical-backend selection, named
 server-scoped tmux handles, normalized observation and mux operations, direct-argv
 spawn launch, durable child binding, and typed one-shot exit observation on v2
 spawn edges. The adapter's launch requires `remain-on-exit` before dispatch;
-uncertain effects remain unknown. `child.close` still requires a current live
-foreground-process identity match, so a recorded dead-pane exit does not authorize
-close. Herdr remains the default and reports unknown exit observations.
+uncertain effects remain unknown. `spawn.close` closes a live child pane after the
+foreground-identity gate, and closes a retained dead pane as `already_exited`
+only when the edge recorded that exit and the tmux server serving now is the one
+that served the create; Herdr cannot name its serving process, so its dead panes
+are always refused. Herdr remains the default and reports unknown exit
+observations.
 
 This backend seam does not establish full Herdsman cutover. Adoption still needs a
 consumer migration and acceptance run with Herdr unavailable; Radar also needs a

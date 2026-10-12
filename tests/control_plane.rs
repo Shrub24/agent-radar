@@ -14,6 +14,7 @@
 //! run" answerable after a restart.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -42,10 +43,11 @@ use agent_radar::model::{
     TerminalMode, Workspace,
 };
 use agent_radar::runtime::{
-    CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation, FocusOutcome,
-    InputOutcome, InputPayload, InputRequest, LaunchOutcome, LaunchRequest,
-    MAX_REPORTED_TEXT_BYTES, OutputOutcome, OutputRead, OutputRequest, OutputSource, ReportOutcome,
-    ReportRequest, ReportedState, RuntimeProvider, SplitDirection, StateReport, Target,
+    BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation,
+    FocusOutcome, InputOutcome, InputPayload, InputRequest, LaunchOutcome, LaunchRequest,
+    MAX_REPORTED_TEXT_BYTES, OutputOutcome, OutputRead, OutputRequest, OutputSource,
+    PaneExitObservation, ReportOutcome, ReportRequest, ReportedState, RuntimeProvider,
+    SplitDirection, StateReport, Target,
 };
 use serde_json::{Value, json};
 
@@ -74,8 +76,12 @@ impl FakeBackend {
 }
 
 impl RuntimeProvider for FakeBackend {
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("fake")
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
-        &["observe", "process_info", "focus"]
+        &["mux.observe", "mux.process_info", "mux.focus"]
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(self.inventory.clone())
@@ -204,9 +210,13 @@ struct GatedBackend {
 }
 
 impl RuntimeProvider for GatedBackend {
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("fake")
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
         // `observe` because the daemon reads this backend while a focus is held.
-        &["observe", "focus"]
+        &["mux.observe", "mux.focus"]
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(FleetObservation {
@@ -346,8 +356,12 @@ impl CloseBackend {
 }
 
 impl RuntimeProvider for CloseBackend {
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("fake")
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
-        &["close"]
+        &["mux.close"]
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         self.inventory.clone()
@@ -384,44 +398,68 @@ impl RuntimeProvider for CloseBackend {
 
 /// Every capability the fake mux backend declares.
 const MUX_CAPABILITIES: &[&str] = &[
-    "observe",
-    "process_info",
-    "creation",
-    "input",
-    "output",
-    "reporting",
+    "mux.observe",
+    "mux.process_info",
+    "mux.create",
+    "mux.input",
+    "mux.output",
+    "mux.report",
 ];
 
 /// The same, plus `launch`: a backend that can serve a spawn, because it can
 /// both create a pane and run a command in it.
 const SPAWN_CAPABILITIES: &[&str] = &[
-    "observe",
-    "process_info",
-    "creation",
-    "input",
-    "output",
-    "reporting",
-    "launch",
-    "close",
-    "child_launch_context_v1",
+    "mux.observe",
+    "mux.process_info",
+    "mux.create",
+    "mux.input",
+    "mux.output",
+    "mux.report",
+    "mux.launch",
+    "mux.close",
+    "mux.launch_context",
 ];
 
-/// The daemon's own registry capability is advertised alongside whatever mux
-/// capabilities the backend declares.
+/// What a backend must declare to close a child whose pane is already dead: the
+/// same primitives plus the retained-exit read the dead-pane evidence comes from.
+const DEAD_CLOSE_CAPABILITIES: &[&str] = &[
+    "mux.observe",
+    "mux.process_info",
+    "mux.create",
+    "mux.input",
+    "mux.output",
+    "mux.report",
+    "mux.launch",
+    "mux.close",
+    "mux.exit_observation",
+];
+
+/// What the handshake advertises for a backend that declares `backend`: the
+/// declaration itself, then each daemon contract whose capabilities are all
+/// present. Nothing the daemon would refuse to serve is in this list.
 fn advertised(backend: &[&str]) -> Value {
-    let mut capabilities: Vec<Value> = backend
-        .iter()
-        .filter(|name| **name != "child_launch_context_v1")
-        .map(|name| json!(name))
-        .collect();
-    if backend.contains(&"child_launch_context_v1")
-        && backend.contains(&"creation")
-        && backend.contains(&"launch")
-    {
-        capabilities.push(json!("child_launch_context_v1"));
+    let mut capabilities: Vec<Value> = Vec::new();
+    for name in backend {
+        if !capabilities.contains(&json!(name)) {
+            capabilities.push(json!(name));
+        }
     }
-    capabilities.push(json!("agent_registry"));
-    capabilities.push(json!("events_v1"));
+    let serves = |needed: &[&str]| needed.iter().all(|name| backend.contains(name));
+    for (contract, needed) in [
+        ("registry.v1", &[][..]),
+        ("events.v1", &[][..]),
+        ("spawn.v1", &["mux.create", "mux.launch"][..]),
+        ("spawn.close.v1", &["mux.observe", "mux.close"][..]),
+        (
+            "spawn.launch_context.v1",
+            &["mux.create", "mux.launch", "mux.launch_context"][..],
+        ),
+        ("spawn.exit_observation.v1", &["mux.exit_observation"][..]),
+    ] {
+        if serves(needed) {
+            capabilities.push(json!(contract));
+        }
+    }
     Value::Array(capabilities)
 }
 
@@ -453,6 +491,14 @@ struct MuxBackend {
     /// confirm a recorded location.
     inventory: FleetObservation,
     foreground: ForegroundEvidence,
+    /// What this backend reports for a pane's exit state: a pane it was not told
+    /// about stays unknown, which is what a backend without the capability says.
+    exits: Mutex<BTreeMap<String, PaneExitObservation>>,
+    /// The pid this backend claims serves it, when a test stages one: a daemon
+    /// reads it as the fence for the panes this backend creates.
+    server_pid: Mutex<Option<i32>>,
+    /// When set, this backend's inventory read fails with these words.
+    inventory_refusal: Mutex<Option<String>>,
     closed: Mutex<Vec<CloseTarget>>,
     close_answer: CloseAnswer,
     created_requests: Mutex<Vec<CreateRequest>>,
@@ -493,6 +539,9 @@ impl MuxBackend {
             launch: LaunchAnswer::Completed,
             inventory: empty_inventory(),
             foreground: ForegroundEvidence::Inconclusive,
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
             close_answer: CloseAnswer::Completed,
             created_requests: Mutex::new(Vec::new()),
@@ -514,6 +563,9 @@ impl MuxBackend {
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
             foreground: self.foreground.clone(),
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
             close_answer: close,
             created_requests: Mutex::new(Vec::new()),
@@ -534,6 +586,9 @@ impl MuxBackend {
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
             foreground: evidence,
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
@@ -558,6 +613,9 @@ impl MuxBackend {
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
             foreground: self.foreground.clone(),
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
@@ -579,6 +637,9 @@ impl MuxBackend {
             launch,
             inventory: self.inventory.clone(),
             foreground: self.foreground.clone(),
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
@@ -600,6 +661,9 @@ impl MuxBackend {
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
             foreground: self.foreground.clone(),
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
@@ -621,6 +685,9 @@ impl MuxBackend {
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
             foreground: self.foreground.clone(),
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
@@ -658,6 +725,9 @@ impl MuxBackend {
                 agents: Vec::new(),
             },
             foreground: self.foreground.clone(),
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
@@ -682,6 +752,26 @@ impl MuxBackend {
             .clone()
     }
 
+    /// Stages one pane as reported dead, or running, from now on.
+    fn reporting_exit(&self, pane_id: &str, observation: PaneExitObservation) {
+        self.exits
+            .lock()
+            .expect("the exit map")
+            .insert(pane_id.to_string(), observation);
+    }
+
+    /// Stages this backend's inventory read as unavailable.
+    fn refusing_inventory(&self, message: &str) {
+        *self.inventory_refusal.lock().expect("the refusal") = Some(message.to_string());
+    }
+
+    /// Stages this backend as served by a process with this pid, so a daemon
+    /// fences the panes it creates against one. Nothing here is a process: the
+    /// verifier the test binds is what confirms or refuses the pid.
+    fn served_by(&self, pid: i32) {
+        *self.server_pid.lock().expect("the server pid") = Some(pid);
+    }
+
     /// What this backend was asked to create, in order.
     fn creates(&self) -> Vec<CreateRequest> {
         self.created_requests
@@ -692,11 +782,46 @@ impl MuxBackend {
 }
 
 impl RuntimeProvider for MuxBackend {
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("fake")
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
         self.capabilities
     }
+
+    fn server_process(&self, _cancel: &AtomicBool) -> Option<i32> {
+        *self.server_pid.lock().expect("the server pid")
+    }
+
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
-        Ok(self.inventory.clone())
+        match self
+            .inventory_refusal
+            .lock()
+            .expect("the refusal")
+            .as_deref()
+        {
+            Some(message) => Err(message.to_string()),
+            None => Ok(self.inventory.clone()),
+        }
+    }
+
+    fn exit_observations(
+        &self,
+        pane_ids: &[String],
+        _cancel: &AtomicBool,
+    ) -> BTreeMap<String, PaneExitObservation> {
+        let exits = self.exits.lock().expect("the exit map");
+        pane_ids
+            .iter()
+            .map(|pane_id| {
+                let observation = exits
+                    .get(pane_id)
+                    .cloned()
+                    .unwrap_or(PaneExitObservation::Unknown);
+                (pane_id.clone(), observation)
+            })
+            .collect()
     }
     fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
         self.foreground.clone()
@@ -794,17 +919,17 @@ fn the_reporting_bridge_is_served_and_recorded() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
-    let ping = client.call("ping", json!({}));
+    let ping = client.call("daemon.ping", json!({}));
     assert!(
         ping["result"]["capabilities"]
             .as_array()
             .expect("capabilities")
-            .contains(&json!("reporting")),
+            .contains(&json!("mux.report")),
         "{ping}"
     );
 
     let state_id = random_uuid();
-    let state = client.call_id(&state_id, "report", state_report("working"));
+    let state = client.call_id(&state_id, "mux.report", state_report("working"));
     let record = result_record(&state);
     assert_eq!(record["outcome"], "completed");
     assert_eq!(record["target"], "wA:p1");
@@ -814,7 +939,7 @@ fn the_reporting_bridge_is_served_and_recorded() {
     assert_eq!(record["params"], state_report("working"));
 
     let session = client.call(
-        "report",
+        "mux.report",
         json!({"request": {
             "kind": "session",
             "pane_id": "wA:p1",
@@ -847,7 +972,7 @@ fn the_reporting_bridge_is_served_and_recorded() {
         "ttl_ms": 30000,
         "sequence": 6,
     }});
-    let metadata = client.call("report", display.clone());
+    let metadata = client.call("mux.report", display.clone());
     assert_eq!(result_record(&metadata)["outcome"], "completed");
     assert_eq!(
         result_record(&metadata)["effects"],
@@ -856,7 +981,7 @@ fn the_reporting_bridge_is_served_and_recorded() {
     assert_eq!(result_record(&metadata)["params"], display);
 
     let workspace = client.call(
-        "report",
+        "mux.report",
         json!({"request": {
             "kind": "metadata",
             "target": {"kind": "workspace", "workspace_id": "wA"},
@@ -913,10 +1038,10 @@ fn the_reporting_bridge_is_served_and_recorded() {
 
     // A repeated id returns the record it wrote and reports nothing again; the
     // same id with different contents refuses.
-    let replay = client.call_id(&state_id, "report", state_report("working"));
+    let replay = client.call_id(&state_id, "mux.report", state_report("working"));
     assert_eq!(replay, state);
     assert_eq!(backend.reports_seen(), 4);
-    let changed = client.call_id(&state_id, "report", state_report("idle"));
+    let changed = client.call_id(&state_id, "mux.report", state_report("idle"));
     assert_eq!(error_code(&changed), "refused");
     assert!(
         changed["error"]["message"]
@@ -930,8 +1055,8 @@ fn the_reporting_bridge_is_served_and_recorded() {
     // A report leaves no record for a read to find: it is not read back here,
     // only the operation that reported it is.
     assert_eq!(
-        client.call("request", json!({"id": state_id}))["result"]["request"]["method"],
-        "report"
+        client.call("mux.request.get", json!({"id": state_id}))["result"]["request"]["method"],
+        "mux.report"
     );
     daemon.stop();
 }
@@ -941,14 +1066,14 @@ fn the_reporting_bridge_is_served_and_recorded() {
 #[test]
 fn a_backend_without_reporting_refuses_it_and_advertises_no_reporting() {
     let sandbox = Sandbox::new("report-unsupported");
-    let backend = MuxBackend::new(&["observe"]);
+    let backend = MuxBackend::new(&["mux.observe"]);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
-    let ping = client.call("ping", json!({}));
-    assert_eq!(ping["result"]["capabilities"], advertised(&["observe"]));
+    let ping = client.call("daemon.ping", json!({}));
+    assert_eq!(ping["result"]["capabilities"], advertised(&["mux.observe"]));
 
-    let refused = client.call("report", state_report("working"));
+    let refused = client.call("mux.report", state_report("working"));
     let record = result_record(&refused);
     assert_eq!(record["outcome"], "refused");
     assert_eq!(record["category"], Category::BACKEND_UNAVAILABLE);
@@ -956,7 +1081,7 @@ fn a_backend_without_reporting_refuses_it_and_advertises_no_reporting() {
         record["message"]
             .as_str()
             .expect("the message")
-            .contains("`reporting`"),
+            .contains("`mux.report`"),
         "{record}"
     );
     assert_eq!(record["effects"], json!([]));
@@ -975,7 +1100,7 @@ fn a_backend_report_refusal_is_recorded_as_refused() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
-    let refused = client.call("report", state_report("working"));
+    let refused = client.call("mux.report", state_report("working"));
     assert_eq!(result_record(&refused)["outcome"], "refused");
     assert_eq!(
         result_record(&refused)["category"],
@@ -998,7 +1123,7 @@ fn an_uncertain_report_stays_unknown_and_suppresses_the_target() {
     let mut client = Client::dial(daemon.path());
 
     let id = random_uuid();
-    let first = client.call_id(&id, "report", state_report("working"));
+    let first = client.call_id(&id, "mux.report", state_report("working"));
     assert_eq!(result_record(&first)["outcome"], "unknown");
     assert_eq!(
         result_record(&first)["category"],
@@ -1007,11 +1132,11 @@ fn an_uncertain_report_stays_unknown_and_suppresses_the_target() {
     assert_eq!(result_record(&first)["effects"], json!([]));
     assert_eq!(backend.reports_seen(), 1);
 
-    let replay = client.call_id(&id, "report", state_report("working"));
+    let replay = client.call_id(&id, "mux.report", state_report("working"));
     assert_eq!(replay, first);
     assert_eq!(backend.reports_seen(), 1);
 
-    let conflicting = client.call("report", state_report("idle"));
+    let conflicting = client.call("mux.report", state_report("idle"));
     assert_eq!(error_code(&conflicting), "refused");
     assert!(
         conflicting["error"]["message"]
@@ -1054,7 +1179,7 @@ fn the_wire_shapes_of_report_are_validated_before_dispatch() {
         json!({"request": {"kind": "state", "pane_id": "wA:p1", "source": "s", "agent": "a", "state": "idle"}, "extra": 1}),
     ];
     for params in cases {
-        let response = client.call("report", params.clone());
+        let response = client.call("mux.report", params.clone());
         assert_eq!(error_code(&response), "bad_params", "{params}: {response}");
     }
     assert_eq!(backend.reports_seen(), 0);
@@ -1183,6 +1308,49 @@ impl ProcessVerifier for MatchingVerifier {
             .then(|| self.identity.clone())
             .map(Some)
             .ok_or_else(|| "wrong pid".into())
+    }
+}
+
+/// The birth identity a test stages for one pid.
+fn staged_identity(pid: i32, start_ticks: u64) -> ProcessIdentity {
+    ProcessIdentity {
+        boot_id: "boot-test".into(),
+        pid,
+        start_ticks,
+    }
+}
+
+/// A verifier that confirms the identities it was handed and refuses every other
+/// pid.
+///
+/// A close reads two processes — the child's own claim and the backend's serving
+/// process — and staging them separately is what keeps one from answering for
+/// the other. Handing it another identity for a pid it already knows is how a
+/// test stages a process that has been replaced under a recycled pid.
+#[derive(Default)]
+struct StagedVerifier {
+    identities: Mutex<BTreeMap<i32, ProcessIdentity>>,
+}
+
+impl StagedVerifier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn staged(self: &Arc<Self>, identity: ProcessIdentity) {
+        self.identities
+            .lock()
+            .expect("staged identities")
+            .insert(identity.pid, identity);
+    }
+}
+
+impl ProcessVerifier for StagedVerifier {
+    fn inspect(&self, pid: i32) -> Result<Option<ProcessIdentity>, String> {
+        match self.identities.lock().expect("staged identities").get(&pid) {
+            Some(identity) => Ok(Some(identity.clone())),
+            None => Err(format!("pid {pid} is not staged")),
+        }
     }
 }
 
@@ -1488,6 +1656,75 @@ fn events_read_long_poll_expiry_validation_and_shutdown() {
         waiter.join().is_err(),
         "shutdown closes the waiting response stream"
     );
+}
+
+/// A bounded prefix resumes where it stopped: the cursor names the last event
+/// delivered, the head and the remaining count are separate facts, and nothing
+/// is skipped on the way to the end.
+#[test]
+fn a_bounded_event_read_resumes_without_skipping_events() {
+    let sandbox = Sandbox::new("events-cursor");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let incarnations = [
+        "3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b01",
+        "3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b02",
+        "3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b03",
+        "3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b04",
+        "3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b05",
+    ];
+    for incarnation in incarnations {
+        let registered = client.call("agent.register", registration_body(incarnation, None, None));
+        assert!(registered["result"]["registration"]["agent_id"].is_string());
+    }
+
+    let mut seen: Vec<u64> = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = client.call("events.read", json!({"after": after, "limit": 2}));
+        let events = page["result"]["events"].as_array().expect("events");
+        assert!(
+            !events.is_empty(),
+            "the journal has more to deliver: {page}"
+        );
+        for event in events {
+            seen.push(event["seq"].as_u64().expect("a sequence"));
+        }
+        let cursor = page["result"]["cursor"]["sequence"]
+            .as_u64()
+            .expect("a cursor");
+        assert_eq!(
+            cursor,
+            events.last().expect("an event")["seq"].as_u64().unwrap(),
+            "the cursor is the last event delivered: {page}"
+        );
+        assert_eq!(
+            page["result"]["tail"].as_u64().unwrap() > cursor,
+            page["result"]["more"] == json!(true),
+            "{page}"
+        );
+        after = cursor;
+        if page["result"]["more"] != json!(true) {
+            break;
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        incarnations.len(),
+        "every event was delivered once"
+    );
+    assert!(
+        seen.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "a resumed read skipped nothing: {seen:?}"
+    );
+
+    // At the head there is nothing to resume from: an empty read says so rather
+    // than reporting a position that does not exist.
+    let done = client.call("events.read", json!({"after": after}));
+    assert_eq!(done["result"]["events"], json!([]));
+    assert_eq!(done["result"]["more"], json!(false), "{done}");
+    assert_eq!(done["result"]["cursor"]["sequence"], json!(after));
+    daemon.stop();
 }
 
 #[test]
@@ -2238,7 +2475,7 @@ fn registering_with_token(client: &mut Client, incarnation: &str, token: &str) -
 fn spawned_edge(client: &mut Client, id: &str, parent: &str) -> Value {
     let response = client.call_id(
         id,
-        "spawn",
+        "spawn.create",
         spawn_params(parent, "/usr/bin/pi", &["--child"]),
     );
     assert_eq!(
@@ -2304,12 +2541,12 @@ fn ping_answers_the_version_backend_and_registry_capability_without_mux() {
     let sandbox = Sandbox::new("ping");
     let mut daemon = sandbox.daemon();
     let mut client = Client::dial(daemon.path());
-    let response = client.call("ping", json!({}));
+    let response = client.call("daemon.ping", json!({}));
     assert_eq!(response["result"]["protocol"], PROTOCOL_VERSION);
     assert_eq!(response["result"]["backend"], "none");
     assert_eq!(response["result"]["capabilities"], advertised(&[]));
     let unsupported = client.call(
-        "child.close",
+        "spawn.close",
         json!({
             "spawn_request_id": FIRST_EDGE,
             "source": "herdsman",
@@ -2346,32 +2583,33 @@ fn real_socket_serves_normalized_observation_and_focus_once() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
-    let ping = client.call("ping", json!({}));
-    assert_eq!(ping["result"]["backend"], "runtime");
+    let ping = client.call("daemon.ping", json!({}));
+    assert_eq!(ping["result"]["backend"], "fake");
+    assert_eq!(ping["result"]["instance"], Value::Null);
     assert_eq!(
         ping["result"]["capabilities"],
-        advertised(&["observe", "process_info", "focus"])
+        advertised(&["mux.observe", "mux.process_info", "mux.focus"])
     );
-    let observed = client.call("observe", json!({}));
+    let observed = client.call("mux.observe", json!({}));
     assert_eq!(
         observed["result"]["inventory"]["workspaces"][0]["workspace_id"],
         "wA"
     );
     assert!(observed["result"]["inventory"].get("raw").is_none());
-    let process = client.call("process_info", json!({"pane_id":"wA:p1"}));
+    let process = client.call("mux.process_info", json!({"pane_id":"wA:p1"}));
     assert_eq!(process["result"]["evidence"]["kind"], "non_shell");
     assert_eq!(process["result"]["evidence"]["pid"], 200);
 
     let id = random_uuid();
     let request = json!({"target":"wA:p1","target_kind":"pane"});
-    let first = client.call_id(&id, "focus", request.clone());
+    let first = client.call_id(&id, "mux.focus", request.clone());
     assert!(first.get("result").is_some(), "{first}");
     assert_eq!(result_record(&first)["outcome"], "completed");
-    let retry = client.call_id(&id, "focus", request.clone());
+    let retry = client.call_id(&id, "mux.focus", request.clone());
     assert_eq!(result_record(&retry)["id"], id);
     let changed = client.call_id(
         &id,
-        "focus",
+        "mux.focus",
         json!({"target":"wA:p1","target_kind":"workspace"}),
     );
     assert_eq!(error_code(&changed), "refused");
@@ -2392,7 +2630,7 @@ fn an_explicit_backend_focus_refusal_is_recorded_as_refused() {
     ));
     let mut daemon = sandbox.daemon_with(backend);
     let mut client = Client::dial(daemon.path());
-    let response = client.call("focus", json!({"target":"pane:1","target_kind":"pane"}));
+    let response = client.call("mux.focus", json!({"target":"pane:1","target_kind":"pane"}));
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(
         result_record(&response)["category"],
@@ -2408,7 +2646,8 @@ fn a_foreign_version_is_refused_and_the_connection_keeps_serving() {
     let mut client = Client::dial(daemon.path());
     let id = random_uuid();
 
-    client.send(&json!({"version": 7, "id": id, "method": "ping", "params": {}}).to_string());
+    client
+        .send(&json!({"version": 7, "id": id, "method": "daemon.ping", "params": {}}).to_string());
     let refused = client.read();
     assert_eq!(refused["id"], id);
     assert_eq!(error_code(&refused), "bad_version");
@@ -2422,11 +2661,76 @@ fn a_foreign_version_is_refused_and_the_connection_keeps_serving() {
 
     // A version that is missing rather than wrong is a malformed request, and
     // says so without pretending to know which version was meant.
-    client.send(&json!({"id": id, "method": "ping"}).to_string());
+    client.send(&json!({"id": id, "method": "daemon.ping"}).to_string());
     assert_eq!(error_code(&client.read()), "bad_request");
 
     // Neither refusal ended the connection.
-    assert_eq!(client.call("ping", json!({}))["result"]["protocol"], 1);
+    assert_eq!(
+        client.call("daemon.ping", json!({}))["result"]["protocol"],
+        PROTOCOL_VERSION
+    );
+    daemon.stop();
+}
+
+/// The first wire is refused rather than aliased: a version-1 client is told the
+/// version this daemon serves, and a name that version used performs nothing.
+#[test]
+fn the_version_one_wire_is_refused_without_aliases() {
+    let sandbox = Sandbox::new("wire-v1");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let id = random_uuid();
+    client.send(
+        &json!({"version": 1, "id": id, "method": "focus",
+            "params": {"target":"wA:p1","target_kind":"pane"}})
+        .to_string(),
+    );
+    let refused = client.read();
+    assert_eq!(refused["id"], id);
+    assert_eq!(error_code(&refused), "bad_version");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("serves 2"),
+        "the refusal names the version that is served: {refused}"
+    );
+
+    for removed in [
+        "ping",
+        "observe",
+        "process_info",
+        "output",
+        "focus",
+        "close",
+        "create",
+        "input",
+        "report",
+        "request",
+        "requests",
+        "spawn",
+        "child.close",
+    ] {
+        let refused = client.call(removed, json!({}));
+        assert_eq!(
+            error_code(&refused),
+            "unknown_method",
+            "{removed}: {refused}"
+        );
+    }
+
+    // No name above reached a backend, and none left a record to act on later.
+    assert!(backend.creates().is_empty());
+    assert!(backend.launches().is_empty());
+    assert_eq!(backend.reports_seen(), 0);
+    assert_eq!(edges_written(&sandbox.state()), 0);
+    let store = Store::open(&sandbox.state()).expect("the state");
+    assert!(
+        store.recent(10).expect("the records").is_empty(),
+        "a refused name is not an operation"
+    );
     daemon.stop();
 }
 
@@ -2443,7 +2747,10 @@ fn an_unknown_method_is_refused_and_the_connection_keeps_serving() {
             .expect("a message")
             .contains("close_everything")
     );
-    assert_eq!(client.call("ping", json!({}))["result"]["protocol"], 1);
+    assert_eq!(
+        client.call("daemon.ping", json!({}))["result"]["protocol"],
+        PROTOCOL_VERSION
+    );
     daemon.stop();
 }
 
@@ -2474,7 +2781,10 @@ fn malformed_and_oversized_lines_are_refused_without_ending_the_connection() {
         "{refused}"
     );
 
-    assert_eq!(client.call("ping", json!({}))["result"]["protocol"], 1);
+    assert_eq!(
+        client.call("daemon.ping", json!({}))["result"]["protocol"],
+        PROTOCOL_VERSION
+    );
     daemon.stop();
 }
 
@@ -2489,10 +2799,10 @@ fn an_operation_is_recorded_before_it_is_refused_and_outlives_the_daemon() {
     let id = random_uuid();
     let mut params = frozen_pane("pane:3");
     params["requester"] = json!("a test");
-    let response = client.call_id(&id, "close", params);
+    let response = client.call_id(&id, "mux.close", params);
     let record = result_record(&response);
     assert_eq!(record["id"], id);
-    assert_eq!(record["method"], "close");
+    assert_eq!(record["method"], "mux.close");
     assert_eq!(record["requester"], "a test");
     assert_eq!(record["target"], "pane:3");
     assert_eq!(record["state"], "completed");
@@ -2502,7 +2812,7 @@ fn an_operation_is_recorded_before_it_is_refused_and_outlives_the_daemon() {
         record["message"]
             .as_str()
             .expect("a message")
-            .contains("`close`"),
+            .contains("`mux.close`"),
         "{record}"
     );
     // Nothing ran, and the record is the account of that.
@@ -2512,11 +2822,11 @@ fn an_operation_is_recorded_before_it_is_refused_and_outlives_the_daemon() {
     assert!(record["completed_at"].is_string());
 
     // Readable through the protocol, by id.
-    let fetched = client.call("request", json!({"id": id}));
+    let fetched = client.call("mux.request.get", json!({"id": id}));
     assert_eq!(result_record(&fetched)["id"], id);
-    let missing = client.call("request", json!({"id": random_uuid()}));
+    let missing = client.call("mux.request.get", json!({"id": random_uuid()}));
     assert_eq!(error_code(&missing), "not_found");
-    let unnamed = client.call("request", json!({}));
+    let unnamed = client.call("mux.request.get", json!({}));
     assert_eq!(error_code(&unnamed), "bad_params");
 
     // Readable on disk by a store that was not the daemon's...
@@ -2531,7 +2841,7 @@ fn an_operation_is_recorded_before_it_is_refused_and_outlives_the_daemon() {
     daemon.stop();
     let mut reopened = sandbox.daemon();
     let mut client = Client::dial(reopened.path());
-    let fetched = client.call("request", json!({"id": id}));
+    let fetched = client.call("mux.request.get", json!({"id": id}));
     assert_eq!(result_record(&fetched)["outcome"], "refused");
     assert_eq!(
         result_record(&fetched)["completed_at"],
@@ -2548,26 +2858,26 @@ fn a_request_id_is_at_most_once_across_methods() {
     let mut daemon = sandbox.daemon();
     let mut client = Client::dial(daemon.path());
     let id = random_uuid();
-    let first = client.call_id(&id, "close", frozen_pane("pane:3"));
-    assert_eq!(result_record(&first)["method"], "close");
-    let same = client.call_id(&id, "close", frozen_pane("pane:3"));
-    assert_eq!(result_record(&same)["method"], "close");
+    let first = client.call_id(&id, "mux.close", frozen_pane("pane:3"));
+    assert_eq!(result_record(&first)["method"], "mux.close");
+    let same = client.call_id(&id, "mux.close", frozen_pane("pane:3"));
+    assert_eq!(result_record(&same)["method"], "mux.close");
     assert_eq!(result_record(&same)["params"], frozen_pane("pane:3"));
     let changed = client.call_id(
         &id,
-        "focus",
+        "mux.focus",
         json!({"target": "pane:4", "target_kind":"pane"}),
     );
     assert_eq!(error_code(&changed), "refused");
-    let stored = client.call("request", json!({"id": id}));
-    assert_eq!(result_record(&stored)["method"], "close");
+    let stored = client.call("mux.request.get", json!({"id": id}));
+    assert_eq!(result_record(&stored)["method"], "mux.close");
     assert_eq!(result_record(&stored)["target"], "pane:3");
     // Same id, same target, different contents: the occupant differs, so the
     // stored request does not describe this one.
     let mut changed_contents = frozen_pane("pane:3");
     changed_contents["request"]["identity"]["pane"]["occupant"] =
         json!({"name": "pi", "managed": false});
-    let reordered = client.call_id(&id, "close", changed_contents);
+    let reordered = client.call_id(&id, "mux.close", changed_contents);
     assert_eq!(error_code(&reordered), "refused");
     daemon.stop();
 }
@@ -2584,7 +2894,7 @@ fn a_second_request_for_an_unresolved_target_is_refused_as_in_flight() {
     let first = random_uuid();
     let held = RequestRecord::new(
         &first,
-        "close",
+        "mux.close",
         Some("radar".into()),
         Some("pane:9".into()),
         now_ms(),
@@ -2598,7 +2908,7 @@ fn a_second_request_for_an_unresolved_target_is_refused_as_in_flight() {
     let second = random_uuid();
     let refused = client.call_id(
         &second,
-        "focus",
+        "mux.focus",
         json!({"target": "pane:9", "target_kind":"pane"}),
     );
     assert_eq!(error_code(&refused), "refused");
@@ -2611,14 +2921,14 @@ fn a_second_request_for_an_unresolved_target_is_refused_as_in_flight() {
     );
 
     // Both records are readable, and the second says why it was refused.
-    let held_record = client.call("request", json!({"id": first}));
+    let held_record = client.call("mux.request.get", json!({"id": first}));
     assert_eq!(result_record(&held_record)["state"], "pending");
-    let refusal = client.call("request", json!({"id": second}));
+    let refusal = client.call("mux.request.get", json!({"id": second}));
     assert_eq!(result_record(&refusal)["outcome"], "refused");
     assert_eq!(result_record(&refusal)["category"], Category::IN_FLIGHT);
 
     // Another target is a different request, and is executed normally.
-    let other = client.call_id(&random_uuid(), "close", frozen_pane("pane:10"));
+    let other = client.call_id(&random_uuid(), "mux.close", frozen_pane("pane:10"));
     assert_eq!(
         result_record(&other)["category"],
         Category::BACKEND_UNAVAILABLE
@@ -2635,8 +2945,8 @@ fn the_mux_reads_are_errors_and_leave_no_record() {
     let mut daemon = sandbox.daemon();
     let mut client = Client::dial(daemon.path());
     for (method, params) in [
-        ("observe", json!({})),
-        ("process_info", json!({"pane_id":"pane:1"})),
+        ("mux.observe", json!({})),
+        ("mux.process_info", json!({"pane_id":"pane:1"})),
     ] {
         let refused = client.call(method, params);
         assert_eq!(error_code(&refused), "backend_unavailable");
@@ -2648,7 +2958,7 @@ fn the_mux_reads_are_errors_and_leave_no_record() {
             "{refused}"
         );
     }
-    let listed = client.call("requests", json!({}));
+    let listed = client.call("mux.request.list", json!({}));
     assert_eq!(listed["result"]["requests"], json!([]));
     daemon.stop();
 }
@@ -2666,7 +2976,7 @@ fn registry_and_resume_are_explicitly_unsupported() {
     assert_eq!(error_code(&listed), "unknown_method");
     let resume = client.call("resume", json!({}));
     assert_eq!(error_code(&resume), "unknown_method");
-    let requests = client.call("requests", json!({}));
+    let requests = client.call("mux.request.list", json!({}));
     assert_eq!(requests["result"]["requests"], json!([]));
     daemon.stop();
 }
@@ -2677,29 +2987,29 @@ fn requests_lists_the_newest_first_and_bounded() {
     let mut daemon = sandbox.daemon();
     let mut client = Client::dial(daemon.path());
     let older = random_uuid();
-    client.call_id(&older, "close", frozen_pane("pane:1"));
+    client.call_id(&older, "mux.close", frozen_pane("pane:1"));
     // A later record: the clock has to move for the order to be observable, and
     // a millisecond is the record's resolution.
     thread::sleep(Duration::from_millis(5));
     let newer = random_uuid();
     client.call_id(
         &newer,
-        "input",
+        "mux.input",
         json!({"request": {"pane_id": "pane:2", "payload": {"kind": "text", "text": "x"}}}),
     );
 
-    let listed = client.call("requests", json!({}));
+    let listed = client.call("mux.request.list", json!({}));
     let records = listed["result"]["requests"].as_array().expect("a list");
     assert_eq!(records.len(), 2);
     assert_eq!(records[0]["id"], newer);
     assert_eq!(records[1]["id"], older);
 
-    let bounded = client.call("requests", json!({"limit": 1}));
+    let bounded = client.call("mux.request.list", json!({"limit": 1}));
     let records = bounded["result"]["requests"].as_array().expect("a list");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["id"], newer);
 
-    let refused = client.call("requests", json!({"limit": "all of them"}));
+    let refused = client.call("mux.request.list", json!({"limit": "all of them"}));
     assert_eq!(error_code(&refused), "bad_params");
     daemon.stop();
 }
@@ -2780,7 +3090,10 @@ fn a_stale_socket_file_is_cleared_and_a_live_one_is_reported() {
 
     let mut daemon = sandbox.daemon();
     let mut client = Client::dial(daemon.path());
-    assert_eq!(client.call("ping", json!({}))["result"]["protocol"], 1);
+    assert_eq!(
+        client.call("daemon.ping", json!({}))["result"]["protocol"],
+        PROTOCOL_VERSION
+    );
 
     let refusal = match Daemon::bind_at(&sandbox.socket(), &sandbox.state()) {
         Err(refusal) => refusal,
@@ -2860,7 +3173,10 @@ fn the_daemon_subcommand_serves_prints_and_stops_cleanly_on_a_signal() {
 
         // The socket answers by the time the path is printed.
         let mut client = Client::dial(&socket);
-        assert_eq!(client.call("ping", json!({}))["result"]["protocol"], 1);
+        assert_eq!(
+            client.call("daemon.ping", json!({}))["result"]["protocol"],
+            PROTOCOL_VERSION
+        );
         // A record planted over one pane holds that target, so the input below is
         // refused in flight: the daemon writes a durable record under the state
         // path it was handed without asking any runtime to type anything.
@@ -2869,7 +3185,7 @@ fn the_daemon_subcommand_serves_prints_and_stops_cleanly_on_a_signal() {
         store
             .create(&RequestRecord::new(
                 &random_uuid(),
-                "input",
+                "mux.input",
                 None,
                 Some(pane.into()),
                 now_ms(),
@@ -2878,7 +3194,7 @@ fn the_daemon_subcommand_serves_prints_and_stops_cleanly_on_a_signal() {
         let id = random_uuid();
         let refused = client.call_id(
             &id,
-            "input",
+            "mux.input",
             json!({"request": {"pane_id": pane, "payload": {"kind": "text", "text": "x"}}}),
         );
         assert_eq!(error_code(&refused), "refused", "{name}: {refused}");
@@ -2996,7 +3312,7 @@ fn a_tmux_backend_serves_and_reports_a_server_that_is_not_running() {
     );
 
     let mut client = Client::dial(&socket);
-    let observed = client.call("observe", json!({}));
+    let observed = client.call("mux.observe", json!({}));
     assert_eq!(error_code(&observed), "backend_unavailable", "{observed}");
     // The adapter reaches one server and reads it: it neither starts tmux's
     // default server nor invents the one it was pointed at.
@@ -3005,8 +3321,8 @@ fn a_tmux_backend_serves_and_reports_a_server_that_is_not_running() {
         "the daemon created a tmux server for an observation"
     );
     assert_eq!(
-        client.call("ping", json!({}))["result"]["protocol"],
-        1,
+        client.call("daemon.ping", json!({}))["result"]["protocol"],
+        PROTOCOL_VERSION,
         "a backend that cannot observe still serves the daemon"
     );
 
@@ -3102,7 +3418,7 @@ fn a_tmux_backend_observes_the_server_it_was_given() {
     lines.next().expect("a greeting line").expect("a greeting");
 
     let mut client = Client::dial(&socket);
-    let observed = client.call("observe", json!({}));
+    let observed = client.call("mux.observe", json!({}));
     let inventory = &observed["result"]["inventory"];
     assert_eq!(
         inventory["workspaces"][0]["workspace_id"],
@@ -3128,7 +3444,7 @@ fn a_tmux_backend_observes_the_server_it_was_given() {
 }
 
 #[test]
-fn tmux_spawn_exit_persists_and_dead_child_close_is_refused() {
+fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
     let Some(server) = TmuxServer::start("tmux-spawn-exit") else {
         return;
     };
@@ -3144,14 +3460,16 @@ fn tmux_spawn_exit_persists_and_dead_child_close_is_refused() {
     lines.next().expect("greeting line").expect("greeting");
 
     let mut client = Client::dial(&socket);
-    let ping = client.call("ping", json!({}));
+    let ping = client.call("daemon.ping", json!({}));
+    assert_eq!(ping["result"]["backend"], "tmux", "{ping}");
+    assert_eq!(ping["result"]["instance"], json!(server.name), "{ping}");
     assert!(
         ping["result"]["capabilities"]
             .as_array()
-            .is_some_and(|capabilities| capabilities.contains(&json!("exit_observation_v1"))),
+            .is_some_and(|capabilities| capabilities.contains(&json!("mux.exit_observation"))),
         "{ping}"
     );
-    let observed = client.call("observe", json!({}));
+    let observed = client.call("mux.observe", json!({}));
     let parent_pane = observed["result"]["inventory"]["panes"][0]["location"]["pane_id"]
         .as_str()
         .expect("parent pane")
@@ -3159,7 +3477,7 @@ fn tmux_spawn_exit_persists_and_dead_child_close_is_refused() {
     let incarnation = PARENT_INCARNATION;
     let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let mut body = registration_body(incarnation, None, None);
-    body["location"] = json!({"backend":"runtime", "pane":parent_pane});
+    body["location"] = json!({"backend":"tmux", "pane":parent_pane});
     let registration = client.call("agent.register", body);
     let parent = agent_id(&registration);
     let context = client.call(
@@ -3175,79 +3493,39 @@ fn tmux_spawn_exit_persists_and_dead_child_close_is_refused() {
     assert!(context["result"].is_object(), "{context}");
     let facts_before = client.call("agent.get", json!({"agent_id":parent}));
 
-    let spawn_id = "d2c7e861-2f21-48f0-aaf0-cb2d1b4f1327";
-    let spawned = client.call_id(
-        spawn_id,
-        "spawn",
-        json!({"request": {
-            "parent": parent,
-            "parent_session_id": session,
-            "executable": "/bin/sh",
-            "argv": ["-c", "read -r _; exit 23"]
-        }}),
+    let (spawn_id, raw_pane, child_agent) = spawned_exiting_tmux_child(
+        &mut client,
+        &server,
+        &state,
+        &parent,
+        session,
+        CHILD_INCARNATION,
     );
-    assert!(spawned["result"].is_object(), "{spawned}");
-    let edge = recorded_edge(&state, spawn_id);
-    let token = edge["token"].as_str().expect("spawn token");
+    let edge = recorded_edge(&state, &spawn_id);
+    // The recorded coordinates name the backend and the server instance that
+    // produced them, so the same pane id elsewhere is a different pane.
+    assert_eq!(edge["location"]["backend"], "tmux", "{edge}");
+    assert_eq!(edge["location"]["instance"], json!(server.name), "{edge}");
     let child_pane = edge["location"]["pane"]
         .as_str()
         .expect("spawned pane")
         .to_string();
-    let raw_pane = child_pane.rsplit(':').next().expect("raw tmux pane");
-    let pid = server
-        .tmux(&["display-message", "-p", "-t", raw_pane, "#{pane_pid}"])
-        .trim()
-        .parse::<i32>()
-        .expect("child process pid");
-    let child_process = process_identity_from_proc(pid);
-    let mut child_registration = registration_body(CHILD_INCARNATION, Some(child_process), None);
-    child_registration["spawn_token"] = json!(token);
-    let child = client.call("agent.register", child_registration);
-    let child_agent = agent_id(&child);
     let child_facts_before = client.call("agent.get", json!({"agent_id":child_agent}));
-    let bound = client.call("spawn.get", json!({"request_id":spawn_id}));
-    assert_eq!(
-        bound["result"]["spawn"]["bound"]["agent_id"],
-        json!(child_agent)
-    );
-
-    // The direct tmux client releases the child's waiting shell only after its
-    // exact live process identity has been bound in the registry.
-    server.tmux(&["send-keys", "-t", raw_pane, "go", "Enter"]);
-    let mut topology = Value::Null;
-    for _ in 0..100 {
-        topology = client.call("spawn.get", json!({"request_id":spawn_id}));
-        if topology["result"]["spawn"]["exit_observation"]["code"] == json!(23) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let child_pane = topology["result"]["spawn"]["location"]["pane"]
-        .as_str()
-        .expect("spawn pane")
-        .to_string();
-    let output = client.call("output", json!({"pane_id":child_pane,"source":"recent"}));
-    assert!(
-        output["result"]["output"]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("Pane is dead (status 23")),
-        "{output}"
-    );
-    assert_eq!(
-        topology["result"]["spawn"]["exit_observation"]["state"],
-        json!("exited"),
-        "{topology}"
-    );
-    assert_eq!(
-        topology["result"]["spawn"]["exit_observation"]["code"],
-        json!(23),
-        "{topology}"
-    );
     let listed = client.call("spawn.list", json!({"limit":10}));
     assert_eq!(
         listed["result"]["spawns"][0]["exit_observation"]["code"],
         json!(23),
         "{listed}"
+    );
+    let output = client.call(
+        "mux.output",
+        json!({"pane_id":child_pane,"source":"recent"}),
+    );
+    assert!(
+        output["result"]["output"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Pane is dead (status 23")),
+        "{output}"
     );
     let facts_after = client.call("agent.get", json!({"agent_id":parent}));
     assert_eq!(
@@ -3259,32 +3537,68 @@ fn tmux_spawn_exit_persists_and_dead_child_close_is_refused() {
         facts_before["result"]["agent"]["assignment"]
     );
 
+    // A same-UID client can respawn a retained pane; while its command runs, there
+    // is a live occupant, so nothing here closes it whatever the edge recorded.
+    server.tmux(&["respawn-pane", "-k", "-t", &raw_pane, "sleep 300"]);
+    let respawn_id = random_uuid();
+    let respawned = client.call_id(
+        &respawn_id,
+        "spawn.close",
+        child_close_params(&spawn_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&respawned), "refused", "{respawned}");
+    assert!(
+        !closes_directory(&state)
+            .join(format!("{respawn_id}.json"))
+            .exists(),
+        "a live pane is not admitted for close on its recorded history"
+    );
+    assert!(
+        pane_ids(&server).contains(&raw_pane.to_string()),
+        "a refused close dispatches nothing"
+    );
+
+    // It exits again, so the pane is dead now while the edge still holds its
+    // recorded exit: the retained pane is cleaned up once, and the answer says
+    // exactly that — an observed pane-command exit and a pane cleanup, never a
+    // process exit.
+    server.tmux(&["respawn-pane", "-k", "-t", &raw_pane, "exit 23"]);
+    wait_until_pane_dead(&server, &raw_pane);
     let close_id = random_uuid();
     let close = client.call_id(
         &close_id,
-        "child.close",
-        json!({
-            "spawn_request_id": spawn_id,
-            "source": "test-publisher",
-            "incarnation": CHILD_INCARNATION,
-            "intent": "cancel"
-        }),
+        "spawn.close",
+        child_close_params(&spawn_id, "test-publisher", CHILD_INCARNATION),
     );
-    assert_eq!(error_code(&close), "refused", "{close}");
+    assert_eq!(
+        close["result"]["close"]["outcome"], "already_exited",
+        "{close}"
+    );
+    assert_eq!(close["result"]["close"]["intent"], "cancel", "{close}");
+    assert_eq!(
+        close["result"]["close"]["exit_observation"]["state"], "exited",
+        "{close}"
+    );
+    assert_eq!(
+        close["result"]["close"]["exit_observation"]["code"],
+        json!(23),
+        "{close}"
+    );
     assert!(
-        !closes_directory(&state)
-            .join(format!("{close_id}.json"))
-            .exists(),
-        "a dead pane without a live foreground identity is not admitted for close"
+        !pane_ids(&server).contains(&raw_pane.to_string()),
+        "the retained pane is gone: {:?}",
+        pane_ids(&server)
     );
     let child_facts_after = client.call("agent.get", json!({"agent_id":child_agent}));
     assert_eq!(
         child_facts_after["result"]["agent"]["execution"],
-        child_facts_before["result"]["agent"]["execution"]
+        child_facts_before["result"]["agent"]["execution"],
+        "a dead-pane close changes no execution fact"
     );
     assert_eq!(
         child_facts_after["result"]["agent"]["assignment"],
-        child_facts_before["result"]["agent"]["assignment"]
+        child_facts_before["result"]["agent"]["assignment"],
+        "a dead-pane close settles no assignment"
     );
 
     drop(client);
@@ -3295,6 +3609,14 @@ fn tmux_spawn_exit_persists_and_dead_child_close_is_refused() {
     let mut lines = BufReader::new(daemon.process.stdout.take().expect("stdout")).lines();
     lines.next().expect("greeting line").expect("greeting");
     let mut client = Client::dial(&socket);
+    // A restart replays the recorded close instead of closing anything again, and
+    // the edge still holds the exit that close rested on.
+    let replayed = client.call_id(
+        &close_id,
+        "spawn.close",
+        child_close_params(&spawn_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(replayed, close, "a restart re-dispatches no close");
     let restored = client.call("spawn.get", json!({"request_id":spawn_id}));
     assert_eq!(
         restored["result"]["spawn"]["exit_observation"]["code"],
@@ -3304,6 +3626,248 @@ fn tmux_spawn_exit_persists_and_dead_child_close_is_refused() {
     drop(client);
     let status = daemon.stop(libc::SIGTERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A tmux server restarted under the same name hands the same pane ids to panes
+/// that were never this daemon's, so an edge whose pane belonged to the server
+/// that has gone never cleans up the pane that now carries its id.
+#[test]
+fn a_tmux_pane_from_another_server_generation_is_never_closed() {
+    let Some(server) = TmuxServer::start("tmux-generation") else {
+        return;
+    };
+    let name = server.name.clone();
+    let sandbox = Sandbox::new("tmux-generation");
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    let backend = [
+        ("RADAR_CONTROL_BACKEND", "tmux"),
+        ("RADAR_TMUX_SERVER", name.as_str()),
+    ];
+    let mut daemon = DaemonChild::spawn_with(&socket, &state, &backend);
+    let mut lines = BufReader::new(daemon.process.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting line").expect("greeting");
+
+    let mut client = Client::dial(&socket);
+    let observed = client.call("mux.observe", json!({}));
+    let parent_pane = observed["result"]["inventory"]["panes"][0]["location"]["pane_id"]
+        .as_str()
+        .expect("parent pane")
+        .to_string();
+    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let mut body = registration_body(PARENT_INCARNATION, None, None);
+    body["location"] = json!({"backend":"tmux", "pane":parent_pane});
+    let parent = agent_id(&client.call("agent.register", body));
+    let context = client.call(
+        "agent.context",
+        json!({
+            "agent_id": parent,
+            "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
+            "sequence": 1,
+            "lease_ms": 10_000,
+            "context": {"session": session}
+        }),
+    );
+    assert!(context["result"].is_object(), "{context}");
+
+    let (stale_spawn, stale_pane, _child) = spawned_exiting_tmux_child(
+        &mut client,
+        &server,
+        &state,
+        &parent,
+        session,
+        CHILD_INCARNATION,
+    );
+    let stale_edge = recorded_edge(&state, &stale_spawn);
+    assert!(
+        stale_edge["instance"].is_object(),
+        "the edge records the instance that served its create: {stale_edge}"
+    );
+    assert_eq!(stale_edge["exit"]["code"], json!(23), "{stale_edge}");
+
+    // The generation that created the pane ends. A fresh server answers to the
+    // same name and hands out the same ids again.
+    server.tmux(&["kill-server"]);
+    drop(server);
+    let Some(server) = TmuxServer::start("tmux-generation") else {
+        return;
+    };
+    assert_eq!(server.name, name, "the replacement serves the same name");
+    server.tmux(&["split-window", "-d", "-t", "%0"]);
+    assert_eq!(
+        pane_ids(&server),
+        vec!["%0".to_string(), stale_pane.clone()],
+        "the fresh server reuses the recorded pane id"
+    );
+    // The very coordinates the edge recorded, with a dead pane in them that the
+    // daemon never created.
+    server.tmux(&[
+        "set-option",
+        "-p",
+        "-t",
+        &stale_pane,
+        "remain-on-exit",
+        "on",
+    ]);
+    server.tmux(&["respawn-pane", "-k", "-t", &stale_pane, "exit 17"]);
+    wait_until_pane_dead(&server, &stale_pane);
+
+    let close_id = random_uuid();
+    let refused = client.call_id(
+        &close_id,
+        "spawn.close",
+        child_close_params(&stale_spawn, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        "the backend instance serving now is not the one that created the recorded pane",
+        "{refused}"
+    );
+    assert!(
+        !closes_directory(&state)
+            .join(format!("{close_id}.json"))
+            .exists(),
+        "a pane from another server generation is refused before admission"
+    );
+    assert!(
+        pane_ids(&server).contains(&stale_pane),
+        "a refused close dispatches nothing: {:?}",
+        pane_ids(&server)
+    );
+
+    // A child of the server that is serving now is still a dead pane this daemon
+    // may clean up, so the fence refuses another generation rather than every
+    // dead pane.
+    let (fresh_spawn, fresh_pane, _child) = spawned_exiting_tmux_child(
+        &mut client,
+        &server,
+        &state,
+        &parent,
+        session,
+        OTHER_INCARNATION,
+    );
+    let fresh_close = random_uuid();
+    let closed = client.call_id(
+        &fresh_close,
+        "spawn.close",
+        child_close_params(&fresh_spawn, "test-publisher", OTHER_INCARNATION),
+    );
+    assert_eq!(
+        closed["result"]["close"]["outcome"], "already_exited",
+        "{closed}"
+    );
+    assert_eq!(
+        closed["result"]["close"]["exit_observation"]["code"],
+        json!(23),
+        "{closed}"
+    );
+    assert!(
+        !pane_ids(&server).contains(&fresh_pane),
+        "the dead pane of the serving instance is cleaned up"
+    );
+
+    drop(client);
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// The pane ids this disposable server reports.
+fn pane_ids(server: &TmuxServer) -> Vec<String> {
+    server
+        .tmux(&["list-panes", "-a", "-F", "#{pane_id}"])
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Spawns one managed child of `parent` in this daemon's tmux server, binds the
+/// child's own process identity with the token its launch carried, releases the
+/// child's waiting shell, and waits until its exit is a recorded fact of its
+/// edge. Returns the spawn request, the raw tmux pane, and the bound child.
+fn spawned_exiting_tmux_child(
+    client: &mut Client,
+    server: &TmuxServer,
+    state: &Path,
+    parent: &str,
+    session: &str,
+    incarnation: &str,
+) -> (String, String, String) {
+    let spawn_id = random_uuid();
+    let spawned = client.call_id(
+        &spawn_id,
+        "spawn.create",
+        json!({"request": {
+            "parent": parent,
+            "parent_session_id": session,
+            "executable": "/bin/sh",
+            "argv": ["-c", "read -r _; exit 23"]
+        }}),
+    );
+    assert!(spawned["result"].is_object(), "{spawned}");
+    let edge = recorded_edge(state, &spawn_id);
+    let token = edge["token"].as_str().expect("spawn token");
+    let raw_pane = edge["location"]["pane"]
+        .as_str()
+        .expect("spawned pane")
+        .rsplit(':')
+        .next()
+        .expect("raw tmux pane")
+        .to_string();
+    let pid = server
+        .tmux(&["display-message", "-p", "-t", &raw_pane, "#{pane_pid}"])
+        .trim()
+        .parse::<i32>()
+        .expect("child process pid");
+    let mut child_registration =
+        registration_body(incarnation, Some(process_identity_from_proc(pid)), None);
+    child_registration["spawn_token"] = json!(token);
+    let child_agent = agent_id(&client.call("agent.register", child_registration));
+    let bound = client.call("spawn.get", json!({"request_id":spawn_id}));
+    assert_eq!(
+        bound["result"]["spawn"]["bound"]["agent_id"],
+        json!(child_agent),
+        "{bound}"
+    );
+
+    // The direct tmux client releases the child's waiting shell only after its
+    // exact live process identity has been bound in the registry.
+    server.tmux(&["send-keys", "-t", &raw_pane, "go", "Enter"]);
+    let mut topology = Value::Null;
+    for _ in 0..100 {
+        topology = client.call("spawn.get", json!({"request_id":spawn_id}));
+        if topology["result"]["spawn"]["exit_observation"]["code"] == json!(23) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        topology["result"]["spawn"]["exit_observation"]["state"],
+        json!("exited"),
+        "{topology}"
+    );
+    assert_eq!(
+        topology["result"]["spawn"]["exit_observation"]["code"],
+        json!(23),
+        "{topology}"
+    );
+    (spawn_id, raw_pane, child_agent)
+}
+
+/// Waits, boundedly, until this server reports the pane dead, so a close is never
+/// asked about a pane whose command is still starting or still running.
+fn wait_until_pane_dead(server: &TmuxServer, raw_pane: &str) {
+    for _ in 0..200 {
+        let dead = server
+            .tmux(&["list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"])
+            .lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>() == [raw_pane, "1"]);
+        if dead {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("pane {raw_pane} never reported dead");
 }
 
 /// Where tmux keeps the socket of a server of `name`.
@@ -3332,12 +3896,12 @@ fn an_uncertain_focus_stays_unknown_and_suppresses_the_target() {
 
     let id = random_uuid();
     let request = json!({"target":"wA:p1","target_kind":"pane"});
-    let first = client.call_id(&id, "focus", request.clone());
+    let first = client.call_id(&id, "mux.focus", request.clone());
     assert_eq!(result_record(&first)["outcome"], "unknown");
     assert_eq!(result_record(&first)["state"], "completed");
 
     // The same id returns the same account; the backend is asked exactly once.
-    let retry = client.call_id(&id, "focus", request);
+    let retry = client.call_id(&id, "mux.focus", request);
     assert_eq!(result_record(&retry)["outcome"], "unknown");
     assert_eq!(
         result_record(&retry)["completed_at"],
@@ -3349,7 +3913,7 @@ fn an_uncertain_focus_stays_unknown_and_suppresses_the_target() {
     let other_id = random_uuid();
     let other = client.call_id(
         &other_id,
-        "focus",
+        "mux.focus",
         json!({"target":"wA:p1","target_kind":"pane"}),
     );
     assert_eq!(error_code(&other), "refused");
@@ -3360,7 +3924,7 @@ fn an_uncertain_focus_stays_unknown_and_suppresses_the_target() {
             .contains(&id),
         "{other}"
     );
-    let refused = client.call("request", json!({"id": other_id}));
+    let refused = client.call("mux.request.get", json!({"id": other_id}));
     assert_eq!(result_record(&refused)["category"], Category::IN_FLIGHT);
     assert_eq!(backend.focused.lock().unwrap().len(), 1);
     daemon.stop();
@@ -3384,7 +3948,7 @@ fn a_started_record_is_visible_and_reads_stay_responsive_before_dispatch() {
     let id = random_uuid();
     blocker.send(&request_line(
         &id,
-        "focus",
+        "mux.focus",
         json!({"target":"wA:p1","target_kind":"pane"}),
     ));
     // Blocks until the request has reached the backend, which is after the
@@ -3393,8 +3957,13 @@ fn a_started_record_is_visible_and_reads_stay_responsive_before_dispatch() {
 
     // A second connection is served while the first waits on the backend.
     let mut reader = Client::dial(daemon.path());
-    assert!(reader.call("observe", json!({})).get("result").is_some());
-    let started = reader.call("request", json!({"id": id}));
+    assert!(
+        reader
+            .call("mux.observe", json!({}))
+            .get("result")
+            .is_some()
+    );
+    let started = reader.call("mux.request.get", json!({"id": id}));
     assert_eq!(result_record(&started)["state"], "started");
     assert!(result_record(&started)["outcome"].is_null());
 
@@ -3465,7 +4034,7 @@ fn stopping_the_daemon_cancels_an_in_flight_focus_into_a_durable_unknown() {
     let id = random_uuid();
     client.send(&request_line(
         &id,
-        "focus",
+        "mux.focus",
         json!({"target":"wA:p1","target_kind":"pane"}),
     ));
     rendezvous.entered();
@@ -3497,7 +4066,7 @@ fn a_managed_pane_close_is_refused_before_the_backend_is_asked() {
     let mut client = Client::dial(daemon.path());
 
     let target = CloseTarget::Pane("wA:p1".into());
-    let response = client.call("close", frozen_from(&inventory, target.clone()));
+    let response = client.call("mux.close", frozen_from(&inventory, target.clone()));
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(
         result_record(&response)["category"],
@@ -3529,7 +4098,7 @@ fn a_tab_with_one_managed_member_is_refused_whole() {
     let mut client = Client::dial(daemon.path());
 
     let target = CloseTarget::Tab("wA:t1".into());
-    let response = client.call("close", frozen_from(&inventory, target.clone()));
+    let response = client.call("mux.close", frozen_from(&inventory, target.clone()));
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(result_record(&response)["target"], "wA:t1");
     assert!(
@@ -3558,7 +4127,7 @@ fn a_replaced_occupant_is_refused_as_changed() {
     let mut client = Client::dial(daemon.path());
 
     let target = CloseTarget::Pane("wA:p1".into());
-    let response = client.call("close", frozen_from(&confirmed, target.clone()));
+    let response = client.call("mux.close", frozen_from(&confirmed, target.clone()));
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(
         result_record(&response)["message"],
@@ -3585,7 +4154,7 @@ fn an_unreadable_inventory_refuses_the_close() {
 
     let target = CloseTarget::Pane("wA:p1".into());
     let frozen = frozen_pane("wA:p1");
-    let response = client.call("close", frozen);
+    let response = client.call("mux.close", frozen);
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(
         result_record(&response)["category"],
@@ -3611,13 +4180,13 @@ fn an_unchanged_unmanaged_pane_closes_once() {
     let target = CloseTarget::Pane("wA:p1".into());
     let frozen = frozen_from(&inventory, target.clone());
     let id = random_uuid();
-    let first = client.call_id(&id, "close", frozen.clone());
+    let first = client.call_id(&id, "mux.close", frozen.clone());
     assert_eq!(result_record(&first)["outcome"], "completed");
     assert_eq!(result_record(&first)["effects"], json!(["close"]));
     assert_eq!(result_record(&first)["target"], "wA:p1");
     assert!(backend.told_to_close(&target), "the backend was not asked");
 
-    let retry = client.call_id(&id, "close", frozen);
+    let retry = client.call_id(&id, "mux.close", frozen);
     assert_eq!(
         result_record(&retry)["completed_at"],
         result_record(&first)["completed_at"],
@@ -3636,7 +4205,7 @@ fn an_unchanged_unmanaged_tab_closes_once() {
     let mut client = Client::dial(daemon.path());
 
     let target = CloseTarget::Tab("wA:t1".into());
-    let response = client.call("close", frozen_from(&inventory, target.clone()));
+    let response = client.call("mux.close", frozen_from(&inventory, target.clone()));
     assert_eq!(result_record(&response)["outcome"], "completed");
     assert_eq!(result_record(&response)["target"], "wA:t1");
     assert!(backend.told_to_close(&target), "the backend was not asked");
@@ -3660,20 +4229,24 @@ fn an_uncertain_close_stays_unknown_and_suppresses_the_target() {
     let target = CloseTarget::Pane("wA:p1".into());
     let frozen = frozen_from(&inventory, target.clone());
     let id = random_uuid();
-    let first = client.call_id(&id, "close", frozen.clone());
+    let first = client.call_id(&id, "mux.close", frozen.clone());
     assert_eq!(result_record(&first)["outcome"], "unknown");
     assert_eq!(result_record(&first)["state"], "completed");
 
-    let retry = client.call_id(&id, "close", frozen);
+    let retry = client.call_id(&id, "mux.close", frozen);
     assert_eq!(
         result_record(&retry)["completed_at"],
         result_record(&first)["completed_at"]
     );
 
     let other_id = random_uuid();
-    let other = client.call_id(&other_id, "close", frozen_from(&inventory, target.clone()));
+    let other = client.call_id(
+        &other_id,
+        "mux.close",
+        frozen_from(&inventory, target.clone()),
+    );
     assert_eq!(error_code(&other), "refused");
-    let refused = client.call("request", json!({"id": other_id}));
+    let refused = client.call("mux.request.get", json!({"id": other_id}));
     assert_eq!(result_record(&refused)["category"], Category::IN_FLIGHT);
     assert_eq!(backend.closed.lock().unwrap().len(), 1);
     daemon.stop();
@@ -3697,7 +4270,7 @@ fn stopping_the_daemon_cancels_an_in_flight_close_into_a_durable_unknown() {
     let id = random_uuid();
     client.send(&request_line(
         &id,
-        "close",
+        "mux.close",
         frozen_from(&inventory, CloseTarget::Pane("wA:p1".into())),
     ));
     rendezvous.entered();
@@ -3730,45 +4303,37 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
     let mut unsupported = spawn_params(&parent, "/usr/bin/pi", &[]);
     unsupported["request"]["cwd"] = json!("/private");
-    assert_eq!(error_code(&client.call("spawn", unsupported)), "bad_params");
+    assert_eq!(
+        error_code(&client.call("spawn.create", unsupported)),
+        "bad_params"
+    );
     assert!(backend.creates().is_empty());
     assert!(backend.launches().is_empty());
     assert_eq!(edges_written(&sandbox.state()), 0);
 
-    let ping = client.call("ping", json!({}));
+    let ping = client.call("daemon.ping", json!({}));
     assert_eq!(
         ping["result"]["capabilities"],
         advertised(MUX_CAPABILITIES),
         "a backend that does not implement launch advertises only its actual capabilities"
     );
-    let duplicate = [
-        "observe",
-        "process_info",
-        "creation",
-        "input",
-        "output",
-        "reporting",
-        "child_launch_context_v1",
-        "child_launch_context_v1",
-    ];
-    let ping_again = client.call("ping", json!({}));
-    let advertised_caps = ping_again["result"]["capabilities"].as_array().unwrap();
+    let ping_again = client.call("daemon.ping", json!({}));
     assert_eq!(
-        advertised_caps
-            .iter()
-            .filter(|cap| cap.as_str() == Some("child_launch_context_v1"))
-            .count(),
-        0
+        ping_again["result"]["capabilities"], ping["result"]["capabilities"],
+        "a refused spawn changes nothing that is advertised"
     );
-    assert_eq!(
-        advertised_caps,
-        &advertised(&duplicate).as_array().unwrap().clone()
+    assert!(
+        !ping_again["result"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .contains(&json!("spawn.launch_context.v1")),
+        "a backend that cannot launch earns no launch-context contract: {ping_again}"
     );
-    let refusal = Operation::readiness("spawn", "launch", backend.capabilities)
+    let refusal = Operation::readiness("spawn.create", "mux.launch", backend.capabilities)
         .expect_err("launch is not implemented by this backend");
     assert_eq!(
         refusal,
-        "spawn needs the `launch` capability; this backend does not provide it"
+        "spawn.create needs the `mux.launch` capability; this backend does not provide it"
     );
     assert!(
         backend
@@ -3781,10 +4346,10 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
 
     // Other operations keep their own capability gates; they do not inherit
     // launch merely because a backend can create or accept terminal input.
-    assert!(Operation::readiness("create", "creation", backend.capabilities).is_ok());
-    assert!(Operation::readiness("input", "input", backend.capabilities).is_ok());
-    let no_launch = ["creation", "input"];
-    assert!(Operation::readiness("spawn", "launch", &no_launch).is_err());
+    assert!(Operation::readiness("mux.create", "mux.create", backend.capabilities).is_ok());
+    assert!(Operation::readiness("mux.input", "mux.input", backend.capabilities).is_ok());
+    let no_launch = ["mux.create", "mux.input"];
+    assert!(Operation::readiness("spawn.create", "mux.launch", &no_launch).is_err());
     daemon.stop();
 }
 
@@ -3802,10 +4367,10 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let mut params = spawn_params(&parent, "/usr/bin/pi", &["--child", "row one"]);
     params["request"]["cwd"] = json!("/work dir");
     params["request"]["env"] = json!({"SECRET": "PRIVATE_ENV_SENTINEL_8812"});
-    let response = client.call_id(&id, "spawn", params.clone());
+    let response = client.call_id(&id, "spawn.create", params.clone());
 
     let record = result_record(&response);
-    assert_eq!(record["method"], "spawn");
+    assert_eq!(record["method"], "spawn.create");
     assert_eq!(record["outcome"], "completed");
     // The record's target is the location the request changed: the pane the child
     // was created beside, so a competing mutation of it cannot run alongside.
@@ -3828,7 +4393,7 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     assert_eq!(spawn["launched"], "completed");
     assert_eq!(
         spawn["location"],
-        json!({"backend": "runtime", "pane": "wA:p2"})
+        json!({"backend": "fake", "pane": "wA:p2"})
     );
     assert!(
         spawn.get("bound").is_none(),
@@ -3871,21 +4436,21 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     // The token is the only thing that binds the edge to its child, so it is a
     // credential: it travels to the pane and appears in no answer.
     no_secret(&response, &token);
-    no_secret(&client.call("request", json!({"id": id})), &token);
+    no_secret(&client.call("mux.request.get", json!({"id": id})), &token);
 
     let secret = "PRIVATE_ENV_SENTINEL_8812";
-    let get = client.call("request", json!({"id": id}));
-    let list = client.call("requests", json!({"limit": 20}));
+    let get = client.call("mux.request.get", json!({"id": id}));
+    let list = client.call("mux.request.list", json!({"limit": 20}));
     no_secret(&get, secret);
     no_secret(&list, secret);
-    let replay = client.call_id(&id, "spawn", params.clone());
+    let replay = client.call_id(&id, "spawn.create", params.clone());
     no_secret(&replay, secret);
     assert_eq!(backend.creates().len(), 1);
     assert_eq!(backend.launches().len(), 1);
 
     let mut changed_env = params.clone();
     changed_env["request"]["env"]["SECRET"] = json!("DIFFERENT_PRIVATE_ENV");
-    let changed_env_response = client.call_id(&id, "spawn", changed_env);
+    let changed_env_response = client.call_id(&id, "spawn.create", changed_env);
     assert_eq!(error_code(&changed_env_response), "refused");
     no_secret(&changed_env_response, "DIFFERENT_PRIVATE_ENV");
     assert_eq!(backend.creates().len(), 1);
@@ -3894,7 +4459,7 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let mut changed = params.clone();
     changed["request"]["cwd"] = json!("/different");
     assert_eq!(
-        error_code(&client.call_id(&id, "spawn", changed)),
+        error_code(&client.call_id(&id, "spawn.create", changed)),
         "refused"
     );
     assert_eq!(backend.creates().len(), 1);
@@ -3934,7 +4499,11 @@ fn a_backend_without_launch_refuses_a_spawn_before_any_effect() {
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
 
     let id = random_uuid();
-    let response = client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let response = client.call_id(
+        &id,
+        "spawn.create",
+        spawn_params(&parent, "/usr/bin/pi", &[]),
+    );
     // The record is the answer: an operation this backend cannot serve is
     // refused in a record a client can read, not answered as a bare error.
     let record = result_record(&response);
@@ -3944,7 +4513,7 @@ fn a_backend_without_launch_refuses_a_spawn_before_any_effect() {
         record["message"]
             .as_str()
             .expect("a message")
-            .contains("the `launch` capability"),
+            .contains("the `mux.launch` capability"),
         "the refusal names what this backend cannot do: {response}"
     );
     assert_eq!(record["effects"], json!([]));
@@ -3962,12 +4531,12 @@ fn a_backend_without_launch_refuses_a_spawn_before_any_effect() {
     );
 
     // The refusal outlives the answer, and still claims no effect.
-    let recorded = client.call("request", json!({"id": id}));
+    let recorded = client.call("mux.request.get", json!({"id": id}));
     assert_eq!(result_record(&recorded)["outcome"], "refused");
 
     // Capability advertisement is unchanged: this backend implements what it
     // says it does, and its refusal adds nothing to it.
-    let ping = client.call("ping", json!({}));
+    let ping = client.call("daemon.ping", json!({}));
     assert_eq!(ping["result"]["capabilities"], advertised(MUX_CAPABILITIES));
     daemon.stop();
 }
@@ -3984,10 +4553,10 @@ fn a_replayed_spawn_request_id_answers_the_recorded_effects_once() {
 
     let id = random_uuid();
     let params = spawn_params(&parent, "/usr/bin/pi", &["--child"]);
-    let first = client.call_id(&id, "spawn", params.clone());
+    let first = client.call_id(&id, "spawn.create", params.clone());
     let written = fs::read(edge_path(&sandbox.state(), &id)).expect("the edge file");
 
-    let second = client.call_id(&id, "spawn", params.clone());
+    let second = client.call_id(&id, "spawn.create", params.clone());
     assert_eq!(
         second, first,
         "a replay is answered from the records the first attempt wrote"
@@ -4002,7 +4571,11 @@ fn a_replayed_spawn_request_id_answers_the_recorded_effects_once() {
 
     // The same id with different contents is a different request, and is refused
     // rather than served as a second effect.
-    let different = client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/other", &[]));
+    let different = client.call_id(
+        &id,
+        "spawn.create",
+        spawn_params(&parent, "/usr/bin/other", &[]),
+    );
     assert_eq!(error_code(&different), "refused");
     assert_eq!(backend.creates().len(), 1);
     assert_eq!(backend.launches().len(), 1);
@@ -4024,7 +4597,7 @@ fn a_refused_spawn_launch_leaves_the_created_pane_named() {
     let id = random_uuid();
     let mut params = spawn_params(&parent, "/usr/bin/pi", &[]);
     params["request"]["env"] = json!({"SECRET": "SECRET_VALUE"});
-    let response = client.call_id(&id, "spawn", params);
+    let response = client.call_id(&id, "spawn.create", params);
     let response_text = response.to_string();
     assert!(!response_text.contains("SECRET_VALUE"));
     assert!(!response_text.contains("secret-token"));
@@ -4035,10 +4608,10 @@ fn a_refused_spawn_launch_leaves_the_created_pane_named() {
     let record_text = record.to_string();
     assert!(!record_text.contains("SECRET_VALUE"));
     assert!(!record_text.contains("secret-token"));
-    let fetched = client.call("request", json!({"id": id}));
+    let fetched = client.call("mux.request.get", json!({"id": id}));
     no_secret(&fetched, "SECRET_VALUE");
     no_secret(&fetched, "secret-token");
-    let listed = client.call("requests", json!({"limit": 20}));
+    let listed = client.call("mux.request.list", json!({"limit": 20}));
     no_secret(&listed, "SECRET_VALUE");
     no_secret(&listed, "secret-token");
     assert_eq!(
@@ -4075,7 +4648,11 @@ fn an_unconfirmed_spawn_launch_reads_unknown_and_is_never_claimed_launched() {
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
 
     let id = random_uuid();
-    let response = client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let response = client.call_id(
+        &id,
+        "spawn.create",
+        spawn_params(&parent, "/usr/bin/pi", &[]),
+    );
     let record = result_record(&response);
     assert_eq!(record["outcome"], "unknown");
     assert_eq!(record["category"], "backend_unavailable");
@@ -4111,7 +4688,10 @@ fn a_spawn_without_a_parent_pane_is_refused_before_any_effect() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
-    let unknown = client.call("spawn", spawn_params(&random_uuid(), "/usr/bin/pi", &[]));
+    let unknown = client.call(
+        "spawn.create",
+        spawn_params(&random_uuid(), "/usr/bin/pi", &[]),
+    );
     assert_eq!(error_code(&unknown), "not_found");
     assert!(
         unknown["error"]["message"]
@@ -4131,7 +4711,10 @@ fn a_spawn_without_a_parent_pane_is_refused_before_any_effect() {
     let unlocatable = agent_id(&unlocatable);
     let context = client.call("agent.context", json!({"agent_id":unlocatable,"publisher":{"source":"test-publisher","incarnation":OTHER_INCARNATION},"sequence":1,"lease_ms":10000,"context":{"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}}));
     assert!(context.get("result").is_some());
-    let no_pane = client.call("spawn", spawn_params(&unlocatable, "/usr/bin/pi", &[]));
+    let no_pane = client.call(
+        "spawn.create",
+        spawn_params(&unlocatable, "/usr/bin/pi", &[]),
+    );
     assert_eq!(error_code(&no_pane), "refused");
     assert!(
         no_pane["error"]["message"]
@@ -4161,7 +4744,7 @@ fn spawn_refuses_missing_stale_null_and_mismatched_exact_parent_context_before_c
     );
     let parent = agent_id(&parent);
 
-    let missing = client.call("spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let missing = client.call("spawn.create", spawn_params(&parent, "/usr/bin/pi", &[]));
     assert_eq!(error_code(&missing), "refused");
     assert!(edges_written(&sandbox.state()) == 0);
 
@@ -4186,14 +4769,14 @@ fn spawn_refuses_missing_stale_null_and_mismatched_exact_parent_context_before_c
             published.get("result").is_some(),
             "context rejected: {published}"
         );
-        let refused = client.call("spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+        let refused = client.call("spawn.create", spawn_params(&parent, "/usr/bin/pi", &[]));
         assert_eq!(error_code(&refused), "refused", "{label}: {refused}");
         assert_eq!(backend.creates().len(), 0);
         assert_eq!(edges_written(&sandbox.state()), 0);
     }
     publish(&mut client, 3, json!(SESSION));
     thread::sleep(Duration::from_millis(1100));
-    let stale = client.call("spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let stale = client.call("spawn.create", spawn_params(&parent, "/usr/bin/pi", &[]));
     assert_eq!(error_code(&stale), "refused");
     assert_eq!(backend.creates().len(), 0);
     assert_eq!(edges_written(&sandbox.state()), 0);
@@ -4264,7 +4847,7 @@ fn the_wire_shapes_of_spawn_are_validated_before_dispatch() {
         ),
     ];
     for (case, params, expected) in cases {
-        let response = client.call("spawn", params);
+        let response = client.call("spawn.create", params);
         assert_eq!(error_code(&response), "bad_params", "{case}: {response}");
         assert!(
             !response.to_string().contains("WIRE_SECRET_SENTINEL"),
@@ -4311,7 +4894,11 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
     // Create the edge through the real socket path; then bind the child process claim.
-    let spawned = client.call_id(&edge_id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let spawned = client.call_id(
+        &edge_id,
+        "spawn.create",
+        spawn_params(&parent, "/usr/bin/pi", &[]),
+    );
     assert_eq!(result_record(&spawned)["outcome"], "completed");
     let edge = recorded_edge(&sandbox.state(), &edge_id);
     let token = edge["token"]
@@ -4331,7 +4918,7 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
     let close_id = random_uuid();
     let first = client.call_id(
         &close_id,
-        "child.close",
+        "spawn.close",
         child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
     );
     assert_eq!(first["result"]["close"]["outcome"], "completed", "{first}");
@@ -4360,7 +4947,7 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
     // and the edge, its binding and the child's registration read as they did.
     let replay = client.call_id(
         &close_id,
-        "child.close",
+        "spawn.close",
         child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
     );
     assert_eq!(
@@ -4387,7 +4974,7 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
         registration["result"]["agent"],
         "a close rewrites no registration of the child it closed"
     );
-    let ping = client.call("ping", json!({}));
+    let ping = client.call("daemon.ping", json!({}));
     assert!(
         !ping["result"]["capabilities"]
             .as_array()
@@ -4425,7 +5012,11 @@ fn child_close_persists_a_backend_refusal_and_replays_it_without_dispatching() {
     .expect("daemon");
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
-    let spawned = client.call_id(&edge_id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+    let spawned = client.call_id(
+        &edge_id,
+        "spawn.create",
+        spawn_params(&parent, "/usr/bin/pi", &[]),
+    );
     assert_eq!(result_record(&spawned)["outcome"], "completed");
     let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
         .as_str()
@@ -4436,7 +5027,7 @@ fn child_close_persists_a_backend_refusal_and_replays_it_without_dispatching() {
     let close_id = random_uuid();
     let refused = client.call_id(
         &close_id,
-        "child.close",
+        "spawn.close",
         child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
     );
     assert_eq!(error_code(&refused), "refused", "{refused}");
@@ -4452,7 +5043,7 @@ fn child_close_persists_a_backend_refusal_and_replays_it_without_dispatching() {
     assert_eq!(record["message"], "no such pane");
     let replay = client.call_id(
         &close_id,
-        "child.close",
+        "spawn.close",
         child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
     );
     assert_eq!(error_code(&replay), "refused", "{replay}");
@@ -4467,7 +5058,7 @@ fn child_close_persists_a_backend_refusal_and_replays_it_without_dispatching() {
     // refused, and the recorded refusal stands.
     let conflict = client.call_id(
         &close_id,
-        "child.close",
+        "spawn.close",
         json!({
             "spawn_request_id": &edge_id,
             "source": "test-publisher",
@@ -4518,7 +5109,11 @@ fn a_restarted_daemon_reads_the_recorded_close_outcome_without_dispatching() {
         .expect("daemon");
         let mut client = Client::dial(daemon.path());
         let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
-        let spawned = client.call_id(&edge_id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+        let spawned = client.call_id(
+            &edge_id,
+            "spawn.create",
+            spawn_params(&parent, "/usr/bin/pi", &[]),
+        );
         assert_eq!(result_record(&spawned)["outcome"], "completed");
         let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
             .as_str()
@@ -4528,10 +5123,12 @@ fn a_restarted_daemon_reads_the_recorded_close_outcome_without_dispatching() {
 
         let lost = client.call_id(
             &close_id,
-            "child.close",
+            "spawn.close",
             child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
         );
-        assert_eq!(error_code(&lost), "backend_unavailable", "{lost}");
+        // An unconfirmed dispatch is its own word: `outcome_unknown`, never the
+        // `backend_unavailable` a caller reads as "nothing was dispatched".
+        assert_eq!(error_code(&lost), "outcome_unknown", "{lost}");
         assert_eq!(lost["error"]["message"], "the reply was lost", "{lost}");
         assert_eq!(
             backend.closed_targets(),
@@ -4560,10 +5157,10 @@ fn a_restarted_daemon_reads_the_recorded_close_outcome_without_dispatching() {
     let mut client = Client::dial(restarted.path());
     let replay = client.call_id(
         &close_id,
-        "child.close",
+        "spawn.close",
         child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
     );
-    assert_eq!(error_code(&replay), "backend_unavailable", "{replay}");
+    assert_eq!(error_code(&replay), "outcome_unknown", "{replay}");
     assert_eq!(replay["error"]["message"], "the reply was lost", "{replay}");
     assert!(
         backend.closed_targets().is_empty(),
@@ -4645,7 +5242,11 @@ fn child_close_refuses_foreground_and_containment_mismatches_without_recording()
         .expect("daemon");
         let mut client = Client::dial(daemon.path());
         let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
-        client.call_id(&id, "spawn", spawn_params(&parent, "/usr/bin/pi", &[]));
+        client.call_id(
+            &id,
+            "spawn.create",
+            spawn_params(&parent, "/usr/bin/pi", &[]),
+        );
         let token = recorded_edge(&sandbox.state(), &id)["token"]
             .as_str()
             .unwrap()
@@ -4654,7 +5255,7 @@ fn child_close_refuses_foreground_and_containment_mismatches_without_recording()
         let close_id = random_uuid();
         let response = client.call_id(
             &close_id,
-            "child.close",
+            "spawn.close",
             child_close_params(&id, "test-publisher", CHILD_INCARNATION),
         );
         assert!(
@@ -4669,6 +5270,492 @@ fn child_close_refuses_foreground_and_containment_mismatches_without_recording()
         assert!(backend.closed_targets().is_empty());
         daemon.stop();
     }
+}
+
+/// A retained pane is closed only from evidence read now *and* the exit this edge
+/// recorded: a dead report alone is not a close, and a recorded exit alone is
+/// history.
+#[test]
+fn a_dead_child_pane_closes_only_from_a_recorded_exit_and_a_dead_report_now() {
+    let sandbox = Sandbox::new("dead-child-close");
+    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p2"]);
+    let verifier = stage_dead_pane(&backend, "wA:p2", Some(900));
+    let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier);
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let edge_id = random_uuid();
+    spawned_edge(&mut client, &edge_id, &parent);
+    let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
+        .as_str()
+        .expect("private spawn token")
+        .to_owned();
+    register_close_child(&mut client, &token, staged_identity(200, 400));
+
+    // The pane is dead now, but this edge never observed the exit: what happened
+    // to a pane is not established by the pane's state alone.
+    let unrecorded_id = random_uuid();
+    let unrecorded = client.call_id(
+        &unrecorded_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert!(unrecorded.get("error").is_some(), "{unrecorded}");
+    assert!(
+        !closes_directory(&sandbox.state())
+            .join(format!("{unrecorded_id}.json"))
+            .exists()
+    );
+    assert!(backend.closed_targets().is_empty());
+
+    // The read that observes the exit records it on the edge. A pane running
+    // again — a same-UID respawn, which tmux permits — is not a dead pane to
+    // clean up however recorded its earlier exit is.
+    let topology = client.call("spawn.get", json!({"request_id": edge_id}));
+    assert_eq!(
+        topology["result"]["spawn"]["exit_observation"]["code"],
+        json!(23),
+        "{topology}"
+    );
+    backend.reporting_exit("wA:p2", PaneExitObservation::Running);
+    let running_id = random_uuid();
+    let running = client.call_id(
+        &running_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert!(running.get("error").is_some(), "{running}");
+    assert!(backend.closed_targets().is_empty());
+
+    // Dead now, with the recorded exit: the retained pane is cleaned up once. The
+    // answer carries the exit the edge recorded, which a later report of the same
+    // pane's state does not rewrite.
+    backend.reporting_exit(
+        "wA:p2",
+        PaneExitObservation::Exited {
+            code: Some(17),
+            signal: None,
+        },
+    );
+    let close_id = random_uuid();
+    let closed = client.call_id(
+        &close_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(
+        closed["result"]["close"]["outcome"], "already_exited",
+        "{closed}"
+    );
+    assert_eq!(
+        closed["result"]["close"]["exit_observation"]["state"], "exited",
+        "{closed}"
+    );
+    assert_eq!(
+        closed["result"]["close"]["exit_observation"]["code"],
+        json!(23),
+        "{closed}"
+    );
+    assert_eq!(
+        backend.closed_targets(),
+        vec![CloseTarget::Pane("wA:p2".into())]
+    );
+
+    // The same request id is answered from the record rather than closed twice.
+    let replay = client.call_id(
+        &close_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(replay, closed);
+    assert_eq!(backend.closed_targets().len(), 1);
+    daemon.stop();
+}
+
+/// A pane the daemon cannot establish now is not established by dead history: an
+/// unreadable inventory and a pane absent from it both refuse before recording.
+#[test]
+fn a_close_refuses_before_recording_when_the_pane_cannot_be_established_now() {
+    let sandbox = Sandbox::new("dead-child-close-evidence");
+    let process = ProcessIdentity {
+        boot_id: "boot-test".into(),
+        pid: 200,
+        start_ticks: 400,
+    };
+    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p2"]);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let edge_id = random_uuid();
+    spawned_edge(&mut client, &edge_id, &parent);
+    let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
+        .as_str()
+        .expect("private spawn token")
+        .to_owned();
+    register_close_child(&mut client, &token, process);
+    backend.reporting_exit(
+        "wA:p2",
+        PaneExitObservation::Exited {
+            code: Some(23),
+            signal: None,
+        },
+    );
+
+    backend.refusing_inventory("tmux is gone");
+    let unreadable_id = random_uuid();
+    let unreadable = client.call_id(
+        &unreadable_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(
+        error_code(&unreadable),
+        "backend_unavailable",
+        "{unreadable}"
+    );
+    assert!(
+        !closes_directory(&sandbox.state())
+            .join(format!("{unreadable_id}.json"))
+            .exists()
+    );
+    assert!(backend.closed_targets().is_empty());
+    drop(client);
+    daemon.stop();
+
+    // The same recorded edge and child, read by a daemon whose inventory does not
+    // hold the pane: the pane it would close is not there, so the dead-pane
+    // evidence is never reached and nothing is dispatched.
+    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p9"]);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    backend.reporting_exit(
+        "wA:p2",
+        PaneExitObservation::Exited {
+            code: Some(23),
+            signal: None,
+        },
+    );
+    let absent_id = random_uuid();
+    let absent = client.call_id(
+        &absent_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&absent), "refused", "{absent}");
+    assert!(
+        absent["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("absent from fresh inventory")),
+        "{absent}"
+    );
+    assert!(
+        !closes_directory(&sandbox.state())
+            .join(format!("{absent_id}.json"))
+            .exists()
+    );
+    assert!(backend.closed_targets().is_empty());
+    daemon.stop();
+}
+
+/// A dead pane whose close the backend refuses is a refusal, not a cleanup: the
+/// record holds no observation, and only a confirmed close may claim one.
+#[test]
+fn a_dead_pane_close_the_backend_refuses_is_not_reported_as_cleanup() {
+    let sandbox = Sandbox::new("dead-child-close-refused");
+    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES)
+        .observing(&["wA:p2"])
+        .closing(CloseAnswer::Refused("no such pane".into()));
+    let verifier = stage_dead_pane(&backend, "wA:p2", Some(900));
+    let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier);
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let edge_id = random_uuid();
+    spawned_edge(&mut client, &edge_id, &parent);
+    let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
+        .as_str()
+        .expect("private spawn token")
+        .to_owned();
+    register_close_child(&mut client, &token, staged_identity(200, 400));
+    let topology = client.call("spawn.get", json!({"request_id": edge_id}));
+    assert_eq!(
+        topology["result"]["spawn"]["exit_observation"]["state"], "exited",
+        "{topology}"
+    );
+
+    let close_id = random_uuid();
+    let refused = client.call_id(
+        &close_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+    assert_eq!(refused["error"]["message"], "no such pane", "{refused}");
+    assert_eq!(
+        backend.closed_targets(),
+        vec![CloseTarget::Pane("wA:p2".into())]
+    );
+    let record = close_record(&sandbox.state(), &close_id);
+    assert_eq!(record["outcome"], "refused", "{record}");
+    assert!(
+        record.get("exit").is_none(),
+        "a refused close observes nothing: {record}"
+    );
+    daemon.stop();
+}
+
+/// A pane id outlives the server that answered the create, so an edge that
+/// cannot name the instance it was created in never cleans one up: a legacy or
+/// unverifiable edge is unfenced, and the pane that now carries the id is not
+/// Radar's to close.
+#[test]
+fn a_dead_pane_close_refuses_when_the_edge_records_no_instance() {
+    let sandbox = Sandbox::new("dead-child-close-unfenced");
+    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p2"]);
+    // The backend names no serving process, so the create records no instance.
+    let verifier = stage_dead_pane(&backend, "wA:p2", None);
+    let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier);
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let edge_id = random_uuid();
+    spawned_edge(&mut client, &edge_id, &parent);
+    let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
+        .as_str()
+        .expect("private spawn token")
+        .to_owned();
+    register_close_child(&mut client, &token, staged_identity(200, 400));
+    let topology = client.call("spawn.get", json!({"request_id": edge_id}));
+    assert_eq!(
+        topology["result"]["spawn"]["exit_observation"]["code"],
+        json!(23),
+        "{topology}"
+    );
+    assert!(
+        recorded_edge(&sandbox.state(), &edge_id)
+            .get("instance")
+            .is_none(),
+        "no instance is inferred for an edge whose create recorded none"
+    );
+
+    let close_id = random_uuid();
+    let unfenced = client.call_id(
+        &close_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&unfenced), "refused", "{unfenced}");
+    assert_eq!(
+        unfenced["error"]["message"],
+        "the spawn edge records no verified backend instance for its pane",
+        "{unfenced}"
+    );
+    assert!(
+        !closes_directory(&sandbox.state())
+            .join(format!("{close_id}.json"))
+            .exists(),
+        "an unfenced pane is refused before admission"
+    );
+    assert!(backend.closed_targets().is_empty());
+    daemon.stop();
+}
+
+/// A server that has replaced the one that created a pane is not the instance
+/// this edge was recorded against, whatever pane id it hands out: the close
+/// refuses before it is admitted, and dispatches nothing.
+#[test]
+fn a_dead_pane_close_refuses_when_the_serving_instance_changed() {
+    let sandbox = Sandbox::new("dead-child-close-refenced");
+    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p2"]);
+    let verifier = stage_dead_pane(&backend, "wA:p2", Some(900));
+    let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let edge_id = random_uuid();
+    spawned_edge(&mut client, &edge_id, &parent);
+    let token = recorded_edge(&sandbox.state(), &edge_id)["token"]
+        .as_str()
+        .expect("private spawn token")
+        .to_owned();
+    register_close_child(&mut client, &token, staged_identity(200, 400));
+    let topology = client.call("spawn.get", json!({"request_id": edge_id}));
+    assert_eq!(
+        topology["result"]["spawn"]["exit_observation"]["code"],
+        json!(23),
+        "{topology}"
+    );
+    assert_eq!(
+        recorded_edge(&sandbox.state(), &edge_id)["instance"],
+        json!({"boot_id": "boot-test", "pid": 900, "start_ticks": 400}),
+        "the edge records the verified instance its create was served by"
+    );
+
+    // The same pid now names a different process: a server restarted under the
+    // name this daemon addresses reuses both the pid and the pane ids.
+    verifier.staged(staged_identity(900, 900));
+    let close_id = random_uuid();
+    let refenced = client.call_id(
+        &close_id,
+        "spawn.close",
+        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
+    );
+    assert_eq!(error_code(&refenced), "refused", "{refenced}");
+    assert_eq!(
+        refenced["error"]["message"],
+        "the backend instance serving now is not the one that created the recorded pane",
+        "{refenced}"
+    );
+    assert!(
+        !closes_directory(&sandbox.state())
+            .join(format!("{close_id}.json"))
+            .exists(),
+        "a pane from another instance is refused before admission"
+    );
+    assert!(backend.closed_targets().is_empty());
+    daemon.stop();
+}
+
+/// A creation-time verifier that stalls is abandoned at the deadline, on the same
+/// daemon-wide budget the close path uses: the spawn still answers, its edge
+/// records no instance, and requests past the bound start no work of their own.
+#[test]
+fn a_stalled_creation_verifier_is_abandoned_on_the_daemons_verification_budget() {
+    const STALL_BOUND: Duration = Duration::from_secs(6);
+    let sandbox = Sandbox::new("spawn-verifier-stall");
+    let verifier = Arc::new(GatedVerifier::new());
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p1", "wA:p2"]);
+    // The backend names a serving process, so a create asks the verifier about it
+    // — and this verifier never answers.
+    backend.served_by(900);
+    let mut daemon = Daemon::bind_with_backend_and_verifier(
+        &sandbox.socket(),
+        &sandbox.state(),
+        Some(backend.clone()),
+        verifier.clone(),
+    )
+    .expect("bind with a stalled verifier");
+    let mut client = Client::dial(daemon.path());
+    // One parent per stalled create: an operation on a target is refused while
+    // another on that target is in flight, so separate subjects are what makes
+    // these creates concurrent.
+    let parents = (1..=(MAX_VERIFICATION_JOBS + 1))
+        .map(|n| {
+            let incarnation = format!("3f1c7a2e-9d4b-4c58-9c7b-{n:012x}");
+            registered_parent(&mut client, &incarnation, &format!("wA:p{n}"))
+        })
+        .collect::<Vec<_>>();
+
+    let path = daemon.path().to_path_buf();
+    let stalls = parents[..MAX_VERIFICATION_JOBS]
+        .iter()
+        .map(|parent| {
+            let path = path.clone();
+            let parent = parent.clone();
+            thread::spawn(move || {
+                let mut client = Client::dial(&path);
+                let request = random_uuid();
+                let answer = client.call_id(
+                    &request,
+                    "spawn.create",
+                    spawn_params(&parent, "/usr/bin/pi", &[]),
+                );
+                (request, answer)
+            })
+        })
+        .collect::<Vec<_>>();
+    wait_for("the creation verifiers to hold the daemon's budget", || {
+        verifier.started() == MAX_VERIFICATION_JOBS
+    });
+    assert!(
+        client.call("daemon.ping", json!({}))["result"].is_object(),
+        "the daemon answers while every verifier slot is held"
+    );
+
+    // Every slot is held by a call that never returns, so a request past the bound
+    // is answered without starting another: the budget is the daemon's, not a
+    // per-request allowance, however many requests arrive.
+    let extra_id = random_uuid();
+    let extra_started = Instant::now();
+    let extra = client.call_id(
+        &extra_id,
+        "spawn.create",
+        spawn_params(&parents[MAX_VERIFICATION_JOBS], "/usr/bin/pi", &[]),
+    );
+    assert!(extra["result"].is_object(), "{extra}");
+    assert!(
+        extra_started.elapsed() < STALL_BOUND,
+        "a request past the bound waited for a slot: {:?}",
+        extra_started.elapsed()
+    );
+    assert_eq!(
+        verifier.started(),
+        MAX_VERIFICATION_JOBS,
+        "a request past the bound started another verifier"
+    );
+
+    // The stalled calls answer at their deadline rather than with the verifier:
+    // the create still runs, and the edge records no instance it could not verify.
+    let mut requests = vec![extra_id];
+    let abandoned = Instant::now();
+    for stall in stalls {
+        let (request, answer) = stall.join().expect("a stalled spawn answered");
+        assert!(answer["result"].is_object(), "{answer}");
+        requests.push(request);
+    }
+    assert!(
+        abandoned.elapsed() < STALL_BOUND,
+        "a stalled spawn was not abandoned at its deadline: {:?}",
+        abandoned.elapsed()
+    );
+    for request in requests {
+        let edge = recorded_edge(&sandbox.state(), &request);
+        assert!(
+            edge["location"]["pane"].is_string(),
+            "the create ran after an unverifiable capture: {edge}"
+        );
+        assert!(
+            edge.get("instance").is_none(),
+            "an unverifiable instance is never recorded: {edge}"
+        );
+    }
+    daemon.stop();
+    verifier.release_all();
+}
+
+/// Binds a daemon over this sandbox that confirms only the identities `verifier`
+/// was handed, so the processes a fence reads are staged one by one.
+fn daemon_with_staged_verifier(
+    sandbox: &Sandbox,
+    backend: Arc<MuxBackend>,
+    verifier: Arc<StagedVerifier>,
+) -> Daemon {
+    Daemon::bind_with_backend_and_verifier(
+        &sandbox.socket(),
+        &sandbox.state(),
+        Some(backend),
+        verifier,
+    )
+    .expect("bind the control socket with a staged verifier")
+}
+
+/// Stages the evidence a dead-pane close is fenced by: a reported exit for this
+/// pane and, when the test names one, the pid its backend claims serves it and
+/// the verifier that confirms it.
+fn stage_dead_pane(
+    backend: &Arc<MuxBackend>,
+    pane: &str,
+    server: Option<i32>,
+) -> Arc<StagedVerifier> {
+    backend.reporting_exit(
+        pane,
+        PaneExitObservation::Exited {
+            code: Some(23),
+            signal: None,
+        },
+    );
+    let verifier = StagedVerifier::new();
+    if let Some(pid) = server {
+        backend.served_by(pid);
+        verifier.staged(staged_identity(pid, 400));
+    }
+    verifier
 }
 
 #[test]
@@ -4893,7 +5980,7 @@ fn the_mux_primitives_are_served_and_recorded() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
-    let ping = client.call("ping", json!({}));
+    let ping = client.call("daemon.ping", json!({}));
     assert_eq!(ping["result"]["capabilities"], advertised(MUX_CAPABILITIES));
 
     let create_id = random_uuid();
@@ -4906,7 +5993,7 @@ fn the_mux_primitives_are_served_and_recorded() {
         },
         "requester": "test",
     });
-    let create = client.call_id(&create_id, "create", create_params.clone());
+    let create = client.call_id(&create_id, "mux.create", create_params.clone());
     let record = result_record(&create);
     assert_eq!(record["outcome"], "completed");
     assert_eq!(record["target"], "wA:p1");
@@ -4925,7 +6012,7 @@ fn the_mux_primitives_are_served_and_recorded() {
 
     // The same ID is answered from its record — identity included — and creates
     // nothing a second time.
-    let replay = client.call_id(&create_id, "create", create_params);
+    let replay = client.call_id(&create_id, "mux.create", create_params);
     assert_eq!(result_record(&replay), record);
     assert_eq!(
         backend
@@ -4937,7 +6024,7 @@ fn the_mux_primitives_are_served_and_recorded() {
     );
 
     let text = client.call(
-        "input",
+        "mux.input",
         json!({"request": {"pane_id": "wA:p1", "payload": {"kind": "text", "text": "ls\n"}}}),
     );
     assert_eq!(result_record(&text)["outcome"], "completed");
@@ -4945,7 +6032,7 @@ fn the_mux_primitives_are_served_and_recorded() {
     assert_eq!(result_record(&text)["effects"], json!(["sent text"]));
 
     let keys = client.call(
-        "input",
+        "mux.input",
         json!({
             "request": {
                 "pane_id": "wA:p1",
@@ -4967,7 +6054,7 @@ fn the_mux_primitives_are_served_and_recorded() {
     let id = random_uuid();
     let output = client.call_id(
         &id,
-        "output",
+        "mux.output",
         json!({"pane_id": "wA:p1", "source": "visible", "lines": 20}),
     );
     assert_eq!(output["result"]["output"]["text"], "hello\n");
@@ -4982,7 +6069,7 @@ fn the_mux_primitives_are_served_and_recorded() {
         }
     );
     // A read is not an operation: nothing about it is a durable record.
-    let missing = client.call("request", json!({"id": id}));
+    let missing = client.call("mux.request.get", json!({"id": id}));
     assert_eq!(error_code(&missing), "not_found");
     daemon.stop();
 }
@@ -4997,7 +6084,7 @@ fn a_create_that_named_nothing_carries_no_identity() {
     let mut client = Client::dial(daemon.path());
 
     let create = client.call(
-        "create",
+        "mux.create",
         json!({"request": {"kind": "workspace", "focus": false}}),
     );
     let record = result_record(&create);
@@ -5028,7 +6115,10 @@ fn an_oversized_output_read_is_cut_to_one_answer_line() {
     let mut daemon = sandbox.daemon_with(backend);
     let mut client = Client::dial(daemon.path());
 
-    let read = client.call("output", json!({"pane_id": "wA:p1", "source": "recent"}));
+    let read = client.call(
+        "mux.output",
+        json!({"pane_id": "wA:p1", "source": "recent"}),
+    );
     let text = read["result"]["output"]["text"]
         .as_str()
         .expect("the read text");
@@ -5048,14 +6138,14 @@ fn an_unimplemented_primitive_is_refused_without_dispatch() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
-    let ping = client.call("ping", json!({}));
+    let ping = client.call("daemon.ping", json!({}));
     assert_eq!(ping["result"]["capabilities"], advertised(&[]));
 
     // An operation this backend cannot serve leaves a settled refusal that names
     // the capability and claims no effect, not a request still claiming to be
     // started.
     let create = client.call(
-        "create",
+        "mux.create",
         json!({"request": {"kind": "workspace", "focus": false}}),
     );
     assert_eq!(result_record(&create)["outcome"], "refused");
@@ -5067,7 +6157,7 @@ fn an_unimplemented_primitive_is_refused_without_dispatch() {
         result_record(&create)["message"]
             .as_str()
             .expect("the message")
-            .contains("`creation`")
+            .contains("`mux.create`")
     );
     assert_eq!(result_record(&create)["effects"], json!([]));
     assert_eq!(result_record(&create)["state"], "completed");
@@ -5075,7 +6165,7 @@ fn an_unimplemented_primitive_is_refused_without_dispatch() {
     assert!(result_record(&create)["created"].is_null());
 
     let left = client.call(
-        "input",
+        "mux.input",
         json!({"request": {"pane_id": "wA:p1", "payload": {"kind": "text", "text": "x"}}}),
     );
     assert_eq!(result_record(&left)["outcome"], "refused");
@@ -5083,16 +6173,19 @@ fn an_unimplemented_primitive_is_refused_without_dispatch() {
         result_record(&left)["message"]
             .as_str()
             .expect("the message")
-            .contains("`input`")
+            .contains("`mux.input`")
     );
     // A read has no record, so its refusal is the whole answer.
-    let read = client.call("output", json!({"pane_id": "wA:p1", "source": "visible"}));
+    let read = client.call(
+        "mux.output",
+        json!({"pane_id": "wA:p1", "source": "visible"}),
+    );
     assert_eq!(error_code(&read), "backend_unavailable");
     assert!(
         read["error"]["message"]
             .as_str()
             .expect("the message")
-            .contains("`output`")
+            .contains("`mux.output`")
     );
     assert!(backend.created_requests.lock().expect("a read").is_empty());
     assert!(backend.input_requests.lock().expect("a read").is_empty());
@@ -5112,43 +6205,43 @@ fn the_wire_shapes_of_create_and_input_are_validated_before_dispatch() {
     let many_keys: Vec<String> = (0..17).map(|_| "enter".to_string()).collect();
     let cases = [
         (
-            "create",
+            "mux.create",
             json!({"request": {"kind": "nowhere", "focus": false}}),
         ),
         (
-            "create",
+            "mux.create",
             json!({"request": {"kind": "pane_split", "pane_id": "", "direction": "right", "focus": false}}),
         ),
         (
-            "create",
+            "mux.create",
             json!({"request": {"kind": "workspace", "focus": false}, "extra": 1}),
         ),
         (
-            "input",
+            "mux.input",
             json!({"request": {"pane_id": "", "payload": {"kind": "text", "text": "ls\n"}}}),
         ),
         (
-            "input",
+            "mux.input",
             json!({"request": {"pane_id": "wA:p1", "payload": {"kind": "text", "text": ""}}}),
         ),
         (
-            "input",
+            "mux.input",
             json!({"request": {"pane_id": "wA:p1", "payload": {"kind": "text", "text": "two\u{7}shapes"}}}),
         ),
         (
-            "input",
+            "mux.input",
             json!({"request": {"pane_id": "wA:p1", "payload": {"kind": "keys", "keys": []}}}),
         ),
         (
-            "input",
+            "mux.input",
             json!({"request": {"pane_id": "wA:p1", "payload": {"kind": "keys", "keys": many_keys}}}),
         ),
         (
-            "input",
+            "mux.input",
             json!({"request": {"pane_id": "wA:p1", "payload": {"kind": "keys", "keys": ["esc\u{1b}"]}}}),
         ),
         (
-            "output",
+            "mux.output",
             json!({"pane_id": "wA:p1", "source": "visible", "lines": 0}),
         ),
     ];
@@ -5177,7 +6270,7 @@ fn an_unscoped_create_suppresses_another_unscoped_mutation_but_not_a_pane_one() 
     let held = random_uuid();
     held_client.send(&request_line(
         &held,
-        "create",
+        "mux.create",
         json!({"request": {"kind": "workspace", "focus": false}}),
     ));
     rendezvous.entered();
@@ -5185,15 +6278,15 @@ fn an_unscoped_create_suppresses_another_unscoped_mutation_but_not_a_pane_one() 
     let second = random_uuid();
     let refused = other.call_id(
         &second,
-        "create",
+        "mux.create",
         json!({"request": {"kind": "workspace", "focus": false}}),
     );
     assert_eq!(error_code(&refused), "refused");
-    let record = other.call("request", json!({"id": second}));
+    let record = other.call("mux.request.get", json!({"id": second}));
     assert_eq!(result_record(&record)["category"], Category::IN_FLIGHT);
 
     let input = other.call(
-        "input",
+        "mux.input",
         json!({"request": {"pane_id": "wA:p1", "payload": {"kind": "text", "text": "hi"}}}),
     );
     assert_eq!(
@@ -5367,14 +6460,14 @@ fn wait_for_exit(child: &mut Child, deadline: Duration) -> ExitStatus {
 
 /// Every capability Radar's client can ask a daemon for.
 const CLIENT_CAPABILITIES: &[&str] = &[
-    "observe",
-    "process_info",
-    "focus",
-    "close",
-    "creation",
-    "input",
-    "output",
-    "reporting",
+    "mux.observe",
+    "mux.process_info",
+    "mux.focus",
+    "mux.close",
+    "mux.create",
+    "mux.input",
+    "mux.output",
+    "mux.report",
 ];
 
 /// The configuration that selects the daemon at `socket`.
@@ -5439,6 +6532,10 @@ impl ClientBackend {
 }
 
 impl RuntimeProvider for ClientBackend {
+    fn identity(&self) -> BackendIdentity {
+        BackendIdentity::named("fake")
+    }
+
     fn capabilities(&self) -> &'static [&'static str] {
         self.capabilities
     }
@@ -5562,7 +6659,8 @@ fn scripted_socket(
 fn scripted_ping(request: &Value) -> Value {
     json!({"id": request["id"], "result": {
         "protocol": PROTOCOL_VERSION,
-        "backend": "runtime",
+        "backend": "herdr",
+        "instance": null,
         "capabilities": CLIENT_CAPABILITIES,
     }})
 }
@@ -5587,8 +6685,8 @@ fn the_daemon_client_serves_every_method_over_a_real_socket() {
     let client = DaemonRuntime::handshake(daemon.path()).expect("the daemon is usable");
     let cancel = AtomicBool::new(false);
     assert_eq!(
-        client.capabilities(),
-        CLIENT_CAPABILITIES,
+        serde_json::to_value(client.capabilities()).expect("a capability list"),
+        advertised(CLIENT_CAPABILITIES),
         "the client is what the daemon declared"
     );
 
@@ -5671,19 +6769,25 @@ fn the_daemon_client_serves_every_method_over_a_real_socket() {
     // The reads left no record; the five effectful calls left one each, carrying
     // the params this client sent them with.
     let mut reader = Client::dial(daemon.path());
-    let listed = reader.call("requests", json!({}));
+    let listed = reader.call("mux.request.list", json!({}));
     let records = listed["result"]["requests"].as_array().expect("a list");
     let methods: Vec<&str> = records
         .iter()
         .filter_map(|record| record["method"].as_str())
         .collect();
     assert_eq!(methods.len(), 5, "{records:?}");
-    for recorded in ["focus", "close", "create", "input", "report"] {
+    for recorded in [
+        "mux.focus",
+        "mux.close",
+        "mux.create",
+        "mux.input",
+        "mux.report",
+    ] {
         assert!(methods.contains(&recorded), "{recorded} was not recorded");
     }
     let close = records
         .iter()
-        .find(|record| record["method"] == "close")
+        .find(|record| record["method"] == "mux.close")
         .expect("the close record");
     assert_eq!(close["target"], "wA:p1");
     assert_eq!(
@@ -5700,7 +6804,8 @@ fn the_daemon_client_serves_every_method_over_a_real_socket() {
 #[test]
 fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client() {
     let sandbox = Sandbox::new("client-missing-capability");
-    let backend = ClientBackend::new(&["observe", "process_info", "focus", "close"]);
+    let backend =
+        ClientBackend::new(&["mux.observe", "mux.process_info", "mux.focus", "mux.close"]);
     let mut daemon = sandbox.daemon_with(backend);
     let client = DaemonRuntime::handshake(daemon.path()).expect("the dashboard's needs are met");
     let cancel = AtomicBool::new(false);
@@ -5708,7 +6813,7 @@ fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client()
     let refused = client.create(&CreateRequest::Workspace { focus: false }, &cancel);
     match refused {
         CreateOutcome::Refused(message) => {
-            assert!(message.contains("`creation`"), "{message}");
+            assert!(message.contains("`mux.create`"), "{message}");
         }
         other => panic!("{other:?}"),
     }
@@ -5721,7 +6826,7 @@ fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client()
         },
         &cancel,
     ) {
-        InputOutcome::Refused(message) => assert!(message.contains("`input`"), "{message}"),
+        InputOutcome::Refused(message) => assert!(message.contains("`mux.input`"), "{message}"),
         other => panic!("{other:?}"),
     }
     match client.report(
@@ -5735,7 +6840,7 @@ fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client()
         }),
         &cancel,
     ) {
-        ReportOutcome::Refused(message) => assert!(message.contains("`reporting`"), "{message}"),
+        ReportOutcome::Refused(message) => assert!(message.contains("`mux.report`"), "{message}"),
         other => panic!("{other:?}"),
     }
     match client.output(
@@ -5747,7 +6852,7 @@ fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client()
         },
         &cancel,
     ) {
-        OutputOutcome::Refused(message) => assert!(message.contains("`output`"), "{message}"),
+        OutputOutcome::Refused(message) => assert!(message.contains("`mux.output`"), "{message}"),
         other => panic!("{other:?}"),
     }
     daemon.stop();
@@ -5844,7 +6949,7 @@ fn a_socket_path_radar_may_not_trust_is_refused_before_any_connection() {
 fn planted_daemon(root: &Path, name: &str, marker: PathBuf) -> PathBuf {
     scripted_socket(root, name, move |request| {
         let _ = fs::write(&marker, b"asked");
-        (scripted_method(request) == "ping").then(|| scripted_ping(request))
+        (scripted_method(request) == "daemon.ping").then(|| scripted_ping(request))
     })
 }
 
@@ -5853,14 +6958,14 @@ fn planted_daemon(root: &Path, name: &str, marker: PathBuf) -> PathBuf {
 #[test]
 fn an_incompatible_daemon_is_reported_and_not_used() {
     let sandbox = Sandbox::new("client-incompatible");
-    let backend = ClientBackend::new(&["observe", "process_info", "focus"]);
+    let backend = ClientBackend::new(&["mux.observe", "mux.process_info", "mux.focus"]);
     let mut daemon = sandbox.daemon_with(backend);
     let selection = select(&daemon_at(daemon.path()), recording_herdr(&sandbox.root));
 
     assert_eq!(selection.backend, "direct");
     let diagnostic = selection.diagnostic.expect("the fallback is reported once");
     assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
-    assert!(diagnostic.contains("`close`"), "{diagnostic}");
+    assert!(diagnostic.contains("`mux.close`"), "{diagnostic}");
     assert!(diagnostic.contains("direct Herdr"), "{diagnostic}");
     daemon.stop();
 }
@@ -5903,7 +7008,7 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
         &sandbox.root,
         "internal.sock",
         |request| match scripted_method(request) {
-            "ping" => Some(scripted_ping(request)),
+            "daemon.ping" => Some(scripted_ping(request)),
             _ => Some(json!({"id": request["id"], "error": {
                 "code": "internal",
                 "message": "the store is unreadable",
@@ -5914,12 +7019,38 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
     let outcome = client.focus_outcome(&Target::Pane("wA:p1".into()), &cancel);
     assert!(matches!(outcome, FocusOutcome::Unknown(_)), "{outcome:?}");
 
+    // `outcome_unknown` is the daemon's word for a dispatched request whose
+    // result is not confirmed. On the close path that must reach the caller as
+    // an unestablished effect: reading it as a refusal would license a retry of
+    // a close that may already have happened.
+    let inventory = serde_json::to_value(close_inventory("wA:t1", &[("wA:p1", None)]))
+        .expect("an inventory shape");
+    let uncertain =
+        scripted_socket(
+            &sandbox.root,
+            "outcome-unknown.sock",
+            move |request| match scripted_method(request) {
+                "daemon.ping" => Some(scripted_ping(request)),
+                "mux.observe" => Some(json!({
+                    "id": request["id"],
+                    "result": {"inventory": inventory.clone()},
+                })),
+                _ => Some(json!({"id": request["id"], "error": {
+                    "code": "outcome_unknown",
+                    "message": "managed child close outcome is unknown",
+                }})),
+            },
+        );
+    let client = DaemonRuntime::handshake(&uncertain).expect("a scripted daemon");
+    let outcome = client.close_outcome(&CloseTarget::Pane("wA:p1".into()), &cancel);
+    assert!(matches!(outcome, CloseOutcome::Unknown(_)), "{outcome:?}");
+
     // A connection that ends without an answer may have carried the request.
     let silent = scripted_socket(
         &sandbox.root,
         "silent.sock",
         |request| match scripted_method(request) {
-            "ping" => Some(scripted_ping(request)),
+            "daemon.ping" => Some(scripted_ping(request)),
             _ => None,
         },
     );
@@ -5934,7 +7065,7 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
             &sandbox.root,
             "unresolved.sock",
             |request| match scripted_method(request) {
-                "ping" => Some(scripted_ping(request)),
+                "daemon.ping" => Some(scripted_ping(request)),
                 _ => Some(json!({"id": request["id"], "result": {"request": {
                     "id": request["id"],
                     "state": "started",
@@ -5950,7 +7081,7 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
         &sandbox.root,
         "refusing.sock",
         |request| match scripted_method(request) {
-            "ping" => Some(scripted_ping(request)),
+            "daemon.ping" => Some(scripted_ping(request)),
             _ => Some(json!({"id": request["id"], "error": {
                 "code": "refused",
                 "message": "focus for this target is already in flight",
@@ -6002,7 +7133,7 @@ fn a_stalled_daemon_is_abandoned_when_the_caller_cancels() {
     let sandbox = Sandbox::new("client-cancel");
     let stall = scripted_socket(&sandbox.root, "stall.sock", |request| {
         match scripted_method(request) {
-            "ping" => Some(scripted_ping(request)),
+            "daemon.ping" => Some(scripted_ping(request)),
             // Holds the connection open and answers nothing, which is the daemon
             // that is still alive and no longer replying.
             _ => {
@@ -6062,5 +7193,59 @@ fn an_uncertain_daemon_close_is_never_retried_through_direct_herdr() {
         !asked_marker(&sandbox.root).exists(),
         "an uncertain daemon close was retried through the direct adapter"
     );
+    daemon.stop();
+}
+
+/// A backend that only says what it is, so the handshake's own words can be read
+/// without a mux behind them.
+struct IdentifiedBackend(BackendIdentity);
+
+impl RuntimeProvider for IdentifiedBackend {
+    fn identity(&self) -> BackendIdentity {
+        self.0.clone()
+    }
+
+    fn capabilities(&self) -> &'static [&'static str] {
+        DaemonRuntime::REQUIRED
+    }
+
+    fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
+        Ok(empty_inventory())
+    }
+
+    fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
+        ForegroundEvidence::Inconclusive
+    }
+
+    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The handshake names the backend that is actually wired, with the server
+/// instance it targets, and Radar's client carries that identity through. A
+/// daemon with no backend says so rather than naming a placeholder.
+#[test]
+fn the_handshake_names_the_wired_backend_and_its_instance() {
+    let sandbox = Sandbox::new("backend-identity");
+
+    let mut bare = sandbox.daemon();
+    let ping = Client::dial(bare.path()).call("daemon.ping", json!({}));
+    assert_eq!(ping["result"]["backend"], "none", "{ping}");
+    assert_eq!(ping["result"]["instance"], Value::Null, "{ping}");
+    bare.stop();
+
+    let daemon_backend = Arc::new(IdentifiedBackend(BackendIdentity::tmux("work")));
+    let mut daemon = sandbox.daemon_with(daemon_backend);
+    let ping = Client::dial(daemon.path()).call("daemon.ping", json!({}));
+    assert_eq!(ping["result"]["backend"], "tmux", "{ping}");
+    assert_eq!(ping["result"]["instance"], "work", "{ping}");
+
+    let client = DaemonRuntime::handshake(daemon.path()).expect("the handshake passes");
+    assert_eq!(client.identity(), BackendIdentity::tmux("work"));
     daemon.stop();
 }

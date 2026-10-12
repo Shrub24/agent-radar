@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::timestamp_millis;
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
-use crate::model::SessionUuid;
+use crate::model::{ProcessIdentity, SessionUuid};
 
 use super::publication::write_atomic;
 use super::{Freshness, Registry, RegistryLocation, bounded_text, read_record_file};
@@ -124,6 +124,14 @@ pub struct SpawnEdge {
     /// Where the child was created, once a create answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<RegistryLocation>,
+    /// The verified birth identity of the process that served the create which
+    /// named this location: the instance this pane belongs to.
+    ///
+    /// Absent on an edge whose create recorded none — a legacy edge, a backend
+    /// that names no server process, or a capture that could not be verified.
+    /// A generation is never inferred from a pane id, a server name or history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<ProcessIdentity>,
     /// What the create did. `Unknown` until the backend answers: a recorded
     /// intent claims no effect.
     pub created: RequestOutcome,
@@ -327,6 +335,7 @@ pub fn record(
         parent_session_id: Some(request.parent_session_id.clone()),
         token: random_uuid(),
         location: None,
+        instance: None,
         created: RequestOutcome::Unknown,
         launched: RequestOutcome::Unknown,
         bound: None,
@@ -355,12 +364,14 @@ pub fn record_created(
     request_id: &str,
     created: RequestOutcome,
     location: Option<RegistryLocation>,
+    instance: Option<ProcessIdentity>,
 ) -> Result<SpawnEdge, String> {
     canonical_uuid("request_id", request_id)?;
     let _transition = registry.transition();
     let stored = stored_edge(registry, request_id)?;
     let edge = SpawnEdge {
         location,
+        instance,
         created,
         ..stored
     };

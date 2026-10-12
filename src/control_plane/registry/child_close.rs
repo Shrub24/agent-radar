@@ -12,7 +12,9 @@
 //!
 //! What is recorded is the mux's pane-close result and nothing more: no process
 //! or process-group exit is claimed from it, and no execution-status or
-//! assignment-state fact is written.
+//! assignment-state fact is written. An `already_exited` result is the same
+//! claim — the pane's command had exited, so no live occupant was verified or
+//! ended — and it carries the exit the edge had already recorded.
 //!
 //! The pane a close targets is the one the spawn edge recorded: a caller names
 //! the child, never a pane id, so there is nothing observable to guess from. The
@@ -30,10 +32,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::control::timestamp_millis;
-use crate::control_plane::store::{RequestOutcome, format_millis};
+use crate::control_plane::store::format_millis;
 use crate::model::SessionUuid;
 
 use super::publication::write_atomic;
+use super::spawn::SpawnExitObservation;
 use super::{MAX_TEXT_BYTES, Registry, RegistryLocation, bounded_text, read_record_file};
 
 /// The record shape this build writes and reads. A record naming another version
@@ -88,6 +91,21 @@ impl ChildCloseRequest {
     }
 }
 
+/// What one managed-child close did.
+///
+/// The words are the close's own: `already_exited` is this operation's result and
+/// a mux operation or a spawn step cannot carry it. It says the pane's command had
+/// exited and that pane was cleaned up — never that the registered process
+/// itself exited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseOutcome {
+    Completed,
+    AlreadyExited,
+    Refused,
+    Unknown,
+}
+
 /// One durable close request: the target, the intent and the outcome.
 ///
 /// The spawn edge and the bound child are recorded facts, copied here when the
@@ -107,13 +125,38 @@ pub struct ChildClose {
     pub intent: CloseIntent,
     /// What the close did. `Unknown` until a dispatch answers: a recorded
     /// request claims no effect, and a lost answer leaves it here.
-    pub outcome: RequestOutcome,
+    pub outcome: CloseOutcome,
+    /// The exit observation of the already-dead pane this close cleaned up,
+    /// copied from the edge so a replay answers without re-reading state that
+    /// may since have moved. Present exactly when the outcome is
+    /// [`CloseOutcome::AlreadyExited`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<SpawnExitObservation>,
     /// The backend's own words for a refused or unconfirmed close, kept so a
     /// replay repeats the answer the original call gave. Absent for a confirmed
     /// close, and for a request whose dispatch never answered at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub recorded_at: String,
+}
+
+/// What one dispatch of an admitted close did, as the record keeps it.
+///
+/// The variants are the outcomes a close can reach, so an outcome word and the
+/// observation that word needs cannot be recorded apart from each other.
+pub enum CloseResult {
+    /// The backend confirmed the pane close for a child whose birth identity was
+    /// verified before dispatch.
+    Completed,
+    /// The backend confirmed the cleanup of a pane whose command had already
+    /// exited. It carries the exit the edge recorded, and claims nothing about
+    /// the agent process beyond it.
+    AlreadyExited(SpawnExitObservation),
+    /// The backend refused; nothing was dispatched.
+    Refused(String),
+    /// The dispatch may have happened and no confirmation came back, with the
+    /// backend's words when it had any.
+    Unknown(Option<String>),
 }
 
 /// What asking the registry to admit one close returned.
@@ -211,7 +254,8 @@ pub fn record(
         incarnation: request.incarnation.clone(),
         location,
         intent: request.intent,
-        outcome: RequestOutcome::Unknown,
+        outcome: CloseOutcome::Unknown,
+        exit: None,
         message: None,
         recorded_at: format_millis(now_ms),
     };
@@ -235,20 +279,26 @@ pub fn record(
 pub fn record_outcome(
     registry: &Registry,
     request_id: &str,
-    outcome: RequestOutcome,
-    message: Option<&str>,
+    result: CloseResult,
 ) -> Result<ChildClose, String> {
     canonical_uuid("request_id", request_id)?;
     let _transition = registry.transition();
     let stored = read_close(registry, request_id)?.ok_or_else(|| {
         format!("child close request {request_id} has no recorded request to settle")
     })?;
-    let storable = storable_message(message);
-    if stored.outcome == outcome && stored.message == storable {
+    let (outcome, exit, message) = match result {
+        CloseResult::Completed => (CloseOutcome::Completed, None, None),
+        CloseResult::AlreadyExited(exit) => (CloseOutcome::AlreadyExited, Some(exit), None),
+        CloseResult::Refused(message) => (CloseOutcome::Refused, None, Some(message)),
+        CloseResult::Unknown(message) => (CloseOutcome::Unknown, None, message),
+    };
+    let storable = storable_message(message.as_deref());
+    if stored.outcome == outcome && stored.message == storable && stored.exit == exit {
         return Ok(stored);
     }
     let close = ChildClose {
         outcome,
+        exit,
         message: storable,
         ..stored
     };

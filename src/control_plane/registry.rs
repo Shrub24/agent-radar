@@ -408,8 +408,8 @@ pub mod publication;
 pub mod spawn;
 
 pub use child_close::{
-    CHILD_CLOSE_VERSION, ChildClose, ChildCloseRequest, CloseAdmission, CloseIntent,
-    MAX_CHILD_CLOSE_BYTES,
+    CHILD_CLOSE_VERSION, ChildClose, ChildCloseRequest, CloseAdmission, CloseIntent, CloseOutcome,
+    CloseResult, MAX_CHILD_CLOSE_BYTES,
 };
 pub use context::{
     AcceptedContext, CONTEXT_VERSION, ContextRequest, ContextValue, ContextWrite,
@@ -559,10 +559,9 @@ impl Registry {
     pub fn record_child_close_outcome(
         &self,
         request_id: &str,
-        outcome: RequestOutcome,
-        message: Option<&str>,
+        result: CloseResult,
     ) -> Result<ChildClose, String> {
-        child_close::record_outcome(self, request_id, outcome, message)
+        child_close::record_outcome(self, request_id, result)
     }
 
     /// One recorded close request, if the daemon has one.
@@ -600,8 +599,9 @@ impl Registry {
         request_id: &str,
         created: RequestOutcome,
         location: Option<RegistryLocation>,
+        instance: Option<ProcessIdentity>,
     ) -> Result<SpawnEdge, String> {
-        spawn::record_created(self, request_id, created, location)
+        spawn::record_created(self, request_id, created, location, instance)
     }
 
     /// Records what one spawn's launch did.
