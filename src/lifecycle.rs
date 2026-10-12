@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::control::{self, ControlRequest, ControlResult, NewRequest, OwnerControl, RequestState};
+use crate::control_plane::registry::PublicRegistration;
 use crate::model::{
     AgentObservation, AgentState, FleetObservation, Lineage, SemanticState, SessionIdentity,
 };
@@ -68,11 +69,13 @@ pub fn pane(
             return containment;
         }
     }
-    match inventory.agent_on_pane(pane_id) {
-        Some(agent) => agent_containment(agent),
-        // No agent and no blocking association: positive unmanaged evidence.
-        None => Containment::Unmanaged,
-    }
+    // Every record on the pane counts, presented or metadata, and the strictest
+    // answer wins. No record at all is positive unmanaged evidence.
+    inventory
+        .all_agents()
+        .filter(|agent| agent.location.pane_id == pane_id)
+        .map(agent_containment)
+        .fold(Containment::Unmanaged, stricter)
 }
 
 /// The tab's containment: managed or uncertain if any member pane is, so a
@@ -105,7 +108,7 @@ pub fn target(inventory: &FleetObservation, target: &CloseTarget) -> Containment
 fn agent_containment(agent: &AgentObservation) -> Containment {
     // Any owner metadata makes the pane managed, whether or not this build can
     // read the key: presence is the signal, absence is unknown.
-    if agent.facts.managed_metadata {
+    if is_protected(agent) {
         return Containment::Managed;
     }
     match agent.name.as_deref() {
@@ -116,6 +119,15 @@ fn agent_containment(agent: &AgentObservation) -> Containment {
         // A kind Radar cannot place is never guessed unmanaged.
         _ => Containment::Uncertain,
     }
+}
+
+/// Whether the pane's agent is protected from unmanaged control: owner metadata
+/// was published, or the daemon's registry knows an agent on this location.
+///
+/// A registration counts even unjoined, so a pane never becomes an unmanaged
+/// close target because its evidence is missing or ambiguous.
+fn is_protected(agent: &AgentObservation) -> bool {
+    agent.facts.managed_metadata || agent.registry.is_some()
 }
 
 /// The stricter of two answers: managed beats uncertain beats unmanaged.
@@ -213,7 +225,10 @@ pub fn matches(inventory: &FleetObservation, expected: &TargetIdentity) -> bool 
 fn pane_identity(inventory: &FleetObservation, pane_id: &str) -> PaneIdentity {
     PaneIdentity {
         pane_id: pane_id.to_string(),
-        occupant: inventory.agent_on_pane(pane_id).map(agent_identity),
+        occupant: inventory
+            .all_agents()
+            .find(|agent| agent.location.pane_id == pane_id)
+            .map(agent_identity),
     }
 }
 
@@ -222,7 +237,7 @@ fn agent_identity(agent: &AgentObservation) -> AgentIdentity {
         name: agent.name.clone(),
         session: agent.session.clone(),
         lineage: agent.lineage.clone(),
-        managed: agent.facts.managed_metadata,
+        managed: is_protected(agent),
         label: agent.facts.label.clone(),
         run: agent.facts.run.clone(),
     }
@@ -362,12 +377,41 @@ pub fn guard(inventory: &FleetObservation, request: &CloseRequest) -> Result<(),
     }
 }
 
+/// Whether a registration names a place inside `target`.
+///
+/// A registration counts whether or not it joins a pane: one made after the
+/// operator confirmed must still stop a generic close of its pane or tab.
+fn registered_within(
+    inventory: &FleetObservation,
+    registrations: &[PublicRegistration],
+    target: &CloseTarget,
+) -> bool {
+    registrations
+        .iter()
+        .filter_map(|registration| registration.location.as_ref())
+        .any(|location| match target {
+            CloseTarget::Pane(pane_id) => location.pane.as_deref() == Some(pane_id),
+            CloseTarget::Tab(tab_id) => {
+                location.tab.as_deref() == Some(tab_id)
+                    || location.pane.as_deref().is_some_and(|pane_id| {
+                        inventory
+                            .pane(pane_id)
+                            .is_some_and(|pane| pane.location.tab_id == *tab_id)
+                    })
+            }
+        })
+}
+
 /// One confirmed close: take a fresh inventory, prove the target is still
-/// positively unmanaged, then ask the runtime to close it.
+/// positively unmanaged and unregistered, then ask the runtime to close it.
+///
+/// `registrations` is read after the inventory and before dispatch. A registry
+/// that cannot be read refuses the close.
 pub fn close_unmanaged(
     provider: &dyn RuntimeProvider,
     request: &CloseRequest,
     cancel: &AtomicBool,
+    registrations: impl FnOnce() -> Result<Vec<PublicRegistration>, String>,
 ) -> DirectClose {
     let inventory = match provider.inventory(cancel) {
         Ok(inventory) => inventory,
@@ -375,6 +419,20 @@ pub fn close_unmanaged(
     };
     if let Err(message) = guard(&inventory, request) {
         return DirectClose::Refused(message);
+    }
+    let described = request.target.description();
+    let registrations = match registrations() {
+        Ok(registrations) => registrations,
+        Err(message) => {
+            return DirectClose::Refused(format!(
+                "{described} cannot be checked against the registry: not closing: {message}"
+            ));
+        }
+    };
+    if registered_within(&inventory, &registrations, &request.target) {
+        return DirectClose::Refused(format!(
+            "{described} is registered by its owner: direct close refused"
+        ));
     }
     match provider.close_outcome(&request.target, cancel) {
         CloseOutcome::Completed => DirectClose::Completed,
@@ -390,7 +448,9 @@ fn run(
     request: &CloseRequest,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
-    match close_unmanaged(provider, request, cancel) {
+    // The operator path has no registry of its own: a daemon applies its registry
+    // guard when it dispatches, and a direct adapter has no registrations.
+    match close_unmanaged(provider, request, cancel, || Ok(Vec::new())) {
         DirectClose::Completed => Ok(format!("closed {}", request.target.description())),
         DirectClose::Refused(message) | DirectClose::Unknown(message) => Err(message),
     }
@@ -909,6 +969,7 @@ mod tests {
     use super::*;
     use crate::model::{AgentObservation, HerdsmanFacts, Location, Pane};
     use crate::observation::RetentionBasis;
+    use serde_json::json;
 
     fn location(pane_id: &str) -> Location {
         Location {
@@ -938,11 +999,13 @@ mod tests {
                 managed_metadata: managed,
                 ..HerdsmanFacts::default()
             },
+            registry: None,
         }
     }
 
     fn inventory(panes: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
         FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: Vec::new(),
             tabs: vec![crate::model::Tab {
                 tab_id: "wA:t1".into(),
@@ -1064,8 +1127,58 @@ mod tests {
                 state: Some(SemanticState::Idle),
                 ..HerdsmanFacts::default()
             },
+            registry: None,
         });
         observation
+    }
+
+    /// A pane whose only evidence is a registration that did not join: no
+    /// Herdr metadata, no lineage, no label.
+    fn registered_only_inventory() -> FleetObservation {
+        let mut observation = inventory(&["wA:p1"], Vec::new());
+        let agent: crate::registry_observation::RegistryAgent = serde_json::from_value(json!({
+            "registration": {
+                "version": 1,
+                "agent_id": "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
+                "registered_at": "2026-01-01T00:00:00.000Z",
+                "source": "herdsman",
+                "incarnation": "11111111-1111-4111-8111-111111111111",
+                "location": {"backend": "herdr", "pane": "wA:p1"},
+                "process_claimed": true,
+                "launch": {"available": false}
+            },
+            "process": {"claimed": true, "verification": "unavailable"},
+            "execution": null,
+            "assignment": null,
+            "facts": null
+        }))
+        .expect("registration decodes");
+        observation.agents = crate::registry_observation::project(
+            &observation,
+            &crate::runtime::BackendIdentity::named("herdr"),
+            crate::registry_observation::RegistryRead {
+                agents: vec![agent],
+                ..Default::default()
+            },
+            &[],
+        );
+        observation
+    }
+
+    #[test]
+    fn a_registered_pane_is_protected_even_when_its_evidence_is_missing() {
+        let observation = registered_only_inventory();
+        assert_eq!(
+            pane(&observation, &none(), "wA:p1"),
+            Containment::Managed,
+            "an unjoined registration is not positive unmanaged evidence"
+        );
+        assert_eq!(
+            target(&observation, &CloseTarget::Tab("wA:t1".into())),
+            Containment::Managed,
+            "a tab holding that pane is refused whole"
+        );
+        assert!(managed_request(&observation, "wA:p1", control::Operation::Close).is_err());
     }
 
     fn temp_owner_root() -> PathBuf {

@@ -219,10 +219,10 @@ is not buried under the long published text a task list brings with it:
 
 | Page | Shows |
 | --- | --- |
-| Overview | What the row is: its kind and lifecycle, its location, the live foreground PID, what it is running, the row's activity, state and model, and the owner's projected state as its own line |
+| Overview | What the row is: its kind and lifecycle, its location, the live foreground PID, what it is running, and the row's activity and state. For a registered agent, each authority is a labelled line with its own publisher and freshness — physical, execution, assignment and facts — followed by the owner's role, definition, assignment text and awaited items, and the session's model, provider, thinking level and context usage |
 | Processes | The process holding the location: the command name the runtime reports for it, the package it runs from and the executable inside it, how that compares with the program `PATH` resolves now, the PID, how long it has run, the terminal mode, and what that process was measured using — scheduler state, interval CPU, resident set and the descendants observed beneath it, summed and then drawn one row each in a table of their own — with the store, the roots' own parts, the birth identity, what the state it is showing means and every reason held behind the page's `details` block |
 | Tasks | The background tasks published for the row — each task's id, phase, source, command, directory, PID, timings, output and exit — and the pane's own token ids when no publisher joins |
-| Source | Where the facts came from: source freshness, the diagnostic when the source failed or a page is retained, the exact session identities, the owner projection and the diagnostics |
+| Source | Where the facts came from: source freshness, the diagnostic when the source failed or a page is retained, the identities the row carries (session name, run, request, ask), its lineage when it has one, and the diagnostics |
 
 Every fact an earlier version showed is still reachable, on one page rather than
 repeated across all four, except a foreground process's arguments: the Processes
@@ -405,6 +405,9 @@ Herdr, and only after a second inventory is taken immediately before acting. A
 pane with no agent, or with an agent kind Pi Herdsman never manages, can be
 closed; a Pi pane publishing any `pi_herdsman_*` key is the owner's and refuses
 the direct path, and a Pi pane with no owner metadata is unverified and refuses.
+A pane carrying a registry candidate is protected the same way whether or not
+Radar could join it to that registration: an unresolved or ambiguous registered
+occupant is the case where a generic close would be a guess.
 A tab holding any managed or unverified member refuses whole, so nothing is
 partly applied. A direct mux close has no conditional form, so this cannot be
 atomic across the inventory read and the close — the checks narrow the window,
@@ -696,32 +699,103 @@ Those are historical, not running, so they stay out of the default `agents` view
 
 ## Observation and continuity
 
-- Radar runs `herdr api snapshot` off the UI thread, with at most one refresh in
-  flight. It waits one second between completed refreshes; each command has a
-  five-second timeout. Input and quitting do not wait for a stalled command.
+Radar observes in one of two modes, chosen once before anything is drawn, and
+neither reads agent facts from Herdr's own agent state:
+
+- **Through a daemon** (`[runtime] backend = "daemon"`), every agent fact comes
+  from the daemon's registry. One refresh reads the daemon's pane inventory,
+  every registered agent (`agent.list`, paged) and the spawn topology
+  (`spawn.list`), and joins them in one pass, so a frame comes from one moment.
+  Herdr's own agent records, display metadata and native agent status are not
+  read for anything the dashboard shows. A daemon that does not declare
+  `registry.v1` and `spawn.v1` fails the refresh with that diagnostic rather
+  than showing a fleet sourced from somewhere else.
+- **Direct** — with no daemon configured, or after the single diagnostic a failed
+  trust check or handshake prints — the tree lists ordinary panes only: no agent
+  rows and no registered facts. That is a deliberate degradation, not a fallback
+  to Herdr's agent state, and nothing switches adapters later.
+
+### Where an agent row's facts come from
+
+Each authority is its own channel with its own writer, provenance and freshness,
+so one can expire, be replaced or stay silent without disturbing the others:
+
+- **execution** — what the session reports it is doing (`pi`).
+- **assignment** — what the owner reports it assigned: activity, role,
+  definition, run, the assignment text, what it awaits and the ask it waits on
+  (`herdsman`).
+- **facts** — the session's own model, provider, thinking level, context usage,
+  session name and background tasks (`pi`).
+
+A whole snapshot replaces the previous one, so an omitted field is withdrawn
+rather than remembered, and a channel nobody has published reads `unknown`,
+never `idle`. Freshness is the writer's lease: an expired snapshot reads `stale`
+beside the value it last described, and never silently turns into a current
+state. Waiting, lost and settling are **derived** by the dashboard from
+published facts and freshness, and a derived word never rewrites what a writer
+published: a row can read `waiting` while the execution line still reads `done`,
+and a finished execution never completes the owner's assignment.
+
+### Joining a registration to a pane
+
+A registration joins a pane on its backend-qualified location — `backend`,
+`instance`, workspace, tab and pane — together with the exact birth identity it
+claimed: `boot_id`, `pid` and `start_ticks`, served as `process.claim`. Radar
+samples the birth identity of the pane's own foreground process for itself, and a
+PID alone, a title, a label, an alias and a session UUID never join an agent to a
+pane.
+
+A registration that cannot be joined exactly is shown **unresolved**, with the
+location it last reported: no claim, a mismatched or unreadable process, a pane
+the inventory does not hold, or two registrations on one identity, which is
+ambiguity rather than evidence. An unresolved row owns no pane — it is not
+focused, its controls refuse, and it borrows nothing from the pane it names. A
+registered pane that vanishes from a successful inventory is unresolved, not a
+claimed process exit.
+
+### Protection is not close eligibility
+
+A registration at a pane keeps that pane, and the tab containing it, out of a
+generic unmanaged close, including where its join is unresolved or ambiguous: the
+pane may be someone's agent even where Radar cannot prove whose. Close
+eligibility is a separate and stronger fact, established by a daemon-authored
+spawn edge to that exact child; a registration, a label, a session UUID or a
+metadata flag never makes a target eligible. `x` on a registration is routed to
+the worker's owner where the pane carries the lineage that route needs, and
+refused where it does not; it never becomes a generic unmanaged close.
+
+### What is still read from Herdr
+
+Herdr's agent records and the `pi_herdsman_*` pane tokens are read as **physical
+and containment evidence only**: they keep a pane that has an occupant protected
+while Radar cannot name that occupant. They are never display facts for an agent
+row — a registered row is named by its registration, its label else its agent id,
+and its values come from the channels above. Ordinary panes keep Herdr's pane
+title and label, which describe the pane rather than an agent.
+
+### Refresh and continuity
+
+- A refresh runs off the UI thread with at most one in flight. It waits one
+  second between completed refreshes, each command has a five-second timeout, and
+  the registry read of one refresh has a single bounded deadline across its
+  pages. Input and quitting do not wait for a stalled read, and a refresh that
+  finishes past its deadline is never applied.
 - Failed collection preserves the last-good inventory with a **stale** diagnostic.
   Initial failure is **unavailable**, not an empty fleet. A successful empty
   snapshot clears the inventory; successful recovery clears the diagnostic. The
   fleet heading carries the state (`Fleet · current`, `Fleet · STALE`,
   `Fleet · UNAVAILABLE`), and the selected row's details write the failure out —
   there is no status line of its own.
-- Roles, assignments, ownership and semantic state come from Herdsman's own
-  published pane metadata (`pi_herdsman_*`), never from Herdr's agent fields.
-  Radar reads the role, a managed worker's runtime label, the owner's assignment
-  projection, the active assignment with its start time, what the pane is
-  awaiting and the background tasks it reports running, and the session's model,
-  provider, thinking level and context. A fact the source does not publish stays
-  unavailable; the source's token lifetime is its freshness, so an expired value
-  is absent rather than remembered.
-- The **row's state word is the pane's activity state**, derived from the pane
-  as Herdsman's contract specifies, in this order: a fresh `lost` from the owner
-  wins, work in flight stays in flight, an unknown or unreported state stays
-  unknown, a non-empty set of outstanding work is `waiting`, and otherwise the
-  runtime's own state stands. That set is the union of the owner's awaited items
-  (`pi_herdsman_awaited`) and the ids in the pane's own background task list
-  (`pi_bg_tasks`) — never `pi_bg_running`, so a pane whose tasks have all exited
-  into `review` is waiting with nothing running. The details keep the published
-  running count distinguishable from the unresolved set.
+- The **row's state word is the session's activity state**, derived in the
+  contract's order: a live `lost` from the owner wins, work in flight stays in
+  flight, an unknown or unreported execution stays unknown, the owner's
+  `settling` stands over an idle execution, a non-empty union of the owner's
+  awaited items (assignment `awaited`) and the ids of the session's own
+  background tasks (facts `background_tasks`) is `waiting`, and otherwise the
+  reported state stands. The running count takes no part in it, so a session
+  whose tasks have all exited with work unresolved is `waiting` with nothing
+  running, and the details keep the published running count distinguishable from
+  the unresolved set.
 - The owner's **assignment state** is a different fact and is shown as its own
   labelled detail line (`assignment: settling (owner projection)`) rather than
   choosing the row's word. It is what a lead's own fleet view names for that
@@ -729,23 +803,24 @@ Those are historical, not running, so they stay out of the default `agents` view
   `settling` or `delivered` projection can be briefly stale, and the row must
   not contradict the pane because of it. `settling`, `delivered` and `unknown`
   projections stay reachable in the details.
+- A registration is placed at the workspace and tab its location names, or under
+  an `unplaced` root when it reports none. Children are not nested under their
+  parent: the exact spawn edge is shown in the details. An ordinary pane never
+  duplicates a current or retained agent row.
 - Radar does not read Herdsman mailboxes, does not treat Herdr's agent name or
   title as a Herdsman fact, and never infers ownership from tab position or from
   the human session name — ownership is exact session identity.
-- Explicit, unambiguous ownership can span tabs within a workspace. Missing,
-  conflicting, cyclic or cross-workspace ownership falls back to workspace-level
-  rows. Ordinary panes never duplicate current or retained agent rows.
 - When an agent disappears but its pane remains, Radar keeps its last observation
-  **in memory**, visibly retained rather than current. Targeted
-  `herdr pane process-info --pane <id>` queries distinguish a foreground shell
-  from a positively identified replacement command using PID evidence.
-  Inconclusive evidence leaves the association unverified.
+  **in memory**, visibly retained rather than current. Foreground evidence for
+  the pane distinguishes a shell from a positively identified replacement
+  command using the process's own PID and birth identity; inconclusive evidence
+  leaves the association unverified.
 - A new reported agent replaces the old association. Positive non-shell evidence
   or a successful snapshot proving pane loss clears it. Retained facts are
   last-observed, not current status or historical outcomes. Restarting Radar clears
   them; it has no durable history.
 
-Polling is best effort: snapshot and process-info reads are not atomic, short
+Polling is best effort: inventory and process reads are not atomic, short
 commands between polls can be missed, and foreground confirmation can lag by two
 refresh cycles. Continuity across Herdr restarts or session moves is not promised.
 
@@ -768,7 +843,9 @@ in [`docs/radar-bus.fixture.json`](docs/radar-bus.fixture.json).
 
 A task list is joined to an agent row by the **exact session UUID** the row
 publishes as its ownership lineage (`pi_herdsman_session`). A row that publishes
-no UUID falls back to the pane its `hello` named, and only while **exactly one**
+no UUID falls back to the pane its `hello` named — a registered row publishes no
+lineage UUID in the row, so a publisher's `hello` pane is how its tasks reach
+it, and only while **exactly one**
 connected publisher names that pane: two of them are an ambiguity, so that row
 gets no publisher's list rather than whichever entry came first. Nothing else
 joins them — not the cwd, not a title, not the human session name. A session
@@ -874,8 +951,10 @@ One Cargo package, with `radar` as its binary:
   checks at the adapter, collector and focus tests against an in-memory
   runtime, lifecycle tests against fake providers and a stub owner in temporary
   directories, bus listener and detail-join tests against a stub publisher, and
-  a focused PTY check that also connects one to the running dashboard. No real
-  Herdr runtime is modified by these tests, and no real lifecycle request is
+  a focused PTY check that also connects one to the running dashboard, plus
+  `tests/tmux_acceptance.py`, which runs the dashboard against a disposable
+  daemon on a disposable tmux server and asserts the registry-backed rows. No
+  real Herdr runtime is modified by these tests, and no real lifecycle request is
   written.
 
 `Cargo.lock` and `flake.lock` record reproducible dependency versions. The approved

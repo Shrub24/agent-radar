@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Minimal reconnecting publisher for the Radar direct agent registry.
 
-This intentionally publishes only an owner assignment projection. Execution
-facts are a separate channel with a separate writer identity and lifecycle.
+The main loop publishes only an owner assignment projection. `publish_facts`
+shows the self-authored facts channel a session publishes with no owner.
+Execution facts are a separate channel with a separate writer identity and
+lifecycle.
 """
 
 from __future__ import annotations
@@ -100,6 +102,22 @@ def publish_assignment(path: Path, registration: dict, publisher: dict,
         params["lease_ms"] = lease_ms
     channel = call(path, "agent.publish", params)["channel"]
     return registered, channel
+
+
+def publish_facts(path: Path, agent_id: str, publisher: dict, snapshot: dict,
+                  sequence: int, *, lease_ms: int | None = None) -> dict:
+    """Acquire the facts writer and publish one complete facts snapshot.
+
+    The publisher is the session itself; no owner is named. A new snapshot
+    replaces every field, so omitted facts are withdrawn.
+    """
+    binding = call(path, "agent.acquire", {"agent_id": agent_id, "channel": "facts",
+                                           "publisher": publisher})["writer"]
+    params = {"agent_id": agent_id, "channel": "facts", "writer_handle": binding["handle"],
+              "sequence": sequence, "snapshot": snapshot}
+    if lease_ms is not None:
+        params["lease_ms"] = lease_ms
+    return call(path, "agent.publish", params)["channel"]
 
 
 def publish_context(path: Path, agent_id: str, publisher: dict,

@@ -25,14 +25,85 @@ import tempfile
 import termios
 import time
 
-# The session UUID the fake pane publishes as `pi_herdsman_session`, and the
-# session the stub publisher greets with.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples/agent-publisher"))
+import publisher  # noqa: E402
+
+# The session UUID the registered worker publishes, and the session the stub
+# publisher greets with.
 SESSION = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+# The identities the disposable registration and its channel publishers use.
+WORKER_INCARNATION = "5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e"
+FACTS_INCARNATION = "6c7d8e9f-0a1b-4c2d-9e3f-4a5b6c7d8e9f"
+EXECUTION_INCARNATION = "7d8e9f0a-1b2c-4d3e-8f4a-5b6c7d8e9f0a"
+# The longest lease a publisher may ask for: the run must not outlive it.
+MAX_LEASE_MS = 300_000
+
+
+def birth_identity(pid):
+    """The boot, pid and start-tick claim the registration is joined on."""
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    fields = stat[stat.rfind(")") + 2:].split()
+    return {"pid": pid, "boot_id": boot_id, "start_ticks": int(fields[19])}
+
+
+def start_daemon(binary, directory, control_path):
+    """A disposable daemon over the fake Herdr CLI. The dashboard reads its
+    agents from here, and nothing else."""
+    env = {**os.environ, "RADAR_CONTROL_SOCKET": str(control_path),
+           "RADAR_CONTROL_STATE": str(directory / "control-state"),
+           "PATH": f"{directory}:{os.environ['PATH']}"}
+    with open(directory / "daemon.log", "w") as log:
+        child = subprocess.Popen([str(binary), "daemon"], env=env, stdout=log, stderr=log)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if child.poll() is not None:
+            raise RuntimeError(f"daemon exited {child.returncode}: {(directory / 'daemon.log').read_text()}")
+        if control_path.exists():
+            try:
+                publisher.call(control_path, "daemon.ping", {})
+                return child
+            except (OSError, RuntimeError):
+                pass
+        time.sleep(0.02)
+    child.kill()
+    raise TimeoutError("daemon socket did not appear")
+
+
+def stop_daemon(child):
+    child.send_signal(signal.SIGTERM)
+    child.wait(timeout=5)
+
+
+def register_worker(control_path, pid):
+    """The one agent the dashboard shows: registered at the fake pane, joined by
+    its process claim, with its own facts and execution. Its Herdr record says
+    otherwise, so only the registration can make these rows."""
+    registered = publisher.call(control_path, "agent.register", {
+        "source": "herdsman", "incarnation": WORKER_INCARNATION, "session": SESSION,
+        "label": "worker task",
+        "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
+        "process": birth_identity(pid),
+    })["registration"]
+    agent_id = registered["agent_id"]
+    publisher.publish_facts(
+        control_path, agent_id, {"source": "pi", "incarnation": FACTS_INCARNATION},
+        {"background_tasks": [{"id": "bg-7", "phase": "running"},
+                              {"id": "bg-8", "phase": "running"}]},
+        1, lease_ms=MAX_LEASE_MS)
+    writer = publisher.call(control_path, "agent.acquire", {
+        "agent_id": agent_id, "channel": "execution",
+        "publisher": {"source": "pi", "incarnation": EXECUTION_INCARNATION}})["writer"]
+    publisher.call(control_path, "agent.publish", {
+        "agent_id": agent_id, "channel": "execution", "writer_handle": writer["handle"],
+        "sequence": 1, "snapshot": {"activity": "working"}, "lease_ms": MAX_LEASE_MS})
 
 
 def check(binary, bus_off=False):
-    """One dashboard run. `bus_off` squats the socket first, so binding the bus
-    fails and the run must stay usable and quit promptly anyway."""
+    """One dashboard run. The main run reads a registered agent from a disposable
+    daemon; `bus_off` runs the direct adapter, which presents no agents, and
+    squats the bus socket first, so binding the bus fails and the run must stay
+    usable and quit promptly anyway."""
     with tempfile.TemporaryDirectory(prefix="radar-terminal-") as directory:
         directory = Path(directory)
         ready = directory / "ready"
@@ -47,11 +118,12 @@ def check(binary, bus_off=False):
             "tabs": [{"tab_id": "wA:t1", "workspace_id": "wA", "label": "agent tab", "number": 1}],
             "panes": [{"pane_id": "wA:p1", "tab_id": "wA:t1", "workspace_id": "wA",
                        "label": "worker task", "terminal_title_stripped": "worker task"}],
+            # The Herdr record for the pane says idle with no tokens. The
+            # registration says working with two tasks, so a dashboard that read
+            # this record instead of the registry would show the wrong state.
             "agents": [{"pane_id": "wA:p1", "tab_id": "wA:t1", "workspace_id": "wA",
-                        "agent": "pi", "agent_status": "working",
-                        "terminal_title_stripped": "worker task",
-                        "tokens": {"pi_herdsman_session": SESSION, "pi_bg_running": "2",
-                                   "pi_bg_tasks": "bg-7:running,bg-8:running"}}],
+                        "agent": "pi", "agent_status": "idle",
+                        "terminal_title_stripped": "worker task"}],
         }}}) + "\n")
         socket_path = directory / "radar.sock"
         # The Processes page's own process table needs a real process this
@@ -88,6 +160,19 @@ if [ "$1" = "pane" ] && [ "$2" = "process-info" ]; then cat '{process_info}'; ex
 cat '{snapshot}'
 ''')
         fake.chmod(0o755)
+        # The main run's agent is the daemon's registration, so the dashboard
+        # reads its facts through the daemon. The bus-off run has no daemon.
+        config = directory / "config.toml"
+        control_path = directory / "control.sock"
+        daemon = None
+        if not bus_off:
+            mode.write_text("ok\n")
+            daemon = start_daemon(binary, directory, control_path)
+            register_worker(control_path, helper.pid)
+            config.write_text(f'[runtime]\nbackend = "daemon"\nsocket = "{control_path}"\n')
+        else:
+            config.write_text("")
+        mode.write_text("error\n")
         squatter = None
         if bus_off:
             # A listener that answers a connect: another Radar owns the path.
@@ -100,7 +185,7 @@ cat '{snapshot}'
         process = subprocess.Popen(
             [str(binary)], stdin=slave, stdout=slave, stderr=slave,
             env={**os.environ, "TERM": "xterm-256color", "PATH": f"{directory}:{os.environ['PATH']}",
-                 "RADAR_SOCKET": str(socket_path)},
+                 "RADAR_SOCKET": str(socket_path), "RADAR_CONFIG": str(config)},
             start_new_session=True,
         )
 
@@ -369,12 +454,15 @@ cat '{snapshot}'
                 process.wait()
             if ready.exists():
                 try:
-                    os.killpg(int(ready.read_text()), signal.SIGKILL)
+                    os.kill(int(ready.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+            if daemon is not None:
+                stop_daemon(daemon)
             os.close(master)
             os.close(slave)
-    print("PASS: source failure/empty/recovery; stub publisher connect/replace/disconnect; "
+    print("PASS: source failure/empty/recovery; a registered agent from a disposable daemon, "
+          "its facts and execution, the stub publisher connect/replace/disconnect; "
           "details focus, page cycling, a scroll key, a disclosure opened and closed "
           "with Space/Enter, process-row navigation with t, a branch folded and opened "
           "on the process table, and Escape back to the tree; "

@@ -1791,6 +1791,7 @@ impl App {
                 let described = match &target_id {
                     RowId::Workspace(workspace_id) => format!("workspace {workspace_id}"),
                     RowId::Agent(pane_id) | RowId::Pane(pane_id) => format!("pane {pane_id}"),
+                    RowId::Registered(agent_id) => format!("unresolved agent {agent_id}"),
                     RowId::Task(_) => unreachable!("a task is looked up through its owner row"),
                 };
                 self.set_focus_message(Some(format!("{described} is not observed")));
@@ -2072,6 +2073,9 @@ impl App {
     fn selected_action(&self) -> Option<Selected> {
         let row = self.selected_row()?;
         Some(match &row.node.row.kind {
+            RowKind::Agent(agent) if !agent.joined() => Selected::Refused(
+                "an unresolved agent is not joined to a pane: its controls are refused",
+            ),
             RowKind::Agent(agent) => Selected::Agent {
                 pane_id: agent.pane_id.clone(),
                 tab_id: agent.tab_id.clone(),
@@ -2305,8 +2309,10 @@ fn containment_of(
     target: &CloseTarget,
 ) -> Containment {
     match target {
-        CloseTarget::Pane(pane_id) => lifecycle::pane(inventory, state.retained(), pane_id),
-        CloseTarget::Tab(tab_id) => lifecycle::tab(inventory, state.retained(), tab_id),
+        CloseTarget::Pane(pane_id) => {
+            lifecycle::pane(inventory, state.retained_containment(), pane_id)
+        }
+        CloseTarget::Tab(tab_id) => lifecycle::tab(inventory, state.retained_containment(), tab_id),
     }
 }
 
@@ -3267,6 +3273,7 @@ mod tests {
 
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![],
             tabs: vec![],
             panes: vec![],
@@ -3285,6 +3292,7 @@ mod tests {
     #[test]
     fn filter_matches_reported_role_and_assignment_when_available() {
         let observation = FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3324,6 +3332,7 @@ mod tests {
                     assignment: Some("audit the parser".into()),
                     ..Default::default()
                 },
+                registry: None,
             }],
         };
         let mut state = ObservationState::new();
@@ -3467,6 +3476,7 @@ mod tests {
         // One agent whose pane tokens name a task: the task row exists from the
         // projection alone, with no publisher and no second refresh.
         let observation = FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3502,6 +3512,7 @@ mod tests {
                     background_tasks: vec!["bg-1:review".into()],
                     ..Default::default()
                 },
+                registry: None,
             }],
         };
         let mut state = ObservationState::new();
@@ -3648,6 +3659,7 @@ mod tests {
         // identity changed. The operator confirmed the first occupant, so
         // closing the second would act on something they never reviewed.
         let observation = |session: &str| FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3683,6 +3695,7 @@ mod tests {
                 }),
                 lineage: None,
                 facts: crate::model::HerdsmanFacts::default(),
+                registry: None,
             }],
         };
         let mut state = ObservationState::new();
@@ -3731,6 +3744,7 @@ mod tests {
                 managed_metadata: true,
                 ..Default::default()
             },
+            registry: None,
         });
         let mut changed = ObservationState::new();
         changed.apply_success(observation);
@@ -3774,6 +3788,7 @@ mod tests {
     #[test]
     fn a_task_row_does_not_redirect_a_close_to_its_owner() {
         let observation = FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3809,6 +3824,7 @@ mod tests {
                     background_tasks: vec!["bg-1:review".into()],
                     ..Default::default()
                 },
+                registry: None,
             }],
         };
         let mut state = ObservationState::new();
@@ -3930,6 +3946,7 @@ mod tests {
         });
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),
@@ -3954,6 +3971,7 @@ mod tests {
                 session: None,
                 lineage,
                 facts,
+                registry: None,
             }],
         });
         state

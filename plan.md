@@ -65,7 +65,16 @@ registration and its verified session UUID; legacy edges are not assigned
 inferred session parentage. Herdsman launch migration remains external; binding
 is not application or assignment readiness.
 
-Registry publication does not yet feed Radar's TUI. General launch, process
+`agent-facts-channels` and `registry-backed-dashboard` are implemented and
+accepted, synced and archived under `openspec/changes/archive/2026-10-13-*`.
+Their verification records accompany the archives. The daemon path
+displays registry execution, assignment and self facts with independent
+provenance/freshness, joined by exact location and process birth identity.
+Unjoined registrations remain visible but own no pane or controls. Direct mode
+shows ordinary panes without Herdr agent-state fallback; legacy metadata is
+retained only for destructive containment safety. Real disposable tmux acceptance
+passed with Herdr unavailable and zero Herdr calls. Publisher adoption of the
+new facts and assignment fields remains external. General launch, process
 termination, resume and restart remain unimplemented. Existing managed controls
 remain owner-routed except the daemon's opt-in close for its own bound children;
 the direct adapter remains an explicit mode/startup fallback, never a retry after
@@ -82,13 +91,14 @@ In priority order:
    contract is now available at `4e376978`; adoption is the next concrete step.
    Not yet live-deployed; existing Herdr readiness/presence remains until physical
    execution cutover.
-2. **Consume direct registry state in Radar.** The daemon contract is ready:
-   paginated registration/execution/assignment facts, fenced current-session
-   context and process verification, each with provenance and freshness. Prepare
-   disposable publishers, then replace existing token observations only after
-   live adoption is verified. Define exact joins, source precedence and
-   retained/disconnected behavior before wiring the TUI. Preserve
-   execution/assignment separation.
+2. **Registry-backed dashboard (complete and archived).** Facts publication
+   and TUI consumption are accepted, including exact joins, separate authorities,
+   freshness, unresolved rows and registered-pane close protection. The final
+   owner gate passed 749 Rust tests, both PTY smokes, publisher fixtures, real
+   disposable tmux acceptance without Herdr, strict specs and checked Nix.
+   Independent Pi publishers can supply self facts without Herdsman; pi-extensions
+   must adopt `registry.facts.v1` and the extended assignment report for full
+   display parity. No legacy state fallback fills missing reports.
 3. **Managed child spawn (`managed-child-spawn`, landed and archived at `e0f0e7b9`).**
    Herdsman asks the daemon to create a child, and the daemon performs it: create
    the pane under a named parent, launch the resolved command, and record one
@@ -102,14 +112,15 @@ In priority order:
    extension adds the cwd/env and exact registry-ID contract needed for Herdsman's
    spawn migration.
 4. **Managed-child-stop.** Implemented, verified and archived as
-   `openspec/changes/archive/2026-10-10-managed-child-stop/`. `child.close`
+   `openspec/changes/archive/2026-10-10-managed-child-stop/`. Protocol v2 `spawn.close`
    targets an exact bound daemon-spawned child, requires fresh pane/containment
    evidence and matching foreground process birth identity (`pid`, `boot_id`,
    `start_ticks`), and persists completed/refused/unknown pane-close outcomes
    without retry. It is pane closure only: no process-exit claim and no
    assignment/execution transition. Scripted fixture and live disposable-Herdr
-   smoke pass. The method is not separately advertised; coordinate explicit
-   pi-extensions adoption before Herdsman uses it.
+   smoke pass. Protocol v2 advertises `spawn.close.v1`; fenced retained-dead-pane cleanup
+   adds `already_exited`, not process-exit or relaunch authority. Coordinate
+   explicit pi-extensions adoption before Herdsman uses it.
 5. **Lead recovery, then stale-lead restart plans.** Reconcile managed child
    topology, pending requests/asks, task results and control outcomes; confirm old
    process exit before resume. Session UUID continuity alone is not proof. Then
@@ -117,13 +128,14 @@ In priority order:
    Do not restart all panes indiscriminately.
 6. **Herdsman cutover and tmux backend.** The targeted current-caller audit is
    recorded in `docs/mux.md`. The tmux `RuntimeProvider` and explicit named-server
-   daemon selection are implemented and locally verified in the active
-   `tmux-backend` change; Herdr remains the default. Tmux supports direct-argv
+   daemon selection are implemented, verified, pushed and archived in
+   `2026-10-12-tmux-backend`; Herdr remains the default. Tmux supports direct-argv
    launch, binding and retained pane-command exit observations for daemon-created
    children, but out-of-band same-UID pane respawn can replace an unread exit
    status. Herdr exit remains unknown. Herdsman migration, explicit application
    readiness, managed-spawn placement parity, lifecycle watching beyond these
-   edges, retained-worker stop/resume and registry-backed TUI observation remain.
+   edges and retained-worker stop/resume remain. Registry-backed TUI observation
+   is now accepted.
    Full parity still requires the used retained-worker lifecycle/recovery flows.
 7. **Further TUI and information surfaces.** Review fleet density; then consider
    non-consuming preview, session statistics/search and fleet failure summaries.
@@ -131,8 +143,10 @@ In priority order:
 Separate daemon follow-ups: retention/pruning for accumulated process-incarnation
 records. The `events.read` long-poll journal (`lifecycle-events`, archived) is the
 event surface; it reports journaled daemon facts only, not backend pushes, exit or
-readiness. `tmux-backend` is implemented and locally verified in its active change;
-it is not yet committed, pushed or archived. It adds explicit named-server selection,
+readiness. `tmux-backend` is implemented, verified, pushed and archived. Protocol v2
+(`f87348032a808967c50a4e84b7e1c766a64ebfe3`) is pushed, with namespaced
+methods/capabilities, delivered-position event cursors, truthful backend identity
+and dispatch uncertainty distinguished from refusal. Tmux adds named-server selection,
 direct-argv launch and typed pane-command exit reads, with the out-of-band respawn
 limitation recorded in its design and mux contract. Launch specs and mux locations
 remain optional and unpublished by Herdsman until a consumer exists. pi-subagents is

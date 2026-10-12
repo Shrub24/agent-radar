@@ -3,7 +3,7 @@
 For the overall surface, lifecycle and adoption path, start with the
 [daemon consumer guide](daemon.md).
 
-**Registry contract `registry.v1`, served on protocol version 2.** This is the
+**Registry contract `registry.v1` with additive `registry.facts.v1`, served on protocol version 2.** This is the
 normative wire reference for direct agent
 registry producers. The records it documents carry their own `version`, which is
 independent of the control-plane protocol version: registrations, close records
@@ -24,6 +24,8 @@ timestamps, plus `<journal-epoch>` for the daemon's current journal epoch and
 `cursor_expired` resynchronisation. Fixture validation replays registry and
 journal exchanges against a disposable daemon and compares each response
 against its template, substituting only generated and clock-derived fields.
+The registry exchanges include self facts with no owner, an extended owner
+assignment and an independent facts replacement; freshness is checked per channel.
 The spawn exchanges use a disposable scripted Herdr socket; these validate the
 served daemon's operation, token binding and public redaction without a live
 mux or partial whole-object comparison. The final
@@ -38,7 +40,7 @@ both child channels first and asserts those publications and the spawn edge are
 unchanged afterwards. The `agent.list` entry is a shape reference, compared
 against the validated `agent.get` template. `agent.get` and `agent.list`
 differ intentionally: writer-facing channel/context replies return the writer
-binding to the publisher, whereas public get/list facts omit writer handles (and
+binding to the publisher, whereas public get/list projections omit writer handles (and
 channel accepted-snapshot handles).
 
 This documents the durable agent-registration records and direct publication
@@ -125,8 +127,10 @@ root are unsupported for concurrent writes.
 The trusted control socket serves `agent.register`, `agent.acquire`,
 `agent.publish`, `agent.retire`, `agent.context`, `agent.get`, `agent.list`,
 `spawn.create`, `spawn.get`, `spawn.list` and `spawn.close`, plus the journal read
-`events.read`. `daemon.ping` advertises `registry.v1` and `events.v1` regardless of
-mux backend. The `agent.*` methods are
+`events.read`. `daemon.ping` advertises `registry.v1`, `registry.facts.v1` and `events.v1`
+regardless of mux backend. `registry.facts.v1` is served whenever `registry.v1`
+is, and names the facts channel and the assignment extension below; an older
+daemon rejects both as `bad_params`. The `agent.*` methods are
 independent of the physical backend and do not call Herdr. `spawn.create` is
 different: it requires the `spawn.v1` contract, which the backend's
 `mux.create` and `mux.launch` capabilities make servable,
@@ -340,7 +344,9 @@ association and does not carry paths or other launch/private data.
 ### One channel is one record
 
 A channel is one file, `<state root>/publications/<agent_id>.<channel>.json`,
-holding the current `writer` binding and an optional `snapshot`. Current session
+holding the current `writer` binding and an optional `snapshot`. Execution,
+assignment and facts are three such files, each with its own writer, sequence
+and lease. Current session
 context is a separate file, `<state root>/publications/<agent_id>.context.json`.
 **Acquire,
 publish and retire each rewrite that single record atomically**: a mode-`0600`
@@ -372,14 +378,15 @@ ID and never creates a fake second child.
 
 ### Provenance and replacement
 
-`execution` and `assignment` are separate streams. Execution is normally
+`execution`, `assignment` and `facts` are separate streams. Execution is normally
 authored by the target agent; assignment may be authored by its registered
-owner. Writer-facing publication replies name the actual writer handle and
-source/incarnation. Public get/list channel facts omit the fencing handle and
-expose source/incarnation/generation, separately naming the reporting owner —
-they do not copy the target's registration source and call that the publisher.
-The two complete snapshots are never merged.
-Each snapshot contains:
+owner; facts are authored by the session itself and name no owner. Writer-facing
+publication replies name the actual writer handle and source/incarnation. Public
+get/list channel projections omit the fencing handle and expose
+source/incarnation/generation, separately naming the reporting owner — they do
+not copy the target's registration source and call that the publisher. The three
+complete snapshots are never merged. Execution and assignment snapshots share
+this base:
 
 - `activity`;
 - optional, separate `waiting_reason`;
@@ -391,12 +398,64 @@ All words are free-form bounded strings, so unknown vocabulary survives; object
 shapes reject unknown fields. An idle process with a failed last turn and
 unsettled owner work can retain all of those facts separately.
 
-A channel that is acquired but not yet reported exposes `snapshot: null`: no
+A channel that is acquired but not yet reported omits its `snapshot` key: no
 invented "unreported" activity is presented. When a writer is replaced, the
 binding changes but the accepted snapshot keeps its **own** source, incarnation,
 handle, generation and sequence, and reads `freshness: "stale"`: the report was
 true when made and is never relabelled as the successor's. Before its first
 accepted snapshot the successor's sequence is zero.
+
+### Facts and assignment fields
+
+Facts and the assignment extension are additive to the base. The daemon serves
+them whenever `registry.v1` is served, so a client negotiates `registry.facts.v1`
+before it publishes them. Each accepted publish replaces the whole channel value
+at a newer sequence, so omitting a field withdraws it on read.
+
+Facts (`channel: "facts"`) are self-authored by the session, with no owner:
+
+- `model`, `provider`, `thinking` and `session_name`: optional bounded text.
+  `session_name` is a display label; the session UUID stays in `agent.context`.
+- `context_usage`: optional bounded producer display text. It is not state and
+  carries no authority over freshness, lifecycle or assignment.
+- `background_tasks`: optional list of at most 64 `{"id","phase"}` objects. Both
+  fields are bounded text, and `id` is unique within the snapshot. `phase` is
+  producer vocabulary.
+- `background_started_unix_ms`: optional nonnegative Unix milliseconds when the
+  unresolved background work began.
+
+Assignment (`channel: "assignment"`) adds owner-authored optional fields to the
+base:
+
+- `role`, `definition`, `run`, `request`, `assignment` and `ask`: bounded text.
+- `assigned_started_unix_ms`: optional nonnegative Unix milliseconds.
+- `awaited`: optional list of at most 64 bounded text items.
+
+Every text value is nonempty, at most 1 KiB and free of control characters.
+Objects reject unknown fields. Each channel accepts only its own shape: base
+fields are refused on `facts`, facts fields on execution or assignment, and
+assignment fields on execution, each as `refused`. A base-shaped payload on the
+assignment channel is an assignment snapshot without owner fields.
+
+`reporting_owner` on the assignment channel is the publisher's claim, not
+authenticated authority: the daemon does not compare it with the registration
+owner. Owner authorship of these fields is a publisher convention under the
+same-UID socket trust described under [errors, trust and limits](#errors-trust-and-limits).
+
+Facts use the same writer rules as every channel: acquire returns a generation-1
+binding for the session's publisher identity, a publish needs a positive
+sequence, and a replacement names the expired or retired incumbent under
+`replace`. Replacement marks the previous facts stale and fences its handle; it
+does not touch assignment or execution.
+
+Each accepted facts publish appends a `facts.published` pointer, and each retire
+appends `facts.retired`. Execution and assignment append their own
+`execution.*` and `assignment.*` pointers. Pointers carry `agent_id` and time
+only, never snapshot values.
+
+`agent.get` and every `agent.list` entry carry a `facts` key: `null` when no
+facts writer was ever acquired, otherwise the public channel projection with its
+provenance, freshness and no fencing handle.
 
 ### Mutable current-session context
 
@@ -470,22 +529,29 @@ daemon-clock lease expiry, persists a new opaque handle/generation before
 acknowledgment, and fences the old handle even if it submits a larger sequence.
 An acquired writer that never reported has no live lease and may be replaced,
 but only by naming its exact incumbent. A successor that has not reported is not
-fresh merely because it sits beside the previous generation's unexpired facts. Stale and retired mean only stale and
+fresh merely because it sits beside the previous generation's unexpired snapshot. Stale and retired mean only stale and
 retired: neither proves process exit, assignment completion or safe restart.
+Each channel has its own writer, sequence, lease and freshness, so facts going
+stale or being replaced never changes execution or assignment freshness, and the
+reverse holds too.
 
 ### Persistence, ownership and bounds
 
 Channel records and current-session context are bounded (64 KiB), versioned
 private JSON files written by atomic sibling-temporary replacement, mode `0600`,
-file and directory flushed before acknowledgment. Each snapshot has at most 16 actions and text fields at
-most 1 KiB. Corrupt records are errors, not successful empty reads. A local
+file and directory flushed before acknowledgment. Each snapshot has at most 16 actions, and each facts
+`background_tasks` or assignment `awaited` list has at most 64 entries. Text
+fields are at most 1 KiB. Corrupt records are errors, not successful empty reads. A local
 transition mutex serializes writers within one `Registry`; the state root has one
 owning daemon, with no cross-process locking or cross-user authorization system.
 
 ## Process identity verification
 
 `agent.get` and `agent.list` read the immutable registration claim, then invoke
-the verifier outside registry/store locks. Verification is bounded by a worker
+the verifier outside registry/store locks. A claimed birth identity is also
+served as `process.claim` (`boot_id`, `pid`, `start_ticks`), present only when
+claimed. It is same-UID process evidence for matching a live pane, not a
+credential, and it never carries launch, argv, cwd or environment data. Verification is bounded by a worker
 deadline; a timeout or daemon stop reports `unavailable`, never `absent`. The
 daemon runs at most `MAX_VERIFICATION_JOBS` (4) verifier calls at once, shared by
 every connection and page: exceeding the bound and waiting for a busy slot are
@@ -516,6 +582,15 @@ snapshot. Neither value infers lifecycle eligibility or triggers a physical
 operation. Tests inject a deterministic verifier; no live mux or process-control
 operation is performed.
 
+A consumer that maps registrations to panes joins on the backend-qualified
+location plus the claimed birth identity, sampling the pane's own foreground
+process for itself: a PID alone, a title, a label, an alias and a session UUID
+never join one. Protection is separate from joinability — a pane carrying a
+registration candidate is refused a generic unmanaged close whether its join is
+exact, unresolved or ambiguous, and only a daemon-authored spawn edge makes a
+managed close eligible. See
+[dashboard consumption](daemon.md#dashboard-consumption).
+
 The endpoint contract exposes explicit writer acquire and replace (with expected
 generation/handle), channel publish/retire under the opaque handle, mutable context
 publish/replace, plus bounded public channel/context reads/listing and separately
@@ -544,6 +619,10 @@ heartbeat. A lost response may be retried with exactly the same sequence,
 snapshot, lease and `observed_at`; identical replay returns the accepted report
 unchanged and does not extend expiry. Advance sequence to renew the lease.
 
+The module's `publish_facts` helper shows the self-authored facts channel: a
+session with no owner acquires `facts` under its own publisher identity and
+publishes a complete snapshot.
+
 The example accepts `--session <canonical-UUID>`; omitting it publishes explicit
 null. It sends a context update only when its current session changes, using a
 separate increasing context sequence under its context writer. A production
@@ -570,8 +649,9 @@ python3 tests/agent_publisher.py
 ```
 
 It uses a private temporary socket/state root, starts and bounds daemon children,
-checks public launch/context redaction and unknown vocabulary, exercises
-assignment replay/heartbeat, context session switch and explicit null,
+checks public launch/context redaction and unknown vocabulary, exercises self
+facts without an owner and their pointers, the fixture's extended assignment and
+independent facts replacement, assignment replay/heartbeat, context session switch and explicit null,
 context privacy, channel lease-expiry replacement, old-writer fencing and restart
 epoch freshness/reconnect, then stops the child in `finally`. It is not live
 publisher or fleet integration. The pi-extensions port is a separate follow-up:
@@ -597,9 +677,15 @@ same-user authentication. Writer handles fence cooperating producers but are
 not secrets against hostile local code; the state is private `0600`, yet another
 process under the same uid can read it. Do not expose the socket remotely.
 
-Lease expiry and daemon epoch changes mean only that published facts are stale;
+`reporting_owner` and the assignment owner fields are provenance the publisher
+reports. The daemon does not compare `reporting_owner` with the registration's
+`owner` or authenticate the publisher, so any process that can connect to the
+socket can publish any channel under any identity. Owner authorship of assignment
+fields is a publisher convention, not daemon authority.
+
+Lease expiry and daemon epoch changes mean only that published snapshots are stale;
 process verification is independent and none of registration, actions,
-retirement, replacement, freshness or process verification establishes lifecycle
+facts, retirement, replacement, freshness or process verification establishes lifecycle
 eligibility, assignment completion or authority to launch/stop/resume. No
 publisher API here executes physical controls.
 

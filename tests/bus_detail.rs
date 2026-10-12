@@ -40,6 +40,7 @@ fn location(pane_id: &str) -> Location {
 fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
     let mut state = ObservationState::new();
     state.apply_success(FleetObservation {
+        metadata_agents: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wH".into(),
             label: Some("home".into()),
@@ -78,6 +79,7 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
                         .collect(),
                     ..HerdsmanFacts::default()
                 },
+                registry: None,
             })
             .collect(),
     });

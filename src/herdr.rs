@@ -212,6 +212,7 @@ pub fn decode_snapshot(output: &str) -> Result<FleetObservation, DecodeError> {
     }
 
     Ok(FleetObservation {
+        metadata_agents: Vec::new(),
         workspaces: inventory
             .workspaces
             .into_iter()
@@ -264,6 +265,7 @@ pub fn decode_snapshot(output: &str) -> Result<FleetObservation, DecodeError> {
                     session,
                     lineage,
                     facts,
+                    registry: None,
                 }
             })
             .collect(),

@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::model::{AgentObservation, FleetObservation, ForegroundEvidence};
+use crate::model::{AgentObservation, FleetObservation, ForegroundEvidence, SessionIdentity};
 
 /// Source-wide freshness of the latest collection outcome.
 ///
@@ -59,10 +59,14 @@ pub struct RetainedAgent {
 pub struct ObservationState {
     inventory: Option<FleetObservation>,
     source: SourceFreshness,
-    /// Retained associations keyed by connector-scoped pane id. Invariant
-    /// maintained by the transitions: every retained pane exists in the
-    /// inventory and has no agent reported on it.
+    /// Display continuity: retained presented agents keyed by connector-scoped
+    /// pane id. Invariant maintained by the transitions: every retained pane
+    /// exists in the inventory and has no presented agent reported on it.
     retained: BTreeMap<String, RetainedAgent>,
+    /// Close containment: the same retention over every agent record, presented
+    /// or Herdr metadata. Never displayed, so a vanished metadata record keeps
+    /// its pane protected without becoming a row.
+    containment: BTreeMap<String, RetainedAgent>,
     /// Retained panes that have not yet been evidence-queried this cycle;
     /// rebuilt on every successful inventory, drained by [`Self::apply_evidence`].
     awaiting_evidence: BTreeSet<String>,
@@ -89,53 +93,31 @@ impl ObservationState {
     /// - a retained agent whose pane disappears, whose agent is reported
     ///   again, or whose session is reported on any current pane is cleared;
     /// - source freshness becomes [`SourceFreshness::Current`].
+    ///
+    /// Display continuity reads presented agents only. Containment reads every
+    /// record, so Herdr metadata that vanishes still protects its pane.
     pub fn apply_success(&mut self, observation: FleetObservation) {
         let previous = self.inventory.take();
 
-        let current_sessions: Vec<_> = observation
-            .agents
-            .iter()
-            .filter_map(|agent| agent.session.clone())
+        self.retained = reconcile(
+            std::mem::take(&mut self.retained),
+            previous.iter().flat_map(|p| p.agents.iter()),
+            observation.agents.iter(),
+            &observation,
+        );
+        self.containment = reconcile(
+            std::mem::take(&mut self.containment),
+            previous.iter().flat_map(|p| p.all_agents()),
+            observation.all_agents(),
+            &observation,
+        );
+
+        self.awaiting_evidence = self
+            .retained
+            .keys()
+            .chain(self.containment.keys())
+            .cloned()
             .collect();
-        let session_is_current = |session: &Option<crate::model::SessionIdentity>| {
-            session
-                .as_ref()
-                .is_some_and(|session| current_sessions.contains(session))
-        };
-
-        let mut retained = BTreeMap::new();
-        // Surviving retentions: still no reported agent, pane still present,
-        // and the session not reported anywhere current (a moved session is
-        // current elsewhere, never retained as "not observed").
-        for (pane_id, entry) in std::mem::take(&mut self.retained) {
-            let agent_reported = observation.agent_on_pane(&pane_id).is_some();
-            let pane_present = observation.pane(&pane_id).is_some();
-            if !agent_reported && pane_present && !session_is_current(&entry.observation.session) {
-                retained.insert(pane_id, entry);
-            }
-        }
-        // New retentions: agents that were current in the previous inventory,
-        // are gone from this one, and whose pane lives on.
-        if let Some(previous) = previous {
-            for agent in &previous.agents {
-                let pane_id = &agent.location.pane_id;
-                if observation.agent_on_pane(pane_id).is_some()
-                    || observation.pane(pane_id).is_none()
-                    || session_is_current(&agent.session)
-                {
-                    continue;
-                }
-                retained
-                    .entry(pane_id.clone())
-                    .or_insert_with(|| RetainedAgent {
-                        observation: agent.clone(),
-                        basis: RetentionBasis::Unverified,
-                    });
-            }
-        }
-
-        self.awaiting_evidence = retained.keys().cloned().collect();
-        self.retained = retained;
         // Evidence belongs to the inventory that was just replaced: a pane that
         // is gone takes its process with it, and the refresh re-queries what is
         // left.
@@ -186,15 +168,20 @@ impl ObservationState {
         match evidence {
             ForegroundEvidence::NonShell { .. } => {
                 self.retained.remove(pane_id);
+                self.containment.remove(pane_id);
             }
             ForegroundEvidence::Shell => {
-                if let Some(entry) = self.retained.get_mut(pane_id) {
-                    entry.basis = RetentionBasis::ShellForeground;
+                for map in [&mut self.retained, &mut self.containment] {
+                    if let Some(entry) = map.get_mut(pane_id) {
+                        entry.basis = RetentionBasis::ShellForeground;
+                    }
                 }
             }
             ForegroundEvidence::Inconclusive => {
-                if let Some(entry) = self.retained.get_mut(pane_id) {
-                    entry.basis = RetentionBasis::Unverified;
+                for map in [&mut self.retained, &mut self.containment] {
+                    if let Some(entry) = map.get_mut(pane_id) {
+                        entry.basis = RetentionBasis::Unverified;
+                    }
                 }
             }
         }
@@ -210,9 +197,16 @@ impl ObservationState {
         &self.source
     }
 
-    /// Retained associations keyed by pane id (empty when nothing is retained).
+    /// Retained presented agents keyed by pane id, for display (empty when
+    /// nothing is retained). Herdr metadata never appears here.
     pub fn retained(&self) -> &BTreeMap<String, RetainedAgent> {
         &self.retained
+    }
+
+    /// Retained associations for close containment, keyed by pane id. Read by
+    /// the close guard only; a display must use [`Self::retained`].
+    pub fn retained_containment(&self) -> &BTreeMap<String, RetainedAgent> {
+        &self.containment
     }
 
     /// The pane ids the current inventory reports, which is what a whole-fleet
@@ -258,13 +252,69 @@ impl ObservationState {
         if let Some(inventory) = &self.inventory {
             candidates.extend(
                 inventory
-                    .agents
-                    .iter()
+                    .all_agents()
                     .map(|agent| agent.location.pane_id.clone()),
             );
         }
         candidates.into_iter().collect()
     }
+}
+
+/// The retentions that survive one inventory, plus those newly retained from
+/// the previous one.
+///
+/// `previous` and `current` are the records a caller counts as agents for its
+/// purpose, and the sessions reported by `current` decide whether a moved
+/// session is retained. A retained pane must still exist and have no record in
+/// `current`.
+fn reconcile<'a>(
+    existing: BTreeMap<String, RetainedAgent>,
+    previous: impl Iterator<Item = &'a AgentObservation>,
+    current: impl Iterator<Item = &'a AgentObservation>,
+    observation: &FleetObservation,
+) -> BTreeMap<String, RetainedAgent> {
+    let current: Vec<&AgentObservation> = current.collect();
+    let current_sessions: Vec<SessionIdentity> = current
+        .iter()
+        .filter_map(|agent| agent.session.clone())
+        .collect();
+    let session_is_current = |session: &Option<SessionIdentity>| {
+        session
+            .as_ref()
+            .is_some_and(|session| current_sessions.contains(session))
+    };
+    let reported_on = |pane_id: &str| current.iter().any(|a| a.location.pane_id == pane_id);
+
+    let mut retained = BTreeMap::new();
+    // Surviving retentions: still no reported agent, pane still present, and
+    // the session not reported anywhere current (a moved session is current
+    // elsewhere, never retained as "not observed").
+    for (pane_id, entry) in existing {
+        if !reported_on(&pane_id)
+            && observation.pane(&pane_id).is_some()
+            && !session_is_current(&entry.observation.session)
+        {
+            retained.insert(pane_id, entry);
+        }
+    }
+    // New retentions: agents that were current in the previous inventory, are
+    // gone from this one, and whose pane lives on.
+    for agent in previous {
+        let pane_id = &agent.location.pane_id;
+        if reported_on(pane_id)
+            || observation.pane(pane_id).is_none()
+            || session_is_current(&agent.session)
+        {
+            continue;
+        }
+        retained
+            .entry(pane_id.clone())
+            .or_insert_with(|| RetainedAgent {
+                observation: agent.clone(),
+                basis: RetentionBasis::Unverified,
+            });
+    }
+    retained
 }
 
 #[cfg(test)]
@@ -303,11 +353,13 @@ mod tests {
                 parent: None,
             }),
             facts: crate::model::HerdsmanFacts::default(),
+            registry: None,
         }
     }
 
     fn observation(pane_ids: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
         FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![],
             tabs: vec![],
             panes: pane_ids

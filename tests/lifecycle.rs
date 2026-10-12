@@ -81,6 +81,7 @@ impl FakeRuntime {
                     managed_metadata: *managed,
                     ..HerdsmanFacts::default()
                 },
+                registry: None,
             }],
             Answer::Session { value } => vec![AgentObservation {
                 location: location.clone(),
@@ -93,10 +94,12 @@ impl FakeRuntime {
                 }),
                 lineage: None,
                 facts: HerdsmanFacts::default(),
+                registry: None,
             }],
             _ => Vec::new(),
         };
         FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: Vec::new(),
             tabs: vec![Tab {
                 tab_id: "wA:t1".into(),

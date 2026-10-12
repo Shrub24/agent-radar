@@ -20,16 +20,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use agent_radar::control_plane::registry::{
-    AcquireRequest, Channel, ChildCloseRequest, CloseAdmission, CloseIntent, CloseOutcome,
-    CloseResult, ContextRequest, ContextValue, ExpectedWriter, Freshness, LaunchSession,
-    LaunchSpec, LocalProcfsVerifier, LocationEvidence, MAX_CHILD_CLOSE_BYTES, MAX_CONTEXT_BYTES,
-    MAX_LISTED, MAX_REGISTRATION_BYTES, MAX_SPAWN_BYTES, MAX_TEXT_BYTES, Outcome,
-    ProcessVerification, ProcessVerifier, PublicChannel, PublicContext, PublishRequest,
-    PublisherIdentity, RegistrationRequest, Registry, RegistryLocation, Snapshot, SpawnBindRequest,
-    SpawnEdge, SpawnRequest, SpawnState, WriterBinding,
+    AcquireRequest, Channel, ChannelRecord, ChildCloseRequest, CloseAdmission, CloseIntent,
+    CloseOutcome, CloseResult, ContextRequest, ContextValue, ExpectedWriter, Freshness,
+    LaunchSession, LaunchSpec, LocalProcfsVerifier, LocationEvidence, MAX_CHILD_CLOSE_BYTES,
+    MAX_CONTEXT_BYTES, MAX_LISTED, MAX_REGISTRATION_BYTES, MAX_SPAWN_BYTES, MAX_TEXT_BYTES,
+    Outcome, ProcessVerification, ProcessVerifier, PublicChannel, PublicContext, PublishRequest,
+    PublisherIdentity, RegistrationRequest, Registry, RegistryLocation, Report, Snapshot,
+    SpawnBindRequest, SpawnEdge, SpawnRequest, SpawnState, WriterBinding,
 };
 use agent_radar::control_plane::{RequestOutcome, random_uuid};
 use agent_radar::model::{ProcessIdentity, SessionUuid};
+use serde_json::{Value, json};
 
 const INCARNATION: &str = "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22";
 const OTHER_INCARNATION: &str = "1c2d3e4f-5678-4abc-9def-0123456789ab";
@@ -661,7 +662,24 @@ fn channel_request(
         sequence,
         lease_ms: Some(10_000),
         observed_at: Some("2001-01-01T00:00:00.000Z".into()),
-        snapshot,
+        snapshot: Report::Execution(snapshot),
+    }
+}
+
+/// The activity an execution or assignment report carries.
+fn activity(report: &Report) -> &str {
+    match report {
+        Report::Execution(snapshot) => &snapshot.activity,
+        Report::Assignment(snapshot) => &snapshot.activity,
+        Report::Facts(_) => panic!("a facts snapshot has no activity"),
+    }
+}
+
+fn outcome(report: &Report) -> Option<&Outcome> {
+    match report {
+        Report::Execution(snapshot) => snapshot.last_outcome.as_ref(),
+        Report::Assignment(snapshot) => snapshot.last_outcome.as_ref(),
+        Report::Facts(_) => panic!("a facts snapshot has no outcome"),
     }
 }
 
@@ -728,24 +746,14 @@ fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
             1_002,
         )
         .expect("assignment report");
+    let execution = &execution.snapshot.as_ref().unwrap().snapshot;
+    assert_eq!(activity(execution), "idle");
     assert_eq!(
-        execution.snapshot.as_ref().unwrap().snapshot.activity,
-        "idle"
-    );
-    assert_eq!(
-        execution
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .snapshot
-            .last_outcome
-            .as_ref()
-            .unwrap()
-            .result,
+        outcome(execution).expect("an outcome").result,
         "failed-tool-timeout"
     );
     assert_eq!(
-        assignment.snapshot.as_ref().unwrap().snapshot.activity,
+        activity(&assignment.snapshot.as_ref().unwrap().snapshot),
         "assignment-open"
     );
 
@@ -832,7 +840,7 @@ fn sequence_replay_conflicts_and_daemon_clock_expiry_are_distinct() {
         "equal replay cannot refresh"
     );
     let mut conflict = first_request.clone();
-    conflict.snapshot = channel_snapshot("idle", None);
+    conflict.snapshot = Report::Execution(channel_snapshot("idle", None));
     assert!(
         registry
             .publish(&conflict, 9_001)
@@ -937,7 +945,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
     assert_eq!(snapshot.generation, old.generation);
     assert_eq!(snapshot.source, first.writer.source);
     assert_eq!(snapshot.sequence, 1);
-    assert_eq!(snapshot.snapshot.activity, "working");
+    assert_eq!(activity(&snapshot.snapshot), "working");
     assert_eq!(snapshot.freshness, Freshness::Stale);
 
     assert!(
@@ -3837,4 +3845,327 @@ fn a_malformed_or_symlinked_or_oversized_child_close_is_not_read() {
     assert!(error.contains("exceeds"), "{error}");
     drop_root(&root);
     drop_root(&elsewhere);
+}
+
+// --- Facts and owner assignment ---------------------------------------------------
+
+/// A publish decoded from its wire form, exactly as the socket decodes it.
+fn publish_wire(registry: &Registry, wire: Value, now_ms: i64) -> Result<ChannelRecord, String> {
+    let request: PublishRequest =
+        serde_json::from_value(wire).map_err(|error| error.to_string())?;
+    registry.publish(&request, now_ms)
+}
+
+fn facts_wire(agent_id: &str, handle: &str, sequence: u64, snapshot: Value) -> Value {
+    json!({
+        "agent_id": agent_id, "channel": "facts", "writer_handle": handle,
+        "sequence": sequence, "lease_ms": 10_000, "snapshot": snapshot
+    })
+}
+
+#[test]
+fn facts_publish_without_an_owner_and_never_touch_execution() {
+    let root = temp_root("facts-ordinary");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let writer = acquire(
+        &registry,
+        &agent.agent_id,
+        Channel::Facts,
+        publisher("pi", OTHER_INCARNATION),
+        1_000,
+    )
+    .expect("a facts writer needs no owner");
+    publish_wire(
+        &registry,
+        facts_wire(
+            &agent.agent_id,
+            &writer.handle,
+            1,
+            json!({
+                "model": "claude-x", "provider": "anthropic", "thinking": "high",
+                "context_usage": "42%", "session_name": "review",
+                "background_tasks": [{"id": "task-1", "phase": "running"}],
+                "background_started_unix_ms": 900
+            }),
+        ),
+        1_001,
+    )
+    .expect("an ordinary session's facts report");
+
+    let facts = registry
+        .published(&agent.agent_id, Channel::Facts, 1_002)
+        .expect("a read")
+        .expect("a facts channel");
+    let snapshot = facts.snapshot.expect("an accepted facts snapshot");
+    assert_eq!(snapshot.source, "pi");
+    assert_eq!(snapshot.freshness, Freshness::Fresh);
+    let Report::Facts(fields) = snapshot.snapshot else {
+        panic!("a facts channel carries a facts snapshot");
+    };
+    assert_eq!(fields.model.as_deref(), Some("claude-x"));
+    assert_eq!(fields.background_tasks[0].id, "task-1");
+    assert!(
+        registry
+            .published(&agent.agent_id, Channel::Execution, 1_002)
+            .expect("a read")
+            .is_none(),
+        "facts never create or alter execution"
+    );
+    drop_root(&root);
+}
+
+#[test]
+fn facts_schema_is_strict_and_a_refused_report_keeps_the_prior_snapshot() {
+    let root = temp_root("facts-strict");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let writer = acquire(
+        &registry,
+        &agent.agent_id,
+        Channel::Facts,
+        publisher("pi", OTHER_INCARNATION),
+        1_000,
+    )
+    .expect("a facts writer");
+    publish_wire(
+        &registry,
+        facts_wire(&agent.agent_id, &writer.handle, 1, json!({"model": "m1"})),
+        1_001,
+    )
+    .expect("the accepted facts");
+
+    let too_many: Vec<Value> = (0..65)
+        .map(|index| json!({"id": format!("t{index}"), "phase": "running"}))
+        .collect();
+    let refused = [
+        json!({"model": "m2", "unknown": true}),
+        json!({"background_tasks": [{"id": "t", "phase": "p", "extra": 1}]}),
+        json!({"background_started_unix_ms": -1}),
+        json!({"activity": "idle"}),
+        json!({"awaited": ["child"]}),
+        json!({"background_tasks": too_many}),
+        json!({"background_tasks": [{"id": "t", "phase": "p"}, {"id": "t", "phase": "q"}]}),
+    ];
+    for snapshot in refused {
+        assert!(
+            publish_wire(
+                &registry,
+                facts_wire(&agent.agent_id, &writer.handle, 2, snapshot.clone()),
+                1_002,
+            )
+            .is_err(),
+            "refused facts: {snapshot}"
+        );
+    }
+
+    let prior = registry
+        .published(&agent.agent_id, Channel::Facts, 1_003)
+        .expect("a read")
+        .expect("a facts channel")
+        .snapshot
+        .expect("the prior snapshot");
+    assert_eq!(prior.sequence, 1, "a refused report consumes no sequence");
+    let Report::Facts(fields) = prior.snapshot else {
+        panic!("a facts snapshot");
+    };
+    assert_eq!(fields.model.as_deref(), Some("m1"));
+    publish_wire(
+        &registry,
+        facts_wire(&agent.agent_id, &writer.handle, 2, json!({"model": "m3"})),
+        1_004,
+    )
+    .expect("the writer still reports at the next sequence");
+    drop_root(&root);
+}
+
+#[test]
+fn owner_assignment_fields_extend_only_the_assignment_channel() {
+    let root = temp_root("assignment-extension");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let execution = acquire(
+        &registry,
+        &agent.agent_id,
+        Channel::Execution,
+        publisher("child", OTHER_INCARNATION),
+        1_000,
+    )
+    .expect("an execution writer");
+    publish_wire(
+        &registry,
+        json!({"agent_id": agent.agent_id, "channel": "execution", "writer_handle": execution.handle,
+               "sequence": 1, "snapshot": {"activity": "working"}}),
+        1_001,
+    )
+    .expect("execution report");
+    let owner = PublisherIdentity {
+        source: "herdsman-owner".into(),
+        incarnation: OWNER_INCARNATION.into(),
+        reporting_owner: Some("lead-owner".into()),
+    };
+    let assignment = acquire(
+        &registry,
+        &agent.agent_id,
+        Channel::Assignment,
+        owner,
+        1_000,
+    )
+    .expect("an owner assignment writer");
+    publish_wire(
+        &registry,
+        json!({"agent_id": agent.agent_id, "channel": "assignment", "writer_handle": assignment.handle,
+               "sequence": 1, "snapshot": {
+                   "activity": "assignment-open", "role": "worker", "definition": "pi-worker",
+                   "run": "run-7", "request": "req-3", "assignment": "Fix the parser",
+                   "assigned_started_unix_ms": 1000, "awaited": ["child-a", "child-b"],
+                   "ask": "approve the merge?"
+               }}),
+        1_002,
+    )
+    .expect("owner assignment with owner-only fields");
+
+    let view = registry
+        .published(&agent.agent_id, Channel::Assignment, 1_003)
+        .expect("a read")
+        .expect("an assignment channel")
+        .snapshot
+        .expect("an assignment snapshot");
+    assert_eq!(view.reporting_owner.as_deref(), Some("lead-owner"));
+    let Report::Assignment(fields) = view.snapshot else {
+        panic!("an assignment channel carries an assignment snapshot");
+    };
+    assert_eq!(fields.awaited, ["child-a", "child-b"]);
+    assert_eq!(fields.ask.as_deref(), Some("approve the merge?"));
+
+    let execution_view = registry
+        .published(&agent.agent_id, Channel::Execution, 1_003)
+        .expect("a read")
+        .expect("an execution channel")
+        .snapshot
+        .expect("an execution snapshot");
+    assert_eq!(activity(&execution_view.snapshot), "working");
+    assert_eq!(execution_view.sequence, 1);
+
+    let owner_field_on_execution = publish_wire(
+        &registry,
+        json!({"agent_id": agent.agent_id, "channel": "execution", "writer_handle": execution.handle,
+               "sequence": 2, "snapshot": {"activity": "idle", "awaited": ["x"]}}),
+        1_004,
+    );
+    assert!(
+        owner_field_on_execution.is_err(),
+        "assignment-only fields are refused on execution"
+    );
+    let still_working = registry
+        .published(&agent.agent_id, Channel::Execution, 1_005)
+        .expect("a read")
+        .expect("an execution channel")
+        .snapshot
+        .expect("an execution snapshot");
+    assert_eq!(activity(&still_working.snapshot), "working");
+
+    publish_wire(
+        &registry,
+        json!({"agent_id": agent.agent_id, "channel": "assignment", "writer_handle": assignment.handle,
+               "sequence": 2, "snapshot": {"activity": "settled"}}),
+        1_006,
+    )
+    .expect("a plain assignment report");
+    let plain = registry
+        .published(&agent.agent_id, Channel::Assignment, 1_007)
+        .expect("a read")
+        .expect("an assignment channel")
+        .snapshot
+        .expect("an assignment snapshot");
+    let Report::Assignment(plain) = plain.snapshot else {
+        panic!("an assignment snapshot");
+    };
+    assert!(
+        plain.awaited.is_empty() && plain.ask.is_none(),
+        "omitted owner fields withdraw"
+    );
+    drop_root(&root);
+}
+
+#[test]
+fn restored_facts_are_stale_and_a_successor_withdraws_what_it_omits() {
+    const SUCCESSOR: &str = "4c2d3e4f-5678-4abc-9def-0123456789ab";
+    let root = temp_root("facts-restart");
+    let registry = Registry::open_at(&root, 1_000).expect("a registry");
+    let agent = registry_agent(&registry, INCARNATION, None);
+    let writer = acquire(
+        &registry,
+        &agent.agent_id,
+        Channel::Facts,
+        publisher("pi", OTHER_INCARNATION),
+        1_000,
+    )
+    .expect("a facts writer");
+    publish_wire(
+        &registry,
+        facts_wire(
+            &agent.agent_id,
+            &writer.handle,
+            1,
+            json!({"model": "m1", "session_name": "s1"}),
+        ),
+        1_001,
+    )
+    .expect("the first facts report");
+    drop(registry);
+
+    let restarted = Registry::open_at(&root, 2_000).expect("a restarted registry");
+    let restored = restarted
+        .published(&agent.agent_id, Channel::Facts, 2_000)
+        .expect("a read")
+        .expect("a facts channel")
+        .snapshot
+        .expect("the restored snapshot");
+    assert_eq!(
+        restored.freshness,
+        Freshness::Stale,
+        "restored facts are stale"
+    );
+    assert!(restored.restored);
+
+    restarted
+        .retire(&agent.agent_id, Channel::Facts, &writer.handle, 2_000)
+        .expect("retire the incumbent");
+    let successor = replace(
+        &restarted,
+        &agent.agent_id,
+        Channel::Facts,
+        publisher("pi", SUCCESSOR),
+        &writer,
+        2_001,
+    )
+    .expect("an explicit replacement");
+    publish_wire(
+        &restarted,
+        facts_wire(
+            &agent.agent_id,
+            &successor.handle,
+            1,
+            json!({"session_name": "s2"}),
+        ),
+        2_002,
+    )
+    .expect("the successor's facts");
+    let current = restarted
+        .published(&agent.agent_id, Channel::Facts, 2_003)
+        .expect("a read")
+        .expect("a facts channel")
+        .snapshot
+        .expect("the successor snapshot");
+    assert_eq!(
+        current.incarnation, SUCCESSOR,
+        "provenance is the successor's"
+    );
+    let Report::Facts(fields) = current.snapshot else {
+        panic!("a facts snapshot");
+    };
+    assert_eq!(fields.model, None, "the omitted model is withdrawn");
+    assert_eq!(fields.session_name.as_deref(), Some("s2"));
+    drop_root(&root);
 }

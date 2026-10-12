@@ -220,6 +220,7 @@ impl RuntimeProvider for GatedBackend {
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: Vec::new(),
             tabs: Vec::new(),
             panes: Vec::new(),
@@ -260,6 +261,7 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
         pane_id: pane_id.into(),
     };
     FleetObservation {
+        metadata_agents: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: None,
@@ -293,6 +295,7 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
                         managed_metadata: managed,
                         ..Default::default()
                     },
+                    registry: None,
                 })
             })
             .collect(),
@@ -447,6 +450,7 @@ fn advertised(backend: &[&str]) -> Value {
     let serves = |needed: &[&str]| needed.iter().all(|name| backend.contains(name));
     for (contract, needed) in [
         ("registry.v1", &[][..]),
+        ("registry.facts.v1", &[][..]),
         ("events.v1", &[][..]),
         ("spawn.v1", &["mux.create", "mux.launch"][..]),
         ("spawn.close.v1", &["mux.observe", "mux.close"][..]),
@@ -708,6 +712,7 @@ impl MuxBackend {
             report: self.report.clone(),
             launch: self.launch.clone(),
             inventory: FleetObservation {
+                metadata_agents: Vec::new(),
                 workspaces: Vec::new(),
                 tabs: Vec::new(),
                 panes: panes
@@ -1195,6 +1200,7 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
         pane_id: "wA:p1".into(),
     };
     let inventory = FleetObservation {
+        metadata_agents: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: Some("main".into()),
@@ -1223,6 +1229,7 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
                 awaited: vec!["agent:peer".into()],
                 ..HerdsmanFacts::default()
             },
+            registry: None,
         }],
     };
     let evidence = ForegroundEvidence::NonShell {
@@ -1392,6 +1399,47 @@ fn socket_agent_get(path: &Path, agent_id: &str) -> Value {
     } else {
         serde_json::from_str(&line).expect("daemon response")
     }
+}
+
+/// `agent.get` serves the claimed birth identity exactly, and no `claim` key at
+/// all when nothing was claimed. Pane matching depends on the exact tuple.
+#[test]
+fn agent_get_serves_the_claimed_birth_identity_only_when_claimed() {
+    let sandbox = Sandbox::new("agent-claim");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let process = ProcessIdentity {
+        boot_id: "boot-claim".into(),
+        pid: 5151,
+        start_ticks: 77,
+    };
+    let claimed = client.call(
+        "agent.register",
+        registration_body(
+            "6a2f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
+            Some(process.clone()),
+            None,
+        ),
+    );
+    let claimed_id = agent_id(&claimed);
+    let unclaimed = client.call(
+        "agent.register",
+        registration_body("7b3f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
+    );
+    let unclaimed_id = agent_id(&unclaimed);
+
+    let served = client.call("agent.get", json!({"agent_id": claimed_id}));
+    assert_eq!(
+        served["result"]["agent"]["process"]["claim"],
+        json!({"boot_id": "boot-claim", "pid": 5151, "start_ticks": 77}),
+        "{served}"
+    );
+    let absent = client.call("agent.get", json!({"agent_id": unclaimed_id}));
+    assert!(
+        absent["result"]["agent"]["process"].get("claim").is_none(),
+        "{absent}"
+    );
+    daemon.stop();
 }
 
 #[test]
@@ -4087,6 +4135,72 @@ fn a_managed_pane_close_is_refused_before_the_backend_is_asked() {
     daemon.stop();
 }
 
+/// A registration made after the operator's snapshot and confirmation still
+/// protects its pane and its tab: the daemon re-reads the registry before it
+/// dispatches a generic close, and the backend is never asked.
+#[test]
+fn a_registration_made_after_confirmation_blocks_pane_and_tab_close() {
+    let sandbox = Sandbox::new("close-registered");
+    let inventory = close_inventory("wA:t1", &[("wA:p1", None), ("wA:p2", None)]);
+    let backend = CloseBackend::new(Ok(inventory.clone()), CloseAnswer::Completed);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    // The operator's frozen identities are taken before the registration exists.
+    let pane = CloseTarget::Pane("wA:p1".into());
+    let tab = CloseTarget::Tab("wA:t1".into());
+    let frozen = [
+        (pane.clone(), frozen_from(&inventory, pane.clone())),
+        (tab.clone(), frozen_from(&inventory, tab.clone())),
+    ];
+
+    let mut body = registration_body(PARENT_INCARNATION, None, None);
+    body["location"] = json!({
+        "backend": "herdr",
+        "workspace": "wA",
+        "tab": "wA:t1",
+        "pane": "wA:p1",
+    });
+    let registered = client.call("agent.register", body);
+    assert!(registered.get("result").is_some(), "{registered}");
+
+    for (target, request) in frozen {
+        let response = client.call("mux.close", request);
+        assert_eq!(result_record(&response)["outcome"], "refused", "{response}");
+        assert!(
+            !backend.told_to_close(&target),
+            "{target:?} was dispatched past its registration"
+        );
+    }
+    daemon.stop();
+}
+
+/// A registry that cannot be read refuses a generic close outright: with no
+/// answer about registrations, the pane might be an agent's, so the backend is
+/// never asked.
+#[test]
+fn an_unreadable_registry_refuses_a_generic_pane_close() {
+    let sandbox = Sandbox::new("close-unreadable-registry");
+    let inventory = close_inventory("wA:t1", &[("wA:p1", None)]);
+    let backend = CloseBackend::new(Ok(inventory.clone()), CloseAnswer::Completed);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    // The registry directory is replaced by a file, so every registry read fails.
+    let agents = sandbox.state().join("agents");
+    fs::remove_dir_all(&agents).expect("remove the registry directory");
+    fs::write(&agents, b"").expect("replace it with a file");
+
+    let target = CloseTarget::Pane("wA:p1".into());
+    let response = client.call("mux.close", frozen_from(&inventory, target.clone()));
+    assert_eq!(result_record(&response)["outcome"], "refused", "{response}");
+    assert!(
+        !backend.told_to_close(&target),
+        "the backend was asked despite an unreadable registry"
+    );
+    daemon.stop();
+}
+
 /// One managed member is enough: a tab is refused whole rather than closed
 /// around the pane its owner is using.
 #[test]
@@ -6329,6 +6443,7 @@ fn a_populated_normalized_graph_round_trips_including_unknown_states() {
 /// An empty normalized inventory, for backends that only exercise one path.
 fn empty_inventory() -> FleetObservation {
     FleetObservation {
+        metadata_agents: Vec::new(),
         workspaces: Vec::new(),
         tabs: Vec::new(),
         panes: Vec::new(),
@@ -7182,7 +7297,10 @@ fn an_uncertain_daemon_close_is_never_retried_through_direct_herdr() {
         identity: lifecycle::identity(&inventory, &target),
     };
     let cancel = AtomicBool::new(false);
-    let outcome = lifecycle::close_unmanaged(selection.provider.as_ref(), &request, &cancel);
+    let outcome =
+        lifecycle::close_unmanaged(selection.provider.as_ref(), &request, &cancel, || {
+            Ok(Vec::new())
+        });
     assert!(
         matches!(outcome, lifecycle::DirectClose::Unknown(_)),
         "{outcome:?}"
@@ -7248,4 +7366,62 @@ fn the_handshake_names_the_wired_backend_and_its_instance() {
     let client = DaemonRuntime::handshake(daemon.path()).expect("the handshake passes");
     assert_eq!(client.identity(), BackendIdentity::tmux("work"));
     daemon.stop();
+}
+
+#[test]
+fn socket_facts_and_owner_assignment_are_read_separately_with_identifier_only_pointers() {
+    let sandbox = Sandbox::new("facts-socket");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let registered = client.call(
+        "agent.register",
+        registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
+    );
+    let id = agent_id(&registered);
+    let model = "private-model-name";
+    let handle = client.call(
+        "agent.acquire",
+        json!({"agent_id":id,"channel":"facts","publisher":{"source":"pi","incarnation":"3c2d3e4f-5678-4abc-9def-0123456789ab"}}),
+    )["result"]["writer"]["handle"]
+        .as_str()
+        .expect("facts writer handle")
+        .to_owned();
+    let published = client.call(
+        "agent.publish",
+        json!({"agent_id":id,"channel":"facts","writer_handle":handle,"sequence":1,
+               "snapshot":{"model":model,"background_tasks":[{"id":"t1","phase":"running"}]}}),
+    );
+    assert!(published["result"].is_object(), "{published}");
+
+    let got = client.call("agent.get", json!({"agent_id":id}));
+    let facts = &got["result"]["agent"]["facts"];
+    assert_eq!(facts["snapshot"]["freshness"], "fresh");
+    assert_eq!(facts["snapshot"]["source"], "pi");
+    assert_eq!(facts["snapshot"]["snapshot"]["model"], model);
+    assert!(facts["writer"].get("handle").is_none(), "{facts}");
+    assert!(facts["snapshot"].get("handle").is_none(), "{facts}");
+    assert!(got["result"]["agent"]["execution"].is_null());
+
+    let listed = client.call("agent.list", json!({}));
+    let entry = listed["result"]["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .find(|agent| agent["registration"]["agent_id"] == id)
+        .expect("the registered agent in the list");
+    assert_eq!(entry["facts"]["snapshot"]["snapshot"]["model"], model);
+    daemon.stop();
+
+    let journal: Value = serde_json::from_slice(
+        &fs::read(sandbox.state().join("events.json")).expect("journal file"),
+    )
+    .expect("journal JSON");
+    let event = journal["events"]
+        .as_array()
+        .expect("events")
+        .last()
+        .expect("an event");
+    assert_eq!(event["kind"], "facts.published");
+    assert_eq!(event["agent_id"], id);
+    assert!(!serde_json::to_string(event).unwrap().contains(model));
 }

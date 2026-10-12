@@ -139,7 +139,9 @@ pub fn targets(tree: &FleetTree, state: &ObservationState) -> HashMap<RowId, Tar
             inventory
                 .agents
                 .iter()
-                .map(|agent| agent.location.workspace_id.as_str()),
+                .map(|agent| agent.location.workspace_id.as_str())
+                // An agent that reports no workspace names none to focus.
+                .filter(|workspace_id| !workspace_id.is_empty()),
         )
         .collect();
 
@@ -154,7 +156,7 @@ pub fn targets(tree: &FleetTree, state: &ObservationState) -> HashMap<RowId, Tar
                 RowKind::Workspace { workspace_id, .. } if workspaces.contains(&**workspace_id) => {
                     Some(Target::Workspace(workspace_id.clone()))
                 }
-                RowKind::Agent(agent) if panes.contains(&*agent.pane_id) => {
+                RowKind::Agent(agent) if agent.joined() && panes.contains(&*agent.pane_id) => {
                     Some(Target::Pane(agent.pane_id.clone()))
                 }
                 RowKind::Pane(pane) if panes.contains(&*pane.pane_id) => {

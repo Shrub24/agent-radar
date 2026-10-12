@@ -105,6 +105,7 @@ fn managed_inventory() -> FleetObservation {
     let session = SessionUuid::parse(SESSION).expect("a UUID");
     let owner = SessionUuid::parse(OWNER).expect("a UUID");
     FleetObservation {
+        metadata_agents: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: Some("main".into()),
@@ -138,6 +139,7 @@ fn managed_inventory() -> FleetObservation {
                 state: Some(agent_radar::model::SemanticState::Idle),
                 ..HerdsmanFacts::default()
             },
+            registry: None,
         }],
     }
 }

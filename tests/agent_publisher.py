@@ -37,10 +37,11 @@ def fixture_pairs():
     check(len(rows) % 2 == 0, "fixture must contain request/response pairs")
     pairs = list(zip(rows[::2], rows[1::2]))
     expected = ["agent.register", "events.read", "events.read", "events.read",
-                "agent.acquire", "agent.publish", "agent.context", "agent.context",
-                "agent.context", "agent.context", "agent.get", "agent.list", "agent.context",
-                "agent.retire", "spawn.create", "agent.register", "spawn.get", "spawn.list",
-                "spawn.create", "spawn.close", "spawn.close"]
+                "agent.acquire", "agent.publish", "agent.acquire", "agent.publish",
+                "agent.acquire", "agent.publish", "agent.publish", "agent.context",
+                "agent.context", "agent.context", "agent.context", "agent.get", "agent.list",
+                "agent.context", "agent.retire", "spawn.create", "agent.register", "spawn.get",
+                "spawn.list", "spawn.create", "spawn.close", "spawn.close"]
     actual = []
     for request, response in pairs:
         check(request["kind"] == "request" and response["kind"] == "response",
@@ -68,7 +69,7 @@ def fixture_pairs():
 def validate_fixture(path):
     """Run registry exchanges and compare stable response schema/content live."""
     pairs = fixture_pairs()
-    handles, agent_id = {}, None
+    handles, agent_id = {}, None  # handles are keyed by writer channel, or "context"
     previous_context = None
     event_epoch = None
     get_template = next(response["result"]["agent"] for request, response in pairs
@@ -107,7 +108,7 @@ def validate_fixture(path):
         if method in ("agent.acquire", "agent.publish", "agent.context", "agent.get", "agent.retire"):
             params["agent_id"] = agent_id
         if method == "agent.publish":
-            params["writer_handle"] = handles["assignment"]
+            params["writer_handle"] = handles[params["channel"]]
         if method == "agent.retire":
             params["writer_handle"] = handles["assignment"]
         if method == "agent.context" and params.get("writer_handle") == "<opaque-uuid>":
@@ -117,6 +118,15 @@ def validate_fixture(path):
             # The fixture uses a 1s incumbent lease so this validates the
             # documented expiry-gated replacement without inventing retire API.
             time.sleep(1.05)
+        if method == "agent.acquire" and "replace" in params:
+            # The facts incumbent has a 1s lease, so replacement waits for its
+            # expiry. Each channel expires on its own clock: the assignment
+            # channel, with a longer lease, stays fresh meanwhile.
+            time.sleep(1.05)
+            params["replace"]["handle"] = handles[params["channel"]]
+            before = get_agent(path, agent_id)
+            check(before["facts"]["snapshot"]["freshness"] == "stale", str(before))
+            check(before["assignment"]["snapshot"]["freshness"] == "fresh", str(before))
         actual = call(path, method, params)
         expected = json.loads(json.dumps(response["result"]))
         if method == "agent.register":
@@ -125,16 +135,18 @@ def validate_fixture(path):
             expected["registration"]["registered_at"] = actual["registration"]["registered_at"]
             expected["registration"]["session"] = actual["registration"]["session"]
         elif method == "agent.acquire":
-            handles["assignment"] = actual["writer"]["handle"]
-            expected["writer"]["handle"] = handles["assignment"]
+            handles[params["channel"]] = actual["writer"]["handle"]
+            expected["writer"]["handle"] = handles[params["channel"]]
         elif method == "agent.publish":
             channel = actual["channel"]
+            handle = handles[params["channel"]]
             expected["channel"]["agent_id"] = agent_id
-            expected["channel"]["writer"]["handle"] = handles["assignment"]
-            expected["channel"]["snapshot"]["handle"] = handles["assignment"]
+            expected["channel"]["writer"]["handle"] = handle
+            expected["channel"]["snapshot"]["handle"] = handle
             expected["channel"]["snapshot"]["received_at"] = channel["snapshot"]["received_at"]
             expected["channel"]["snapshot"]["expires_at"] = channel["snapshot"]["expires_at"]
-            check(channel["snapshot"]["lease_ms"] == publisher.DEFAULT_LEASE_MS, str(channel))
+            check(channel["snapshot"]["lease_ms"] == params.get("lease_ms", publisher.DEFAULT_LEASE_MS),
+                  str(channel))
         elif method == "agent.context":
             context = actual["context"]
             expected["context"]["writer"].pop("handle", None)
@@ -168,6 +180,9 @@ def validate_fixture(path):
             expected["agent"]["assignment"]["snapshot"].pop("handle", None)
             expected["agent"]["assignment"]["snapshot"]["received_at"] = actual["agent"]["assignment"]["snapshot"]["received_at"]
             expected["agent"]["assignment"]["snapshot"]["expires_at"] = actual["agent"]["assignment"]["snapshot"]["expires_at"]
+            expected["agent"]["facts"]["agent_id"] = agent_id
+            expected["agent"]["facts"]["snapshot"]["received_at"] = actual["agent"]["facts"]["snapshot"]["received_at"]
+            expected["agent"]["facts"]["snapshot"]["expires_at"] = actual["agent"]["facts"]["snapshot"]["expires_at"]
             expected["agent"]["context"]["context"]["received_at"] = actual["agent"]["context"]["context"]["received_at"]
             expected["agent"]["context"]["context"]["expires_at"] = actual["agent"]["context"]["context"]["expires_at"]
             expected["agent"]["context"]["context"]["freshness"] = actual["agent"]["context"]["context"]["freshness"]
@@ -183,6 +198,9 @@ def validate_fixture(path):
             expected_agent["context"]["context"]["received_at"] = actual["agents"][0]["context"]["context"]["received_at"]
             expected_agent["context"]["context"]["expires_at"] = actual["agents"][0]["context"]["context"]["expires_at"]
             expected_agent["context"]["context"]["freshness"] = actual["agents"][0]["context"]["context"]["freshness"]
+            expected_agent["facts"]["agent_id"] = agent_id
+            expected_agent["facts"]["snapshot"]["received_at"] = actual["agents"][0]["facts"]["snapshot"]["received_at"]
+            expected_agent["facts"]["snapshot"]["expires_at"] = actual["agents"][0]["facts"]["snapshot"]["expires_at"]
             expected_agent["context"]["agent_id"] = agent_id
             check(actual["agents"] == [expected_agent], f"fixture agent.list mismatch: {actual}")
             check(actual["next"] is None, str(actual))
@@ -197,6 +215,13 @@ def validate_fixture(path):
         check(actual == expected,
               f"fixture {method} differs from served response:\nactual={actual}\nexpected={expected}")
     check(agent_id is not None, "fixture did not register an agent")
+    # Facts publication appends identifier-only pointers, never the values it carries.
+    events = call(path, "events.read", {"after": 1, "limit": 500})["events"]
+    pointers = [event for event in events if event["kind"] == "facts.published"]
+    check(len(pointers) == 2, f"expected one pointer per accepted facts report: {events}")
+    check(all(set(event) == {"seq", "kind", "agent_id", "at"} and event["agent_id"] == agent_id
+              for event in pointers), f"facts pointer carries more than identifiers: {pointers}")
+    check("claude-opus-example" not in json.dumps(events), "facts value leaked into the journal")
     # The scripted-backend sequence below validates spawn wire shapes end to end.
 
 
@@ -330,6 +355,7 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
         check(listed["spawns"] == [get] and listed["next"] is None, str(listed))
         bound_child = get_agent(socket_path, get["bound"]["agent_id"])
         check(bound_child["execution"] is None, "binding must not imply execution readiness")
+        check(bound_child["facts"] is None, "a child that published no facts reads them as null")
         check(bound_child["registration"]["agent_id"] == child["agent_id"], str(bound_child))
         for channel, publisher_identity in (
             ("assignment", {"source": "fixture-owner", "incarnation": "9f8e7d6c-4321-4def-8abc-0123456789ab", "reporting_owner": "owner-smoke"}),
@@ -436,6 +462,14 @@ def main():
             check(get["registration"]["launch"] == {"available": True, "revision": "r1"}, str(get))
             check(get["assignment"]["snapshot"]["snapshot"] == snapshot, str(get))
             check(get["execution"] is None, "assignment merged into execution")
+            # Self facts need no owner and never reach execution or assignment.
+            facts = publisher.publish_facts(
+                socket_path, agent_id, {"source": "pi", "incarnation": "2d3e4f50-6789-4abc-8def-0123456789ab"},
+                {"model": "live-model", "session_name": "live"}, 1)
+            check(facts["snapshot"]["freshness"] == "fresh", str(facts))
+            live = get_agent(socket_path, agent_id)
+            check(live["facts"]["snapshot"]["snapshot"]["model"] == "live-model", str(live))
+            check(live["assignment"]["snapshot"]["snapshot"] == snapshot, "facts changed assignment")
 
             # Session switch uses the same context writer and generation, and
             # never republishes the immutable registration or private launch path.
@@ -503,6 +537,10 @@ def main():
             daemon = spawn_daemon(binary, socket_path, state_path)
             restored = get_agent(socket_path, agent_id)["assignment"]["snapshot"]
             check(restored["restored"] is True and restored["freshness"] == "stale", str(restored))
+            restored_facts = get_agent(socket_path, agent_id)["facts"]["snapshot"]
+            check(restored_facts["restored"] is True and restored_facts["freshness"] == "stale",
+                  str(restored_facts))
+            check(restored_facts["snapshot"]["model"] == "live-model", str(restored_facts))
             registered3 = call(socket_path, "agent.register", registration)["registration"]
             check(registered3["agent_id"] == agent_id, "restart changed registration identity")
             binding = call(socket_path, "agent.acquire", {

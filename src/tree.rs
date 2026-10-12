@@ -19,6 +19,7 @@ use crate::model::{
     AgentObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Pane, TerminalMode,
 };
 use crate::observation::{ObservationState, RetentionBasis};
+use crate::registry_observation::{Binding, RegistryView};
 
 /// A finished session, as its title survives on a pane's label.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +126,9 @@ pub enum RowId {
     Workspace(String),
     /// Agent row, keyed by its connector-scoped pane id.
     Agent(String),
+    /// An unresolved registration's row, keyed by its agent id: it has no pane
+    /// to key by, and two registrations may name the same reported pane.
+    Registered(String),
     /// Ordinary pane row, keyed by its connector-scoped pane id.
     Pane(String),
     /// Background-task row, keyed by owner, session and task id.
@@ -240,9 +244,21 @@ pub struct AgentRow {
     /// process was queried for this pane. `None` for a retained row (no live
     /// process to compare) and until a refresh has asked about the pane.
     pub foreground: Option<ForegroundEvidence>,
+    /// The registration this row presents, on the daemon path. Its binding says
+    /// whether the pane is proven; its channels carry each authority's freshness.
+    pub registry: Option<RegistryView>,
 }
 
 impl AgentRow {
+    /// Whether the row's pane is proven by an exact registration join. An
+    /// unresolved row keeps its reported location for display only: it names no
+    /// pane to focus or control, and takes no pane's foreground or tasks.
+    pub fn joined(&self) -> bool {
+        self.registry
+            .as_ref()
+            .is_none_or(|view| view.binding == Binding::Joined)
+    }
+
     /// How the foreground executable compares with the program installed now,
     /// when a live process was queried for this pane. A shell, an inconclusive
     /// foreground or no query at all yields nothing to claim.
@@ -361,7 +377,12 @@ impl FleetTree {
         let mut workspace_index: HashMap<&str, usize> = HashMap::new();
 
         for workspace_id in &workspace_ids {
-            let label = workspace_labels.get(workspace_id.as_str()).copied();
+            // A registration that reports no workspace is placed here, under a
+            // root that says so, rather than under a heading with no name.
+            let label = workspace_labels
+                .get(workspace_id.as_str())
+                .copied()
+                .or_else(|| workspace_id.is_empty().then_some("unplaced"));
             let mut agents: Vec<(TreeNode, Option<Lineage>)> = Vec::new();
 
             for agent in &inventory.agents {
@@ -369,16 +390,27 @@ impl FleetTree {
                     continue;
                 }
                 let pane_id = agent.location.pane_id.as_str();
-                if !claimed.insert(pane_id) {
+                // Only a joined agent owns its pane. An unresolved one claims
+                // nothing, so the pane it reported still shows its own row and
+                // two unresolved registrations on one pane both show.
+                let joined = agent
+                    .registry
+                    .as_ref()
+                    .is_none_or(|view| view.binding == Binding::Joined);
+                if joined && !claimed.insert(pane_id) {
                     continue; // duplicate agent record for an already-rowed pane
                 }
-                let pane = inventory.pane(pane_id);
+                let (pane, foreground) = if joined {
+                    (inventory.pane(pane_id), state.foreground(pane_id).cloned())
+                } else {
+                    (None, None)
+                };
                 agents.push((
                     agent_node(
                         agent,
                         None,
                         pane,
-                        state.foreground(pane_id).cloned(),
+                        foreground,
                         &workspace_labels,
                         &tab_labels,
                     ),
@@ -535,11 +567,22 @@ fn agent_node(
     tab_labels: &HashMap<&str, &str>,
 ) -> TreeNode {
     let location = &agent.location;
+    let registry = agent.registry.clone();
+    let id = match &registry {
+        Some(view) if view.binding != Binding::Joined => {
+            RowId::Registered(view.agent.registration.agent_id.clone())
+        }
+        _ => RowId::Agent(location.pane_id.clone()),
+    };
     // The name a row shows is what Herdsman publishes for this agent — a
     // managed worker's runtime label, a lead's session name — and only then
     // the reported title. Herdr writes the vendor's own mark and name into
     // that title and the row already draws the mark beside it, so only the
     // words are kept.
+    let fallback = match &id {
+        RowId::Registered(agent_id) => agent_id.clone(),
+        _ => location.pane_id.clone(),
+    };
     let raw = agent
         .facts
         .display_name()
@@ -547,7 +590,7 @@ fn agent_node(
         .or_else(|| agent.label.clone())
         .or_else(|| agent.name.clone())
         .or_else(|| pane.and_then(|pane| pane.display_name().map(str::to_string)))
-        .unwrap_or_else(|| location.pane_id.clone());
+        .unwrap_or(fallback);
     let displayed = crate::title::display(&raw, agent.name.as_deref());
     let title = crate::title::strip_workspace_suffix(
         &displayed,
@@ -558,7 +601,7 @@ fn agent_node(
     .to_string();
     TreeNode {
         row: TreeRow {
-            id: RowId::Agent(location.pane_id.clone()),
+            id,
             kind: RowKind::Agent(Box::new(AgentRow {
                 pane_id: location.pane_id.clone(),
                 workspace_id: location.workspace_id.clone(),
@@ -584,6 +627,7 @@ fn agent_node(
                 // say what a publisher is connected with.
                 tasks: TaskProjection::default(),
                 foreground,
+                registry,
             })),
         },
         children: Vec::new(),
@@ -599,6 +643,11 @@ fn attach_node_tasks(node: &mut TreeNode, bus: &BusState) {
     let RowKind::Agent(agent) = &node.row.kind else {
         return;
     };
+    // An unresolved row's pane is only where a registration reported it, so a
+    // bus session or token on that pane is not this row's task.
+    if !agent.joined() {
+        return;
+    }
     let projected = project_tasks(
         &agent.pane_id,
         agent.session_uuid.as_deref(),
@@ -982,8 +1031,10 @@ mod tests {
             }),
             lineage,
             facts: crate::model::HerdsmanFacts::default(),
+            registry: None,
         };
         let observation = FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("mixed".into()),
@@ -1126,7 +1177,7 @@ mod tests {
         for (_, id, _) in &rows {
             let pane = match id {
                 RowId::Agent(pane) | RowId::Pane(pane) => Some(pane.as_str()),
-                RowId::Workspace(_) | RowId::Task(_) => None,
+                RowId::Workspace(_) | RowId::Registered(_) | RowId::Task(_) => None,
             };
             if let Some(pane) = pane {
                 assert!(seen_panes.insert(pane), "duplicate row for pane {pane}");

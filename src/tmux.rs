@@ -360,6 +360,7 @@ impl RuntimeProvider for TmuxRuntime {
         let windows = self.run_whole(&["list-windows", "-a", "-F", WINDOW_FORMAT], cancel)?;
         let panes = self.run_whole(&["list-panes", "-a", "-F", PANE_FORMAT], cancel)?;
         Ok(FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: self.decode_sessions(&sessions)?,
             tabs: self.decode_windows(&windows)?,
             panes: self.decode_panes(&panes)?,

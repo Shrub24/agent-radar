@@ -419,10 +419,12 @@ pub use process::{
     LocalProcfsVerifier, ProcessVerification, ProcessVerifier, verify_identity, verify_registration,
 };
 pub use publication::{
-    AcceptedSnapshot, AcquireRequest, Channel, ChannelRecord, DEFAULT_LEASE_MS, ExpectedWriter,
-    Freshness, MAX_ACTIONS, MAX_LEASE_MS, MAX_PUBLICATION_BYTES, MIN_LEASE_MS, Outcome,
+    AcceptedSnapshot, AcquireRequest, AssignmentSnapshot, BackgroundTask, Channel, ChannelRecord,
+    DEFAULT_LEASE_MS, ExpectedWriter, FactsSnapshot, Freshness, MAX_ACTIONS, MAX_AWAITED,
+    MAX_BACKGROUND_TASKS, MAX_LEASE_MS, MAX_PUBLICATION_BYTES, MIN_LEASE_MS, Outcome,
     PUBLICATION_VERSION, PublicChannel, PublicChannelFacts, PublicSnapshot, PublicSnapshotFacts,
-    PublicWriter, PublicWriterFacts, PublishRequest, PublisherIdentity, Snapshot, WriterBinding,
+    PublicWriter, PublicWriterFacts, PublishRequest, PublisherIdentity, Report, Snapshot,
+    WriterBinding,
 };
 pub use spawn::{
     BoundChild, LocationEvidence, MAX_SPAWN_BYTES, PublicSpawnEdge, PublicSpawnExitObservation,
@@ -841,6 +843,11 @@ impl Registry {
         }
         self.append_event("agent.registered", Some(&registration.agent_id), None, None);
         Ok(registration)
+    }
+
+    /// Every registration's public record, in agent-id order, read in full.
+    pub fn public_registrations(&self) -> Result<Vec<PublicRegistration>, String> {
+        Ok(self.all()?.iter().map(Registration::public).collect())
     }
 
     /// Every registration, in agent-id order.

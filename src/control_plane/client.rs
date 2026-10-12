@@ -31,15 +31,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::ops;
+use super::registry::PublicSpawnTopology;
 use super::{MAX_LINE_BYTES, PROTOCOL_VERSION, random_uuid, socket_path, trusted_socket};
 use crate::config::{RuntimeBackend, RuntimeConfig};
 use crate::herdr::{HerdrConfig, HerdrRuntime};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::{FleetObservation, ForegroundEvidence};
+use crate::registry_observation::{RegistryAgent, RegistryRead};
 use crate::runtime::{
     BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedIdentity,
     CreatedKind, CreatedLocation, FocusOutcome, InputOutcome, InputRequest, OutputOutcome,
@@ -53,6 +55,26 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long one socket wait lasts before cancellation and the deadline are
 /// checked again.
 const WAIT_GRANULARITY: Duration = Duration::from_millis(10);
+
+/// Agents asked for per `agent.list` page: the daemon's own maximum.
+const REGISTRY_PAGE_LIMIT: usize = 100;
+
+/// How long reading every registered agent may take in one refresh.
+const REGISTRY_READ_DEADLINE: Duration = Duration::from_secs(10);
+
+/// One `agent.list` answer.
+#[derive(Deserialize)]
+struct AgentPage {
+    agents: Vec<RegistryAgent>,
+    next: Option<String>,
+}
+
+/// One `spawn.list` answer.
+#[derive(Deserialize)]
+struct SpawnPage {
+    spawns: Vec<PublicSpawnTopology>,
+    next: Option<String>,
+}
 
 /// The label this caller's records carry, so an operator reading the store knows
 /// who asked.
@@ -77,6 +99,7 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     ops::LAUNCH_CONTEXT_CAPABILITY,
     ops::EXIT_OBSERVATION_CAPABILITY,
     ops::REGISTRY_CONTRACT,
+    ops::REGISTRY_FACTS_CONTRACT,
     ops::EVENTS_CONTRACT,
     ops::SPAWN_CONTRACT,
     ops::SPAWN_CLOSE_CONTRACT,
@@ -167,6 +190,50 @@ impl DaemonRuntime {
         })
     }
 
+    /// Every page of one cursor-paged read, to the end.
+    ///
+    /// A partial read is never returned as the whole: a page that fails, a
+    /// cursor that does not advance, or a read that outlives its deadline fails
+    /// the read, and so the refresh, which keeps the last inventory stale.
+    fn read_all<T>(
+        &self,
+        method: &str,
+        what: &str,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        decode: impl Fn(Value) -> Result<(Vec<T>, Option<String>), serde_json::Error>,
+    ) -> Result<Vec<T>, String> {
+        let mut items = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(self.describe(format!(
+                    "did not finish reading {what} within {REGISTRY_READ_DEADLINE:?}"
+                )));
+            }
+            let mut params = json!({"limit": REGISTRY_PAGE_LIMIT});
+            if let Some(cursor) = &after {
+                params["after"] = json!(cursor);
+            }
+            let result = self
+                .call(method, params, cancel)
+                .map_err(|failure| failure.message)?;
+            let (page, next) = decode(result).map_err(|error| {
+                self.describe(format!("sent an unreadable {what} page: {error}"))
+            })?;
+            items.extend(page);
+            match next {
+                None => return Ok(items),
+                Some(next) if after.as_deref() == Some(next.as_str()) => {
+                    return Err(
+                        self.describe(format!("repeated a {what} page cursor without progress"))
+                    );
+                }
+                Some(next) => after = Some(next),
+            }
+        }
+    }
+
     /// One exchange, with every failure naming the daemon it happened to.
     fn call(&self, method: &str, params: Value, cancel: &AtomicBool) -> Result<Value, Failure> {
         exchange_at(&self.socket, method, params, cancel)
@@ -208,6 +275,33 @@ impl RuntimeProvider for DaemonRuntime {
         let inventory = result.get("inventory").cloned().unwrap_or(Value::Null);
         serde_json::from_value(inventory)
             .map_err(|error| self.describe(format!("sent an unreadable inventory: {error}")))
+    }
+
+    fn registry(&self, cancel: &AtomicBool) -> Result<Option<RegistryRead>, String> {
+        // Without the registry there are no agent facts, and the inventory's own
+        // agent records are not a substitute. Refreshing fails visibly instead.
+        for contract in [ops::REGISTRY_CONTRACT, ops::SPAWN_CONTRACT] {
+            if !self.declared.contains(&contract) {
+                return Err(self.describe(format!("does not provide `{contract}`")));
+            }
+        }
+        let deadline = Instant::now() + REGISTRY_READ_DEADLINE;
+        let agents = self.read_all(
+            "agent.list",
+            "registered agents",
+            deadline,
+            cancel,
+            |value| {
+                let page: AgentPage = serde_json::from_value(value)?;
+                Ok((page.agents, page.next))
+            },
+        )?;
+        let topology =
+            self.read_all("spawn.list", "spawn topology", deadline, cancel, |value| {
+                let page: SpawnPage = serde_json::from_value(value)?;
+                Ok((page.spawns, page.next))
+            })?;
+        Ok(Some(RegistryRead { agents, topology }))
     }
 
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence {

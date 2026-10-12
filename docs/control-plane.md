@@ -71,7 +71,7 @@ Lines are capped at 1 MiB excluding newline; an oversized line is drained and re
 `daemon.ping`, params `{}`:
 
 ```json
-{"protocol":2,"backend":"tmux","instance":"radar","capabilities":["mux.observe","mux.process_info","mux.focus","mux.close","mux.create","mux.input","mux.output","mux.launch","mux.launch_context","mux.exit_observation","registry.v1","events.v1","spawn.v1","spawn.close.v1","spawn.launch_context.v1","spawn.exit_observation.v1"]}
+{"protocol":2,"backend":"tmux","instance":"radar","capabilities":["mux.observe","mux.process_info","mux.focus","mux.close","mux.create","mux.input","mux.output","mux.launch","mux.launch_context","mux.exit_observation","registry.v1","registry.facts.v1","events.v1","spawn.v1","spawn.close.v1","spawn.launch_context.v1","spawn.exit_observation.v1"]}
 ```
 
 `backend` is the wired physical backend: `herdr`, `tmux` or `none`, never a placeholder. `instance` names the tmux server for a tmux backend and is null otherwise. `capabilities` is the backend's own `mux.*` declaration plus the daemon contracts those capabilities make servable.
@@ -97,13 +97,14 @@ Daemon contracts are versioned promises that the daemon serves the methods a cap
 | Contract | Needs | Serves |
 |---|---|---|
 | `registry.v1` | — | All `agent.*` methods |
+| `registry.facts.v1` | — | The `facts` channel and the assignment extension on `agent.acquire`/`agent.publish` |
 | `events.v1` | — | `events.read` |
 | `spawn.v1` | `mux.create` + `mux.launch` | `spawn.create` |
 | `spawn.close.v1` | `mux.observe` + `mux.close` | `spawn.close` |
 | `spawn.launch_context.v1` | `mux.create` + `mux.launch` + `mux.launch_context` | cwd/environment-bearing `spawn.create` |
 | `spawn.exit_observation.v1` | `mux.exit_observation` | typed `exit_observation` on current spawn edges |
 
-`registry.v1` and `events.v1` need no backend and are advertised even for backend `none`. A contract that the daemon would refuse to serve is never advertised, and a capability is never advertised by a backend that cannot serve it. Check the protocol version and the contracts your client needs at handshake; other absences refuse only their own methods. `daemon.ping` cannot prove which build is running — a daemon built before a contract existed simply omits it and answers its methods `unknown_method` — so treat an absent contract or an `unknown_method` answer as the compatibility signal and keep your existing path.
+`registry.v1`, `registry.facts.v1` and `events.v1` need no backend and are advertised even for backend `none`. A contract that the daemon would refuse to serve is never advertised, and a capability is never advertised by a backend that cannot serve it. Check the protocol version and the contracts your client needs at handshake; other absences refuse only their own methods. `daemon.ping` cannot prove which build is running — a daemon built before a contract existed simply omits it and answers its methods `unknown_method` — so treat an absent contract or an `unknown_method` answer as the compatibility signal and keep your existing path.
 
 ## Methods
 
@@ -135,7 +136,7 @@ Records contain `id`, `method`, optional `requester`, optional `target`, stored 
 Effectful backend refusals can settle `outcome: refused`; confirmed actions settle `completed`; possible dispatch without trustworthy outcome settles `unknown`. A record in `started` without outcome is also unknown. `internal` is not proof of non-dispatch. The client maps protocol pre-dispatch errors to refusal; `outcome_unknown`, `internal`, malformed/lost replies and post-write transport failure are unknown. A write failure before its first byte is refusal; after any byte it is unknown. Re-read with `mux.request.get`/`mux.request.list` to learn the durable record. Never automatically retry an uncertain mutation, including through the direct adapter. Retrying the same UUID only retrieves the record; it does not execute again.
 
 - `mux.focus`: `{"target":"wA:p1","target_kind":"pane","requester":"extension-name"}`. Requires `mux.focus`. `target_kind` is `pane` or `workspace`. Completed effect is `focus`.
-- `mux.close`: `{"request":{"target":{"pane":"wA:p1"},"identity":{"pane":{"pane_id":"wA:p1","occupant":null}}},"requester":"extension-name"}`. Requires `mux.close`. `target` is externally tagged `{"pane":"id"}` or `{"tab":"id"}`. `identity` is a frozen `TargetIdentity`: pane form is `{"pane":{"pane_id":"…","occupant":null-or-AgentIdentity}}`; tab form is `{"tab":{"tab_id":"…","members":[PaneIdentity,…]}}`. AgentIdentity carries `name`, `session`, `lineage`, `managed`, `label`, `run`; PaneIdentity carries `pane_id`, `occupant`. Freeze from a fresh observation at confirmation time, then send that exact identity. The daemon re-observes and checks equality and positive-unmanaged containment; changed, managed, uncertain, or mixed tabs refuse. Completed means runtime confirmed close, not that removal was re-observed. Managed worker close/restart remains owner-routed, never this method; a daemon-created child pane is closed with `spawn.close` below.
+- `mux.close`: `{"request":{"target":{"pane":"wA:p1"},"identity":{"pane":{"pane_id":"wA:p1","occupant":null}}},"requester":"extension-name"}`. Requires `mux.close`. `target` is externally tagged `{"pane":"id"}` or `{"tab":"id"}`. `identity` is a frozen `TargetIdentity`: pane form is `{"pane":{"pane_id":"…","occupant":null-or-AgentIdentity}}`; tab form is `{"tab":{"tab_id":"…","members":[PaneIdentity,…]}}`. AgentIdentity carries `name`, `session`, `lineage`, `managed`, `label`, `run`; PaneIdentity carries `pane_id`, `occupant`. Freeze from a fresh observation at confirmation time, then send that exact identity. The daemon re-observes and checks equality and positive-unmanaged containment, then reads the registry immediately before dispatch: any registration naming the pane, or a pane in the tab, refuses the close, and an unreadable registry refuses it too. Changed, managed, uncertain, or mixed tabs refuse. Completed means runtime confirmed close, not that removal was re-observed. Managed worker close/restart remains owner-routed, never this method; a daemon-created child pane is closed with `spawn.close` below.
 - `mux.create`: `{"request":{"kind":"pane_split","pane_id":"wA:p1","direction":"right","focus":false},"requester":"extension-name"}`. Requires `mux.create`. Tagged request variants: `{"kind":"workspace","focus":false}`, `{"kind":"tab","workspace_id":"wA","focus":false}`, `{"kind":"pane_split","pane_id":"wA:p1","direction":"down","focus":false}`. Directions `right`/`down`. Creates a mux location only; it does not launch a process or restore an agent. Record `created` is `{ "kind":"workspace|tab|pane", "id":"runtime-reported-id" }` only when backend names it; do not infer it from request or effect prose.
 - `mux.input`: `{"request":{"pane_id":"wA:p1","payload":{"kind":"text","text":"hello\n"}},"requester":"extension-name"}`. Requires `mux.input`. Exactly one tagged payload: text or keys. Text is 1..=4096 bytes; control characters refused except newline/tab. Keys are 1..=16 names, each 1..=32 ASCII letters/digits/`+`/`-`/`_`. Key names are passed to backend; use only names it supports. Text is literal input, not shell evaluation.
 - `mux.report`: `{"request":{"kind":"state","pane_id":"wA:p1","source":"publisher","agent":"pi","state":"working","sequence":4},"requester":"extension-name"}`. Requires `mux.report`. Tagged variants `state`, `session`, `metadata`; see schemas below. This is a curated normalized schema, not a generic Herdr RPC passthrough. Unknown fields/kinds refuse. It forwards the caller's own values; it does not merge them into a registry or establish authority. `resume_argv`, `release_agent`, and `clear_agent_authority` are unsupported.
@@ -193,7 +194,7 @@ Result keys: one object takes the method's own noun, a page takes its plural plu
 | `agent.acquire` | `writer` |
 | `agent.publish`, `agent.retire` | `channel` |
 | `agent.context` | `writer`, `context` |
-| `agent.get` | `agent` (`registration`, `process`, `execution`, `assignment`, `context`; launch availability and revision inside `registration`) |
+| `agent.get` | `agent` (`registration`, `process`, `execution`, `assignment`, `facts`, `context`; launch availability and revision inside `registration`) |
 | `agent.list` | `agents`, `next` |
 | `spawn.create` | `request`, `spawn` |
 | `spawn.get` | `spawn` (edge fields flattened, plus `state` and `freshness`) |

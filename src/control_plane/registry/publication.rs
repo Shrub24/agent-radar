@@ -22,6 +22,7 @@
 //! handle, and fence-rejects every old handle thereafter. Stale means only stale:
 //! it is never exit or restart evidence.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -49,6 +50,10 @@ pub const MIN_LEASE_MS: i64 = 1_000;
 pub const MAX_LEASE_MS: i64 = 300_000;
 /// Maximum advertised actions per snapshot.
 pub const MAX_ACTIONS: usize = 16;
+/// Maximum background tasks in one facts snapshot.
+pub const MAX_BACKGROUND_TASKS: usize = 64;
+/// Maximum awaited items in one assignment snapshot.
+pub const MAX_AWAITED: usize = 64;
 
 /// Independent publisher channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -58,6 +63,8 @@ pub enum Channel {
     Execution,
     /// Owner assignment projection.
     Assignment,
+    /// Self-authored process facts, published with no owner.
+    Facts,
 }
 
 impl Channel {
@@ -65,6 +72,7 @@ impl Channel {
         match self {
             Self::Execution => "execution",
             Self::Assignment => "assignment",
+            Self::Facts => "facts",
         }
     }
 }
@@ -95,23 +103,220 @@ pub struct Snapshot {
 
 impl Snapshot {
     fn validate(&self) -> Result<(), String> {
-        bounded_text("activity", &self.activity, false)?;
-        if let Some(reason) = &self.waiting_reason {
-            bounded_text("waiting_reason", reason, false)?;
+        validate_base(
+            &self.activity,
+            self.waiting_reason.as_deref(),
+            self.last_outcome.as_ref(),
+            &self.actions,
+        )
+    }
+}
+
+/// The fields every execution and assignment snapshot shares.
+fn validate_base(
+    activity: &str,
+    waiting_reason: Option<&str>,
+    last_outcome: Option<&Outcome>,
+    actions: &[String],
+) -> Result<(), String> {
+    bounded_text("activity", activity, false)?;
+    if let Some(reason) = waiting_reason {
+        bounded_text("waiting_reason", reason, false)?;
+    }
+    if let Some(outcome) = last_outcome {
+        bounded_text("last_outcome.result", &outcome.result, false)?;
+        if let Some(detail) = &outcome.detail {
+            bounded_text("last_outcome.detail", detail, false)?;
         }
-        if let Some(outcome) = &self.last_outcome {
-            bounded_text("last_outcome.result", &outcome.result, false)?;
-            if let Some(detail) = &outcome.detail {
-                bounded_text("last_outcome.detail", detail, false)?;
+    }
+    if actions.len() > MAX_ACTIONS {
+        return Err(format!("`actions` names more than {MAX_ACTIONS} entries"));
+    }
+    for action in actions {
+        bounded_text("action", action, false)?;
+    }
+    Ok(())
+}
+
+/// The owner's complete assignment snapshot: the shared base plus facts only an
+/// owner knows. It is authored by the owner's writer and is never derived from
+/// execution activity; the owner's identity is provenance, not authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentSnapshot {
+    pub activity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_started_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub awaited: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<String>,
+}
+
+impl AssignmentSnapshot {
+    fn validate(&self) -> Result<(), String> {
+        validate_base(
+            &self.activity,
+            self.waiting_reason.as_deref(),
+            self.last_outcome.as_ref(),
+            &self.actions,
+        )?;
+        for (field, value) in [
+            ("role", &self.role),
+            ("definition", &self.definition),
+            ("run", &self.run),
+            ("request", &self.request),
+            ("assignment", &self.assignment),
+            ("ask", &self.ask),
+        ] {
+            if let Some(value) = value {
+                bounded_text(field, value, false)?;
             }
         }
-        if self.actions.len() > MAX_ACTIONS {
-            return Err(format!("`actions` names more than {MAX_ACTIONS} entries"));
+        if self.awaited.len() > MAX_AWAITED {
+            return Err(format!("`awaited` names more than {MAX_AWAITED} entries"));
         }
-        for action in &self.actions {
-            bounded_text("action", action, false)?;
+        for item in &self.awaited {
+            bounded_text("awaited", item, false)?;
         }
         Ok(())
+    }
+}
+
+impl From<Snapshot> for AssignmentSnapshot {
+    fn from(base: Snapshot) -> Self {
+        Self {
+            activity: base.activity,
+            waiting_reason: base.waiting_reason,
+            last_outcome: base.last_outcome,
+            actions: base.actions,
+            role: None,
+            definition: None,
+            run: None,
+            request: None,
+            assignment: None,
+            assigned_started_unix_ms: None,
+            awaited: Vec::new(),
+            ask: None,
+        }
+    }
+}
+
+/// One background task the agent process reports as unresolved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub phase: String,
+}
+
+/// The agent's own process facts. Self-authored by any Pi session, with no owner
+/// or assignment, and kept separate from execution and assignment. Every field
+/// is optional and a published snapshot replaces the whole value, so omission
+/// withdraws a fact. `context_usage` is producer display text, not state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_tasks: Vec<BackgroundTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_started_unix_ms: Option<u64>,
+}
+
+impl FactsSnapshot {
+    fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("model", &self.model),
+            ("provider", &self.provider),
+            ("thinking", &self.thinking),
+            ("context_usage", &self.context_usage),
+            ("session_name", &self.session_name),
+        ] {
+            if let Some(value) = value {
+                bounded_text(field, value, false)?;
+            }
+        }
+        if self.background_tasks.len() > MAX_BACKGROUND_TASKS {
+            return Err(format!(
+                "`background_tasks` names more than {MAX_BACKGROUND_TASKS} entries"
+            ));
+        }
+        let mut ids = HashSet::new();
+        for task in &self.background_tasks {
+            bounded_text("background_tasks.id", &task.id, false)?;
+            bounded_text("background_tasks.phase", &task.phase, false)?;
+            if !ids.insert(task.id.as_str()) {
+                return Err("`background_tasks` ids must be unique".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One complete accepted snapshot, typed by the channel that carries it. Each
+/// variant is strict about its own fields, so a field from another channel is
+/// refused rather than silently dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Report {
+    // Execution is tried first: its base shape is the one assignment shares, and
+    // `for_channel` maps it onto the assignment schema where the channel requires.
+    Execution(Snapshot),
+    Assignment(AssignmentSnapshot),
+    Facts(FactsSnapshot),
+}
+
+impl Report {
+    /// Reads this payload as a snapshot of `channel`. A base-shaped payload on
+    /// the assignment channel is an assignment snapshot without owner fields;
+    /// every other mismatch names fields that belong to another channel.
+    pub fn for_channel(&self, channel: Channel) -> Result<Self, String> {
+        match (channel, self) {
+            (Channel::Execution, Self::Execution(_))
+            | (Channel::Facts, Self::Facts(_))
+            | (Channel::Assignment, Self::Assignment(_)) => Ok(self.clone()),
+            (Channel::Assignment, Self::Execution(base)) => {
+                Ok(Self::Assignment(base.clone().into()))
+            }
+            _ => Err(format!(
+                "snapshot fields do not belong to the `{}` channel",
+                channel.name()
+            )),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Execution(snapshot) => snapshot.validate(),
+            Self::Assignment(snapshot) => snapshot.validate(),
+            Self::Facts(snapshot) => snapshot.validate(),
+        }
     }
 }
 
@@ -238,14 +443,14 @@ pub struct AcceptedSnapshot {
     pub serving_epoch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
-    pub snapshot: Snapshot,
+    pub snapshot: Report,
 }
 
 impl AcceptedSnapshot {
-    fn repeats(&self, request: &PublishRequest) -> bool {
+    fn repeats(&self, request: &PublishRequest, report: &Report) -> bool {
         self.lease_ms == request.lease_ms()
             && self.observed_at == request.observed_at
-            && self.snapshot == request.snapshot
+            && self.snapshot == *report
     }
 
     /// Freshness of this accepted snapshot relative to the current writer.
@@ -470,7 +675,7 @@ pub struct PublicSnapshot {
     pub observed_at: Option<String>,
     pub restored: bool,
     pub freshness: Freshness,
-    pub snapshot: Snapshot,
+    pub snapshot: Report,
 }
 
 /// The current writer as an unrelated reader may see it: provenance and
@@ -506,7 +711,7 @@ pub struct PublicSnapshotFacts {
     pub observed_at: Option<String>,
     pub restored: bool,
     pub freshness: Freshness,
-    pub snapshot: Snapshot,
+    pub snapshot: Report,
 }
 
 /// A channel read for a reader that is not its writer: the same identity,
@@ -547,11 +752,13 @@ pub struct PublishRequest {
     pub lease_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
-    pub snapshot: Snapshot,
+    pub snapshot: Report,
 }
 
 impl PublishRequest {
-    pub fn validate(&self) -> Result<(), String> {
+    /// Checks the envelope and the snapshot against this request's channel, and
+    /// returns the snapshot as that channel's schema.
+    pub fn validate(&self) -> Result<Report, String> {
         validate_agent_id(&self.agent_id)?;
         validate_agent_id(&self.writer_handle)?;
         if self.sequence == 0 {
@@ -570,7 +777,9 @@ impl PublishRequest {
                 return Err("`observed_at` is not a timestamp".into());
             }
         }
-        self.snapshot.validate()
+        let report = self.snapshot.for_channel(self.channel)?;
+        report.validate()?;
+        Ok(report)
     }
 
     pub fn lease_ms(&self) -> i64 {
@@ -689,7 +898,7 @@ pub fn publish(
     request: &PublishRequest,
     now_ms: i64,
 ) -> Result<ChannelRecord, String> {
-    request.validate()?;
+    let report = request.validate()?;
     let _transition = registry.transition();
     let record = read_record(registry, &request.agent_id, request.channel)?
         .ok_or_else(|| "channel has no writer".to_string())?;
@@ -706,7 +915,7 @@ pub fn publish(
         let replay = record
             .snapshot
             .as_ref()
-            .is_some_and(|snapshot| snapshot.repeats(request));
+            .is_some_and(|snapshot| snapshot.repeats(request, &report));
         if record.writer.sequence > 0 && replay {
             return Ok(record);
         }
@@ -734,7 +943,7 @@ pub fn publish(
             expires_at: format_millis(now_ms + lease),
             serving_epoch: registry.serving_epoch().into(),
             observed_at: request.observed_at.clone(),
-            snapshot: request.snapshot.clone(),
+            snapshot: report,
         }),
     };
     write_record(registry, &updated)?;
@@ -742,6 +951,7 @@ pub fn publish(
         match request.channel {
             Channel::Execution => "execution.published",
             Channel::Assignment => "assignment.published",
+            Channel::Facts => "facts.published",
         },
         Some(&request.agent_id),
         None,
@@ -780,6 +990,7 @@ pub fn retire(
         match channel {
             Channel::Execution => "execution.retired",
             Channel::Assignment => "assignment.retired",
+            Channel::Facts => "facts.retired",
         },
         Some(agent_id),
         None,
@@ -812,7 +1023,7 @@ fn read_record(
         Err(error) if error.contains("No such file or directory") => return Ok(None),
         Err(error) => return Err(error),
     };
-    let record: ChannelRecord =
+    let mut record: ChannelRecord =
         serde_json::from_slice(&bytes).map_err(|error| format!("not a channel record: {error}"))?;
     if record.version != PUBLICATION_VERSION
         || record.agent_id != agent_id
@@ -825,12 +1036,13 @@ fn read_record(
     }
     validate_agent_id(&record.writer.handle)?;
     validate_agent_id(&record.writer.incarnation)?;
-    if let Some(snapshot) = &record.snapshot {
-        if snapshot.generation == 0 || snapshot.generation > record.writer.generation {
+    if let Some(accepted) = &mut record.snapshot {
+        if accepted.generation == 0 || accepted.generation > record.writer.generation {
             return Err("channel snapshot generation is out of range".into());
         }
-        validate_agent_id(&snapshot.handle)?;
-        validate_agent_id(&snapshot.incarnation)?;
+        validate_agent_id(&accepted.handle)?;
+        validate_agent_id(&accepted.incarnation)?;
+        accepted.snapshot = accepted.snapshot.for_channel(channel)?;
     }
     Ok(Some(record))
 }
@@ -1035,12 +1247,12 @@ mod tests {
             sequence,
             lease_ms: Some(10_000),
             observed_at: None,
-            snapshot: Snapshot {
+            snapshot: Report::Execution(Snapshot {
                 activity: "working".into(),
                 waiting_reason: None,
                 last_outcome: None,
                 actions: Vec::new(),
-            },
+            }),
         };
         registry
             .publish(&make_request(1), 1_000)

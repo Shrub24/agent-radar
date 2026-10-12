@@ -11,17 +11,22 @@ use agent_radar::Target;
 use agent_radar::app::DetailPage;
 use agent_radar::bus::{BusEvent, Task, TaskState};
 use agent_radar::config::Config;
+use agent_radar::control_plane::registry::PublicSpawnTopology;
+use agent_radar::focus;
 use agent_radar::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Location, Pane,
     RuntimeStatus, SessionUuid, Tab, Workspace,
 };
+use agent_radar::registry_observation::{self, RegistryAgent, RegistryRead};
+use agent_radar::runtime::BackendIdentity;
 use agent_radar::tree::{RowKind, TaskId, TaskProjection, TaskRow, TaskSource, TreeNode};
-use agent_radar::{Action, App, Geometry, ObservationState, PaneView, RowId, theme, ui};
+use agent_radar::{Action, App, Geometry, ObservationState, Operation, PaneView, RowId, theme, ui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
+use serde_json::{Value, json};
 
 /// A session UUID the tests publish under, from one hex digit: the literal
 /// shape a publisher sends, without the file carrying a real-looking id.
@@ -87,6 +92,7 @@ impl<'a> Agent<'a> {
 /// inventory reports beside them.
 fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
     FleetObservation {
+        metadata_agents: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wH".into(),
             label: Some("home".into()),
@@ -127,6 +133,7 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                         .collect(),
                     ..HerdsmanFacts::default()
                 },
+                registry: None,
             })
             .collect(),
     }
@@ -768,6 +775,74 @@ fn retained_token_facts_are_labelled_and_never_animate() {
     );
     assert!(tasks(&app, "wH:p1")[0].is_running());
     assert!(app.animates(), "a live running task animates");
+}
+
+/// Herdr metadata for `pane_id`: a Pi-owned record, managed by its owner, that
+/// the backend reports as containment evidence only.
+fn owner_metadata(pane_id: &str) -> AgentObservation {
+    AgentObservation {
+        location: location(pane_id),
+        name: Some("pi".into()),
+        label: Some("owner task".into()),
+        status: Some(RuntimeStatus::Working),
+        session: None,
+        lineage: None,
+        facts: HerdsmanFacts {
+            managed_metadata: true,
+            ..HerdsmanFacts::default()
+        },
+        registry: None,
+    }
+}
+
+/// A fleet whose only agent record is Herdr metadata, not a presented agent.
+fn metadata_only(metadata: Vec<AgentObservation>, panes: &[&str]) -> FleetObservation {
+    let mut observation = observation(&[], panes);
+    observation.metadata_agents = metadata;
+    observation
+}
+
+/// Metadata that appears and then vanishes while its pane survives must never
+/// become an agent row, retained or current, yet still protects the pane from
+/// a direct close.
+#[test]
+fn vanished_metadata_shows_no_row_and_still_protects_its_pane() {
+    let mut state = ObservationState::new();
+    state.apply_success(metadata_only(vec![owner_metadata("wH:p1")], &["wH:p1"]));
+    assert!(agent_node(&app_for(&state).tree().roots, "wH:p1").is_none());
+
+    state.apply_success(metadata_only(Vec::new(), &["wH:p1"]));
+    assert!(
+        state.retained().is_empty(),
+        "metadata reached display continuity"
+    );
+    assert!(state.retained_containment().contains_key("wH:p1"));
+
+    let mut app = app_for(&state);
+    assert!(agent_node(&app.tree().roots, "wH:p1").is_none());
+    // Every pane shows, so the pane row is the close target.
+    app.cycle_panes();
+    app.cycle_panes();
+    assert_eq!(app.pane_view(), PaneView::All);
+    select(&mut app, &RowId::Pane("wH:p1".into()));
+    app.begin_action(Operation::ClosePane, &state);
+    assert!(
+        app.confirmation().is_none(),
+        "a managed pane was offered a direct close"
+    );
+    assert!(app.focus_message().is_some(), "the refusal left no reason");
+
+    app.begin_action(Operation::CloseTab, &state);
+    assert!(
+        app.confirmation().is_none(),
+        "a managed tab was offered a direct close"
+    );
+    assert!(
+        app.focus_message()
+            .is_some_and(|message| message.contains("managed by its owner")),
+        "{:?}",
+        app.focus_message()
+    );
 }
 
 /// Installs the configuration the presentation tests draw with, once per test
@@ -1654,4 +1729,389 @@ fn b_while_entering_filter_text_is_filter_text() {
     app.handle_key(key(KeyCode::Esc));
     app.handle_key(key(KeyCode::Char('b')));
     assert!(app.shows_tasks(), "outside entry it is the toggle again");
+}
+
+const REGISTRY_BOOT: &str = "3f1c2a9e-0000-4000-8000-000000000001";
+const REGISTRY_INCARNATION: &str = "11111111-1111-4111-8111-111111111111";
+const REGISTRY_SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+
+/// A registration as `agent.list` serves it, with the reports it holds. A
+/// claimed registration names the birth identity the registry verifies.
+fn registration(
+    agent_id: &str,
+    location: Value,
+    claimed: bool,
+    reports: Vec<Value>,
+) -> RegistryAgent {
+    let claim =
+        claimed.then(|| json!({"boot_id": REGISTRY_BOOT, "pid": 4242, "start_ticks": 1_000}));
+    let channel = |name: &str| {
+        reports
+            .iter()
+            .find(|report| report["channel"] == name)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    serde_json::from_value(json!({
+        "registration": {
+            "version": 1,
+            "agent_id": agent_id,
+            "registered_at": "2026-01-01T00:00:00.000Z",
+            "source": "herdsman",
+            "incarnation": REGISTRY_INCARNATION,
+            "session": REGISTRY_SESSION,
+            "label": format!("{agent_id} label"),
+            "location": location,
+            "process_claimed": claimed,
+            "launch": {"available": false}
+        },
+        "process": {"claimed": claimed, "claim": claim, "verification": "unavailable"},
+        "execution": channel("execution"),
+        "assignment": channel("assignment"),
+        "facts": channel("facts")
+    }))
+    .expect("registration fixture decodes")
+}
+
+/// One channel's report at `freshness`. The owner publishes the assignment for
+/// its own owner; a session publishes its execution and facts itself.
+fn report(agent_id: &str, channel: &str, freshness: &str, snapshot: Value) -> Value {
+    let (source, owner) = if channel == "assignment" {
+        ("herdsman", Some("herdsman-owner"))
+    } else {
+        ("pi", None)
+    };
+    json!({
+        "version": 1,
+        "agent_id": agent_id,
+        "channel": channel,
+        "writer": {"source": source, "incarnation": REGISTRY_INCARNATION, "generation": 1, "sequence": 3},
+        "snapshot": {
+            "source": source, "incarnation": REGISTRY_INCARNATION, "reporting_owner": owner,
+            "generation": 1, "sequence": 3, "lease_ms": 30000,
+            "received_at": "2026-01-01T00:00:00.000Z", "expires_at": "2026-01-01T00:00:30.000Z",
+            "restored": false, "freshness": freshness, "snapshot": snapshot
+        }
+    })
+}
+
+/// A spawn edge that binds `child` under `parent`, as the daemon serves it.
+fn bound_edge(parent: &str, child: &str) -> PublicSpawnTopology {
+    serde_json::from_value(json!({
+        "version": 1,
+        "request_id": format!("request-{child}"),
+        "parent": parent,
+        "created": "completed",
+        "launched": "completed",
+        "bound": {"source": "test", "incarnation": REGISTRY_INCARNATION, "agent_id": child,
+                  "bound_at": "2026-01-01T00:00:00.000Z"},
+        "recorded_at": "2026-01-01T00:00:00.000Z",
+        "state": "bound"
+    }))
+    .expect("a topology fixture")
+}
+
+fn at(pane_id: &str) -> Value {
+    json!({"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": pane_id})
+}
+
+/// The node a row id names, anywhere in the tree.
+fn node_of<'a>(nodes: &'a [TreeNode], id: &RowId) -> Option<&'a TreeNode> {
+    nodes.iter().find_map(|node| {
+        (node.row.id == *id)
+            .then_some(node)
+            .or_else(|| node_of(&node.children, id))
+    })
+}
+
+fn wa_inventory(pane_ids: &[&str]) -> FleetObservation {
+    FleetObservation {
+        metadata_agents: Vec::new(),
+        workspaces: vec![Workspace {
+            workspace_id: "wA".into(),
+            label: Some("alpha".into()),
+            number: None,
+        }],
+        tabs: Vec::new(),
+        panes: pane_ids
+            .iter()
+            .map(|id| Pane {
+                location: Location {
+                    workspace_id: "wA".into(),
+                    tab_id: "wA:t1".into(),
+                    pane_id: (*id).into(),
+                },
+                label: None,
+                title: None,
+            })
+            .collect(),
+        agents: Vec::new(),
+    }
+}
+
+fn registry_state(
+    inventory: FleetObservation,
+    agents: Vec<RegistryAgent>,
+    topology: Vec<PublicSpawnTopology>,
+) -> ObservationState {
+    let read = RegistryRead { agents, topology };
+    let agents =
+        registry_observation::project(&inventory, &BackendIdentity::named("herdr"), read, &[]);
+    let mut state = ObservationState::new();
+    state.apply_success(FleetObservation {
+        agents,
+        ..inventory
+    });
+    state
+}
+
+/// Text of one registered row's details, every page open.
+fn details(state: &ObservationState, id: &RowId) -> String {
+    let mut app = app_for(state);
+    select(&mut app, id);
+    pages(state, &mut app)
+}
+
+/// Registrations that cannot join a pane stay distinct rows that own no pane:
+/// the reported pane keeps its own row, and the controls they would reach are
+/// refused.
+#[test]
+fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
+    let state = registry_state(
+        wa_inventory(&["wA:p1"]),
+        vec![
+            registration("r1", at("wA:p1"), false, Vec::new()),
+            registration("r2", at("wA:p1"), false, Vec::new()),
+            registration("r3", Value::Null, false, Vec::new()),
+        ],
+        Vec::new(),
+    );
+    let mut app = app_for(&state);
+    {
+        let tree = app.tree();
+        for id in ["r1", "r2", "r3"] {
+            assert!(
+                node_of(&tree.roots, &RowId::Registered(id.into())).is_some(),
+                "{id} lost its row"
+            );
+        }
+        assert!(
+            node_of(&tree.roots, &RowId::Pane("wA:p1".into())).is_some(),
+            "the pane lost its row"
+        );
+        assert!(
+            node_of(&tree.roots, &RowId::Agent("wA:p1".into())).is_none(),
+            "a registration claimed the pane"
+        );
+        let unplaced =
+            node_of(&tree.roots, &RowId::Workspace(String::new())).expect("unplaced root");
+        assert_eq!(unplaced.row.title(), "unplaced");
+        let targets = focus::targets(tree, &state);
+        assert!(
+            !targets.contains_key(&RowId::Registered("r1".into())),
+            "an unresolved row focuses a pane"
+        );
+        assert_eq!(
+            targets.get(&RowId::Pane("wA:p1".into())),
+            Some(&Target::Pane("wA:p1".into()))
+        );
+    }
+
+    select(&mut app, &RowId::Registered("r1".into()));
+    app.begin_action(Operation::ClosePane, &state);
+    assert!(
+        app.confirmation().is_none(),
+        "an unresolved agent was offered a close"
+    );
+    assert!(
+        app.focus_message()
+            .is_some_and(|message| message.contains("not joined to a pane")),
+        "{:?}",
+        app.focus_message()
+    );
+}
+
+/// Each authority is its own line with the publisher named: the session's
+/// execution, the owner's assignment, and the self facts. The owner's waiting
+/// reason and outcome come with the assignment they describe.
+#[test]
+fn each_authority_is_its_own_line_with_its_publisher_named() {
+    let state = registry_state(
+        wa_inventory(&["wA:p1"]),
+        vec![registration(
+            "w",
+            at("wA:p1"),
+            false,
+            vec![
+                report("w", "execution", "fresh", json!({"activity": "idle"})),
+                report(
+                    "w",
+                    "assignment",
+                    "fresh",
+                    json!({
+                        "activity": "waiting",
+                        "waiting_reason": "awaiting review",
+                        "last_outcome": {"result": "partial", "detail": "tests pending"}
+                    }),
+                ),
+                report(
+                    "w",
+                    "facts",
+                    "fresh",
+                    json!({
+                        "model": "gpt-x",
+                        "background_tasks": [{"id": "bg-7", "phase": "running"}]
+                    }),
+                ),
+            ],
+        )],
+        Vec::new(),
+    );
+    let text = details(&state, &RowId::Registered("w".into()));
+    assert!(text.contains("execution: idle · from pi"), "{text}");
+    assert!(
+        text.contains("assignment: waiting · from herdsman for herdsman-owner"),
+        "{text}"
+    );
+    assert!(text.contains("waiting reason: awaiting review"), "{text}");
+    assert!(
+        text.contains("last outcome: partial — tests pending"),
+        "{text}"
+    );
+    assert!(text.contains("facts: fresh · from pi"), "{text}");
+    assert!(text.contains("model: gpt-x"), "{text}");
+    assert!(text.contains("1 background task"), "{text}");
+    assert!(text.contains("state: waiting"), "{text}");
+}
+
+/// A session's `done` is its execution and nothing more: the owner's assignment
+/// keeps its own value, and a registration with no reports says unknown on every
+/// line rather than idle or done.
+#[test]
+fn execution_done_is_not_assignment_completion_and_silence_is_unknown() {
+    let state = registry_state(
+        wa_inventory(&["wA:p1"]),
+        vec![
+            registration(
+                "done",
+                at("wA:p1"),
+                false,
+                vec![
+                    report("done", "execution", "fresh", json!({"activity": "done"})),
+                    report(
+                        "done",
+                        "assignment",
+                        "fresh",
+                        json!({"activity": "working"}),
+                    ),
+                ],
+            ),
+            registration("silent", at("wA:p1"), false, Vec::new()),
+        ],
+        Vec::new(),
+    );
+    let done = details(&state, &RowId::Registered("done".into()));
+    assert!(done.contains("execution: done · from pi"), "{done}");
+    assert!(
+        done.contains("assignment: working · from herdsman for herdsman-owner"),
+        "{done}"
+    );
+    assert!(!done.contains("assignment: done"), "{done}");
+
+    let silent = details(&state, &RowId::Registered("silent".into()));
+    assert!(
+        silent.contains("execution: unknown — nothing reported"),
+        "{silent}"
+    );
+    assert!(
+        silent.contains("assignment: unknown — nothing reported"),
+        "{silent}"
+    );
+    assert!(silent.contains("facts: not reported"), "{silent}");
+    assert!(silent.contains("state: unknown"), "{silent}");
+}
+
+/// Each channel carries its own freshness. An expired execution reads stale
+/// while a fresh owner `lost` still decides the state, and an owner `settling`
+/// is shown over an idle execution without replacing it.
+#[test]
+fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
+    let state = registry_state(
+        wa_inventory(&["wA:p1"]),
+        vec![
+            registration(
+                "stale",
+                at("wA:p1"),
+                false,
+                vec![
+                    report("stale", "execution", "stale", json!({"activity": "idle"})),
+                    report("stale", "assignment", "fresh", json!({"activity": "lost"})),
+                ],
+            ),
+            registration(
+                "settles",
+                at("wA:p1"),
+                false,
+                vec![
+                    report("settles", "execution", "fresh", json!({"activity": "idle"})),
+                    report(
+                        "settles",
+                        "assignment",
+                        "fresh",
+                        json!({"activity": "settling"}),
+                    ),
+                ],
+            ),
+        ],
+        Vec::new(),
+    );
+    let lost = details(&state, &RowId::Registered("stale".into()));
+    assert!(
+        lost.contains("execution: stale — last report expired"),
+        "{lost}"
+    );
+    assert!(
+        lost.contains("assignment: lost · from herdsman for herdsman-owner"),
+        "{lost}"
+    );
+    assert!(
+        lost.contains("state: lost (the assignment reports lost)"),
+        "{lost}"
+    );
+
+    let settling = details(&state, &RowId::Registered("settles".into()));
+    assert!(settling.contains("execution: idle · from pi"), "{settling}");
+    assert!(
+        settling.contains("state: settling (the assignment reports settling)"),
+        "{settling}"
+    );
+}
+
+/// A spawn edge names its exact parent by registration id, so two registrations
+/// that publish one session are two parents and only the named one is cited. A
+/// parent this view does not hold is said to be absent, not guessed at.
+#[test]
+fn a_child_names_its_exact_parent_and_an_absent_parent_is_said_so() {
+    let state = registry_state(
+        wa_inventory(&["wA:p1", "wA:p2", "wA:p3", "wA:p4"]),
+        vec![
+            registration("lead", at("wA:p1"), false, Vec::new()),
+            registration("other", at("wA:p2"), false, Vec::new()),
+            registration("child", at("wA:p3"), false, Vec::new()),
+            registration("orphan", at("wA:p4"), false, Vec::new()),
+        ],
+        vec![bound_edge("other", "child"), bound_edge("gone", "orphan")],
+    );
+    let child = details(&state, &RowId::Registered("child".into()));
+    assert!(
+        child.contains("spawn: child of other label (other) (bound)"),
+        "{child}"
+    );
+    assert!(!child.contains("child of lead"), "{child}");
+
+    let orphan = details(&state, &RowId::Registered("orphan".into()));
+    assert!(
+        orphan.contains("spawn: child of gone (not in this view) (bound)"),
+        "{orphan}"
+    );
 }

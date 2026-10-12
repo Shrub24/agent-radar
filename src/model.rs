@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::registry_observation::RegistryView;
+
 mod option_duration_millis {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;
@@ -349,6 +351,10 @@ pub struct HerdsmanFacts {
     pub request: Option<String>,
     /// A lead's pending owner question.
     pub ask: Option<String>,
+    /// Why the owner says the assignment is waiting, as it published it.
+    pub waiting_reason: Option<String>,
+    /// The owner's last outcome for the assignment, as it published it.
+    pub last_outcome: Option<String>,
     /// The active assignment's display text.
     pub assignment: Option<String>,
     /// The active assignment's start, Unix milliseconds as published.
@@ -494,6 +500,11 @@ pub struct AgentObservation {
     /// What Herdsman publishes about this agent. Empty unless the source
     /// published metadata; never inferred from runtime facts.
     pub facts: HerdsmanFacts,
+    /// The daemon's registration for this agent, with how it binds to a pane.
+    /// `None` for an agent the registry does not know, and for every agent when
+    /// no registry is read. A registration that names a pane protects that pane
+    /// even when unjoined.
+    pub registry: Option<RegistryView>,
 }
 
 impl AgentObservation {
@@ -514,10 +525,11 @@ impl AgentObservation {
 
     /// The pane's activity state, derived as Herdsman's contract specifies:
     /// a live `lost` from the owner wins, work in flight stays in flight, an
-    /// unknown or unreported native state stays unknown, a non-empty union of
-    /// the owner's awaited items and the pane's background task ids is waiting,
-    /// and otherwise the native state stands. The derivation is in that order
-    /// and the running count takes no part in it.
+    /// unknown or unreported native state stays unknown, the owner's `settling`
+    /// stands over an idle execution, a non-empty union of the owner's awaited
+    /// items and the pane's background task ids is waiting, and otherwise the
+    /// native state stands. The derivation is in that order and the running
+    /// count takes no part in it.
     pub fn activity_state(&self) -> AgentState {
         if matches!(self.facts.state, Some(SemanticState::Lost)) {
             return AgentState::Lost;
@@ -532,6 +544,7 @@ impl AgentObservation {
             // Nothing observed: an awaited item does not make an unreadable
             // pane readable.
             AgentState::Unknown | AgentState::Other(_) => native,
+            _ if matches!(self.facts.state, Some(SemanticState::Settling)) => AgentState::Settling,
             // Nothing outstanding: the native state is the state.
             _ if !self.facts.is_awaited() => native,
             // Outstanding work with nothing in flight is what waiting means.
@@ -552,7 +565,14 @@ pub struct FleetObservation {
     pub workspaces: Vec<Workspace>,
     pub tabs: Vec<Tab>,
     pub panes: Vec<Pane>,
+    /// The agents this observation presents as facts. The collector sets these
+    /// from the registry; a backend's own metadata records never land here.
     pub agents: Vec<AgentObservation>,
+    /// Agent records a backend reads from pane metadata. They are physical
+    /// evidence that protects a pane from unmanaged control, and are never
+    /// presented as agent facts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_agents: Vec<AgentObservation>,
 }
 
 impl FleetObservation {
@@ -569,6 +589,11 @@ impl FleetObservation {
     /// may mirror agent fields but are never consulted here.
     pub fn agent_on_pane(&self, pane_id: &str) -> Option<&AgentObservation> {
         self.agents.iter().find(|a| a.location.pane_id == pane_id)
+    }
+
+    /// Every agent record this observation holds, presented or metadata.
+    pub fn all_agents(&self) -> impl Iterator<Item = &AgentObservation> {
+        self.agents.iter().chain(&self.metadata_agents)
     }
 }
 
@@ -986,6 +1011,7 @@ mod tests {
             session: None,
             lineage: None,
             facts,
+            registry: None,
         }
     }
 
@@ -1097,12 +1123,23 @@ mod tests {
             observed(awaiting(), None).activity_state().word(),
             "unknown"
         );
-        // 4. Otherwise outstanding work with nothing in flight is waiting.
+        // 4. The owner's settling stands over an idle execution, and an
+        // unknown execution still reads unknown whatever the owner reports.
+        let settling = HerdsmanFacts {
+            state: Some(SemanticState::Settling),
+            ..awaiting()
+        };
+        assert_eq!(
+            observed(settling.clone(), idle()).activity_state().word(),
+            "settling"
+        );
+        assert_eq!(observed(settling, None).activity_state().word(), "unknown");
+        // 5. Otherwise outstanding work with nothing in flight is waiting.
         assert_eq!(
             observed(awaiting(), idle()).activity_state().word(),
             "waiting"
         );
-        // 5. With neither publisher reporting anything, the native state
+        // 6. With neither publisher reporting anything, the native state
         // stands — idle here, never inferred waiting.
         assert_eq!(
             observed(HerdsmanFacts::default(), idle())

@@ -166,7 +166,8 @@ retained-worker close/restart orchestration in `extension/index.ts`.
 | Placement parity | Add managed-spawn placement where Herdsman actually requires new-tab/existing-pane/custom-anchor behavior; generic create is not a managed launch |
 | Loss/exit watching | Consume resumable daemon events and page spawn topology; typed pane exit is currently available only for tmux-backed v2 spawn edges, while Herdr and missing panes remain unknown |
 | Retained-worker stop/resume/restart | Specify and implement physical stop/exit verification and replacement/resume binding while Herdsman keeps run/result/mailbox policy |
-| Backend detection and dashboard state | Remove direct Herdr environment/alias assumptions; wire registry facts into Radar's fleet view and make daemon/server selection explicit |
+| Session facts (model, provider, thinking, context usage, session name, background tasks) | Publish to the `facts` channel after negotiating `registry.facts.v1`; which reporter writes it is pi-extensions' decision |
+| Backend detection and dashboard state | Done in Radar: daemon/server selection is explicit and the fleet view reads registry facts (see [dashboard consumption](daemon.md#dashboard-consumption)). What remains is Herdsman's own direct Herdr environment and alias assumptions in its launch and inspect paths |
 
 The first row can migrate now for the supported parent-split launch flow.
 Retained-worker resume and the other currently used behaviors are necessary for

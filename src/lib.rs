@@ -14,6 +14,7 @@ pub mod model;
 pub mod observation;
 pub mod process_icons;
 pub mod procfs;
+pub mod registry_observation;
 pub mod runtime;
 pub mod theme;
 pub mod title;

@@ -27,12 +27,16 @@ use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bus::Task;
+use crate::control_plane::registry::{Freshness, PublicChannelFacts};
 use crate::model::{
     AgentObservation, AgentState, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent,
     DescendantSample, ForegroundEvidence, HerdsmanFacts, ProcessIdentity, ProcessResources,
     ProcessState, SessionIdentity, SessionUuid, TerminalMode, Total,
 };
 use crate::observation::{ObservationState, RetentionBasis, SourceFreshness};
+use crate::registry_observation::{
+    Binding, RegistryView, SpawnBinding, Unjoined, channel_freshness,
+};
 use crate::theme;
 use crate::tree::{AgentRow, RowKind, TaskRow, TaskSource};
 
@@ -884,6 +888,7 @@ fn row_item(
                         | crate::model::AgentState::Idle
                 ))
                 .then(|| sanitize(agent.state.word())),
+                (!agent.joined()).then(|| "unresolved".to_string()),
                 agent.facts.assigned_for.map(duration),
                 agent.facts.model_and_thinking().map(|m| sanitize(&m)),
                 (unresolved > 0).then(|| {
@@ -1819,29 +1824,27 @@ fn overview_lines(
             {
                 page.push(line);
             }
-            page.push(field(
-                "agent",
-                agent
-                    .name
-                    .as_deref()
-                    .map(sanitize)
-                    .unwrap_or_else(unavailable),
-            ));
-            let status = agent
-                .status
-                .as_ref()
-                .map(|status| sanitize(&status.to_string()))
-                .unwrap_or_else(unavailable);
-            // The row draws the state derived from the pane; how the owner
-            // projects it, and the identities it published, are Source facts.
-            page.push(field(
-                "state",
-                format!("{} (derived from the pane)", sanitize(agent.state.word())),
-            ));
-            page.push(match &agent.retained {
-                Some(_) => field("status (last observed)", status),
-                None => field("status", status),
-            });
+            page.push(field("agent", agent_identifier(agent)));
+            match &agent.registry {
+                Some(view) => registry_lines(state, agent, view, page),
+                None => {
+                    let status = agent
+                        .status
+                        .as_ref()
+                        .map(|status| sanitize(&status.to_string()))
+                        .unwrap_or_else(unavailable);
+                    // The row draws the state derived from the pane; how the owner
+                    // projects it, and the identities it published, are Source facts.
+                    page.push(field(
+                        "state",
+                        format!("{} (derived from the pane)", sanitize(agent.state.word())),
+                    ));
+                    page.push(match &agent.retained {
+                        Some(_) => field("status (last observed)", status),
+                        None => field("status", status),
+                    });
+                }
+            }
             activity_lines(&agent.facts, blocks, page);
         }
         RowKind::Task(task) => {
@@ -1860,6 +1863,193 @@ fn overview_lines(
             }
         }
     }
+}
+
+/// What names this row's agent.
+///
+/// A backend's own agent name is used where it has one. A registry-backed row
+/// has none, and that absence says nothing about the agent: the registration's
+/// label, else the agent id it was registered under, names it instead. Reporting
+/// both as `unavailable` would hide a registration the row is drawn from.
+fn agent_identifier(agent: &AgentRow) -> String {
+    if let Some(name) = agent.name.as_deref() {
+        return sanitize(name);
+    }
+    if let Some(view) = agent.registry.as_ref() {
+        return match view.agent.registration.label.as_deref() {
+            Some(label) => sanitize(label),
+            None => sanitize(&view.agent.registration.agent_id),
+        };
+    }
+    unavailable()
+}
+
+/// A registered agent's authorities, one labelled line each: where its pane
+/// stands, what it last executed, what its owner assigned, its own facts, and the
+/// state derived from them. Each carries its own freshness, so an expired report
+/// reads as stale rather than as the state it last described.
+fn registry_lines(
+    state: &ObservationState,
+    agent: &AgentRow,
+    view: &RegistryView,
+    page: &mut PageLines,
+) {
+    let observed = |text: String| match &agent.retained {
+        Some(_) => format!("{text} (last observed)"),
+        None => text,
+    };
+    page.push(field(
+        "physical",
+        physical_text(&view.binding, agent.retained.is_some()),
+    ));
+    page.push(field(
+        "execution",
+        observed(with_source(
+            execution_text(agent, &view.agent.execution),
+            &view.agent.execution,
+        )),
+    ));
+    page.push(field(
+        "assignment",
+        observed(with_source(
+            assignment_text(agent, &view.agent.assignment),
+            &view.agent.assignment,
+        )),
+    ));
+    if let Some(reason) = agent.facts.waiting_reason.as_deref() {
+        page.push(field("waiting reason", sanitize(reason)));
+    }
+    if let Some(outcome) = agent.facts.last_outcome.as_deref() {
+        page.push(field("last outcome", sanitize(outcome)));
+    }
+    page.push(field(
+        "facts",
+        with_source(
+            freshness_word(channel_freshness(&view.agent.facts)).to_string(),
+            &view.agent.facts,
+        ),
+    ));
+    page.push(field(
+        "state",
+        observed(format!(
+            "{} ({})",
+            sanitize(agent.state.word()),
+            state_basis(&agent.state)
+        )),
+    ));
+    if let Some(spawn) = &view.spawn {
+        page.push(field("spawn", spawn_text(state, spawn)));
+    }
+}
+
+/// Whether the pane is proven. A retained agent has no registration on its pane
+/// now, and an unresolved one names the reason it does not join.
+fn physical_text(binding: &Binding, retained: bool) -> String {
+    if retained {
+        return "retained — no registration on this pane now".to_string();
+    }
+    match binding {
+        Binding::Joined => "joined to this pane by process identity".to_string(),
+        Binding::Unjoined(reason) => format!("unresolved — {}", unjoined_text(*reason)),
+    }
+}
+
+fn unjoined_text(reason: Unjoined) -> &'static str {
+    match reason {
+        Unjoined::NoLocation => "no pane reported",
+        Unjoined::NoClaim => "no process identity claimed",
+        Unjoined::PaneAbsent => "reported pane is not in the inventory; no exit is claimed",
+        Unjoined::LocationMismatch => "reported backend, workspace or tab differs from the pane",
+        Unjoined::ForegroundUnreadable => "the pane's foreground identity was not read",
+        Unjoined::IdentityMismatch => "the pane's foreground is a different process",
+        Unjoined::Ambiguous => "another registration claims the same process",
+    }
+}
+
+/// The execution report, shown only while fresh: an expired or missing report is
+/// never read as idle.
+fn execution_text(agent: &AgentRow, channel: &Option<PublicChannelFacts>) -> String {
+    match channel_freshness(channel) {
+        Some(Freshness::Fresh) => match &agent.status {
+            Some(status) => sanitize(&status.to_string()),
+            None => "unknown — report unreadable".to_string(),
+        },
+        Some(Freshness::Stale) => "stale — last report expired".to_string(),
+        None => "unknown — nothing reported".to_string(),
+    }
+}
+
+/// The owner's assignment report, shown only while fresh.
+fn assignment_text(agent: &AgentRow, channel: &Option<PublicChannelFacts>) -> String {
+    match channel_freshness(channel) {
+        Some(Freshness::Fresh) => match &agent.facts.state {
+            Some(projected) => sanitize(AgentState::from(projected).word()),
+            None => "reported without a state".to_string(),
+        },
+        Some(Freshness::Stale) => "stale — last report expired".to_string(),
+        None => "unknown — nothing reported".to_string(),
+    }
+}
+
+/// A report's publisher beside its freshness: the source that wrote it and, when
+/// the registry names one, the owner it wrote for. An absent report names none.
+fn with_source(text: String, channel: &Option<PublicChannelFacts>) -> String {
+    let Some(snapshot) = channel
+        .as_ref()
+        .and_then(|channel| channel.snapshot.as_ref())
+    else {
+        return text;
+    };
+    match &snapshot.reporting_owner {
+        Some(owner) => format!(
+            "{text} · from {} for {}",
+            sanitize(&snapshot.source),
+            sanitize(owner)
+        ),
+        None => format!("{text} · from {}", sanitize(&snapshot.source)),
+    }
+}
+
+fn freshness_word(freshness: Option<Freshness>) -> &'static str {
+    match freshness {
+        Some(Freshness::Fresh) => "fresh",
+        Some(Freshness::Stale) => "stale",
+        None => "not reported",
+    }
+}
+
+/// Which authority a derived state comes from, so a reader can check it.
+fn state_basis(state: &AgentState) -> &'static str {
+    match state {
+        AgentState::Lost => "the assignment reports lost",
+        AgentState::Settling => "the assignment reports settling",
+        AgentState::Waiting => "idle with awaited items or background tasks",
+        AgentState::Unknown => "execution unknown or unreported",
+        _ => "from the execution report",
+    }
+}
+
+/// The exact spawn edge: the parent is named by its registration when it is in
+/// this view, and by its id alone when it is not. A child's edge is never a
+/// process exit, so an unresolved edge is stated as that.
+fn spawn_text(state: &ObservationState, spawn: &SpawnBinding) -> String {
+    let parent = state
+        .inventory()
+        .into_iter()
+        .flat_map(|inventory| inventory.agents.iter())
+        .filter_map(|agent| agent.registry.as_ref())
+        .find(|view| view.agent.registration.agent_id == spawn.parent);
+    let parent = match parent.and_then(|view| view.agent.registration.label.as_deref()) {
+        Some(label) => format!("{} ({})", sanitize(label), sanitize(&spawn.parent)),
+        None if parent.is_some() => sanitize(&spawn.parent),
+        None => format!("{} (not in this view)", sanitize(&spawn.parent)),
+    };
+    let edge = match spawn.state {
+        crate::control_plane::registry::SpawnState::Unbound => "not yet bound",
+        crate::control_plane::registry::SpawnState::Bound => "bound",
+        crate::control_plane::registry::SpawnState::Unresolved => "unresolved",
+    };
+    format!("child of {parent} ({edge})")
 }
 
 /// The row of the process table the reader has selected, when one is: the page
@@ -3135,6 +3325,7 @@ fn bus_diagnostic(app: &App) -> Option<Line<'static>> {
 
 fn location_text(label: Option<&str>, id: &str) -> String {
     match label {
+        _ if id.is_empty() => unavailable(),
         Some(label) => format!("{} ({})", sanitize(label), sanitize(id)),
         None => sanitize(id),
     }
@@ -3150,7 +3341,7 @@ fn location_line(
         "{} · {} · {}",
         location_text(workspace.0, workspace.1),
         location_text(tab.0, tab.1),
-        sanitize(pane_id)
+        location_text(None, pane_id)
     )
 }
 
@@ -3463,6 +3654,7 @@ mod tests {
         };
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
@@ -3487,6 +3679,7 @@ mod tests {
                 session: None,
                 lineage: None,
                 facts,
+                registry: None,
             }],
         });
         state
@@ -3543,6 +3736,7 @@ mod tests {
             .collect();
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
@@ -3577,6 +3771,7 @@ mod tests {
             session: None,
             lineage: Some(lineage),
             facts: HerdsmanFacts::default(),
+            registry: None,
         };
 
         let ambiguous = lineage_state(vec![
@@ -3867,9 +4062,11 @@ mod tests {
                 session: None,
                 lineage: None,
                 facts: crate::model::HerdsmanFacts::default(),
+                registry: None,
             })
             .collect();
         let mut observation = FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![crate::model::Workspace {
                 workspace_id: "wL".into(),
                 label: Some("long".into()),
@@ -8262,6 +8459,7 @@ mod tests {
             .expect("a UUID");
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            metadata_agents: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),
@@ -8295,6 +8493,7 @@ mod tests {
                     state: Some(SemanticState::Idle),
                     ..Default::default()
                 },
+                registry: None,
             }],
         });
         state

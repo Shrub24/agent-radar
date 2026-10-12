@@ -273,7 +273,7 @@ pub enum LocationEvidence {
 
 /// One edge as a topology read reports it: the stored facts, plus the two things
 /// a read derives instead of inferring.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicSpawnTopology {
     #[serde(flatten)]
     pub edge: PublicSpawnEdge,

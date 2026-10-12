@@ -24,6 +24,7 @@ pub use crate::runtime::{
 /// The `*.v1` names are the daemon's own, not the backend's: they say which of
 /// the daemon's methods a backend's capabilities make servable.
 pub const REGISTRY_CONTRACT: &str = "registry.v1";
+pub const REGISTRY_FACTS_CONTRACT: &str = "registry.facts.v1";
 pub const EVENTS_CONTRACT: &str = "events.v1";
 pub const SPAWN_CONTRACT: &str = "spawn.v1";
 pub const SPAWN_CLOSE_CONTRACT: &str = "spawn.close.v1";
@@ -38,6 +39,7 @@ pub const SPAWN_EXIT_OBSERVATION_CONTRACT: &str = "spawn.exit_observation.v1";
 /// event journal are answered from the daemon's own records and need no backend.
 const CONTRACTS: &[(&str, &[&str])] = &[
     (REGISTRY_CONTRACT, &[]),
+    (REGISTRY_FACTS_CONTRACT, &[]),
     (EVENTS_CONTRACT, &[]),
     (SPAWN_CONTRACT, &[CREATE_CAPABILITY, LAUNCH_CAPABILITY]),
     (
@@ -362,12 +364,17 @@ mod tests {
         }
         assert_eq!(
             advertised(&[LAUNCH_CAPABILITY]),
-            vec![LAUNCH_CAPABILITY, REGISTRY_CONTRACT, EVENTS_CONTRACT],
+            vec![
+                LAUNCH_CAPABILITY,
+                REGISTRY_CONTRACT,
+                REGISTRY_FACTS_CONTRACT,
+                EVENTS_CONTRACT
+            ],
             "a backend that can only launch serves spawn.create no better than none"
         );
         assert_eq!(
             advertised(&[]),
-            vec![REGISTRY_CONTRACT, EVENTS_CONTRACT],
+            vec![REGISTRY_CONTRACT, REGISTRY_FACTS_CONTRACT, EVENTS_CONTRACT],
             "the daemon's own records need no backend"
         );
     }
@@ -376,7 +383,12 @@ mod tests {
     fn a_capability_a_backend_states_twice_is_advertised_once() {
         assert_eq!(
             advertised(&[OBSERVE_CAPABILITY, OBSERVE_CAPABILITY]),
-            vec![OBSERVE_CAPABILITY, REGISTRY_CONTRACT, EVENTS_CONTRACT]
+            vec![
+                OBSERVE_CAPABILITY,
+                REGISTRY_CONTRACT,
+                REGISTRY_FACTS_CONTRACT,
+                EVENTS_CONTRACT
+            ]
         );
     }
 

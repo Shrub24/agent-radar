@@ -909,6 +909,10 @@ struct SpawnListParams {
 #[derive(Clone, Debug, serde::Serialize)]
 struct ProcessEvidence {
     claimed: bool,
+    /// The registered birth identity, present only when one was claimed. It is
+    /// same-UID process evidence for matching a pane, not a credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim: Option<crate::model::ProcessIdentity>,
     verification: registry::ProcessVerification,
 }
 
@@ -1327,6 +1331,7 @@ fn process_evidence(
 ) -> ProcessEvidence {
     ProcessEvidence {
         claimed: registration.request.process.is_some(),
+        claim: registration.request.process.clone(),
         verification,
     }
 }
@@ -1815,6 +1820,10 @@ fn registry_request(
                     Ok(value) => value,
                     Err(error) => return registry_error(request, error),
                 };
+            let facts = match registry.published_facts(&params.agent_id, Channel::Facts, now_ms) {
+                Ok(value) => value,
+                Err(error) => return registry_error(request, error),
+            };
             let context = match registry.context(&params.agent_id, now_ms) {
                 Ok(value) => value,
                 Err(error) => return registry_error(request, error),
@@ -1824,7 +1833,8 @@ fn registry_request(
                 json!({"agent": {
                     "registration": registration.public(),
                     "process": process_evidence(&registration, verified),
-                    "execution": execution, "assignment": assignment, "context": context,
+                    "execution": execution, "assignment": assignment, "facts": facts,
+                    "context": context,
                 }}),
             )
         }
@@ -1895,6 +1905,14 @@ fn registry_request(
                     Ok(value) => value,
                     Err(error) => return registry_error(request, error),
                 };
+                let facts = match registry.published_facts(
+                    &registration.agent_id,
+                    Channel::Facts,
+                    now_ms,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return registry_error(request, error),
+                };
                 let context = match registry.context(&registration.agent_id, now_ms) {
                     Ok(value) => value,
                     Err(error) => return registry_error(request, error),
@@ -1904,6 +1922,7 @@ fn registry_request(
                     "process": process_evidence(registration, verified),
                     "execution": execution,
                     "assignment": assignment,
+                    "facts": facts,
                     "context": context,
                 });
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
@@ -2833,7 +2852,13 @@ fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
         .with_params(request.params.clone());
     // A backend confirmation says the close was performed, not that the location
     // is gone: nothing here re-reads the post-state, so the record says so.
-    let done = match lifecycle::close_unmanaged(backend.as_ref(), &close_request, &cancel) {
+    let registrations = || locked(core).registry.public_registrations();
+    let done = match lifecycle::close_unmanaged(
+        backend.as_ref(),
+        &close_request,
+        &cancel,
+        registrations,
+    ) {
         DirectClose::Completed => record.complete(
             RequestOutcome::Completed,
             None,

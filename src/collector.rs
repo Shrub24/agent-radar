@@ -29,6 +29,10 @@
 //! [`ForegroundEvidence::Inconclusive`] and never proves that either the source
 //! or the pane disappeared.
 //!
+//! A registry-serving backend's agents are joined to panes here too: the
+//! registrations are read after the inventory, and a registration's pane is
+//! sampled in the same refresh so the join can be proven by its birth identity.
+//!
 //! Two normalized facts are completed here rather than by an adapter. The
 //! active assignment's age is measured once per refresh against one read of the
 //! clock, so decoded facts stay clockless and the rows of a single frame stay
@@ -48,6 +52,7 @@
 //! cycles: retention itself is immediate, and its shell/non-shell confirmation
 //! lands within two poll intervals.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -57,11 +62,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::observation::ObservationState;
 use crate::procfs::{self, Sampler};
+use crate::registry_observation;
 use crate::runtime::RuntimeProvider;
 
 /// Interval between refreshes when [`CollectorConfig::poll_interval`] is left
 /// at its default.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long one refresh may run, end to end, across the inventory, the registry,
+/// its topology and every candidate's foreground evidence.
+///
+/// The main loop cancels a refresh that outlives this, and cancellation reaches
+/// every runtime call, so the bound holds even when one call would wait longer.
+const REFRESH_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Collection settings: the refresh schedule alone.
 ///
@@ -98,8 +111,10 @@ enum RefreshOutcome {
 
 /// A refresh running on its own thread.
 struct Refresh {
-    /// Set by [`Collector::shutdown`]; the worker turns it into a cancellation.
+    /// Set by [`Collector::shutdown`] or by the deadline; the worker turns it into
+    /// a cancellation.
     cancel: Arc<AtomicBool>,
+    deadline: Instant,
     outcomes: Receiver<RefreshOutcome>,
     worker: JoinHandle<()>,
 }
@@ -165,6 +180,16 @@ impl Collector {
             return false;
         }
         let applied = self.apply_finished(state);
+        // The deadline is enforced here, on the caller's thread, so a refresh
+        // stuck in one call is still cancelled. Tick at least as often as the
+        // poll interval for this to hold promptly.
+        if let Some(refresh) = self
+            .in_flight
+            .as_ref()
+            .filter(|r| Instant::now() >= r.deadline)
+        {
+            refresh.cancel.store(true, Ordering::SeqCst);
+        }
         if self.in_flight.is_none() && Instant::now() >= self.next_refresh {
             // A whole-fleet process sweep covers every pane; otherwise the
             // candidates are the continuity retentions plus the live agent panes
@@ -242,6 +267,7 @@ impl Collector {
     /// Starts one refresh off the calling thread.
     fn start_refresh(&mut self, candidates: Vec<String>) {
         let cancel = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + REFRESH_DEADLINE;
         let (sender, outcomes) = mpsc::channel();
         let worker = {
             let provider = Arc::clone(&self.provider);
@@ -250,12 +276,19 @@ impl Collector {
             thread::Builder::new()
                 .name("radar-collector".to_string())
                 .spawn(move || {
-                    let _ = sender.send(collect(provider.as_ref(), &candidates, &cancel, &sampler));
+                    let _ = sender.send(collect(
+                        provider.as_ref(),
+                        &candidates,
+                        &cancel,
+                        &sampler,
+                        deadline,
+                    ));
                 })
                 .expect("collector thread")
         };
         self.in_flight = Some(Refresh {
             cancel,
+            deadline,
             outcomes,
             worker,
         });
@@ -268,18 +301,37 @@ impl Drop for Collector {
     }
 }
 
-/// Runs one refresh: the inventory, then evidence for each candidate.
+/// Runs one refresh: the inventory, the registry, then evidence for each pane.
+///
+/// Registered agents are read after the inventory and joined after the evidence,
+/// so a registration's pane is sampled in this refresh whether or not an agent
+/// was ever seen on it. The backend's own agent records are kept as containment
+/// evidence only. A refresh that was cancelled, by its deadline or by shutdown,
+/// is a failure, never a partial success.
 fn collect(
     provider: &dyn RuntimeProvider,
     candidates: &[String],
     cancel: &AtomicBool,
     sampler: &Mutex<Sampler>,
+    deadline: Instant,
 ) -> RefreshOutcome {
     let mut observation = match provider.inventory(cancel) {
         Ok(observation) => observation,
         Err(diagnostic) => return RefreshOutcome::Failure { diagnostic },
     };
-    stamp_assignment_ages(&mut observation);
+    let registry = match provider.registry(cancel) {
+        Ok(registry) => registry,
+        Err(diagnostic) => return RefreshOutcome::Failure { diagnostic },
+    };
+    // A set: a pane named by the continuity candidates and by a registration is
+    // sampled once.
+    let mut panes: BTreeSet<String> = candidates.iter().cloned().collect();
+    if let Some(read) = &registry {
+        panes.extend(read.agents.iter().filter_map(|agent| {
+            let pane = agent.registration.location.as_ref()?.pane.as_ref()?;
+            observation.pane(pane).map(|_| pane.clone())
+        }));
+    }
     // One PATH lookup per distinct program name for the whole refresh, and one
     // entry point for the local facts composed onto the evidence below.
     let mut binaries = procfs::BinaryIndex::new();
@@ -296,10 +348,10 @@ fn collect(
     // every root in it: descendants are summed from that scan rather than the
     // table being walked once per pane.
     let now = Instant::now();
-    if !candidates.is_empty() {
+    if !panes.is_empty() {
         sampler.scan(now, cancel);
     }
-    let evidence = candidates
+    let evidence: Vec<(String, ForegroundEvidence)> = panes
         .iter()
         .map(|pane_id| {
             (
@@ -312,6 +364,22 @@ fn collect(
     // root has summed its descendants: the processes this refresh did not read do
     // not come back, and their counters are not kept for them.
     sampler.finish();
+    drop(sampler);
+    // The clock is checked as well as the flag: a refresh that finished past its
+    // deadline is never applied, even before the main loop has cancelled it.
+    if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
+        return RefreshOutcome::Failure {
+            diagnostic: format!("collection did not finish within {REFRESH_DEADLINE:?}"),
+        };
+    }
+    // Presented agents come from the registry alone. Where there is no registry,
+    // none are presented; the backend's own records stay as containment evidence.
+    let metadata_agents = std::mem::take(&mut observation.agents);
+    observation.agents = registry.map_or_else(Vec::new, |read| {
+        registry_observation::project(&observation, &provider.identity(), read, &evidence)
+    });
+    observation.metadata_agents = metadata_agents;
+    stamp_assignment_ages(&mut observation);
     RefreshOutcome::Success {
         observation,
         evidence,
@@ -370,6 +438,8 @@ fn evidence_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{FleetObservation, ForegroundEvidence};
+    use crate::runtime::{BackendIdentity, CloseTarget, Target};
 
     #[test]
     fn the_poll_interval_defaults_to_one_second() {
@@ -377,5 +447,56 @@ mod tests {
             CollectorConfig::default().poll_interval,
             Duration::from_secs(1)
         );
+    }
+
+    /// A backend that answers an empty inventory and nothing else: the refresh
+    /// has no panes to sample, so only its own clock decides the outcome.
+    struct EmptyInventory;
+
+    impl RuntimeProvider for EmptyInventory {
+        fn identity(&self) -> BackendIdentity {
+            BackendIdentity::named("test")
+        }
+
+        fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
+            Ok(FleetObservation {
+                metadata_agents: Vec::new(),
+                workspaces: Vec::new(),
+                tabs: Vec::new(),
+                panes: Vec::new(),
+                agents: Vec::new(),
+            })
+        }
+
+        fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
+            ForegroundEvidence::Inconclusive
+        }
+
+        fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
+            Err("not used".into())
+        }
+
+        fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
+            Err("not used".into())
+        }
+    }
+
+    /// A refresh that completes at or after its deadline is refused even though
+    /// nothing cancelled it: the flag is clear and the work succeeded. The same
+    /// backend with the deadline ahead is applied, so the refusal is the clock's.
+    #[test]
+    fn a_refresh_that_finishes_at_its_deadline_is_refused_even_uncancelled() {
+        let cancel = AtomicBool::new(false);
+        let sampler = Mutex::new(Sampler::new());
+        let ahead = Instant::now() + Duration::from_secs(60);
+        assert!(matches!(
+            collect(&EmptyInventory, &[], &cancel, &sampler, ahead),
+            RefreshOutcome::Success { .. }
+        ));
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert!(matches!(
+            collect(&EmptyInventory, &[], &cancel, &sampler, Instant::now()),
+            RefreshOutcome::Failure { .. }
+        ));
     }
 }

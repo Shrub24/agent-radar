@@ -14,7 +14,7 @@ The daemon has two independent surfaces on one local control socket:
 | Surface | Use | Reference |
 |---|---|---|
 | Physical mux adapter | Observe terminal locations/process evidence; focus, create, input, read output and guarded unmanaged close | [Control-plane protocol](control-plane.md) |
-| Direct agent registry | Register agent incarnations; publish execution and assignment facts; read current facts and process verification | [Agent registration](agent-registration.md) |
+| Direct agent registry | Register agent incarnations; publish execution, assignment and session facts; read current snapshots and process verification | [Agent registration](agent-registration.md) |
 
 The physical backend defaults to Herdr; the daemon can also select the tmux
 adapter explicitly with `RADAR_CONTROL_BACKEND=tmux` and a named
@@ -64,9 +64,24 @@ make itself a lifecycle manager: there is no resume, restart, recovery,
 or adoption of panes launched outside the daemon. A created pane is not a bound
 child until that child registers with the private spawn token. Private
 launch/resume specifications stored on registrations remain inert unless
-explicitly used by a supported operation. The current Radar TUI still uses its
-existing observation path; registering an agent is not yet a way to make it
-appear there.
+explicitly used by a supported operation.
+
+## Dashboard consumption
+
+The Radar TUI is a registry consumer. With a daemon selected, it declares
+`registry.v1` and `spawn.v1`, reads the daemon's pane inventory plus paged
+`agent.list` and `spawn.list`, and joins each registration to a pane by its
+backend-qualified location and the exact `process.claim` birth identity of that
+pane's own foreground process. A daemon that omits either contract fails the
+refresh with that diagnostic rather than showing a fleet from another source.
+Herdr's agent records, its display metadata and its native agent status are never
+display facts: a registered row is named by its registration and shows the
+execution, assignment and facts channels, each with its own provenance and
+freshness. A registration at a pane also protects it — and the tab containing it
+— from a generic unmanaged close, joined or not; `x` is routed to the owner where
+the pane carries the lineage that route needs, and refused otherwise. Direct,
+with no daemon, the TUI lists ordinary panes only. No agent fact in the dashboard
+comes from a Herdr token once a daemon serves the registry.
 
 ## Connect and negotiate
 
@@ -77,7 +92,7 @@ start or supervise it.
 Clients connect directly using Unix-domain UTF-8 JSON Lines, protocol version
 `2`, with a canonical UUID request ID and one matching response per request.
 Send `daemon.ping` first and check the served protocol and the contracts your
-client needs: `registry.v1` for a publisher, `events.v1` for a journal reader,
+client needs: `registry.v1` for a publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader,
 `spawn.v1` and `spawn.close.v1` for managed children. Do not require mux
 capabilities for a registry-only publisher. The handshake states what this build
 serves; it cannot prove which build is running, so treat an absent contract or an
@@ -107,6 +122,7 @@ processes running as the same user. Do not expose this socket remotely.
 | Register a subject | `agent.register` | `registry.v1` |
 | Acquire or explicitly replace a channel writer | `agent.acquire` | `registry.v1` |
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `registry.v1` |
+| Session facts and assignment extension | `agent.acquire`, `agent.publish` on channel `facts`, or extended assignment fields | `registry.v1`; negotiate `registry.facts.v1` |
 | Update current session context | `agent.context` | `registry.v1` |
 | Public registry reads | `agent.get`, `agent.list` | `registry.v1` |
 | Spawn topology reads | `spawn.get`, `spawn.list` | `registry.v1`; location confirmation additionally uses `mux.observe` when available |
@@ -172,7 +188,8 @@ effect. Registry publication uses its own identity/sequence rules; it does not
 share the mux mutation lane.
 
 `mux.close` accepts only positively unmanaged targets with a frozen identity that
-the daemon rechecks. `spawn.close` is separate: it requires a daemon-authored
+the daemon rechecks, and refuses any target a registration names, including one made
+after the operator confirmed. `spawn.close` is separate: it requires a daemon-authored
 spawn edge with a bound child, that child's process identity claim, a fresh pane
 and containment match, and then either an exact foreground birth-identity match
 for a live occupant or, for a retained dead pane, the edge's own recorded exit,
@@ -213,6 +230,10 @@ The first port can be small:
   execution evidence separately on `execution`.
 - Keep optional Herdr metadata mirroring only where an existing consumer needs
   it. Registry publication itself needs no Herdr commands or token parsing.
+- Publish the session's own `facts` channel (model, provider, thinking, context
+  usage, session name, background tasks) where a dashboard consumer needs it.
+  Adoption is additive: a dashboard shows the assignment extension and `facts`
+  rows as unavailable until a publisher writes them, and nothing else changes.
 - Route child creation through `spawn.create` only after `daemon.ping` confirms
   protocol 2 and the `spawn.v1` contract (the backend's `mux.create` and
   `mux.launch` capabilities), plus `mux.launch_context` when supplying
@@ -257,7 +278,13 @@ scripted backend to verify create, launch, token binding and redaction without a
 live Herdr session. Its close exchanges cover the live-pane path and its same-ID
 replay; the dead-pane `already_exited` path needs a retained pane and a fenced
 edge, and a scripted Herdr backend can never fence one, so that path is covered
-by the isolated disposable-tmux tests instead. The publisher example itself
+by the isolated disposable-tmux tests instead.
+`python3 tests/tmux_acceptance.py target/debug/radar` is the dashboard
+acceptance: it runs the TUI against a disposable daemon on a disposable tmux
+server, registers agents whose panes run real foreground processes, and asserts
+the registry-backed rows, the refusal of a generic close for a registration, and
+that no Herdr call is made. It needs no Herdr, and it leaves no server, pane,
+daemon or socket behind, on success or failure. The publisher example itself
 remains a registry-publisher
 reference and does not launch children. It retains publisher identity for one
 process lifetime; a production publisher must define durable reconnect state.
