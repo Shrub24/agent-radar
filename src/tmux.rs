@@ -48,6 +48,15 @@ const BACKEND: &str = "tmux";
 /// in its record, so a title can never be read as another field.
 const FIELD: char = '\u{1f}';
 
+/// The same separator as a tmux that cannot write the byte writes it.
+///
+/// Measured against Radar's own formats: tmux 3.5a (Debian trixie) writes the
+/// byte above as this `\ooo` escape, and tmux 3.7c writes the byte. Both spell
+/// the same field boundary and the same record. A boundary is never an
+/// instruction — the text is not unescaped, and a display field that already
+/// spells `\037` is read as the text tmux sent.
+const FIELD_ESCAPED: &str = "\\037";
+
 /// One `list-sessions` record: the session, then its name.
 const SESSION_FORMAT: &str = "#{session_id}\u{1f}#{session_name}";
 
@@ -727,13 +736,13 @@ impl TmuxRuntime {
         kinds: &[Kind; N],
     ) -> Result<[String; N], Failure> {
         let line = answer.lines().find(|line| !line.is_empty()).unwrap_or("");
-        let fields: Vec<&str> = line.split(FIELD).collect();
-        if fields.len() != N
-            || !fields
+        let named = split_record::<N>(line).filter(|fields| {
+            fields
                 .iter()
                 .zip(kinds)
                 .all(|(field, kind)| kind.names(field))
-        {
+        });
+        let Some(fields) = named else {
             return Err(Failure::unknown(format!(
                 "tmux answered a creation with `{line:?}`, which names no {}",
                 kinds
@@ -742,8 +751,8 @@ impl TmuxRuntime {
                     .collect::<Vec<&str>>()
                     .join(", ")
             )));
-        }
-        Ok(std::array::from_fn(|index| fields[index].to_string()))
+        };
+        Ok(fields.map(str::to_string))
     }
 
     /// The handle for one tmux id: the backend and the server qualify it, and
@@ -1060,17 +1069,35 @@ fn records(text: &str) -> impl Iterator<Item = &str> {
 
 /// One record split into its fields.
 ///
-/// The last field takes the rest of the line, so the one field tmux cannot
-/// police — a title — is read whole whatever it contains. An earlier field that
-/// contained the separator would shift the record, and the id checks that follow
-/// turn that into a failure rather than a wrong location.
+/// A boundary is the raw separator byte or the escape a tmux that cannot write
+/// the byte sends in its place; both spell the same record. The last field takes
+/// the rest of the line, so the one field tmux cannot police — a title — is read
+/// whole whatever it contains. An earlier field that carried a boundary would
+/// shift the record, and the id checks that follow turn that into a failure
+/// rather than a wrong location.
 fn split_record<const N: usize>(line: &str) -> Option<[&str; N]> {
-    let mut parts = line.splitn(N, FIELD);
     let mut fields = [""; N];
-    for field in &mut fields {
-        *field = parts.next()?;
+    let mut rest = line;
+    let mut remaining = fields.iter_mut();
+    for field in remaining.by_ref().take(N.saturating_sub(1)) {
+        let (value, after) = next_field(rest)?;
+        *field = value;
+        rest = after;
     }
+    *remaining.next()? = rest;
     Some(fields)
+}
+
+/// The field before the next boundary in `rest` and what follows it, or `None`
+/// when no boundary is left.
+fn next_field(rest: &str) -> Option<(&str, &str)> {
+    let (at, width) = match (rest.find(FIELD), rest.find(FIELD_ESCAPED)) {
+        (Some(raw), Some(escaped)) if escaped < raw => (escaped, FIELD_ESCAPED.len()),
+        (Some(raw), _) => (raw, FIELD.len_utf8()),
+        (None, Some(escaped)) => (escaped, FIELD_ESCAPED.len()),
+        (None, None) => return None,
+    };
+    Some((&rest[..at], &rest[at + width..]))
 }
 
 /// A field that carries text only when it carries something.
@@ -1277,6 +1304,58 @@ mod tests {
             .expect("a pane list");
         assert_eq!(panes[0].title.as_deref(), Some("odd\u{1f}title"));
         assert_eq!(panes[0].location.pane_id, "tmux:probe:%3");
+    }
+
+    /// tmux 3.5a writes the separator as its `\ooo` escape, so it arrives as the
+    /// literal text `\037` where tmux 3.7c writes the byte. The same record has
+    /// to read the same either way, and text that spells the escape is still
+    /// text.
+    #[test]
+    fn a_record_reads_the_same_whether_the_separator_arrived_escaped_or_raw() {
+        let runtime = runtime("probe");
+
+        assert_eq!(
+            runtime
+                .decode_panes("%3\\037@1\\037$0\\037a title\n")
+                .expect("an escaped pane list"),
+            runtime
+                .decode_panes("%3\u{1f}@1\u{1f}$0\u{1f}a title\n")
+                .expect("a raw pane list")
+        );
+        assert_eq!(
+            runtime
+                .decode_windows("@1\\037$0\\0372\\037editor\n")
+                .expect("an escaped window list"),
+            runtime
+                .decode_windows("@1\u{1f}$0\u{1f}2\u{1f}editor\n")
+                .expect("a raw window list")
+        );
+        let sessions = runtime
+            .decode_sessions("$0\\037herdsman\n")
+            .expect("an escaped session list");
+        assert_eq!(sessions[0].workspace_id, "tmux:probe:$0");
+        assert_eq!(sessions[0].label.as_deref(), Some("herdsman"));
+        assert_eq!(
+            decode_foreground("100\\037pi"),
+            ForegroundEvidence::command(100, Some("pi".to_string()), None)
+        );
+        match runtime.created("@1\\037$0", &[Kind::Window, Kind::Session]) {
+            Ok(ids) => assert_eq!(ids, ["@1".to_string(), "$0".to_string()]),
+            Err(_) => panic!("a creation's escaped identities were rejected"),
+        }
+
+        // The escape is a boundary, never an instruction: text that spells it
+        // stays the text tmux sent, and one in a field that should be an id is
+        // a malformed record rather than a shifted location.
+        let panes = runtime
+            .decode_panes("%3\\037@1\\037$0\\037back\\037slash\n")
+            .expect("an escaped pane list");
+        assert_eq!(panes[0].title.as_deref(), Some("back\\037slash"));
+        assert!(
+            runtime
+                .decode_panes("%3\\037@1\\037odd\\037$0\\037title\n")
+                .is_err()
+        );
     }
 
     #[test]

@@ -189,8 +189,14 @@ that served the create; Herdr cannot name its serving process, so its dead panes
 are always refused. Herdr remains the default and reports unknown exit
 observations.
 
-This backend seam does not establish full Herdsman cutover. Adoption still needs a
-consumer migration and acceptance run with Herdr unavailable; Radar also needs a
-registry-backed observation path and backend-neutral location detection before a
-tmux-only fleet can use it fully. Resume/recovery and richer placement remain
-separate missing contracts; do not claim them from a successful spawn.
+Record reads accept the raw separator byte observed on tmux 3.7c and the literal
+`\037` separator observed on Debian tmux 3.5a. Only field boundaries are decoded;
+the final display field stays as tmux sent it, including literal backslashes.
+This avoids general escape decoding, which would alter display text. These checks
+establish record-format compatibility, not full lifecycle acceptance on 3.5a.
+
+The registry-backed dashboard and Herdr-free tmux acceptance are shipped. Full
+Herdsman cutover still needs its own consumer migration and real Pi/Herdsman
+acceptance with Herdr unavailable; dashboard acceptance does not establish it.
+Resume/recovery and richer placement remain separate contracts; do not claim
+them from a successful spawn.

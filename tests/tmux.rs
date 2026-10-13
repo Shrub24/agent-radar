@@ -34,6 +34,7 @@ const DEADLINE: Duration = Duration::from_secs(20);
 const FAILING: &str = "tests/fixtures/tmux-fake.sh";
 const STALLING: &str = "tests/fixtures/tmux-stall.sh";
 const LAUNCH_FAILING: &str = "tests/fixtures/tmux-launch-fail.sh";
+const ESCAPING: &str = "tests/fixtures/tmux-escaped.sh";
 
 fn cancel() -> AtomicBool {
     AtomicBool::new(false)
@@ -443,6 +444,81 @@ fn a_cancelled_command_returns_without_waiting_out_its_deadline() {
         started.elapsed() < Duration::from_secs(10),
         "cancellation waited out the command deadline"
     );
+}
+
+/// tmux 3.5a writes the separator as its `\ooo` escape, so every record the
+/// adapter asks for arrives with the separator as the literal text `\037`
+/// where tmux 3.7c writes the byte — measured on Debian trixie's tmux 3.5a
+/// versus the tmux 3.7c the rest of these tests run against. It is the same
+/// record either way, and every read must decode it the same way.
+#[test]
+fn records_with_tmux_3_5as_escaped_separator_decode_the_same_way() {
+    let fake = Fake::new("tmux-escaped", ESCAPING, Duration::from_secs(5));
+    let runtime = &fake.runtime;
+    let cancel = cancel();
+    let pane = fake.handle("%1");
+
+    let observation = runtime
+        .inventory(&cancel)
+        .expect("an inventory of escaped records");
+    let workspace = fake.handle("$0");
+    assert_eq!(observation.workspaces.len(), 1, "{observation:?}");
+    assert_eq!(observation.workspaces[0].workspace_id, workspace);
+    assert_eq!(observation.workspaces[0].label.as_deref(), Some("herdsman"));
+    assert_eq!(observation.tabs.len(), 1, "{observation:?}");
+    assert_eq!(observation.tabs[0].tab_id, fake.handle("@1"));
+    assert_eq!(observation.tabs[0].workspace_id, workspace);
+    assert_eq!(observation.tabs[0].number, Some(2));
+    assert_eq!(observation.tabs[0].label.as_deref(), Some("editor"));
+    assert_eq!(observation.panes.len(), 1, "{observation:?}");
+    assert_eq!(observation.panes[0].location.pane_id, pane);
+    assert_eq!(observation.panes[0].location.tab_id, fake.handle("@1"));
+    assert_eq!(observation.panes[0].location.workspace_id, workspace);
+    assert_eq!(observation.panes[0].title.as_deref(), Some("a title"));
+
+    assert_eq!(
+        runtime.foreground_evidence(&pane, &cancel),
+        ForegroundEvidence::command(4242, Some("pi".to_string()), None)
+    );
+
+    let exits = runtime.exit_observations(std::slice::from_ref(&pane), &cancel);
+    assert_eq!(
+        exits.get(&pane),
+        Some(&PaneExitObservation::Exited {
+            code: Some(0),
+            signal: None,
+        })
+    );
+
+    let tab = fake.handle("@2");
+    let created = runtime.create(
+        &CreateRequest::Tab {
+            workspace_id: workspace.clone(),
+            focus: false,
+        },
+        &cancel,
+    );
+    let CreateOutcome::Completed(created) = created else {
+        panic!("a tab was not created: {created:?}")
+    };
+    assert_eq!(created.tab_id.as_deref(), Some(tab.as_str()));
+    assert_eq!(created.workspace_id.as_deref(), Some(workspace.as_str()));
+
+    let split_pane = fake.handle("%3");
+    let created = runtime.create(
+        &CreateRequest::PaneSplit {
+            pane_id: pane,
+            direction: SplitDirection::Right,
+            focus: false,
+        },
+        &cancel,
+    );
+    let CreateOutcome::Completed(created) = created else {
+        panic!("a pane was not created: {created:?}")
+    };
+    assert_eq!(created.pane_id.as_deref(), Some(split_pane.as_str()));
+    assert_eq!(created.tab_id.as_deref(), Some(tab.as_str()));
+    assert_eq!(created.workspace_id.as_deref(), Some(workspace.as_str()));
 }
 
 /// The text of one visible read, or `None` when the read did not complete.
