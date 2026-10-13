@@ -176,6 +176,36 @@ refused). Client-level socket tests dispatch each control under the caller's own
 id, answer a replay with the same container and no second effect, and refuse a
 control whose contract the daemon does not advertise before it is sent.
 
+## Acceptance
+
+Run on the committed tree (`87a82ec9`, `main`) with every gate in one pass:
+
+- `cargo fmt --check`, strict Clippy (`-D warnings`) and `cargo build --locked
+  --all-targets`: clean.
+- `cargo test --locked --all-targets`: every suite green — 410 library tests and
+  131 control-plane socket tests among them, with the container coverage named
+  above.
+- `openspec validate --all --strict`: 21/21.
+- The publisher fixture smoke: a disposable daemon registering, acquiring,
+  publishing, reading back, switching sessions, retiring and reading events, with
+  replay, fencing, restart freshness and privacy.
+- The PTY smoke: source failure/empty/recovery, a registered agent and its facts,
+  the stub publisher, details focus and page cycling, a scroll, a disclosure
+  opened and closed, process-row navigation, a folded branch, Escape back to the
+  tree, filter entry, a stalled quit with a client connected, mouse capture taken
+  and released, and terminal restoration.
+- The disposable-tmux acceptance: two registrations joined a real tmux server
+  through a disposable daemon, their execution/assignment/self facts kept their own
+  values and freshness, an unjoinable registration stayed unresolved and silent, a
+  finished execution did not complete the assignment, close was refused for both,
+  Herdr was never called, and every resource was removed.
+- The checked Nix build: `/nix/store/mww8blfbg9cqwy47mgq3fjakxvsby7fi-agent-radar-0.1.0`.
+
+Two mutation checks confirm the new coverage is load-bearing: accepting a
+`running` pane exit in the reload gate fails the reload test, and skipping the
+serving-incarnation comparison in deletion fails the deletion-fence test; both
+pass again when restored.
+
 ## Limits
 
 - A container whose creation established no verified serving incarnation is
