@@ -98,22 +98,105 @@ ours, removed → the backend's name), and a socket test that the dashboard clie
 receives the container through the registry read rather than a second protocol.
 `openspec validate --all --strict`: 21/21.
 
+## Deletion
+
+`topology.delete` (`topology.delete.v1`, requiring `mux.close`) removes a
+container and everything recorded inside it. The request names the container and
+the place and occupant the operator confirmed; the daemon refuses when the
+container is unknown, already removed, bound to another place, recorded under
+another serving instance, or when a live managed worker is registered inside what
+it would remove. That last refusal names each worker and the stop-then-delete
+sequence, and nothing is dispatched.
+
+The close itself is the same guarded dispatch `mux.close` runs — one fresh
+inventory, the frozen identity, the registry — and the removals are recorded only
+after the runtime confirms the close. A deletion claims no process exit, no
+unregistration and no assignment outcome; an uncertain dispatch records the
+uncertainty and leaves the container unremoved. The verdict is that a place Radar
+owns can be removed by the operator who made it, without a live worker inside it
+being ended silently, and without a reused handle being closed as if it were the
+recorded container.
+
+Evidence: a deletion closes the container's own place exactly once and records
+each removal; a live registered worker inside the target is named and no close is
+dispatched (mutation-checked: suppressing that refusal fails the test); a
+container bound to another place is refused; a container recorded under another
+serving instance is refused; an already-removed container is refused under a
+fresh id; and a replayed request id answers its own record and dispatches nothing.
+
+## Reload and the recorded recipe
+
+`topology.create` accepts an optional `recipe` for a pane creation only. It is
+preflighted against the backend before anything is created, held in the daemon's
+owner-only store (`lifecycle/private/container-<id>.json`, mode 0600) before the
+record that says so, and run in the created pane by the daemon itself with no
+spawn token, so the child is not a spawn child. The record says only that a recipe
+is held: the command, its working directory and its environment appear in no
+record, read or event.
+
+`topology.reload` (`topology.reload.v1`, requiring `mux.launch` and
+`mux.exit_observation`) runs that recipe again in the same pane slot. It requires
+a typed retained exit the backend reports now, and refuses when the command is
+still running or its exit cannot be established — naming the stop-then-reload
+sequence rather than signalling anything itself, which is how deletion treats a
+live worker too. It records its own outcome, changes no container, and is not a Pi
+session restart, a new container or an assignment fact.
+
+Evidence: a recipe creation holds its command privately (asserted on the file's
+mode and on the absence of the command and its environment from every read) and
+runs it in the created pane with `spawn_token: None`; a recipe on a creation that
+makes no pane is refused before any effect; a reload with no recipe, with a
+command still running, and with an exit the backend cannot establish each refuses
+without a second launch; a reload over a typed exit runs the recipe again in the
+same pane and answers with the container unchanged.
+
+## TUI control plane
+
+A workspace or pane row now carries the container Radar records for its place
+(`tree::ContainerRef`), and the details panel shows that identity beside the
+location. `a`, `D` and `R` open the same confirmation dialog the lifecycle
+actions use, frozen when it opens: the container id, its place and that place's
+occupant. Cancel is the default, Confirm revalidates against the latest current
+observation, and a container removed or rebound before Confirm refuses with
+nothing sent.
+
+A confirmed control is dispatched through `control_plane::client::ContainerControls`,
+implemented by the dashboard client over the same socket and handshake as its
+reads, one control at a time and off the UI thread. The request id is minted at
+Confirm, carried in the request, and kept in the outcome line the footer shows, so
+a lost answer leaves an operation to read back rather than an effect nobody can
+name. A control the daemon does not advertise is refused before it is sent, a run
+with no daemon dispatches nothing and says so, and nothing is removed from the
+tree optimistically.
+
+Evidence: app tests cover the container confirmation (frozen id, place and
+occupant; Cancel by default; a removed container refused at confirm; a row with no
+container refused before the dialog opens; a reload of a pane with no recipe
+refused). Client-level socket tests dispatch each control under the caller's own
+id, answer a replay with the same container and no second effect, and refuse a
+control whose contract the daemon does not advertise before it is sent.
+
 ## Limits
 
 - A container whose creation established no verified serving incarnation is
-  recorded and never called present. Every backend that reports no server process —
-  Herdr and the test backends — lands in that state.
-- Container bindings are recorded from the daemon's own create paths. A container
-  Radar never created (a pane the operator made in tmux) is not a container record
-  yet; `fleet-overview`'s unmanaged rows and section 5's tree are where that
-  becomes visible.
-- Containers reach the tree but do not yet drive it. Rows still carry the
-  backend's own identifiers rather than a container identity and binding, so
-  section 5.2's targets have nothing to name; roots and nesting still follow the
-  backend's groups, with containers naming them; and a recorded container the
-  backend no longer reports is neither shown nor resolvable from the tree.
-- Deletion and reload are not implemented. The TUI can display the hierarchy the
-  daemon records, and still writes control through the owner file.
-- The contract table in `docs/control-plane.md` (its sample handshake line and its
-  contract list) and the contract discussion in `docs/agent-registration.md` are
-  stale until the documentation section lands.
+  recorded and never called present; deletion and reload of one refuse for the same
+  reason. Every backend that reports no server process — Herdr and the test
+  backends — lands in that state, so those two controls are tmux-shaped today.
+- Container bindings are recorded from the daemon's own create paths. A pane the
+  operator made outside Radar is not a container record, so it has no identity to
+  act on and the TUI refuses it as "not a container Radar records".
+- The tree has no tab row, so a tab container is shown as a row's tab label and
+  its id in the details, and is not selectable: tab-level create and delete are
+  deferred rather than guessed.
+- Roots and nesting still follow the backend's groups, with containers naming
+  them, rather than being built from the container parent links; and a recorded
+  container the backend no longer reports is shown as an unresolved detail line
+  rather than as a row of its own.
+- The TUI creates an empty slot: it takes no recipe, so a created pane runs
+  nothing until something is typed into it or a later slice adds the input field.
+- The `spawn`-launched pane's own launch context is not the container recipe, so
+  a spawned pane is not reloadable through this verb yet: its recipe lives on the
+  edge.
+- A reload's evidence is the pane's retained exit, not a tracked process. A
+  container-launched command is not captured with a pidfd, so reload cannot stop
+  one itself; the operator stops it first, exactly as deletion asks.

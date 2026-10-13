@@ -33,6 +33,8 @@ pub const SPAWN_EXIT_OBSERVATION_CONTRACT: &str = "spawn.exit_observation.v1";
 pub const LIFECYCLE_CANCEL_CONTRACT: &str = "lifecycle.cancel.v1";
 pub const LIFECYCLE_STOP_CONTRACT: &str = "lifecycle.stop.v1";
 pub const TOPOLOGY_CREATE_CONTRACT: &str = "topology.create.v1";
+pub const TOPOLOGY_DELETE_CONTRACT: &str = "topology.delete.v1";
+pub const TOPOLOGY_RELOAD_CONTRACT: &str = "topology.reload.v1";
 pub const TOPOLOGY_GET_CONTRACT: &str = "topology.get.v1";
 pub const TOPOLOGY_LIST_CONTRACT: &str = "topology.list.v1";
 pub const TOPOLOGY_RECONCILE_CONTRACT: &str = "topology.reconcile.v1";
@@ -52,6 +54,11 @@ const CONTRACTS: &[(&str, &[&str])] = &[
     (REGISTRY_FACTS_CONTRACT, &[]),
     (EVENTS_CONTRACT, &[]),
     (TOPOLOGY_CREATE_CONTRACT, &[CREATE_CAPABILITY]),
+    (TOPOLOGY_DELETE_CONTRACT, &[CLOSE_CAPABILITY]),
+    (
+        TOPOLOGY_RELOAD_CONTRACT,
+        &[LAUNCH_CAPABILITY, EXIT_OBSERVATION_CAPABILITY],
+    ),
     (TOPOLOGY_GET_CONTRACT, &[]),
     (TOPOLOGY_LIST_CONTRACT, &[]),
     (TOPOLOGY_RECONCILE_CONTRACT, &[OBSERVE_CAPABILITY]),
@@ -124,6 +131,12 @@ pub enum Operation {
     /// primitive create is the same; the container, its label and its provenance
     /// are what this verb adds.
     CreateContainer,
+    /// Deletion of a container Radar recorded: the same close a generic one
+    /// dispatches, guarded by the container's own binding and the frozen target.
+    DeleteContainer,
+    /// Reload of a pane container's slot: its recorded recipe runs again in the
+    /// same pane, once nothing that may still be running is in it.
+    ReloadContainer,
     /// Cancellation of a tracked launch: revocation, then a signal to its captured
     /// process.
     Cancel,
@@ -146,6 +159,8 @@ impl Operation {
             "mux.report" => Self::Report,
             "spawn.create" => Self::Spawn,
             "topology.create" => Self::CreateContainer,
+            "topology.delete" => Self::DeleteContainer,
+            "topology.reload" => Self::ReloadContainer,
             "lifecycle.cancel" => Self::Cancel,
             "lifecycle.stop" => Self::Stop,
             "lifecycle.enroll" => Self::Enroll,
@@ -164,6 +179,8 @@ impl Operation {
             Self::Report => "mux.report",
             Self::Spawn => "spawn.create",
             Self::CreateContainer => "topology.create",
+            Self::DeleteContainer => "topology.delete",
+            Self::ReloadContainer => "topology.reload",
             Self::Cancel => "lifecycle.cancel",
             Self::Stop => "lifecycle.stop",
             Self::Enroll => "lifecycle.enroll",
@@ -183,6 +200,10 @@ impl Operation {
             // cannot serve it: a pane with no command in it is not a child.
             Self::Spawn => &[CREATE_CAPABILITY, LAUNCH_CAPABILITY],
             Self::CreateContainer => &[CREATE_CAPABILITY],
+            Self::DeleteContainer => &[CLOSE_CAPABILITY],
+            // A reload runs a command, and it needs the pane's own retained exit
+            // evidence to prove the previous command is gone before it does.
+            Self::ReloadContainer => &[LAUNCH_CAPABILITY, EXIT_OBSERVATION_CAPABILITY],
             Self::Cancel | Self::Stop => &[LIFECYCLE_TRACKING_CAPABILITY],
             Self::Enroll => &[LIFECYCLE_TRACKING_CAPABILITY, OBSERVE_CAPABILITY],
             Self::Restart => &[

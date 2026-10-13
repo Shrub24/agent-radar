@@ -113,6 +113,9 @@ impl Category {
     pub const BACKEND_UNAVAILABLE: &'static str = "backend_unavailable";
     /// The backend gave an explicit refusal before reporting success.
     pub const BACKEND_REFUSED: &'static str = "backend_refused";
+    /// The daemon refused the operation itself: an ineligible target, a frozen
+    /// target that no longer matches, or an effect it will not dispatch.
+    pub const REFUSED: &'static str = "refused";
 }
 
 /// What has happened to a request so far. Written in order; `Completed` is

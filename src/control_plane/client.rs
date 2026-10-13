@@ -110,8 +110,10 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     ops::REGISTRY_FACTS_CONTRACT,
     ops::EVENTS_CONTRACT,
     ops::TOPOLOGY_CREATE_CONTRACT,
+    ops::TOPOLOGY_DELETE_CONTRACT,
     ops::TOPOLOGY_GET_CONTRACT,
     ops::TOPOLOGY_LIST_CONTRACT,
+    ops::TOPOLOGY_RELOAD_CONTRACT,
     ops::TOPOLOGY_RECONCILE_CONTRACT,
     ops::SPAWN_CONTRACT,
     ops::SPAWN_CLOSE_CONTRACT,
@@ -429,6 +431,9 @@ impl RuntimeProvider for DaemonRuntime {
 /// the configured daemon was not the one used.
 pub struct Selected {
     pub provider: Arc<dyn RuntimeProvider>,
+    /// The daemon's own container controls, for a run that talks to one. A direct
+    /// adapter records no containers, so it has none and says so when asked.
+    pub containers: Option<Arc<dyn ContainerControls>>,
     /// The backend in use, in the protocol's own words: `direct` or `daemon`.
     pub backend: &'static str,
     /// The single diagnostic to print, when a configured daemon could not be
@@ -447,6 +452,7 @@ pub struct Selected {
 pub fn select(runtime: &RuntimeConfig, direct: HerdrConfig) -> Selected {
     let direct = || Selected {
         provider: Arc::new(HerdrRuntime::new(direct)),
+        containers: None,
         backend: "direct",
         diagnostic: None,
     };
@@ -455,11 +461,17 @@ pub fn select(runtime: &RuntimeConfig, direct: HerdrConfig) -> Selected {
     }
     let socket = runtime.socket.clone().unwrap_or_else(socket_path);
     match DaemonRuntime::handshake(&socket) {
-        Ok(daemon) => Selected {
-            provider: Arc::new(daemon),
-            backend: "daemon",
-            diagnostic: None,
-        },
+        Ok(daemon) => {
+            // The controls travel with the same client the reads come from: one
+            // handshake, one socket, and no second transport for an effect.
+            let daemon = Arc::new(daemon);
+            Selected {
+                provider: Arc::clone(&daemon) as Arc<dyn RuntimeProvider>,
+                containers: Some(Arc::clone(&daemon) as Arc<dyn ContainerControls>),
+                backend: "daemon",
+                diagnostic: None,
+            }
+        }
         Err(failure) => Selected {
             diagnostic: Some(format!("{failure}; using the direct Herdr adapter")),
             ..direct()
@@ -683,13 +695,17 @@ fn location_of(identity: CreatedIdentity) -> CreatedLocation {
 /// Each exchange dials its own connection, which is what the daemon serves: one
 /// connection carries lines until its reader fails, and a client that wants a
 /// fresh request gets a fresh dial.
-fn exchange(
+/// One request, under a request id the caller already has.
+///
+/// A confirmed container control carries the operator’s own id, so a lost answer
+/// is read back under the id that was sent rather than sent again.
+fn exchange_with_id(
     socket: &Path,
+    id: &str,
     method: &str,
     params: Value,
     cancel: &AtomicBool,
 ) -> Result<Value, Failure> {
-    let id = random_uuid();
     // The terminator is what makes it a line: the daemon answers one line per
     // request and reads until it has one.
     let mut line = json!({
@@ -711,7 +727,7 @@ fn exchange(
     let answer = read_answer(&mut stream, budget, cancel).map_err(Failure::unknown)?;
     let answer: Value = serde_json::from_str(&answer)
         .map_err(|error| Failure::unknown(format!("sent an unreadable answer: {error}")))?;
-    if answer.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+    if answer.get("id").and_then(Value::as_str) != Some(id) {
         return Err(Failure::unknown("answered a different request".to_string()));
     }
     if let Some(error) = answer.get("error") {
@@ -758,7 +774,19 @@ fn exchange_at(
     params: Value,
     cancel: &AtomicBool,
 ) -> Result<Value, Failure> {
-    exchange(socket, method, params, cancel).map_err(|failure| Failure {
+    exchange_with_id_at(socket, &random_uuid(), method, params, cancel)
+}
+
+/// The id-carrying form of the exchange above, with every failure naming the
+/// daemon it happened to.
+fn exchange_with_id_at(
+    socket: &Path,
+    id: &str,
+    method: &str,
+    params: Value,
+    cancel: &AtomicBool,
+) -> Result<Value, Failure> {
+    exchange_with_id(socket, id, method, params, cancel).map_err(|failure| Failure {
         message: format!(
             "the control daemon at {} {}",
             socket.display(),
@@ -830,5 +858,245 @@ fn read_answer(
             Err(error) if is_timeout(&error) => budget.wait(cancel)?,
             Err(error) => return Err(format!("sent no answer: {error}")),
         }
+    }
+}
+
+/// The container controls a daemon serves, for the TUI to request and read back.
+///
+/// Every call carries the caller's own request id, because the answer to a
+/// confirmed control can be lost: the operator reads that id back rather than the
+/// client dispatching a second effect. A control the daemon does not serve is
+/// refused before it is sent, and nothing here falls back to another transport.
+pub trait ContainerControls: Send + Sync {
+    /// Splits a pane slot from a pane, running a command in it when one is given.
+    fn create_container(
+        &self,
+        request: &ContainerCreate,
+        cancel: &AtomicBool,
+    ) -> Result<ContainerAnswer, String>;
+    /// Deletes one container Radar records, as the operator confirmed it.
+    fn delete_container(
+        &self,
+        request: &ContainerDelete,
+        cancel: &AtomicBool,
+    ) -> Result<ContainerAnswer, String>;
+    /// Runs a pane container's recorded recipe again in its own slot.
+    fn reload_container(
+        &self,
+        request: &ContainerReload,
+        cancel: &AtomicBool,
+    ) -> Result<ContainerAnswer, String>;
+}
+
+/// What one container creation makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContainerCreateKind {
+    /// A tab in this workspace.
+    Tab { workspace_id: String },
+    /// A pane slot split from this pane.
+    PaneSplit { pane_id: String },
+}
+
+/// A container creation, with Radar’s own name for the slot and the command it
+/// runs.
+///
+/// No `Debug`: a recipe is private launch data, and printing one would put a
+/// command and its environment in a diagnostic.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ContainerCreate {
+    /// The caller’s own id: the durable key of this operation.
+    pub request_id: String,
+    /// What the creation makes, and where.
+    pub kind: ContainerCreateKind,
+    pub label: Option<String>,
+    /// The command the slot runs, in the daemon's own recipe shape. It is held
+    /// privately by the daemon and never read back.
+    pub recipe: Option<super::containers::Recipe>,
+}
+
+/// A container deletion: the container, and the target the operator confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerDelete {
+    pub request_id: String,
+    pub container_id: String,
+    /// The frozen target and occupant, as the daemon's close contract takes it:
+    /// the daemon refuses the deletion when that place no longer holds it.
+    pub frozen: Value,
+}
+
+/// A container reload: the pane container whose recorded recipe runs again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerReload {
+    pub request_id: String,
+    pub container_id: String,
+}
+
+/// What the daemon answered for one container control: its own record, the
+/// container it made or acted on, and the containers a deletion removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerAnswer {
+    pub request: Value,
+    /// The container a creation made, or a reload acted on, unchanged.
+    pub container: Option<PublicContainer>,
+    /// The containers a deletion marked removed, in id order.
+    pub removed: Vec<PublicContainer>,
+}
+
+impl std::fmt::Debug for ContainerCreate {
+    /// Names what the control is, and never what it runs: a recipe is private
+    /// launch data, so it is reported as held rather than printed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContainerCreate")
+            .field("request_id", &self.request_id)
+            .field("kind", &self.kind)
+            .field("label", &self.label)
+            .field("recipe", &self.recipe.as_ref().map(|_| "held"))
+            .finish()
+    }
+}
+
+impl ContainerAnswer {
+    /// The outcome the record carries: `completed`, `refused` or `unknown`.
+    pub fn outcome(&self) -> &str {
+        self.request
+            .get("outcome")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    }
+
+    /// The record's own message, when it wrote one.
+    pub fn message(&self) -> Option<&str> {
+        self.request.get("message").and_then(Value::as_str)
+    }
+}
+
+impl DaemonRuntime {
+    /// One container control, sent under the caller's own request id.
+    ///
+    /// The contract it needs is checked before the request is sent, so a caller
+    /// refuses work this daemon does not serve instead of discovering it mid-effect.
+    fn container_control(
+        &self,
+        contract: &str,
+        request_id: &str,
+        method: &str,
+        params: Value,
+        cancel: &AtomicBool,
+    ) -> Result<ContainerAnswer, String> {
+        if !self.declared.contains(&contract) {
+            return Err(self.describe(format!("does not provide `{contract}`")));
+        }
+        let result = exchange_with_id_at(&self.socket, request_id, method, params, cancel)
+            .map_err(|failure| failure.message)?;
+        let container = self.public_container(result.get("container"))?;
+        let removed = self.public_container_list(result.get("removed"))?;
+        Ok(ContainerAnswer {
+            request: result.get("request").cloned().unwrap_or(Value::Null),
+            container,
+            removed,
+        })
+    }
+}
+
+impl DaemonRuntime {
+    /// One container the daemon named, when it named one.
+    fn public_container(&self, value: Option<&Value>) -> Result<Option<PublicContainer>, String> {
+        value
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| self.describe(format!("answered an unreadable container: {error}")))
+    }
+
+    /// The containers the daemon named, in the order it named them.
+    fn public_container_list(&self, value: Option<&Value>) -> Result<Vec<PublicContainer>, String> {
+        let Some(values) = value.and_then(Value::as_array) else {
+            return Ok(Vec::new());
+        };
+        values
+            .iter()
+            .map(|value| serde_json::from_value(value.clone()))
+            .collect::<Result<Vec<PublicContainer>, _>>()
+            .map_err(|error| self.describe(format!("answered an unreadable container: {error}")))
+    }
+}
+
+impl ContainerControls for DaemonRuntime {
+    fn create_container(
+        &self,
+        request: &ContainerCreate,
+        cancel: &AtomicBool,
+    ) -> Result<ContainerAnswer, String> {
+        let request_kind = match &request.kind {
+            ContainerCreateKind::Tab { workspace_id } => json!({
+                "kind": "tab",
+                "workspace_id": workspace_id,
+                "focus": false,
+            }),
+            ContainerCreateKind::PaneSplit { pane_id } => json!({
+                "kind": "pane_split",
+                "pane_id": pane_id,
+                "direction": "right",
+                "focus": false,
+            }),
+        };
+        let mut params = json!({
+            "request": request_kind,
+            "requester": REQUESTER,
+        });
+        if let Some(label) = &request.label {
+            params["label"] = json!(label);
+        }
+        if let Some(recipe) = &request.recipe {
+            params["recipe"] = serde_json::to_value(recipe)
+                .map_err(|error| self.describe(format!("cannot carry the recipe: {error}")))?;
+        }
+        self.container_control(
+            ops::TOPOLOGY_CREATE_CONTRACT,
+            &request.request_id,
+            "topology.create",
+            params,
+            cancel,
+        )
+    }
+
+    fn delete_container(
+        &self,
+        request: &ContainerDelete,
+        cancel: &AtomicBool,
+    ) -> Result<ContainerAnswer, String> {
+        let params = json!({
+            "request": {
+                "container_id": request.container_id,
+                "frozen": request.frozen,
+            },
+            "requester": REQUESTER,
+        });
+        self.container_control(
+            ops::TOPOLOGY_DELETE_CONTRACT,
+            &request.request_id,
+            "topology.delete",
+            params,
+            cancel,
+        )
+    }
+
+    fn reload_container(
+        &self,
+        request: &ContainerReload,
+        cancel: &AtomicBool,
+    ) -> Result<ContainerAnswer, String> {
+        let params = json!({
+            "request": {"container_id": request.container_id},
+            "requester": REQUESTER,
+        });
+        self.container_control(
+            ops::TOPOLOGY_RELOAD_CONTRACT,
+            &request.request_id,
+            "topology.reload",
+            params,
+            cancel,
+        )
     }
 }

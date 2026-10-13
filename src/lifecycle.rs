@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::control::{self, ControlRequest, ControlResult, NewRequest, OwnerControl, RequestState};
-use crate::control_plane::registry::PublicRegistration;
+use crate::control_plane::registry::{PublicRegistration, RegistryLocation};
 use crate::model::{
     AgentObservation, AgentState, FleetObservation, Lineage, SemanticState, SessionIdentity,
 };
@@ -93,6 +93,21 @@ pub fn tab(
         .fold(Containment::Unmanaged, stricter)
 }
 
+/// The workspace's containment: managed or uncertain if any pane in it is, so a
+/// workspace holding one managed pane is refused whole.
+pub fn workspace(
+    inventory: &FleetObservation,
+    retained: &BTreeMap<String, RetainedAgent>,
+    workspace_id: &str,
+) -> Containment {
+    inventory
+        .panes
+        .iter()
+        .filter(|member| member.location.workspace_id == workspace_id)
+        .map(|member| pane(inventory, retained, &member.location.pane_id))
+        .fold(Containment::Unmanaged, stricter)
+}
+
 /// The containment of a close target read from one inventory alone, as the
 /// close worker has it: local retained associations are not visible off-thread,
 /// and the confirmation already checked them against the full state.
@@ -101,6 +116,7 @@ pub fn target(inventory: &FleetObservation, target: &CloseTarget) -> Containment
     match target {
         CloseTarget::Pane(pane_id) => pane(inventory, &none, pane_id),
         CloseTarget::Tab(tab_id) => tab(inventory, &none, tab_id),
+        CloseTarget::Workspace(workspace_id) => workspace(inventory, &none, workspace_id),
     }
 }
 
@@ -184,6 +200,10 @@ pub enum TargetIdentity {
         tab_id: String,
         members: Vec<PaneIdentity>,
     },
+    Workspace {
+        workspace_id: String,
+        members: Vec<PaneIdentity>,
+    },
 }
 
 impl TargetIdentity {
@@ -192,6 +212,7 @@ impl TargetIdentity {
         match self {
             Self::Pane(pane) => CloseTarget::Pane(pane.pane_id.clone()),
             Self::Tab { tab_id, .. } => CloseTarget::Tab(tab_id.clone()),
+            Self::Workspace { workspace_id, .. } => CloseTarget::Workspace(workspace_id.clone()),
         }
     }
 }
@@ -211,6 +232,20 @@ pub fn identity(inventory: &FleetObservation, target: &CloseTarget) -> TargetIde
             members.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
             TargetIdentity::Tab {
                 tab_id: tab_id.clone(),
+                members,
+            }
+        }
+        CloseTarget::Workspace(workspace_id) => {
+            let mut members: Vec<PaneIdentity> = inventory
+                .panes
+                .iter()
+                .filter(|pane| pane.location.workspace_id == *workspace_id)
+                .map(|pane| pane_identity(inventory, &pane.location.pane_id))
+                .collect();
+            // Membership is a set: order in the source is not identity.
+            members.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+            TargetIdentity::Workspace {
+                workspace_id: workspace_id.clone(),
                 members,
             }
         }
@@ -361,6 +396,16 @@ pub fn guard(inventory: &FleetObservation, request: &CloseRequest) -> Result<(),
         CloseTarget::Tab(tab_id) if !inventory.tabs.iter().any(|tab| tab.tab_id == *tab_id) => {
             return Err(format!("tab {tab_id} is gone: nothing to close"));
         }
+        CloseTarget::Workspace(workspace_id)
+            if !inventory
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.workspace_id == *workspace_id) =>
+        {
+            return Err(format!(
+                "workspace {workspace_id} is gone: nothing to close"
+            ));
+        }
         _ => {}
     }
     if !matches(inventory, &request.identity) {
@@ -399,7 +444,37 @@ fn registered_within(
                             .is_some_and(|pane| pane.location.tab_id == *tab_id)
                     })
             }
+            CloseTarget::Workspace(workspace_id) => {
+                location.workspace.as_deref() == Some(workspace_id)
+                    || location.pane.as_deref().is_some_and(|pane_id| {
+                        inventory
+                            .pane(pane_id)
+                            .is_some_and(|pane| pane.location.workspace_id == *workspace_id)
+                    })
+                    || location.tab.as_deref().is_some_and(|tab_id| {
+                        inventory
+                            .tabs
+                            .iter()
+                            .any(|tab| tab.tab_id == *tab_id && tab.workspace_id == *workspace_id)
+                    })
+            }
         })
+}
+
+/// The registrations whose own published location names a place the caller is
+/// about to change.
+///
+/// Each registration carries the location it published, so this needs no second
+/// backend read, and a registration counts whether or not it joins a pane: one
+/// made after the operator confirmed must still stop an effect over its place.
+pub fn registrations_in(
+    registrations: &[PublicRegistration],
+    inside: impl Fn(&RegistryLocation) -> bool,
+) -> Vec<&PublicRegistration> {
+    registrations
+        .iter()
+        .filter(|registration| registration.location.as_ref().is_some_and(&inside))
+        .collect()
 }
 
 /// One confirmed close: take a fresh inventory, prove the target is still
@@ -489,7 +564,9 @@ impl ManagedRequest {
     ) -> Result<ControlRequest, control::ControlError> {
         let pane_id = match &self.target {
             CloseTarget::Pane(pane_id) => Some(pane_id.clone()),
-            CloseTarget::Tab(_) => None,
+            // The owner-file request names the worker, not its location: a tab or
+            // workspace target publishes the same document as any other close.
+            CloseTarget::Tab(_) | CloseTarget::Workspace(_) => None,
         };
         ControlRequest::with_ttl(
             NewRequest {

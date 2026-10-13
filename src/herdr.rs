@@ -565,6 +565,14 @@ impl RuntimeProvider for HerdrRuntime {
         let closed = match target {
             CloseTarget::Pane(pane_id) => run(&self.config, &["pane", "close", pane_id], cancel),
             CloseTarget::Tab(tab_id) => run(&self.config, &["tab", "close", tab_id], cancel),
+            // Herdr's documented grammar closes a pane or a tab by id and names no
+            // workspace close. Guessing one would dispatch a command nobody has
+            // verified, so a workspace delete is refused here rather than attempted.
+            CloseTarget::Workspace(workspace_id) => {
+                return CloseOutcome::Refused(format!(
+                    "herdr has no workspace close: workspace {workspace_id} was not closed"
+                ));
+            }
         };
         closed
             .map(|_| CloseOutcome::Completed)
@@ -818,11 +826,9 @@ fn launch_line(request: &LaunchRequest) -> Result<String, String> {
         atoms.push("env".to_string());
         atoms.extend(request.env.keys().map(|name| format!("-u {name}")));
     }
-    atoms.push(format!(
-        "{}={}",
-        LAUNCH_TOKEN_ENV,
-        shell_quote(&request.spawn_token)
-    ));
+    if let Some(token) = &request.spawn_token {
+        atoms.push(format!("{}={}", LAUNCH_TOKEN_ENV, shell_quote(token)));
+    }
     atoms.extend(
         request
             .env

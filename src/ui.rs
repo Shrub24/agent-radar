@@ -370,6 +370,9 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
         Operation::ClosePane => "Close pane",
         Operation::CloseTab => "Close tab",
         Operation::Restart => "Restart worker",
+        Operation::CreateContainer => "Add to container",
+        Operation::DeleteContainer => "Delete container",
+        Operation::ReloadContainer => "Reload pane",
     };
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
@@ -645,6 +648,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("n/N", "next".to_string()),
         ("w/W", "work".to_string()),
         ("x/X", "close pane/tab".to_string()),
+        ("a/D/R", "add/delete/reload".to_string()),
         ("s", app.order().label().to_string()),
         ("p", app.pane_view().label().to_string()),
         ("d", toggle_label(app.shows_details(), "details")),
@@ -660,6 +664,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("n", "next".to_string()),
         ("w", "work".to_string()),
         ("x/X", "close".to_string()),
+        ("a/D/R", "container".to_string()),
         ("s", app.order().label().to_string()),
         ("p", app.pane_view().label().to_string()),
         ("d", "details".to_string()),
@@ -1742,6 +1747,44 @@ fn detail_page_lines(
     page_lines
 }
 
+/// What Radar records about the container a row shows: its own identity, whether
+/// it made the place, and the handle it is bound to.
+///
+/// An unfenced or unresolved binding is stated as it is: the handle is evidence,
+/// and a row without a container is a place this daemon records nothing for.
+fn container_fields(container: Option<&crate::tree::ContainerRef>, page: &mut PageLines) {
+    use crate::control_plane::containers::{Kind, Provenance};
+    let Some(container) = container else {
+        return;
+    };
+    page.push(field("container", container.container_id.clone()));
+    page.push(field(
+        "place",
+        format!(
+            "{} ({})",
+            container.handle,
+            match container.kind {
+                Kind::Workspace => "workspace",
+                Kind::Tab => "tab",
+                Kind::Pane => "pane",
+            }
+        ),
+    ));
+    page.push(field(
+        "owner",
+        match container.provenance {
+            Provenance::Created => "created by radar".to_string(),
+            Provenance::Observed => "observed — not created by radar".to_string(),
+        },
+    ));
+    if container.recipe {
+        page.push(field("recipe", "held".to_string()));
+    }
+    if let Some(unresolved) = &container.unresolved {
+        page.push(field("unresolved", sanitize(unresolved)));
+    }
+}
+
 /// Overview: what this row is, in the compact form: location, the live PID and
 /// the agent's activity and model, with the published assignment and what it
 /// awaits kept to a summary. The command, the age and the measurements of the
@@ -1757,6 +1800,7 @@ fn overview_lines(
             workspace_id,
             label,
             number,
+            container,
         } => {
             page.push(field("kind", "workspace".to_string()));
             page.push(field(
@@ -1767,6 +1811,7 @@ fn overview_lines(
                 "number",
                 number.map(|n| n.to_string()).unwrap_or_else(unavailable),
             ));
+            container_fields(container.as_ref(), page);
         }
         RowKind::Pane(pane) => {
             page.push(field(
@@ -1797,6 +1842,7 @@ fn overview_lines(
                 // instead of it.
                 page.push(field("pane now", sanitize(&pane.title)));
             }
+            container_fields(pane.container.as_ref(), page);
             if let Some(line) = live_pid(state, pane.foreground.as_ref()) {
                 page.push(line);
             }
@@ -1825,6 +1871,7 @@ fn overview_lines(
                 page.push(line);
             }
             page.push(field("agent", agent_identifier(agent)));
+            container_fields(agent.container.as_ref(), page);
             match &agent.registry {
                 Some(view) => registry_lines(state, agent, view, page),
                 None => {

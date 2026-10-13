@@ -59,12 +59,14 @@ budget — four concurrent verifier jobs daemon-wide, each abandoned at a
 three-second deadline, polled so a stop request is honoured — so a stalled
 verifier leaves an unfenced edge instead of holding the worker answering a
 caller, and verification is deliberately not atomic with dispatch (a same-UID
-process could respawn the pane in the window between them). The daemon does not
-make itself a lifecycle manager: there is no resume, restart, recovery,
-or adoption of panes launched outside the daemon. A created pane is not a bound
-child until that child registers with the private spawn token. Private
-launch/resume specifications stored on registrations remain inert unless
-explicitly used by a supported operation.
+process could respawn the pane in the window between them). The daemon tracks the launches it makes: a captured
+process is stopped or cancelled through its own verified path, a lead can be
+enrolled as a restartable subject, and a recovery sweep re-observes every tracked
+launch by verified identity. Process stop, cancellation and restart are their own
+contracts (`lifecycle.*`) and claim nothing about assignments or registration. A
+created pane is not a bound child until that child registers with the private
+spawn token, and private launch/resume specifications stored on registrations
+remain inert unless explicitly used by a supported operation.
 
 ## Dashboard consumption
 
@@ -127,6 +129,9 @@ processes running as the same user. Do not expose this socket remotely.
 | Public registry reads | `agent.get`, `agent.list` | `registry.v1` |
 | Spawn topology reads | `spawn.get`, `spawn.list` | `registry.v1`; location confirmation additionally uses `mux.observe` when available |
 | Close a daemon-created child pane | `spawn.close` | `spawn.close.v1` (`mux.observe` + `mux.close`); dead-pane cleanup additionally needs `mux.exit_observation` and a fenced edge |
+| Container reads | `topology.get`, `topology.list`, `topology.reconcile` | `topology.get.v1`/`topology.list.v1`; `topology.reconcile.v1` additionally needs `mux.observe` |
+| Container controls | `topology.create`, `topology.delete`, `topology.reload` | `topology.create.v1` (`mux.create`), `topology.delete.v1` (`mux.close`), `topology.reload.v1` (`mux.launch` + `mux.exit_observation`) |
+| Tracked launch controls | `lifecycle.cancel`, `lifecycle.stop`, `lifecycle.enroll`, `lifecycle.restart`, `lifecycle.get`, `lifecycle.list` | `lifecycle.*` contracts; `lifecycle.enroll` also needs `mux.observe` |
 
 Use `events.read` to resume ordered journal pointers with bounded long polling; it does not replace current-state reads. `cursor` is the position after the last delivered event, so following it never skips an event, while `tail` and `more` say whether a backlog remains: while `more` is true, read again immediately instead of waiting. On `cursor_expired`, resynchronise using paged `agent.list` and `spawn.list`, plus `mux.request.list` for operation records, then resume from the returned cursor. Events may be lost between fact durability and append, so an unclean restart changes the epoch. Absence of an event is not evidence of freshness or liveness.
 
@@ -220,6 +225,57 @@ does not authorize relaunch. `unknown` and later missing-pane topology remain
 unresolved, not evidence of process exit or assignment completion. See the exact
 [method contract](control-plane.md#managed-child-close) and its
 [registration/topology context](agent-registration.md#managed-child-close).
+
+## Containers and their controls
+
+A container is the daemon's own durable identity for a place in the hierarchy: a
+workspace, a tab or a pane slot. It carries an id, a parent link, Radar's own
+label and its provenance, and it keeps its backend binding — backend name,
+verified serving process incarnation, raw handle — separate from that identity. A
+handle is evidence, never the identity: a handle reappearing under a different
+serving incarnation is not the recorded container, and a container the daemon
+removed names nothing at all.
+
+Read them with `topology.get` (one id), `topology.list` (paged, `next_after`) and
+`topology.reconcile` (one bounded pass that records per-container observations).
+Reconciliation reports drift — present, missing, replaced, unavailable — with the
+time it was observed and a source label. It never rewrites a binding, adopts a
+foreign handle, deletes a record or dispatches an effect.
+
+Three controls change containers. Each takes one caller-chosen request id, is
+recorded before it is answered, and is read back by that id:
+
+- `topology.create` (`topology.create.v1`, needs `mux.create`) makes a tab in a
+  workspace or splits a pane, and records the container under the label the
+  caller gave it. An optional `recipe` — a command with its cwd and environment
+  — is accepted for a pane creation only: it is preflighted against the backend,
+  held in the daemon's owner-only store, and run in the created pane by the
+  daemon itself, with no spawn token, so the child is not a spawn child. The
+  container record says only that a recipe is held; the command and its
+  environment appear in no record, read or event.
+- `topology.delete` (`topology.delete.v1`, needs `mux.close`) removes a container
+  and everything recorded inside it. The request carries the container id and the
+  place and occupant the operator confirmed; the daemon refuses when the
+  container is unknown, already removed, bound to another place, recorded under
+  another serving instance, or when a live managed worker is registered inside
+  what it would remove — that refusal names each worker and the stop-then-delete
+  sequence. The close itself is the same guarded dispatch `mux.close` uses, and
+  the removals are recorded only after the runtime confirms the close. A
+  deletion claims no process exit, no unregistration and no assignment outcome.
+- `topology.reload` (`topology.reload.v1`, needs `mux.launch` and
+  `mux.exit_observation`) runs a pane container's recorded recipe again in its own
+  pane slot. It requires the slot's previous command to be provably gone — a
+  typed retained exit the backend reports now — and refuses when that command is
+  still running or its exit cannot be established, naming the stop-then-reload
+  sequence. It records its own outcome, changes no container, and is not a Pi
+  session restart, a new container or an assignment fact.
+
+`topology.create` is the same creation body as `mux.create`, which keeps its
+primitive semantics and takes no Radar annotations. A repeated request id is
+answered with the container it already made and dispatches nothing; the same id
+with different content is refused. The dashboard drives these controls through
+one socket and one handshake, keeps each operation's request id in its outcome
+line, and never falls back to a second transport.
 
 ## Herdsman adoption
 

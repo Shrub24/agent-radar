@@ -3037,6 +3037,8 @@ fn execute(
         ops::Operation::Close => execute_close(request, core),
         ops::Operation::Create => execute_create(request, core, verification),
         ops::Operation::CreateContainer => execute_container_create(request, core, verification),
+        ops::Operation::DeleteContainer => execute_container_delete(request, core, verification),
+        ops::Operation::ReloadContainer => execute_container_reload(request, core, verification),
         ops::Operation::Input => execute_input(request, core),
         ops::Operation::Report => execute_report(request, core),
         ops::Operation::Spawn => execute_spawn(request, core, verification),
@@ -3522,7 +3524,7 @@ fn dispatch_creation(
     // The primitive create carries the request alone; the hierarchy verb carries
     // the label its container is recorded under.
     let extra: &[&str] = match operation {
-        ops::Operation::CreateContainer => &["label"],
+        ops::Operation::CreateContainer => &["label", "recipe"],
         _ => &[],
     };
     let frozen = frozen_params(request, extra)?;
@@ -3556,6 +3558,15 @@ fn dispatch_creation(
                 "the create target is not a valid identifier",
             ),
         ));
+    }
+    // The command this creation's slot runs, if it carries one, is parsed and
+    // checked here: a recipe this backend cannot carry refuses before a pane
+    // exists, exactly as a spawn is preflighted.
+    let recipe = creation_recipe(request, &create)?;
+    if let Some(recipe) = &recipe
+        && let Err(refusal) = preflight_recipe(core, &create, recipe)
+    {
+        return Err(Response::refused(&request.id, &refusal));
     }
     let requester = match request.optional_string("requester") {
         Ok(requester) => requester,
@@ -3596,9 +3607,31 @@ fn dispatch_creation(
                 Arc::clone(&core.registry)
             };
             let backend_identity = backend.identity();
+            let id = store::random_uuid();
+            let mut notes: Vec<String> = Vec::new();
+            // A recipe is held privately before the record that says so is
+            // written, so no record claims a command the daemon does not have. It
+            // is held only for a create that named a pane: a recipe runs in a pane
+            // slot, and a create that named nothing has no slot to run it in.
+            let held = match (recipe.as_ref(), created.pane_id.as_deref()) {
+                (Some(recipe), Some(_)) => match containers::write_recipe(&registry, &id, recipe) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        notes.push(format!("the recipe was not held: {error}"));
+                        false
+                    }
+                },
+                (Some(_), None) => {
+                    notes.push("the runtime named no pane, so the recipe was not held".to_string());
+                    false
+                }
+                (None, _) => false,
+            };
             let recording = containers::record_created(
                 &registry,
                 containers::Confirmed {
+                    id,
+                    recipe: held,
                     request: &create,
                     created: &created,
                     backend: &backend_identity,
@@ -3608,30 +3641,62 @@ fn dispatch_creation(
                 },
                 &store::format_millis(now),
             );
-            let (container, note) = match (recording, created.is_empty()) {
-                (Err(error), _) => (
-                    None,
-                    Some(format!("the created container was not recorded: {error}")),
-                ),
-                (Ok(_), true) => (
-                    None,
-                    Some(
+            let (container, _) = match (recording, created.is_empty()) {
+                (Err(error), _) => {
+                    notes.push(format!("the created container was not recorded: {error}"));
+                    (None, false)
+                }
+                (Ok(_), true) => {
+                    notes.push(
                         "the runtime confirmed the creation without naming what it created"
                             .to_owned(),
-                    ),
-                ),
-                (Ok(mut recorded), false) => (recorded.pop(), None),
+                    );
+                    (None, true)
+                }
+                (Ok(mut recorded), false) => (recorded.pop(), true),
             };
+            // The recipe runs in the pane the create named, launched by the daemon
+            // outside any spawn: the child carries no spawn token, and this launch
+            // is what a later reload requires to be gone before running it again.
+            let launched = match (held, created.pane_id.as_deref()) {
+                (true, Some(pane_id)) => recipe.as_ref().map(|recipe| {
+                    backend.launch(
+                        &LaunchRequest {
+                            pane_id: pane_id.to_string(),
+                            executable: recipe.executable.clone(),
+                            argv: recipe.argv.clone(),
+                            spawn_token: None,
+                            cwd: recipe.cwd.clone(),
+                            env: recipe.env.clone(),
+                        },
+                        &cancel,
+                    )
+                }),
+                _ => None,
+            };
+            let mut effects = created.effects();
+            let (outcome, category) = match &launched {
+                Some(LaunchOutcome::Completed) => {
+                    effects.push("launch".into());
+                    (RequestOutcome::Completed, None)
+                }
+                Some(LaunchOutcome::Refused(message)) => {
+                    notes.push(format!("the recipe was not launched: {message}"));
+                    (RequestOutcome::Refused, Some(Category::BACKEND_REFUSED))
+                }
+                Some(LaunchOutcome::Unknown(message)) => {
+                    notes.push(format!(
+                        "the recipe launch is unknown and is not retried: {message}"
+                    ));
+                    (RequestOutcome::Unknown, Some(Category::BACKEND_UNAVAILABLE))
+                }
+                None => (RequestOutcome::Completed, None),
+            };
+            let note = (!notes.is_empty()).then(|| notes.join("; "));
             return Ok(Creation {
                 record: record
                     .created(created.identity(create.created_kind()))
-                    .complete(
-                        RequestOutcome::Completed,
-                        None,
-                        note.as_deref(),
-                        created.effects(),
-                        now,
-                    ),
+                    .complete(outcome, category, note.as_deref(), effects, now),
                 container,
             });
         }
@@ -3654,6 +3719,568 @@ fn dispatch_creation(
         record: done,
         container: None,
     })
+}
+
+/// Deletes one container Radar records: the hierarchy's own verb for removing a
+/// workspace, a tab or a pane slot.
+///
+/// The container is what is deleted and the frozen target is what the operator
+/// confirmed, so a container replaced in the meantime is not the one acted on.
+/// The close is the same guarded dispatch a generic close runs — positively
+/// unmanaged, still the frozen identity, unregistered — and what a deletion would
+/// take with it is read from the daemon's own records before anything is
+/// dispatched. Pane removal is recorded as a removal; no process is claimed to
+/// have exited, no child to have been unregistered, and no assignment to have
+/// completed.
+fn execute_container_delete(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let frozen = match frozen_params(request, &[]) {
+        Ok(frozen) => frozen,
+        Err(response) => return response,
+    };
+    let delete: containers::DeleteRequest = match serde_json::from_value(frozen) {
+        Ok(delete) => delete,
+        Err(error) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BadParams,
+                    format!("`request` is not a container deletion: {error}"),
+                ),
+            );
+        }
+    };
+    if !valid_identifier(&delete.container_id) {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                "the container id is not a valid identifier",
+            ),
+        );
+    }
+    let requester = match request.optional_string("requester") {
+        Ok(requester) => requester,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let now = store::now_ms();
+    let operation = ops::Operation::DeleteContainer;
+    let method = operation.as_str();
+    let target = delete.container_id.clone();
+    let (backend, cancel) = match admit(operation, request, Some(&target), &requester, now, core) {
+        Admission::Answered(response) => return response,
+        Admission::Unsupported(message) => {
+            return execute_unsupported(operation, request, &message, Some(target), core);
+        }
+        Admission::Dispatch(backend, cancel) => (backend, cancel),
+    };
+    let record = RequestRecord::new(&request.id, method, requester, Some(target), now)
+        .with_params(request.params.clone());
+    // Everything below refuses into the record: a confirmed deletion is readable
+    // by its request id whatever it decided.
+    let registry = {
+        let core = locked(core);
+        Arc::clone(&core.registry)
+    };
+    let container = match containers::read(&registry, &delete.container_id) {
+        Ok(Some(container)) => container,
+        Ok(None) => {
+            return write_refused(
+                request,
+                record,
+                &format!(
+                    "container {} is not recorded: nothing was deleted",
+                    delete.container_id
+                ),
+                core,
+            );
+        }
+        Err(error) => return write_refused(request, record, &error, core),
+    };
+    // A container this daemon already removed is history, and one whose binding
+    // names no verified serving instance cannot be fenced: neither is deleted.
+    if let Some(at) = container.removed_at.as_deref() {
+        return write_refused(
+            request,
+            record,
+            &format!(
+                "container {} was removed at {at}: nothing was deleted",
+                container.id
+            ),
+            core,
+        );
+    }
+    let Some(binding) = container.binding.clone() else {
+        return write_refused(
+            request,
+            record,
+            &format!(
+                "container {} records no binding: nothing was deleted",
+                container.id
+            ),
+            core,
+        );
+    };
+    let expected = container.kind.target(&binding.handle);
+    if delete.frozen.target != expected {
+        return write_refused(
+            request,
+            record,
+            &format!(
+                "{} is not container {}'s location ({}): nothing was deleted",
+                delete.frozen.target.description(),
+                container.id,
+                expected.description()
+            ),
+            core,
+        );
+    }
+    let verifier = Arc::clone(&locked(core).verifier);
+    let serving = serving_identity(&backend, &verifier, &cancel, verification);
+    let Some(recorded) = binding.incarnation.clone() else {
+        return write_refused(
+            request,
+            record,
+            &format!(
+                "container {} records no verified serving instance: nothing was deleted",
+                container.id
+            ),
+            core,
+        );
+    };
+    if serving.as_ref() != Some(&recorded) {
+        return write_refused(
+            request,
+            record,
+            &format!(
+                "container {} was recorded under another serving instance: nothing was deleted",
+                container.id
+            ),
+            core,
+        );
+    }
+    // What the deletion would take with it, from the daemon's own records: the
+    // container, everything recorded inside it, and any worker registered into
+    // one of those places.
+    let members = match containers::subtree(&registry, &container.id) {
+        Ok(members) => members,
+        Err(message) => return write_refused(request, record, &message, core),
+    };
+    let mut places: Vec<(containers::Kind, String)> = Vec::new();
+    for id in &members {
+        match containers::read(&registry, id) {
+            Ok(Some(member)) => {
+                if let Some(binding) = member.binding.as_ref() {
+                    places.push((member.kind, binding.handle.clone()));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return write_refused(request, record, &error, core),
+        }
+    }
+    let registrations = match locked(core).registry.public_registrations() {
+        Ok(registrations) => registrations,
+        Err(message) => return write_refused(request, record, &message, core),
+    };
+    // A live managed process is named rather than closed around: the operator
+    // stops it first, and the stop reports the exit while the deletion reports
+    // the removal.
+    let occupied = lifecycle::registrations_in(&registrations, |location| {
+        places.iter().any(|(kind, handle)| match kind {
+            containers::Kind::Workspace => location.workspace.as_deref() == Some(handle),
+            containers::Kind::Tab => location.tab.as_deref() == Some(handle),
+            containers::Kind::Pane => location.pane.as_deref() == Some(handle),
+        })
+    });
+    if !occupied.is_empty() {
+        let named: Vec<String> = occupied
+            .iter()
+            .map(|registration| match registration.label.as_deref() {
+                Some(label) => format!("{label} ({})", registration.agent_id),
+                None => registration.agent_id.clone(),
+            })
+            .collect();
+        return write_refused(
+            request,
+            record,
+            &format!(
+                "deleting {} would end {}: stop it first, then delete; nothing was deleted",
+                delete.frozen.target.description(),
+                named.join(", ")
+            ),
+            core,
+        );
+    }
+    // The guarded dispatch a generic close uses, unchanged: one fresh inventory,
+    // the frozen identity, and a registry that must answer.
+    let registrations = || locked(core).registry.public_registrations();
+    let settled = match lifecycle::close_unmanaged(
+        backend.as_ref(),
+        &delete.frozen,
+        &cancel,
+        registrations,
+    ) {
+        DirectClose::Completed => {
+            let now = store::now_ms();
+            let at = store::format_millis(now);
+            let mut removed: Vec<containers::Container> = Vec::new();
+            let mut failures: Vec<String> = Vec::new();
+            for id in &members {
+                match containers::record_removed(&registry, id, &at) {
+                    Ok(container) => removed.push(container),
+                    Err(error) => failures.push(format!("{id}: {error}")),
+                }
+            }
+            // The close is the runtime's confirmation that it removed the place,
+            // not a re-observation of it, and the removals are the daemon's own
+            // records: neither claims anything about a process.
+            let note = if failures.is_empty() {
+                format!(
+                    "{} was closed by the runtime; {} container record(s) marked removed",
+                    delete.frozen.target.description(),
+                    removed.len()
+                )
+            } else {
+                format!(
+                    "{} was closed by the runtime; removals were not recorded for: {}",
+                    delete.frozen.target.description(),
+                    failures.join("; ")
+                )
+            };
+            let settled = record.complete(
+                RequestOutcome::Completed,
+                None,
+                Some(&note),
+                vec!["close".into(), "container.removal".into()],
+                now,
+            );
+            return write_deleted(request, settled, removed, core);
+        }
+        DirectClose::Refused(message) => record.complete(
+            RequestOutcome::Refused,
+            Some(Category::BACKEND_REFUSED),
+            Some(&message),
+            Vec::new(),
+            store::now_ms(),
+        ),
+        DirectClose::Unknown(message) => record.complete(
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            Some(&message),
+            Vec::new(),
+            store::now_ms(),
+        ),
+    };
+    write_deleted(request, settled, Vec::new(), core)
+}
+
+/// Reloads one pane container's slot: the recipe it was created with runs again
+/// in the pane it was created in.
+///
+/// Reload requires the previous command to be gone — the pane's own retained exit
+/// evidence, read now — so nothing is replaced while it may still be running. It
+/// records its own outcome and claims no session restart, no new container and no
+/// assignment fact: it is one slot's command run again.
+fn execute_container_reload(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let frozen = match frozen_params(request, &[]) {
+        Ok(frozen) => frozen,
+        Err(response) => return response,
+    };
+    let reload: containers::ReloadRequest = match serde_json::from_value(frozen) {
+        Ok(reload) => reload,
+        Err(error) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BadParams,
+                    format!("`request` is not a container reload: {error}"),
+                ),
+            );
+        }
+    };
+    if !valid_identifier(&reload.container_id) {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                "the container id is not a valid identifier",
+            ),
+        );
+    }
+    let requester = match request.optional_string("requester") {
+        Ok(requester) => requester,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let now = store::now_ms();
+    let operation = ops::Operation::ReloadContainer;
+    let method = operation.as_str();
+    let target = reload.container_id.clone();
+    let (backend, cancel) = match admit(operation, request, Some(&target), &requester, now, core) {
+        Admission::Answered(response) => return response,
+        Admission::Unsupported(message) => {
+            return execute_unsupported(operation, request, &message, Some(target), core);
+        }
+        Admission::Dispatch(backend, cancel) => (backend, cancel),
+    };
+    let record = RequestRecord::new(&request.id, method, requester, Some(target), now)
+        .with_params(request.params.clone());
+    let registry = {
+        let core = locked(core);
+        Arc::clone(&core.registry)
+    };
+    let container = match containers::read(&registry, &reload.container_id) {
+        Ok(Some(container)) => container,
+        Ok(None) => {
+            return reload_refused(
+                request,
+                record,
+                &format!(
+                    "container {} is not recorded: nothing was reloaded",
+                    reload.container_id
+                ),
+                None,
+                core,
+            );
+        }
+        Err(error) => return reload_refused(request, record, &error, None, core),
+    };
+    // Everything a reload requires is decided here, and every refusal names what
+    // is missing: only a pane slot runs a recipe, only a container Radar created
+    // has one, and the recipe itself must still be held.
+    let eligible = (|| -> Result<(containers::Binding, containers::Recipe), String> {
+        if container.kind != containers::Kind::Pane {
+            return Err("only a pane slot runs a recipe".to_string());
+        }
+        if container.provenance != containers::Provenance::Created {
+            return Err(
+                "this container is not one Radar created: it has no recipe to run".to_string(),
+            );
+        }
+        if let Some(at) = container.removed_at.as_deref() {
+            return Err(format!("container {} was removed at {at}", container.id));
+        }
+        let binding = container
+            .binding
+            .clone()
+            .ok_or_else(|| format!("container {} records no binding", container.id))?;
+        let verifier = Arc::clone(&locked(core).verifier);
+        let serving = serving_identity(&backend, &verifier, &cancel, verification);
+        let Some(recorded) = binding.incarnation.clone() else {
+            return Err(format!(
+                "container {} records no verified serving instance",
+                container.id
+            ));
+        };
+        if serving.as_ref() != Some(&recorded) {
+            return Err(format!(
+                "container {} was recorded under another serving instance",
+                container.id
+            ));
+        }
+        if !container.recipe {
+            return Err(format!("container {} records no recipe", container.id));
+        }
+        // The record says a recipe is held and the private store has none: the two
+        // disagree, and a command is never invented to run.
+        let recipe = containers::read_recipe(&registry, &container.id)?
+            .ok_or_else(|| format!("the recipe held for container {} is missing", container.id))?;
+        Ok((binding, recipe))
+    })();
+    let (binding, recipe) = match eligible {
+        Ok(ready) => ready,
+        Err(message) => {
+            return reload_refused(
+                request,
+                record,
+                &format!("{message}: nothing was reloaded"),
+                Some(container),
+                core,
+            );
+        }
+    };
+    // The pane's own retained exit is the evidence that the previous command is
+    // gone. A command still running, or one whose exit cannot be established, is
+    // not replaced: the operator stops it first.
+    let pane = binding.handle.clone();
+    let observed = backend.exit_observations(std::slice::from_ref(&pane), &cancel);
+    match observed.get(&pane) {
+        Some(PaneExitObservation::Exited { .. }) => {}
+        Some(PaneExitObservation::Running) => {
+            return reload_refused(
+                request,
+                record,
+                &format!("pane {pane} is still running its command: stop it first, then reload"),
+                Some(container),
+                core,
+            );
+        }
+        _ => {
+            return reload_refused(
+                request,
+                record,
+                &format!(
+                    "pane {pane} does not report an exited command: not replacing what may still be running"
+                ),
+                Some(container),
+                core,
+            );
+        }
+    }
+    let launched = backend.launch(
+        &LaunchRequest {
+            pane_id: pane.clone(),
+            executable: recipe.executable.clone(),
+            argv: recipe.argv.clone(),
+            // A container's own launch is not a spawn child: no token, and the
+            // variable is not put in its environment.
+            spawn_token: None,
+            cwd: recipe.cwd.clone(),
+            env: recipe.env.clone(),
+        },
+        &cancel,
+    );
+    let settled = match launched {
+        LaunchOutcome::Completed => record.complete(
+            RequestOutcome::Completed,
+            None,
+            Some(&format!(
+                "the recorded recipe was run again in {pane}; the container is unchanged"
+            )),
+            vec!["launch".into()],
+            store::now_ms(),
+        ),
+        LaunchOutcome::Refused(message) => record.complete(
+            RequestOutcome::Refused,
+            Some(Category::BACKEND_REFUSED),
+            Some(&message),
+            Vec::new(),
+            store::now_ms(),
+        ),
+        LaunchOutcome::Unknown(message) => record.complete(
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            Some(&message),
+            Vec::new(),
+            store::now_ms(),
+        ),
+    };
+    write_reloaded(request, settled, Some(container), core)
+}
+
+/// Answers an admitted reload with a refusal that is recorded before it is
+/// written.
+fn reload_refused(
+    request: &Request,
+    record: RequestRecord,
+    message: &str,
+    container: Option<containers::Container>,
+    core: &Arc<Mutex<Core>>,
+) -> Response {
+    write_reloaded(
+        request,
+        record.complete(
+            RequestOutcome::Refused,
+            Some(Category::REFUSED),
+            Some(message),
+            Vec::new(),
+            store::now_ms(),
+        ),
+        container,
+        core,
+    )
+}
+
+/// Answers a settled reload with the container it acted on, unchanged.
+fn write_reloaded(
+    request: &Request,
+    record: RequestRecord,
+    container: Option<containers::Container>,
+    core: &Arc<Mutex<Core>>,
+) -> Response {
+    write_settled_with(
+        request,
+        record,
+        json!({
+            "container": container.map(|container| container.public()),
+        }),
+        core,
+    )
+}
+
+/// Writes a settled operation with the public facts its own answer names beside
+/// the record, so a caller acts on what its request did rather than on what the
+/// next read happens to show.
+fn write_settled_with(
+    request: &Request,
+    record: RequestRecord,
+    extra: serde_json::Value,
+    core: &Arc<Mutex<Core>>,
+) -> Response {
+    let core = locked(core);
+    match core.store.write(&record) {
+        Ok(()) => {
+            let mut body = json!({ "request": public_record(record) });
+            if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+                for (key, value) in extra {
+                    body.insert(key.clone(), value.clone());
+                }
+            }
+            Response::ok(&request.id, body)
+        }
+        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    }
+}
+
+/// Answers an admitted deletion with a refusal that is recorded before it is
+/// written, so a caller reads back what the daemon decided.
+fn write_refused(
+    request: &Request,
+    record: RequestRecord,
+    message: &str,
+    core: &Arc<Mutex<Core>>,
+) -> Response {
+    write_deleted(
+        request,
+        record.complete(
+            RequestOutcome::Refused,
+            Some(Category::REFUSED),
+            Some(message),
+            Vec::new(),
+            store::now_ms(),
+        ),
+        Vec::new(),
+        core,
+    )
+}
+
+/// Writes a settled deletion together with the containers it marked removed.
+///
+/// The containers travel with the record so a caller reads what its own request
+/// removed rather than joining handles to whatever the tree shows next.
+fn write_deleted(
+    request: &Request,
+    record: RequestRecord,
+    removed: Vec<containers::Container>,
+    core: &Arc<Mutex<Core>>,
+) -> Response {
+    write_settled_with(
+        request,
+        record,
+        json!({
+            "removed": removed
+                .into_iter()
+                .map(|container| container.public())
+                .collect::<Vec<_>>(),
+        }),
+        core,
+    )
 }
 
 /// Validates, records and dispatches one pane input.
@@ -3824,18 +4451,39 @@ struct SpawnParams {
 /// Asks the selected backend whether it can carry this launch, before any record
 /// is written.
 fn preflight_launch(core: &Arc<Mutex<Core>>, params: &SpawnParams) -> Result<(), Refusal> {
+    preflight_command(
+        core,
+        "preflight",
+        &params.executable,
+        &params.argv,
+        params.cwd.as_deref(),
+        &params.env,
+    )
+}
+
+/// Asks the selected backend whether it can carry one command in one pane, before
+/// any record is written. The probe names no token: what is checked is the command
+/// and the context it needs.
+fn preflight_command(
+    core: &Arc<Mutex<Core>>,
+    pane_id: &str,
+    executable: &str,
+    argv: &[String],
+    cwd: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<(), Refusal> {
     let launch_context = LaunchRequest {
-        pane_id: "preflight".to_string(),
-        executable: params.executable.clone(),
-        argv: params.argv.clone(),
-        spawn_token: "00000000-0000-0000-0000-000000000000".to_string(),
-        cwd: params.cwd.clone(),
-        env: params.env.clone(),
+        pane_id: pane_id.to_string(),
+        executable: executable.to_string(),
+        argv: argv.to_vec(),
+        spawn_token: None,
+        cwd: cwd.map(str::to_string),
+        env: env.clone(),
     };
     let preflight = {
         let core = locked(core);
         core.backend.as_ref().map(|backend| {
-            if (!params.env.is_empty() || params.cwd.is_some())
+            if (!env.is_empty() || cwd.is_some())
                 && !backend.capabilities().contains(&LAUNCH_CONTEXT_CAPABILITY)
             {
                 Err("selected backend does not support launch context".to_string())
@@ -3846,12 +4494,69 @@ fn preflight_launch(core: &Arc<Mutex<Core>>, params: &SpawnParams) -> Result<(),
     };
     match preflight {
         Some(Err(message)) => Err(Refusal::new(Code::BadParams, message)),
-        None if params.cwd.is_some() || !params.env.is_empty() => Err(Refusal::new(
+        None if cwd.is_some() || !env.is_empty() => Err(Refusal::new(
             Code::BackendUnavailable,
             "selected backend does not support launch context",
         )),
         _ => Ok(()),
     }
+}
+
+/// The recipe a creation carries: the command its pane slot runs.
+///
+/// A recipe is held privately and reported only as held. It is refused on a
+/// creation that makes no pane, because a recipe runs in a pane slot, and only the
+/// hierarchy verb accepts one: the primitive create takes no Radar annotations.
+fn creation_recipe(
+    request: &Request,
+    create: &CreateRequest,
+) -> Result<Option<containers::Recipe>, Response> {
+    let Some(recipe) = request.params.get("recipe") else {
+        return Ok(None);
+    };
+    if !matches!(create, CreateRequest::PaneSplit { .. }) {
+        return Err(Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                "a recipe runs in a pane slot: only a pane creation carries one",
+            ),
+        ));
+    }
+    serde_json::from_value(recipe.clone())
+        .map(Some)
+        .map_err(|error| {
+            Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BadParams,
+                    format!("`recipe` is not a container recipe: {error}"),
+                ),
+            )
+        })
+}
+
+/// Asks the selected backend whether it can carry a container's recipe, before
+/// anything is created.
+fn preflight_recipe(
+    core: &Arc<Mutex<Core>>,
+    create: &CreateRequest,
+    recipe: &containers::Recipe,
+) -> Result<(), Refusal> {
+    let CreateRequest::PaneSplit { pane_id, .. } = create else {
+        return Err(Refusal::new(
+            Code::BadParams,
+            "a recipe runs in a pane slot: only a pane creation carries one",
+        ));
+    };
+    preflight_command(
+        core,
+        pane_id,
+        &recipe.executable,
+        &recipe.argv,
+        recipe.cwd.as_deref(),
+        &recipe.env,
+    )
 }
 
 /// Validates, records and dispatches one managed child spawn.
@@ -4110,6 +4815,8 @@ fn spawn_child(
         if let Err(error) = containers::record_created(
             &registry,
             containers::Confirmed {
+                id: store::random_uuid(),
+                recipe: false,
                 request: &create_request,
                 created: named,
                 backend: &backend.identity(),
@@ -4164,7 +4871,7 @@ fn spawn_child(
                 pane_id: pane,
                 executable: params.executable.clone(),
                 argv: params.argv.clone(),
-                spawn_token: edge.token.clone(),
+                spawn_token: Some(edge.token.clone()),
                 cwd: params.cwd.clone(),
                 env: params.env.clone(),
             };

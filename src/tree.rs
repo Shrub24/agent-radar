@@ -189,12 +189,45 @@ impl TreeRow {
     }
 }
 
+/// The daemon's own identity for the place a row shows, when it records one.
+///
+/// The backend handle is evidence, never the identity itself: this is what a
+/// control is addressed by, and what says whether Radar made the place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerRef {
+    pub container_id: String,
+    pub kind: Kind,
+    pub provenance: crate::control_plane::containers::Provenance,
+    /// The handle the container's binding names, as its backend knows it.
+    pub handle: String,
+    /// Whether a recipe is held for this container's pane, which is what a reload
+    /// needs before it can run one again.
+    pub recipe: bool,
+    /// A source-labelled reason the binding cannot be trusted right now.
+    pub unresolved: Option<String>,
+}
+
+/// The labels and container identities one build resolves its rows from.
+///
+/// The workspace and pane maps are identities a control is addressed by. A tab
+/// container is not collected: the tree has no tab row, so nothing selects one.
+#[derive(Default)]
+struct Places<'a> {
+    workspaces: HashMap<&'a str, ContainerRef>,
+    panes: HashMap<&'a str, ContainerRef>,
+    workspace_labels: HashMap<&'a str, &'a str>,
+    tab_labels: HashMap<&'a str, &'a str>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowKind {
     Workspace {
         workspace_id: String,
         label: Option<String>,
         number: Option<u32>,
+        /// The workspace container Radar records for this place, when it records
+        /// one: without it the group is a place this daemon does not own.
+        container: Option<ContainerRef>,
     },
     /// Both row kinds that carry every published fact are boxed: an agent row
     /// carries everything the source said, a task row a publisher's whole
@@ -214,6 +247,8 @@ pub struct AgentRow {
     pub workspace_label: Option<String>,
     pub tab_id: String,
     pub tab_label: Option<String>,
+    /// The pane container this agent occupies, when Radar records one.
+    pub container: Option<ContainerRef>,
     /// The name the row shows: a managed worker's published runtime label, a
     /// lead's published session name, or the reported title when the source
     /// publishes neither.
@@ -281,6 +316,8 @@ pub struct PaneRow {
     pub workspace_label: Option<String>,
     pub tab_id: String,
     pub tab_label: Option<String>,
+    /// The pane container Radar records for this place, when it records one.
+    pub container: Option<ContainerRef>,
     /// What the pane is now: its own label, or the terminal title when the
     /// label is a session that has gone. Falls back to the pane id when the
     /// title only repeats the workspace it already sits under.
@@ -345,10 +382,12 @@ impl FleetTree {
             return FleetTree::default();
         };
 
-        // Radar's own name for a container it created wins over whatever the
-        // backend calls it: an operator who labelled a workspace named it. A
+        // Radar's own identity for a container it recorded, and radar's own name
+        // for one it created: an operator who labelled a workspace named it. A
         // workspace Radar never created keeps the backend's own label, and a
         // backend that names nothing keeps its ids.
+        let workspaces = container_refs(inventory, Kind::Workspace);
+        let panes = container_refs(inventory, Kind::Pane);
         let mut workspace_labels: HashMap<&str, &str> = inventory
             .workspaces
             .iter()
@@ -361,6 +400,12 @@ impl FleetTree {
             .filter_map(|t| Some((t.tab_id.as_str(), t.label.as_deref()?)))
             .collect();
         tab_labels.extend(container_labels(inventory, Kind::Tab));
+        let places = Places {
+            workspaces,
+            panes,
+            workspace_labels,
+            tab_labels,
+        };
         let workspace_numbers: HashMap<&str, u32> = inventory
             .workspaces
             .iter()
@@ -387,7 +432,8 @@ impl FleetTree {
         for workspace_id in &workspace_ids {
             // A registration that reports no workspace is placed here, under a
             // root that says so, rather than under a heading with no name.
-            let label = workspace_labels
+            let label = places
+                .workspace_labels
                 .get(workspace_id.as_str())
                 .copied()
                 .or_else(|| workspace_id.is_empty().then_some("unplaced"));
@@ -414,14 +460,7 @@ impl FleetTree {
                     (None, None)
                 };
                 agents.push((
-                    agent_node(
-                        agent,
-                        None,
-                        pane,
-                        foreground,
-                        &workspace_labels,
-                        &tab_labels,
-                    ),
+                    agent_node(agent, None, pane, foreground, &places),
                     agent.lineage.clone(),
                 ));
             }
@@ -443,8 +482,7 @@ impl FleetTree {
                         // A retained row has no live process: it is not shown
                         // staleness at all, whatever evidence the pane holds.
                         None,
-                        &workspace_labels,
-                        &tab_labels,
+                        &places,
                     ),
                     agent.lineage.clone(),
                 ));
@@ -458,6 +496,7 @@ impl FleetTree {
                         workspace_id: workspace_id.clone(),
                         label: label.map(str::to_string),
                         number: workspace_numbers.get(workspace_id.as_str()).copied(),
+                        container: places.workspaces.get(workspace_id.as_str()).cloned(),
                     },
                 },
                 children: nest(agents),
@@ -481,13 +520,16 @@ impl FleetTree {
                     kind: RowKind::Pane(Box::new(PaneRow {
                         pane_id: pane_id.to_string(),
                         workspace_id: pane.location.workspace_id.clone(),
-                        workspace_label: workspace_labels
+                        workspace_label: places
+                            .workspace_labels
                             .get(pane.location.workspace_id.as_str())
                             .map(|label| (*label).to_string()),
                         tab_id: pane.location.tab_id.clone(),
-                        tab_label: tab_labels
+                        tab_label: places
+                            .tab_labels
                             .get(pane.location.tab_id.as_str())
                             .map(|label| (*label).to_string()),
+                        container: places.panes.get(pane_id).cloned(),
                         // Herdr keeps the last title an agent set as the pane's
                         // label. When the pane reports no agent, that label is a
                         // finished session, not what the pane is now.
@@ -502,7 +544,8 @@ impl FleetTree {
                         title: crate::title::pane_title(
                             pane.label.as_deref(),
                             pane.title.as_deref(),
-                            workspace_labels
+                            places
+                                .workspace_labels
                                 .get(pane.location.workspace_id.as_str())
                                 .copied(),
                             pane_id,
@@ -571,8 +614,7 @@ fn agent_node(
     retained: Option<RetentionBasis>,
     pane: Option<&Pane>,
     foreground: Option<ForegroundEvidence>,
-    workspace_labels: &HashMap<&str, &str>,
-    tab_labels: &HashMap<&str, &str>,
+    places: &Places<'_>,
 ) -> TreeNode {
     let location = &agent.location;
     let registry = agent.registry.clone();
@@ -602,7 +644,8 @@ fn agent_node(
     let displayed = crate::title::display(&raw, agent.name.as_deref());
     let title = crate::title::strip_workspace_suffix(
         &displayed,
-        workspace_labels
+        places
+            .workspace_labels
             .get(location.workspace_id.as_str())
             .copied(),
     )
@@ -613,13 +656,16 @@ fn agent_node(
             kind: RowKind::Agent(Box::new(AgentRow {
                 pane_id: location.pane_id.clone(),
                 workspace_id: location.workspace_id.clone(),
-                workspace_label: workspace_labels
+                workspace_label: places
+                    .workspace_labels
                     .get(location.workspace_id.as_str())
                     .map(|label| (*label).to_string()),
                 tab_id: location.tab_id.clone(),
-                tab_label: tab_labels
+                tab_label: places
+                    .tab_labels
                     .get(location.tab_id.as_str())
                     .map(|label| (*label).to_string()),
+                container: places.panes.get(location.pane_id.as_str()).cloned(),
                 title,
                 name: agent.name.clone(),
                 status: agent.status.clone(),
@@ -863,6 +909,34 @@ fn nest(mut agents: Vec<(TreeNode, Option<Lineage>)>) -> Vec<TreeNode> {
         .collect()
 }
 
+/// The container identities of one kind, keyed by the handle the backend knows it
+/// by.
+///
+/// A container this daemon removed is not offered as an identity: its handle may
+/// belong to a later backend instance that is not the container recorded here. One
+/// with no binding has no handle to be keyed by.
+fn container_refs(inventory: &FleetObservation, kind: Kind) -> HashMap<&str, ContainerRef> {
+    inventory
+        .containers
+        .iter()
+        .filter(|container| container.kind == kind && container.removed_at.is_none())
+        .filter_map(|container| {
+            let binding = container.binding.as_ref()?;
+            Some((
+                binding.handle.as_str(),
+                ContainerRef {
+                    container_id: container.container_id.clone(),
+                    kind: container.kind,
+                    provenance: container.provenance,
+                    handle: binding.handle.clone(),
+                    recipe: container.recipe,
+                    unresolved: container.unresolved.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
 /// The recorded label of every container of one kind, keyed by the handle the
 /// backend knows it by.
 ///
@@ -967,6 +1041,7 @@ mod tests {
             parent: None,
             label: Some(label.to_string()),
             created_by: None,
+            recipe: false,
             provenance: Provenance::Created,
             binding: Some(ContainerBinding {
                 backend: "fake".into(),
@@ -1029,6 +1104,96 @@ mod tests {
             "backend-name",
             "a removed container's label does not name whatever holds its handle now"
         );
+    }
+
+    /// A pane container bound to the handle the backend knows the pane by.
+    fn pane_container(id: &str, handle: &str, removed: Option<&str>) -> PublicContainer {
+        PublicContainer {
+            container_id: id.to_string(),
+            kind: Kind::Pane,
+            parent: None,
+            label: None,
+            created_by: None,
+            recipe: false,
+            provenance: Provenance::Created,
+            binding: Some(ContainerBinding {
+                backend: "fake".into(),
+                incarnation: None,
+                handle: handle.to_string(),
+            }),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            observed_at: None,
+            unresolved: None,
+            removed_at: removed.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn rows_carry_the_container_radar_records_for_their_place() {
+        let mut observation = FleetObservation {
+            workspaces: vec![Workspace {
+                workspace_id: "wA".into(),
+                label: None,
+                number: Some(1),
+            }],
+            tabs: vec![Tab {
+                tab_id: "wA:t1".into(),
+                workspace_id: "wA".into(),
+                label: None,
+                number: Some(1),
+            }],
+            panes: vec![Pane {
+                location: Location {
+                    workspace_id: "wA".into(),
+                    tab_id: "wA:t1".into(),
+                    pane_id: "wA:p1".into(),
+                },
+                label: None,
+                title: None,
+            }],
+            agents: Vec::new(),
+            metadata_agents: Vec::new(),
+            containers: vec![
+                workspace_container("c1", "wA", "work", None),
+                pane_container("c2", "wA:p1", None),
+            ],
+        };
+        let mut state = ObservationState::new();
+        state.apply_success(observation.clone());
+        let tree = FleetTree::build(&state);
+
+        match &node(&tree, &RowId::Workspace("wA".into())).row.kind {
+            RowKind::Workspace { container, .. } => {
+                let container = container.as_ref().expect("the workspace container");
+                assert_eq!(container.container_id, "c1");
+                assert_eq!(container.handle, "wA");
+                assert_eq!(container.provenance, Provenance::Created);
+            }
+            other => panic!("a workspace group: {other:?}"),
+        }
+        match &node(&tree, &RowId::Pane("wA:p1".into())).row.kind {
+            RowKind::Pane(pane) => {
+                let container = pane.container.as_ref().expect("the pane container");
+                assert_eq!(container.container_id, "c2");
+                assert_eq!(container.handle, "wA:p1");
+                assert!(!container.recipe, "no recipe was held for this pane");
+            }
+            other => panic!("a pane row: {other:?}"),
+        }
+
+        // A container the daemon removed is not the identity of whatever holds its
+        // handle now: the row shows a place this daemon records nothing for.
+        observation.containers = vec![pane_container(
+            "c2",
+            "wA:p1",
+            Some("2026-01-01T00:00:01.000Z"),
+        )];
+        state.apply_success(observation);
+        let tree = FleetTree::build(&state);
+        match &node(&tree, &RowId::Pane("wA:p1".into())).row.kind {
+            RowKind::Pane(pane) => assert!(pane.container.is_none(), "{pane:?}"),
+            other => panic!("a pane row: {other:?}"),
+        }
     }
 
     /// (depth, row id, title) for every node in source order.

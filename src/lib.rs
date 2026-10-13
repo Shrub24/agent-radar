@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod theme;
 pub mod title;
 pub mod tmux;
+pub mod topology;
 pub mod tree;
 pub mod ui;
 

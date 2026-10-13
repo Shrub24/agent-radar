@@ -36,7 +36,7 @@ still use Herdr.
 | `mux.input` | `input` | Literal text or named keys; no agent lifecycle interpretation |
 | `mux.output` | `output` | Bounded, non-consuming output snapshot; no scrollback/cursor consumption |
 | `mux.report` | `report` | Optional forwarding to backend metadata; not direct registry publication |
-| `mux.close` | `close_outcome` | Physical pane/tab close after the daemon's positive-unmanaged containment and identity gate |
+| `mux.close` | `close_outcome` | Physical pane/tab/workspace close after the daemon's positive-unmanaged containment and identity gate |
 | `spawn.create` | `validate_launch`, `create`, `launch` | Daemon-managed child creation/launch with durable edge and private registration correlation |
 | `spawn.close` | `inventory`, `foreground_evidence`, `exit_observation`, `server_process`, `close_outcome` | Close only the recorded, token-bound child's pane: a live occupant after exact foreground-identity verification, or a retained dead pane after the edge's recorded exit and the creating-instance fence. `server_process` is not a daemon method: it is the seam by which the daemon fences a created edge to the process that served it |
 

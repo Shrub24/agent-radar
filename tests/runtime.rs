@@ -1094,7 +1094,7 @@ fn launch_request(pane: &str, executable: &Path, argv: &[&str], token: &str) -> 
         pane_id: pane.to_string(),
         executable: executable.display().to_string(),
         argv: argv.iter().map(|argument| argument.to_string()).collect(),
-        spawn_token: token.to_string(),
+        spawn_token: Some(token.to_string()),
         cwd: None,
         env: Default::default(),
     }
@@ -1216,7 +1216,7 @@ fn a_launch_types_one_quoted_line_the_pane_shell_yields_the_argv_from() {
     assert!(shell.success(), "the typed line did not run: {line}");
     let expected = format!(
         "TOKEN={}\nPWD={}\nINHERITED=inherited\nEMPTY_SET=x EMPTY=<>\nOVERRIDE=<overlay ' \" $() ; *>\n{}COUNT={}\n",
-        request.spawn_token,
+        request.spawn_token.as_deref().expect("a launch token"),
         request.cwd.as_deref().expect("cwd"),
         request
             .argv

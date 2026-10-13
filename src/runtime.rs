@@ -76,6 +76,8 @@ pub enum Target {
 pub enum CloseTarget {
     Pane(String),
     Tab(String),
+    /// A whole workspace, which takes its tabs and panes with it.
+    Workspace(String),
 }
 
 impl CloseTarget {
@@ -83,7 +85,7 @@ impl CloseTarget {
     /// shared with every other operation over the same location.
     pub fn id(&self) -> &str {
         match self {
-            Self::Pane(id) | Self::Tab(id) => id,
+            Self::Pane(id) | Self::Tab(id) | Self::Workspace(id) => id,
         }
     }
 
@@ -92,6 +94,7 @@ impl CloseTarget {
         match self {
             Self::Pane(pane_id) => format!("pane {pane_id}"),
             Self::Tab(tab_id) => format!("tab {tab_id}"),
+            Self::Workspace(workspace_id) => format!("workspace {workspace_id}"),
         }
     }
 }
@@ -242,16 +245,19 @@ pub enum CreateOutcome {
 /// runs in.
 ///
 /// `spawn_token` is the private correlation token the child presents when it
-/// registers. The token travels to the child in its environment under
-/// [`LAUNCH_TOKEN_ENV`] and must never appear in an inventory, projection or
-/// diagnostic.
+/// registers, for a launch that is a spawn child. A launch the daemon makes
+/// outside a spawn — a container's own recipe — carries none, and the variable
+/// is then not put in the child's environment at all. The token travels to the
+/// child under [`LAUNCH_TOKEN_ENV`] and must never appear in an inventory,
+/// projection or diagnostic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRequest {
     pub pane_id: String,
     pub executable: String,
     #[serde(default)]
     pub argv: Vec<String>,
-    pub spawn_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -334,7 +340,9 @@ impl LaunchRequest {
             return Err("`pane_id` is not a valid pane identifier".to_string());
         }
         validate_command(&self.executable, &self.argv)?;
-        if self.spawn_token.is_empty() || self.spawn_token.chars().any(char::is_control) {
+        if let Some(token) = &self.spawn_token
+            && (token.is_empty() || token.chars().any(char::is_control))
+        {
             return Err("`spawn_token` must be non-empty printable text".to_string());
         }
         if let Some(cwd) = &self.cwd

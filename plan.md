@@ -81,6 +81,23 @@ the direct adapter remains an explicit mode/startup fallback, never a retry afte
 uncertain dispatch.
 Linux-only is accepted; cross-platform support is not a prerequisite.
 
+`daemon-managed-lifecycle` is committed and pushed (`a0a7f97f`): the daemon owns
+managed-launch lifecycle — tracked launches whose process is captured with a
+pidfd, cancel and verified stop through one exact-process path, enrollment and
+restart, a durable typed event log whose projections are rebuilt by replay, and
+an unbound launch's pane cleaned up as a recorded cancel effect fenced to the
+creating server instance. `managed-topology` is implemented in the same line:
+durable containers with a separate backend binding, `topology.create` (a labelled
+container that may carry a private recipe, run in the created pane by the daemon),
+`topology.delete` (the guarded close of a container's place, which refuses to end
+a live managed worker and names it), `topology.reload` (a pane's recorded recipe
+run again, only over a typed retained exit), and a tree whose rows carry the
+container identity of their place, with `a`/`D`/`R` in the TUI confirmed against a
+frozen container and dispatched to the daemon by request id. See each change's
+verification record. `managed-topology` is not archived yet: the TUI's tab-level
+controls, a recipe input field, PTY coverage of the container actions and the live
+tmux acceptance of the container verbs remain open.
+
 ## Adoption-first execution queue
 
 The near-term goal is daily Pi/Herdsman delegation and terminal management through

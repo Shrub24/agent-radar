@@ -123,9 +123,9 @@ When a container holds a live managed process, the daemon SHALL refuse deletion 
 - **WHEN** the operator runs the stop operation first and the process exit is verified
 - **THEN** the deletion proceeds and reports the pane removal, with the verified exit reported by the stop and not by the deletion
 
-### Requirement: Per-pane reload relaunches one pane slot after verified exit
+### Requirement: Per-pane reload relaunches one pane slot
 
-Reloading a pane container SHALL re-run that container's recorded recipe in the same pane slot. The daemon SHALL stop the pane's process through the common verified-stop path when it is managed, SHALL require verified exit or an already recorded exit, and SHALL refuse rather than replace a process that may still be running. Reload SHALL record its own durable outcome and SHALL NOT be reported as a restart of an agent's Pi session, as a new container, or as an assignment outcome.
+Reloading a pane container SHALL re-run its recorded recipe in the same pane slot. Only a pane container this daemon created with a recipe SHALL reload; anything else SHALL refuse and say what is missing. Reload SHALL require the previous command to be provably gone, and SHALL refuse rather than replace one still running or whose exit cannot be established. Reload SHALL record its own outcome and SHALL NOT report a Pi session, a new container, an assignment outcome, or any process exit.
 
 #### Scenario: Reload of a managed pane
 
@@ -134,8 +134,13 @@ Reloading a pane container SHALL re-run that container's recorded recipe in the 
 
 #### Scenario: The process may still be running
 
-- **WHEN** a reload is requested for a pane whose process is not verified gone
-- **THEN** it refuses without replacing anything in that pane
+- **WHEN** a reload is requested for a pane whose command is still running, or whose exit the backend cannot establish
+- **THEN** it refuses without replacing anything in that pane, and says to stop it first
+
+#### Scenario: A container Radar did not create
+
+- **WHEN** a reload targets a container recorded as observed rather than created
+- **THEN** it refuses, because Radar holds no recipe for a place it did not make
 
 #### Scenario: No recipe
 

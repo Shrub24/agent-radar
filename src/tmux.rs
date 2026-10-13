@@ -350,8 +350,12 @@ impl RuntimeProvider for TmuxRuntime {
             args.push("-e".to_string());
             args.push(format!("{name}={value}"));
         }
-        args.push("-e".to_string());
-        args.push(format!("{LAUNCH_TOKEN_ENV}={}", request.spawn_token));
+        // A launch outside a spawn has no token, and then the variable is not
+        // in the child's environment at all rather than set to nothing.
+        if let Some(token) = &request.spawn_token {
+            args.push("-e".to_string());
+            args.push(format!("{LAUNCH_TOKEN_ENV}={token}"));
+        }
         args.push(request.executable.clone());
         args.extend(request.argv.iter().cloned());
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -648,6 +652,9 @@ impl TmuxRuntime {
         let (command, address) = match target {
             CloseTarget::Pane(pane_id) => ("kill-pane", self.address(pane_id, Kind::Pane)),
             CloseTarget::Tab(tab_id) => ("kill-window", self.address(tab_id, Kind::Window)),
+            CloseTarget::Workspace(workspace_id) => {
+                ("kill-session", self.address(workspace_id, Kind::Session))
+            }
         };
         let address = address.map_err(Failure::refused)?;
         self.run(&[command, "-t", &address], cancel)

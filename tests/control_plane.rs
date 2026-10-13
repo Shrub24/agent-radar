@@ -425,6 +425,18 @@ const SPAWN_CAPABILITIES: &[&str] = &[
     "mux.launch_context",
 ];
 
+/// What a backend must state to create a pane, run a command in it with a private
+/// context, and report what that pane's command did: what a container recipe needs
+/// on both ends.
+const RECIPE_CAPABILITIES: &[&str] = &[
+    "mux.observe",
+    "mux.process_info",
+    "mux.create",
+    "mux.launch",
+    "mux.launch_context",
+    "mux.exit_observation",
+];
+
 /// What a backend must declare to close a child whose pane is already dead: the
 /// same primitives plus the retained-exit read the dead-pane evidence comes from.
 const DEAD_CLOSE_CAPABILITIES: &[&str] = &[
@@ -455,8 +467,13 @@ fn advertised(backend: &[&str]) -> Value {
         ("registry.facts.v1", &[][..]),
         ("events.v1", &[][..]),
         ("topology.create.v1", &["mux.create"][..]),
+        ("topology.delete.v1", &["mux.close"][..]),
         ("topology.get.v1", &[][..]),
         ("topology.list.v1", &[][..]),
+        (
+            "topology.reload.v1",
+            &["mux.launch", "mux.exit_observation"][..],
+        ),
         ("topology.reconcile.v1", &["mux.observe"][..]),
         ("spawn.v1", &["mux.create", "mux.launch"][..]),
         ("spawn.close.v1", &["mux.observe", "mux.close"][..]),
@@ -670,6 +687,33 @@ impl MuxBackend {
             report: self.report.clone(),
             launch: self.launch.clone(),
             inventory: self.inventory.clone(),
+            foreground: self.foreground.clone(),
+            exits: Mutex::new(BTreeMap::new()),
+            server_pid: Mutex::new(None),
+            inventory_refusal: Mutex::new(None),
+            closed: Mutex::new(Vec::new()),
+            close_answer: self.close_answer.clone(),
+            created_requests: Mutex::new(Vec::new()),
+            input_requests: Mutex::new(Vec::new()),
+            output_requests: Mutex::new(Vec::new()),
+            report_requests: Mutex::new(Vec::new()),
+            launch_requests: Mutex::new(Vec::new()),
+            gate: None,
+        })
+    }
+
+    /// The same backend reporting exactly this inventory.
+    ///
+    /// A container's frozen target has to be checkable against what the backend
+    /// says is there, so a test that deletes one states what its backend serves.
+    fn with_inventory(self: &Arc<Self>, inventory: FleetObservation) -> Arc<Self> {
+        Arc::new(Self {
+            capabilities: self.capabilities,
+            created: self.created.clone(),
+            output: self.output.clone(),
+            report: self.report.clone(),
+            launch: self.launch.clone(),
+            inventory,
             foreground: self.foreground.clone(),
             exits: Mutex::new(BTreeMap::new()),
             server_pid: Mutex::new(None),
@@ -5219,7 +5263,7 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
         .as_str()
         .expect("a minted token")
         .to_string();
-    assert_eq!(launches[0].spawn_token, token);
+    assert_eq!(launches[0].spawn_token, Some(token.clone()));
     // The token is the only thing that binds the edge to its child, so it is a
     // credential: it travels to the pane and appears in no answer.
     no_secret(&response, &token);
@@ -8964,6 +9008,608 @@ fn the_client_reads_the_containers_the_daemon_records() {
             .as_ref()
             .map(|binding| binding.handle.as_str()),
         Some("wA")
+    );
+    daemon.stop();
+}
+
+/// An inventory that reports one workspace and nothing inside it.
+fn workspace_inventory(workspace_id: &str) -> FleetObservation {
+    FleetObservation {
+        metadata_agents: Vec::new(),
+        containers: Vec::new(),
+        workspaces: vec![Workspace {
+            workspace_id: workspace_id.into(),
+            label: None,
+            number: Some(1),
+        }],
+        tabs: Vec::new(),
+        panes: Vec::new(),
+        agents: Vec::new(),
+    }
+}
+
+/// A freeze of one empty workspace: the target and identity a client sends when it
+/// deletes a workspace it saw holding nothing.
+fn frozen_workspace(workspace_id: &str) -> Value {
+    json!({
+        "target": {"workspace": workspace_id},
+        "identity": {"workspace": {"workspace_id": workspace_id, "members": []}},
+    })
+}
+
+/// A daemon whose fake backend can create and fence a workspace container.
+///
+/// The backend is served by this test process, so the container it creates records
+/// a verified serving instance — the fence a deletion needs — and reports the
+/// workspace, so a frozen target has a place to be checked against.
+fn deletion_setup(name: &str, handle: &str) -> (Sandbox, Arc<MuxBackend>, Daemon, Client) {
+    let sandbox = Sandbox::new(name);
+    // A backend that can both create and close locations is what a container
+    // deletion asks of it, so the test states both capabilities.
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+        .naming(CreatedLocation {
+            workspace_id: Some(handle.into()),
+            tab_id: None,
+            pane_id: None,
+        })
+        .with_inventory(workspace_inventory(handle));
+    backend.served_by(std::process::id() as i32);
+    let daemon = sandbox.daemon_with(backend.clone());
+    let client = Client::dial(daemon.path());
+    (sandbox, backend, daemon, client)
+}
+
+/// A created workspace container's id and the delete request naming its place.
+fn created_workspace(client: &mut Client, handle: &str) -> (String, Value) {
+    let created = client.call(
+        "topology.create",
+        json!({"request": {"kind": "workspace", "focus": false}, "label": "work", "requester": "test"}),
+    );
+    let container = &created["result"]["container"];
+    assert_eq!(container["binding"]["handle"], json!(handle), "{created}");
+    let id = container["container_id"]
+        .as_str()
+        .expect("a container id")
+        .to_string();
+    let request = json!({
+        "request": {"container_id": id, "frozen": frozen_workspace(handle)},
+        "requester": "test",
+    });
+    (id, request)
+}
+
+#[test]
+fn a_confirmed_deletion_closes_a_container_and_records_each_removal_once() {
+    let (_sandbox, backend, mut daemon, mut client) = deletion_setup("topology-delete", "wA");
+    let (id, request) = created_workspace(&mut client, "wA");
+
+    let deletion_id = random_uuid();
+    let deletion = client.call_id(&deletion_id, "topology.delete", request.clone());
+    assert_eq!(
+        result_record(&deletion)["outcome"],
+        "completed",
+        "{deletion}"
+    );
+    assert_eq!(
+        backend.closed_targets(),
+        vec![CloseTarget::Workspace("wA".into())],
+        "the container's own place is what is closed"
+    );
+    let removed = deletion["result"]["removed"]
+        .as_array()
+        .expect("the removed containers")
+        .clone();
+    assert_eq!(removed.len(), 1, "{deletion}");
+    assert_eq!(removed[0]["container_id"], json!(id));
+    assert!(removed[0]["removed_at"].is_string(), "{deletion}");
+    // The outcome says what the runtime confirmed and what the daemon recorded,
+    // and claims nothing about a process.
+    let message = result_record(&deletion)["message"]
+        .as_str()
+        .expect("a note")
+        .to_string();
+    assert!(message.contains("closed by the runtime"), "{message}");
+    assert!(message.contains("marked removed"), "{message}");
+    assert!(!message.contains("exit"), "{message}");
+
+    // The same request id answers the same record and closes nothing again.
+    let replay = client.call_id(&deletion_id, "topology.delete", request);
+    assert_eq!(result_record(&replay)["outcome"], "completed", "{replay}");
+    assert_eq!(
+        backend.closed_targets().len(),
+        1,
+        "a replayed deletion dispatches nothing"
+    );
+
+    // A fresh request id for the same container is refused: it is history now.
+    let again = client.call(
+        "topology.delete",
+        json!({"request": {"container_id": id, "frozen": frozen_workspace("wA")}, "requester": "test"}),
+    );
+    assert_eq!(result_record(&again)["outcome"], "refused", "{again}");
+    assert!(
+        result_record(&again)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("was removed at")),
+        "{again}"
+    );
+    assert_eq!(backend.closed_targets().len(), 1);
+    daemon.stop();
+}
+
+#[test]
+fn a_deletion_that_would_end_a_live_worker_names_it_and_dispatches_nothing() {
+    let (_sandbox, backend, mut daemon, mut client) =
+        deletion_setup("topology-delete-managed", "wA");
+    let (_id, request) = created_workspace(&mut client, "wA");
+
+    // A worker registered into the workspace the deletion would take with it.
+    let mut body = registration_body("3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b22", None, None);
+    body["location"] = json!({"backend": "fake", "workspace": "wA"});
+    let registered = client.call("agent.register", body);
+    let worker = agent_id(&registered).to_string();
+    assert!(!worker.is_empty(), "{registered}");
+
+    let deletion = client.call("topology.delete", request);
+    assert_eq!(result_record(&deletion)["outcome"], "refused", "{deletion}");
+    let message = result_record(&deletion)["message"]
+        .as_str()
+        .expect("a refusal message")
+        .to_string();
+    assert!(message.contains(&worker), "{message}");
+    assert!(message.contains("stop it first, then delete"), "{message}");
+    assert!(
+        backend.closed_targets().is_empty(),
+        "a refusal dispatches nothing"
+    );
+    // And the container is not history: the deletion did not happen.
+    let listed = client.call("topology.list", json!({}));
+    assert_eq!(
+        listed["result"]["containers"][0]["removed_at"],
+        Value::Null,
+        "{listed}"
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_deletion_under_another_serving_instance_refuses_and_dispatches_nothing() {
+    let (_sandbox, backend, mut daemon, mut client) =
+        deletion_setup("topology-delete-replaced", "wA");
+    let (_id, request) = created_workspace(&mut client, "wA");
+
+    // The handle is now served by another process: pid 1 is not this test's.
+    backend.served_by(1);
+    let deletion = client.call("topology.delete", request);
+    assert_eq!(result_record(&deletion)["outcome"], "refused", "{deletion}");
+    assert!(
+        result_record(&deletion)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("another serving instance")),
+        "{deletion}"
+    );
+    assert!(
+        backend.closed_targets().is_empty(),
+        "a container recorded under another instance is not closed"
+    );
+    assert_eq!(
+        result_record(&deletion)["category"],
+        "refused",
+        "{deletion}"
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_deletion_of_another_place_than_the_container_binds_is_refused() {
+    let (_sandbox, backend, mut daemon, mut client) =
+        deletion_setup("topology-delete-mismatch", "wA");
+    let (id, _request) = created_workspace(&mut client, "wA");
+
+    // The container is wA and the frozen target names a tab: the two describe
+    // different places, so nothing is dispatched.
+    let deletion = client.call(
+        "topology.delete",
+        json!({
+            "request": {
+                "container_id": id,
+                "frozen": {
+                    "target": {"tab": "wA:t1"},
+                    "identity": {"tab": {"tab_id": "wA:t1", "members": []}},
+                },
+            },
+            "requester": "test",
+        }),
+    );
+    assert_eq!(result_record(&deletion)["outcome"], "refused", "{deletion}");
+    assert!(
+        result_record(&deletion)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not container")),
+        "{deletion}"
+    );
+    assert!(backend.closed_targets().is_empty());
+    daemon.stop();
+}
+
+/// A backend that can create a pane, run a command in it, and report what that
+/// pane's command did: what a container recipe needs on both ends.
+fn recipe_backend() -> Arc<MuxBackend> {
+    // Served by this test process, so the container it creates records a verified
+    // serving instance: the fence a reload checks before it replaces anything.
+    let backend = MuxBackend::new(RECIPE_CAPABILITIES).naming(CreatedLocation {
+        workspace_id: Some("wA".into()),
+        tab_id: Some("wA:t1".into()),
+        pane_id: Some("wA:p2".into()),
+    });
+    backend.served_by(std::process::id() as i32);
+    backend
+}
+
+/// The create request one test uses: a pane split carrying a private command.
+fn recipe_creation() -> Value {
+    json!({
+        "request": {
+            "kind": "pane_split",
+            "pane_id": "wA:p1",
+            "direction": "right",
+            "focus": false,
+        },
+        "label": "runner",
+        "recipe": {
+            "executable": "/bin/echo",
+            "argv": ["sentinel-argv"],
+            "cwd": "/tmp",
+            "env": {"SENTINEL_ENV": "sentinel-value"},
+        },
+        "requester": "test",
+    })
+}
+
+#[test]
+fn a_recipe_creation_holds_the_command_privately_and_runs_it_in_its_pane() {
+    let sandbox = Sandbox::new("topology-recipe");
+    let backend = recipe_backend();
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let created = client.call("topology.create", recipe_creation());
+    assert_eq!(result_record(&created)["outcome"], "completed", "{created}");
+    let container = created["result"]["container"].clone();
+    assert_eq!(container["recipe"], json!(true), "{created}");
+    assert_eq!(container["label"], json!("runner"), "{created}");
+    let id = container["container_id"]
+        .as_str()
+        .expect("a container id")
+        .to_string();
+
+    // The command runs in the pane the create named, launched by the daemon, and
+    // carries no spawn token: it is not a spawn child.
+    let launches = backend.launches();
+    assert_eq!(launches.len(), 1, "{created}");
+    assert_eq!(launches[0].pane_id, "wA:p2");
+    assert_eq!(launches[0].executable, "/bin/echo");
+    assert_eq!(launches[0].argv, vec!["sentinel-argv".to_string()]);
+    assert_eq!(launches[0].spawn_token, None);
+
+    // The recipe is held in the daemon's owner-only store, and no read carries it.
+    use std::os::unix::fs::PermissionsExt;
+    let held = sandbox
+        .state()
+        .join("lifecycle/private")
+        .join(format!("container-{id}.json"));
+    let bytes = fs::read_to_string(&held).expect("the private recipe");
+    assert!(bytes.contains("sentinel-value"), "{bytes}");
+    assert_eq!(
+        fs::metadata(&held)
+            .expect("recipe metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "a recipe is readable by its owner alone"
+    );
+    let read = client.call("topology.get", json!({"container_id": id}));
+    assert_eq!(read["result"]["container"]["recipe"], json!(true), "{read}");
+    assert!(!read.to_string().contains("sentinel-value"), "{read}");
+    assert!(!read.to_string().contains("sentinel-argv"), "{read}");
+
+    // A create that makes no pane cannot carry a recipe, and one is never held.
+    let refused = client.call(
+        "topology.create",
+        json!({
+            "request": {"kind": "workspace", "focus": false},
+            "recipe": {"executable": "/bin/echo", "argv": [], "env": {}},
+            "requester": "test",
+        }),
+    );
+    assert_eq!(error_code(&refused), "bad_params", "{refused}");
+    assert_eq!(backend.creates().len(), 1, "nothing was created for it");
+    daemon.stop();
+}
+
+#[test]
+fn a_reload_runs_the_recorded_recipe_only_over_a_command_that_exited() {
+    let sandbox = Sandbox::new("topology-reload");
+    let backend = recipe_backend();
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let created = client.call("topology.create", recipe_creation());
+    let id = created["result"]["container"]["container_id"]
+        .as_str()
+        .expect("a container id")
+        .to_string();
+    assert_eq!(backend.launches().len(), 1, "{created}");
+    let reload = json!({"request": {"container_id": id}, "requester": "test"});
+
+    // Nothing establishes that the pane's command ended, so nothing is replaced.
+    let unknown = client.call("topology.reload", reload.clone());
+    assert_eq!(result_record(&unknown)["outcome"], "refused", "{unknown}");
+    assert!(
+        result_record(&unknown)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("does not report an exited command")),
+        "{unknown}"
+    );
+    assert_eq!(
+        backend.launches().len(),
+        1,
+        "no second launch was dispatched"
+    );
+
+    backend.reporting_exit("wA:p2", PaneExitObservation::Running);
+    let running = client.call("topology.reload", reload.clone());
+    assert_eq!(result_record(&running)["outcome"], "refused", "{running}");
+    assert!(
+        result_record(&running)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("still running its command")),
+        "{running}"
+    );
+    assert_eq!(backend.launches().len(), 1);
+
+    // A typed exit is the evidence a reload needs, and the recipe runs again in the
+    // same pane.
+    backend.reporting_exit(
+        "wA:p2",
+        PaneExitObservation::Exited {
+            code: Some(0),
+            signal: None,
+        },
+    );
+    let reloaded = client.call("topology.reload", reload.clone());
+    assert_eq!(
+        result_record(&reloaded)["outcome"],
+        "completed",
+        "{reloaded}"
+    );
+    let launches = backend.launches();
+    assert_eq!(launches.len(), 2, "{reloaded}");
+    assert_eq!(launches[1].pane_id, "wA:p2");
+    assert_eq!(launches[1].executable, "/bin/echo");
+    assert_eq!(launches[1].spawn_token, None);
+    // The container is the same one, and its recipe is still held: a reload is not
+    // a new container.
+    assert_eq!(reloaded["result"]["container"]["container_id"], json!(id));
+    assert_eq!(
+        reloaded["result"]["container"]["recipe"],
+        json!(true),
+        "{reloaded}"
+    );
+
+    // A container with no recipe refuses by name, and nothing is launched.
+    let plain = client.call(
+        "topology.create",
+        json!({
+            "request": {"kind": "pane_split", "pane_id": "wA:p1", "direction": "right", "focus": false},
+            "label": "plain",
+            "requester": "test",
+        }),
+    );
+    let plain_id = plain["result"]["container"]["container_id"]
+        .as_str()
+        .expect("a container id")
+        .to_string();
+    let no_recipe = client.call(
+        "topology.reload",
+        json!({"request": {"container_id": plain_id}, "requester": "test"}),
+    );
+    assert_eq!(
+        result_record(&no_recipe)["outcome"],
+        "refused",
+        "{no_recipe}"
+    );
+    assert!(
+        result_record(&no_recipe)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("records no recipe")),
+        "{no_recipe}"
+    );
+    assert_eq!(backend.launches().len(), 2);
+    daemon.stop();
+}
+
+/// What the dashboard client needs from any daemon it dials: the reads and the
+/// controls the TUI itself asks for.
+const DASHBOARD_CAPABILITIES: &[&str] =
+    &["mux.observe", "mux.process_info", "mux.focus", "mux.close"];
+
+/// What a backend must state to serve the container controls end to end: create a
+/// place, run a command in it, report what that command did, and close it.
+const CONTAINER_CAPABILITIES: &[&str] = &[
+    "mux.observe",
+    "mux.process_info",
+    "mux.focus",
+    "mux.create",
+    "mux.close",
+    "mux.launch",
+    "mux.launch_context",
+    "mux.exit_observation",
+];
+
+#[test]
+fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
+    use agent_radar::control_plane::client::{
+        ContainerControls, ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
+    };
+
+    let sandbox = Sandbox::new("client-containers");
+    let backend = MuxBackend::new(CONTAINER_CAPABILITIES)
+        .naming(CreatedLocation {
+            workspace_id: Some("wA".into()),
+            tab_id: Some("wA:t1".into()),
+            pane_id: Some("wA:p2".into()),
+        })
+        .observing(&["wA:p2"]);
+    backend.served_by(std::process::id() as i32);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let controls = DaemonRuntime::handshake(daemon.path()).expect("the daemon is usable");
+
+    // One creation, under the caller's own id.
+    let create_id = random_uuid();
+    let created = controls
+        .create_container(
+            &ContainerCreate {
+                request_id: create_id.clone(),
+                kind: ContainerCreateKind::PaneSplit {
+                    pane_id: "wA:p1".into(),
+                },
+                label: Some("work".into()),
+                recipe: None,
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("the daemon serves a creation");
+    assert_eq!(created.outcome(), "completed", "{created:?}");
+    let container = created.container.clone().expect("the container it made");
+    assert_eq!(container.label.as_deref(), Some("work"));
+    assert_eq!(backend.creates().len(), 1);
+
+    // The id is how a lost answer is read back: the same request answers the same
+    // container and dispatches no second creation.
+    let again = controls
+        .create_container(
+            &ContainerCreate {
+                request_id: create_id.clone(),
+                kind: ContainerCreateKind::PaneSplit {
+                    pane_id: "wA:p1".into(),
+                },
+                label: Some("work".into()),
+                recipe: None,
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("the daemon still answers");
+    assert_eq!(
+        again.container.as_ref().map(|c| c.container_id.clone()),
+        Some(container.container_id.clone())
+    );
+    assert_eq!(backend.creates().len(), 1, "a replay creates nothing");
+
+    // A deletion carries the place and occupant the operator confirmed, and the
+    // container records the removal.
+    let delete_id = random_uuid();
+    let deleted = controls
+        .delete_container(
+            &ContainerDelete {
+                request_id: delete_id.clone(),
+                container_id: container.container_id.clone(),
+                frozen: json!({
+                    "target": {"pane": "wA:p2"},
+                    "identity": {"pane": {"pane_id": "wA:p2", "occupant": null}},
+                }),
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("the daemon serves a deletion");
+    assert_eq!(deleted.outcome(), "completed", "{deleted:?}");
+    assert_eq!(
+        backend.closed_targets(),
+        vec![CloseTarget::Pane("wA:p2".into())]
+    );
+    assert_eq!(deleted.removed.len(), 1, "{deleted:?}");
+    assert!(
+        deleted.removed[0].removed_at.is_some(),
+        "the deletion records the removal: {deleted:?}"
+    );
+    assert_eq!(
+        deleted.removed[0].container_id,
+        container.container_id.clone(),
+        "{deleted:?}"
+    );
+
+    // The replay answers the same record and closes nothing again.
+    let replayed = controls
+        .delete_container(
+            &ContainerDelete {
+                request_id: delete_id,
+                container_id: container.container_id.clone(),
+                frozen: json!({
+                    "target": {"pane": "wA:p2"},
+                    "identity": {"pane": {"pane_id": "wA:p2", "occupant": null}},
+                }),
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("the daemon still answers");
+    assert_eq!(replayed.outcome(), "completed", "{replayed:?}");
+    assert_eq!(backend.closed_targets().len(), 1, "a replay closes nothing");
+
+    // A reload of the container that was just deleted is refused by name, and
+    // nothing is launched.
+    let reloaded = controls
+        .reload_container(
+            &ContainerReload {
+                request_id: random_uuid(),
+                container_id: container.container_id,
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("the daemon answers a reload");
+    assert_eq!(reloaded.outcome(), "refused", "{reloaded:?}");
+    assert!(
+        reloaded
+            .message()
+            .is_some_and(|message| message.contains("was removed at")),
+        "{reloaded:?}"
+    );
+    assert!(backend.launches().is_empty(), "nothing was launched");
+    daemon.stop();
+}
+
+#[test]
+fn the_client_refuses_a_container_control_the_daemon_does_not_serve() {
+    use agent_radar::control_plane::client::{
+        ContainerControls, ContainerCreate, ContainerCreateKind,
+    };
+
+    let sandbox = Sandbox::new("client-containers-unsupported");
+    // A backend that serves the dashboard's own reads and controls but cannot
+    // create a place: this daemon serves no container creation.
+    let backend = MuxBackend::new(DASHBOARD_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let controls = DaemonRuntime::handshake(daemon.path()).expect("the daemon is usable");
+    let refused = controls.create_container(
+        &ContainerCreate {
+            request_id: random_uuid(),
+            kind: ContainerCreateKind::PaneSplit {
+                pane_id: "wA:p1".into(),
+            },
+            label: None,
+            recipe: None,
+        },
+        &AtomicBool::new(false),
+    );
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|message| message.contains("topology.create.v1")),
+        "{refused:?}"
+    );
+    assert!(
+        backend.creates().is_empty(),
+        "a contract the daemon does not serve is refused before it is sent"
     );
     daemon.stop();
 }

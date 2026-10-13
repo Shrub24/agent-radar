@@ -11,11 +11,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use crate::control_plane::events::{Log, Source, Transition};
 use crate::control_plane::registry::Registry;
-use crate::control_plane::store::random_uuid;
+use crate::control_plane::registry::publication::write_atomic;
+use crate::lifecycle::CloseRequest;
 use crate::model::{FleetObservation, ProcessIdentity};
-use crate::runtime::{BackendIdentity, CreateRequest, CreatedLocation};
+use crate::runtime::{BackendIdentity, CloseTarget, CreateRequest, CreatedLocation};
 
 /// What a container is in the hierarchy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +28,39 @@ pub enum Kind {
     Workspace,
     Tab,
     Pane,
+}
+
+impl Kind {
+    /// The close target a handle of this kind is deleted by.
+    pub fn target(self, handle: &str) -> CloseTarget {
+        match self {
+            Self::Workspace => CloseTarget::Workspace(handle.to_string()),
+            Self::Tab => CloseTarget::Tab(handle.to_string()),
+            Self::Pane => CloseTarget::Pane(handle.to_string()),
+        }
+    }
+}
+
+/// The frozen request one container reload carries: the container whose slot runs
+/// its recorded recipe again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReloadRequest {
+    pub container_id: String,
+}
+
+/// The frozen request one container deletion carries.
+///
+/// The operator confirms a container and the location and occupant they saw it
+/// hold, so a deletion acts on the container that was confirmed rather than on
+/// whatever holds that place when the daemon gets to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRequest {
+    pub container_id: String,
+    /// The target and occupant frozen at confirmation, revalidated before the
+    /// effect as the generic close does.
+    pub frozen: CloseRequest,
 }
 
 /// Who made the container.
@@ -60,6 +97,12 @@ pub struct Container {
     /// The operation that created it, so a replayed creation is answered with the
     /// same container instead of creating a second one.
     pub created_by: Option<String>,
+    /// Whether a recipe is held for this container's pane, in owner-only storage.
+    ///
+    /// The record says only that one is held: a command and its environment are not
+    /// public facts, and no read carries them.
+    #[serde(default)]
+    pub recipe: bool,
     pub provenance: Provenance,
     /// Absent when creation could not establish it: the container is recorded
     /// unresolved rather than bound to a guessed handle.
@@ -183,6 +226,7 @@ impl Container {
             parent: self.parent.clone(),
             label: self.label.clone(),
             created_by: self.created_by.clone(),
+            recipe: self.recipe,
             provenance: self.provenance,
             binding: self.binding.clone(),
             created_at: self.created_at.clone(),
@@ -203,6 +247,9 @@ pub struct PublicContainer {
     pub label: Option<String>,
     /// The operation that created it, for a caller reconciling its own requests.
     pub created_by: Option<String>,
+    /// Whether a recipe is held for this container's pane, so a caller knows the
+    /// slot can be reloaded without reading private storage.
+    pub recipe: bool,
     pub provenance: Provenance,
     pub binding: Option<Binding>,
     pub created_at: String,
@@ -248,6 +295,11 @@ pub fn list_after(
 
 /// The creation a runtime confirmed, as the daemon records it.
 pub struct Confirmed<'a> {
+    /// The identity the container is recorded under. The caller states it, so a
+    /// recipe can be held under it before the record that names it is written.
+    pub id: String,
+    /// Whether a recipe was held for this container's pane.
+    pub recipe: bool,
     /// What the caller asked for. Only the identity named here is recorded.
     pub request: &'a CreateRequest,
     /// What the runtime said it made.
@@ -274,6 +326,8 @@ pub fn record_created(
     at: &str,
 ) -> Result<Vec<Container>, String> {
     let Confirmed {
+        id,
+        recipe,
         request,
         created,
         backend,
@@ -312,11 +366,12 @@ pub fn record_created(
             .and_then(|id| log.container(&id).and_then(|c| c.parent.clone())),
     };
     let container = Container {
-        id: random_uuid(),
+        id,
         kind,
         parent,
         label,
         created_by,
+        recipe,
         provenance: Provenance::Created,
         binding: Some(Binding {
             backend: backend.name.clone(),
@@ -419,6 +474,105 @@ impl Inventory {
             })
             .collect()
     }
+}
+
+/// The command a container's pane runs, held privately and never reported.
+pub type Recipe = crate::control_plane::lifecycle::LaunchContext;
+
+/// The most one private recipe may occupy, as the private store's own bound.
+const MAX_RECIPE_BYTES: usize = 8 * 1024;
+
+/// Where one container's private recipe is held.
+///
+/// The private directory is the daemon's owner-only store: a recipe is described
+/// by no record, returned by no read and written into no event.
+fn recipe_path(registry: &Registry, id: &str) -> PathBuf {
+    registry
+        .subjects()
+        .join("private")
+        .join(format!("container-{id}.json"))
+}
+
+/// Holds one container's recipe privately, before the record that says so.
+pub fn write_recipe(registry: &Registry, id: &str, recipe: &Recipe) -> Result<(), String> {
+    let directory = registry.subjects().join("private");
+    crate::control_plane::registry::prepare_directory(&directory)?;
+    let bytes = serde_json::to_vec_pretty(recipe)
+        .map_err(|_| "cannot encode a container recipe".to_string())?;
+    write_atomic(
+        &directory,
+        &recipe_path(registry, id),
+        &bytes,
+        MAX_RECIPE_BYTES,
+    )
+}
+
+/// The recipe this container's pane runs, when one is held.
+pub fn read_recipe(registry: &Registry, id: &str) -> Result<Option<Recipe>, String> {
+    let path = recipe_path(registry, id);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("container recipe {id}: {error}")),
+        Ok(_) => {}
+    }
+    let bytes = crate::control_plane::registry::read_record_file(&path, MAX_RECIPE_BYTES)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("not a container recipe: {error}"))
+}
+
+/// A container and everything recorded inside it, in id order.
+///
+/// Deleting a container removes what it holds, so the caller marks the whole
+/// subtree rather than leaving records of places that no longer exist.
+pub fn subtree(registry: &Registry, id: &str) -> Result<Vec<String>, String> {
+    let containers: Vec<Container> = {
+        let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+        log.container_ids()
+            .filter_map(|id| log.container(id).cloned())
+            .collect()
+    };
+    if !containers.iter().any(|container| container.id == id) {
+        return Err(format!("container {id} is not recorded"));
+    }
+    let mut members: BTreeSet<String> = BTreeSet::from([id.to_string()]);
+    let mut frontier = vec![id.to_string()];
+    while let Some(parent) = frontier.pop() {
+        for container in &containers {
+            if container.parent.as_deref() == Some(parent.as_str())
+                && members.insert(container.id.clone())
+            {
+                frontier.push(container.id.clone());
+            }
+        }
+    }
+    Ok(members.into_iter().collect())
+}
+
+/// Records one container as removed by an operator's deletion.
+///
+/// The binding is kept: the record still says which handle it was, and a handle
+/// reappearing under another serving instance is a different container. Nothing
+/// here dispatches, and a container already recorded as removed is reported as it
+/// stands rather than appended twice.
+pub fn record_removed(registry: &Registry, id: &str, at: &str) -> Result<Container, String> {
+    let previous = read(registry, id)?.ok_or_else(|| format!("container {id} is not recorded"))?;
+    if previous.removed_at.is_some() {
+        return Ok(previous);
+    }
+    let mut next = previous.clone();
+    next.removed_at = Some(at.to_string());
+    {
+        let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+        log.append_container_checked(
+            id,
+            at,
+            Source::TopologyControl,
+            Transition::ContainerRemoved,
+            &next,
+        )?;
+    }
+    Ok(next)
 }
 
 /// What one reconciliation pass did, so a caller reads counts rather than prose.
@@ -525,11 +679,12 @@ mod tests {
 
     fn container(binding: Option<Binding>) -> Container {
         Container {
-            id: random_uuid(),
+            id: crate::control_plane::store::random_uuid(),
             kind: Kind::Pane,
             parent: None,
             label: None,
             created_by: None,
+            recipe: false,
             provenance: Provenance::Created,
             binding,
             created_at: "1000".into(),
@@ -608,7 +763,10 @@ mod tests {
 
     #[test]
     fn a_removed_container_is_never_matched_by_handle_again() {
-        let directory = std::env::temp_dir().join(format!("radar-containers-{}", random_uuid()));
+        let directory = std::env::temp_dir().join(format!(
+            "radar-containers-{}",
+            crate::control_plane::store::random_uuid()
+        ));
         let mut log = Log::open(&directory).expect("a container log");
         let created = container(Some(binding("wA:p1", 42)));
         let id = created.id.clone();
@@ -648,6 +806,8 @@ mod tests {
         record_created(
             registry,
             Confirmed {
+                id: crate::control_plane::store::random_uuid(),
+                recipe: false,
                 request: &request,
                 created: &created,
                 backend: &backend(),
@@ -697,7 +857,10 @@ mod tests {
 
     #[test]
     fn reconciling_reports_drift_and_keeps_every_record() {
-        let directory = std::env::temp_dir().join(format!("radar-containers-{}", random_uuid()));
+        let directory = std::env::temp_dir().join(format!(
+            "radar-containers-{}",
+            crate::control_plane::store::random_uuid()
+        ));
         let registry = Registry::open_at(&directory, 1000).expect("a registry");
         let pane = record(
             &registry,

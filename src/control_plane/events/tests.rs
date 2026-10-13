@@ -284,6 +284,8 @@ fn replay_restores_a_container_without_rewriting_it() {
     let made = containers::record_created(
         &registry,
         containers::Confirmed {
+            id: crate::control_plane::store::random_uuid(),
+            recipe: false,
             request: &crate::runtime::CreateRequest::Tab {
                 workspace_id: "wA".into(),
                 focus: false,

@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_radar::bus::Listener;
+use agent_radar::control_plane::client::ContainerControls;
 use agent_radar::runtime::RuntimeProvider;
+use agent_radar::topology::ContainerControl;
 use agent_radar::{
     Action, App, Closer, Collector, CollectorConfig, Config, Confirmed, Focuser, Geometry,
     HerdrConfig, ManagedActions, ObservationState, PaneView, control_plane, theme, ui,
@@ -154,12 +156,14 @@ fn load_config() -> Config {
 /// The choice is made once: the daemon when it was configured and passed its
 /// handshake, the direct adapter otherwise. Nothing switches later, and nothing
 /// retries an operation the daemon may have accepted.
-fn selected_runtime(config: &Config) -> Arc<dyn RuntimeProvider> {
+fn selected_runtime(
+    config: &Config,
+) -> (Arc<dyn RuntimeProvider>, Option<Arc<dyn ContainerControls>>) {
     let selection = control_plane::select(&config.runtime, HerdrConfig::default());
     if let Some(diagnostic) = &selection.diagnostic {
         eprintln!("radar: {diagnostic}");
     }
-    selection.provider
+    (selection.provider, selection.containers)
 }
 
 fn run() -> io::Result<()> {
@@ -168,7 +172,7 @@ fn run() -> io::Result<()> {
     // The runtime is chosen before the terminal is taken over and before anything
     // is collected or acted on, so the one line explaining a configured daemon
     // that could not be used is readable rather than drawn over.
-    let runtime = selected_runtime(&config);
+    let (runtime, container_controls) = selected_runtime(&config);
     let mut terminal = ratatui::try_init()?;
     enable_mouse_capture();
     // The panic path restores the terminal through the hook `try_init` installed;
@@ -187,6 +191,9 @@ fn run() -> io::Result<()> {
     // the mux. The worker reads nothing until an operator confirms an action;
     // an absent or untrusted root is the owner's transport being unavailable.
     let mut managed = ManagedActions::new(control_root());
+    // A confirmed container control goes to the daemon, one at a time and off the
+    // UI thread. A run without a daemon has no container to act on and says so.
+    let mut containers = ContainerControl::new(container_controls);
     let mut state = ObservationState::new();
     let mut app = App::new();
     let mut list = ListState::default();
@@ -233,6 +240,13 @@ fn run() -> io::Result<()> {
         // and quitting stay responsive while it waits on the runtime.
         if let Some(outcome) = closer.poll() {
             app.set_focus_message(Some(outcome.unwrap_or_else(|message| message)));
+            dirty = true;
+        }
+        // A container control is answered on its own thread too, and its outcome
+        // keeps the request id it was dispatched under so a lost answer leaves an
+        // operation to read back.
+        if let Some(finished) = containers.poll() {
+            app.apply_container_outcome(finished);
             dirty = true;
         }
         // Owner-routed outcomes arrive from the worker thread the same way: the
@@ -292,15 +306,16 @@ fn run() -> io::Result<()> {
                     match action {
                         Action::Focus(target) => focuser.start(target),
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
-                        Action::ConfirmAction => match app.confirm(&state) {
-                            Some(Confirmed::Direct(request)) => closer.start(request),
-                            Some(Confirmed::Managed(request)) => {
-                                if let Err(message) = managed.start(request) {
-                                    app.set_focus_message(Some(message));
-                                }
-                            }
-                            None => {}
-                        },
+                        Action::ConfirmAction => {
+                            let confirmed = app.confirm(&state);
+                            dispatch(
+                                confirmed,
+                                &mut app,
+                                &mut closer,
+                                &mut managed,
+                                &mut containers,
+                            );
+                        }
                     }
                 }
                 dirty = true;
@@ -310,15 +325,16 @@ fn run() -> io::Result<()> {
                     match action {
                         Action::Focus(target) => focuser.start(target),
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
-                        Action::ConfirmAction => match app.confirm(&state) {
-                            Some(Confirmed::Direct(request)) => closer.start(request),
-                            Some(Confirmed::Managed(request)) => {
-                                if let Err(message) = managed.start(request) {
-                                    app.set_focus_message(Some(message));
-                                }
-                            }
-                            None => {}
-                        },
+                        Action::ConfirmAction => {
+                            let confirmed = app.confirm(&state);
+                            dispatch(
+                                confirmed,
+                                &mut app,
+                                &mut closer,
+                                &mut managed,
+                                &mut containers,
+                            );
+                        }
                     }
                 }
                 if let Some(offset) = app.take_scroll() {
@@ -336,8 +352,38 @@ fn run() -> io::Result<()> {
     focuser.shutdown();
     closer.shutdown();
     managed.shutdown();
+    containers.shutdown();
     collector.shutdown();
     Ok(())
+}
+
+/// Carries out one confirmed action.
+///
+/// Every route keeps its own effect: a direct close runs on the runtime, an
+/// owner-routed request is published to the worker's owner, and a container
+/// control is dispatched to the daemon. None of them is retried through another,
+/// because an action that may have been accepted is unknown rather than unperformed.
+fn dispatch(
+    confirmed: Option<Confirmed>,
+    app: &mut App,
+    closer: &mut Closer,
+    managed: &mut ManagedActions,
+    containers: &mut ContainerControl,
+) {
+    match confirmed {
+        Some(Confirmed::Direct(request)) => closer.start(request),
+        Some(Confirmed::Managed(request)) => {
+            if let Err(message) = managed.start(request) {
+                app.set_focus_message(Some(message));
+            }
+        }
+        Some(Confirmed::Container(control)) => {
+            if let Err(message) = containers.start(control) {
+                app.set_focus_message(Some(message));
+            }
+        }
+        None => {}
+    }
 }
 
 /// Turns mouse capture on. A wheel turn and a click only arrive while it is on,

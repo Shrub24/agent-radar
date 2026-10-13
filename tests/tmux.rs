@@ -233,7 +233,7 @@ fn launch_refuses_before_dispatch_when_remain_on_exit_cannot_be_armed() {
         pane_id: fake.handle("%0"),
         executable: "/bin/sh".to_string(),
         argv: vec!["-c".to_string(), "exit 0".to_string()],
-        spawn_token: "private-token-sentinel".to_string(),
+        spawn_token: Some("private-token-sentinel".to_string()),
         cwd: None,
         env: BTreeMap::new(),
     };
@@ -257,7 +257,7 @@ fn launch_failure_diagnostics_never_echo_the_private_token_or_environment() {
         pane_id: fake.handle("%0"),
         executable: "/bin/sh".to_string(),
         argv: vec!["-c".to_string(), "exit 0".to_string()],
-        spawn_token: "private-token-sentinel".to_string(),
+        spawn_token: Some("private-token-sentinel".to_string()),
         cwd: Some("/tmp".to_string()),
         env: BTreeMap::from([(
             "PRIVATE_VALUE".to_string(),
@@ -1029,7 +1029,7 @@ fn launch_runs_argv_with_overlay_and_preserves_immediate_exit_status() {
             "quote'argument".to_string(),
             "line\\nbreak".replace("\\n", "\n"),
         ],
-        spawn_token: "private-launch-token-sentinel".to_string(),
+        spawn_token: Some("private-launch-token-sentinel".to_string()),
         cwd: Some("/tmp".to_string()),
         env: BTreeMap::from([(
             "RADAR_LAUNCH_TEST".to_string(),
@@ -1130,7 +1130,7 @@ fn tmux_records_signal_exit_and_missing_pane_stays_unknown() {
         pane_id: pane.clone(),
         executable: "/bin/sh".to_string(),
         argv: vec!["-c".to_string(), "kill -TERM $$".to_string()],
-        spawn_token: "signal-exit-token".to_string(),
+        spawn_token: Some("signal-exit-token".to_string()),
         cwd: None,
         env: BTreeMap::new(),
     };
@@ -1178,7 +1178,7 @@ fn direct_launch_process_is_the_pane_process() {
         pane_id: pane.clone(),
         executable: executable.display().to_string(),
         argv: vec!["10".to_string()],
-        spawn_token: "pid-check-token".to_string(),
+        spawn_token: Some("pid-check-token".to_string()),
         cwd: None,
         env: BTreeMap::new(),
     };

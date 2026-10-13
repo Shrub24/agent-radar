@@ -22,6 +22,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
 
 use crate::bus::{BusEvent, BusState, Task};
 use crate::control::{self, ControlResult, Outcome};
+use crate::control_plane::client::{
+    ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
+};
 use crate::lifecycle::{self, CloseRequest, Containment, TargetIdentity};
 use crate::observation::{ObservationState, SourceFreshness};
 use crate::runtime::{CloseTarget, Target};
@@ -33,7 +36,8 @@ use crate::model::{
     ProcessIdentity, ProcessResources,
 };
 use crate::tree::{
-    AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskRow, TaskSource, TreeNode,
+    AgentRow, ContainerRef, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskRow, TaskSource,
+    TreeNode,
 };
 
 /// How long a focus message stays up when no key clears it first.
@@ -370,12 +374,30 @@ pub fn collapsible_tasks(row: &VisibleRow<'_>) -> Vec<TaskId> {
 /// The lifecycle operation a confirmation is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
-    /// Close the selected row's pane.
+    /// Close the selected row’s pane.
     ClosePane,
-    /// Close the selected row's tab.
+    /// Close the selected row’s tab.
     CloseTab,
     /// Restart the selected managed worker through its owner.
     Restart,
+    /// Add a place inside the selected container: a tab in a workspace, or a pane
+    /// slot split from a pane.
+    CreateContainer,
+    /// Delete the selected container and everything recorded inside it.
+    DeleteContainer,
+    /// Run the selected pane container’s recorded recipe again in its own slot.
+    ReloadContainer,
+}
+
+impl Operation {
+    /// Whether this operation is a container control rather than an owner request:
+    /// a container control goes to the daemon, which records the container.
+    pub fn is_container(self) -> bool {
+        matches!(
+            self,
+            Self::CreateContainer | Self::DeleteContainer | Self::ReloadContainer
+        )
+    }
 }
 
 /// One row of the current view: the projected node plus its display depth,
@@ -667,6 +689,9 @@ pub struct Confirmation {
     /// The exact owner-routed action, when this confirmation is a managed close
     /// or restart rather than a direct runtime close.
     pub managed: Option<lifecycle::ManagedRequest>,
+    /// The container this confirmation acts on, when it is a container control:
+    /// the daemon revalidates that exact record before it changes anything.
+    pub container_id: Option<String>,
 }
 
 /// A confirmed action ready to run: a direct runtime close, or an owner-routed
@@ -675,6 +700,8 @@ pub struct Confirmation {
 pub enum Confirmed {
     Direct(CloseRequest),
     Managed(lifecycle::ManagedRequest),
+    /// A container control, dispatched to the daemon under its own request id.
+    Container(crate::topology::Control),
 }
 
 /// One lifecycle outcome, kept visible until it is dismissed.
@@ -1627,6 +1654,11 @@ impl App {
             KeyCode::Char('x') => return Some(Action::BeginAction(Operation::ClosePane)),
             KeyCode::Char('X') => return Some(Action::BeginAction(Operation::CloseTab)),
             KeyCode::Char('r') => return Some(Action::BeginAction(Operation::Restart)),
+            // Container controls act on a container Radar records rather than on an
+            // owner: `a` adds a place inside it, `D` deletes it, `R` reloads its slot.
+            KeyCode::Char('a') => return Some(Action::BeginAction(Operation::CreateContainer)),
+            KeyCode::Char('D') => return Some(Action::BeginAction(Operation::DeleteContainer)),
+            KeyCode::Char('R') => return Some(Action::BeginAction(Operation::ReloadContainer)),
             KeyCode::Char('c') => self.dismiss_notices(),
             KeyCode::Tab | KeyCode::BackTab => self.toggle_detail_focus(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
@@ -1809,6 +1841,12 @@ impl App {
     /// the runtime, and only positive unmanaged evidence reaches the direct
     /// path. Nothing is sent here — Confirm is a separate act.
     pub fn begin_action(&mut self, operation: Operation, state: &ObservationState) {
+        // A container control names a container, not an owner-file request: it is
+        // confirmed against the container Radar records.
+        if operation.is_container() {
+            self.begin_container(operation, state);
+            return;
+        }
         let Some(selected) = self.selected_action() else {
             self.set_focus_message(Some("nothing selected: no action target".to_string()));
             return;
@@ -1878,6 +1916,11 @@ impl App {
             Operation::ClosePane => CloseTarget::Pane(pane_id.clone()),
             Operation::CloseTab => CloseTarget::Tab(tab_id),
             Operation::Restart => unreachable!("restart returned above"),
+            Operation::CreateContainer
+            | Operation::DeleteContainer
+            | Operation::ReloadContainer => {
+                unreachable!("a container control returned above")
+            }
         };
         match containment_of(inventory, state, &target) {
             // A tab with any managed or uncertain member refuses whole, so a
@@ -1933,6 +1976,10 @@ impl App {
                 all
             }
             CloseTarget::Pane(_) => losses,
+            // A workspace is deleted through the daemon's own container operation,
+            // whose losses are its members; this owner-file path has no workspace
+            // form and never opens a confirmation for one.
+            CloseTarget::Workspace(_) => losses,
         };
         self.confirmation = Some(Confirmation {
             operation,
@@ -1941,7 +1988,214 @@ impl App {
             losses,
             confirm_selected: false,
             managed: None,
+            container_id: None,
         });
+    }
+
+    /// The container the selected row shows, when Radar records one for it.
+    ///
+    /// A row without one is a place this daemon records nothing for: there is no
+    /// container to address, and inventing one from the handle would name a place
+    /// Radar does not own.
+    pub fn selected_container(&self) -> Option<&ContainerRef> {
+        let row = self.selected_row()?;
+        match &row.node.row.kind {
+            RowKind::Workspace { container, .. } => container.as_ref(),
+            RowKind::Agent(agent) => agent.container.as_ref(),
+            RowKind::Pane(pane) => pane.container.as_ref(),
+            RowKind::Task(_) => None,
+        }
+    }
+
+    /// Opens the confirmation for one container control.
+    ///
+    /// The container, its place and the occupant of that place are frozen now, not
+    /// read from the cursor at Confirm: moving the selection while the dialog is up
+    /// must not retarget it, and the daemon revalidates the frozen place before it
+    /// changes anything.
+    fn begin_container(&mut self, operation: Operation, state: &ObservationState) {
+        if !matches!(state.source_freshness(), SourceFreshness::Current) {
+            self.set_focus_message(Some("the fleet is stale: not acting".to_string()));
+            return;
+        }
+        let Some(inventory) = state.inventory() else {
+            self.set_focus_message(Some("no current inventory: not acting".to_string()));
+            return;
+        };
+        let Some(container) = self.selected_container().cloned() else {
+            self.set_focus_message(Some(
+                "this row is not a container Radar records: nothing to act on".to_string(),
+            ));
+            return;
+        };
+        // A binding the daemon could not verify is not acted on: the container is
+        // recorded, but nothing here can say the place is still its.
+        if let Some(reason) = &container.unresolved {
+            self.set_focus_message(Some(format!(
+                "container {} is unresolved ({reason}): nothing to act on",
+                container.container_id
+            )));
+            return;
+        }
+        let target = container.kind.target(&container.handle);
+        let mut losses = vec![format!(
+            "container {} — {} {}",
+            container.container_id,
+            match container.kind {
+                crate::control_plane::containers::Kind::Workspace => "workspace",
+                crate::control_plane::containers::Kind::Tab => "tab",
+                crate::control_plane::containers::Kind::Pane => "pane",
+            },
+            container.handle
+        )];
+        match operation {
+            Operation::DeleteContainer => {
+                losses.push("everything recorded inside it is removed with it".to_string());
+                losses.push(
+                    "a live managed worker inside it refuses the deletion, naming itself"
+                        .to_string(),
+                );
+            }
+            Operation::ReloadContainer => {
+                if container.kind != crate::control_plane::containers::Kind::Pane {
+                    self.set_focus_message(Some(
+                        "only a pane slot runs a recipe: select a pane".to_string(),
+                    ));
+                    return;
+                }
+                if !container.recipe {
+                    self.set_focus_message(Some(format!(
+                        "container {} records no recipe: nothing to reload",
+                        container.container_id
+                    )));
+                    return;
+                }
+                losses.push("the recorded recipe runs again in this pane".to_string());
+                losses.push(
+                    "a command of its own that has not exited refuses the reload".to_string(),
+                );
+            }
+            Operation::CreateContainer => match container.kind {
+                crate::control_plane::containers::Kind::Pane => {
+                    losses.push("a new pane is split from this one".to_string())
+                }
+                crate::control_plane::containers::Kind::Workspace => {
+                    losses.push("a new tab is created in this workspace".to_string())
+                }
+                // A tab is a place inside its workspace, and Radar creates tabs in a
+                // workspace rather than in a tab: the operator picks the pane or the
+                // workspace instead of this guessing.
+                crate::control_plane::containers::Kind::Tab => {
+                    self.set_focus_message(Some(
+                        "select a pane in this tab to add a pane, or its workspace to add a tab"
+                            .to_string(),
+                    ));
+                    return;
+                }
+            },
+            _ => return,
+        }
+        losses.push("nothing already running is replaced".to_string());
+        let identity = lifecycle::identity(inventory, &target);
+        self.confirmation = Some(Confirmation {
+            operation,
+            target,
+            identity,
+            losses,
+            confirm_selected: false,
+            managed: None,
+            container_id: Some(container.container_id),
+        });
+    }
+
+    /// Revalidates a container control against the latest current observation and
+    /// hands back the control to dispatch.
+    ///
+    /// The place must still be the one that was confirmed and still hold what was
+    /// confirmed: a handle a later backend instance reused is not this container's,
+    /// so the control is refused here rather than aimed at whatever holds it now.
+    fn confirm_container(
+        &mut self,
+        confirmation: Confirmation,
+        state: &ObservationState,
+    ) -> Option<Confirmed> {
+        let described = confirmation.target.description();
+        if !matches!(state.source_freshness(), SourceFreshness::Current) {
+            self.set_focus_message(Some("the fleet is stale: nothing was sent".to_string()));
+            return None;
+        }
+        let Some(inventory) = state.inventory() else {
+            self.set_focus_message(Some("no current inventory: nothing was sent".to_string()));
+            return None;
+        };
+        let Some(id) = confirmation.container_id.as_deref() else {
+            self.set_focus_message(Some(
+                "this control names no container: nothing was sent".to_string(),
+            ));
+            return None;
+        };
+        let recorded = inventory
+            .containers
+            .iter()
+            .find(|container| container.container_id == id && container.removed_at.is_none());
+        let Some(recorded) = recorded else {
+            self.set_focus_message(Some(format!("container {id} is gone: nothing was sent")));
+            return None;
+        };
+        if recorded
+            .binding
+            .as_ref()
+            .is_none_or(|binding| binding.handle != *confirmation.target.id())
+            || !lifecycle::matches(inventory, &confirmation.identity)
+        {
+            self.set_focus_message(Some(format!("{described} changed: nothing was sent")));
+            return None;
+        }
+        let request_id = crate::control_plane::random_uuid();
+        let control = match confirmation.operation {
+            Operation::DeleteContainer => crate::topology::Control::Delete(ContainerDelete {
+                request_id,
+                container_id: id.to_string(),
+                // The frozen target and occupant travel with the request: the daemon
+                // refuses the deletion when that place no longer holds them.
+                frozen: serde_json::json!({
+                    "target": confirmation.target,
+                    "identity": confirmation.identity,
+                }),
+            }),
+            Operation::ReloadContainer => crate::topology::Control::Reload(ContainerReload {
+                request_id,
+                container_id: id.to_string(),
+            }),
+            Operation::CreateContainer => {
+                let kind = match recorded.kind {
+                    crate::control_plane::containers::Kind::Workspace => ContainerCreateKind::Tab {
+                        workspace_id: recorded
+                            .binding
+                            .as_ref()
+                            .expect("binding checked above")
+                            .handle
+                            .clone(),
+                    },
+                    _ => ContainerCreateKind::PaneSplit {
+                        pane_id: recorded
+                            .binding
+                            .as_ref()
+                            .expect("binding checked above")
+                            .handle
+                            .clone(),
+                    },
+                };
+                crate::topology::Control::Create(ContainerCreate {
+                    request_id,
+                    kind,
+                    label: None,
+                    recipe: None,
+                })
+            }
+            _ => return None,
+        };
+        Some(Confirmed::Container(control))
     }
 
     /// Opens the confirmation for an owner-routed managed action.
@@ -1958,6 +2212,7 @@ impl App {
             losses,
             confirm_selected: false,
             managed: Some(managed),
+            container_id: None,
         });
     }
 
@@ -1966,6 +2221,9 @@ impl App {
     /// disappeared target or changed containment cancels it with a reason.
     pub fn confirm(&mut self, state: &ObservationState) -> Option<Confirmed> {
         let confirmation = self.confirmation.take()?;
+        if confirmation.operation.is_container() {
+            return self.confirm_container(confirmation, state);
+        }
         let described = confirmation.target.description();
         if !matches!(state.source_freshness(), SourceFreshness::Current) {
             self.set_focus_message(Some("the fleet is stale: nothing was sent".to_string()));
@@ -2007,7 +2265,7 @@ impl App {
         {
             let pane_id = match &managed.target {
                 CloseTarget::Pane(pane_id) => pane_id.clone(),
-                CloseTarget::Tab(_) => String::new(),
+                CloseTarget::Tab(_) | CloseTarget::Workspace(_) => String::new(),
             };
             let idle = inventory
                 .agent_on_pane(&pane_id)
@@ -2030,23 +2288,58 @@ impl App {
 
     /// Records a lifecycle outcome from the owner-control worker, refining the
     /// line for the same request rather than adding another.
-    pub fn apply_managed_update(&mut self, update: lifecycle::Update) {
-        let (failed, text) = lifecycle_notice(&update);
-        match self
-            .notices
-            .iter_mut()
-            .find(|notice| notice.id == update.id)
-        {
+    /// Records what a confirmed container control reported.
+    ///
+    /// The line keeps the request id the control was dispatched under, so an
+    /// answer that never arrived leaves an operation the operator can read back
+    /// instead of an effect nobody can name.
+    pub fn apply_container_outcome(&mut self, finished: crate::topology::Finished) {
+        let crate::topology::Finished {
+            verb,
+            request_id,
+            result,
+        } = finished;
+        match result {
+            Ok(answer) => {
+                let outcome = answer.outcome().to_string();
+                let described = match (&answer.container, answer.removed.len()) {
+                    (Some(container), _) => format!("container {}", container.container_id),
+                    // A deletion names what it removed: one place, or a subtree.
+                    (None, 1) => format!("container {}", answer.removed[0].container_id),
+                    (None, count) if count > 1 => format!("{count} containers"),
+                    (None, _) => "the container".to_string(),
+                };
+                let mut text = format!("{verb} {outcome} for {described} [{request_id}]");
+                if let Some(message) = answer.message() {
+                    text.push_str(&format!(": {message}"));
+                }
+                let failed = outcome != "completed";
+                self.record_notice(request_id, text, failed);
+            }
+            Err(message) => self.record_notice(
+                request_id.clone(),
+                format!("{verb} not sent [{request_id}]: {message}"),
+                true,
+            ),
+        }
+    }
+
+    /// Records one outcome line, refining a notice for the same request id rather
+    /// than adding another.
+    fn record_notice(&mut self, id: String, text: String, failed: bool) {
+        match self.notices.iter_mut().find(|notice| notice.id == id) {
             Some(notice) => {
                 notice.failed = failed;
                 notice.text = text;
             }
-            None => self.notices.push(Notice {
-                id: update.id,
-                text,
-                failed,
-            }),
+            None => self.notices.push(Notice { id, text, failed }),
         }
+    }
+
+    /// Applies one update from an owner-routed request.
+    pub fn apply_managed_update(&mut self, update: lifecycle::Update) {
+        let (failed, text) = lifecycle_notice(&update);
+        self.record_notice(update.id, text, failed);
     }
 
     /// Lifecycle outcomes, newest last, kept until dismissed.
@@ -2313,6 +2606,9 @@ fn containment_of(
             lifecycle::pane(inventory, state.retained_containment(), pane_id)
         }
         CloseTarget::Tab(tab_id) => lifecycle::tab(inventory, state.retained_containment(), tab_id),
+        CloseTarget::Workspace(workspace_id) => {
+            lifecycle::workspace(inventory, state.retained_containment(), workspace_id)
+        }
     }
 }
 
@@ -2421,6 +2717,10 @@ fn target_present(inventory: &FleetObservation, target: &CloseTarget) -> bool {
     match target {
         CloseTarget::Pane(pane_id) => inventory.pane(pane_id).is_some(),
         CloseTarget::Tab(tab_id) => inventory.tabs.iter().any(|tab| tab.tab_id == *tab_id),
+        CloseTarget::Workspace(workspace_id) => inventory
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.workspace_id == *workspace_id),
     }
 }
 
@@ -2678,6 +2978,10 @@ fn collect_filtered<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::containers::{
+        Binding as ContainerBinding, Kind as ContainerKind, Provenance as ContainerProvenance,
+        PublicContainer,
+    };
     use crate::herdr::decode_snapshot;
     use crate::model::{
         AgentObservation, FleetObservation, Location, Pane, RuntimeStatus, SessionIdentity, Tab,
@@ -3373,7 +3677,7 @@ mod tests {
     fn direct(confirmed: Confirmed) -> CloseRequest {
         match confirmed {
             Confirmed::Direct(request) => request,
-            Confirmed::Managed(_) => panic!("expected a direct close"),
+            Confirmed::Managed(_) | Confirmed::Container(_) => panic!("expected a direct close"),
         }
     }
 
@@ -3607,6 +3911,149 @@ mod tests {
         assert_eq!(press(&mut app, KeyCode::Tab), None);
         assert!(app.confirmation().expect("open").confirm_selected);
         assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::ConfirmAction));
+    }
+
+    /// A container as the daemon reads one out: a pane Radar created, with the
+    /// command its slot runs held privately.
+    fn pane_container(id: &str, handle: &str, removed: Option<&str>) -> PublicContainer {
+        PublicContainer {
+            container_id: id.to_string(),
+            kind: ContainerKind::Pane,
+            parent: None,
+            label: Some("work".to_string()),
+            created_by: None,
+            recipe: true,
+            provenance: ContainerProvenance::Created,
+            binding: Some(ContainerBinding {
+                backend: "fake".into(),
+                incarnation: None,
+                handle: handle.to_string(),
+            }),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            observed_at: None,
+            unresolved: None,
+            removed_at: removed.map(str::to_string),
+        }
+    }
+
+    /// The fixture with one container Radar created for a pane, every pane listed,
+    /// and that pane's row selected.
+    fn fixture_with_container(removed: Option<&str>) -> (ObservationState, App) {
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        observation.containers = vec![pane_container("c1", "wA:p3", removed)];
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let mut app = App::new();
+        app.refresh(&state);
+        show_all_panes(&mut app);
+        select_row(&mut app, &RowId::Pane("wA:p3".into()));
+        (state, app)
+    }
+
+    #[test]
+    fn a_container_row_offers_a_container_control_and_a_plain_pane_does_not() {
+        let (state, mut app) = fixture_with_container(None);
+        app.begin_action(Operation::DeleteContainer, &state);
+        let confirmation = app.confirmation().expect("a container confirmation");
+        assert_eq!(confirmation.container_id.as_deref(), Some("c1"));
+        assert_eq!(confirmation.target, CloseTarget::Pane("wA:p3".into()));
+        assert!(!confirmation.confirm_selected, "Cancel is the default");
+        assert!(
+            confirmation
+                .losses
+                .iter()
+                .any(|line| line.contains("container c1")),
+            "the losses name the container: {:?}",
+            confirmation.losses
+        );
+        app.cancel_confirmation();
+
+        // A pane Radar records nothing for has no container to address, and none is
+        // invented from the handle the backend knows the pane by.
+        let (plain, mut app) = fixture();
+        show_all_panes(&mut app);
+        select_row(&mut app, &RowId::Pane("wA:p3".into()));
+        app.begin_action(Operation::DeleteContainer, &plain);
+        assert!(app.confirmation().is_none(), "nothing to confirm");
+        assert!(
+            app.focus_message()
+                .is_some_and(|message| message.contains("not a container Radar records")),
+            "{:?}",
+            app.focus_message()
+        );
+
+        // A reload of a pane with no recipe refuses for the same reason: there is
+        // nothing recorded to run again.
+        let (no_recipe, mut app) = fixture();
+        show_all_panes(&mut app);
+        select_row(&mut app, &RowId::Pane("wA:p3".into()));
+        app.begin_action(Operation::ReloadContainer, &no_recipe);
+        assert!(app.confirmation().is_none());
+    }
+
+    #[test]
+    fn a_container_control_freezes_its_place_and_occupant_at_confirm() {
+        let (state, mut app) = fixture_with_container(None);
+        app.begin_action(Operation::DeleteContainer, &state);
+        match app.confirm(&state).expect("the container still holds") {
+            Confirmed::Container(crate::topology::Control::Delete(request)) => {
+                assert_eq!(request.container_id, "c1");
+                assert_eq!(
+                    request.frozen["target"],
+                    serde_json::json!({"pane": "wA:p3"}),
+                    "{}",
+                    request.frozen
+                );
+                assert_eq!(
+                    request.frozen["identity"]["pane"]["pane_id"],
+                    serde_json::json!("wA:p3"),
+                    "{}",
+                    request.frozen
+                );
+                // The caller's own id is the operation's key: a lost answer is read
+                // back under it rather than sent again.
+                assert!(
+                    crate::model::SessionUuid::parse(&request.request_id).is_some(),
+                    "{}",
+                    request.request_id
+                );
+            }
+            other => panic!("a container deletion: {other:?}"),
+        }
+
+        // A reload needs the recipe the record says is held, and hands back a
+        // control naming the container rather than the place.
+        app.begin_action(Operation::ReloadContainer, &state);
+        match app.confirm(&state).expect("the container still holds") {
+            Confirmed::Container(crate::topology::Control::Reload(request)) => {
+                assert_eq!(request.container_id, "c1")
+            }
+            other => panic!("a container reload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_container_changed_before_confirm_is_not_acted_on() {
+        let (mut state, mut app) = fixture_with_container(None);
+        app.begin_action(Operation::DeleteContainer, &state);
+        assert!(app.confirmation().is_some());
+
+        // The container is removed while the dialog is up: the place may now belong
+        // to whatever the backend put there, so nothing is sent.
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        observation.containers = vec![pane_container(
+            "c1",
+            "wA:p3",
+            Some("2026-01-01T00:00:02.000Z"),
+        )];
+        state.apply_success(observation);
+        assert!(app.confirm(&state).is_none(), "nothing was sent");
+        assert!(
+            app.focus_message()
+                .is_some_and(|message| message.contains("is gone")),
+            "{:?}",
+            app.focus_message()
+        );
     }
 
     #[test]
@@ -4006,7 +4453,9 @@ mod tests {
         assert_eq!(press(&mut app, KeyCode::Tab), None);
         match app.confirm(&state).expect("unchanged") {
             Confirmed::Managed(request) => assert_eq!(request.run_id, MANAGED_RUN),
-            Confirmed::Direct(_) => panic!("a managed target is never a direct close"),
+            Confirmed::Direct(_) | Confirmed::Container(_) => {
+                panic!("a managed target is never a direct close")
+            }
         }
     }
 
