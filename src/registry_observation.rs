@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::control_plane::containers::PublicContainer;
 use crate::control_plane::registry::{
     Channel, Freshness, PublicChannelFacts, PublicRegistration, PublicSpawnTopology, Report,
     SpawnState,
@@ -37,12 +38,15 @@ pub struct RegistryAgent {
     pub facts: Option<PublicChannelFacts>,
 }
 
-/// What one registry read returns: every registered agent and every spawn edge,
-/// each read to the end of its pages.
+/// What one registry read returns: every registered agent, every spawn edge and
+/// every container this daemon records, each read to the end of its pages.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RegistryRead {
     pub agents: Vec<RegistryAgent>,
     pub topology: Vec<PublicSpawnTopology>,
+    /// Durable containers, which the backend's own inventory does not carry: a
+    /// fleet Radar created has a topology of its own.
+    pub containers: Vec<PublicContainer>,
 }
 
 /// The process evidence `agent.list` serves beside a registration. Only the
@@ -110,7 +114,11 @@ pub fn project(
     read: RegistryRead,
     evidence: &[(String, ForegroundEvidence)],
 ) -> Vec<AgentObservation> {
-    let RegistryRead { agents, topology } = read;
+    let RegistryRead {
+        agents,
+        topology,
+        containers: _,
+    } = read;
     let foreground: HashMap<&str, &ProcessIdentity> = evidence
         .iter()
         .filter_map(|(pane_id, evidence)| match evidence {
@@ -375,6 +383,7 @@ mod tests {
     fn inventory(panes: Vec<Pane>) -> FleetObservation {
         FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: Vec::new(),
             tabs: Vec::new(),
             panes,
@@ -579,6 +588,7 @@ mod tests {
         let read = RegistryRead {
             agents: vec![agent],
             topology: vec![edge],
+            containers: Vec::new(),
         };
         let projected = project(&panes, &herdr(), read, &[]);
         let view = projected[0].registry.as_ref().expect("registry view");

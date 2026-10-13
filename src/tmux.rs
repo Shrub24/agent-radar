@@ -33,13 +33,17 @@ use crate::runtime::{
     BackendIdentity, CLOSE_CAPABILITY, CREATE_CAPABILITY, CloseOutcome, CloseTarget, CreateOutcome,
     CreateRequest, CreatedLocation, EXIT_OBSERVATION_CAPABILITY, FOCUS_CAPABILITY, FocusOutcome,
     INPUT_CAPABILITY, InputOutcome, InputPayload, InputRequest, LAUNCH_CAPABILITY,
-    LAUNCH_CONTEXT_CAPABILITY, LAUNCH_TOKEN_ENV, LaunchOutcome, LaunchRequest, OBSERVE_CAPABILITY,
-    OUTPUT_CAPABILITY, OutputOutcome, OutputRead, OutputRequest, OutputSource,
-    PROCESS_INFO_CAPABILITY, PaneExitObservation, RuntimeProvider, SplitDirection, Target,
+    LAUNCH_CONTEXT_CAPABILITY, LAUNCH_TOKEN_ENV, LIFECYCLE_TRACKING_CAPABILITY, LaunchOutcome,
+    LaunchRequest, OBSERVE_CAPABILITY, OUTPUT_CAPABILITY, OutputOutcome, OutputRead, OutputRequest,
+    OutputSource, PROCESS_INFO_CAPABILITY, PaneExitObservation, RuntimeProvider, SplitDirection,
+    Target,
 };
 
 /// The backend word in every handle this adapter names.
 const BACKEND: &str = "tmux";
+
+/// The global hook a launch's exit wake is appended to.
+const PANE_DIED_HOOK: &str = "pane-died";
 
 /// What separates the fields of one record the adapter asks tmux for.
 ///
@@ -299,6 +303,7 @@ impl RuntimeProvider for TmuxRuntime {
             LAUNCH_CAPABILITY,
             LAUNCH_CONTEXT_CAPABILITY,
             EXIT_OBSERVATION_CAPABILITY,
+            LIFECYCLE_TRACKING_CAPABILITY,
         ]
     }
 
@@ -370,6 +375,7 @@ impl RuntimeProvider for TmuxRuntime {
         let panes = self.run_whole(&["list-panes", "-a", "-F", PANE_FORMAT], cancel)?;
         Ok(FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: self.decode_sessions(&sessions)?,
             tabs: self.decode_windows(&windows)?,
             panes: self.decode_panes(&panes)?,
@@ -460,6 +466,52 @@ impl RuntimeProvider for TmuxRuntime {
             .run_whole(&["display-message", "-p", "#{pid}"], cancel)
             .ok()?;
         text.trim().parse::<i32>().ok().filter(|pid| *pid > 0)
+    }
+
+    /// Appends the wake to the global `pane-died` slots, so a user's own hook in
+    /// an earlier slot is left alone.
+    fn install_exit_wake(
+        &self,
+        _subject_id: &str,
+        command: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        // tmux reads the hook as its own command line and the shell reads the
+        // command inside it; any character that would end or re-quote either is
+        // refused rather than escaped.
+        if command
+            .chars()
+            .any(|c| matches!(c, '"' | '\\' | '$' | '`' | '#' | ';' | '\n'))
+        {
+            return Err("the wake command contains characters tmux would reinterpret".into());
+        }
+        let hook = format!("run-shell -b \"{command}\"");
+        self.run(&["set-hook", "-ga", PANE_DIED_HOOK, &hook], cancel)
+            .map(|_| ())
+    }
+
+    /// Unsets only the slots whose command names this launch. tmux indices are
+    /// stable across an unset, so the slot read is the slot removed.
+    fn remove_exit_wake(&self, subject_id: &str, cancel: &AtomicBool) -> Result<(), String> {
+        let listing = self.run_whole(&["show-hooks", "-g", PANE_DIED_HOOK], cancel)?;
+        let marker = format!("--subject {subject_id} ");
+        for line in listing.lines() {
+            let Some(rest) = line.strip_prefix(PANE_DIED_HOOK) else {
+                continue;
+            };
+            let Some(index) = rest
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once(']'))
+                .map(|(index, _)| index)
+            else {
+                continue;
+            };
+            if line.contains(&marker) {
+                let slot = format!("{PANE_DIED_HOOK}[{index}]");
+                self.run(&["set-hook", "-gu", &slot], cancel)?;
+            }
+        }
+        Ok(())
     }
 }
 

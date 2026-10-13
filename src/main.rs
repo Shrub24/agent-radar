@@ -73,6 +73,14 @@ fn handle_arguments() -> Option<i32> {
             print!("{USAGE}");
             Some(0)
         }
+        Some(control_plane::lifecycle::BOOTSTRAP_COMMAND) => {
+            let arguments: Vec<String> = std::env::args().skip(2).collect();
+            Some(control_plane::lifecycle::run_bootstrap(&arguments))
+        }
+        Some(control_plane::lifecycle::WAKE_COMMAND) => {
+            let arguments: Vec<String> = std::env::args().skip(2).collect();
+            Some(control_plane::lifecycle::run_wake(&arguments))
+        }
         Some("daemon") => Some(match std::env::args().nth(2).as_deref() {
             Some("--help" | "-h") => {
                 print!("{DAEMON_USAGE}");

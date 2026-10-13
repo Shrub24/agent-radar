@@ -15,8 +15,8 @@
 
 pub use crate::runtime::{
     CLOSE_CAPABILITY, CREATE_CAPABILITY, EXIT_OBSERVATION_CAPABILITY, FOCUS_CAPABILITY,
-    INPUT_CAPABILITY, LAUNCH_CAPABILITY, LAUNCH_CONTEXT_CAPABILITY, OBSERVE_CAPABILITY,
-    OUTPUT_CAPABILITY, PROCESS_INFO_CAPABILITY, REPORT_CAPABILITY,
+    INPUT_CAPABILITY, LAUNCH_CAPABILITY, LAUNCH_CONTEXT_CAPABILITY, LIFECYCLE_TRACKING_CAPABILITY,
+    OBSERVE_CAPABILITY, OUTPUT_CAPABILITY, PROCESS_INFO_CAPABILITY, REPORT_CAPABILITY,
 };
 
 /// A contract the daemon itself serves, versioned because a consumer pins it.
@@ -30,6 +30,16 @@ pub const SPAWN_CONTRACT: &str = "spawn.v1";
 pub const SPAWN_CLOSE_CONTRACT: &str = "spawn.close.v1";
 pub const SPAWN_LAUNCH_CONTEXT_CONTRACT: &str = "spawn.launch_context.v1";
 pub const SPAWN_EXIT_OBSERVATION_CONTRACT: &str = "spawn.exit_observation.v1";
+pub const LIFECYCLE_CANCEL_CONTRACT: &str = "lifecycle.cancel.v1";
+pub const LIFECYCLE_STOP_CONTRACT: &str = "lifecycle.stop.v1";
+pub const TOPOLOGY_CREATE_CONTRACT: &str = "topology.create.v1";
+pub const TOPOLOGY_GET_CONTRACT: &str = "topology.get.v1";
+pub const TOPOLOGY_LIST_CONTRACT: &str = "topology.list.v1";
+pub const TOPOLOGY_RECONCILE_CONTRACT: &str = "topology.reconcile.v1";
+pub const LIFECYCLE_GET_CONTRACT: &str = "lifecycle.get.v1";
+pub const LIFECYCLE_LIST_CONTRACT: &str = "lifecycle.list.v1";
+pub const LIFECYCLE_ENROLL_CONTRACT: &str = "lifecycle.enroll.v1";
+pub const LIFECYCLE_RESTART_CONTRACT: &str = "lifecycle.restart.v1";
 
 /// Every daemon contract, with the backend capabilities its methods are served
 /// from.
@@ -41,6 +51,10 @@ const CONTRACTS: &[(&str, &[&str])] = &[
     (REGISTRY_CONTRACT, &[]),
     (REGISTRY_FACTS_CONTRACT, &[]),
     (EVENTS_CONTRACT, &[]),
+    (TOPOLOGY_CREATE_CONTRACT, &[CREATE_CAPABILITY]),
+    (TOPOLOGY_GET_CONTRACT, &[]),
+    (TOPOLOGY_LIST_CONTRACT, &[]),
+    (TOPOLOGY_RECONCILE_CONTRACT, &[OBSERVE_CAPABILITY]),
     (SPAWN_CONTRACT, &[CREATE_CAPABILITY, LAUNCH_CAPABILITY]),
     (
         SPAWN_CLOSE_CONTRACT,
@@ -57,6 +71,22 @@ const CONTRACTS: &[(&str, &[&str])] = &[
     (
         SPAWN_EXIT_OBSERVATION_CONTRACT,
         &[EXIT_OBSERVATION_CAPABILITY],
+    ),
+    (LIFECYCLE_CANCEL_CONTRACT, &[LIFECYCLE_TRACKING_CAPABILITY]),
+    (LIFECYCLE_STOP_CONTRACT, &[LIFECYCLE_TRACKING_CAPABILITY]),
+    (LIFECYCLE_GET_CONTRACT, &[LIFECYCLE_TRACKING_CAPABILITY]),
+    (LIFECYCLE_LIST_CONTRACT, &[LIFECYCLE_TRACKING_CAPABILITY]),
+    (
+        LIFECYCLE_ENROLL_CONTRACT,
+        &[LIFECYCLE_TRACKING_CAPABILITY, OBSERVE_CAPABILITY],
+    ),
+    (
+        LIFECYCLE_RESTART_CONTRACT,
+        &[
+            LIFECYCLE_TRACKING_CAPABILITY,
+            CREATE_CAPABILITY,
+            LAUNCH_CAPABILITY,
+        ],
     ),
 ];
 
@@ -90,6 +120,19 @@ pub enum Operation {
     /// A managed child: a pane created under a named parent, and the resolved
     /// command launched in it.
     Spawn,
+    /// Creation of a location Radar records as one of its own containers. The
+    /// primitive create is the same; the container, its label and its provenance
+    /// are what this verb adds.
+    CreateContainer,
+    /// Cancellation of a tracked launch: revocation, then a signal to its captured
+    /// process.
+    Cancel,
+    /// Stop of a tracked launch's captured process, leaving the launch as it is.
+    Stop,
+    /// Enrollment of a running lead the daemon did not launch, as a restartable subject.
+    Enroll,
+    /// Operator restart of a restartable lead: stop, then a replacement in its own pane.
+    Restart,
 }
 
 impl Operation {
@@ -102,6 +145,11 @@ impl Operation {
             "mux.input" => Self::Input,
             "mux.report" => Self::Report,
             "spawn.create" => Self::Spawn,
+            "topology.create" => Self::CreateContainer,
+            "lifecycle.cancel" => Self::Cancel,
+            "lifecycle.stop" => Self::Stop,
+            "lifecycle.enroll" => Self::Enroll,
+            "lifecycle.restart" => Self::Restart,
             _ => return None,
         })
     }
@@ -115,6 +163,11 @@ impl Operation {
             Self::Input => "mux.input",
             Self::Report => "mux.report",
             Self::Spawn => "spawn.create",
+            Self::CreateContainer => "topology.create",
+            Self::Cancel => "lifecycle.cancel",
+            Self::Stop => "lifecycle.stop",
+            Self::Enroll => "lifecycle.enroll",
+            Self::Restart => "lifecycle.restart",
         }
     }
 
@@ -129,6 +182,14 @@ impl Operation {
             // A spawn does both, so a backend that can do only one of them
             // cannot serve it: a pane with no command in it is not a child.
             Self::Spawn => &[CREATE_CAPABILITY, LAUNCH_CAPABILITY],
+            Self::CreateContainer => &[CREATE_CAPABILITY],
+            Self::Cancel | Self::Stop => &[LIFECYCLE_TRACKING_CAPABILITY],
+            Self::Enroll => &[LIFECYCLE_TRACKING_CAPABILITY, OBSERVE_CAPABILITY],
+            Self::Restart => &[
+                LIFECYCLE_TRACKING_CAPABILITY,
+                CREATE_CAPABILITY,
+                LAUNCH_CAPABILITY,
+            ],
         }
     }
 
@@ -196,6 +257,13 @@ pub enum Method {
     /// Registry reads and writes: the daemon's own durable records, answered
     /// whether or not a mux backend is wired.
     Registry,
+    /// The internal claim a tracked launch's bootstrap makes before it runs its
+    /// program. Not a public operation: it is served only to a launch the daemon
+    /// created, through its correlation.
+    Bootstrap,
+    /// The internal notification a launch's pane-death hook sends. It is a hint
+    /// that reconciles one launch against exact process evidence.
+    Wake,
     /// An operation, served as a durable request.
     Operation(Operation),
 }
@@ -214,7 +282,12 @@ pub fn classify(method: &str) -> Option<Method> {
         // still reports a recorded location changes its freshness, never whether
         // the read is served.
         "spawn.get" | "spawn.list" | "spawn.close" => Method::Registry,
+        // A lifecycle read reports the daemon's own subject records.
+        "lifecycle.get" | "lifecycle.list" => Method::Registry,
+        "topology.get" | "topology.list" | "topology.reconcile" => Method::Registry,
         "mux.observe" | "mux.process_info" | "mux.output" => Method::Read,
+        "spawn.bootstrap" => Method::Bootstrap,
+        "lifecycle.wake" => Method::Wake,
         other => Method::Operation(Operation::from_method(other)?),
     })
 }
@@ -344,6 +417,7 @@ mod tests {
             LAUNCH_CAPABILITY,
             LAUNCH_CONTEXT_CAPABILITY,
             EXIT_OBSERVATION_CAPABILITY,
+            LIFECYCLE_TRACKING_CAPABILITY,
         ];
         for (contract, needs) in CONTRACTS {
             assert!(
@@ -368,13 +442,21 @@ mod tests {
                 LAUNCH_CAPABILITY,
                 REGISTRY_CONTRACT,
                 REGISTRY_FACTS_CONTRACT,
-                EVENTS_CONTRACT
+                EVENTS_CONTRACT,
+                TOPOLOGY_GET_CONTRACT,
+                TOPOLOGY_LIST_CONTRACT
             ],
             "a backend that can only launch serves spawn.create no better than none"
         );
         assert_eq!(
             advertised(&[]),
-            vec![REGISTRY_CONTRACT, REGISTRY_FACTS_CONTRACT, EVENTS_CONTRACT],
+            vec![
+                REGISTRY_CONTRACT,
+                REGISTRY_FACTS_CONTRACT,
+                EVENTS_CONTRACT,
+                TOPOLOGY_GET_CONTRACT,
+                TOPOLOGY_LIST_CONTRACT
+            ],
             "the daemon's own records need no backend"
         );
     }
@@ -387,7 +469,10 @@ mod tests {
                 OBSERVE_CAPABILITY,
                 REGISTRY_CONTRACT,
                 REGISTRY_FACTS_CONTRACT,
-                EVENTS_CONTRACT
+                EVENTS_CONTRACT,
+                TOPOLOGY_GET_CONTRACT,
+                TOPOLOGY_LIST_CONTRACT,
+                TOPOLOGY_RECONCILE_CONTRACT
             ]
         );
     }

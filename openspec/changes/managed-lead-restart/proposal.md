@@ -1,5 +1,10 @@
 # Proposal
 
+> Unimplemented restart execution is superseded by
+> `../daemon-managed-lifecycle/`. The shipped exact-parent/session spawn slice
+> and its verification remain valid; do not apply the older Herdr-readiness or
+> session-as-logical-subject plan in parallel.
+
 ## Why
 
 Radar cannot yet safely restart a managed lead or standalone session: restart is limited to eligible idle workers, while the daemon has no launch/reattach operation. As Radar takes ownership of lifecycle orchestration, it should restart the lead without needlessly restarting live children, preserving the logical session and runtime tree while replacing only the lead's live process binding.

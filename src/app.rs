@@ -3274,6 +3274,7 @@ mod tests {
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![],
             tabs: vec![],
             panes: vec![],
@@ -3293,6 +3294,7 @@ mod tests {
     fn filter_matches_reported_role_and_assignment_when_available() {
         let observation = FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3477,6 +3479,7 @@ mod tests {
         // projection alone, with no publisher and no second refresh.
         let observation = FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3660,6 +3663,7 @@ mod tests {
         // closing the second would act on something they never reviewed.
         let observation = |session: &str| FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3789,6 +3793,7 @@ mod tests {
     fn a_task_row_does_not_redirect_a_close_to_its_owner() {
         let observation = FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3947,6 +3952,7 @@ mod tests {
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),

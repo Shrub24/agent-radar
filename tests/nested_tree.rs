@@ -93,6 +93,7 @@ impl<'a> Agent<'a> {
 fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
     FleetObservation {
         metadata_agents: Vec::new(),
+        containers: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wH".into(),
             label: Some("home".into()),
@@ -1827,6 +1828,7 @@ fn node_of<'a>(nodes: &'a [TreeNode], id: &RowId) -> Option<&'a TreeNode> {
 fn wa_inventory(pane_ids: &[&str]) -> FleetObservation {
     FleetObservation {
         metadata_agents: Vec::new(),
+        containers: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: Some("alpha".into()),
@@ -1854,7 +1856,11 @@ fn registry_state(
     agents: Vec<RegistryAgent>,
     topology: Vec<PublicSpawnTopology>,
 ) -> ObservationState {
-    let read = RegistryRead { agents, topology };
+    let read = RegistryRead {
+        agents,
+        topology,
+        ..RegistryRead::default()
+    };
     let agents =
         registry_observation::project(&inventory, &BackendIdentity::named("herdr"), read, &[]);
     let mut state = ObservationState::new();

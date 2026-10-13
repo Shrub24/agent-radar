@@ -1,5 +1,9 @@
 # Tasks
 
+> Historical task record: completed session-aware spawn tasks remain accepted.
+> Unchecked restart-execution tasks are superseded by
+> `../daemon-managed-lifecycle/tasks.md`, not completed or independently runnable.
+
 ## 1. Logical subject and topology contract
 - [x] 1.1 Define the stable parent pair as exact `parent agent_id` plus explicit `parent_session_id`; keep process birth identity and mux location separate, and do not resolve a session UUID to a process by searching registrations.
 - [x] 1.2 Extend spawn request and edge formats to carry both exact process parent and session parent. Require fresh published session context for that exact agent to equal `parent_session_id` before effects; keep legacy v1 edges explicitly process-parented and readable without inferred session identity.

@@ -15,8 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::bus::{BusSession, BusState, Task};
+use crate::control_plane::containers::Kind;
 use crate::model::{
-    AgentObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Pane, TerminalMode,
+    AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Pane,
+    TerminalMode,
 };
 use crate::observation::{ObservationState, RetentionBasis};
 use crate::registry_observation::{Binding, RegistryView};
@@ -343,16 +345,22 @@ impl FleetTree {
             return FleetTree::default();
         };
 
-        let workspace_labels: HashMap<&str, &str> = inventory
+        // Radar's own name for a container it created wins over whatever the
+        // backend calls it: an operator who labelled a workspace named it. A
+        // workspace Radar never created keeps the backend's own label, and a
+        // backend that names nothing keeps its ids.
+        let mut workspace_labels: HashMap<&str, &str> = inventory
             .workspaces
             .iter()
             .filter_map(|w| Some((w.workspace_id.as_str(), w.label.as_deref()?)))
             .collect();
-        let tab_labels: HashMap<&str, &str> = inventory
+        workspace_labels.extend(container_labels(inventory, Kind::Workspace));
+        let mut tab_labels: HashMap<&str, &str> = inventory
             .tabs
             .iter()
             .filter_map(|t| Some((t.tab_id.as_str(), t.label.as_deref()?)))
             .collect();
+        tab_labels.extend(container_labels(inventory, Kind::Tab));
         let workspace_numbers: HashMap<&str, u32> = inventory
             .workspaces
             .iter()
@@ -855,6 +863,24 @@ fn nest(mut agents: Vec<(TreeNode, Option<Lineage>)>) -> Vec<TreeNode> {
         .collect()
 }
 
+/// The recorded label of every container of one kind, keyed by the handle the
+/// backend knows it by.
+///
+/// A container this daemon removed names nothing: its handle may belong to a
+/// later backend instance that is not the container recorded here. One with no
+/// binding has no handle to be grouped by, and one with no label names nothing.
+fn container_labels(inventory: &FleetObservation, kind: Kind) -> HashMap<&str, &str> {
+    inventory
+        .containers
+        .iter()
+        .filter(|container| container.kind == kind && container.removed_at.is_none())
+        .filter_map(|container| {
+            let binding = container.binding.as_ref()?;
+            Some((binding.handle.as_str(), container.label.as_deref()?))
+        })
+        .collect()
+}
+
 /// Drops every parent edge that lies on a cycle (DFS gray-edge detection).
 ///
 /// Iterative rather than recursive: a pathological source could report a very
@@ -904,6 +930,9 @@ fn remove_cycles(parent: &mut [Option<usize>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::containers::{
+        Binding as ContainerBinding, Provenance, PublicContainer,
+    };
     use crate::herdr::decode_snapshot;
     use crate::model::{
         FleetObservation, Location, RuntimeStatus, SessionIdentity, SessionUuid, Tab, Workspace,
@@ -922,6 +951,84 @@ mod tests {
         let mut state = ObservationState::new();
         state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
         state
+    }
+
+    /// A container as the daemon reads one out: a workspace it created, with its
+    /// own label for the handle the backend knows it by.
+    fn workspace_container(
+        id: &str,
+        handle: &str,
+        label: &str,
+        removed: Option<&str>,
+    ) -> PublicContainer {
+        PublicContainer {
+            container_id: id.to_string(),
+            kind: Kind::Workspace,
+            parent: None,
+            label: Some(label.to_string()),
+            created_by: None,
+            provenance: Provenance::Created,
+            binding: Some(ContainerBinding {
+                backend: "fake".into(),
+                incarnation: None,
+                handle: handle.to_string(),
+            }),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            observed_at: None,
+            unresolved: None,
+            removed_at: removed.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_recorded_container_names_its_group_and_a_removed_one_names_nothing() {
+        let mut observation = FleetObservation {
+            workspaces: vec![Workspace {
+                workspace_id: "wA".into(),
+                label: Some("backend-name".into()),
+                number: Some(1),
+            }],
+            tabs: Vec::new(),
+            panes: Vec::new(),
+            agents: Vec::new(),
+            metadata_agents: Vec::new(),
+            containers: Vec::new(),
+        };
+        let mut state = ObservationState::new();
+        state.apply_success(observation.clone());
+        let named = |state: &ObservationState| {
+            flatten(&FleetTree::build(state))
+                .first()
+                .expect("a workspace root")
+                .2
+                .clone()
+        };
+        assert_eq!(
+            named(&state),
+            "backend-name",
+            "a workspace Radar never created keeps the backend's own name"
+        );
+
+        observation.containers = vec![workspace_container("c1", "wA", "work", None)];
+        state.apply_success(observation.clone());
+        assert_eq!(
+            named(&state),
+            "work",
+            "the container Radar created names the group it binds"
+        );
+
+        observation.containers = vec![workspace_container(
+            "c1",
+            "wA",
+            "work",
+            Some("2026-01-01T00:00:01.000Z"),
+        )];
+        state.apply_success(observation);
+        assert_eq!(
+            named(&state),
+            "backend-name",
+            "a removed container's label does not name whatever holds its handle now"
+        );
     }
 
     /// (depth, row id, title) for every node in source order.
@@ -1035,6 +1142,7 @@ mod tests {
         };
         let observation = FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("mixed".into()),

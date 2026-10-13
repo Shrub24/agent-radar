@@ -213,6 +213,8 @@ pub fn decode_snapshot(output: &str) -> Result<FleetObservation, DecodeError> {
 
     Ok(FleetObservation {
         metadata_agents: Vec::new(),
+        // Containers are the daemon's records, never a backend's inventory.
+        containers: Vec::new(),
         workspaces: inventory
             .workspaces
             .into_iter()

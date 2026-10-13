@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::containers::PublicContainer;
 use super::ops;
 use super::registry::PublicSpawnTopology;
 use super::{MAX_LINE_BYTES, PROTOCOL_VERSION, random_uuid, socket_path, trusted_socket};
@@ -76,6 +77,13 @@ struct SpawnPage {
     next: Option<String>,
 }
 
+/// One `topology.list` answer.
+#[derive(Deserialize)]
+struct ContainerPage {
+    containers: Vec<PublicContainer>,
+    next: Option<String>,
+}
+
 /// The label this caller's records carry, so an operator reading the store knows
 /// who asked.
 const REQUESTER: &str = "radar";
@@ -101,6 +109,10 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     ops::REGISTRY_CONTRACT,
     ops::REGISTRY_FACTS_CONTRACT,
     ops::EVENTS_CONTRACT,
+    ops::TOPOLOGY_CREATE_CONTRACT,
+    ops::TOPOLOGY_GET_CONTRACT,
+    ops::TOPOLOGY_LIST_CONTRACT,
+    ops::TOPOLOGY_RECONCILE_CONTRACT,
     ops::SPAWN_CONTRACT,
     ops::SPAWN_CLOSE_CONTRACT,
     ops::SPAWN_LAUNCH_CONTEXT_CONTRACT,
@@ -301,7 +313,22 @@ impl RuntimeProvider for DaemonRuntime {
                 let page: SpawnPage = serde_json::from_value(value)?;
                 Ok((page.spawns, page.next))
             })?;
-        Ok(Some(RegistryRead { agents, topology }))
+        // Containers are the daemon's own records, and a daemon that does not
+        // serve them has none: a missing contract reads as no containers rather
+        // than as a refresh that failed.
+        let containers = if self.declared.contains(&ops::TOPOLOGY_LIST_CONTRACT) {
+            self.read_all("topology.list", "containers", deadline, cancel, |value| {
+                let page: ContainerPage = serde_json::from_value(value)?;
+                Ok((page.containers, page.next))
+            })?
+        } else {
+            Vec::new()
+        };
+        Ok(Some(RegistryRead {
+            agents,
+            topology,
+            containers,
+        }))
     }
 
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence {

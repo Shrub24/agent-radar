@@ -1,5 +1,10 @@
 # Design
 
+> Historical execution design, superseded by
+> `../daemon-managed-lifecycle/design.md`. Keep the accepted exact-parent/session
+> prerequisite; do not implement this document's Herdr readiness dependency,
+> session-as-subject identity or TUI-owned execution path.
+
 ## Context
 
 See proposal.md. Today the daemon registry identifies publisher/process incarnations and separately publishes mutable session UUID context; daemon-spawn edges record a parent identity and are durable, but there is no managed restart operation. Existing `agent.context` cannot take over a registration, and Herdr foreground/session metadata is not sufficient to distinguish multiple live attaches. The daemon's private launch specification is inert. Existing worker restart remains owner-routed and lead/standalone restart is explicitly refused.

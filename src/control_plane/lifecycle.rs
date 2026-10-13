@@ -1,0 +1,1795 @@
+//! Daemon-owned launch subjects: the physical lifecycle of a tracked spawn.
+//!
+//! A tracked launch runs the requested program through a bootstrap that is the
+//! Radar binary itself. The bootstrap claims its own process incarnation with a
+//! private, one-use correlation; the daemon verifies that the claimed process is
+//! the pane's foreground process and was started with the requested launch, then
+//! records it and only then releases the bootstrap to exec the program. The exec
+//! keeps the PID and birth identity, so the captured process is the program that
+//! runs. A correlation is spent at capture; a revoked subject never captures or binds.
+//!
+//! Every transition of a subject runs under the registry's transition lock. That
+//! lock is the one commit fence shared with registration binding, so a cancel and
+//! a bootstrap claim, or a cancel and a registration, have exactly one winner.
+//! The lock is never held across a wait for a process to exit.
+
+mod observation;
+pub use observation::{Evidence, Observation, Observer, observe_exit_from};
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::control_plane::protocol::{MAX_LINE_BYTES, PROTOCOL_VERSION};
+use crate::control_plane::registry::publication::write_atomic;
+use crate::control_plane::registry::{
+    LocalProcfsVerifier, ProcessVerifier, Registry, read_record_file,
+};
+use crate::control_plane::store::{format_millis, random_uuid};
+use crate::model::{ProcessIdentity, SessionUuid};
+use crate::process_control::{self, Acquired, Effective};
+use crate::runtime::LaunchRequest;
+
+/// Environment variables the bootstrap reads and removes before the program runs.
+pub const SUBJECT_ENV: &str = "PI_RADAR_LAUNCH_SUBJECT";
+pub const CORRELATION_ENV: &str = "PI_RADAR_LAUNCH_CORRELATION";
+
+/// The internal method a bootstrap calls to claim its process.
+pub const BOOTSTRAP_METHOD: &str = "spawn.bootstrap";
+
+/// The subcommand a pane-death hook runs, and the internal method it calls.
+pub const WAKE_COMMAND: &str = "lifecycle-wake";
+pub const WAKE_METHOD: &str = "lifecycle.wake";
+
+/// The subcommand the Radar binary runs as the bootstrap.
+pub const BOOTSTRAP_COMMAND: &str = "launch-bootstrap";
+
+/// Refusal for a claim the subject cannot take: unknown, spent, revoked, or no
+/// longer awaiting a process. It says nothing about which.
+pub const NOT_AWAITING: &str = "launch is not awaiting a bootstrap";
+
+/// Refusal for a captured process that was not started with the requested launch.
+pub const LAUNCH_MISMATCH: &str = "launch context does not match the requested launch";
+
+const SUBJECT_VERSION: u32 = 1;
+const MAX_SUBJECT_BYTES: usize = 64 * 1024;
+/// How long a cancelled process gets to exit after SIGTERM before the operation
+/// reports the exit as not verified.
+const EXIT_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a bootstrap waits for the daemon before it gives up without running
+/// the program.
+const RELEASE_DEADLINE: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    /// Launch recorded; no process has claimed it yet.
+    Pending,
+    /// The bootstrap's process is captured and released to exec.
+    Captured,
+    /// A registration presented the token with the captured identity.
+    Bound,
+    /// Cancelled before binding: no registration may bind it.
+    Revoked,
+}
+
+/// The launch a tracked spawn asked for. It is private: it holds the env values
+/// the caller supplied, and it is never returned by any read.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchContext {
+    pub executable: String,
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl LaunchContext {
+    /// Whether the process was started with this launch: the program and its
+    /// argv, its working directory when one was requested, and each requested
+    /// environment value. Variables the backend adds to every pane are not part
+    /// of the launch and are not compared.
+    fn launched_as(&self, effective: &Effective) -> bool {
+        let Some(separator) = effective.cmdline.iter().position(|arg| arg == "--") else {
+            return false;
+        };
+        let mut program = vec![self.executable.clone()];
+        program.extend(self.argv.iter().cloned());
+        let cwd_matches = self
+            .cwd
+            .as_deref()
+            .is_none_or(|cwd| fs::canonicalize(cwd).ok().as_deref() == effective.cwd.as_deref());
+        &effective.cmdline[separator + 1..] == program.as_slice()
+            && cwd_matches
+            && self
+                .env
+                .iter()
+                .all(|(name, value)| effective.env.get(name) == Some(value))
+    }
+}
+
+/// How a subject came to be tracked: launched by a tracked spawn, or enrolled from
+/// a running lead the daemon did not launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    #[default]
+    Spawned,
+    Enrolled,
+}
+
+/// One durable launch subject. The correlation is a private credential and is
+/// spent at capture; no public read returns it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Subject {
+    pub version: u32,
+    pub subject_id: String,
+    pub spawn_request_id: String,
+    #[serde(default)]
+    pub origin: Origin,
+    pub state: State,
+    pub launch: LaunchContext,
+    /// The Pi session a restart resumes. Present only on a restartable subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The replacement spawn dispatched for this process generation, recorded
+    /// before its dispatch so a second replacement is never launched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<String>,
+    /// The captured birth identity of the launched process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Observation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_agent_id: Option<String>,
+    /// Recorded before a SIGTERM is sent, so a signal is never sent twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signalled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<String>,
+    /// Recorded once, by the cancel that revoked an unbound launch. A bound
+    /// launch's pane belongs to its child and is closed through spawn.close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_cleanup: Option<PaneCleanup>,
+    pub recorded_at: String,
+}
+
+/// What a spawn needs to launch a tracked child: the subject it belongs to and
+/// the correlation its bootstrap presents.
+pub struct Ticket {
+    pub subject_id: String,
+    pub correlation: String,
+}
+
+/// The daemon's own executable and socket, which every tracked launch runs.
+#[derive(Clone, Debug)]
+pub struct Bootstrap {
+    pub executable: String,
+    pub socket: String,
+}
+
+/// What became of the launched process in a cancel. Each fact is separate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Exit {
+    /// No process identity was captured, so nothing was signalled. The launch
+    /// was revoked before any bootstrap could release a program.
+    Unresolved,
+    /// The captured process is verified gone.
+    Exited,
+    /// The process could not be verified gone; the reason names why.
+    Unverified(String),
+}
+
+/// What a cancel or stop did. Revocation, signal dispatch and exit are reported apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Termination {
+    /// The launch was revoked by this cancel rather than already revoked or bound.
+    pub revoked: bool,
+    /// SIGTERM was dispatched by this cancel.
+    pub signal_attempted: bool,
+    pub exit: Exit,
+}
+
+/// What a cancel did about the pane an unbound launch left behind. Reported
+/// apart from revocation and from verified process exit, and not an exit claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome", content = "reason")]
+pub enum PaneCleanup {
+    /// One close was dispatched in the instance that created the pane, and it
+    /// answered.
+    Cleaned,
+    /// Nothing was dispatched, for this reason.
+    Refused(String),
+    /// A close was dispatched and its answer was lost. It is never dispatched
+    /// again for this launch.
+    Unknown(String),
+}
+
+impl PaneCleanup {
+    /// What the outcome reads as on a cancel's effects list.
+    pub fn effect(&self) -> String {
+        match self {
+            Self::Cleaned => "pane cleaned up".to_string(),
+            Self::Refused(reason) => format!("pane kept: {reason}"),
+            Self::Unknown(reason) => format!("pane cleanup unverified: {reason}"),
+        }
+    }
+}
+
+enum Stage {
+    Settled(Exit),
+    Watch {
+        descriptor: std::os::fd::OwnedFd,
+        signal: bool,
+    },
+}
+
+/// A pending subject for `launch`, with fresh ids. Its record is what is bounded.
+fn draft(
+    spawn_request_id: &str,
+    launch: LaunchContext,
+    session: Option<String>,
+    now_ms: i64,
+) -> Subject {
+    Subject {
+        observation: None,
+        version: SUBJECT_VERSION,
+        subject_id: random_uuid(),
+        spawn_request_id: spawn_request_id.to_string(),
+        origin: Origin::Spawned,
+        state: State::Pending,
+        launch,
+        correlation: Some(random_uuid()),
+        process: None,
+        bound_agent_id: None,
+        signalled_at: None,
+        exited_at: None,
+        pane_cleanup: None,
+        recorded_at: format_millis(now_ms),
+        session,
+        successor: None,
+    }
+}
+
+/// Refuses a launch whose subject record would exceed its bound. The record is
+/// the launch's only durable correlation, so an oversized launch is never started.
+pub fn check_bounds(launch: &LaunchContext) -> Result<(), String> {
+    let draft = draft("", launch.clone(), None, 0);
+    let bytes = serde_json::to_vec_pretty(&draft).map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_SUBJECT_BYTES {
+        return Err("the launch is too large to track".into());
+    }
+    Ok(())
+}
+
+/// Records a pending subject for a spawn whose edge is already recorded, before
+/// any effect that could launch its process.
+pub fn create(
+    registry: &Registry,
+    spawn_request_id: &str,
+    launch: LaunchContext,
+    session: Option<String>,
+    now_ms: i64,
+) -> Result<Ticket, String> {
+    let _transition = registry.transition();
+    let subject = draft(spawn_request_id, launch, session, now_ms);
+    write(registry, &subject)?;
+    Ok(Ticket {
+        subject_id: subject.subject_id,
+        correlation: subject.correlation.unwrap_or_default(),
+    })
+}
+
+/// The subject with this id, or `None` when none was recorded.
+pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Subject>, String> {
+    if SessionUuid::parse(subject_id).is_none() {
+        return Err("`subject_id` must be a canonical UUID".into());
+    }
+    let facts = registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .facts(subject_id)
+        .cloned();
+    let path = if facts.is_some() {
+        recipe_path(registry, subject_id)
+    } else {
+        path(registry, subject_id)
+    };
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("launch subject {subject_id}: {error}")),
+        Ok(_) => {}
+    }
+    let bytes = read_record_file(&path, MAX_SUBJECT_BYTES)?;
+    let mut subject: Subject =
+        serde_json::from_slice(&bytes).map_err(|error| format!("not a launch subject: {error}"))?;
+    if subject.version != SUBJECT_VERSION || subject.subject_id != subject_id {
+        return Err("launch subject does not match its name or version".into());
+    }
+    if let Some(facts) = facts {
+        facts.apply_to(&mut subject);
+    }
+    Ok(Some(subject))
+}
+
+fn read_recorded(registry: &Registry, subject_id: &str) -> Result<Subject, String> {
+    read(registry, subject_id)?.ok_or_else(|| "tracked launch subject is unavailable".to_string())
+}
+
+/// Records what a cancel did about the launch's own pane. The first outcome is
+/// durable and is what a later cancel of the same launch reports: nothing is
+/// closed twice, and an uncertain cleanup is never retried into a second one.
+pub fn record_pane_cleanup(
+    registry: &Registry,
+    subject_id: &str,
+    outcome: PaneCleanup,
+    now_ms: i64,
+) -> Result<PaneCleanup, String> {
+    let _transition = registry.transition();
+    let mut subject = read_recorded(registry, subject_id)?;
+    if let Some(recorded) = subject.pane_cleanup.clone() {
+        return Ok(recorded);
+    }
+    if subject.state != State::Revoked {
+        return Err("only a revoked launch's own pane is cleaned up".into());
+    }
+    subject.pane_cleanup = Some(outcome.clone());
+    subject.recorded_at = format_millis(now_ms);
+    write(registry, &subject)?;
+    Ok(outcome)
+}
+
+/// Captures the process a bootstrap claimed, spending its correlation.
+///
+/// Refuses unless the subject is still pending with this correlation, and the
+/// process was started with the requested launch. A cancel that won the race
+/// revoked the subject; a replayed claim finds the spent correlation.
+pub fn capture(
+    registry: &Registry,
+    subject_id: &str,
+    correlation: &str,
+    process: &ProcessIdentity,
+    effective: &Effective,
+    now_ms: i64,
+) -> Result<(), String> {
+    let _transition = registry.transition();
+    let mut subject = read(registry, subject_id)?.ok_or_else(|| NOT_AWAITING.to_string())?;
+    if subject.state != State::Pending || subject.correlation.as_deref() != Some(correlation) {
+        return Err(NOT_AWAITING.into());
+    }
+    if !subject.launch.launched_as(effective) {
+        return Err(LAUNCH_MISMATCH.into());
+    }
+    subject.state = State::Captured;
+    subject.correlation = None;
+    subject.process = Some(process.clone());
+    subject.recorded_at = format_millis(now_ms);
+    write(registry, &subject)
+}
+
+/// Decides whether a registration may bind the tracked launch, and records the
+/// binding in the subject. Runs under the registry transition lock, before the
+/// edge is spent, so the subject is always at least as far along as the edge.
+///
+/// A launch binds exactly once, to the captured identity; the same registration
+/// replaying its bind is answered, and any other presenter is refused.
+pub(crate) fn fence_registration(
+    registry: &Registry,
+    subject_id: &str,
+    process: Option<&ProcessIdentity>,
+    agent_id: Option<&str>,
+    now_ms: i64,
+) -> Result<(), String> {
+    let mut subject = read_recorded(registry, subject_id)?;
+    match (subject.state, agent_id) {
+        (State::Bound, Some(agent))
+            if subject.bound_agent_id.as_deref() == Some(agent)
+                && subject.process.as_ref() == process =>
+        {
+            Ok(())
+        }
+        (State::Bound, _) => Err("launch is already bound to another registration".into()),
+        (State::Captured, Some(agent))
+            if process.is_some() && subject.process.as_ref() == process =>
+        {
+            subject.state = State::Bound;
+            subject.bound_agent_id = Some(agent.to_string());
+            subject.recorded_at = format_millis(now_ms);
+            write(registry, &subject)
+        }
+        (State::Captured, _) => Err("registration does not match the launched process".into()),
+        (State::Pending, _) => Err("launch has not been released to its process".into()),
+        (State::Revoked, _) => Err("launch was cancelled".into()),
+    }
+}
+
+/// Cancels a tracked launch: revokes it while it is unbound, then stops its
+/// captured process. A revoked launch never binds afterwards.
+pub fn cancel(
+    registry: &Registry,
+    subject_id: &str,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+) -> Result<Termination, String> {
+    let revoked = revoke(registry, subject_id, now_ms)?;
+    terminate(registry, subject_id, verifier, now_ms, revoked)
+}
+
+/// Stops a tracked launch's captured process. The launch itself is left as it is:
+/// a bound launch stays bound, and an unbound one is not revoked.
+pub fn stop(
+    registry: &Registry,
+    subject_id: &str,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+) -> Result<Termination, String> {
+    terminate(registry, subject_id, verifier, now_ms, false)
+}
+
+/// Records a launch's exit if its captured process is verifiably gone, and
+/// reports whether it is. A notification calls this; it is never itself proof.
+pub fn observe_exit(
+    registry: &Registry,
+    subject_id: &str,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+) -> Result<bool, String> {
+    observe_exit_from(registry, subject_id, verifier, now_ms, Observer::Read)
+}
+
+/// Records an enrolled subject for a running registration the daemon did not
+/// launch. Its process is already verified, so it is bound at once. Refused when
+/// another tracked subject names the same registration, so binding stays unique.
+pub fn enroll(registry: &Registry, subject: &Subject) -> Result<(), String> {
+    let _transition = registry.transition();
+    let agent = subject
+        .bound_agent_id
+        .as_deref()
+        .ok_or("an enrolled subject must name its registration")?;
+    if bound_elsewhere(registry, agent, &subject.subject_id)? {
+        return Err("the registration is already tracked by a launch subject".into());
+    }
+    write(registry, subject)
+}
+
+/// Records an enrolled subject for a registration whose process the caller has
+/// verified live on its pane. The enrollment request is its origin, so it names no
+/// spawn edge, and it is bound at once. Returns the new subject id.
+pub fn enroll_subject(
+    registry: &Registry,
+    enrollment_id: &str,
+    agent_id: &str,
+    process: &ProcessIdentity,
+    session: &str,
+    launch: LaunchContext,
+    now_ms: i64,
+) -> Result<String, String> {
+    let subject = Subject {
+        observation: None,
+        version: SUBJECT_VERSION,
+        subject_id: random_uuid(),
+        spawn_request_id: enrollment_id.to_string(),
+        origin: Origin::Enrolled,
+        state: State::Bound,
+        launch,
+        session: Some(session.to_string()),
+        successor: None,
+        correlation: None,
+        process: Some(process.clone()),
+        bound_agent_id: Some(agent_id.to_string()),
+        signalled_at: None,
+        exited_at: None,
+        pane_cleanup: None,
+        recorded_at: format_millis(now_ms),
+    };
+    enroll(registry, &subject)?;
+    Ok(subject.subject_id)
+}
+
+/// Whether a tracked subject other than `except` names `agent_id`.
+fn bound_elsewhere(registry: &Registry, agent_id: &str, except: &str) -> Result<bool, String> {
+    let mut after: Option<String> = None;
+    loop {
+        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
+        if page.iter().any(|subject| {
+            subject.subject_id != except && subject.bound_agent_id.as_deref() == Some(agent_id)
+        }) {
+            return Ok(true);
+        }
+        match page.last() {
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// Records the replacement dispatched for this process generation, before the
+/// dispatch. A generation that already has a successor refuses, so no second
+/// replacement can be launched for it.
+pub fn set_successor(
+    registry: &Registry,
+    subject_id: &str,
+    successor: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let _transition = registry.transition();
+    let mut subject = read_recorded(registry, subject_id)?;
+    if let Some(existing) = &subject.successor {
+        return Err(format!(
+            "this process is already superseded by spawn {existing}"
+        ));
+    }
+    subject.successor = Some(successor.to_string());
+    subject.recorded_at = format_millis(now_ms);
+    write(registry, &subject)
+}
+
+/// Pi's value-taking flags that a restart keeps, from `pi --help`. Any other flag
+/// is treated as boolean, so a bare argument after it refuses rather than replays.
+const VALUE_FLAGS: &[&str] = &[
+    "--provider",
+    "--model",
+    "--api-key",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--mode",
+    "--session-dir",
+    "--name",
+    "-n",
+    "--models",
+    "--tools",
+    "-t",
+    "--exclude-tools",
+    "-xt",
+    "--thinking",
+    "--extension",
+    "-e",
+    "--skill",
+    "--prompt-template",
+    "--theme",
+    "--use-theme",
+    "--export",
+    "--tui-mode",
+    "--fff-mode",
+    "--fff-frecency-db",
+    "--fff-history-db",
+    "--fff-profile",
+];
+/// Flags whose value selects the session a process starts in. A restart replaces them.
+const SESSION_VALUE_FLAGS: &[&str] = &["--session", "--session-id", "--fork"];
+/// Flags that select a session without a value, which a restart replaces.
+const SESSION_FLAGS: &[&str] = &["--continue", "-c", "--resume", "-r", "--no-session"];
+
+/// The launch that resumes `session`: the captured argv with its prior session
+/// selectors removed and `--session <session>` appended.
+///
+/// Fail-closed: a bare argument that is not a known flag's value may be a
+/// message, which a restart would replay on every relaunch, so it refuses. An
+/// unknown valued flag refuses for the same reason rather than being guessed at.
+pub fn resume_launch(launch: &LaunchContext, session: &str) -> Result<LaunchContext, String> {
+    let mut argv = Vec::new();
+    let mut args = launch.argv.iter();
+    while let Some(arg) = args.next() {
+        if SESSION_FLAGS.contains(&arg.as_str()) {
+            continue;
+        }
+        if SESSION_VALUE_FLAGS.contains(&arg.as_str()) {
+            args.next();
+            continue;
+        }
+        if SESSION_VALUE_FLAGS.iter().any(|flag| {
+            arg.strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+        }) {
+            continue;
+        }
+        if !arg.starts_with('-') {
+            return Err(
+                "the captured launch has a bare argument that may be a message; restart refuses it"
+                    .into(),
+            );
+        }
+        argv.push(arg.clone());
+        if VALUE_FLAGS.contains(&arg.as_str()) {
+            let value = args
+                .next()
+                .ok_or("the captured launch has a flag with no value")?;
+            argv.push(value.clone());
+        }
+    }
+    argv.push("--session".to_string());
+    argv.push(session.to_string());
+    Ok(LaunchContext {
+        executable: launch.executable.clone(),
+        argv,
+        cwd: launch.cwd.clone(),
+        env: launch.env.clone(),
+    })
+}
+
+/// The launch a running process was started with, from its verified kernel record.
+/// Radar's own bootstrap and token variables are dropped, since a replacement is
+/// given fresh ones.
+pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
+    let (executable, argv) = effective
+        .cmdline
+        .split_first()
+        .ok_or("the process has no recorded command line")?;
+    let cwd = match &effective.cwd {
+        Some(path) => Some(
+            path.to_str()
+                .ok_or("the working directory is not text")?
+                .to_string(),
+        ),
+        None => None,
+    };
+    let env = effective
+        .env
+        .iter()
+        .filter(|(name, _)| {
+            ![
+                SUBJECT_ENV,
+                CORRELATION_ENV,
+                crate::runtime::LAUNCH_TOKEN_ENV,
+            ]
+            .contains(&name.as_str())
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    Ok(LaunchContext {
+        executable: executable.clone(),
+        argv: argv.to_vec(),
+        cwd,
+        env,
+    })
+}
+
+/// The public projection of a subject: identities, binding and recorded facts.
+/// It carries no launch data and no correlation, which are private.
+pub fn public_view(subject: &Subject) -> Value {
+    json!({
+        "subject_id": subject.subject_id,
+        "spawn_request_id": subject.spawn_request_id,
+        "state": subject.state,
+        "process": subject.process,
+        "observation": subject.observation,
+        "pane_cleanup": subject.pane_cleanup,
+        "bound_agent_id": subject.bound_agent_id,
+        "signalled_at": subject.signalled_at,
+        "exited_at": subject.exited_at,
+        "recorded_at": subject.recorded_at,
+        "origin": subject.origin,
+        "session": subject.session,
+        "successor": subject.successor,
+    })
+}
+
+/// Subjects in id order after `after`, at most `limit`, for a bounded listing.
+/// Only names are sorted; each returned record is read and validated.
+pub fn list_after(
+    registry: &Registry,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Subject>, String> {
+    let entries = match fs::read_dir(registry.subjects()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("launch subjects: {error}")),
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .map(str::to_string)
+        })
+        .filter(|id| SessionUuid::parse(id).is_some())
+        .filter(|id| after.is_none_or(|after| id.as_str() > after))
+        .collect();
+    ids.extend(
+        registry
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ids()
+            .filter(|id| after.is_none_or(|after| id.as_str() > after))
+            .cloned(),
+    );
+    ids.sort();
+    ids.dedup();
+    ids.truncate(limit);
+    ids.iter().map(|id| read_recorded(registry, id)).collect()
+}
+
+/// Most subject records one recovery pass examines. A pass is bounded so a long
+/// history cannot hold the registry's transition lock for an unbounded time.
+pub const SWEEP_LIMIT: usize = 256;
+
+/// Re-observes recorded launches whose exit notification may have been missed,
+/// including ones whose daemon restarted while the process ran or exited.
+///
+/// Each launch is judged only by its verified birth identity, through the same
+/// path as a wake. Nothing is signalled, relaunched or repeated here. Returns how
+/// many examined launches are verified exited, including ones already recorded.
+pub fn sweep(
+    registry: &Registry,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+) -> Result<usize, String> {
+    let mut ids: Vec<String> = registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .ids()
+        .cloned()
+        .collect();
+    for entry in fs::read_dir(registry.subjects()).map_err(|e| format!("launch subjects: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            && SessionUuid::parse(id).is_some()
+        {
+            ids.push(id.to_owned());
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    let mut exited = 0;
+    for id in ids.into_iter().take(SWEEP_LIMIT) {
+        if observe_exit_from(registry, &id, verifier, now_ms, Observer::Sweep) == Ok(true) {
+            exited += 1;
+        }
+    }
+    Ok(exited)
+}
+
+/// Revokes a launch that is still unbound, and says whether it did.
+fn revoke(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<bool, String> {
+    let _transition = registry.transition();
+    let mut subject = read_recorded(registry, subject_id)?;
+    if !matches!(subject.state, State::Pending | State::Captured) {
+        return Ok(false);
+    }
+    subject.state = State::Revoked;
+    subject.correlation = None;
+    subject.recorded_at = format_millis(now_ms);
+    write(registry, &subject)?;
+    Ok(true)
+}
+
+/// Sends SIGTERM to the captured process through its pidfd, if one is captured
+/// and not yet signalled, and waits boundedly for the exit. The registry lock is
+/// released during the wait.
+fn terminate(
+    registry: &Registry,
+    subject_id: &str,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+    revoked: bool,
+) -> Result<Termination, String> {
+    let (descriptor, signal) = match stage(registry, subject_id, verifier, now_ms)? {
+        Stage::Settled(exit) => {
+            return Ok(Termination {
+                revoked,
+                signal_attempted: false,
+                exit,
+            });
+        }
+        Stage::Watch { descriptor, signal } => (descriptor, signal),
+    };
+    let mut signal_attempted = false;
+    if signal {
+        signal_attempted = true;
+        if let Err(error) = process_control::terminate(&descriptor) {
+            return Ok(Termination {
+                revoked,
+                signal_attempted,
+                exit: Exit::Unverified(format!("SIGTERM could not be sent: {error}")),
+            });
+        }
+    }
+    let exit = if process_control::exited_within(&descriptor, EXIT_DEADLINE) {
+        record_exit(registry, subject_id, now_ms)?;
+        Exit::Exited
+    } else {
+        Exit::Unverified("exit was not verified before the deadline".into())
+    };
+    Ok(Termination {
+        revoked,
+        signal_attempted,
+        exit,
+    })
+}
+
+/// The locked half of a stop: the signal intent, and the descriptor to wait on.
+/// Settles without waiting when there is no captured process to signal.
+fn stage(
+    registry: &Registry,
+    subject_id: &str,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+) -> Result<Stage, String> {
+    let subject = read_recorded(registry, subject_id)?;
+    let Some(process) = subject.process.clone() else {
+        return Ok(Stage::Settled(Exit::Unresolved));
+    };
+    if subject.exited_at.is_some() {
+        return Ok(Stage::Settled(Exit::Exited));
+    }
+    let acquired = process_control::acquire(&process, verifier);
+    let _transition = registry.transition();
+    let mut subject = read_recorded(registry, subject_id)?;
+    if subject.process.as_ref() != Some(&process) {
+        return Ok(Stage::Settled(Exit::Unresolved));
+    }
+    if subject.exited_at.is_some() {
+        return Ok(Stage::Settled(Exit::Exited));
+    }
+    let descriptor = match acquired {
+        Ok(Acquired::Process(descriptor)) => descriptor,
+        Ok(Acquired::Absent | Acquired::Replaced) => {
+            record_exit_locked(registry, &mut subject, now_ms)?;
+            return Ok(Stage::Settled(Exit::Exited));
+        }
+        // An identity that cannot be read is not a process to signal.
+        Err(_) => return Ok(Stage::Settled(Exit::Unresolved)),
+    };
+    let signal = subject.signalled_at.is_none();
+    if signal {
+        subject.signalled_at = Some(format_millis(now_ms));
+        subject.recorded_at = format_millis(now_ms);
+        write(registry, &subject)?;
+    }
+    Ok(Stage::Watch { descriptor, signal })
+}
+
+fn record_exit(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<(), String> {
+    let _transition = registry.transition();
+    let mut subject = read_recorded(registry, subject_id)?;
+    record_exit_locked(registry, &mut subject, now_ms)
+}
+
+fn record_exit_locked(
+    registry: &Registry,
+    subject: &mut Subject,
+    now_ms: i64,
+) -> Result<(), String> {
+    if subject.exited_at.is_none() {
+        subject.exited_at = Some(format_millis(now_ms));
+        subject.recorded_at = format_millis(now_ms);
+        write(registry, subject)?;
+    }
+    Ok(())
+}
+
+/// The command a tracked launch runs: the bootstrap, carrying the target program
+/// and the private correlation. The target's executable, argv, cwd and the
+/// caller's environment overlay are passed through unchanged.
+pub fn wrap(bootstrap: &Bootstrap, ticket: &Ticket, target: LaunchRequest) -> LaunchRequest {
+    let LaunchRequest {
+        pane_id,
+        executable,
+        argv,
+        spawn_token,
+        cwd,
+        mut env,
+    } = target;
+    let mut wrapped = vec![
+        BOOTSTRAP_COMMAND.to_string(),
+        "--socket".to_string(),
+        bootstrap.socket.clone(),
+        "--".to_string(),
+        executable,
+    ];
+    wrapped.extend(argv);
+    env.insert(SUBJECT_ENV.to_string(), ticket.subject_id.clone());
+    env.insert(CORRELATION_ENV.to_string(), ticket.correlation.clone());
+    LaunchRequest {
+        pane_id,
+        executable: bootstrap.executable.clone(),
+        argv: wrapped,
+        spawn_token,
+        cwd,
+        env,
+    }
+}
+
+/// The shell command a pane-death hook runs for one launch. It names the launch
+/// and the server generation the pane was created in; it is a hint, not evidence.
+pub fn wake_command(
+    bootstrap: &Bootstrap,
+    subject_id: &str,
+    server: &ProcessIdentity,
+) -> Result<String, String> {
+    // The paths are single-quoted for the shell, so a quote in either would end
+    // the quoting early.
+    if [&bootstrap.executable, &bootstrap.socket]
+        .iter()
+        .any(|path| path.contains('\''))
+    {
+        return Err("the daemon's paths cannot be quoted for a pane-death hook".into());
+    }
+    Ok(format!(
+        "'{}' {WAKE_COMMAND} --socket '{}' --subject {subject_id} --server {}:{}:{}",
+        bootstrap.executable, bootstrap.socket, server.pid, server.start_ticks, server.boot_id
+    ))
+}
+
+/// Runs as the wake a pane-death hook starts:
+/// `--socket <path> --subject <id> --server <pid>:<start>:<boot>`.
+///
+/// It asks the daemon to reconcile the launch and reports nothing: the hook has no
+/// reader, and a wake that never arrives is recovered by the next read.
+pub fn run_wake(arguments: &[String]) -> i32 {
+    let Some((socket, subject, server)) = parse_wake(arguments) else {
+        eprintln!("radar {WAKE_COMMAND}: malformed invocation");
+        return 2;
+    };
+    match exchange(
+        Path::new(socket),
+        WAKE_METHOD,
+        json!({"subject_id": subject, "server": server}),
+    ) {
+        Ok(_) => 0,
+        Err(message) => {
+            eprintln!("radar {WAKE_COMMAND}: {message}");
+            1
+        }
+    }
+}
+
+fn parse_wake(arguments: &[String]) -> Option<(&str, &str, ProcessIdentity)> {
+    let [
+        socket_flag,
+        socket,
+        subject_flag,
+        subject,
+        server_flag,
+        server,
+    ] = arguments
+    else {
+        return None;
+    };
+    if socket_flag != "--socket" || subject_flag != "--subject" || server_flag != "--server" {
+        return None;
+    }
+    let mut fields = server.splitn(3, ':');
+    let pid = fields.next()?.parse().ok()?;
+    let start_ticks = fields.next()?.parse().ok()?;
+    let boot_id = fields.next()?.to_string();
+    Some((
+        socket,
+        subject,
+        ProcessIdentity {
+            boot_id,
+            pid,
+            start_ticks,
+        },
+    ))
+}
+
+/// Runs as the bootstrap inside a tracked pane: `--socket <path> -- <program>
+/// [argument...]`.
+///
+/// Claims this process with the daemon, then replaces itself with the program.
+/// Returns only on failure, and an unreleased bootstrap never runs the program.
+pub fn run_bootstrap(arguments: &[String]) -> i32 {
+    let Some((socket, program)) = parse_bootstrap(arguments) else {
+        eprintln!("radar {BOOTSTRAP_COMMAND}: malformed invocation");
+        return 2;
+    };
+    if let Err(message) = release(Path::new(socket)) {
+        eprintln!("radar {BOOTSTRAP_COMMAND}: {message}");
+        return 111;
+    }
+    let error = Command::new(program[0])
+        .args(&program[1..])
+        .env_remove(SUBJECT_ENV)
+        .env_remove(CORRELATION_ENV)
+        .exec();
+    eprintln!("radar {BOOTSTRAP_COMMAND}: could not run the program: {error}");
+    127
+}
+
+fn parse_bootstrap(arguments: &[String]) -> Option<(&str, Vec<&str>)> {
+    let [flag, socket, separator, program @ ..] = arguments else {
+        return None;
+    };
+    if flag != "--socket" || separator != "--" || program.is_empty() {
+        return None;
+    }
+    Some((socket, program.iter().map(String::as_str).collect()))
+}
+
+fn release(socket: &Path) -> Result<(), String> {
+    let subject = std::env::var(SUBJECT_ENV).map_err(|_| "no launch subject".to_string())?;
+    let correlation =
+        std::env::var(CORRELATION_ENV).map_err(|_| "no launch correlation".to_string())?;
+    let process = LocalProcfsVerifier
+        .inspect(std::process::id() as i32)?
+        .ok_or_else(|| "this process has no identity to claim".to_string())?;
+    let result = exchange(
+        socket,
+        BOOTSTRAP_METHOD,
+        json!({"subject_id": subject, "correlation": correlation, "process": process}),
+    )?;
+    match result.get("released") {
+        Some(Value::Bool(true)) => Ok(()),
+        _ => Err("launch was not released".into()),
+    }
+}
+
+/// One request on the daemon socket, answered with its result. A refusal is an
+/// error: its text is the daemon's, and it never carries a correlation.
+fn exchange(socket: &Path, method: &str, params: Value) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|error| format!("daemon socket is unavailable: {error}"))?;
+    stream
+        .set_read_timeout(Some(RELEASE_DEADLINE))
+        .and_then(|()| stream.set_write_timeout(Some(RELEASE_DEADLINE)))
+        .map_err(|error| error.to_string())?;
+    let request = json!({
+        "version": PROTOCOL_VERSION,
+        "id": random_uuid(),
+        "method": method,
+        "params": params,
+    });
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .map_err(|error| format!("could not send the request: {error}"))?;
+    let mut line = String::new();
+    BufReader::new((&stream).take(MAX_LINE_BYTES as u64))
+        .read_line(&mut line)
+        .map_err(|error| format!("no answer from the daemon: {error}"))?;
+    let response: Value =
+        serde_json::from_str(&line).map_err(|_| "the daemon's answer is unreadable".to_string())?;
+    match response.get("result") {
+        Some(result) => Ok(result.clone()),
+        None => Err("the daemon refused the request".into()),
+    }
+}
+
+fn write(registry: &Registry, subject: &Subject) -> Result<(), String> {
+    use crate::control_plane::events::{Facts, Source, Transition};
+    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = log.facts(&subject.subject_id).cloned();
+    let previous = if let Some(facts) = previous {
+        Some(facts)
+    } else {
+        let legacy_path = path(registry, &subject.subject_id);
+        let legacy = if legacy_path.try_exists().map_err(|e| e.to_string())? {
+            let bytes = read_record_file(&legacy_path, MAX_SUBJECT_BYTES)?;
+            Some(
+                serde_json::from_slice::<Subject>(&bytes)
+                    .map_err(|_| "invalid legacy lifecycle subject")?,
+            )
+        } else {
+            None
+        };
+        let seed = legacy.as_ref().unwrap_or(subject);
+        let directory = registry.subjects().join("private");
+        crate::control_plane::registry::prepare_directory(&directory)?;
+        let bytes = serde_json::to_vec_pretty(seed)
+            .map_err(|_| "cannot encode private lifecycle recipe")?;
+        write_atomic(
+            &directory,
+            &recipe_path(registry, &subject.subject_id),
+            &bytes,
+            MAX_SUBJECT_BYTES,
+        )?;
+        if let Some(legacy) = legacy {
+            let facts = Facts::from_subject(&legacy);
+            log.append(
+                &subject.subject_id,
+                &legacy.recorded_at,
+                Source::RecoveryImport,
+                Transition::Imported(facts.clone()),
+            )?;
+            Some(facts)
+        } else {
+            let facts = Facts::from_subject(subject);
+            let (source, transition) = match subject.origin {
+                Origin::Spawned => (Source::Launch, Transition::Created(facts)),
+                Origin::Enrolled => (Source::Operator, Transition::Enrolled(facts)),
+            };
+            return log.append(
+                &subject.subject_id,
+                &subject.recorded_at,
+                source,
+                transition,
+            );
+        }
+    };
+    let previous = previous.expect("baseline established");
+    let target = Facts::from_subject(subject);
+    if previous == target {
+        return Ok(());
+    }
+    let (source, transition) = if previous.state != target.state {
+        match target.state {
+            State::Captured => (
+                Source::Bootstrap,
+                Transition::Captured(target.process.clone().ok_or("capture has no process")?),
+            ),
+            State::Bound => (
+                Source::Registration,
+                Transition::Bound {
+                    agent_id: target
+                        .bound_agent_id
+                        .clone()
+                        .ok_or("binding has no agent")?,
+                },
+            ),
+            State::Revoked => (Source::ProcessControl, Transition::Revoked),
+            State::Pending => return Err("cannot return a subject to pending".into()),
+        }
+    } else if previous.observation != target.observation {
+        (
+            Source::ProcessObservation,
+            Transition::Observed(
+                target
+                    .observation
+                    .clone()
+                    .ok_or("cannot remove a process observation")?,
+            ),
+        )
+    } else if previous.exited_at != target.exited_at {
+        (Source::ProcessObservation, Transition::ExitVerified)
+    } else if previous.pane_cleanup != target.pane_cleanup {
+        (
+            Source::PaneControl,
+            Transition::PaneCleanup(
+                target
+                    .pane_cleanup
+                    .clone()
+                    .ok_or("cannot remove a pane cleanup outcome")?,
+            ),
+        )
+    } else if previous.signalled_at != target.signalled_at {
+        (Source::ProcessControl, Transition::SignalRequested)
+    } else if previous.successor != target.successor {
+        (
+            Source::Operator,
+            Transition::SuccessorReserved {
+                spawn_request_id: target
+                    .successor
+                    .clone()
+                    .ok_or("cannot remove a successor")?,
+            },
+        )
+    } else {
+        return Err("unsupported lifecycle transition".into());
+    };
+    log.append_checked(
+        &subject.subject_id,
+        &subject.recorded_at,
+        source,
+        transition,
+        &target,
+    )
+}
+
+fn recipe_path(registry: &Registry, subject_id: &str) -> PathBuf {
+    registry
+        .subjects()
+        .join("private")
+        .join(format!("{subject_id}.json"))
+}
+
+fn path(registry: &Registry, subject_id: &str) -> PathBuf {
+    registry.subjects().join(format!("{subject_id}.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    use super::*;
+
+    const SPAWN: &str = "5b2e8c41-0a7d-4f36-b1d9-6c3a7e5f8b1d";
+    const AGENT: &str = "7d1f3a2b-4c5e-4f60-8a9b-0c1d2e3f4a5b";
+
+    /// A state root under the temp directory, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("radar-lifecycle-{label}-{}", random_uuid()));
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&path)
+                .expect("scratch root");
+            Self(path)
+        }
+
+        /// Opens the registry the way a daemon restart does.
+        fn registry(&self) -> Registry {
+            Registry::open(&self.0).expect("registry")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A verifier for a launch that has no captured process: any inspection is a
+    /// failure of the claim that nothing was signalled.
+    struct Uninspected;
+
+    impl ProcessVerifier for Uninspected {
+        fn inspect(&self, _pid: i32) -> Result<Option<ProcessIdentity>, String> {
+            panic!("an uncaptured launch must not inspect any process")
+        }
+    }
+
+    /// A child that is killed if the test panics before it is waited for.
+    struct Child(std::process::Child);
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn launch() -> LaunchContext {
+        LaunchContext {
+            executable: "/usr/bin/pi".into(),
+            argv: vec!["--resume".into()],
+            cwd: None,
+            env: BTreeMap::from([("RADAR_TEST_MARK".to_string(), "value".to_string())]),
+        }
+    }
+
+    /// The kernel's view of a bootstrap that was started with `launch`.
+    fn started_as(launch: &LaunchContext) -> Effective {
+        let mut cmdline = vec![
+            "radar".to_string(),
+            BOOTSTRAP_COMMAND.to_string(),
+            "--socket".to_string(),
+            "/run/radar.sock".to_string(),
+            "--".to_string(),
+            launch.executable.clone(),
+        ];
+        cmdline.extend(launch.argv.iter().cloned());
+        Effective {
+            cmdline,
+            cwd: None,
+            env: launch.env.clone(),
+        }
+    }
+
+    fn identity(pid: i32) -> ProcessIdentity {
+        ProcessIdentity {
+            boot_id: "boot".into(),
+            pid,
+            start_ticks: 42,
+        }
+    }
+
+    /// A verifier whose identity cannot be read at all.
+    struct Unreadable;
+
+    impl ProcessVerifier for Unreadable {
+        fn inspect(&self, _pid: i32) -> Result<Option<ProcessIdentity>, String> {
+            Err("the process identity cannot be read".into())
+        }
+    }
+
+    #[test]
+    fn a_launch_cancelled_before_capture_is_never_released() {
+        let scratch = Scratch::new("before-capture");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+        let subject = ticket.subject_id.as_str();
+
+        let cancelled = cancel(&registry, subject, &Uninspected, 2).expect("cancel");
+        assert_eq!(
+            cancelled,
+            Termination {
+                revoked: true,
+                signal_attempted: false,
+                exit: Exit::Unresolved,
+            }
+        );
+        let claim = capture(
+            &registry,
+            subject,
+            &ticket.correlation,
+            &identity(7),
+            &started_as(&launch()),
+            3,
+        );
+        assert_eq!(claim, Err(NOT_AWAITING.to_string()));
+
+        // Revocation is durable: a reopened registry still refuses every bind.
+        let reopened = scratch.registry();
+        assert_eq!(
+            read(&reopened, subject)
+                .expect("read")
+                .expect("subject")
+                .state,
+            State::Revoked
+        );
+        assert_eq!(
+            fence_registration(&reopened, subject, Some(&identity(7)), Some(AGENT), 4),
+            Err("launch was cancelled".to_string())
+        );
+        // A repeated cancel revokes nothing further and signals nothing.
+        let again = cancel(&reopened, subject, &Uninspected, 5).expect("cancel");
+        assert_eq!(
+            again,
+            Termination {
+                revoked: false,
+                signal_attempted: false,
+                exit: Exit::Unresolved,
+            }
+        );
+    }
+
+    #[test]
+    fn a_captured_claim_is_spent_and_survives_reopen() {
+        let scratch = Scratch::new("spent");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+        let subject = ticket.subject_id.as_str();
+        capture(
+            &registry,
+            subject,
+            &ticket.correlation,
+            &identity(7),
+            &started_as(&launch()),
+            2,
+        )
+        .expect("capture");
+
+        let reopened = scratch.registry();
+        assert_eq!(
+            capture(
+                &reopened,
+                subject,
+                &ticket.correlation,
+                &identity(7),
+                &started_as(&launch()),
+                3,
+            ),
+            Err(NOT_AWAITING.to_string()),
+            "a replayed correlation is spent"
+        );
+        fence_registration(&reopened, subject, Some(&identity(7)), Some(AGENT), 4)
+            .expect("the captured identity binds");
+        assert_eq!(
+            fence_registration(&reopened, subject, Some(&identity(8)), Some(AGENT), 5),
+            Err("launch is already bound to another registration".to_string())
+        );
+    }
+
+    #[test]
+    fn a_process_not_started_with_the_requested_launch_is_not_captured() {
+        let scratch = Scratch::new("mismatch");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+        let subject = ticket.subject_id.as_str();
+
+        let mut altered = started_as(&launch());
+        altered
+            .env
+            .insert("RADAR_TEST_MARK".into(), "changed".into());
+        assert_eq!(
+            capture(
+                &registry,
+                subject,
+                &ticket.correlation,
+                &identity(7),
+                &altered,
+                2
+            ),
+            Err(LAUNCH_MISMATCH.to_string())
+        );
+        let still_pending = read(&registry, subject).expect("read").expect("subject");
+        assert_eq!(still_pending.state, State::Pending);
+        assert_eq!(
+            still_pending.correlation.as_deref(),
+            Some(ticket.correlation.as_str())
+        );
+    }
+
+    #[test]
+    fn a_registration_bound_before_cancel_stops_exactly_its_process() {
+        let scratch = Scratch::new("bound-first");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+        let subject = ticket.subject_id.as_str();
+        let mut child = Child(Command::new("sleep").arg("300").spawn().expect("sleep"));
+        let pid = child.0.id() as i32;
+        let process = LocalProcfsVerifier
+            .inspect(pid)
+            .expect("procfs")
+            .expect("the child is alive");
+        capture(
+            &registry,
+            subject,
+            &ticket.correlation,
+            &process,
+            &started_as(&launch()),
+            2,
+        )
+        .expect("capture");
+        fence_registration(&registry, subject, Some(&process), Some(AGENT), 3).expect("bind");
+
+        let cancelled = cancel(&registry, subject, &LocalProcfsVerifier, 4).expect("cancel");
+        assert_eq!(
+            cancelled,
+            Termination {
+                revoked: false,
+                signal_attempted: true,
+                exit: Exit::Exited,
+            }
+        );
+        let status = child.0.wait().expect("reaped");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert_eq!(
+            read(&registry, subject)
+                .expect("read")
+                .expect("subject")
+                .state,
+            State::Bound
+        );
+    }
+
+    /// Captures a live child as a tracked launch, bound to the test's agent.
+    fn captured_child(registry: &Registry) -> (String, Child, ProcessIdentity) {
+        let ticket = create(registry, SPAWN, launch(), None, 1).expect("subject");
+        let child = Child(Command::new("sleep").arg("300").spawn().expect("sleep"));
+        let process = LocalProcfsVerifier
+            .inspect(child.0.id() as i32)
+            .expect("procfs")
+            .expect("the child is alive");
+        capture(
+            registry,
+            &ticket.subject_id,
+            &ticket.correlation,
+            &process,
+            &started_as(&launch()),
+            2,
+        )
+        .expect("capture");
+        (ticket.subject_id, child, process)
+    }
+
+    #[test]
+    fn a_process_that_exited_while_no_daemon_observed_it_is_recorded_by_the_sweep() {
+        let scratch = Scratch::new("sweep-exited");
+        let registry = scratch.registry();
+        let (subject, mut child, _) = captured_child(&registry);
+        child.0.kill().expect("kill");
+        child.0.wait().expect("reaped");
+
+        // A restarted daemon opens the same records and runs its first pass.
+        let restarted = scratch.registry();
+        assert_eq!(sweep(&restarted, &LocalProcfsVerifier, 3), Ok(1));
+        let recorded = read(&restarted, &subject).expect("read").expect("subject");
+        assert!(recorded.exited_at.is_some());
+        assert!(recorded.signalled_at.is_none(), "the sweep never signals");
+    }
+
+    #[test]
+    fn a_live_process_is_neither_recorded_nor_signalled_by_the_sweep() {
+        let scratch = Scratch::new("sweep-live");
+        let registry = scratch.registry();
+        let (subject, mut child, _) = captured_child(&registry);
+
+        assert_eq!(sweep(&registry, &LocalProcfsVerifier, 3), Ok(0));
+        assert!(
+            child.0.try_wait().expect("try_wait").is_none(),
+            "still running"
+        );
+        let kept = read(&registry, &subject).expect("read").expect("subject");
+        assert!(kept.exited_at.is_none());
+        assert!(kept.signalled_at.is_none());
+        let observation = kept.observation.expect("running observation");
+        assert_eq!(observation.evidence, Evidence::Running);
+        assert_eq!(observation.source, Observer::Sweep);
+        let tail = registry.events.lock().unwrap().tail();
+        assert_eq!(sweep(&registry, &LocalProcfsVerifier, 4), Ok(0));
+        assert_eq!(
+            registry.events.lock().unwrap().tail(),
+            tail,
+            "unchanged samples are not new transitions"
+        );
+    }
+
+    #[test]
+    fn unavailable_reconciliation_preserves_the_process_and_can_recover() {
+        let scratch = Scratch::new("observation-unavailable");
+        let registry = scratch.registry();
+        let (subject, mut child, _) = captured_child(&registry);
+        assert!(observe_exit(&registry, &subject, &Unreadable, 3).is_err());
+        let unknown = read(&registry, &subject).unwrap().unwrap();
+        assert_eq!(unknown.observation.unwrap().evidence, Evidence::Unavailable);
+        assert!(unknown.exited_at.is_none());
+        assert!(unknown.signalled_at.is_none());
+        assert_eq!(
+            observe_exit(&registry, &subject, &LocalProcfsVerifier, 4),
+            Ok(false)
+        );
+        assert_eq!(
+            read(&registry, &subject)
+                .unwrap()
+                .unwrap()
+                .observation
+                .unwrap()
+                .evidence,
+            Evidence::Running
+        );
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_pane_cleanup_is_recorded_once_and_only_for_a_revoked_launch() {
+        let scratch = Scratch::new("pane-cleanup");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+        let subject = ticket.subject_id.as_str();
+
+        // A launch no cancel revoked is not cleaned up: its pane is still the
+        // launch's, and only a cancel acts on it.
+        assert!(record_pane_cleanup(&registry, subject, PaneCleanup::Cleaned, 2).is_err());
+
+        let cancelled = cancel(&registry, subject, &Uninspected, 3).expect("cancel");
+        assert!(cancelled.revoked);
+        let refused = PaneCleanup::Refused("kept for the operator".into());
+        assert_eq!(
+            record_pane_cleanup(&registry, subject, refused.clone(), 4).expect("cleanup"),
+            refused
+        );
+
+        // The first outcome is the durable one: a later cancel reports it rather
+        // than closing anything again.
+        assert_eq!(
+            record_pane_cleanup(&registry, subject, PaneCleanup::Cleaned, 5).expect("cleanup"),
+            refused
+        );
+        drop(registry);
+
+        // The outcome is replayed from the log, not read from a mutable file.
+        let reopened = crate::control_plane::Registry::open(&scratch.0).expect("reopen");
+        let restored = read(&reopened, subject).expect("read").expect("subject");
+        assert_eq!(restored.pane_cleanup, Some(refused));
+        assert_eq!(restored.state, State::Revoked);
+    }
+
+    #[test]
+    fn concurrent_hints_coalesce_without_blocking_an_independent_subject() {
+        use std::sync::{Arc, Mutex, mpsc};
+        struct Blocked {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl ProcessVerifier for Blocked {
+            fn inspect(&self, _pid: i32) -> Result<Option<ProcessIdentity>, String> {
+                self.entered.send(()).unwrap();
+                let _ = self.release.lock().unwrap().recv();
+                Err("source unavailable".into())
+            }
+        }
+        let scratch = Scratch::new("coalesced-observation");
+        let registry = Arc::new(scratch.registry());
+        let (subject, _child, _) = captured_child(&registry);
+        let other = create(&registry, &random_uuid(), launch(), None, 1).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let verifier = Arc::new(Blocked {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let observing = Arc::clone(&registry);
+        let observed = subject.clone();
+        let source = Arc::clone(&verifier);
+        let first =
+            std::thread::spawn(move || observe_exit(&observing, &observed, source.as_ref(), 3));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            observe_exit(&registry, &subject, &Uninspected, 4),
+            Ok(false),
+            "a duplicate hint must not inspect again"
+        );
+        let independent = Arc::clone(&registry);
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            done_tx
+                .send(cancel(&independent, &other.subject_id, &Uninspected, 4))
+                .unwrap()
+        });
+        let done = done_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        second.join().unwrap();
+        assert!(
+            done.expect("independent cancellation must not wait for the blocked source")
+                .unwrap()
+                .revoked
+        );
+    }
+
+    #[test]
+    fn a_stop_leaves_an_unbound_launch_unrevoked() {
+        let scratch = Scratch::new("stop-pending");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+
+        let stopped = stop(&registry, &ticket.subject_id, &Uninspected, 2).expect("stop");
+        assert_eq!(
+            stopped,
+            Termination {
+                revoked: false,
+                signal_attempted: false,
+                exit: Exit::Unresolved,
+            }
+        );
+        let subject = read(&registry, &ticket.subject_id)
+            .expect("read")
+            .expect("subject");
+        assert_eq!(subject.state, State::Pending);
+    }
+
+    #[test]
+    fn a_stop_of_a_reused_pid_signals_nothing_and_records_the_claim_gone() {
+        let scratch = Scratch::new("stop-reused");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+        let subject = ticket.subject_id.as_str();
+        let mut child = Child(Command::new("sleep").arg("300").spawn().expect("sleep"));
+        let pid = child.0.id() as i32;
+        let live = LocalProcfsVerifier
+            .inspect(pid)
+            .expect("procfs")
+            .expect("the child is alive");
+        // The claim names this PID as it was at some earlier incarnation.
+        let claimed = ProcessIdentity {
+            start_ticks: live.start_ticks + 1,
+            ..live
+        };
+        capture(
+            &registry,
+            subject,
+            &ticket.correlation,
+            &claimed,
+            &started_as(&launch()),
+            2,
+        )
+        .expect("capture");
+
+        let stopped = stop(&registry, subject, &LocalProcfsVerifier, 3).expect("stop");
+        assert_eq!(
+            stopped,
+            Termination {
+                revoked: false,
+                signal_attempted: false,
+                exit: Exit::Exited,
+            }
+        );
+        assert!(child.0.try_wait().expect("child state").is_none());
+    }
+
+    #[test]
+    fn a_stop_of_an_unreadable_identity_is_unresolved_and_signals_nothing() {
+        let scratch = Scratch::new("stop-unreadable");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+        let subject = ticket.subject_id.as_str();
+        capture(
+            &registry,
+            subject,
+            &ticket.correlation,
+            &identity(7),
+            &started_as(&launch()),
+            2,
+        )
+        .expect("capture");
+
+        let stopped = stop(&registry, subject, &Unreadable, 3).expect("stop");
+        assert_eq!(
+            stopped,
+            Termination {
+                revoked: false,
+                signal_attempted: false,
+                exit: Exit::Unresolved,
+            }
+        );
+        let record = read(&registry, subject).expect("read").expect("subject");
+        assert_eq!(record.signalled_at, None);
+        assert_eq!(record.exited_at, None);
+    }
+}
+
+#[cfg(test)]
+mod resume_recipe_tests {
+    use super::*;
+
+    fn launch(argv: &[&str]) -> LaunchContext {
+        LaunchContext {
+            executable: "pi".into(),
+            argv: argv.iter().map(|arg| arg.to_string()).collect(),
+            cwd: None,
+            env: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn resume_replaces_prior_session_selectors_with_the_live_session() {
+        let resumed = resume_launch(
+            &launch(&[
+                "--session",
+                "old",
+                "--model",
+                "m",
+                "--continue",
+                "--name",
+                "lead",
+            ]),
+            "1234",
+        )
+        .expect("resume");
+        assert_eq!(
+            resumed.argv,
+            ["--model", "m", "--name", "lead", "--session", "1234"]
+        );
+    }
+
+    #[test]
+    fn resume_strips_equals_form_and_fork_selectors() {
+        let resumed =
+            resume_launch(&launch(&["--session=old", "--fork", "x", "-r"]), "9").expect("resume");
+        assert_eq!(resumed.argv, ["--session", "9"]);
+    }
+
+    #[test]
+    fn resume_refuses_a_bare_message_argument() {
+        assert!(resume_launch(&launch(&["--model", "m", "fix the build"]), "1").is_err());
+    }
+
+    #[test]
+    fn captured_launch_drops_radar_bootstrap_and_token_variables() {
+        let mut env = BTreeMap::new();
+        env.insert(SUBJECT_ENV.to_string(), "s".to_string());
+        env.insert(CORRELATION_ENV.to_string(), "c".to_string());
+        env.insert(
+            crate::runtime::LAUNCH_TOKEN_ENV.to_string(),
+            "t".to_string(),
+        );
+        env.insert("KEEP".to_string(), "v".to_string());
+        let effective = Effective {
+            cmdline: vec!["pi".into(), "--session".into(), "x".into()],
+            cwd: None,
+            env,
+        };
+        let captured = captured_launch(&effective).expect("captured");
+        assert_eq!(captured.executable, "pi");
+        assert_eq!(captured.argv, ["--session", "x"]);
+        assert_eq!(captured.env.keys().collect::<Vec<_>>(), ["KEEP"]);
+    }
+}

@@ -1006,6 +1006,7 @@ mod tests {
     fn inventory(panes: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
         FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: Vec::new(),
             tabs: vec![crate::model::Tab {
                 tab_id: "wA:t1".into(),

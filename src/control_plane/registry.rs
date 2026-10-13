@@ -63,6 +63,8 @@ pub const MAX_LISTED: usize = 100;
 
 /// The directory inside the state root that holds one file per agent.
 const AGENTS: &str = "agents";
+/// The directory inside the state root that holds one file per launch subject.
+const SUBJECTS: &str = "lifecycle";
 
 /// Where an agent's incarnation lives on one backend, in that backend's own
 /// coordinates.
@@ -390,6 +392,8 @@ pub struct Registry {
     /// cross-process/distributed lock. The state root has one owning daemon.
     admission: Mutex<()>,
     journal: std::sync::Mutex<Option<crate::control_plane::store::Store>>,
+    pub(crate) observing: Mutex<std::collections::HashSet<String>>,
+    pub(crate) events: std::sync::Arc<Mutex<crate::control_plane::events::Log>>,
 }
 
 /// Durable managed-child close requests: the edge and child they target, the
@@ -464,6 +468,8 @@ impl Registry {
         prepare_directory(&spawns)?;
         let closes = root.join(child_close::CLOSES);
         prepare_directory(&closes)?;
+        let subjects = root.join(SUBJECTS);
+        prepare_directory(&subjects)?;
         Ok(Self {
             directory,
             root: root.to_path_buf(),
@@ -471,6 +477,8 @@ impl Registry {
             serving_epoch: random_uuid(),
             admission: Mutex::new(()),
             journal: std::sync::Mutex::new(None),
+            observing: Mutex::new(std::collections::HashSet::new()),
+            events: crate::control_plane::events::shared(&root.join("events"))?,
         })
     }
 
@@ -496,6 +504,8 @@ impl Registry {
             .clone();
         if let Some(store) = store {
             let event = crate::control_plane::store::Event {
+                subject_id: None,
+                lifecycle_event_id: None,
                 seq: 0,
                 kind: kind.to_string(),
                 agent_id: agent_id.map(str::to_string),
@@ -527,6 +537,11 @@ impl Registry {
     /// The `closes` directory.
     pub fn closes(&self) -> PathBuf {
         self.root.join(child_close::CLOSES)
+    }
+
+    /// The directory of daemon launch subjects.
+    pub(crate) fn subjects(&self) -> PathBuf {
+        self.root.join(SUBJECTS)
     }
 
     /// The registration for one source incarnation.
@@ -623,6 +638,11 @@ impl Registry {
         now_ms: i64,
     ) -> Result<SpawnEdge, String> {
         spawn::record_exit_observation(self, request_id, code, signal, now_ms)
+    }
+
+    /// Records the launch subject a tracked spawn's edge belongs to.
+    pub fn attach_subject(&self, request_id: &str, subject_id: &str) -> Result<SpawnEdge, String> {
+        spawn::attach_subject(self, request_id, subject_id)
     }
 
     /// Binds the edge a spawn token minted to the child that presented it,
@@ -726,7 +746,7 @@ impl Registry {
         context::published(self, agent_id, now_ms)
     }
 
-    fn transition(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(crate) fn transition(&self) -> std::sync::MutexGuard<'_, ()> {
         self.admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1009,7 +1029,7 @@ fn decode(bytes: &[u8]) -> Result<Registration, String> {
 /// planted path cannot be read as a registry or publication record. Extracting
 /// the two copies into one shared helper belongs with a change that may touch
 /// the store.
-fn read_record_file(path: &Path, bound: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn read_record_file(path: &Path, bound: usize) -> Result<Vec<u8>, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("record {}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1044,7 +1064,7 @@ fn read_record_file(path: &Path, bound: usize) -> Result<Vec<u8>, String> {
 ///
 /// The mutation store applies the same rule to its own directory; the two remain
 /// separate until a change may touch the store.
-fn prepare_directory(directory: &Path) -> Result<(), String> {
+pub(crate) fn prepare_directory(directory: &Path) -> Result<(), String> {
     let diagnostic =
         |error: std::io::Error| format!("registry directory {}: {error}", directory.display());
     if !directory.exists() {

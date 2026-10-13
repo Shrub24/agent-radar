@@ -68,6 +68,10 @@ fn journal_lock(root: &Path) -> Arc<Mutex<()>> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_event_id: Option<String>,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -82,6 +86,8 @@ pub struct Event {
 struct Journal {
     epoch: String,
     next_seq: u64,
+    #[serde(default)]
+    source_seq: u64,
     events: Vec<Event>,
 }
 
@@ -316,7 +322,16 @@ pub struct Store {
     root: PathBuf,
     journal_lock: Arc<Mutex<()>>,
     event_wake: Arc<(Mutex<u64>, std::sync::Condvar)>,
+    events: Arc<Mutex<super::events::Log>>,
 }
+
+pub(crate) fn notify_events(root: &Path) {
+    let wake = event_wake(root);
+    *wake.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    wake.1.notify_all();
+}
+
+mod delivery;
 
 impl Store {
     /// Opens the store under `root`, creating `root` and its `requests`
@@ -335,6 +350,7 @@ impl Store {
             root: root.to_path_buf(),
             journal_lock: journal_lock(root),
             event_wake: event_wake(root),
+            events: super::events::shared(&root.join("events"))?,
         };
         store.begin_journal_epoch()?;
         Ok(store)
@@ -388,6 +404,7 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Journal {
                 epoch: random_uuid(),
                 next_seq: 1,
+                source_seq: 0,
                 events: Vec::new(),
             }),
             Err(error) => Err(format!("event journal: {error}")),
@@ -406,7 +423,8 @@ impl Store {
                 .open(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-            fs::rename(&temporary, self.root.join(JOURNAL))
+            fs::rename(&temporary, self.root.join(JOURNAL))?;
+            fs::File::open(&self.root)?.sync_all()
         })();
         if let Err(error) = result {
             let _ = fs::remove_file(temporary);
@@ -427,9 +445,15 @@ impl Store {
         {
             return Err("event kind must be nonempty bounded text".into());
         }
-        for identifier in [&event.agent_id, &event.spawn, &event.request_id]
-            .into_iter()
-            .flatten()
+        for identifier in [
+            &event.agent_id,
+            &event.spawn,
+            &event.request_id,
+            &event.subject_id,
+            &event.lifecycle_event_id,
+        ]
+        .into_iter()
+        .flatten()
         {
             if identifier.is_empty()
                 || identifier.len() > 128
@@ -496,20 +520,13 @@ impl Store {
 
     /// Retained events in sequence order, for internal verification and future reads.
     pub fn events(&self) -> Result<Vec<Event>, String> {
-        Ok(self.load_journal()?.events)
+        Ok(self.event_snapshot()?.3)
     }
 
     /// Journal epoch, current cursor and earliest retained sequence.
     pub fn event_cursor(&self) -> Result<(String, u64, u64), String> {
-        let journal = self.load_journal()?;
-        Ok((
-            journal.epoch,
-            journal.next_seq.saturating_sub(1),
-            journal
-                .events
-                .first()
-                .map_or(journal.next_seq, |event| event.seq),
-        ))
+        let (epoch, tail, earliest, _, _) = self.event_snapshot()?;
+        Ok((epoch, tail, earliest))
     }
 
     /// The `requests` directory.
@@ -522,16 +539,35 @@ impl Store {
         validate_id(id)?;
         let path = self.path(id);
         match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self
+                    .events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .operation(id)
+                    .is_some()
+                {
+                    return Err("event-backed operation is missing its private seed".into());
+                }
+                return Ok(None);
+            }
             Err(error) => return Err(format!("request record {}: {error}", path.display())),
             Ok(_) => {}
         }
         let bytes = read_record_file(&path)?;
-        let record = decode(&bytes).map_err(|error| format!("request {id}: {error}"))?;
+        let mut record = decode(&bytes).map_err(|error| format!("request {id}: {error}"))?;
         if record.id != id {
             return Err(format!(
                 "request {id}: record id does not match its filename"
             ));
+        }
+        if let Some(projection) = self
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .operation(id)
+        {
+            super::events::operations::apply(projection, &mut record)?;
         }
         Ok(Some(record))
     }
@@ -540,6 +576,24 @@ impl Store {
     /// replace the first record, even if the method or target differs.
     pub fn create(&self, record: &RequestRecord) -> Result<(), String> {
         validate_id(&record.id)?;
+        if super::events::operations::managed(&record.method) {
+            if self.get(&record.id)?.is_some() {
+                return Err(format!("request {} already exists", record.id));
+            }
+            let mut log = self.events.lock().unwrap_or_else(|e| e.into_inner());
+            if log.operation(&record.id).is_some() {
+                return Err(format!("request {} already exists", record.id));
+            }
+            let bytes = serde_json::to_vec_pretty(record)
+                .map_err(|_| "cannot encode private operation seed")?;
+            super::registry::publication::write_atomic(
+                &self.directory,
+                &self.path(&record.id),
+                &bytes,
+                MAX_RECORD_BYTES,
+            )?;
+            return log.record_operation(record, false);
+        }
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|error| format!("request {}: {error}", record.id))?;
         if bytes.len() > MAX_RECORD_BYTES {
@@ -578,8 +632,18 @@ impl Store {
     /// request id.
     pub fn write(&self, record: &RequestRecord) -> Result<(), String> {
         validate_id(&record.id)?;
-        if self.get(&record.id)?.is_none() {
-            return Err(format!("request {} does not exist", record.id));
+        let previous = self
+            .get(&record.id)?
+            .ok_or_else(|| format!("request {} does not exist", record.id))?;
+        if super::events::operations::managed(&record.method) {
+            if previous.params != record.params || previous.fingerprint != record.fingerprint {
+                return Err("operation update changes private admitted parameters".into());
+            }
+            let mut log = self.events.lock().unwrap_or_else(|e| e.into_inner());
+            if log.operation(&record.id).is_none() {
+                log.record_operation(&previous, true)?;
+            }
+            return log.record_operation(record, false);
         }
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|error| format!("request {}: {error}", record.id))?;
@@ -637,8 +701,24 @@ impl Store {
                     path.display()
                 ));
             }
+            let mut record = record;
+            if let Some(projection) = self
+                .events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .operation(&record.id)
+            {
+                super::events::operations::apply(projection, &mut record)?;
+            }
             records.push(record);
         }
+        let log = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        for id in log.operation_ids() {
+            if !records.iter().any(|record| &record.id == id) {
+                return Err("event-backed operation is missing its private seed".into());
+            }
+        }
+        drop(log);
         records.sort_by(|left, right| {
             let left_at = timestamp_millis(&left.requested_at).unwrap_or(i64::MIN);
             let right_at = timestamp_millis(&right.requested_at).unwrap_or(i64::MIN);
@@ -907,6 +987,8 @@ mod tests {
         for n in 0..MAX_EVENTS + 1 {
             store
                 .append_event(Event {
+                    subject_id: None,
+                    lifecycle_event_id: None,
                     seq: 0,
                     kind: format!("k{n}"),
                     agent_id: Some("agent".into()),
@@ -928,6 +1010,8 @@ mod tests {
         assert_eq!(reopened.event_cursor().unwrap().0, epoch);
         let event = reopened
             .append_event(Event {
+                subject_id: None,
+                lifecycle_event_id: None,
                 seq: 0,
                 kind: "publication".into(),
                 agent_id: Some("a".into()),
@@ -953,6 +1037,8 @@ mod tests {
                     for item in 0..25 {
                         store
                             .append_event(Event {
+                                subject_id: None,
+                                lifecycle_event_id: None,
                                 seq: 0,
                                 kind: "concurrent".into(),
                                 agent_id: Some(format!("{worker}-{item}")),

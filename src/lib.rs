@@ -12,6 +12,7 @@ pub mod herdr;
 pub mod lifecycle;
 pub mod model;
 pub mod observation;
+pub mod process_control;
 pub mod process_icons;
 pub mod procfs;
 pub mod registry_observation;

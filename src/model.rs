@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::control_plane::containers::PublicContainer;
 use crate::registry_observation::RegistryView;
 
 mod option_duration_millis {
@@ -573,6 +574,11 @@ pub struct FleetObservation {
     /// presented as agent facts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_agents: Vec<AgentObservation>,
+    /// The containers this daemon records, read beside the registry facts. A
+    /// backend's inventory never carries them, and an empty list means no
+    /// container was read — not that none exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub containers: Vec<PublicContainer>,
 }
 
 impl FleetObservation {

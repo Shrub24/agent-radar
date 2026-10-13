@@ -360,6 +360,7 @@ mod tests {
     fn observation(pane_ids: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
         FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![],
             tabs: vec![],
             panes: pane_ids

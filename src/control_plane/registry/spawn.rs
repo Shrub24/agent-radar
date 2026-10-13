@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::control::timestamp_millis;
+use crate::control_plane::lifecycle;
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
 use crate::model::{ProcessIdentity, SessionUuid};
 
@@ -119,6 +120,10 @@ pub struct SpawnEdge {
     /// Logical session parent; absent only on legacy v1 process-parented edges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// The launch subject a tracked launch belongs to. Absent on an untracked
+    /// edge, and then binding is not fenced by a subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
     /// Private. It appears in no projection and in no refusal.
     pub token: String,
     /// Where the child was created, once a create answered.
@@ -158,6 +163,7 @@ impl SpawnEdge {
             request_id: self.request_id.clone(),
             parent: self.parent.clone(),
             parent_session_id: self.parent_session_id.clone(),
+            subject_id: self.subject_id.clone(),
             location: self.location.clone(),
             created: self.created,
             launched: self.launched,
@@ -227,6 +233,8 @@ pub struct PublicSpawnEdge {
     pub parent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<RegistryLocation>,
     pub created: RequestOutcome,
@@ -333,6 +341,7 @@ pub fn record(
         request_id: request.request_id.clone(),
         parent: request.parent.clone(),
         parent_session_id: Some(request.parent_session_id.clone()),
+        subject_id: None,
         token: random_uuid(),
         location: None,
         instance: None,
@@ -349,6 +358,29 @@ pub fn record(
         None,
         Some(&edge.request_id),
     );
+    Ok(edge)
+}
+
+/// Attaches the launch subject a tracked spawn's edge belongs to. An edge names
+/// at most one subject, and attaching it again is refused.
+pub fn attach_subject(
+    registry: &Registry,
+    request_id: &str,
+    subject_id: &str,
+) -> Result<SpawnEdge, String> {
+    canonical_uuid("request_id", request_id)?;
+    let _transition = registry.transition();
+    let stored = stored_edge(registry, request_id)?;
+    if stored.subject_id.is_some() {
+        return Err(format!(
+            "spawn request {request_id} already names a launch subject"
+        ));
+    }
+    let edge = SpawnEdge {
+        subject_id: Some(subject_id.to_string()),
+        ..stored
+    };
+    write_edge(registry, &edge)?;
     Ok(edge)
 }
 
@@ -493,7 +525,7 @@ pub fn bind(
 ) -> Result<SpawnEdge, String> {
     request.validate()?;
     let _transition = registry.transition();
-    bind_locked(registry, request, now_ms, None)
+    bind_locked(registry, request, now_ms, None, None)
 }
 
 /// Binds the edge a registration's token names to that exact registration.
@@ -516,6 +548,7 @@ pub(super) fn bind_presented_token(
         &registration_bind(token, request),
         now_ms,
         Some(agent_id),
+        request.process.as_ref(),
     )?;
     Ok(())
 }
@@ -538,7 +571,14 @@ pub(super) fn heal_binding(
         .registration_for_incarnation(&request.source, &request.incarnation)?
         .ok_or_else(|| "registered child identity is unavailable for spawn binding".to_string())?;
     let bind = registration_bind(token, request);
-    bind_locked(registry, &bind, now_ms, Some(&registration.agent_id)).map(|_| ())
+    bind_locked(
+        registry,
+        &bind,
+        now_ms,
+        Some(&registration.agent_id),
+        request.process.as_ref(),
+    )
+    .map(|_| ())
 }
 
 fn registration_bind(token: &str, request: &super::RegistrationRequest) -> SpawnBindRequest {
@@ -555,6 +595,7 @@ fn bind_locked(
     request: &SpawnBindRequest,
     now_ms: i64,
     agent_id: Option<&str>,
+    process: Option<&ProcessIdentity>,
 ) -> Result<SpawnEdge, String> {
     let mut matches = edges(registry)?
         .into_iter()
@@ -566,6 +607,12 @@ fn bind_locked(
     // binding whichever was read first would attribute a child to a guess.
     if matches.next().is_some() {
         return Err("this spawn token names more than one edge".into());
+    }
+    // A tracked launch binds only to the process its daemon captured, and only
+    // while its subject is still live. The subject is written first: an edge that
+    // could not be written leaves the subject bound, which a same-content retry heals.
+    if let Some(subject_id) = &stored.subject_id {
+        lifecycle::fence_registration(registry, subject_id, process, agent_id, now_ms)?;
     }
     if let Some(bound) = &stored.bound {
         if bound.source == request.source

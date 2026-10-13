@@ -41,6 +41,7 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
     let mut state = ObservationState::new();
     state.apply_success(FleetObservation {
         metadata_agents: Vec::new(),
+        containers: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wH".into(),
             label: Some("home".into()),

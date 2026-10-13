@@ -280,6 +280,10 @@ pub const LAUNCH_CAPABILITY: &str = "mux.launch";
 pub const LAUNCH_CONTEXT_CAPABILITY: &str = "mux.launch_context";
 /// The capability a backend declares when it can observe retained pane exits.
 pub const EXIT_OBSERVATION_CAPABILITY: &str = "mux.exit_observation";
+/// The capability a backend declares when a launch can be tracked from its own
+/// process: the launched program's birth identity is captured before it runs,
+/// so cancelling the launch can signal exactly that process.
+pub const LIFECYCLE_TRACKING_CAPABILITY: &str = "mux.lifecycle_tracking";
 
 /// Read-only observation of a pane's current command lifecycle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -933,6 +937,24 @@ pub trait RuntimeProvider: Send + Sync {
         None
     }
 
+    /// Installs the wake that runs `command` when a launch's pane process dies.
+    ///
+    /// The wake is an optimisation: it never proves an exit, and it is removed
+    /// by [`RuntimeProvider::remove_exit_wake`] once the exit is recorded.
+    fn install_exit_wake(
+        &self,
+        _subject_id: &str,
+        _command: &str,
+        _cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        Err("this runtime cannot notify a pane's process exit".to_string())
+    }
+
+    /// Removes only the wake installed for `subject_id`, leaving every other hook.
+    fn remove_exit_wake(&self, _subject_id: &str, _cancel: &AtomicBool) -> Result<(), String> {
+        Ok(())
+    }
+
     /// The whole normalized inventory, or a user-facing diagnostic.
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String>;
 
@@ -1069,6 +1091,19 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn server_process(&self, cancel: &AtomicBool) -> Option<i32> {
         (**self).server_process(cancel)
+    }
+
+    fn install_exit_wake(
+        &self,
+        subject_id: &str,
+        command: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        (**self).install_exit_wake(subject_id, command, cancel)
+    }
+
+    fn remove_exit_wake(&self, subject_id: &str, cancel: &AtomicBool) -> Result<(), String> {
+        (**self).remove_exit_wake(subject_id, cancel)
     }
 
     fn capabilities(&self) -> &'static [&'static str] {

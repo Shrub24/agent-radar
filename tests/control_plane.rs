@@ -221,6 +221,7 @@ impl RuntimeProvider for GatedBackend {
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: Vec::new(),
             tabs: Vec::new(),
             panes: Vec::new(),
@@ -262,6 +263,7 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
     };
     FleetObservation {
         metadata_agents: Vec::new(),
+        containers: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: None,
@@ -452,6 +454,10 @@ fn advertised(backend: &[&str]) -> Value {
         ("registry.v1", &[][..]),
         ("registry.facts.v1", &[][..]),
         ("events.v1", &[][..]),
+        ("topology.create.v1", &["mux.create"][..]),
+        ("topology.get.v1", &[][..]),
+        ("topology.list.v1", &[][..]),
+        ("topology.reconcile.v1", &["mux.observe"][..]),
         ("spawn.v1", &["mux.create", "mux.launch"][..]),
         ("spawn.close.v1", &["mux.observe", "mux.close"][..]),
         (
@@ -713,6 +719,7 @@ impl MuxBackend {
             launch: self.launch.clone(),
             inventory: FleetObservation {
                 metadata_agents: Vec::new(),
+                containers: Vec::new(),
                 workspaces: Vec::new(),
                 tabs: Vec::new(),
                 panes: panes
@@ -1201,6 +1208,7 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
     };
     let inventory = FleetObservation {
         metadata_agents: Vec::new(),
+        containers: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: Some("main".into()),
@@ -2556,6 +2564,33 @@ fn recorded_edge(state: &Path, request_id: &str) -> Value {
         .expect("a spawn edge")
 }
 
+/// Waits until a tracked launch's bootstrap has been released to run its program.
+///
+/// A registration is accepted only from a launch the daemon captured, and the
+/// capture is asynchronous to the spawn's own answer, so a test that registers
+/// its child waits for that durable fact first.
+fn await_captured_launch(state: &Path, request_id: &str) {
+    let subject = recorded_edge(state, request_id)["subject_id"]
+        .as_str()
+        .expect("tracked launch subject")
+        .to_string();
+    for _ in 0..500 {
+        if let Ok(registry) = agent_radar::control_plane::Registry::open(state)
+            && agent_radar::control_plane::lifecycle::read(&registry, &subject).is_ok_and(
+                |record| {
+                    record.is_some_and(|subject| {
+                        subject.state == agent_radar::control_plane::lifecycle::State::Captured
+                    })
+                },
+            )
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("launch {subject} was never captured");
+}
+
 fn edge_path(state: &Path, request_id: &str) -> PathBuf {
     state.join("spawns").join(format!("{request_id}.json"))
 }
@@ -3491,6 +3526,643 @@ fn a_tmux_backend_observes_the_server_it_was_given() {
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
+/// A tracked launch is captured by its own bootstrap, and cancelling it signals
+/// exactly the captured process and records its exit as verified.
+#[test]
+fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-cancel") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-cancel");
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    let backend = [
+        ("RADAR_CONTROL_BACKEND", "tmux"),
+        ("RADAR_TMUX_SERVER", server.name.as_str()),
+    ];
+    let mut daemon = DaemonChild::spawn_with(&socket, &state, &backend);
+    let mut lines = BufReader::new(daemon.process.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting line").expect("greeting");
+
+    let mut client = Client::dial(&socket);
+    let observed = client.call("mux.observe", json!({}));
+    let parent_pane = observed["result"]["inventory"]["panes"][0]["location"]["pane_id"]
+        .as_str()
+        .expect("parent pane")
+        .to_string();
+    let mut body = registration_body(PARENT_INCARNATION, None, None);
+    body["location"] = json!({"backend":"tmux", "pane":parent_pane});
+    let parent = agent_id(&client.call("agent.register", body));
+    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    client.call(
+        "agent.context",
+        json!({
+            "agent_id": parent,
+            "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
+            "sequence": 1,
+            "lease_ms": 10_000,
+            "context": {"session": session}
+        }),
+    );
+
+    let spawn_id = random_uuid();
+    let spawned = client.call_id(
+        &spawn_id,
+        "spawn.create",
+        json!({"request": {
+            "parent": parent,
+            "parent_session_id": session,
+            "executable": "/bin/sh",
+            "argv": ["-c", "exec sleep 300"]
+        }}),
+    );
+    assert!(spawned["result"].is_object(), "{spawned}");
+    await_captured_launch(&state, &spawn_id);
+    let subject_id = recorded_edge(&state, &spawn_id)["subject_id"]
+        .as_str()
+        .expect("tracked launch subject")
+        .to_string();
+    let subject = subject_record(&state, &subject_id);
+    let pid = subject["process"]["pid"].as_i64().expect("captured pid") as i32;
+
+    let cancel_id = random_uuid();
+    let cancelled = client.call_id(
+        &cancel_id,
+        "lifecycle.cancel",
+        json!({"request": {"subject_id": subject_id}}),
+    );
+    assert_eq!(
+        result_record(&cancelled)["outcome"],
+        "completed",
+        "{cancelled}"
+    );
+    assert_eq!(
+        result_record(&cancelled)["effects"],
+        json!([
+            "launch revoked",
+            "sigterm dispatched",
+            "pane cleaned up",
+            "process exit verified"
+        ]),
+        "{cancelled}"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "captured process {pid} still runs"
+    );
+    let replayed = client.call_id(
+        &cancel_id,
+        "lifecycle.cancel",
+        json!({"request": {"subject_id": subject_id}}),
+    );
+    assert_eq!(
+        replayed, cancelled,
+        "a same-ID cancel replays without a second signal"
+    );
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// The logical session a tracked parent publishes; tracked children launch under it.
+const TRACKED_SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+
+/// Starts the daemon on a disposable tmux server and waits for its greeting.
+fn tmux_daemon(socket: &Path, state: &Path, server: &TmuxServer) -> DaemonChild {
+    let backend = [
+        ("RADAR_CONTROL_BACKEND", "tmux"),
+        ("RADAR_TMUX_SERVER", server.name.as_str()),
+    ];
+    let mut daemon = DaemonChild::spawn_with(socket, state, &backend);
+    let mut reader = BufReader::new(daemon.process.stdout.take().expect("stdout"));
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).expect("greeting");
+    daemon.process.stdout = Some(reader.into_inner());
+    daemon
+}
+
+/// A registered parent in the server's own pane, publishing the tracked session.
+fn tracked_parent(client: &mut Client) -> String {
+    let observed = client.call("mux.observe", json!({}));
+    let pane = observed["result"]["inventory"]["panes"][0]["location"]["pane_id"]
+        .as_str()
+        .expect("parent pane")
+        .to_string();
+    let mut body = registration_body(PARENT_INCARNATION, None, None);
+    body["location"] = json!({"backend":"tmux", "pane":pane});
+    let parent = agent_id(&client.call("agent.register", body));
+    let context = client.call(
+        "agent.context",
+        json!({
+            "agent_id": parent,
+            "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
+            "sequence": 1,
+            "lease_ms": 10_000,
+            "context": {"session": TRACKED_SESSION}
+        }),
+    );
+    assert!(context["result"].is_object(), "{context}");
+    parent
+}
+
+/// Spawns one tracked child under `parent` and waits until its bootstrap has been
+/// released. Returns the spawn request id and its launch subject id.
+fn tracked_spawn(client: &mut Client, state: &Path, parent: &str, argv: Value) -> (String, String) {
+    let spawn_id = random_uuid();
+    let spawned = client.call_id(
+        &spawn_id,
+        "spawn.create",
+        json!({"request": {
+            "parent": parent,
+            "parent_session_id": TRACKED_SESSION,
+            "executable": "/bin/sh",
+            "argv": argv
+        }}),
+    );
+    assert!(spawned["result"].is_object(), "{spawned}");
+    await_captured_launch(state, &spawn_id);
+    let subject = recorded_edge(state, &spawn_id)["subject_id"]
+        .as_str()
+        .expect("tracked launch subject")
+        .to_string();
+    (spawn_id, subject)
+}
+
+fn subject_record(state: &Path, subject_id: &str) -> Value {
+    let registry =
+        agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
+    let subject = agent_radar::control_plane::lifecycle::read(&registry, subject_id)
+        .expect("replayable subject")
+        .expect("a launch subject");
+    serde_json::to_value(subject).expect("a subject projection")
+}
+
+fn captured_identity(state: &Path, subject_id: &str) -> ProcessIdentity {
+    serde_json::from_value(subject_record(state, subject_id)["process"].clone())
+        .expect("a captured identity")
+}
+
+/// A child registration that presents the spawn's token and the captured identity.
+fn child_registration_for(state: &Path, spawn_id: &str, subject_id: &str) -> Value {
+    let mut body = registration_body(
+        CHILD_INCARNATION,
+        Some(captured_identity(state, subject_id)),
+        None,
+    );
+    body["spawn_token"] = recorded_edge(state, spawn_id)["token"].clone();
+    body
+}
+
+fn cancel_subject(client: &mut Client, request_id: &str, subject_id: &str) -> Value {
+    client.call_id(
+        request_id,
+        "lifecycle.cancel",
+        json!({"request": {"subject_id": subject_id}}),
+    )
+}
+
+fn await_gone(pid: i32) {
+    for _ in 0..500 {
+        if !process_exists(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("process {pid} still runs");
+}
+
+/// Registration can commit before a cancel: the cancel then stops exactly the
+/// process the registration bound, and the launch is bound rather than revoked.
+#[test]
+fn a_cancel_after_binding_stops_the_bound_process() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-bound") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-bound");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let pid = captured_identity(&state, &subject).pid;
+
+    let registered = client.call(
+        "agent.register",
+        child_registration_for(&state, &spawn_id, &subject),
+    );
+    let child = agent_id(&registered);
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&cancelled)["outcome"],
+        "completed",
+        "{cancelled}"
+    );
+    assert_eq!(
+        result_record(&cancelled)["effects"],
+        json!(["sigterm dispatched", "pane kept", "process exit verified"]),
+        "{cancelled}"
+    );
+    assert!(!process_exists(pid), "the bound process {pid} still runs");
+    assert_eq!(subject_record(&state, &subject)["state"], "bound");
+    let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
+    assert_eq!(
+        spawn["result"]["spawn"]["bound"]["agent_id"],
+        json!(child),
+        "{spawn}"
+    );
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// Cancel can commit before registration: the late token presents the captured
+/// identity and is refused, and the launch stays revoked.
+#[test]
+fn a_registration_after_cancel_is_refused_and_the_launch_stays_revoked() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-revoked") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-revoked");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let pid = captured_identity(&state, &subject).pid;
+
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&cancelled)["effects"],
+        json!([
+            "launch revoked",
+            "sigterm dispatched",
+            "pane cleaned up",
+            "process exit verified"
+        ]),
+        "{cancelled}"
+    );
+    assert!(!process_exists(pid), "the revoked process {pid} still runs");
+    let late = client.call(
+        "agent.register",
+        child_registration_for(&state, &spawn_id, &subject),
+    );
+    assert_eq!(error_code(&late), "refused", "{late}");
+    assert_eq!(subject_record(&state, &subject)["state"], "revoked");
+    let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
+    assert!(spawn["result"]["spawn"]["bound"].is_null(), "{spawn}");
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// `lifecycle.get` reports a tracked launch's public facts and nothing private: no
+/// launch context, env value, argv or correlation.
+#[test]
+fn lifecycle_get_reports_a_subject_without_its_private_launch_data() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-get") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-get");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (_, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&cancelled)["outcome"],
+        "completed",
+        "{cancelled}"
+    );
+
+    let read = client.call("lifecycle.get", json!({"subject_id": subject}));
+    let view = &read["result"]["subject"];
+    assert_eq!(view["subject_id"], subject, "{read}");
+    assert_eq!(view["state"], "revoked", "{read}");
+    assert!(view["signalled_at"].is_string(), "{read}");
+    assert!(view["exited_at"].is_string(), "{read}");
+    let text = read.to_string();
+    assert!(!text.contains("correlation"), "{read}");
+    assert!(!text.contains("sleep 300"), "argv leaked: {read}");
+    assert!(!text.contains("PI_RADAR_LAUNCH"), "{read}");
+    assert!(!text.contains("launch\""), "{read}");
+
+    let unknown = client.call("lifecycle.get", json!({"subject_id": random_uuid()}));
+    assert_eq!(error_code(&unknown), "not_found", "{unknown}");
+    let malformed = client.call("lifecycle.get", json!({"subject_id": "not-a-uuid"}));
+    assert_eq!(error_code(&malformed), "bad_params", "{malformed}");
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A revoked launch stays revoked, and a repeated cancel signals nothing, across a
+/// daemon restart. A same-ID replay reads the stored outcome.
+#[test]
+fn a_revoked_launch_stays_revoked_and_unsignalled_across_a_daemon_restart() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-restart") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-restart");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let cancel_id = random_uuid();
+    let first = cancel_subject(&mut client, &cancel_id, &subject);
+    assert_eq!(result_record(&first)["outcome"], "completed", "{first}");
+    let before = subject_record(&state, &subject);
+    assert_eq!(daemon.stop(libc::SIGTERM, DEADLINE).code(), Some(0));
+
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    assert_eq!(cancel_subject(&mut client, &cancel_id, &subject), first);
+    let fresh = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&fresh)["effects"],
+        json!(["pane cleaned up", "process exit verified"]),
+        "{fresh}"
+    );
+    let after = subject_record(&state, &subject);
+    assert_eq!(after["signalled_at"], before["signalled_at"]);
+    assert_eq!(after["state"], "revoked");
+    let late = client.call(
+        "agent.register",
+        child_registration_for(&state, &spawn_id, &subject),
+    );
+    assert_eq!(error_code(&late), "refused", "{late}");
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A request id that names one cancel cannot name another launch's cancel, and
+/// the refused replay signals nothing.
+#[test]
+fn a_cancel_request_id_cannot_be_reused_for_another_launch() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-conflict") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-conflict");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (_, first) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let (_, second) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let second_pid = captured_identity(&state, &second).pid;
+
+    let request_id = random_uuid();
+    let reply = cancel_subject(&mut client, &request_id, &first);
+    assert_eq!(result_record(&reply)["outcome"], "completed", "{reply}");
+    let conflicting = cancel_subject(&mut client, &request_id, &second);
+    assert_eq!(error_code(&conflicting), "refused", "{conflicting}");
+    assert!(process_exists(second_pid), "the other launch was signalled");
+    assert_eq!(subject_record(&state, &second)["signalled_at"], Value::Null);
+    assert_eq!(cancel_subject(&mut client, &request_id, &first), reply);
+
+    let cleanup = cancel_subject(&mut client, &random_uuid(), &second);
+    assert_eq!(result_record(&cleanup)["outcome"], "completed", "{cleanup}");
+    await_gone(second_pid);
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A tracked launch whose bootstrap never reported has no process identity. Its
+/// cancel revokes it, names the unresolved identity, and signals nothing.
+#[test]
+fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_signal() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-unresolved") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-unresolved");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    // The launch is recorded while no daemon runs, as a bootstrap that never
+    // reported would leave it: pending, with no process identity.
+    let registry = agent_radar::control_plane::registry::Registry::open(&state).expect("registry");
+    let launch = agent_radar::control_plane::lifecycle::LaunchContext {
+        executable: "/bin/sh".into(),
+        argv: vec!["-c".into(), "exec sleep 300".into()],
+        cwd: None,
+        env: BTreeMap::new(),
+    };
+    let spawn_id = random_uuid();
+    let ticket =
+        agent_radar::control_plane::lifecycle::create(&registry, &spawn_id, launch, None, 1)
+            .expect("pending launch");
+    drop(registry);
+
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &ticket.subject_id);
+    assert_eq!(
+        result_record(&cancelled)["outcome"],
+        "completed",
+        "{cancelled}"
+    );
+    assert_eq!(
+        result_record(&cancelled)["effects"],
+        json!(["launch revoked", "pane kept", "process identity unresolved"]),
+        "{cancelled}"
+    );
+    let subject = subject_record(&state, &ticket.subject_id);
+    assert_eq!(subject["state"], "revoked");
+    assert_eq!(subject["signalled_at"], Value::Null, "{subject}");
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A program that exits at once is captured and observed without any registration:
+/// the cancel reports its exit and signals nothing.
+#[test]
+fn a_launch_that_exits_at_once_is_observable_without_a_registration() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-exit") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-exit");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", "exit 0"]));
+    let pid = captured_identity(&state, &subject).pid;
+    await_gone(pid);
+
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&cancelled)["effects"],
+        json!(["launch revoked", "pane cleaned up", "process exit verified"]),
+        "{cancelled}"
+    );
+    assert!(subject_record(&state, &subject)["exited_at"].is_string());
+    let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
+    assert!(spawn["result"]["spawn"]["bound"].is_null(), "{spawn}");
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// The program runs with the requested argv, cwd and environment; the bootstrap
+/// correlation is gone before exec and the registration token remains. Reads
+/// expose none of the argv, env values, token or correlation.
+#[test]
+fn a_tracked_launch_runs_its_requested_program_and_keeps_its_secrets_private() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-context") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-context");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let launch_dir = sandbox.root.join("launch");
+    fs::create_dir_all(&launch_dir).expect("launch directory");
+    let spawn_id = random_uuid();
+    let spawned = client.call_id(
+        &spawn_id,
+        "spawn.create",
+        json!({"request": {
+            "parent": parent,
+            "parent_session_id": TRACKED_SESSION,
+            "executable": "/bin/sh",
+            "argv": ["-c", "env > effective.env; pwd > effective.cwd; exec sleep 300"],
+            "cwd": launch_dir,
+            "env": {"RADAR_TEST_MARK": "mark-value-7f3a"}
+        }}),
+    );
+    assert!(spawned["result"].is_object(), "{spawned}");
+    await_captured_launch(&state, &spawn_id);
+    let subject = recorded_edge(&state, &spawn_id)["subject_id"]
+        .as_str()
+        .expect("tracked launch subject")
+        .to_string();
+    let pid = captured_identity(&state, &subject).pid;
+    let token = recorded_edge(&state, &spawn_id)["token"]
+        .as_str()
+        .expect("spawn token")
+        .to_string();
+
+    // The program writes its environment before its directory, so the directory
+    // file marks the end of both writes.
+    for _ in 0..500 {
+        if launch_dir.join("effective.cwd").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let environment = fs::read_to_string(launch_dir.join("effective.env")).expect("environment");
+    assert!(
+        environment
+            .lines()
+            .any(|line| line == "RADAR_TEST_MARK=mark-value-7f3a")
+    );
+    assert!(
+        environment
+            .lines()
+            .any(|line| line == format!("PI_RADAR_SPAWN_TOKEN={token}"))
+    );
+    assert!(
+        !environment.contains("PI_RADAR_LAUNCH_CORRELATION"),
+        "{environment}"
+    );
+    assert!(
+        !environment.contains("PI_RADAR_LAUNCH_SUBJECT"),
+        "{environment}"
+    );
+    let directory = fs::read_to_string(launch_dir.join("effective.cwd")).expect("directory");
+    assert_eq!(
+        Path::new(directory.trim_end()),
+        fs::canonicalize(&launch_dir).expect("canonical directory")
+    );
+
+    let record = client.call("mux.request.get", json!({"id": spawn_id}));
+    let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
+    for text in [record.to_string(), spawn.to_string()] {
+        for secret in [
+            "mark-value-7f3a",
+            "exec sleep 300",
+            &token,
+            "PI_RADAR_LAUNCH_CORRELATION",
+        ] {
+            assert!(!text.contains(secret), "{secret} is in {text}");
+        }
+    }
+
+    let cleanup = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(result_record(&cleanup)["outcome"], "completed", "{cleanup}");
+    await_gone(pid);
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A spawn whose arguments or environment have the wrong shape is refused without
+/// echoing those values.
+#[test]
+fn a_refused_spawn_does_not_echo_its_arguments_or_environment() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-refusal") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-refusal");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    for (name, body) in [
+        ("argv", json!({"argv": "argv-secret-9c1e"})),
+        ("env", json!({"env": "env-secret-5d2a"})),
+    ] {
+        let mut request = json!({"parent": parent, "parent_session_id": TRACKED_SESSION, "executable": "/bin/sh"});
+        request
+            .as_object_mut()
+            .expect("object")
+            .extend(body.as_object().expect("object").clone());
+        let refused = client.call("spawn.create", json!({"request": request}));
+        assert!(refused["result"].is_null(), "{name}: {refused}");
+        let text = refused.to_string();
+        assert!(
+            !text.contains("secret-9c1e") && !text.contains("secret-5d2a"),
+            "{text}"
+        );
+    }
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
 #[test]
 fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
     let Some(server) = TmuxServer::start("tmux-spawn-exit") else {
@@ -3853,6 +4525,7 @@ fn spawned_exiting_tmux_child(
         }}),
     );
     assert!(spawned["result"].is_object(), "{spawned}");
+    await_captured_launch(state, &spawn_id);
     let edge = recorded_edge(state, &spawn_id);
     let token = edge["token"].as_str().expect("spawn token");
     let raw_pane = edge["location"]["pane"]
@@ -6444,6 +7117,7 @@ fn a_populated_normalized_graph_round_trips_including_unknown_states() {
 fn empty_inventory() -> FleetObservation {
     FleetObservation {
         metadata_agents: Vec::new(),
+        containers: Vec::new(),
         workspaces: Vec::new(),
         tabs: Vec::new(),
         panes: Vec::new(),
@@ -7424,4 +8098,872 @@ fn socket_facts_and_owner_assignment_are_read_separately_with_identifier_only_po
     assert_eq!(event["kind"], "facts.published");
     assert_eq!(event["agent_id"], id);
     assert!(!serde_json::to_string(event).unwrap().contains(model));
+}
+
+fn stop_subject(client: &mut Client, request_id: &str, subject_id: &str) -> Value {
+    client.call_id(
+        request_id,
+        "lifecycle.stop",
+        json!({"request": {"subject_id": subject_id}}),
+    )
+}
+
+/// Waits until the daemon has recorded the launch's exit, through its pane-death
+/// wake or a later reconciliation.
+fn await_recorded_exit(state: &Path, subject_id: &str) {
+    for _ in 0..500 {
+        if !subject_record(state, subject_id)["exited_at"].is_null() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the launch's exit was never recorded");
+}
+
+/// Waits until no pane-died hook names the launch. The wake removes its slot
+/// after it records the exit, so the record can be readable first.
+fn await_hook_removed(server: &TmuxServer, subject_id: &str) -> String {
+    for _ in 0..500 {
+        let hooks = server.tmux(&["show-hooks", "-g", "pane-died"]);
+        if !hooks.contains(subject_id) {
+            return hooks;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the launch's pane-died wake was never removed");
+}
+
+/// Waits until the named tmux server has exited, so a replacement can take its
+/// name.
+fn await_server_exit(name: &str) {
+    for _ in 0..500 {
+        let alive = Command::new("tmux")
+            .args(["-L", name, "has-session"])
+            .env_remove("TMUX")
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the tmux server did not exit");
+}
+
+/// A stop signals the captured process once, replays by request id, and refuses
+/// a conflicting reuse of that id without signalling the other launch.
+#[test]
+fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-stop") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-stop");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (_, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let (_, other) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let pid = captured_identity(&state, &subject).pid;
+    let other_pid = captured_identity(&state, &other).pid;
+
+    let request_id = random_uuid();
+    let stopped = stop_subject(&mut client, &request_id, &subject);
+    assert_eq!(result_record(&stopped)["outcome"], "completed", "{stopped}");
+    assert_eq!(
+        result_record(&stopped)["effects"],
+        json!(["sigterm dispatched", "process exit verified"]),
+        "{stopped}"
+    );
+    await_gone(pid);
+    let signalled = subject_record(&state, &subject)["signalled_at"].clone();
+    assert!(!signalled.is_null());
+
+    assert_eq!(stop_subject(&mut client, &request_id, &subject), stopped);
+    let conflicting = stop_subject(&mut client, &request_id, &other);
+    assert_eq!(error_code(&conflicting), "refused", "{conflicting}");
+    assert!(process_exists(other_pid), "the other launch was signalled");
+    assert_eq!(subject_record(&state, &other)["signalled_at"], Value::Null);
+
+    let fresh = stop_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&fresh)["effects"],
+        json!(["process exit verified"]),
+        "{fresh}"
+    );
+    assert_eq!(subject_record(&state, &subject)["signalled_at"], signalled);
+
+    let cleanup = cancel_subject(&mut client, &random_uuid(), &other);
+    assert_eq!(result_record(&cleanup)["outcome"], "completed", "{cleanup}");
+    await_gone(other_pid);
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A process that ignores SIGTERM is reported uncertain. It is signalled once,
+/// is not replaced, and a later stop does not signal it again.
+#[test]
+fn a_process_ignoring_sigterm_stops_uncertainly_and_is_not_signalled_again() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-ignored") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-ignored");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (_, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "trap '' TERM; exec sleep 300"]),
+    );
+    let pid = captured_identity(&state, &subject).pid;
+
+    let first = stop_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(result_record(&first)["outcome"], "unknown", "{first}");
+    assert_eq!(
+        result_record(&first)["effects"],
+        json!(["sigterm dispatched"]),
+        "{first}"
+    );
+    assert!(
+        result_record(&first)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("exit was not verified")),
+        "{first}"
+    );
+    assert!(process_exists(pid), "the process ignored SIGTERM");
+    assert!(subject_record(&state, &subject)["exited_at"].is_null());
+    assert_eq!(
+        result_record(&first)["target"],
+        subject,
+        "the durable lane is the subject, not its pane"
+    );
+    let cancellation = client.call_id(
+        &random_uuid(),
+        "lifecycle.cancel",
+        json!({"request": {"subject_id": subject}}),
+    );
+    assert!(
+        !result_record(&cancellation)["effects"]
+            .to_string()
+            .contains("sigterm dispatched"),
+        "{cancellation}"
+    );
+    assert_eq!(
+        subject_record(&state, &subject)["state"],
+        "captured",
+        "a conflicting cancel must not revoke the launch"
+    );
+
+    let second = stop_subject(&mut client, &random_uuid(), &subject);
+    assert!(
+        !result_record(&second)["effects"]
+            .to_string()
+            .contains("sigterm dispatched"),
+        "{second}"
+    );
+
+    // SAFETY: the pid is this test's own process, the one it just launched.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    await_gone(pid);
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// The raw tmux pane a tracked launch was dispatched into. A recorded location
+/// qualifies the raw pane id the server lists.
+fn launch_pane(client: &mut Client, spawn_id: &str) -> String {
+    client.call("spawn.get", json!({"request_id": spawn_id}))["result"]["spawn"]["location"]["pane"]
+        .as_str()
+        .and_then(|recorded| recorded.rsplit(':').next())
+        .expect("the launch's pane")
+        .to_string()
+}
+
+/// A cancel of an unbound launch whose process is verified gone closes the pane
+/// that launch left behind, records it as the launch's own fact, and never closes
+/// anything a second time.
+#[test]
+fn an_unbound_launch_whose_process_exited_has_its_pane_cleaned_up_once() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-cleanup") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-cleanup");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", "exit 0"]));
+    let pane = launch_pane(&mut client, &spawn_id);
+    assert!(
+        pane_ids(&server).contains(&pane),
+        "the launch's pane {pane} exists before the cancel: {:?}",
+        pane_ids(&server)
+    );
+
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&cancelled)["outcome"],
+        "completed",
+        "{cancelled}"
+    );
+    assert!(
+        result_record(&cancelled)["effects"]
+            .to_string()
+            .contains("pane cleaned up"),
+        "{cancelled}"
+    );
+    assert!(
+        !pane_ids(&server).contains(&pane),
+        "the pane {pane} an abandoned launch left behind is gone: {:?}",
+        pane_ids(&server)
+    );
+    assert_eq!(
+        subject_record(&state, &subject)["pane_cleanup"]["outcome"],
+        "cleaned",
+        "the cleanup is a durable fact of the launch"
+    );
+
+    // A later cancel reports the recorded outcome and closes nothing again.
+    let second = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert!(
+        result_record(&second)["effects"]
+            .to_string()
+            .contains("pane cleaned up"),
+        "{second}"
+    );
+    assert!(
+        !pane_ids(&server).contains(&pane),
+        "{second}: {:?}",
+        pane_ids(&server)
+    );
+
+    drop(client);
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A cancel whose signal is not verified gone keeps the pane: closing it would
+/// end the process without a signal or an exit claim.
+#[test]
+fn an_unbound_launch_whose_process_may_still_be_live_keeps_its_pane() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-kept") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-kept");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "trap '' TERM; exec sleep 300"]),
+    );
+    let pid = captured_identity(&state, &subject).pid;
+    let pane = launch_pane(&mut client, &spawn_id);
+
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&cancelled)["outcome"],
+        "unknown",
+        "{cancelled}"
+    );
+    assert!(
+        result_record(&cancelled)["effects"]
+            .to_string()
+            .contains("pane kept"),
+        "{cancelled}"
+    );
+    assert!(
+        pane_ids(&server).contains(&pane),
+        "the pane {pane} whose launch may still be alive is kept: {:?}",
+        pane_ids(&server)
+    );
+    assert!(
+        result_record(&cancelled)["message"]
+            .as_str()
+            .is_none_or(|message| message.contains("not")),
+        "{cancelled}"
+    );
+    // A refusal dispatches nothing, so it records no cleanup: the launch's pane
+    // is re-decided against whatever evidence a later cancel finds.
+    assert_eq!(
+        subject_record(&state, &subject)["pane_cleanup"],
+        Value::Null,
+        "a refusal is not a recorded cleanup effect"
+    );
+    assert!(process_exists(pid), "the process ignored SIGTERM");
+
+    // SAFETY: the pid is this test's own process, the one it just launched.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    await_gone(pid);
+
+    // The unresolved cancel keeps its target suppressed, so the process that
+    // has since gone does not become a second cleanup of the same pane.
+    let after = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(error_code(&after), "refused", "{after}");
+    assert!(pane_ids(&server).contains(&pane), "{after}");
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A pane whose process exits wakes the daemon, which records the exit without
+/// a stop. The wake leaves the operator's own pane-died hook alone and removes
+/// only its slot; a duplicate wake reads the same exit.
+#[test]
+fn a_pane_death_wakes_the_daemon_and_keeps_the_users_hook() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-wake") else {
+        return;
+    };
+    server.tmux(&["set-hook", "-g", "pane-died", "display-message user-hook"]);
+    let sandbox = Sandbox::new("tmux-lifecycle-wake");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", "exit 0"]));
+    await_recorded_exit(&state, &subject);
+
+    let hooks = await_hook_removed(&server, &subject);
+    assert!(hooks.contains("display-message user-hook"), "{hooks}");
+    let instance = recorded_edge(&state, &spawn_id)["instance"].clone();
+    let duplicate = client.call(
+        "lifecycle.wake",
+        json!({"subject_id": subject, "server": instance}),
+    );
+    assert_eq!(duplicate["result"]["exited"], json!(true), "{duplicate}");
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A wake naming a server generation that no longer serves the pane is refused,
+/// and the replacement's pane is not recorded as this launch's exit.
+#[test]
+fn a_wake_from_a_replaced_server_generation_is_refused() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-generation") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-generation");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let instance = recorded_edge(&state, &spawn_id)["instance"].clone();
+    let pid = captured_identity(&state, &subject).pid;
+
+    server.tmux(&["kill-server"]);
+    await_server_exit(&server.name);
+    server.tmux(&["new-session", "-d", "-s", "main", "-x", "100", "-y", "30"]);
+    let refused = client.call(
+        "lifecycle.wake",
+        json!({"subject_id": subject, "server": instance}),
+    );
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+    assert!(subject_record(&state, &subject)["exited_at"].is_null());
+
+    await_gone(pid);
+    let stopped = stop_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(result_record(&stopped)["outcome"], "completed", "{stopped}");
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A revocation made before a crash is still in force after the daemon is killed
+/// without a clean shutdown.
+#[test]
+fn a_revocation_survives_a_crash_without_a_clean_shutdown() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-crash") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-crash");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
+    let cancel_id = random_uuid();
+    let first = cancel_subject(&mut client, &cancel_id, &subject);
+    assert_eq!(result_record(&first)["outcome"], "completed", "{first}");
+    let before = subject_record(&state, &subject);
+    assert_eq!(daemon.stop(libc::SIGKILL, DEADLINE).code(), None);
+
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    assert_eq!(cancel_subject(&mut client, &cancel_id, &subject), first);
+    let late = client.call(
+        "agent.register",
+        child_registration_for(&state, &spawn_id, &subject),
+    );
+    assert_eq!(error_code(&late), "refused", "{late}");
+    let after = subject_record(&state, &subject);
+    assert_eq!(after["state"], "revoked");
+    assert_eq!(after["signalled_at"], before["signalled_at"]);
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A launch whose subject record would exceed its bound is refused before any
+/// record or effect, rather than failing inside the daemon.
+#[test]
+fn a_launch_too_large_to_track_is_refused_before_any_effect() {
+    let Some(server) = TmuxServer::start("tmux-lifecycle-oversize") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-lifecycle-oversize");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let entries = || {
+        fs::read_dir(state.join("lifecycle"))
+            .map(|dir| dir.count())
+            .unwrap_or(0)
+    };
+    let before = entries();
+
+    let spawn_id = random_uuid();
+    let refused = client.call_id(
+        &spawn_id,
+        "spawn.create",
+        json!({"request": {
+            "parent": parent,
+            "parent_session_id": TRACKED_SESSION,
+            "executable": "/bin/sh",
+            "argv": ["-c", "exec sleep 300"],
+            "env": {"BULK": "x".repeat(70 * 1024)}
+        }}),
+    );
+    assert_eq!(error_code(&refused), "bad_params", "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("too large to track")),
+        "{refused}"
+    );
+    assert_eq!(entries(), before);
+    assert!(!edge_path(&state, &spawn_id).exists());
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[test]
+fn a_confirmed_create_records_one_owned_container() {
+    let sandbox = Sandbox::new("topology-create");
+    let backend = MuxBackend::new(MUX_CAPABILITIES).naming(CreatedLocation {
+        workspace_id: Some("wA".into()),
+        tab_id: Some("wA:t2".into()),
+        pane_id: Some("wA:p2".into()),
+    });
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let ping = client.call("daemon.ping", json!({}));
+    assert!(
+        ping["result"]["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .contains(&json!("topology.get.v1")),
+        "{ping}"
+    );
+
+    // An empty topology is a page with nothing in it, not an error.
+    let empty = client.call("topology.list", json!({}));
+    assert_eq!(empty["result"]["containers"], json!([]));
+    assert_eq!(empty["result"]["next_after"], Value::Null);
+
+    let workspace = client.call(
+        "mux.create",
+        json!({"request": {"kind": "workspace", "focus": false}, "requester": "test"}),
+    );
+    assert_eq!(result_record(&workspace)["outcome"], "completed");
+
+    // A tab in that workspace: the tab is the container recorded, and the
+    // workspace the runtime names is context, not a second container.
+    let tab = client.call(
+        "mux.create",
+        json!({"request": {"kind": "tab", "workspace_id": "wA", "focus": false}, "requester": "test"}),
+    );
+    assert_eq!(result_record(&tab)["outcome"], "completed");
+
+    let listed = client.call("topology.list", json!({}));
+    let containers = listed["result"]["containers"]
+        .as_array()
+        .expect("containers")
+        .clone();
+    assert_eq!(
+        containers.len(),
+        2,
+        "one container per creation, not one per named identity: {listed}"
+    );
+    let workspace_container = containers
+        .iter()
+        .find(|container| container["kind"] == json!("workspace"))
+        .expect("the workspace container");
+    let tab_container = containers
+        .iter()
+        .find(|container| container["kind"] == json!("tab"))
+        .expect("the tab container");
+    assert_eq!(workspace_container["provenance"], "created");
+    assert_eq!(
+        workspace_container["binding"],
+        json!({"backend": "fake", "incarnation": Value::Null, "handle": "wA"})
+    );
+    assert_eq!(tab_container["binding"]["handle"], "wA:t2");
+    assert_eq!(
+        tab_container["parent"], workspace_container["container_id"],
+        "a tab is recorded under the container its workspace handle names"
+    );
+    assert!(tab_container["observed_at"].is_null());
+
+    // A pane split: the target pane was never recorded, so the parent stays
+    // unresolved instead of being guessed.
+    let pane = client.call(
+        "mux.create",
+        json!({"request": {"kind": "pane_split", "pane_id": "wA:p1", "direction": "right", "focus": false}, "requester": "test"}),
+    );
+    assert_eq!(result_record(&pane)["outcome"], "completed");
+    let listed = client.call("topology.list", json!({}));
+    let containers = listed["result"]["containers"]
+        .as_array()
+        .expect("containers")
+        .clone();
+    assert_eq!(containers.len(), 3);
+    let pane_container = containers
+        .iter()
+        .find(|container| container["kind"] == json!("pane"))
+        .expect("the pane container");
+    assert_eq!(pane_container["binding"]["handle"], "wA:p2");
+    assert_eq!(pane_container["parent"], Value::Null);
+
+    // One container by id, and two reads that name nothing recorded.
+    let id = pane_container["container_id"]
+        .as_str()
+        .expect("a container id")
+        .to_string();
+    let got = client.call("topology.get", json!({"container_id": id}));
+    assert_eq!(got["result"]["container"], *pane_container);
+    let missing = client.call("topology.get", json!({"container_id": random_uuid()}));
+    assert_eq!(error_code(&missing), "not_found");
+    let malformed = client.call("topology.get", json!({"container_id": "wA:p2"}));
+    assert_eq!(error_code(&malformed), "bad_params");
+
+    // A page of one tells the caller where to continue.
+    let page = client.call("topology.list", json!({"limit": 1}));
+    assert_eq!(page["result"]["containers"].as_array().unwrap().len(), 1);
+    assert_eq!(page["result"]["has_more"], json!(true));
+    let after = page["result"]["next_after"]
+        .as_str()
+        .expect("a continuation")
+        .to_string();
+    let next = client.call("topology.list", json!({"limit": 1, "after": after}));
+    assert_eq!(next["result"]["containers"].as_array().unwrap().len(), 1);
+    assert_ne!(
+        next["result"]["containers"][0]["container_id"],
+        page["result"]["containers"][0]["container_id"]
+    );
+    daemon.stop();
+}
+
+#[test]
+fn reconciling_reports_drift_without_dispatching_or_deleting() {
+    let sandbox = Sandbox::new("topology-reconcile");
+    // The test backend names no serving instance, so its inventory cannot fence a
+    // handle: a reconciliation says so rather than calling the pane present.
+    let backend = MuxBackend::new(MUX_CAPABILITIES).observing(&["wA:p2"]);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let create = client.call(
+        "mux.create",
+        json!({"request": {"kind": "pane_split", "pane_id": "wA:p1", "direction": "right", "focus": false}, "requester": "test"}),
+    );
+    assert_eq!(result_record(&create)["outcome"], "completed");
+
+    let reconciled = client.call("topology.reconcile", json!({}));
+    assert_eq!(
+        reconciled["result"]["reconciled"]["unavailable"],
+        json!(1),
+        "{reconciled}"
+    );
+    assert_eq!(
+        backend.closed.lock().expect("the closed list").len(),
+        0,
+        "a reconciliation dispatches nothing"
+    );
+
+    // The record survives with the reason it could not be verified, so a caller
+    // reads drift instead of a state nobody established.
+    let listed = client.call("topology.list", json!({}));
+    let container = &listed["result"]["containers"][0];
+    assert!(
+        container["unresolved"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("could not be verified")),
+        "{listed}"
+    );
+    assert!(container["observed_at"].is_string(), "{listed}");
+    assert_eq!(container["removed_at"], Value::Null);
+    assert_eq!(
+        backend
+            .created_requests
+            .lock()
+            .expect("the create list")
+            .len(),
+        1,
+        "reconciling creates nothing"
+    );
+
+    let no_backend = {
+        let sandbox = Sandbox::new("topology-reconcile-none");
+        let mut daemon = sandbox.daemon();
+        let mut client = Client::dial(daemon.path());
+        let response = client.call("topology.reconcile", json!({}));
+        daemon.stop();
+        response
+    };
+    assert_eq!(error_code(&no_backend), "backend_unavailable");
+    daemon.stop();
+}
+
+#[test]
+fn a_spawn_records_the_pane_it_dispatched_into_as_a_container() {
+    let sandbox = Sandbox::new("spawn-container");
+    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    spawned_edge(&mut client, &random_uuid(), &parent);
+
+    let listed = client.call("topology.list", json!({}));
+    let containers = listed["result"]["containers"]
+        .as_array()
+        .expect("containers")
+        .clone();
+    assert_eq!(
+        containers.len(),
+        1,
+        "the pane a spawn dispatched into is one container: {listed}"
+    );
+    assert_eq!(containers[0]["kind"], "pane");
+    assert_eq!(containers[0]["provenance"], "created");
+    assert_eq!(containers[0]["binding"]["handle"], "wA:p2");
+    assert_eq!(
+        containers[0]["parent"],
+        Value::Null,
+        "a registered parent pane has no recorded container to sit under"
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_radar_creation_answers_with_the_container_it_recorded() {
+    let sandbox = Sandbox::new("topology-create-verb");
+    let backend = MuxBackend::new(MUX_CAPABILITIES).naming(CreatedLocation {
+        workspace_id: Some("wA".into()),
+        tab_id: Some("wA:t2".into()),
+        pane_id: Some("wA:p2".into()),
+    });
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let created = client.call(
+        "topology.create",
+        json!({"request": {"kind": "workspace", "focus": false}, "label": "work", "requester": "test"}),
+    );
+    assert_eq!(result_record(&created)["outcome"], "completed", "{created}");
+    let container = created["result"]["container"].clone();
+    assert_eq!(container["kind"], "workspace");
+    assert_eq!(container["label"], "work");
+    assert_eq!(container["provenance"], "created");
+    assert_eq!(container["binding"]["handle"], "wA");
+
+    // The answer names a record the daemon serves, so a caller acts on the
+    // identity it made instead of joining a handle to the next tree it draws.
+    let id = container["container_id"]
+        .as_str()
+        .expect("a container id")
+        .to_string();
+    let got = client.call("topology.get", json!({"container_id": id}));
+    assert_eq!(got["result"]["container"], container);
+
+    // A label is Radar's own name for a container, so it is bounded and carries
+    // no control characters, and both are checked before the backend is asked.
+    for label in [json!("two\nlines"), json!("x".repeat(129))] {
+        let refused = client.call(
+            "topology.create",
+            json!({"request": {"kind": "workspace", "focus": false}, "label": label, "requester": "test"}),
+        );
+        assert_eq!(error_code(&refused), "bad_params", "{refused}");
+        assert!(
+            result_record(&refused)["outcome"].is_null(),
+            "a refused parameter authors no record: {refused}"
+        );
+    }
+    assert_eq!(
+        backend.creates().len(),
+        1,
+        "only the admitted creation reached the backend"
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_creation_this_backend_cannot_serve_is_refused_before_any_effect() {
+    let sandbox = Sandbox::new("topology-create-unsupported");
+    let backend = MuxBackend::new(&["mux.observe", "mux.focus", "mux.close"]);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let id = random_uuid();
+    let refused = client.call_id(
+        &id,
+        "topology.create",
+        json!({"request": {"kind": "workspace", "focus": false}, "requester": "test"}),
+    );
+    let record = result_record(&refused);
+    assert_eq!(record["outcome"], "refused");
+    assert!(
+        record["message"]
+            .as_str()
+            .expect("a message")
+            .contains("the `mux.create` capability"),
+        "the refusal names what this backend cannot do: {refused}"
+    );
+    assert!(backend.creates().is_empty(), "nothing was created");
+    assert!(refused["result"].get("container").is_none());
+    assert_eq!(
+        client.call("daemon.ping", json!({}))["result"]["capabilities"],
+        advertised(&["mux.observe", "mux.focus", "mux.close"])
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_replayed_creation_answers_with_the_same_container_and_creates_nothing() {
+    let sandbox = Sandbox::new("topology-create-replay");
+    let backend = MuxBackend::new(MUX_CAPABILITIES).naming(CreatedLocation {
+        workspace_id: Some("wA".into()),
+        tab_id: None,
+        pane_id: None,
+    });
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let id = random_uuid();
+    let params = json!({
+        "request": {"kind": "workspace", "focus": false},
+        "label": "work",
+        "requester": "test"
+    });
+    let first = client.call_id(&id, "topology.create", params.clone());
+    let container = first["result"]["container"].clone();
+    assert!(
+        container["container_id"].is_string(),
+        "the first answer names the container: {first}"
+    );
+
+    // The same request is the same creation: a caller recovering from a lost
+    // answer reads the container it already made and reaches no backend.
+    let again = client.call_id(&id, "topology.create", params);
+    assert_eq!(again["result"]["container"], container, "{again}");
+    assert_eq!(
+        backend.creates().len(),
+        1,
+        "a replayed creation dispatches nothing"
+    );
+
+    // The same id naming different contents is refused rather than dispatched.
+    let changed = client.call_id(
+        &id,
+        "topology.create",
+        json!({
+            "request": {"kind": "workspace", "focus": false},
+            "label": "other",
+            "requester": "test"
+        }),
+    );
+    assert_eq!(error_code(&changed), "refused", "{changed}");
+    assert_eq!(backend.creates().len(), 1);
+    daemon.stop();
+}
+
+#[test]
+fn the_client_reads_the_containers_the_daemon_records() {
+    let sandbox = Sandbox::new("client-containers");
+    // The capabilities the dashboard client's handshake requires, plus launch:
+    // its registry read requires the spawn contract, which a backend can only
+    // serve when it can both create a pane and run a command in it.
+    let backend = MuxBackend::new(&[
+        "mux.observe",
+        "mux.process_info",
+        "mux.focus",
+        "mux.close",
+        "mux.create",
+        "mux.input",
+        "mux.output",
+        "mux.report",
+        "mux.launch",
+    ])
+    .naming(CreatedLocation {
+        workspace_id: Some("wA".into()),
+        tab_id: None,
+        pane_id: None,
+    });
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut raw = Client::dial(daemon.path());
+    let created = raw.call(
+        "topology.create",
+        json!({"request": {"kind": "workspace", "focus": false}, "label": "work", "requester": "test"}),
+    );
+    assert!(
+        created["result"]["container"]["container_id"].is_string(),
+        "{created}"
+    );
+
+    // The dashboard client reads the containers with the registry facts, in the
+    // normalized types the rest of Radar sees: the tree's own names for a fleet
+    // Radar created reach the client without a second protocol.
+    let client = DaemonRuntime::handshake(daemon.path()).expect("the daemon is usable");
+    let cancel = AtomicBool::new(false);
+    let read = client
+        .registry(&cancel)
+        .expect("a registry read")
+        .expect("a registry");
+    assert_eq!(read.containers.len(), 1, "{read:?}");
+    assert_eq!(read.containers[0].label.as_deref(), Some("work"));
+    assert_eq!(
+        read.containers[0]
+            .binding
+            .as_ref()
+            .map(|binding| binding.handle.as_str()),
+        Some("wA")
+    );
+    daemon.stop();
 }

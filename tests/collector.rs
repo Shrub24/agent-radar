@@ -329,6 +329,7 @@ fn registered_assignment(agent_id: &str, assigned_started_unix_ms: Option<u64>) 
 fn inventory(pane_ids: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
     FleetObservation {
         metadata_agents: Vec::new(),
+        containers: Vec::new(),
         workspaces: vec![],
         tabs: vec![],
         panes: pane_ids

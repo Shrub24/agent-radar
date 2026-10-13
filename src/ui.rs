@@ -3655,6 +3655,7 @@ mod tests {
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
@@ -3737,6 +3738,7 @@ mod tests {
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
@@ -4067,6 +4069,7 @@ mod tests {
             .collect();
         let mut observation = FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![crate::model::Workspace {
                 workspace_id: "wL".into(),
                 label: Some("long".into()),
@@ -8460,6 +8463,7 @@ mod tests {
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
+            containers: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),

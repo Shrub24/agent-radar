@@ -26,9 +26,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+use crate::control_plane::containers;
+use crate::control_plane::lifecycle::{self as subjects, Bootstrap};
 use crate::control_plane::ops::{self, Method};
 use crate::control_plane::protocol::{self, Code, PROTOCOL_VERSION, Refusal, Request, Response};
 use crate::control_plane::registry::{
@@ -37,13 +40,15 @@ use crate::control_plane::registry::{
 };
 use crate::control_plane::store::{self, Category, RequestOutcome, RequestRecord, Store};
 use crate::lifecycle::{self, CloseRequest, DirectClose};
-use crate::model::FleetObservation;
+use crate::model::SessionUuid;
+use crate::model::{FleetObservation, ProcessIdentity};
+use crate::process_control::{self, Acquired};
 use crate::runtime::{
     BackendIdentity, CLOSE_CAPABILITY, CreateOutcome, CreateRequest, CreatedKind, CreatedLocation,
     EXIT_OBSERVATION_CAPABILITY, FocusOutcome, InputOutcome, InputPayload, InputRequest,
-    LAUNCH_CONTEXT_CAPABILITY, LaunchOutcome, LaunchRequest, OutputOutcome, OutputRead,
-    OutputRequest, PaneExitObservation, ReportOutcome, ReportRequest, RuntimeProvider,
-    SplitDirection, Target, validate_command,
+    LAUNCH_CONTEXT_CAPABILITY, LIFECYCLE_TRACKING_CAPABILITY, LaunchOutcome, LaunchRequest,
+    OutputOutcome, OutputRead, OutputRequest, PaneExitObservation, ReportOutcome, ReportRequest,
+    RuntimeProvider, SplitDirection, Target, validate_command,
 };
 use crate::{HerdrConfig, HerdrRuntime, TmuxConfig, TmuxRuntime};
 
@@ -67,9 +72,18 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// caller names no limit.
 const MAX_LISTED: usize = 200;
 const DEFAULT_LISTED: usize = 50;
+/// The most characters one container label carries.
+///
+/// A label is Radar's own name for a container and is shown in the tree, so it is
+/// bounded where it is accepted rather than truncated where it is displayed.
+const MAX_LABEL_CHARS: usize = 128;
 /// The registry returns at most this many records in one page, agents and spawn
 /// edges alike.
 const MAX_REGISTRY_PAGE: usize = registry::MAX_LISTED;
+
+/// One reconciliation pass writes one observation per container, each its own
+/// durable append, so a pass is capped rather than sized by the fleet.
+const MAX_RECONCILE: usize = 128;
 /// Keep response payloads below the protocol line limit, including JSON framing.
 ///
 /// A page holds at most [`MAX_REGISTRY_PAGE`] records of a few kilobytes each, so
@@ -429,6 +443,11 @@ struct Core {
     backend: Option<Arc<dyn RuntimeProvider>>,
     verifier: Arc<dyn ProcessVerifier>,
     stopping: Arc<AtomicBool>,
+    /// What a tracked launch runs as its bootstrap. `None` when this process has
+    /// no executable path it can name, which refuses tracked launches.
+    bootstrap: Option<Bootstrap>,
+    /// Unix milliseconds of the last completed recovery sweep pass; 0 before one.
+    sweep_at: Arc<std::sync::atomic::AtomicI64>,
 }
 
 fn stop_backend_for(connections: &Arc<Mutex<Connections>>) {
@@ -451,6 +470,7 @@ pub struct Daemon {
     connections: Arc<Mutex<Connections>>,
     verification: Arc<VerificationBudget>,
     accept: Option<JoinHandle<()>>,
+    sweeper: Option<JoinHandle<()>>,
     socket_identity: (u64, u64),
     core: Arc<Mutex<Core>>,
 }
@@ -539,12 +559,15 @@ impl Daemon {
             active: Mutex::new(0),
             workers: Mutex::new(Vec::new()),
         });
+        let bootstrap = bootstrap_for(socket);
         let core = Arc::new(Mutex::new(Core {
             store,
             registry: Arc::new(registry),
             backend,
             verifier,
             stopping: Arc::clone(&stopping),
+            sweep_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            bootstrap,
         }));
         let connections = Arc::new(Mutex::new(Connections::default()));
         let result = thread::Builder::new()
@@ -570,6 +593,7 @@ impl Daemon {
                 return Err(format!("control accept thread: {error}"));
             }
         };
+        let sweeper = spawn_sweeper(&core, &stopping);
         Ok(Self {
             path: socket.to_path_buf(),
             state: state.to_path_buf(),
@@ -577,6 +601,7 @@ impl Daemon {
             connections,
             verification,
             accept: Some(accept),
+            sweeper,
             socket_identity,
             core,
         })
@@ -622,6 +647,9 @@ impl Daemon {
         self.stopping.store(true, Ordering::SeqCst);
         stop_backend_for(&self.connections);
         let _ = accept.join();
+        if let Some(sweeper) = self.sweeper.take() {
+            let _ = sweeper.join();
+        }
         let (live, workers): (Vec<(u64, UnixStream)>, Vec<JoinHandle<()>>) = {
             let mut connections = locked(&self.connections);
             (
@@ -848,6 +876,8 @@ fn handle_line(
         Method::Requests => answer(writer, read_many(core, &request)),
         Method::Events => answer(writer, read_events(core, &request, stopping)),
         Method::Registry => answer(writer, registry_request(core, &request, verification)),
+        Method::Bootstrap => answer(writer, bootstrap_request(core, &request, verification)),
+        Method::Wake => answer(writer, wake_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
         Method::Operation(operation) => {
             let response = execute(operation, &request, core, verification);
@@ -883,6 +913,60 @@ struct AgentRetireParams {
 #[serde(deny_unknown_fields)]
 struct SpawnGetParams {
     request_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleGetParams {
+    subject_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleListParams {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContainerGetParams {
+    container_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContainerListParams {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContainerReconcileParams {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Unix milliseconds now.
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+/// Where lifecycle reads get their recovery evidence: the sweep interval and its
+/// last completed pass. No pass yet is reported as null, never as success.
+fn sweep_source(core: &Arc<Mutex<Core>>) -> serde_json::Value {
+    let last = locked(core).sweep_at.load(Ordering::SeqCst);
+    json!({"recovery_sweep": {
+        "interval_ms": SWEEP_INTERVAL.as_millis() as u64,
+        "last_pass_at": (last > 0).then(|| crate::control_plane::store::format_millis(last)),
+    }})
 }
 
 #[derive(serde::Deserialize)]
@@ -1281,6 +1365,134 @@ fn bounded_foreground(
         "radar-close-foreground",
         move || backend.foreground_evidence(&pane_id, &cancel),
     )
+}
+
+/// Closes the pane an unbound launch left behind, fenced to the very instance
+/// that created it, and records what happened as that launch's own durable fact.
+///
+/// Closing a pane ends whatever still runs in it, so a pane is closed only once
+/// nothing this daemon launched can still be alive there: the launch's process is
+/// verified gone, or the pane itself is a retained, already-exited pane of this
+/// edge. Anything less leaves the pane to the operator and says why. This reports
+/// a cleanup, never a process exit.
+///
+/// Only a cleanup that was dispatched is recorded: a confirmed close, a backend
+/// refusal and an unanswered dispatch are each durable facts of the launch. An
+/// eligibility refusal dispatches nothing, so it records nothing and a later
+/// admitted cancel re-decides it against the evidence it finds.
+fn cleanup_unbound_pane(
+    registry: &Arc<Registry>,
+    backend: &Arc<dyn RuntimeProvider>,
+    verifier: &Arc<dyn ProcessVerifier>,
+    subject_id: &str,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+    now_ms: i64,
+) -> Option<subjects::PaneCleanup> {
+    use subjects::PaneCleanup;
+
+    let Ok(Some(subject)) = subjects::read(registry, subject_id) else {
+        return Some(PaneCleanup::Refused(
+            "the tracked launch is unavailable".into(),
+        ));
+    };
+    // The first outcome is the one that stands, so a second cancel reports it
+    // rather than closing anything again.
+    if let Some(recorded) = subject.pane_cleanup.clone() {
+        return Some(recorded);
+    }
+    if subject.state == subjects::State::Bound {
+        // A bound launch's pane belongs to its registered child, so no cancel
+        // has anything to say about it.
+        return None;
+    }
+    if subject.state != subjects::State::Revoked {
+        return Some(PaneCleanup::Refused(
+            "the launch is not a revoked one, so its pane is not this cancel's to remove".into(),
+        ));
+    }
+    // A subject with no spawn edge never had a pane of this daemon's: an
+    // enrolled lead's pane belongs to the operator who enrolled it.
+    let Ok(Some(edge)) = registry.spawn_edge(&subject.spawn_request_id) else {
+        return None;
+    };
+    if edge.version != registry::SPAWN_VERSION {
+        return Some(PaneCleanup::Refused(
+            "a legacy spawn edge names no pane of this daemon's".into(),
+        ));
+    }
+    let Some(location) = edge.location.as_ref() else {
+        return Some(PaneCleanup::Refused("the launch records no pane".into()));
+    };
+    let Some(pane) = location.pane.clone() else {
+        return Some(PaneCleanup::Refused("the launch records no pane".into()));
+    };
+    let identity = backend.identity();
+    if location.backend != identity.name || location.instance != identity.instance {
+        return Some(PaneCleanup::Refused(
+            "the recorded pane belongs to a different backend instance".into(),
+        ));
+    }
+    // A pane id outlives the server that answered the create, so the pane is only
+    // this launch's while the very process that served the create still serves.
+    let Some(created_in) = edge.instance.clone() else {
+        return Some(PaneCleanup::Refused(
+            "the launch records no verified backend instance for its pane".into(),
+        ));
+    };
+    match serving_identity(backend, verifier, stopping, budget) {
+        Some(serving) if serving == created_in => {}
+        _ => {
+            return Some(PaneCleanup::Refused(
+                "the backend instance serving now is not the one that created the recorded pane"
+                    .into(),
+            ));
+        }
+    }
+    if !backend
+        .capabilities()
+        .contains(&EXIT_OBSERVATION_CAPABILITY)
+    {
+        return Some(PaneCleanup::Refused(
+            "this backend cannot report whether the pane's command has exited".into(),
+        ));
+    }
+    let exited = subject.exited_at.is_some()
+        || (edge.exit.is_some()
+            && matches!(
+                bounded_exit_observation(backend, &pane, stopping, budget),
+                Ok(PaneExitObservation::Exited { .. })
+            ));
+    if !exited {
+        return Some(PaneCleanup::Refused(
+            "the launch's process is not verified gone; closing its pane would end it unclaimed"
+                .into(),
+        ));
+    }
+    let reader = Arc::clone(backend);
+    let cancel = Arc::clone(stopping);
+    let outcome = run_bounded(
+        budget,
+        stopping,
+        Instant::now() + VERIFICATION_TIMEOUT,
+        "radar-pane-cleanup",
+        move || reader.close_outcome(&crate::runtime::CloseTarget::Pane(pane), &cancel),
+    );
+    let outcome = match outcome {
+        Ok(crate::runtime::CloseOutcome::Completed) => PaneCleanup::Cleaned,
+        Ok(crate::runtime::CloseOutcome::Refused(message)) => PaneCleanup::Refused(message),
+        Ok(crate::runtime::CloseOutcome::Unknown(message)) => PaneCleanup::Unknown(message),
+        // The dispatch may have reached the backend and its answer was lost.
+        Err(()) => PaneCleanup::Unknown("the cleanup did not finish inside its deadline".into()),
+    };
+    match subjects::record_pane_cleanup(registry, subject_id, outcome, now_ms) {
+        Ok(recorded) => Some(recorded),
+        // An unrecorded outcome is never claimed as a cleanup: a replay must not
+        // read "cleaned" for a close nothing committed.
+        Err(error) => Some(PaneCleanup::Unknown(format!(
+            "the cleanup outcome could not be recorded: {error}"
+        ))),
+    }
 }
 
 /// Reads one pane's exit state now, bounded and cancellable like every other
@@ -1981,6 +2193,278 @@ fn registry_request(
             let evidence = location_evidence(inventory.as_ref(), &stored);
             Response::ok(&request.id, json!({"spawn": stored.topology(evidence)}))
         }
+        "lifecycle.get" => {
+            let params: LifecycleGetParams = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            if SessionUuid::parse(&params.subject_id).is_none() {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::BadParams, "`subject_id` must be a canonical UUID"),
+                );
+            }
+            let (registry, verifier) = {
+                let core = locked(core);
+                (Arc::clone(&core.registry), Arc::clone(&core.verifier))
+            };
+            match subjects::read(&registry, &params.subject_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(Code::NotFound, "launch subject is not recorded"),
+                    );
+                }
+                Err(error) => return registry_error(request, error),
+            }
+            // Observe exit by verified identity before answering, as spawn reads do.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as i64);
+            if let Err(error) =
+                subjects::observe_exit(&registry, &params.subject_id, verifier.as_ref(), now)
+            {
+                return registry_error(request, error);
+            }
+            match subjects::read(&registry, &params.subject_id) {
+                Ok(Some(subject)) => Response::ok(
+                    &request.id,
+                    json!({"subject": subjects::public_view(&subject), "source": sweep_source(core)}),
+                ),
+                Ok(None) => Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::NotFound, "launch subject is not recorded"),
+                ),
+                Err(error) => registry_error(request, error),
+            }
+        }
+        "lifecycle.list" => {
+            let params: LifecycleListParams = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            match params.limit {
+                Some(0) => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(Code::BadParams, "`limit` must be positive"),
+                    );
+                }
+                Some(limit) if limit > MAX_REGISTRY_PAGE => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(
+                            Code::BadParams,
+                            format!("`limit` must be at most {MAX_REGISTRY_PAGE}"),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            if params
+                .after
+                .as_deref()
+                .is_some_and(|after| SessionUuid::parse(after).is_none())
+            {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::BadParams, "`after` must be a canonical UUID"),
+                );
+            }
+            let limit = params.limit.unwrap_or(50).min(MAX_REGISTRY_PAGE);
+            let (registry, verifier) = {
+                let core = locked(core);
+                (Arc::clone(&core.registry), Arc::clone(&core.verifier))
+            };
+            // One record beyond the page tells whether a continuation exists.
+            let read = match subjects::list_after(&registry, params.after.as_deref(), limit + 1) {
+                Ok(read) => read,
+                Err(error) => return registry_error(request, error),
+            };
+            let has_more = read.len() > limit;
+            let page: Vec<String> = read
+                .iter()
+                .take(limit)
+                .map(|subject| subject.subject_id.clone())
+                .collect();
+            let now = unix_millis();
+            let mut views = Vec::with_capacity(page.len());
+            for subject_id in &page {
+                if let Err(error) =
+                    subjects::observe_exit(&registry, subject_id, verifier.as_ref(), now)
+                {
+                    return registry_error(request, error);
+                }
+                match subjects::read(&registry, subject_id) {
+                    Ok(Some(subject)) => views.push(subjects::public_view(&subject)),
+                    Ok(None) => {}
+                    Err(error) => return registry_error(request, error),
+                }
+            }
+            let next_after = if has_more { page.last().cloned() } else { None };
+            Response::ok(
+                &request.id,
+                json!({
+                    "subjects": views,
+                    "has_more": has_more,
+                    "next_after": next_after,
+                    "source": sweep_source(core),
+                }),
+            )
+        }
+        "topology.get" => {
+            let params: ContainerGetParams = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            if SessionUuid::parse(&params.container_id).is_none() {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::BadParams, "`container_id` must be a canonical UUID"),
+                );
+            }
+            let registry = {
+                let core = locked(core);
+                Arc::clone(&core.registry)
+            };
+            match containers::read(&registry, &params.container_id) {
+                Ok(Some(container)) => {
+                    Response::ok(&request.id, json!({"container": container.public()}))
+                }
+                Ok(None) => Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::NotFound, "container is not recorded"),
+                ),
+                Err(error) => registry_error(request, error),
+            }
+        }
+        "topology.list" => {
+            let params: ContainerListParams = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            match params.limit {
+                Some(0) => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(Code::BadParams, "`limit` must be positive"),
+                    );
+                }
+                Some(limit) if limit > MAX_REGISTRY_PAGE => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(
+                            Code::BadParams,
+                            format!("`limit` must be at most {MAX_REGISTRY_PAGE}"),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            if params
+                .after
+                .as_deref()
+                .is_some_and(|after| SessionUuid::parse(after).is_none())
+            {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::BadParams, "`after` must be a canonical UUID"),
+                );
+            }
+            let limit = params.limit.unwrap_or(50).min(MAX_REGISTRY_PAGE);
+            let registry = {
+                let core = locked(core);
+                Arc::clone(&core.registry)
+            };
+            // One record beyond the page tells whether a continuation exists.
+            let read = match containers::list_after(&registry, params.after.as_deref(), limit + 1) {
+                Ok(read) => read,
+                Err(error) => return registry_error(request, error),
+            };
+            let has_more = read.len() > limit;
+            let page: Vec<_> = read
+                .iter()
+                .take(limit)
+                .map(|container| container.public())
+                .collect();
+            let next_after = if has_more {
+                page.last().map(|container| container.container_id.clone())
+            } else {
+                None
+            };
+            Response::ok(
+                &request.id,
+                json!({"containers": page, "has_more": has_more, "next_after": next_after}),
+            )
+        }
+        "topology.reconcile" => {
+            let params: ContainerReconcileParams = match decode_params(request) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            match params.limit {
+                Some(0) => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(Code::BadParams, "`limit` must be positive"),
+                    );
+                }
+                Some(limit) if limit > MAX_RECONCILE => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(
+                            Code::BadParams,
+                            format!("`limit` must be at most {MAX_RECONCILE}"),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            let limit = params.limit.unwrap_or(MAX_RECONCILE).min(MAX_RECONCILE);
+            let backend = {
+                let core = locked(core);
+                core.backend.clone()
+            };
+            // A reconciliation needs an inventory to reconcile against: without
+            // one it refuses rather than recording that everything is missing.
+            let Some(backend) = backend else {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::BackendUnavailable, "no mux backend is wired"),
+                );
+            };
+            let Some(inventory) = observed_inventory(core) else {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(
+                        Code::BackendUnavailable,
+                        "the backend did not answer an inventory read",
+                    ),
+                );
+            };
+            let (registry, verifier, stopping) = {
+                let core = locked(core);
+                (
+                    Arc::clone(&core.registry),
+                    Arc::clone(&core.verifier),
+                    Arc::clone(&core.stopping),
+                )
+            };
+            // Every handle in the snapshot belongs to the incarnation serving it,
+            // so an unverified serving process confirms nothing.
+            let incarnation = serving_identity(&backend, &verifier, &stopping, verification);
+            let inventory = containers::Inventory::from_observation(
+                &inventory,
+                &backend.identity(),
+                incarnation,
+            );
+            let at = store::format_millis(unix_millis());
+            match containers::reconcile(&registry, &inventory, &at, limit) {
+                Ok(outcome) => Response::ok(&request.id, json!({"reconciled": outcome})),
+                Err(error) => registry_error(request, error),
+            }
+        }
         "spawn.close" => {
             let params: ChildCloseParams = match decode_params(request) {
                 Ok(value) => value,
@@ -2295,6 +2779,7 @@ fn public_record(record: RequestRecord) -> serde_json::Value {
             && let Some(object) = request.as_object_mut()
         {
             object.remove("env");
+            object.remove("argv");
         }
         if let Some(object) = params.as_object_mut() {
             object.remove("env");
@@ -2373,14 +2858,8 @@ fn read_events(core: &Arc<Mutex<Core>>, request: &Request, stopping: &Arc<Atomic
     let deadline = Instant::now() + Duration::from_millis(wait);
     loop {
         let generation = store.event_generation();
-        let (epoch, tail, earliest) = match store.event_cursor() {
+        let (epoch, tail, earliest, events, delivery_pending) = match store.event_snapshot() {
             Ok(cursor) => cursor,
-            Err(error) => {
-                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
-            }
-        };
-        let events = match store.events() {
-            Ok(events) => events,
             Err(error) => {
                 return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
             }
@@ -2404,7 +2883,7 @@ fn read_events(core: &Arc<Mutex<Core>>, request: &Request, stopping: &Arc<Atomic
         // whether a resumed read has anything left: a bounded prefix and a byte
         // bound can no longer look like an empty journal.
         let (available, cursor) = deliverable(events, after, limit, MAX_EVENTS_RESPONSE_BYTES);
-        let more = tail > cursor;
+        let more = tail > cursor || delivery_pending;
         if !available.is_empty()
             || wait == 0
             || stopping.load(Ordering::SeqCst)
@@ -2556,10 +3035,16 @@ fn execute(
     match operation {
         ops::Operation::Focus => execute_focus(request, core),
         ops::Operation::Close => execute_close(request, core),
-        ops::Operation::Create => execute_create(request, core),
+        ops::Operation::Create => execute_create(request, core, verification),
+        ops::Operation::CreateContainer => execute_container_create(request, core, verification),
         ops::Operation::Input => execute_input(request, core),
         ops::Operation::Report => execute_report(request, core),
         ops::Operation::Spawn => execute_spawn(request, core, verification),
+        ops::Operation::Enroll => execute_enroll(request, core, verification),
+        ops::Operation::Restart => execute_restart(request, core, verification),
+        ops::Operation::Cancel | ops::Operation::Stop => {
+            execute_subject_control(request, core, operation, verification)
+        }
     }
 }
 
@@ -2609,10 +3094,17 @@ fn admit(
                 && record.requester == *requester
                 && record.params.as_ref() == Some(&request.params);
             if same {
-                return Admission::Answered(Response::ok(
-                    &request.id,
-                    json!({ "request": public_record(record.clone()) }),
-                ));
+                let mut result = json!({ "request": public_record(record.clone()) });
+                // A replayed creation names the container its first answer named,
+                // so a caller recovering from a lost answer reads the identity it
+                // already made instead of searching the tree for it. No other
+                // operation's answer carries a container, so a replay of one stays
+                // the answer the first call gave.
+                if let ops::Operation::CreateContainer = operation {
+                    let container = containers::created_by(&core.registry, &request.id);
+                    result["container"] = json!(container.map(|container| container.public()));
+                }
+                return Admission::Answered(Response::ok(&request.id, result));
             }
             let message = if record.params.is_none() {
                 "legacy record cannot establish content-equivalent replay"
@@ -2885,12 +3377,13 @@ fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
 }
 
 /// The frozen normalized request a create or input carries under `request`,
-/// or the refusal to answer with.
-fn frozen_params(request: &Request) -> Result<serde_json::Value, Response> {
+/// or the refusal to answer with. `extra` names further params this method
+/// accepts beside it.
+fn frozen_params(request: &Request, extra: &[&str]) -> Result<serde_json::Value, Response> {
     if request.params.as_object().is_none_or(|params| {
-        params
-            .keys()
-            .any(|key| !matches!(key.as_str(), "request" | "requester"))
+        params.keys().any(|key| {
+            !matches!(key.as_str(), "request" | "requester") && !extra.contains(&key.as_str())
+        })
     }) {
         return Err(Response::refused(
             &request.id,
@@ -2908,28 +3401,141 @@ fn frozen_params(request: &Request) -> Result<serde_json::Value, Response> {
     })
 }
 
-/// Validates, records and dispatches one creation.
+/// One creation's result: the record to settle, and the container it recorded.
+struct Creation {
+    record: RequestRecord,
+    container: Option<containers::Container>,
+}
+
+/// The label a creation carries, bounded and free of control characters.
 ///
-/// Creation is a mux primitive: a location is made, and nothing is started in
-/// it. The record's target is the location the request changes — the pane being
-/// split, or the workspace a new tab joins — so a competing mutation of that
-/// location cannot run beside it. A new workspace changes nothing that exists,
-/// so it has no target and shares only the unscoped mutations' lane.
-fn execute_create(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
-    let frozen = match frozen_params(request) {
-        Ok(frozen) => frozen,
+/// A label is Radar's own name for a container: it is recorded verbatim and shown
+/// in the tree, and the backend is never told it. It is bounded here, at the wire
+/// boundary, rather than truncated wherever it is displayed.
+fn creation_label(request: &Request) -> Result<Option<String>, Response> {
+    let label = match request.optional_string("label") {
+        Ok(label) => label,
+        Err(refusal) => return Err(Response::refused(&request.id, &refusal)),
+    };
+    let Some(label) = label.filter(|label| !label.is_empty()) else {
+        return Ok(None);
+    };
+    if label.chars().count() > MAX_LABEL_CHARS {
+        return Err(Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                format!("a container label is at most {MAX_LABEL_CHARS} characters"),
+            ),
+        ));
+    }
+    if label.chars().any(char::is_control) {
+        return Err(Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                "a container label cannot carry control characters",
+            ),
+        ));
+    }
+    Ok(Some(label))
+}
+
+/// Dispatches a primitive create: a location is made, and nothing is started in
+/// it.
+///
+/// The record's target is the location the request changes — the pane being split,
+/// or the workspace a new tab joins — so a competing mutation of that location
+/// cannot run beside it. A new workspace changes nothing that exists, so it has no
+/// target and shares only the unscoped mutations' lane.
+fn execute_create(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    match dispatch_creation(ops::Operation::Create, None, request, core, verification) {
+        Ok(creation) => write_settled(request, creation.record, core),
+        Err(response) => response,
+    }
+}
+
+/// Dispatches a creation Radar records as one of its own containers.
+///
+/// The creation is the same primitive one; what this verb adds is that the
+/// container, its label and its provenance are Radar's records, and that the
+/// caller is answered with the container it made.
+fn execute_container_create(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let label = match creation_label(request) {
+        Ok(label) => label,
         Err(response) => return response,
     };
+    match dispatch_creation(
+        ops::Operation::CreateContainer,
+        label,
+        request,
+        core,
+        verification,
+    ) {
+        Ok(creation) => write_created(request, creation, core),
+        Err(response) => response,
+    }
+}
+
+/// Writes a settled creation together with the container it recorded.
+///
+/// The container travels with the record so a caller acts on the identity it made
+/// instead of joining a handle to whatever the tree shows next.
+fn write_created(request: &Request, creation: Creation, core: &Arc<Mutex<Core>>) -> Response {
+    let core = locked(core);
+    match core.store.write(&creation.record) {
+        Ok(()) => Response::ok(
+            &request.id,
+            json!({
+                "request": public_record(creation.record),
+                "container": creation.container.map(|container| container.public()),
+            }),
+        ),
+        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    }
+}
+
+/// Validates, records and dispatches one creation, and records the container it
+/// made.
+///
+/// `mux.create` asks a backend for a primitive and `topology.create` for the same
+/// creation as Radar's own hierarchy verb, so the two share every step: the
+/// request is validated here, the runtime's answer is turned into a container
+/// record before the creation is reported, and only the operation a caller is
+/// recorded under differs. A container is recorded for the identity the request
+/// asked for and no other, and a runtime that names nothing records nothing.
+fn dispatch_creation(
+    operation: ops::Operation,
+    label: Option<String>,
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Result<Creation, Response> {
+    // The primitive create carries the request alone; the hierarchy verb carries
+    // the label its container is recorded under.
+    let extra: &[&str] = match operation {
+        ops::Operation::CreateContainer => &["label"],
+        _ => &[],
+    };
+    let frozen = frozen_params(request, extra)?;
     let create: CreateRequest = match serde_json::from_value(frozen) {
         Ok(create) => create,
         Err(error) => {
-            return Response::refused(
+            return Err(Response::refused(
                 &request.id,
                 &Refusal::new(
                     Code::BadParams,
                     format!("`request` is not a create request: {error}"),
                 ),
-            );
+            ));
         }
     };
     // The scope is named by the caller, so a create never lands wherever the
@@ -2943,47 +3549,92 @@ fn execute_create(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
         .as_deref()
         .is_some_and(|target| !valid_identifier(target))
     {
-        return Response::refused(
+        return Err(Response::refused(
             &request.id,
             &Refusal::new(
                 Code::BadParams,
                 "the create target is not a valid identifier",
             ),
-        );
+        ));
     }
     let requester = match request.optional_string("requester") {
         Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
+        Err(refusal) => return Err(Response::refused(&request.id, &refusal)),
     };
     let now = store::now_ms();
-    let operation = ops::Operation::Create;
     let method = operation.as_str();
     let (backend, cancel) =
         match admit(operation, request, target.as_deref(), &requester, now, core) {
-            Admission::Answered(response) => return response,
+            Admission::Answered(response) => return Err(response),
             Admission::Unsupported(message) => {
-                return execute_unsupported(operation, request, &message, target, core);
+                return Err(execute_unsupported(
+                    operation, request, &message, target, core,
+                ));
             }
             Admission::Dispatch(backend, cancel) => (backend, cancel),
         };
     let record = RequestRecord::new(&request.id, method, requester, target, now)
         .with_params(request.params.clone());
+    // The incarnation serving this create is verified before it is dispatched, so
+    // the container is bound to the generation that made it rather than to
+    // whatever a later server puts at the same handle.
+    let verifier = Arc::clone(&locked(core).verifier);
+    let incarnation = serving_identity(&backend, &verifier, &cancel, verification);
     // Creation is confirmed, not re-observed: the runtime says it made the
     // location, nothing here lists to prove it exists.
     let done = match backend.create(&create, &cancel) {
         // The identity the answer named travels as data, so a client acts on what
         // it created without reading the effect prose.
-        CreateOutcome::Completed(created) => record
-            .created(created.identity(create.created_kind()))
-            .complete(
-                RequestOutcome::Completed,
-                None,
-                created
-                    .is_empty()
-                    .then_some("the runtime confirmed the creation without naming what it created"),
-                created.effects(),
-                store::now_ms(),
-            ),
+        CreateOutcome::Completed(created) => {
+            // The container is recorded before the creation is reported, so a
+            // caller never reads an owned location that no record names. A failed
+            // append is reported rather than hidden: the effect happened, and the
+            // caller must not be told the topology is recorded when it is not.
+            let now = store::now_ms();
+            let registry = {
+                let core = locked(core);
+                Arc::clone(&core.registry)
+            };
+            let backend_identity = backend.identity();
+            let recording = containers::record_created(
+                &registry,
+                containers::Confirmed {
+                    request: &create,
+                    created: &created,
+                    backend: &backend_identity,
+                    incarnation: incarnation.clone(),
+                    label,
+                    created_by: Some(request.id.clone()),
+                },
+                &store::format_millis(now),
+            );
+            let (container, note) = match (recording, created.is_empty()) {
+                (Err(error), _) => (
+                    None,
+                    Some(format!("the created container was not recorded: {error}")),
+                ),
+                (Ok(_), true) => (
+                    None,
+                    Some(
+                        "the runtime confirmed the creation without naming what it created"
+                            .to_owned(),
+                    ),
+                ),
+                (Ok(mut recorded), false) => (recorded.pop(), None),
+            };
+            return Ok(Creation {
+                record: record
+                    .created(created.identity(create.created_kind()))
+                    .complete(
+                        RequestOutcome::Completed,
+                        None,
+                        note.as_deref(),
+                        created.effects(),
+                        now,
+                    ),
+                container,
+            });
+        }
         CreateOutcome::Refused(message) => record.complete(
             RequestOutcome::Refused,
             Some(Category::BACKEND_REFUSED),
@@ -2999,7 +3650,10 @@ fn execute_create(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
             store::now_ms(),
         ),
     };
-    write_settled(request, done, core)
+    Ok(Creation {
+        record: done,
+        container: None,
+    })
 }
 
 /// Validates, records and dispatches one pane input.
@@ -3010,7 +3664,7 @@ fn execute_create(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
 /// survives validation is input this seam can carry without deciding for the
 /// caller what a terminal would do with it.
 fn execute_input(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
-    let frozen = match frozen_params(request) {
+    let frozen = match frozen_params(request, &[]) {
         Ok(frozen) => frozen,
         Err(response) => return response,
     };
@@ -3089,7 +3743,7 @@ fn execute_input(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
 /// Where the backend cannot report, the capability gate refuses before dispatch
 /// and the record says so, rather than the daemon substituting an operation.
 fn execute_report(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
-    let frozen = match frozen_params(request) {
+    let frozen = match frozen_params(request, &[]) {
         Ok(frozen) => frozen,
         Err(response) => return response,
     };
@@ -3167,42 +3821,9 @@ struct SpawnParams {
     env: std::collections::BTreeMap<String, String>,
 }
 
-/// Validates, records and dispatches one managed child spawn.
-///
-/// One operation, and four durable facts in order: the intent with its private
-/// token, the pane under the parent's own registered pane, the command typed
-/// into it, and the request's record. Each is written before the next is
-/// attempted, so a spawn that stops half-way leaves what it established readable
-/// rather than an unattributable pane; nothing is cleaned up on a later failure,
-/// because an operator can see and close a pane and cannot see one deleted
-/// silently. No assignment fact and no process lifecycle is touched: creating a
-/// child says nothing about keeping it alive.
-fn execute_spawn(
-    request: &Request,
-    core: &Arc<Mutex<Core>>,
-    verification: &Arc<VerificationBudget>,
-) -> Response {
-    let frozen = match frozen_params(request) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
-    let params: SpawnParams = match serde_json::from_value(frozen) {
-        Ok(params) => params,
-        Err(_error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    "`request` is not a valid spawn request".to_string(),
-                ),
-            );
-        }
-    };
-    // The command and the parent are validated at the wire boundary, before
-    // anything is recorded: a request this seam cannot carry creates no pane.
-    if let Err(message) = validate_command(&params.executable, &params.argv) {
-        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
-    }
+/// Asks the selected backend whether it can carry this launch, before any record
+/// is written.
+fn preflight_launch(core: &Arc<Mutex<Core>>, params: &SpawnParams) -> Result<(), Refusal> {
     let launch_context = LaunchRequest {
         pane_id: "preflight".to_string(),
         executable: params.executable.clone(),
@@ -3224,19 +3845,53 @@ fn execute_spawn(
         })
     };
     match preflight {
-        Some(Err(message)) => {
-            return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
-        }
-        None if params.cwd.is_some() || !params.env.is_empty() => {
+        Some(Err(message)) => Err(Refusal::new(Code::BadParams, message)),
+        None if params.cwd.is_some() || !params.env.is_empty() => Err(Refusal::new(
+            Code::BackendUnavailable,
+            "selected backend does not support launch context",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Validates, records and dispatches one managed child spawn.
+///
+/// One operation, and four durable facts in order: the intent with its private
+/// token, the pane under the parent's own registered pane, the command typed
+/// into it, and the request's record. Each is written before the next is
+/// attempted, so a spawn that stops half-way leaves what it established readable
+/// rather than an unattributable pane; nothing is cleaned up on a later failure,
+/// because an operator can see and close a pane and cannot see one deleted
+/// silently. No assignment fact and no process lifecycle is touched: creating a
+/// child says nothing about keeping it alive.
+fn execute_spawn(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let frozen = match frozen_params(request, &[]) {
+        Ok(frozen) => frozen,
+        Err(response) => return response,
+    };
+    let params: SpawnParams = match serde_json::from_value(frozen) {
+        Ok(params) => params,
+        Err(_error) => {
             return Response::refused(
                 &request.id,
                 &Refusal::new(
-                    Code::BackendUnavailable,
-                    "selected backend does not support launch context",
+                    Code::BadParams,
+                    "`request` is not a valid spawn request".to_string(),
                 ),
             );
         }
-        _ => {}
+    };
+    // The command and the parent are validated at the wire boundary, before
+    // anything is recorded: a request this seam cannot carry creates no pane.
+    if let Err(message) = validate_command(&params.executable, &params.argv) {
+        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+    }
+    if let Err(refusal) = preflight_launch(core, &params) {
+        return Response::refused(&request.id, &refusal);
     }
     let intent = registry::SpawnRequest {
         request_id: request.id.clone(),
@@ -3244,6 +3899,14 @@ fn execute_spawn(
         parent_session_id: params.parent_session_id.clone(),
     };
     if let Err(message) = intent.validate() {
+        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+    }
+    let tracks_launches = locked(core).backend.as_ref().is_some_and(|backend| {
+        backend
+            .capabilities()
+            .contains(&LIFECYCLE_TRACKING_CAPABILITY)
+    });
+    if tracks_launches && let Err(message) = subjects::check_bounds(&requested_launch(&params)) {
         return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
     }
     // The child is created beside the pane its parent registered: a spawn never
@@ -3310,6 +3973,29 @@ fn execute_spawn(
             }
         }
     };
+    spawn_child(
+        request,
+        core,
+        verification,
+        &params,
+        &intent,
+        parent_pane,
+        None,
+    )
+}
+
+/// Creates the pane a child runs in and launches it there, once its parent pane is
+/// resolved. A restart reuses this with the lead's own pane as the parent pane and
+/// its resume recipe as the launch, so both paths share one durable sequence.
+fn spawn_child(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+    params: &SpawnParams,
+    intent: &registry::SpawnRequest,
+    parent_pane: String,
+    session: Option<String>,
+) -> Response {
     let requester = match request.optional_string("requester") {
         Ok(requester) => requester,
         Err(refusal) => return Response::refused(&request.id, &refusal),
@@ -3341,7 +4027,7 @@ fn execute_spawn(
     // The intent, its parent and the token the child will present are durable
     // before the first effect: a spawn that dies here leaves a readable intent,
     // not nothing to reconcile.
-    if let Err(message) = locked(core).registry.record_spawn(&intent, now) {
+    if let Err(message) = locked(core).registry.record_spawn(intent, now) {
         let settled = record.complete(
             RequestOutcome::Refused,
             None,
@@ -3352,6 +4038,35 @@ fn execute_spawn(
         let _ = write_settled(request, settled, core);
         return Response::refused(&request.id, &Refusal::new(Code::Refused, message));
     }
+    // A backend that tracks its launches gets the subject before any effect, so
+    // the bootstrap's correlation is recorded before the launch can run it.
+    let tracking = if backend
+        .capabilities()
+        .contains(&LIFECYCLE_TRACKING_CAPABILITY)
+    {
+        match track_launch(
+            core,
+            &request.id,
+            requested_launch(params),
+            session.clone(),
+            now,
+        ) {
+            Ok(tracking) => Some(tracking),
+            Err(message) => {
+                let settled = record.complete(
+                    RequestOutcome::Refused,
+                    None,
+                    Some(&message),
+                    Vec::new(),
+                    store::now_ms(),
+                );
+                let _ = write_settled(request, settled, core);
+                return Response::refused(&request.id, &Refusal::new(Code::Internal, message));
+            }
+        }
+    } else {
+        None
+    };
     // The pane is a split of the parent's own pane, unfocused: a child is
     // created where its parent is, and creating one must not move the operator's
     // cursor.
@@ -3363,15 +4078,13 @@ fn execute_spawn(
     // records nothing.
     let verifier = Arc::clone(&locked(core).verifier);
     let instance = serving_identity(&backend, &verifier, &cancel, verification);
-    let created = backend.create(
-        &CreateRequest::PaneSplit {
-            pane_id: parent_pane,
-            direction: SplitDirection::Right,
-            focus: false,
-        },
-        &cancel,
-    );
-    let (created_outcome, named, created_message) = match &created {
+    let create_request = CreateRequest::PaneSplit {
+        pane_id: parent_pane,
+        direction: SplitDirection::Right,
+        focus: false,
+    };
+    let created = backend.create(&create_request, &cancel);
+    let (created_outcome, named, mut created_message) = match &created {
         CreateOutcome::Completed(named) => (
             RequestOutcome::Completed,
             Some(named),
@@ -3385,6 +4098,30 @@ fn execute_spawn(
     let location = named
         .filter(|named| !named.is_empty())
         .map(|named| created_location(named, &backend.identity()));
+    // The pane this launch was dispatched into is recorded as one of this
+    // daemon's containers before the edge and the launch are recorded: a spawned
+    // agent's slot is topology, not only a location on an edge.
+    if let Some(named) = named {
+        let registry = {
+            let core = locked(core);
+            Arc::clone(&core.registry)
+        };
+        let at = store::format_millis(store::now_ms());
+        if let Err(error) = containers::record_created(
+            &registry,
+            containers::Confirmed {
+                request: &create_request,
+                created: named,
+                backend: &backend.identity(),
+                incarnation: instance.clone(),
+                label: None,
+                created_by: Some(request.id.clone()),
+            },
+            &at,
+        ) {
+            created_message = Some(format!("the created container was not recorded: {error}"));
+        }
+    }
     let mut effects = named.map(CreatedLocation::effects).unwrap_or_default();
     let pane = named.and_then(|named| named.identity(CreatedKind::Pane));
     // An instance identity is recorded only for a pane: an edge with no location
@@ -3423,17 +4160,19 @@ fn execute_spawn(
         .as_ref()
         .and_then(|location| location.pane.clone())
         .map(|pane| {
-            backend.launch(
-                &LaunchRequest {
-                    pane_id: pane,
-                    executable: params.executable.clone(),
-                    argv: params.argv.clone(),
-                    spawn_token: edge.token.clone(),
-                    cwd: params.cwd.clone(),
-                    env: params.env.clone(),
-                },
-                &cancel,
-            )
+            let target = LaunchRequest {
+                pane_id: pane,
+                executable: params.executable.clone(),
+                argv: params.argv.clone(),
+                spawn_token: edge.token.clone(),
+                cwd: params.cwd.clone(),
+                env: params.env.clone(),
+            };
+            let launch = match &tracking {
+                Some((bootstrap, ticket)) => subjects::wrap(bootstrap, ticket, target),
+                None => target,
+            };
+            backend.launch(&launch, &cancel)
         });
     let (launched_outcome, launch_message) = match &launched {
         Some(LaunchOutcome::Completed) => (Some(RequestOutcome::Completed), None),
@@ -3510,6 +4249,1028 @@ fn execute_spawn(
         .created(pane)
         .complete(outcome, category, message, effects, store::now_ms());
     settle_spawn(request, done, &edge, core)
+}
+
+/// The bootstrap a tracked launch runs: this binary, serving `socket`. `None`
+/// when either path is not text the launch argv can carry.
+fn bootstrap_for(socket: &Path) -> Option<Bootstrap> {
+    Some(Bootstrap {
+        executable: std::env::current_exe().ok()?.to_str()?.to_string(),
+        socket: socket.to_str()?.to_string(),
+    })
+}
+
+/// Records the launch subject for a tracked spawn and attaches it to the edge,
+/// returning what the launch needs to run through the bootstrap.
+fn track_launch(
+    core: &Arc<Mutex<Core>>,
+    request_id: &str,
+    launch: subjects::LaunchContext,
+    session: Option<String>,
+    now: i64,
+) -> Result<(Bootstrap, subjects::Ticket), String> {
+    let (registry, bootstrap) = {
+        let core = locked(core);
+        (Arc::clone(&core.registry), core.bootstrap.clone())
+    };
+    let bootstrap =
+        bootstrap.ok_or("this daemon has no executable path a tracked launch can run through")?;
+    let ticket = subjects::create(&registry, request_id, launch, session, now)?;
+    registry.attach_subject(request_id, &ticket.subject_id)?;
+    Ok((bootstrap, ticket))
+}
+
+fn requested_launch(params: &SpawnParams) -> subjects::LaunchContext {
+    subjects::LaunchContext {
+        executable: params.executable.clone(),
+        argv: params.argv.clone(),
+        cwd: params.cwd.clone(),
+        env: params.env.clone(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapParams {
+    subject_id: String,
+    correlation: String,
+    process: ProcessIdentity,
+}
+
+/// Captures the process a tracked launch's bootstrap claims, and releases it to
+/// run its program.
+///
+/// Released only when the subject is pending with this correlation, the pane the
+/// edge recorded has this process as its foreground, the identity matches the
+/// live process, and a pidfd can be opened on it. Every refusal reads the same
+/// way, so a caller cannot probe which of those checks failed.
+fn bootstrap_request(
+    core: &Arc<Mutex<Core>>,
+    request: &Request,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let params: BootstrapParams = match decode_params(request) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let (registry, backend, verifier, stopping) = {
+        let core = locked(core);
+        let Some(backend) = core.backend.clone() else {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::BackendUnavailable, "no backend is wired"),
+            );
+        };
+        (
+            Arc::clone(&core.registry),
+            backend,
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let not_awaiting = || {
+        Response::refused(
+            &request.id,
+            &Refusal::new(Code::Refused, subjects::NOT_AWAITING),
+        )
+    };
+    if !backend
+        .capabilities()
+        .contains(&LIFECYCLE_TRACKING_CAPABILITY)
+    {
+        return not_awaiting();
+    }
+    let subject = match subjects::read(&registry, &params.subject_id) {
+        Ok(Some(subject))
+            if subject.state == subjects::State::Pending
+                && subject.correlation.as_deref() == Some(params.correlation.as_str()) =>
+        {
+            subject
+        }
+        Ok(_) => return not_awaiting(),
+        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    };
+    let edge = match registry.spawn_edge(&subject.spawn_request_id) {
+        Ok(Some(edge)) => edge,
+        Ok(None) => return not_awaiting(),
+        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    };
+    let Some(pane) = edge
+        .location
+        .as_ref()
+        .and_then(|location| location.pane.clone())
+    else {
+        return not_awaiting();
+    };
+    if let Err(refusal) = verify_live_occupant(
+        &backend,
+        &verifier,
+        &pane,
+        &params.process,
+        &stopping,
+        verification,
+    ) {
+        return Response::refused(&request.id, &refusal);
+    }
+    // The pidfd is held across the context read, so the read describes the
+    // claimed process. A later stop reopens one from the record.
+    let _pidfd = match process_control::acquire(&params.process, verifier.as_ref()) {
+        Ok(Acquired::Process(pidfd)) => pidfd,
+        Ok(Acquired::Absent) => return not_awaiting(),
+        Ok(Acquired::Replaced) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::Refused, "process identity has changed"),
+            );
+        }
+        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Refused, error)),
+    };
+    let Ok(effective) = process_control::effective(params.process.pid) else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(Code::BackendUnavailable, "launch context is unavailable"),
+        );
+    };
+    // The bootstrap runs no program before release, so its context reads describe
+    // the claimed process only while that identity still holds.
+    if !matches!(
+        verifier.inspect(params.process.pid),
+        Ok(Some(observed)) if observed == params.process
+    ) {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "foreground process birth identity is unavailable or changed",
+            ),
+        );
+    }
+    // The wake is installed before the launch is captured, so the program's exit
+    // is noticed from the moment it can run. A launch whose wake cannot be
+    // installed is never released.
+    if let Err(message) = install_exit_wake(core, &backend, &params.subject_id, &edge, &stopping) {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(Code::BackendUnavailable, message),
+        );
+    }
+    match subjects::capture(
+        &registry,
+        &params.subject_id,
+        &params.correlation,
+        &params.process,
+        &effective,
+        store::now_ms(),
+    ) {
+        Ok(()) => Response::ok(&request.id, json!({ "released": true })),
+        Err(error) => {
+            retire_wake(&backend, &params.subject_id, &stopping);
+            Response::refused(&request.id, &Refusal::new(Code::Refused, error))
+        }
+    }
+}
+
+/// Installs the pane-death wake for a launch, naming the server generation its
+/// pane was created in. A launch whose generation was not recorded cannot be
+/// fenced, so it has no wake.
+fn install_exit_wake(
+    core: &Arc<Mutex<Core>>,
+    backend: &Arc<dyn RuntimeProvider>,
+    subject_id: &str,
+    edge: &registry::SpawnEdge,
+    stopping: &AtomicBool,
+) -> Result<(), String> {
+    let bootstrap = locked(core)
+        .bootstrap
+        .clone()
+        .ok_or("this daemon has no executable path a tracked launch can run through")?;
+    let instance = edge
+        .instance
+        .as_ref()
+        .ok_or("the launch's server generation is unrecorded, so its exit cannot be notified")?;
+    let command = subjects::wake_command(&bootstrap, subject_id, instance)?;
+    backend.install_exit_wake(subject_id, &command, stopping)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubjectParams {
+    #[serde(default)]
+    subject_id: Option<String>,
+    #[serde(default)]
+    spawn_request_id: Option<String>,
+}
+
+/// Validates, records and dispatches a cancel or stop of a tracked launch.
+///
+/// The target is the exact subject, named directly or through the spawn that
+/// created it. The record's target is the subject's pane, so a competing
+/// mutation of that pane waits behind it. The record names each effect: launch
+/// revocation (cancel only), signal dispatch, exit verification, and the pane an
+/// unbound launch left behind.
+fn execute_subject_control(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    operation: ops::Operation,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let frozen = match frozen_params(request, &[]) {
+        Ok(frozen) => frozen,
+        Err(response) => return response,
+    };
+    let params: SubjectParams = match serde_json::from_value(frozen) {
+        Ok(params) => params,
+        Err(_error) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BadParams,
+                    "`request` is not a valid subject request".to_string(),
+                ),
+            );
+        }
+    };
+    let requester = match request.optional_string("requester") {
+        Ok(requester) => requester,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let registry = Arc::clone(&locked(core).registry);
+    let (subject_id, target) = match cancel_target(&registry, &params) {
+        Ok(target) => target,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let now = store::now_ms();
+    match admit(operation, request, Some(&target), &requester, now, core) {
+        Admission::Answered(response) => return response,
+        Admission::Unsupported(message) => {
+            return execute_unsupported(operation, request, &message, Some(target), core);
+        }
+        Admission::Dispatch(..) => {}
+    }
+    let (verifier, backend, stopping) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.verifier),
+            core.backend.clone(),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let termination = match operation {
+        ops::Operation::Stop => subjects::stop(&registry, &subject_id, verifier.as_ref(), now),
+        _ => subjects::cancel(&registry, &subject_id, verifier.as_ref(), now),
+    };
+    // Every cancel asks about the launch's own pane, so a launch already cleaned
+    // up reports that instead of closing anything again. A bound launch's pane
+    // belongs to its child, and a stop leaves the launch exactly as it is.
+    let cleanup = match (&termination, operation, &backend) {
+        (Ok(_), ops::Operation::Cancel, Some(backend)) => cleanup_unbound_pane(
+            &registry,
+            backend,
+            &verifier,
+            &subject_id,
+            &stopping,
+            verification,
+            now,
+        ),
+        _ => None,
+    };
+    let (outcome, category, message, effects) = match termination {
+        Ok(termination) => {
+            if let (subjects::Exit::Exited, Some(backend)) = (&termination.exit, &backend) {
+                retire_wake(backend, &subject_id, &stopping);
+            }
+            termination_outcome(&termination, operation, cleanup.as_ref())
+        }
+        Err(error) => (RequestOutcome::Unknown, None, Some(error), Vec::new()),
+    };
+    let record = RequestRecord::new(
+        &request.id,
+        operation.as_str(),
+        requester,
+        Some(target),
+        now,
+    )
+    .with_params(request.params.clone())
+    .complete(
+        outcome,
+        category,
+        message.as_deref(),
+        effects,
+        store::now_ms(),
+    );
+    write_settled(request, record, core)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollParams {
+    agent_id: String,
+    session: String,
+}
+
+/// What a lifecycle request reports: its outcome, category, message and effects.
+type Settlement = (
+    RequestOutcome,
+    Option<&'static str>,
+    Option<String>,
+    Vec<String>,
+);
+
+fn refusal_settlement(message: impl Into<String>) -> Settlement {
+    (
+        RequestOutcome::Refused,
+        Some(Category::BACKEND_REFUSED),
+        Some(message.into()),
+        Vec::new(),
+    )
+}
+
+/// Enrolls a running lead the daemon did not launch as a restartable subject.
+///
+/// The named registration must claim a process that is verifiably the foreground of
+/// its own pane, and its fresh session context must name the operator's session.
+/// Nothing is signalled or relaunched: the enrollment records what was verified.
+fn execute_enroll(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let frozen = match frozen_params(request, &[]) {
+        Ok(frozen) => frozen,
+        Err(response) => return response,
+    };
+    let params: EnrollParams = match serde_json::from_value(frozen) {
+        Ok(params) => params,
+        Err(_error) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BadParams,
+                    "`request` is not a valid enrollment".to_string(),
+                ),
+            );
+        }
+    };
+    let requester = match request.optional_string("requester") {
+        Ok(requester) => requester,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    if crate::model::SessionUuid::parse(&params.session).is_none() {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                "`session` must be a canonical UUID".to_string(),
+            ),
+        );
+    }
+    let (registry, verifier, stopping) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let now = store::now_ms();
+    let registration = match registry.get(&params.agent_id) {
+        Ok(Some(registration)) => registration,
+        Ok(None) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::NotFound, "registration is not recorded".to_string()),
+            );
+        }
+        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    };
+    let Some(pane) = registration
+        .request
+        .location
+        .as_ref()
+        .and_then(|location| location.pane.clone())
+    else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "registration names no pane to enroll".to_string(),
+            ),
+        );
+    };
+    let Some(claim) = registration.request.process.clone() else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "registration claims no process to enroll".to_string(),
+            ),
+        );
+    };
+    match registry.context(&params.agent_id, now) {
+        Ok(Some(context))
+            if context.context.freshness == registry::Freshness::Fresh
+                && context.context.session.as_deref() == Some(params.session.as_str()) => {}
+        Ok(_) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::Refused,
+                    "registration's fresh session context does not match the session".to_string(),
+                ),
+            );
+        }
+        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    }
+    let (backend, _cancel) = match admit(
+        ops::Operation::Enroll,
+        request,
+        Some(&pane),
+        &requester,
+        now,
+        core,
+    ) {
+        Admission::Answered(response) => return response,
+        Admission::Unsupported(message) => {
+            return execute_unsupported(
+                ops::Operation::Enroll,
+                request,
+                &message,
+                Some(pane),
+                core,
+            );
+        }
+        Admission::Dispatch(backend, cancel) => (backend, cancel),
+    };
+    let record = RequestRecord::new(
+        &request.id,
+        ops::Operation::Enroll.as_str(),
+        requester,
+        Some(pane.clone()),
+        now,
+    )
+    .with_params(request.params.clone());
+    let enrolled =
+        match verify_live_occupant(&backend, &verifier, &pane, &claim, &stopping, verification) {
+            Err(refusal) => Err(refusal.message),
+            Ok(()) => record_enrollment(&registry, &verifier, &params, &claim, &request.id, now),
+        };
+    let (outcome, category, message, effects) = match enrolled {
+        Ok(subject_id) => (
+            RequestOutcome::Completed,
+            None,
+            None,
+            vec![format!("enrolled subject {subject_id}")],
+        ),
+        Err(message) => refusal_settlement(message),
+    };
+    write_settled(
+        request,
+        record.complete(
+            outcome,
+            category,
+            message.as_deref(),
+            effects,
+            store::now_ms(),
+        ),
+        core,
+    )
+}
+
+/// Records the enrolled subject for a verified process. The launch is read only
+/// while the claimed birth identity still holds, so it describes the claimed process.
+fn record_enrollment(
+    registry: &registry::Registry,
+    verifier: &Arc<dyn ProcessVerifier>,
+    params: &EnrollParams,
+    claim: &crate::model::ProcessIdentity,
+    enrollment_id: &str,
+    now: i64,
+) -> Result<String, String> {
+    let effective = process_control::effective(claim.pid)
+        .map_err(|_| "launch context is unavailable".to_string())?;
+    if !matches!(verifier.inspect(claim.pid), Ok(Some(observed)) if observed == *claim) {
+        return Err("foreground process birth identity is unavailable or changed".into());
+    }
+    let launch = subjects::captured_launch(&effective)?;
+    subjects::enroll_subject(
+        registry,
+        enrollment_id,
+        &params.agent_id,
+        claim,
+        &params.session,
+        launch,
+        now,
+    )
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestartParams {
+    subject_id: String,
+}
+
+/// Restarts an enrolled or tracked lead: stops its verified process, then launches a
+/// replacement that resumes its Pi session in a fresh pane split from the lead's own.
+///
+/// Refusals before the stop change nothing. The replacement is recorded as the old
+/// process's successor before it is launched, so a replay under a new request never
+/// launches a second one. Children and their immutable edges are left as they are.
+fn execute_restart(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let frozen = match frozen_params(request, &[]) {
+        Ok(frozen) => frozen,
+        Err(response) => return response,
+    };
+    let params: RestartParams = match serde_json::from_value(frozen) {
+        Ok(params) => params,
+        Err(_error) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BadParams,
+                    "`request` is not a valid restart request".to_string(),
+                ),
+            );
+        }
+    };
+    let requester = match request.optional_string("requester") {
+        Ok(requester) => requester,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let registry = Arc::clone(&locked(core).registry);
+    let subject = match subjects::read(&registry, &params.subject_id) {
+        Ok(Some(subject)) => subject,
+        Ok(None) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::NotFound, "launch subject is not recorded".to_string()),
+            );
+        }
+        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    };
+    // The anchor is the lead's own pane: a dead lead's pane stays addressable under
+    // remain-on-exit, and a replacement is split from it rather than from a parent.
+    let anchor = match subject.bound_agent_id.as_deref() {
+        Some(agent) => match registry.get(agent) {
+            Ok(Some(registration)) => registration
+                .request
+                .location
+                .and_then(|location| location.pane),
+            Ok(None) => None,
+            Err(error) => {
+                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+            }
+        },
+        None => None,
+    };
+    let Some(anchor) = anchor else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "restart needs the lead's own recorded pane as its anchor".to_string(),
+            ),
+        );
+    };
+    let now = store::now_ms();
+    let cancel = match admit(
+        ops::Operation::Restart,
+        request,
+        Some(&subject.subject_id),
+        &requester,
+        now,
+        core,
+    ) {
+        Admission::Answered(response) => return response,
+        Admission::Unsupported(message) => {
+            return execute_unsupported(
+                ops::Operation::Restart,
+                request,
+                &message,
+                Some(subject.subject_id.clone()),
+                core,
+            );
+        }
+        Admission::Dispatch(_, cancel) => cancel,
+    };
+    let record = RequestRecord::new(
+        &request.id,
+        ops::Operation::Restart.as_str(),
+        requester,
+        Some(subject.subject_id.clone()),
+        now,
+    )
+    .with_params(request.params.clone());
+    let (outcome, category, message, effects) =
+        restart_lead(core, &subject, &anchor, &cancel, verification, now);
+    write_settled(
+        request,
+        record.complete(
+            outcome,
+            category,
+            message.as_deref(),
+            effects,
+            store::now_ms(),
+        ),
+        core,
+    )
+}
+
+/// The restart's effects after admission, in order: the checks, the verified stop,
+/// the successor record, then the replacement launch. Each stage reports on its own.
+fn restart_lead(
+    core: &Arc<Mutex<Core>>,
+    subject: &subjects::Subject,
+    anchor: &str,
+    cancel: &AtomicBool,
+    verification: &Arc<VerificationBudget>,
+    now: i64,
+) -> Settlement {
+    let (registry, backend, verifier) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            core.backend.clone(),
+            Arc::clone(&core.verifier),
+        )
+    };
+    let Some(backend) = backend else {
+        return refusal_settlement("no backend is wired");
+    };
+    if subject.state != subjects::State::Bound {
+        return refusal_settlement("the subject is not bound to a live process");
+    }
+    let (Some(agent), Some(session)) = (
+        subject.bound_agent_id.as_deref(),
+        subject.session.as_deref(),
+    ) else {
+        return refusal_settlement("the subject has no session to resume; enroll it first");
+    };
+    if let Some(successor) = &subject.successor {
+        return refusal_settlement(format!(
+            "this process is already superseded by spawn {successor}"
+        ));
+    }
+    match backend.inventory(cancel) {
+        Ok(fleet)
+            if fleet
+                .panes
+                .iter()
+                .any(|pane| pane.location.pane_id == anchor) => {}
+        Ok(_) => {
+            return refusal_settlement(
+                "the lead's pane is no longer present to anchor the replacement",
+            );
+        }
+        Err(error) => {
+            return (
+                RequestOutcome::Refused,
+                Some(Category::BACKEND_UNAVAILABLE),
+                Some(error),
+                Vec::new(),
+            );
+        }
+    }
+    match registry.context(agent, now) {
+        Ok(Some(context)) if context.context.session.as_deref() == Some(session) => {}
+        Ok(_) => {
+            return refusal_settlement(
+                "the lead's published session no longer matches its recipe; enroll it again",
+            );
+        }
+        Err(error) => return refusal_settlement(error),
+    }
+    let resume = match subjects::resume_launch(&subject.launch, session) {
+        Ok(resume) => resume,
+        Err(message) => return refusal_settlement(message),
+    };
+    let params = SpawnParams {
+        parent: agent.to_string(),
+        parent_session_id: session.to_string(),
+        executable: resume.executable,
+        argv: resume.argv,
+        cwd: resume.cwd,
+        env: resume.env,
+    };
+    if let Err(message) = validate_command(&params.executable, &params.argv) {
+        return refusal_settlement(message);
+    }
+    if let Err(message) = subjects::check_bounds(&requested_launch(&params)) {
+        return refusal_settlement(message);
+    }
+    if let Err(refusal) = preflight_launch(core, &params) {
+        return refusal_settlement(refusal.message);
+    }
+    let mut effects = Vec::new();
+    let termination = match subjects::stop(&registry, &subject.subject_id, verifier.as_ref(), now) {
+        Ok(termination) => termination,
+        Err(error) => {
+            return (
+                RequestOutcome::Unknown,
+                Some(Category::BACKEND_UNAVAILABLE),
+                Some(error),
+                effects,
+            );
+        }
+    };
+    if termination.signal_attempted {
+        effects.push("signalled previous process".to_string());
+    }
+    match termination.exit {
+        subjects::Exit::Exited => effects.push("previous process exited".to_string()),
+        subjects::Exit::Unresolved => {
+            return (
+                RequestOutcome::Refused,
+                Some(Category::BACKEND_REFUSED),
+                Some(
+                    "the previous process could not be identified; no replacement was launched"
+                        .into(),
+                ),
+                effects,
+            );
+        }
+        subjects::Exit::Unverified(reason) => {
+            return (
+                RequestOutcome::Unknown,
+                Some(Category::BACKEND_UNAVAILABLE),
+                Some(format!(
+                    "previous process exit is not verified; no replacement was launched: {reason}"
+                )),
+                effects,
+            );
+        }
+    }
+    let successor = store::random_uuid();
+    if let Err(error) =
+        subjects::set_successor(&registry, &subject.subject_id, &successor, store::now_ms())
+    {
+        return (
+            RequestOutcome::Refused,
+            Some(Category::BACKEND_REFUSED),
+            Some(error),
+            effects,
+        );
+    }
+    effects.push(format!("successor {successor}"));
+    let intent = registry::SpawnRequest {
+        request_id: successor.clone(),
+        parent: params.parent.clone(),
+        parent_session_id: params.parent_session_id.clone(),
+    };
+    let replacement = Request {
+        id: successor.clone(),
+        method: ops::Operation::Spawn.as_str().to_string(),
+        params: serde_json::json!({
+            "parent": params.parent,
+            "parent_session_id": params.parent_session_id,
+            "executable": params.executable,
+            "argv": params.argv,
+            "cwd": params.cwd,
+            "env": params.env,
+        }),
+    };
+    let _ = spawn_child(
+        &replacement,
+        core,
+        verification,
+        &params,
+        &intent,
+        anchor.to_string(),
+        Some(session.to_string()),
+    );
+    match registry.spawn_edge(&successor) {
+        Ok(Some(edge)) => match edge.launched {
+            RequestOutcome::Completed => {
+                effects.push("launched replacement".to_string());
+                (RequestOutcome::Completed, None, None, effects)
+            }
+            RequestOutcome::Unknown => (
+                RequestOutcome::Unknown,
+                Some(Category::BACKEND_UNAVAILABLE),
+                Some("replacement launch is unknown; it will not be retried".into()),
+                effects,
+            ),
+            _ => (
+                RequestOutcome::Refused,
+                Some(Category::BACKEND_REFUSED),
+                Some("replacement was not launched".into()),
+                effects,
+            ),
+        },
+        Ok(None) => (
+            RequestOutcome::Refused,
+            Some(Category::BACKEND_REFUSED),
+            Some("replacement was not recorded".into()),
+            effects,
+        ),
+        Err(error) => (
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            Some(error),
+            effects,
+        ),
+    }
+}
+
+/// The subject a cancel or stop names and the target it is admitted under.
+fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String, String), Refusal> {
+    let internal = |error: String| Refusal::new(Code::Internal, error);
+    let subject = match (&params.subject_id, &params.spawn_request_id) {
+        (Some(subject_id), None) => subjects::read(registry, subject_id)
+            .map_err(internal)?
+            .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?,
+        (None, Some(request_id)) => {
+            let edge = registry
+                .spawn_edge(request_id)
+                .map_err(internal)?
+                .ok_or_else(|| Refusal::new(Code::NotFound, "spawn is not recorded"))?;
+            let subject_id = edge.subject_id.clone().ok_or_else(|| {
+                Refusal::new(Code::Refused, "spawn is not a lifecycle-tracked launch")
+            })?;
+            subjects::read(registry, &subject_id)
+                .map_err(internal)?
+                .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?
+        }
+        _ => {
+            return Err(Refusal::new(
+                Code::BadParams,
+                "exactly one of `subject_id` or `spawn_request_id` is required",
+            ));
+        }
+    };
+    Ok((subject.subject_id.clone(), subject.subject_id))
+}
+
+/// What a cancel's or stop's effects read as on its record: the outcome the caller
+/// may rely on, the message for it, and each effect named separately. Only a
+/// cancel names the pane, because only a cancel acts on it.
+fn termination_outcome(
+    termination: &subjects::Termination,
+    operation: ops::Operation,
+    cleanup: Option<&subjects::PaneCleanup>,
+) -> (
+    RequestOutcome,
+    Option<&'static str>,
+    Option<String>,
+    Vec<String>,
+) {
+    let mut effects = Vec::new();
+    if termination.revoked {
+        effects.push("launch revoked".to_string());
+    }
+    if termination.signal_attempted {
+        effects.push("sigterm dispatched".to_string());
+    }
+    if operation == ops::Operation::Cancel {
+        match cleanup {
+            Some(cleanup) => effects.push(cleanup.effect()),
+            None => effects.push("pane kept".to_string()),
+        }
+    }
+    match &termination.exit {
+        subjects::Exit::Unresolved => {
+            effects.push("process identity unresolved".to_string());
+            (RequestOutcome::Completed, None, None, effects)
+        }
+        subjects::Exit::Exited => {
+            effects.push("process exit verified".to_string());
+            (RequestOutcome::Completed, None, None, effects)
+        }
+        subjects::Exit::Unverified(message) => (
+            RequestOutcome::Unknown,
+            None,
+            Some(message.clone()),
+            effects,
+        ),
+    }
+}
+
+/// Removes a launch's exit wake once its exit is recorded. Best effort: a slot
+/// left behind names a launch that has ended, and the next wake removes it.
+fn retire_wake(backend: &Arc<dyn RuntimeProvider>, subject_id: &str, stopping: &AtomicBool) {
+    let _ = backend.remove_exit_wake(subject_id, stopping);
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WakeParams {
+    subject_id: String,
+    server: crate::model::ProcessIdentity,
+}
+
+/// Reconciles one launch after its pane's process may have died.
+///
+/// How long the recovery sweep waits between passes.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Starts the bounded recovery sweep. It re-observes recorded launches on a fixed
+/// interval, so a missed exit notification is recovered without any client, and
+/// it stops with the daemon.
+fn spawn_sweeper(core: &Arc<Mutex<Core>>, stopping: &Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+    let (registry, verifier, sweep_at) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.sweep_at),
+        )
+    };
+    let stopping = Arc::clone(stopping);
+    thread::Builder::new()
+        .name("radar-control-sweep".to_string())
+        .spawn(move || {
+            while !stopping.load(Ordering::SeqCst) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis() as i64);
+                match subjects::sweep(&registry, verifier.as_ref(), now) {
+                    Ok(_) => sweep_at.store(now, Ordering::SeqCst),
+                    Err(error) => eprintln!("launch recovery sweep failed: {error}"),
+                }
+                let deadline = std::time::Instant::now() + SWEEP_INTERVAL;
+                while std::time::Instant::now() < deadline && !stopping.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        })
+        .ok()
+}
+
+/// A wake is honoured only from the server generation that created the pane and
+/// is serving now, so a pane id reused by a replaced server is not this launch's
+/// pane. It records an exit only when pidfd verification shows the process gone.
+fn wake_request(
+    core: &Arc<Mutex<Core>>,
+    request: &Request,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let params: WakeParams = match decode_params(request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let (registry, backend, verifier, stopping) = {
+        let core = locked(core);
+        let Some(backend) = core.backend.clone() else {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::BackendUnavailable, "no backend is wired"),
+            );
+        };
+        (
+            Arc::clone(&core.registry),
+            backend,
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let subject = match subjects::read(&registry, &params.subject_id) {
+        Ok(Some(subject)) => subject,
+        Ok(None) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::NotFound, "launch subject is not recorded"),
+            );
+        }
+        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    };
+    let edge = match registry.spawn_edge(&subject.spawn_request_id) {
+        Ok(Some(edge)) => edge,
+        Ok(None) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::NotFound, "spawn is not recorded"),
+            );
+        }
+        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    };
+    let serving = serving_identity(&backend, &verifier, &stopping, verification);
+    if edge.instance.as_ref() != Some(&params.server) || serving.as_ref() != Some(&params.server) {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "wake names a server generation that does not serve this launch",
+            ),
+        );
+    }
+    match subjects::observe_exit_from(
+        &registry,
+        &params.subject_id,
+        verifier.as_ref(),
+        store::now_ms(),
+        subjects::Observer::TmuxHook,
+    ) {
+        Ok(exited) => {
+            if exited {
+                retire_wake(&backend, &params.subject_id, &stopping);
+            }
+            Response::ok(&request.id, json!({ "exited": exited }))
+        }
+        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+    }
 }
 
 /// The location a create answered with, in the coordinates this daemon records.
@@ -3752,6 +5513,8 @@ mod tests {
 
     fn event(seq: u64) -> store::Event {
         store::Event {
+            subject_id: None,
+            lifecycle_event_id: None,
             seq,
             kind: "agent.registered".to_string(),
             agent_id: Some(format!("agent-{seq}")),
