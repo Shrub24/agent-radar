@@ -81,119 +81,140 @@ the direct adapter remains an explicit mode/startup fallback, never a retry afte
 uncertain dispatch.
 Linux-only is accepted; cross-platform support is not a prerequisite.
 
-In priority order:
+## Adoption-first execution queue
 
-1. **Herdsman direct-publication adoption (pi-extensions).** Stages 1-3 landed on
-   pi-extensions main `f5eedd29` (ADR 0031), verified 24/24 against an isolated
-   daemon. It publishes execution and owner assignment directly, uses a local
-   exact-`agent_id` binding, and persists/replays pending content. It does not
-   mirror to Herdr or perform lifecycle actions. Radar's mutable session-context
-   contract is now available at `4e376978`; adoption is the next concrete step.
-   Not yet live-deployed; existing Herdr readiness/presence remains until physical
-   execution cutover.
-2. **Registry-backed dashboard (complete and archived).** Facts publication
-   and TUI consumption are accepted, including exact joins, separate authorities,
-   freshness, unresolved rows and registered-pane close protection. The final
-   owner gate passed 749 Rust tests, both PTY smokes, publisher fixtures, real
-   disposable tmux acceptance without Herdr, strict specs and checked Nix.
-   Independent Pi publishers can supply self facts without Herdsman; pi-extensions
-   must adopt `registry.facts.v1` and the extended assignment report for full
-   display parity. No legacy state fallback fills missing reports.
-3. **Managed child spawn (`managed-child-spawn`, landed and archived at `e0f0e7b9`).**
-   Herdsman asks the daemon to create a child, and the daemon performs it: create
-   the pane under a named parent, launch the resolved command, and record one
-   durable parent/child runtime edge. The child binds through a private single-use
-   spawn token carried into its launch environment and presented at registration,
-   so nothing is inferred from pane titles, aliases or session UUIDs. Herdr launch
-   is terminal input under the quoting rules ADR 0029 measured, behind a declared
-   `launch` capability. Stop, resume, restart, lead recovery and adoption of panes
-   not created by the daemon were out of scope at landing. Managed-child-stop now
-   supplies pane closure over those edges; the verified child-launch-binding
-   extension adds the cwd/env and exact registry-ID contract needed for Herdsman's
-   spawn migration.
-4. **Managed-child-stop.** Implemented, verified and archived as
-   `openspec/changes/archive/2026-10-10-managed-child-stop/`. Protocol v2 `spawn.close`
-   targets an exact bound daemon-spawned child, requires fresh pane/containment
-   evidence and matching foreground process birth identity (`pid`, `boot_id`,
-   `start_ticks`), and persists completed/refused/unknown pane-close outcomes
-   without retry. It is pane closure only: no process-exit claim and no
-   assignment/execution transition. Scripted fixture and live disposable-Herdr
-   smoke pass. Protocol v2 advertises `spawn.close.v1`; fenced retained-dead-pane cleanup
-   adds `already_exited`, not process-exit or relaunch authority. Coordinate
-   explicit pi-extensions adoption before Herdsman uses it.
-5. **Lead recovery, then stale-lead restart plans.** Reconcile managed child
-   topology, pending requests/asks, task results and control outcomes; confirm old
-   process exit before resume. Session UUID continuity alone is not proof. Then
-   add confirmed stale-lead batches and startup plans before opt-in automation.
-   Do not restart all panes indiscriminately.
-6. **Herdsman cutover and tmux backend.** The targeted current-caller audit is
-   recorded in `docs/mux.md`. The tmux `RuntimeProvider` and explicit named-server
-   daemon selection are implemented, verified, pushed and archived in
-   `2026-10-12-tmux-backend`; Herdr remains the default. Tmux supports direct-argv
-   launch, binding and retained pane-command exit observations for daemon-created
-   children, but out-of-band same-UID pane respawn can replace an unread exit
-   status. Herdr exit remains unknown. Herdsman migration, explicit application
-   readiness, managed-spawn placement parity, lifecycle watching beyond these
-   edges and retained-worker stop/resume remain. Registry-backed TUI observation
-   is now accepted.
-   Full parity still requires the used retained-worker lifecycle/recovery flows.
-7. **Further TUI and information surfaces.** Review fleet density; then consider
-   non-consuming preview, session statistics/search and fleet failure summaries.
+The near-term goal is daily Pi/Herdsman delegation and terminal management through
+Radar and tmux with Herdr unavailable. Shipped registry observation, distinct
+readiness and the Herdr-free dashboard acceptance are foundations, not new work.
+Keep each change independently adoptable; no generic asynchronous-work platform.
 
-Separate daemon follow-ups: retention/pruning for accumulated process-incarnation
-records. The `events.read` long-poll journal (`lifecycle-events`, archived) is the
-event surface; it reports journaled daemon facts only, not backend pushes, exit or
-readiness. `tmux-backend` is implemented, verified, pushed and archived. Protocol v2
-(`f87348032a808967c50a4e84b7e1c766a64ebfe3`) is pushed, with namespaced
-methods/capabilities, delivered-position event cursors, truthful backend identity
-and dispatch uncertainty distinguished from refusal. Tmux adds named-server selection,
-direct-argv launch and typed pane-command exit reads, with the out-of-band respawn
-limitation recorded in its design and mux contract. Launch specs and mux locations
-remain optional and unpublished by Herdsman until a consumer exists. pi-subagents is
-removed and excluded.
+### Priority 0 — Fixed-pin Herdsman cutover and real adoption
 
-Linux-only is accepted; cross-platform support is not a prerequisite. Background
-task metrics still require publisher-captured process birth identity. Physical
-lead restart waits for lifecycle execution and reconciliation contracts, not
-merely publisher adoption. Radar's TUI-only restart proposal is currently blocked
-on Herdr providing a positive readiness acknowledgement for a newly created pane;
-no timing or output heuristic may substitute. Cooperative whole-fleet restart
-follows safe lead-only restart; it must not become a bulk kill.
+The pi-extensions executors own their in-flight physical-client cutover. Current
+coordinated report: disposable acceptance remains 6/10 at protocol-v2 pin
+`f87348032a80`; real Pi/Herdsman integrated acceptance has not yet run. Remaining
+consumer work includes bootstrap/environment/fixture cleanup, individual legacy
+suite attribution, a command-wait hang and isolated packaging smoke. Real child
+readiness, first assignment/result, saved-session continuation and the actual
+event watcher/resync path still need integrated evidence. An acceptance-labelled
+commit does not substitute for those runs. Do not move the tested daemon pin.
+Facts/assignment-extension adoption at Radar `55ff25d5` is a separate following
+slice. Pi execution hooks already support ordinary sessions loading Herdsman;
+auth/login reporting and some provider-error outcomes remain separate gaps.
 
-Background-task resource enrichment still needs publisher-captured birth
-identity; it is not a prerequisite for lead recovery. Command-specific actions,
-new tabs, a project picker, separate runtime/agent modes and arbitrary process
-browsing remain later work. Cooperative whole-fleet restart follows safe
-lead-only restart; it must not become a bulk kill.
+Acceptance: real Pi children bind to exact `agent_id` before readiness and
+assignment; concurrent workers complete, fail and cancel with correct results
+and owner notification; cwd/environment and project/JJ workspace assumptions
+hold; Herdr is unavailable and never called; interrupted startup causes neither
+duplicate launch nor premature reservation release. Certify an explicit supported
+operation matrix rather than requiring unused Manager placement or every old
+Herdr path. Include the intended operator close/cancel surface: registry-only
+rows are protected but legacy owner routing can refuse without session lineage.
+Route exact daemon-bound children through the supported close contract when
+needed; unrelated, unbound or ambiguous registrations remain refused. This is
+control wiring, not a generic kill API. Keep pending/unknown operations visible
+with their durable IDs.
 
-### Lead recovery and stale restarts
+### Priority 1A — Narrow lifecycle and recovery blockers
 
-Basic confirmed pane/tab close and idle managed-worker restart are already
-implemented. The missing owner operation is lead/standalone restart, including
-its recovery guarantees:
+1. **Unbound spawn cancellation/abandonment.** Existing `spawn.close` requires a
+   bound child. Add durable token revocation and an exact-edge outcome without
+   deleting history. Binding versus cancellation must have one durable winner.
+   Replay and daemon restart must not restore the token or repeat cleanup.
+   Server generation alone does not prove a live pane's occupant belongs to the
+   launch: cleanup needs fresh containment and appropriate incarnation evidence.
+   Report revocation, pane cleanup and process exit separately; insufficient
+   evidence preserves an explicit unresolved operation/reservation.
+2. **Exact-process graceful stop, when a supported workflow needs it.** Use the
+   registered or daemon-captured launch birth identity and a pidfd-bound SIGTERM.
+   Never PID-only signaling, SIGKILL escalation or relaunch before verified exit.
+   Pane close and pane-command exit observations are not process-exit proof.
+3. **Recovery and deployment acceptance.** Restart the TUI and daemon while
+   workers run; preserve processes and durable operations, mark restored reports
+   stale until renewed, and never replay an uncertain effect. Replace the named
+   tmux server with reused IDs and refuse stale targets. Establish service/cgroup
+   shutdown policy so stopping presentation or Radar does not stop tmux/agents.
 
-- Identify the exact session and live process incarnation. Confirm that the old
-  process has exited before resuming its session; never create a second attach
-  as a side effect of restart.
-- Preserve or explicitly reconcile child runs, ownership/lineage, pending asks
-  and requests, unresolved task results and control outcomes. A new process
-  retaining the same session UUID is not sufficient evidence of success.
-- Have the owner declare restart eligibility and supported recovery. A lead
-  may look idle while still owning active children or unconsumed results; row
-  activity alone must not authorize its restart.
-- Publish request acceptance, execution and the resulting session/process
-  identity. Unknown execution stays unknown and suppressed, not automatically
-  retried or inferred successful because a pane disappeared.
-- For stale batches, use the existing exact binary-counterpart comparison;
-  unknown freshness is not stale. Freeze and revalidate each target, report
-  refused/skipped/unknown results, and leave the initiating session until last.
-- On Radar launch, detect stale leads and offer a restart plan first. Silent
-  startup restart is not the default. Later opt-in automation needs positive
-  lead identity, owner-certified eligibility and the same recovery guarantees.
+Prioritize these against actual failed cutover cases. Unbound abandonment/token
+revocation is the only currently known missing daemon lifecycle primitive for
+interrupted fresh starts, not an exhaustive proof that no other gap exists.
+Fresh distinct-worker delegation needs no verified-stop primitive. Reuse of the
+same running generation stays mailbox/address-fenced; new-pane saved-session
+continuation requires old process absent/mismatched and refuses unavailable
+verification. Intentional stop of a still-verified process is outside this cutover.
+A safe refusal with a visible unresolved launch is acceptable for unsupported
+automation; silently leaking a worker or declaring it stopped is not.
 
-Evaluate moving Herdr's restart-on-launch responsibility into this owner-routed
-path. Do not copy its all-pane restart behavior: preserve ordinary panes and
-managed children unless their owner explicitly includes them in the plan.
+### Priority 1B — Pinned sidebar and client-local navigation prototype
+
+Compare a Kitty outer split with a nested-tmux shell on disposable resources;
+do not mandate a terminal. Use real workspaces/tabs, two clients or monitors,
+keyboard/mouse, resizing, clipboard and normal Pi/editor rendering. Establish
+which host runs daemon, execution server and sidebar, including SSH limitations.
+
+Current tmux window selection can change both attached clients' views. Define
+client targeting and session/window sharing together; a client ID alone is not
+acceptance. Switching one view must leave the other unchanged. Closing the shell
+must leave running agents intact. Keep selection and layout preferences local
+to the view and logical parentage independent of pane arrangement.
+
+### Priority 2 — Shared daemon-owned sampled observation
+
+Move observation ownership and scheduling behind a daemon seam only as needed
+by the adopted sidebar/full TUI or multiple clients. Reuse collector,
+`ObservationState` and `registry_observation::project`. Serve immutable sampled
+revisions, collection times, source freshness and unresolved evidence; define
+last-good/stale behavior and revision-consistent pagination.
+
+Existing journal events are invalidation pointers, not an atomic state log or
+physical backend feed. Retain recovery reconciliation and resync for lost
+notifications. Prefer native source notifications plus targeted reads where
+they improve timeliness; do not require control mode, an async rewrite or a
+database migration. Bounds do not remove the current cost of process
+verification on every registry read; shared scheduling is the intended remedy.
+
+### Priority 3 — Broaden from operational feedback
+
+Managed placement extends spawn; generic workspace/tab creation already exists.
+Project grouping, layout persistence, retained-agent restart, lead recovery,
+resource enrichment, preview/search and additional integrations follow daily-use
+evidence. Keep project/JJ workspace policy external initially. Stable logical
+subjects and successor correlation belong with an actual restart operation,
+not as prerequisites for fresh-worker cutover. Linux-only remains accepted.
+
+### Deferred — Shared asynchronous work and messaging
+
+Do not implement a generic `AsyncWork` engine, job supervisor, custody transfer,
+notification broker, durable inbox, universal wait/dependency coordinator or
+peer/task-claiming layer during cutover. Retain current Herdsman and
+pi-bash-processes contracts until a separate migration proves an improvement.
+
+Preserve distinct resource references and physical/execution/assignment/result
+authorities. Never equate process exit, capture readiness, assignment settlement,
+notification delivery or acknowledgment. Future work crosses backend-neutral
+seams and replaceable delivery interfaces; it must not be encoded through pane
+labels, PID-only identity or implicit session-name coupling.
+
+### Lead recovery and stale restarts (deferred until required)
+
+Existing owner-routed worker controls are not proof of daemon-managed restart.
+The approved lead restart direction is TUI-only, operator-confirmed and based on
+daemon-owned launch provenance; no new Herdsman grant or assignment-writer
+authority. Preserve live children and their edges, replace only a positively
+stopped process, and bind the replacement by an operation-scoped private
+correlation. A matching Pi session UUID alone never authorizes a successor.
+
+The current `managed-lead-restart` draft retains an unresolved Herdr shell-ready
+prerequisite. A tmux direct-argv implementation does not inherit that prerequisite;
+revise the draft for its actual backend before implementation rather than waiting
+for Herdr or using shell timing/output heuristics. Neither backend currently has
+the complete verified stop/relaunch/reconciliation operation.
+
+Resume in a fresh pane; preserving the old pane is not required. Preserve or
+explicitly reconcile children, pending asks, assignments, unconsumed results and
+control outcomes. Unknown effects remain suppressed. Stale-lead batches,
+startup restart plans and cooperative whole-fleet restart follow accepted
+lead-only recovery, never indiscriminate pane kills.
 
 ### Structured activity, reasons and outcomes
 
@@ -255,7 +276,8 @@ References (pinned originals):
 
 ### Direct owner reporting and a lifecycle/state daemon
 
-The initial migration complements Herdr:
+The initial migration used Herdr as its first physical adapter. The current
+adoption target is Radar/tmux with Herdr unavailable; retain this ownership split:
 
 - The coordinator wraps Herdr as the first backend for physical pane inventory,
   locations, focus and controls, with a backend-neutral port for consumers.
@@ -274,19 +296,20 @@ The initial migration complements Herdr:
 - Background-task observation remains non-consuming. Neither state display nor
   a new transport may acknowledge a result or compete with the agent's `get`.
 
-The physical wrappers, direct registry, mutable session context, managed
-child-spawn and managed-child-stop foundations are landed. Herdsman adoption of
-`child.close` remains an explicit next coordination step. pi-extensions will
-revisit an incarnation-scoped pane token when adopting close; for now the daemon
-uses fail-closed procfs birth-identity verification. Physical lead restart remains
-blocked until Herdr exposes positive fresh-pane shell readiness; this is a concrete
-mux capability gap, not a missing Herdsman restart API.
+Physical wrappers, direct registry, mutable session context, managed spawn,
+launch/binding, protocol-v2 `spawn.close`, facts channels and registry-backed
+observation are shipped. Herdsman physical cutover and publisher adoption are
+separate acceptance steps. Existing live-close checks remain fail-closed on
+foreground process birth identity; dead cleanup is fenced to the creating server
+incarnation. Unbound cancellation and exact-process stop are narrow next lifecycle
+contracts, not a reason to move assignment or result authority into Radar.
 
 ### Verification and shipping gates
 
 - Descendant-table and daemon source/PTY/checked Nix gates are complete; daemon
   publisher verification uses a disposable daemon, not live Herdsman integration.
-- Sync/archive both completed daemon changes and keep the roadmap reconciled.
+- Completed facts/dashboard changes are synced, archived and pushed at
+  `55ff25d5`; new lifecycle work requires its own verification and shipping gate.
 - Validate the real Herdsman publication port before claiming live adoption.
 - Run an operator-approved live lifecycle smoke against owners that loaded the
   supported contract; stub-owner tests do not prove live recovery.
