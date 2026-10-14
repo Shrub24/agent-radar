@@ -514,7 +514,7 @@ impl Registry {
                 at: crate::control_plane::store::now(),
             };
             if let Err(error) = store.append_event(event) {
-                eprintln!("event journal append failed after {kind}: {error}");
+                tracing::error!(kind, %error, "event journal append failed");
             }
         }
     }

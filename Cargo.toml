@@ -14,6 +14,9 @@ path = "src/main.rs"
 [dependencies]
 crossterm = "0.29"
 nucleo-picker = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+unicode-width = "0.2"
 # `unstable-rendered-line-info` exposes `Paragraph::line_count`, the row count of
 # a wrapped paragraph: the details panel scrolls in the rows it draws, so it asks
 # the widget that wraps for the geometry rather than counting them itself.

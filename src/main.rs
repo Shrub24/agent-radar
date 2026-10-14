@@ -138,6 +138,7 @@ fn run_server_command() -> i32 {
 /// surprise on their machine. The exit code is the shell's to read, so a daemon
 /// that could not bind says so and stops rather than serving nothing quietly.
 fn serve_daemon() -> i32 {
+    agent_radar::log::init_daemon();
     if let Err(diagnostic) = agent_radar::install_signal_handlers() {
         eprintln!("radar daemon: {diagnostic}");
         return 1;
@@ -241,6 +242,8 @@ fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
 fn run() -> io::Result<()> {
     let config = load_config();
     theme::install(config.clone());
+    // The dashboard owns the terminal, so its diagnostics go to a file.
+    let log_note = agent_radar::log::init_dashboard(&agent_radar::log::dashboard_log_path()).err();
     let mut terminal = ratatui::try_init()?;
     enable_mouse_capture();
     // The panic path restores the terminal through the hook `try_init` installed;
@@ -272,6 +275,9 @@ fn run() -> io::Result<()> {
     let mut containers = ContainerControl::new(container_controls);
     let mut state = ObservationState::new();
     let mut app = App::new();
+    if let Some(reason) = log_note {
+        app.set_focus_message(Some(format!("no dashboard log: {reason}")));
+    }
     let mut list = ListState::default();
     let mut task_revision = None;
     let mut task_diagnostic = task_diagnostic;

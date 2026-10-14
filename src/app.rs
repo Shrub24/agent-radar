@@ -42,6 +42,9 @@ use crate::tree::{
 /// How long a focus message stays up when no key clears it first.
 const FOCUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
 
+/// How long a completed outcome stays in the footer. A failure is kept until `c`.
+const NOTICE_TTL: Duration = Duration::from_secs(8);
+
 /// The width of a row's disclosure marker in cells: `ui::fold_marker` draws it,
 /// and a leaf keeps the same two blank columns, so the hit cell is the same
 /// whether or not the row has children to show.
@@ -741,6 +744,8 @@ pub enum Confirmed {
 /// One lifecycle outcome, kept visible until it is dismissed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
+    /// When this line was recorded or last refined, so a success can age out.
+    pub at: Instant,
     /// The request id, or the exact target key before one was minted. A later
     /// update with the same id refines this line rather than adding another.
     pub id: String,
@@ -2639,12 +2644,25 @@ impl App {
     /// Records one outcome line, refining a notice for the same request id rather
     /// than adding another.
     fn record_notice(&mut self, id: String, text: String, failed: bool) {
+        // The footer shows one clipped line; the log keeps the whole text.
+        if failed {
+            tracing::warn!(request = %id, "{text}");
+        } else {
+            tracing::info!(request = %id, "{text}");
+        }
+        let at = Instant::now();
         match self.notices.iter_mut().find(|notice| notice.id == id) {
             Some(notice) => {
                 notice.failed = failed;
                 notice.text = text;
+                notice.at = at;
             }
-            None => self.notices.push(Notice { id, text, failed }),
+            None => self.notices.push(Notice {
+                at,
+                id,
+                text,
+                failed,
+            }),
         }
     }
 
@@ -2753,18 +2771,28 @@ impl App {
     }
     /// Shows or clears the one-line action message.
     pub fn set_focus_message(&mut self, message: Option<String>) {
+        if let Some(message) = &message {
+            tracing::warn!("{message}");
+        }
         self.focus_message = message.map(|message| (message, Instant::now()));
     }
 
     /// Drops a message that has been up for [`FOCUS_MESSAGE_TTL`]. Returns
     /// whether anything changed, so the caller can skip a redraw.
+    ///
+    /// A completed outcome ages out with it, because the result was the operator's
+    /// own action and the tree already shows it. A failure stays until dismissed.
     pub fn expire_focus_message(&mut self, now: Instant) -> bool {
+        let before = self.notices.len();
+        self.notices
+            .retain(|notice| notice.failed || now.duration_since(notice.at) < NOTICE_TTL);
+        let aged = self.notices.len() != before;
         match &self.focus_message {
             Some((_, set)) if now.duration_since(*set) >= FOCUS_MESSAGE_TTL => {
                 self.focus_message = None;
                 true
             }
-            _ => false,
+            _ => aged,
         }
     }
 
@@ -5164,6 +5192,25 @@ mod tests {
             app.confirm(&unknown),
             Some(Confirmed::Subject { .. })
         ));
+    }
+
+    #[test]
+    fn a_completed_outcome_ages_out_and_a_failure_stays_until_dismissed() {
+        let mut app = App::new();
+        app.record_notice("ok".into(), "create completed".into(), false);
+        app.record_notice("bad".into(), "delete refused".into(), true);
+        assert!(!app.expire_focus_message(Instant::now()));
+        assert_eq!(app.lifecycle_notices().len(), 2);
+        assert!(app.expire_focus_message(Instant::now() + NOTICE_TTL));
+        let left: Vec<_> = app
+            .lifecycle_notices()
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(left, ["bad"]);
+        assert!(!app.expire_focus_message(Instant::now() + NOTICE_TTL * 10));
+        app.dismiss_notices();
+        assert!(app.lifecycle_notices().is_empty());
     }
 
     #[test]

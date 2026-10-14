@@ -565,6 +565,31 @@ fn regions(area: Rect, wanted: u16) -> (Rect, Rect) {
     (body, hints)
 }
 
+/// The first line of `text`, since a footer line holds one.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().to_string()
+}
+
+/// `text` cut to `width` terminal columns, ending in `…` when anything was cut.
+fn elide(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if unicode_width::UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let columns = character.width().unwrap_or(0);
+        if used + columns + 1 > width {
+            break;
+        }
+        out.push(character);
+        used += columns;
+    }
+    out.push('…');
+    out
+}
+
 /// The footer line: the last focus message while one is up, otherwise the keys
 /// this view answers to.
 ///
@@ -585,9 +610,11 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     // source freshness drawn with the tree: an owner's answer says nothing about
     // whether the fleet is being observed.
     let mut action_lines: Vec<Line<'static>> = Vec::new();
+    // One line each, cut with an ellipsis rather than clipped mid-word; the whole
+    // text is in the dashboard's log.
     if let Some(message) = app.focus_message() {
         action_lines.push(Line::from(Span::styled(
-            sanitize(message),
+            elide(&first_line(&sanitize(message)), width),
             Style::new().fg(palette.failed),
         )));
     }
@@ -603,12 +630,18 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         } else {
             Style::new().fg(palette.done)
         };
-        let mut spans = vec![Span::styled(sanitize(&notice.text), style)];
-        if index + 1 == count {
-            spans.push(Span::styled(
-                "  ·  c dismiss",
-                Style::new().fg(palette.muted),
-            ));
+        let dismiss = if index + 1 == count {
+            "  ·  c dismiss"
+        } else {
+            ""
+        };
+        let room = width.saturating_sub(dismiss.chars().count());
+        let mut spans = vec![Span::styled(
+            elide(&first_line(&sanitize(&notice.text)), room),
+            style,
+        )];
+        if !dismiss.is_empty() {
+            spans.push(Span::styled(dismiss, Style::new().fg(palette.muted)));
         }
         action_lines.push(Line::from(spans));
     }
@@ -4468,6 +4501,15 @@ mod tests {
         // the toggle rather than dropping it.
         let narrow = render_text(&state, &app, 40, 24);
         assert!(narrow.contains("b"), "{narrow}");
+    }
+
+    #[test]
+    fn a_long_footer_message_is_cut_with_an_ellipsis_at_the_width() {
+        assert_eq!(elide("short", 10), "short");
+        assert_eq!(elide("0123456789abcdef", 10), "012345678…");
+        assert_eq!(elide("日本語日本語", 7), "日本語…");
+        assert_eq!(first_line("one\ntwo"), "one");
+        assert_eq!(elide("anything", 0), "…");
     }
 
     #[test]

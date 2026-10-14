@@ -994,3 +994,7 @@ resume/restart, topology, or a production tmux backend. Managed-worker close and
 restart remain requests to the worker's owner, not mux operations. The daemon's
 [protocol reference](docs/control-plane.md) documents capabilities, durable
 operation records, uncertainty and extension-porting examples.
+
+## Logs
+
+The daemon logs to stderr, which its user unit sends to the journal (`journalctl --user -u radar-daemon`). The dashboard owns the terminal, so it logs to `tui.log` beside the daemon's state directory (by default `~/.local/state/agent-radar/tui.log`, started afresh past 2 MiB). The footer shows one line cut with an ellipsis; a failure stays until `c`, and the whole text is in the log. `RADAR_LOG` takes a filter such as `debug`. Log lines carry identifiers and outcomes, never a command or an environment.

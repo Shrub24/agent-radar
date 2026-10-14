@@ -5963,10 +5963,10 @@ fn spawn_sweeper(
                     .map_or(0, |elapsed| elapsed.as_millis() as i64);
                 match subjects::sweep(&registry, verifier.as_ref(), now) {
                     Ok(_) => sweep_at.store(now, Ordering::SeqCst),
-                    Err(error) => eprintln!("launch recovery sweep failed: {error}"),
+                    Err(error) => tracing::error!(%error, "launch recovery sweep failed"),
                 }
                 if let Err(error) = adopt_topology(&core, &registry, &verification, &mut seen) {
-                    eprintln!("topology adoption failed: {error}");
+                    tracing::error!(%error, "topology adoption failed");
                 }
                 let deadline = std::time::Instant::now() + SWEEP_INTERVAL;
                 while std::time::Instant::now() < deadline && !stopping.load(Ordering::SeqCst) {
