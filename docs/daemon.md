@@ -24,7 +24,23 @@ executables named by `RADAR_TMUX` and `RADAR_SYSTEMCTL` (absolute paths in the
 Home Manager unit, `tmux` and `systemctl` from `PATH` otherwise), so its unit
 needs no `PATH`: tmux gives a new session its creator's `PATH`, and a unit with
 a minimal one would give every pane that instead of the user's profiles. A pane
-started before this change keeps its old `PATH`; make a new workspace. Registry calls work without a mux backend and do not publish
+started before this change keeps its old `PATH`; make a new workspace.
+
+The daemon records every session, window and pane of its own server as an
+`observed` container, with parent links, on its recovery pass (every two seconds),
+only when the server's places or its verified serving incarnation changed, and
+never for a place already recorded. It waits while a `topology.create` is
+unfinished so a created place is not recorded twice. Observed containers have no
+recipe, so `topology.reload` refuses them; `topology.delete` keeps its
+confirmation and its refusal to end a live worker. A tmux `mux.focus` with no
+attached client is refused (`no tmux client is attached to this server`) before
+anything changes, and a focus never holds its target against a later mutation.
+The dashboard, not the daemon, opens a terminal when a focus is refused for
+want of a client, because only it holds the user's desktop session: it runs
+`[tui] terminal` (else `$TERMINAL -e`) with `tmux -L <server> attach-session -t
+<id>` and asks again. `L` in the dashboard is `topology.create` with the typed
+command as the recipe.
+Registry calls work without a mux backend and do not publish
 through Herdr. The older mux `report` method still forwards state/session/metadata
 to the backend; it is **not** direct registry publication.
 

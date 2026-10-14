@@ -373,6 +373,7 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
         Operation::CreateContainer => "Add to container",
         Operation::DeleteContainer => "Delete container",
         Operation::ReloadContainer => "Reload pane",
+        Operation::LaunchContainer => "Run a command",
     };
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
@@ -613,6 +614,19 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     if !action_lines.is_empty() {
         return action_lines;
     }
+    if let Some(line) = app.launch_prompt() {
+        // The line is the user's own typing, so it is shown whole at the front of
+        // the footer, ahead of the keys that answer it.
+        let mut lines = vec![Line::from(format!("run: {line}\u{2588}"))];
+        lines.extend(wrap_hints(
+            &[
+                ("Enter", "review".to_string()),
+                ("Esc", "cancel".to_string()),
+            ],
+            width,
+        ));
+        return lines;
+    }
     if app.is_filter_editing() {
         let pairs = vec![
             ("type", "filter".to_string()),
@@ -648,7 +662,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("n/N", "next".to_string()),
         ("w/W", "work".to_string()),
         ("x/X", "close pane/tab".to_string()),
-        ("a/A/D/R", "add/workspace/delete/reload".to_string()),
+        ("a/A/L/D/R", "add/workspace/run/delete/reload".to_string()),
         ("s", app.order().label().to_string()),
         ("p", app.pane_view().label().to_string()),
         ("d", toggle_label(app.shows_details(), "details")),

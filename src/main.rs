@@ -282,6 +282,9 @@ fn run() -> io::Result<()> {
     let started = Instant::now();
     let mut phase: usize = 0;
     let mut dirty = true;
+    // A focus with no client attached opens a terminal and asks again, because a
+    // client has to exist before a focus can show anything.
+    let mut attach = Attach::default();
 
     loop {
         // Foreground evidence is swept while a pane view is showing panes, and
@@ -321,7 +324,12 @@ fn run() -> io::Result<()> {
         // A focus request is answered on its own thread; applying the outcome
         // here is what puts a failure on the footer, and never waits on Herdr.
         if let Some(outcome) = focuser.poll() {
-            app.set_focus_message(outcome.diagnostic().map(str::to_string));
+            let message = attach.answered(&outcome, &config.tui);
+            app.set_focus_message(message.or_else(|| outcome.diagnostic().map(str::to_string)));
+            dirty = true;
+        }
+        if let Some(message) = attach.poll(&mut focuser) {
+            app.set_focus_message(Some(message));
             dirty = true;
         }
         // A confirmed close is answered on its own thread too: input, collection
@@ -392,7 +400,10 @@ fn run() -> io::Result<()> {
                 }
                 if let Some(action) = app.handle_key(key) {
                     match action {
-                        Action::Focus(target) => focuser.start(target),
+                        Action::Focus(target) => {
+                            attach.ask(&target);
+                            focuser.start(target);
+                        }
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
                         Action::NewWorkspace => {
                             let control = Some(app.new_workspace());
@@ -421,7 +432,10 @@ fn run() -> io::Result<()> {
             Event::Mouse(mouse) => {
                 if let Some(action) = app.handle_mouse(mouse) {
                     match action {
-                        Action::Focus(target) => focuser.start(target),
+                        Action::Focus(target) => {
+                            attach.ask(&target);
+                            focuser.start(target);
+                        }
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
                         Action::NewWorkspace => {
                             let control = Some(app.new_workspace());
@@ -521,4 +535,93 @@ fn enable_mouse_capture() {
 /// the loop, and the panic hook above.
 fn disable_mouse_capture() {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
+}
+
+/// Where a focus stands while a terminal is being opened for it.
+#[derive(Default)]
+struct Attach {
+    /// The place being focused, from the request the user made.
+    asked: Option<agent_radar::Target>,
+    /// Set once a terminal was opened for `asked`, with when to look again.
+    waiting: Option<(Instant, u32)>,
+    /// What the terminal thread says when it ends.
+    ended: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+}
+
+/// How often, and how many times, a focus is asked again once a terminal is open.
+const ATTACH_RETRY: Duration = Duration::from_millis(250);
+const ATTACH_TRIES: u32 = 24;
+
+impl Attach {
+    /// A new focus request replaces whatever was waiting.
+    fn ask(&mut self, target: &agent_radar::Target) {
+        self.asked = Some(target.clone());
+        self.waiting = None;
+    }
+
+    /// Reads a focus answer. With no client attached it opens a terminal once and
+    /// then asks again until the server has one; any other answer ends the wait.
+    fn answered(
+        &mut self,
+        outcome: &agent_radar::FocusOutcome,
+        tui: &agent_radar::config::TuiConfig,
+    ) -> Option<String> {
+        let no_client = matches!(
+            outcome,
+            agent_radar::FocusOutcome::Refused(message)
+                if message == agent_radar::runtime::NO_CLIENT
+        );
+        let Some(target) = self.asked.clone().filter(|_| no_client) else {
+            self.waiting = None;
+            return None;
+        };
+        if let Some((_, tries)) = self.waiting {
+            if tries >= ATTACH_TRIES {
+                self.waiting = None;
+                return Some("no terminal attached to the tmux server in time".to_string());
+            }
+            self.waiting = Some((Instant::now() + ATTACH_RETRY, tries + 1));
+            return None;
+        }
+        let environment = std::env::var("TERMINAL").ok();
+        let prefix = match agent_radar::attach::terminal_prefix(
+            tui.terminal.as_deref(),
+            environment.as_deref(),
+        ) {
+            Ok(prefix) => prefix,
+            Err(message) => return Some(message),
+        };
+        let handle = match &target {
+            agent_radar::Target::Pane(handle) | agent_radar::Target::Workspace(handle) => {
+                handle.clone()
+            }
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.ended = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(agent_radar::attach::open_terminal(&prefix, &handle));
+        });
+        self.waiting = Some((Instant::now() + ATTACH_RETRY, 0));
+        Some("no tmux client attached: opening a terminal".to_string())
+    }
+
+    /// Asks the focus again when it is time, and reports a terminal that failed.
+    fn poll(&mut self, focuser: &mut Focuser) -> Option<String> {
+        if let Some(Err(message)) = self.ended.as_ref().and_then(|ended| ended.try_recv().ok()) {
+            self.waiting = None;
+            self.ended = None;
+            return Some(message);
+        }
+        let (at, _) = self.waiting?;
+        if Instant::now() >= at
+            && let Some(target) = self.asked.clone()
+        {
+            focuser.start(target);
+            // Not asked again until its answer sets the next time.
+            self.waiting = self
+                .waiting
+                .map(|(_, tries)| (Instant::now() + Duration::from_secs(3600), tries));
+        }
+        None
+    }
 }

@@ -826,7 +826,12 @@ title and label, which describe the pane rather than an agent.
   server is never shown, and one that names no pane, or a pane the inventory
   lacks, is shown only while a publisher holds a live lease or the daemon
   recorded a spawn edge for it, so a dead agent's record ages out of the tree.
-  `A` creates a new workspace whatever row is selected. Children are not nested under their
+  `A` creates a new workspace whatever row is selected, and `L` runs a typed
+  command in a new tab (on a workspace) or pane (on a pane) after a confirmation
+  that shows the resolved program; the line is split by quoting alone, with no
+  `$VAR`, `~`, glob or pipe expansion, and a program must be on `PATH`.
+  Enter on a row focuses it; with no tmux client attached it opens a terminal
+  attached to the server (`[tui] terminal`, else `$TERMINAL -e`) and asks again. Children are not nested under their
   parent: the exact spawn edge is shown in the details. An ordinary pane never
   duplicates a current or retained agent row.
 - Radar does not read Herdsman mailboxes, does not treat Herdr's agent name or

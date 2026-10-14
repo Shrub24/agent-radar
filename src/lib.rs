@@ -2,6 +2,7 @@
 //! Herdr wire formats stay in the connector; presentation uses normalized facts.
 
 pub mod app;
+pub mod attach;
 pub mod bus;
 pub mod collector;
 pub mod config;

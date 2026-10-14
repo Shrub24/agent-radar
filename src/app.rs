@@ -389,6 +389,9 @@ pub enum Operation {
     DeleteContainer,
     /// Run the selected pane container’s recorded recipe again in its own slot.
     ReloadContainer,
+    /// Run a typed command in a new place inside the selected container: a new tab
+    /// in a workspace, or a pane split from a pane.
+    LaunchContainer,
 }
 
 impl Operation {
@@ -397,7 +400,10 @@ impl Operation {
     pub fn is_container(self) -> bool {
         matches!(
             self,
-            Self::CreateContainer | Self::DeleteContainer | Self::ReloadContainer
+            Self::CreateContainer
+                | Self::DeleteContainer
+                | Self::ReloadContainer
+                | Self::LaunchContainer
         )
     }
 }
@@ -580,6 +586,11 @@ pub struct App {
     /// Filter query as typed; empty means "no filter".
     filter: String,
     filter_editing: bool,
+    /// The command line being typed for a launch, while one is.
+    launch_prompt: Option<String>,
+    /// The words a launch will run, once the line was accepted and its
+    /// confirmation is open.
+    launch_command: Option<Vec<String>>,
     view: PaneView,
     /// Whether the details panel is hidden. Stored inverted so `Default` — the
     /// state a run starts in — is "details shown".
@@ -1669,6 +1680,10 @@ impl App {
         if self.confirmation.is_some() {
             return self.handle_confirmation_key(key);
         }
+        // A launch prompt owns the keyboard: its text is never a command key.
+        if self.launch_prompt.is_some() {
+            return self.handle_launch_key(key);
+        }
         self.focus_message = None;
         if self.filter_editing {
             self.handle_filter_key(key);
@@ -1687,6 +1702,8 @@ impl App {
             // `A` starts a workspace from nowhere: nothing is selected, replaced or
             // confirmed, because an addition cannot take anything away.
             KeyCode::Char('A') => return Some(Action::NewWorkspace),
+            // `L` runs a typed command in a new tab or pane.
+            KeyCode::Char('L') => return Some(Action::BeginAction(Operation::LaunchContainer)),
             KeyCode::Char('D') => return Some(Action::BeginAction(Operation::DeleteContainer)),
             KeyCode::Char('R') => return Some(Action::BeginAction(Operation::ReloadContainer)),
             KeyCode::Char('c') => self.dismiss_notices(),
@@ -1945,7 +1962,8 @@ impl App {
             Operation::Restart => unreachable!("restart returned above"),
             Operation::CreateContainer
             | Operation::DeleteContainer
-            | Operation::ReloadContainer => unreachable!("a container control returned above"),
+            | Operation::ReloadContainer
+            | Operation::LaunchContainer => unreachable!("a container control returned above"),
         };
         match containment_of(inventory, state, &target) {
             Containment::Managed if !matches!(operation, Operation::ClosePane) => {
@@ -2111,7 +2129,7 @@ impl App {
                     "a command of its own that has not exited refuses the reload".to_string(),
                 );
             }
-            Operation::CreateContainer => match container.kind {
+            Operation::CreateContainer | Operation::LaunchContainer => match container.kind {
                 crate::control_plane::containers::Kind::Pane => {
                     losses.push("a new pane is split from this one".to_string())
                 }
@@ -2132,6 +2150,31 @@ impl App {
             _ => return,
         }
         losses.push("nothing already running is replaced".to_string());
+        if operation == Operation::LaunchContainer {
+            let Some(words) = self.launch_command.as_ref() else {
+                // No command yet: ask for one. The place is chosen again, from the
+                // selection, when the line is accepted, and the prompt is modal so
+                // it cannot have moved.
+                self.launch_prompt = Some(String::new());
+                return;
+            };
+            let resolved =
+                crate::topology::resolve_executable(&words[0], std::env::var_os("PATH").as_deref());
+            match resolved {
+                Ok(executable) => {
+                    let mut shown = vec![executable];
+                    shown.extend(words[1..].iter().cloned());
+                    losses.insert(1, format!("runs: {}", shown.join(" ")));
+                }
+                Err(message) => {
+                    self.launch_command = None;
+                    self.set_focus_message(Some(message));
+                    return;
+                }
+            }
+        } else {
+            self.launch_command = None;
+        }
         let identity = lifecycle::identity(inventory, &target);
         self.confirmation = Some(Confirmation {
             operation,
@@ -2203,7 +2246,7 @@ impl App {
                 request_id,
                 container_id: id.to_string(),
             }),
-            Operation::CreateContainer => {
+            Operation::CreateContainer | Operation::LaunchContainer => {
                 let kind = match recorded.kind {
                     crate::control_plane::containers::Kind::Workspace => ContainerCreateKind::Tab {
                         workspace_id: recorded
@@ -2222,11 +2265,32 @@ impl App {
                             .clone(),
                     },
                 };
+                let recipe = if confirmation.operation == Operation::LaunchContainer {
+                    let words = self.launch_command.take()?;
+                    let executable = match crate::topology::resolve_executable(
+                        &words[0],
+                        std::env::var_os("PATH").as_deref(),
+                    ) {
+                        Ok(executable) => executable,
+                        Err(message) => {
+                            self.set_focus_message(Some(format!("{message}: nothing was sent")));
+                            return None;
+                        }
+                    };
+                    Some(crate::control_plane::containers::Recipe {
+                        executable,
+                        argv: words[1..].to_vec(),
+                        cwd: None,
+                        env: Default::default(),
+                    })
+                } else {
+                    None
+                };
                 crate::topology::Control::Create(ContainerCreate {
                     request_id,
                     kind,
                     label: None,
-                    recipe: None,
+                    recipe,
                 })
             }
             _ => return None,
@@ -2521,6 +2585,40 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Whether a launch command line is being typed.
+    pub fn launch_prompt(&self) -> Option<&str> {
+        self.launch_prompt.as_deref()
+    }
+
+    /// Reads one key of the launch prompt. Enter hands the line to the same
+    /// confirmation the other container controls use, which is where its words
+    /// are shown; nothing runs from the prompt itself.
+    fn handle_launch_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let line = self.launch_prompt.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.launch_prompt = None,
+            KeyCode::Enter => {
+                return match crate::topology::split_command_line(line) {
+                    Ok(words) => {
+                        self.launch_command = Some(words);
+                        self.launch_prompt = None;
+                        Some(Action::BeginAction(Operation::LaunchContainer))
+                    }
+                    Err(message) => {
+                        self.set_focus_message(Some(message));
+                        None
+                    }
+                };
+            }
+            KeyCode::Backspace => {
+                line.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() => line.push(c),
+            _ => {}
+        }
+        None
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent) {
@@ -4083,6 +4181,102 @@ mod tests {
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         app.begin_action(Operation::ReloadContainer, &no_recipe);
         assert!(app.confirmation().is_none());
+    }
+
+    #[test]
+    fn a_launch_asks_for_a_command_then_shows_what_it_runs_before_confirming() {
+        let (state, mut app) = fixture_with_container(None);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('L')),
+            Some(Action::BeginAction(Operation::LaunchContainer))
+        );
+        // The first press only opens the prompt: nothing is confirmed or sent.
+        app.begin_action(Operation::LaunchContainer, &state);
+        assert!(app.confirmation().is_none());
+        assert_eq!(app.launch_prompt(), Some(""));
+
+        // The prompt owns the keyboard, so its letters are text, not commands.
+        for c in "sh -c 'exit 0'".chars() {
+            assert_eq!(press(&mut app, KeyCode::Char(c)), None);
+        }
+        assert_eq!(app.launch_prompt(), Some("sh -c 'exit 0'"));
+        assert!(app.confirmation().is_none());
+        // An empty line is refused with a reason and keeps the prompt open.
+        let mut empty = app_with_prompt(&state);
+        assert_eq!(press(&mut empty, KeyCode::Enter), None);
+        assert!(empty.launch_prompt().is_some());
+        assert!(
+            empty
+                .focus_message()
+                .is_some_and(|message| message.contains("type a command")),
+            "{:?}",
+            empty.focus_message()
+        );
+
+        // Enter reviews it in the same dialog the other controls use, with the
+        // resolved program shown, and Cancel is still the default.
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::BeginAction(Operation::LaunchContainer))
+        );
+        app.begin_action(Operation::LaunchContainer, &state);
+        assert!(app.launch_prompt().is_none());
+        let confirmation = app.confirmation().expect("a confirmation");
+        assert!(!confirmation.confirm_selected);
+        assert!(
+            confirmation
+                .losses
+                .iter()
+                .any(|line| line.starts_with("runs: /") && line.ends_with("sh -c exit 0")),
+            "{:?}",
+            confirmation.losses
+        );
+        match app.confirm(&state).expect("still held") {
+            Confirmed::Container(crate::topology::Control::Create(request)) => {
+                let recipe = request.recipe.expect("the command rides as the recipe");
+                assert!(recipe.executable.starts_with('/'), "{}", recipe.executable);
+                assert_eq!(recipe.argv, ["-c", "exit 0"]);
+            }
+            other => panic!("a launch: {other:?}"),
+        }
+
+        // Esc leaves the prompt and nothing is queued behind it.
+        let mut cancelled = app_with_prompt(&state);
+        press(&mut cancelled, KeyCode::Char('x'));
+        assert_eq!(press(&mut cancelled, KeyCode::Esc), None);
+        assert!(cancelled.launch_prompt().is_none());
+        assert!(cancelled.confirmation().is_none());
+    }
+
+    #[test]
+    fn a_launch_of_a_program_not_on_path_is_refused_before_a_dialog() {
+        let (state, mut app) = fixture_with_container(None);
+        app.begin_action(Operation::LaunchContainer, &state);
+        for c in "radar-no-such-program --x".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::BeginAction(Operation::LaunchContainer))
+        );
+        app.begin_action(Operation::LaunchContainer, &state);
+        assert!(app.confirmation().is_none());
+        assert!(
+            app.focus_message()
+                .is_some_and(|message| message.contains("not an executable on PATH")),
+            "{:?}",
+            app.focus_message()
+        );
+    }
+
+    /// An app whose launch prompt is open over the container fixture's selection.
+    fn app_with_prompt(state: &ObservationState) -> App {
+        let mut app = App::new();
+        app.refresh(state);
+        show_all_panes(&mut app);
+        select_row(&mut app, &RowId::Pane("wA:p3".into()));
+        app.begin_action(Operation::LaunchContainer, state);
+        app
     }
 
     #[test]

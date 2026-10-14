@@ -211,6 +211,15 @@ impl Default for DaemonConfig {
     }
 }
 
+/// What the dashboard itself does on the user's desktop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TuiConfig {
+    /// The program and leading arguments that run a command in a new terminal,
+    /// used to attach to the server when a focus finds no client. Unset runs
+    /// `$TERMINAL -e`.
+    pub terminal: Option<Vec<String>>,
+}
+
 /// The loaded configuration: defaults with any file's choices applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -222,6 +231,8 @@ pub struct Config {
     pub processes: BTreeMap<String, String>,
     /// What the control daemon serves.
     pub daemon: DaemonConfig,
+    /// What the dashboard does on the desktop.
+    pub tui: TuiConfig,
 }
 
 impl Default for Config {
@@ -232,6 +243,7 @@ impl Default for Config {
             appearance: Appearance::default(),
             processes: default_processes(),
             daemon: DaemonConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }
@@ -370,6 +382,18 @@ impl Config {
             }
             config.daemon.tmux_server = server.to_string();
         }
+        if let Some(terminal) = file.tui.unwrap_or_default().terminal {
+            // A blank program would run nothing, which is worse than no setting.
+            if terminal
+                .first()
+                .is_none_or(|program| program.trim().is_empty())
+            {
+                return Err(
+                    "tui.terminal: name a program, for example [\"foot\", \"-e\"]".to_string(),
+                );
+            }
+            config.tui.terminal = Some(terminal);
+        }
         Ok(config)
     }
 
@@ -481,7 +505,17 @@ impl Config {
              # the tmux server a `tmux` backend serves; never tmux's default server\n\
              tmux_server = \"{server}\""
         ));
-        out.push('\n');
+        out.push_str(
+            "\n\n# What the dashboard does on the desktop.\n\
+             [tui]\n\
+             # The program and arguments that run a command in a new terminal, used to attach\n\
+             # to the tmux server when a focus finds no client. Unset runs `$TERMINAL -e`.\n\
+             # terminal = [\"wezterm\", \"start\", \"--\"]\n",
+        );
+        if let Some(terminal) = &self.tui.terminal {
+            let quoted: Vec<String> = terminal.iter().map(|word| format!("{word:?}")).collect();
+            out.push_str(&format!("terminal = [{}]\n", quoted.join(", ")));
+        }
         out
     }
 }
@@ -645,6 +679,13 @@ struct FileConfig {
     appearance: Option<FileAppearance>,
     processes: Option<BTreeMap<String, String>>,
     daemon: Option<FileDaemon>,
+    tui: Option<FileTui>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileTui {
+    terminal: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -936,6 +977,31 @@ htop = "none"
             Config::parse(&printed).expect("round trips"),
             Config::default()
         );
+    }
+
+    #[test]
+    fn the_terminal_to_attach_with_is_configurable_and_round_trips() {
+        assert_eq!(Config::default().tui, TuiConfig::default());
+        let config =
+            Config::parse("[tui]\nterminal = [\"wezterm\", \"start\", \"--\"]\n").expect("parses");
+        assert_eq!(
+            config.tui.terminal,
+            Some(vec!["wezterm".into(), "start".into(), "--".into()])
+        );
+        assert_eq!(
+            Config::parse(&config.to_document()).expect("round trips"),
+            config
+        );
+        // The printed default sets nothing, so it reads back as unset.
+        assert_eq!(
+            Config::parse(&Config::default().to_document()).expect("round trips"),
+            Config::default()
+        );
+        // A blank program would run nothing; so is an empty list.
+        for document in ["[tui]\nterminal = []\n", "[tui]\nterminal = [\" \"]\n"] {
+            assert!(Config::parse(document).is_err(), "{document}");
+        }
+        assert!(Config::parse("[tui]\nterm = []\n").is_err());
     }
 
     #[test]
