@@ -1,5 +1,8 @@
 # Radar plan
 
+Deferred and parked work, with options, priority and confidence, lives in
+[ideas.md](ideas.md).
+
 The queue behind the OpenSpec changes. An item lives here with the decision it
 still needs, and leaves when it becomes a change worth specifying. What is
 already settled is in `README.md` and `openspec/`; this file is the future.
