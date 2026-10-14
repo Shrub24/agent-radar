@@ -140,8 +140,14 @@ pub enum SplitDirection {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CreateRequest {
-    /// A new workspace.
-    Workspace { focus: bool },
+    /// A new workspace, starting in `directory` when one is named. The directory
+    /// is an absolute path the runtime checks; it is never taken from the caller's
+    /// own working directory.
+    Workspace {
+        focus: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory: Option<String>,
+    },
     /// A new tab in `workspace_id`. The workspace is named by the caller rather
     /// than taken from whichever pane the multiplexer currently has focused.
     Tab { workspace_id: String, focus: bool },

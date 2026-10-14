@@ -739,7 +739,7 @@ impl TmuxRuntime {
         cancel: &AtomicBool,
     ) -> Result<CreatedLocation, Failure> {
         match request {
-            CreateRequest::Workspace { focus } => {
+            CreateRequest::Workspace { focus, directory } => {
                 if *focus {
                     // tmux focuses a session by switching a client to it, and
                     // this command has no client. Creating first and switching
@@ -753,12 +753,22 @@ impl TmuxRuntime {
                 }
                 // `-d` leaves the caller's client where it is, and the name is
                 // tmux's own: this seam names no workspace.
-                let answer = self
-                    .run(
-                        &["new-session", "-d", "-P", "-F", CREATED_SESSION_FORMAT],
-                        cancel,
-                    )
-                    .map_err(Failure::unknown)?;
+                let mut args = vec!["new-session", "-d"];
+                if let Some(directory) = directory {
+                    // Checked here, where the daemon runs, because tmux would
+                    // otherwise start the session somewhere of its own choosing
+                    // and report success.
+                    if !std::path::Path::new(directory).is_absolute()
+                        || !std::path::Path::new(directory).is_dir()
+                    {
+                        return Err(Failure::refused(format!(
+                            "`{directory}` is not an existing absolute directory"
+                        )));
+                    }
+                    args.extend(["-c", directory.as_str()]);
+                }
+                args.extend(["-P", "-F", CREATED_SESSION_FORMAT]);
+                let answer = self.run(&args, cancel).map_err(Failure::unknown)?;
                 let [session] = self.created(&answer.text, &[Kind::Session])?;
                 Ok(CreatedLocation {
                     workspace_id: Some(self.handle(&session)),

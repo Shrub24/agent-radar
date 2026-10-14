@@ -2123,11 +2123,21 @@ impl App {
     }
 
     /// The control that creates a new workspace, whatever row is selected.
-    pub fn new_workspace(&self) -> Confirmed {
+    ///
+    /// With a `project` it starts in that directory and is named for it; without
+    /// one it is tmux's own empty session.
+    pub fn new_workspace(&self, project: Option<&std::path::Path>) -> Confirmed {
+        let (label, directory) = match project {
+            Some(directory) => (
+                Some(crate::project::project_name(directory)),
+                Some(directory.to_string_lossy().into_owned()),
+            ),
+            None => (None, None),
+        };
         Confirmed::Container(crate::topology::Control::Create(ContainerCreate {
             request_id: crate::control_plane::random_uuid(),
-            kind: ContainerCreateKind::Workspace,
-            label: None,
+            kind: ContainerCreateKind::Workspace { directory },
+            label,
             recipe: None,
         }))
     }
@@ -3665,9 +3675,12 @@ mod tests {
             press(&mut app, KeyCode::Char('A')),
             Some(Action::NewWorkspace)
         );
-        match app.new_workspace() {
+        match app.new_workspace(None) {
             Confirmed::Container(crate::topology::Control::Create(create)) => {
-                assert_eq!(create.kind, ContainerCreateKind::Workspace);
+                assert_eq!(
+                    create.kind,
+                    ContainerCreateKind::Workspace { directory: None }
+                );
                 assert!(create.recipe.is_none());
             }
             _ => panic!("a workspace creation"),

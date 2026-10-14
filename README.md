@@ -826,7 +826,7 @@ title and label, which describe the pane rather than an agent.
   server is never shown, and one that names no pane, or a pane the inventory
   lacks, is shown only while a publisher holds a live lease or the daemon
   recorded a spawn edge for it, so a dead agent's record ages out of the tree.
-  `A` creates a new workspace whatever row is selected, and `L` runs a typed
+  `A` opens a project picker (the start directory, then `[tui] project_source`, default `zoxide query -l`, filtered to git projects by `project_filter`) and creates a workspace named for the chosen project whatever row is selected, and `L` runs a typed
   command in a new tab (on a workspace) or pane (on a pane) after a confirmation
   that shows the resolved program; the line is split by quoting alone, with no
   `$VAR`, `~`, glob or pipe expansion, and a program must be on `PATH`. A lead started this way is enrolled

@@ -585,7 +585,16 @@ impl RuntimeProvider for HerdrRuntime {
         // created. The caller's `focus` is passed as a boolean rather than left
         // to the CLI, so "do not steal the operator's focus" is stated once.
         let (method, params) = match request {
-            CreateRequest::Workspace { focus } => ("workspace.create", json!({ "focus": focus })),
+            CreateRequest::Workspace {
+                directory: Some(_), ..
+            } => {
+                return CreateOutcome::Refused(
+                    "Herdr's workspace creation takes no starting directory".to_string(),
+                );
+            }
+            CreateRequest::Workspace { focus, .. } => {
+                ("workspace.create", json!({ "focus": focus }))
+            }
             CreateRequest::Tab {
                 workspace_id,
                 focus,

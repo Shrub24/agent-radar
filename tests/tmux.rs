@@ -149,7 +149,13 @@ fn drive(fake: &Fake) {
     let _ = runtime.focus_outcome(&Target::Workspace(workspace.clone()), &cancel);
     let _ = runtime.close_outcome(&CloseTarget::Pane(pane.clone()), &cancel);
     let _ = runtime.close_outcome(&CloseTarget::Tab(fake.handle("@0")), &cancel);
-    let _ = runtime.create(&CreateRequest::Workspace { focus: false }, &cancel);
+    let _ = runtime.create(
+        &CreateRequest::Workspace {
+            focus: false,
+            directory: None,
+        },
+        &cancel,
+    );
     let _ = runtime.create(
         &CreateRequest::Tab {
             workspace_id: workspace.clone(),
@@ -382,7 +388,13 @@ fn a_command_that_failed_after_dispatch_is_unknown_never_refused() {
         matches!(output, OutputOutcome::Unknown(_)),
         "a dispatched read failure was not unknown: {output:?}"
     );
-    let created = runtime.create(&CreateRequest::Workspace { focus: false }, &cancel);
+    let created = runtime.create(
+        &CreateRequest::Workspace {
+            focus: false,
+            directory: None,
+        },
+        &cancel,
+    );
     assert!(
         matches!(created, CreateOutcome::Unknown(_)),
         "a dispatched creation failure was not unknown: {created:?}"
@@ -390,10 +402,56 @@ fn a_command_that_failed_after_dispatch_is_unknown_never_refused() {
 }
 
 #[test]
+fn a_workspace_starts_in_the_named_directory_and_refuses_one_that_does_not_exist() {
+    let Some(probe) = Probe::start("workspace directory") else {
+        return;
+    };
+    let directory = std::env::temp_dir()
+        .canonicalize()
+        .expect("a temp dir")
+        .join(format!("radar-dir-{}-{}", std::process::id(), unique()));
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let cancel = AtomicBool::new(false);
+    let request = |directory: &str| CreateRequest::Workspace {
+        focus: false,
+        directory: Some(directory.to_string()),
+    };
+    let created = probe
+        .runtime
+        .create(&request(directory.to_str().unwrap()), &cancel);
+    let CreateOutcome::Completed(location) = created else {
+        panic!("a workspace in an existing directory was not created: {created:?}");
+    };
+    assert!(location.workspace_id.is_some());
+    let path = probe.tmux(&["display-message", "-p", "-t", "$1", "#{session_path}"]);
+    assert_eq!(path.trim(), directory.to_str().unwrap());
+
+    // A missing or relative directory is refused before tmux creates anything.
+    let sessions = probe.ids(&["list-sessions", "-F", "#{session_id}"]).len();
+    for bad in [directory.join("missing"), PathBuf::from("relative")] {
+        let refused = probe
+            .runtime
+            .create(&request(bad.to_str().unwrap()), &cancel);
+        assert!(matches!(refused, CreateOutcome::Refused(_)), "{refused:?}");
+    }
+    assert_eq!(
+        probe.ids(&["list-sessions", "-F", "#{session_id}"]).len(),
+        sessions
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
 fn a_workspace_that_cannot_be_focused_is_refused_before_creating_anything() {
     let fake = Fake::failing();
     let runtime = &fake.runtime;
-    let created = runtime.create(&CreateRequest::Workspace { focus: true }, &cancel());
+    let created = runtime.create(
+        &CreateRequest::Workspace {
+            focus: true,
+            directory: None,
+        },
+        &cancel(),
+    );
     assert!(
         matches!(created, CreateOutcome::Refused(_)),
         "a focus tmux cannot apply was not refused: {created:?}"
@@ -877,7 +935,13 @@ fn create_names_the_locations_it_made() {
     let runtime = &probe.runtime;
     let cancel = cancel();
 
-    let created = runtime.create(&CreateRequest::Workspace { focus: false }, &cancel);
+    let created = runtime.create(
+        &CreateRequest::Workspace {
+            focus: false,
+            directory: None,
+        },
+        &cancel,
+    );
     let CreateOutcome::Completed(workspace) = created else {
         panic!("a workspace was not created: {created:?}");
     };

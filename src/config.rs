@@ -218,6 +218,22 @@ pub struct TuiConfig {
     /// used to attach to the server when a focus finds no client. Unset runs
     /// `$TERMINAL -e`.
     pub terminal: Option<Vec<String>>,
+    /// The command that prints candidate project directories, one per line, for
+    /// a new workspace. Unset runs `zoxide query -l`; a program that is missing
+    /// or fails leaves only the directory Radar was started in.
+    pub project_source: Option<Vec<String>>,
+    /// Which of the source's directories are offered.
+    pub project_filter: ProjectFilter,
+}
+
+/// Which candidate directories a new-workspace picker offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectFilter {
+    /// Only directories that contain a `.git` entry.
+    #[default]
+    Git,
+    /// Every existing directory the source prints.
+    None,
 }
 
 /// The loaded configuration: defaults with any file's choices applied.
@@ -382,7 +398,30 @@ impl Config {
             }
             config.daemon.tmux_server = server.to_string();
         }
-        if let Some(terminal) = file.tui.unwrap_or_default().terminal {
+        let tui = file.tui.unwrap_or_default();
+        if let Some(source) = tui.project_source {
+            if source
+                .first()
+                .is_none_or(|program| program.trim().is_empty())
+            {
+                return Err(
+                    "tui.project_source: name a program, for example [\"zoxide\", \"query\", \"-l\"]"
+                        .to_string(),
+                );
+            }
+            config.tui.project_source = Some(source);
+        }
+        match tui.project_filter.as_deref() {
+            None => {}
+            Some("git") => config.tui.project_filter = ProjectFilter::Git,
+            Some("none") => config.tui.project_filter = ProjectFilter::None,
+            Some(other) => {
+                return Err(format!(
+                    "tui.project_filter: `{other}` is not `git` or `none`"
+                ));
+            }
+        }
+        if let Some(terminal) = tui.terminal {
             // A blank program would run nothing, which is worse than no setting.
             if terminal
                 .first()
@@ -510,8 +549,20 @@ impl Config {
              [tui]\n\
              # The program and arguments that run a command in a new terminal, used to attach\n\
              # to the tmux server when a focus finds no client. Unset runs `$TERMINAL -e`.\n\
-             # terminal = [\"wezterm\", \"start\", \"--\"]\n",
+             # terminal = [\"wezterm\", \"start\", \"--\"]\n\
+             # The command that prints candidate project directories for a new workspace, one\n\
+             # per line. Unset runs `zoxide query -l`.\n\
+             # project_source = [\"zoxide\", \"query\", \"-l\"]\n\
+             # `git` offers only directories containing `.git`; `none` offers every directory.\n\
+             # project_filter = \"git\"\n",
         );
+        if let Some(source) = &self.tui.project_source {
+            let quoted: Vec<String> = source.iter().map(|word| format!("{word:?}")).collect();
+            out.push_str(&format!("project_source = [{}]\n", quoted.join(", ")));
+        }
+        if self.tui.project_filter == ProjectFilter::None {
+            out.push_str("project_filter = \"none\"\n");
+        }
         if let Some(terminal) = &self.tui.terminal {
             let quoted: Vec<String> = terminal.iter().map(|word| format!("{word:?}")).collect();
             out.push_str(&format!("terminal = [{}]\n", quoted.join(", ")));
@@ -686,6 +737,8 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct FileTui {
     terminal: Option<Vec<String>>,
+    project_source: Option<Vec<String>>,
+    project_filter: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

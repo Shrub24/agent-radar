@@ -7764,7 +7764,13 @@ fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client()
     let client = DaemonRuntime::handshake(daemon.path()).expect("the dashboard's needs are met");
     let cancel = AtomicBool::new(false);
 
-    let refused = client.create(&CreateRequest::Workspace { focus: false }, &cancel);
+    let refused = client.create(
+        &CreateRequest::Workspace {
+            focus: false,
+            directory: None,
+        },
+        &cancel,
+    );
     match refused {
         CreateOutcome::Refused(message) => {
             assert!(message.contains("`mux.create`"), "{message}");

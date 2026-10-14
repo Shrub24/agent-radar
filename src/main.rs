@@ -416,7 +416,7 @@ fn run() -> io::Result<()> {
                         }
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
                         Action::NewWorkspace => {
-                            let control = Some(app.new_workspace());
+                            let control = choose_project(&mut terminal, &config.tui, &mut app)?;
                             dispatch(
                                 control,
                                 &mut app,
@@ -448,7 +448,7 @@ fn run() -> io::Result<()> {
                         }
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
                         Action::NewWorkspace => {
-                            let control = Some(app.new_workspace());
+                            let control = choose_project(&mut terminal, &config.tui, &mut app)?;
                             dispatch(
                                 control,
                                 &mut app,
@@ -549,6 +549,30 @@ fn dispatch(
         }
         None => {}
     }
+}
+
+/// Lets the operator pick the directory a new workspace starts in, and returns the
+/// creation for it. The picker draws its own screen, so the dashboard gives the
+/// terminal back first and takes it again after, whatever the picker answered.
+/// Cancelling creates nothing.
+fn choose_project(
+    terminal: &mut ratatui::DefaultTerminal,
+    tui: &agent_radar::config::TuiConfig,
+    app: &mut App,
+) -> io::Result<Option<Confirmed>> {
+    let cwd = std::env::current_dir()?;
+    let found =
+        agent_radar::project::candidates(tui.project_source.as_deref(), tui.project_filter, &cwd);
+    disable_mouse_capture();
+    ratatui::try_restore()?;
+    let chosen = agent_radar::project::pick(&found.directories);
+    *terminal = ratatui::try_init()?;
+    enable_mouse_capture();
+    terminal.clear()?;
+    if let Some(note) = found.note {
+        app.set_focus_message(Some(note));
+    }
+    Ok(chosen?.map(|directory| app.new_workspace(Some(&directory))))
 }
 
 /// Turns mouse capture on. A wheel turn and a click only arrive while it is on,

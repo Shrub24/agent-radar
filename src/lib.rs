@@ -17,6 +17,7 @@ pub mod observation;
 pub mod process_control;
 pub mod process_icons;
 pub mod procfs;
+pub mod project;
 pub mod registry_observation;
 pub mod runtime;
 pub mod service;
