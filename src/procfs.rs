@@ -1061,8 +1061,7 @@ impl Sampler {
 /// cannot say — a machine whose CPU time Radar cannot convert.
 #[cfg(target_os = "linux")]
 fn clock_ticks() -> Option<i64> {
-    let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    (hertz > 0).then_some(hertz)
+    i64::try_from(rustix::param::clock_ticks_per_second()).ok()
 }
 
 /// No kernel counter is read on a platform Radar has no reader for.
@@ -1134,8 +1133,6 @@ fn in_store(path: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::ffi::CString;
-    use std::os::fd::RawFd;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -1187,8 +1184,7 @@ mod platform {
         }
 
         fn page_size(&mut self) -> Option<u64> {
-            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            (page > 0).then_some(page as u64)
+            Some(rustix::param::page_size() as u64)
         }
     }
 
@@ -1266,42 +1262,36 @@ mod platform {
         let Ok(fd) = open_terminal(&path) else {
             return TerminalMode::Unknown;
         };
-        let mode = read_attributes(fd).map_or(TerminalMode::Unknown, mode_from_attributes);
-        unsafe { libc::close(fd) };
-        mode
+        read_attributes(&fd).map_or(TerminalMode::Unknown, mode_from_attributes)
     }
 
     /// Opens a terminal device for reading, without making it ours.
-    fn open_terminal(path: &str) -> Result<RawFd, std::ffi::NulError> {
-        let path = CString::new(path)?;
-        // `O_NOCTTY` matters: opening a terminal without it can hand this
-        // process a controlling terminal it did not ask for.
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK,
-            )
-        };
-        Ok(fd)
+    fn open_terminal(path: &str) -> rustix::io::Result<std::os::fd::OwnedFd> {
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
     }
 
-    fn read_attributes(fd: RawFd) -> Option<libc::termios> {
-        let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
-        let read = unsafe { libc::tcgetattr(fd, attributes.as_mut_ptr()) };
-        // A negative fd lands here too, which is an unreadable terminal and not
-        // a reason to fail.
-        (read == 0).then(|| unsafe { attributes.assume_init() })
+    fn read_attributes(fd: &std::os::fd::OwnedFd) -> Option<rustix::termios::Termios> {
+        rustix::termios::tcgetattr(fd).ok()
     }
 
     /// A program that has turned off canonical mode *and* echo is drawing the
     /// screen itself. One that has not is printing to a terminal the shell
     /// still owns.
-    fn mode_from_attributes(attributes: libc::termios) -> TerminalMode {
-        let line_discipline = attributes.c_lflag & (libc::ICANON | libc::ECHO);
-        if line_discipline == 0 {
-            TerminalMode::FullScreen
-        } else {
+    fn mode_from_attributes(attributes: rustix::termios::Termios) -> TerminalMode {
+        mode_from_local_modes(attributes.local_modes)
+    }
+
+    fn mode_from_local_modes(local_modes: rustix::termios::LocalModes) -> TerminalMode {
+        if local_modes
+            .intersects(rustix::termios::LocalModes::ICANON | rustix::termios::LocalModes::ECHO)
+        {
             TerminalMode::Line
+        } else {
+            TerminalMode::FullScreen
         }
     }
 
@@ -1310,24 +1300,20 @@ mod platform {
         use super::*;
         use crate::model::BinaryFreshness;
 
-        fn attributes(line_discipline: libc::tcflag_t) -> libc::termios {
-            let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-            attributes.c_lflag = line_discipline;
-            attributes
-        }
-
         #[test]
         fn raw_mode_is_what_a_full_screen_program_leaves_behind() {
             assert_eq!(
-                mode_from_attributes(attributes(0)),
+                mode_from_local_modes(rustix::termios::LocalModes::empty()),
                 TerminalMode::FullScreen
             );
             assert_eq!(
-                mode_from_attributes(attributes(libc::ICANON)),
+                mode_from_local_modes(rustix::termios::LocalModes::ICANON),
                 TerminalMode::Line
             );
             assert_eq!(
-                mode_from_attributes(attributes(libc::ICANON | libc::ECHO)),
+                mode_from_local_modes(
+                    rustix::termios::LocalModes::ICANON | rustix::termios::LocalModes::ECHO,
+                ),
                 TerminalMode::Line
             );
         }

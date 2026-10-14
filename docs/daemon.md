@@ -9,12 +9,13 @@ adapter seam, capability guarantees and second-backend boundary.
 
 ## What is available
 
-The daemon has two independent surfaces on one local control socket:
+The daemon exposes physical control, registry reads/publications, and volatile background-task detail. The versioned control socket serves the physical and registry APIs plus `tasks.list.v1`. Until `pi-bash-processes` migrates, its existing publisher protocol is accepted through a temporary compatibility socket entry into the same daemon transport; the TUI never owns that listener.
 
 | Surface | Use | Reference |
 |---|---|---|
 | Physical mux adapter | Observe terminal locations/process evidence; focus, create, input, read output and guarded unmanaged close | [Control-plane protocol](control-plane.md) |
 | Direct agent registry | Register agent incarnations; publish execution, assignment and session facts; read current snapshots and process verification | [Agent registration](agent-registration.md) |
+| Background-task read | Read volatile task snapshots grouped by exact Pi session UUID | [Publisher bridge](radar-bus.md) |
 
 The physical backend defaults to tmux on the server named `radar`. Herdr is
 selected only explicitly with `RADAR_CONTROL_BACKEND=herdr`. The server name comes from
@@ -84,20 +85,13 @@ records are readable with `mux.request.list` and `"unfinished": true`. No comman
 
 ## Dashboard consumption
 
-The Radar TUI is a registry consumer. With a daemon selected, it declares
-`registry.v1` and `spawn.v1`, reads the daemon's pane inventory plus paged
-`agent.list` and `spawn.list`, and joins each registration to a pane by its
-backend-qualified location and the exact `process.claim` birth identity of that
-pane's own foreground process. A daemon that omits either contract fails the
+The Radar TUI is an optional display client. It declares `registry.v1` and `spawn.v1`, reads the daemon's pane inventory plus paged `agent.list` and `spawn.list`, and joins each registration to a pane by its backend-qualified location and the exact `process.claim` birth identity of that pane's own foreground process. It reads background-task snapshots through `tasks.list.v1` and joins them only by exact Pi session UUID; it does not bind publisher sockets or ingest messages. A daemon that omits either contract fails the
 refresh with that diagnostic rather than showing a fleet from another source.
 Herdr's agent records, its display metadata and its native agent status are never
 display facts: a registered row is named by its registration and shows the
 execution, assignment and facts channels, each with its own provenance and
 freshness. A registration at a pane also protects it — and the tab containing it
-— from a generic unmanaged close, joined or not; `x` is routed to the owner where
-the pane carries the lineage that route needs, and refused otherwise. Direct,
-with no daemon, the TUI lists ordinary panes only. No agent fact in the dashboard
-comes from a Herdr token once a daemon serves the registry.
+— from a generic unmanaged close, joined or not; managed controls use daemon lifecycle methods and refuse rather than falling back when the daemon is unavailable. No agent fact in the dashboard comes from a Herdr token once the daemon serves the registry.
 
 ## Connect and negotiate
 
@@ -109,18 +103,12 @@ units start and stop it; see [Stopping and refusals](#stopping-and-refusals).
 Clients connect directly using Unix-domain UTF-8 JSON Lines, protocol version
 `2`, with a canonical UUID request ID and one matching response per request.
 Send `daemon.ping` first and check the served protocol and the contracts your
-client needs: `registry.v1` for a publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader,
-`spawn.v1` and `spawn.close.v1` for managed children. Do not require mux
+client needs: `registry.v1` for a registry publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader, `tasks.list.v1` for background-task snapshots, and `spawn.v1`/`spawn.close.v1` for managed children. Do not require mux
 capabilities for a registry-only publisher. The handshake states what this build
 serves; it cannot prove which build is running, so treat an absent contract or an
 `unknown_method` answer as the signal to keep your previous path.
 
-Default socket resolution: `RADAR_CONTROL_SOCKET`, then
-`$XDG_RUNTIME_DIR/agent-radar/control.sock`, then
-`/tmp/agent-radar-<uid>/control.sock`. This is separate from the background-task
-bus socket. See the [protocol reference](control-plane.md#start-and-select) for
-state-path resolution, the `[daemon]` table, and the daemon's
-physical-backend selection.
+Default control socket resolution: `RADAR_CONTROL_SOCKET`, then `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then `/tmp/agent-radar-<uid>/control.sock`. The daemon temporarily also binds the legacy publisher socket path described in [the publisher bridge](radar-bus.md); it is an ingest-only compatibility entry into the same transport and task state. See the [protocol reference](control-plane.md#start-and-select) for state-path resolution, the `[daemon]` table, and physical-backend selection.
 
 Before connecting, check that the socket and its parent are not symlinks, the
 parent is a user-owned real directory with mode `0700`, and the socket is a
@@ -136,6 +124,7 @@ processes running as the same user. Do not expose this socket remotely.
 | Physical mutations | `mux.focus`, `mux.close`, `mux.create`, `mux.input`, `mux.report`, `spawn.create` | Respective mux capabilities (`spawn.create` also `mux.launch`) |
 | Mutation readback | `mux.request.get`, `mux.request.list` | None |
 | Durable lifecycle events | `events.read` | `events.v1` |
+| Volatile task snapshot | `tasks.list` | `tasks.list.v1` |
 | Register a subject | `agent.register` | `registry.v1` |
 | Acquire or explicitly replace a channel writer | `agent.acquire` | `registry.v1` |
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `registry.v1` |

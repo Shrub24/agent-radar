@@ -11,8 +11,9 @@ use agent_radar::app::DetailPage;
 use agent_radar::bus::{BusEvent, Task, TaskState};
 use agent_radar::model::{
     AgentObservation, FleetObservation, HerdsmanFacts, Lineage, Location, Pane, RuntimeStatus,
-    SessionUuid, Tab, Workspace,
+    SessionIdentity, SessionUuid, Tab, Workspace,
 };
+use agent_radar::registry_observation::{self, RegistryAgent, RegistryView};
 use agent_radar::{App, ObservationState, RowId, ui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -37,6 +38,60 @@ fn location(pane_id: &str) -> Location {
 /// tasks its pane tokens carry. The token list is what says what is unresolved
 /// — the running count beside it is not a task set — so the count publishes
 /// that many ids.
+fn task_session_view(pane_id: &str, session: &str) -> RegistryView {
+    let agent_id = format!("test-{pane_id}");
+    let mut agent: RegistryAgent = serde_json::from_value(serde_json::json!({
+        "registration": {
+            "version": 1,
+            "agent_id": agent_id,
+            "registered_at": "2026-01-01T00:00:00.000Z",
+            "source": "herdsman",
+            "incarnation": "11111111-1111-4111-8111-111111111111",
+            "session": session,
+            "label": "worker",
+            "location": {"backend":"test","workspace":"wH","tab":"wH:t1","pane":pane_id},
+            "process_claimed": false,
+            "launch": {"available":false}
+        },
+        "process": {"claimed":false,"claim":null,"verification":"unavailable"},
+        "execution": null,
+        "assignment": null,
+        "facts": null
+    }))
+    .expect("registration fixture decodes");
+    agent.context = Some(
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "agent_id": agent_id,
+            "writer": {
+                "source":"herdsman",
+                "incarnation":"22222222-2222-4222-8222-222222222222",
+                "generation":1,
+                "sequence":1
+            },
+            "context": {
+                "source":"herdsman",
+                "incarnation":"22222222-2222-4222-8222-222222222222",
+                "generation":1,
+                "sequence":1,
+                "lease_ms":30000,
+                "received_at":"2026-01-01T00:00:00.000Z",
+                "expires_at":"2026-01-01T00:00:30.000Z",
+                "restored":false,
+                "freshness":"fresh",
+                "session":session
+            }
+        }))
+        .expect("session context fixture decodes"),
+    );
+    RegistryView {
+        agent,
+        binding: registry_observation::Binding::Joined,
+        spawn: None,
+        managed: None,
+    }
+}
+
 fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
     let mut state = ObservationState::new();
     state.apply_success(FleetObservation {
@@ -69,7 +124,9 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
                 name: Some("pi".into()),
                 label: Some(format!("worker {pane_id}")),
                 status: Some(RuntimeStatus::Working),
-                session: None,
+                session: session
+                    .and_then(SessionUuid::parse)
+                    .map(SessionIdentity::Uuid),
                 lineage: session.map(|uuid| Lineage {
                     session: SessionUuid::parse(uuid).expect("test UUID"),
                     parent: None,
@@ -81,7 +138,7 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
                         .collect(),
                     ..HerdsmanFacts::default()
                 },
-                registry: None,
+                registry: session.map(|uuid| task_session_view(pane_id, uuid)),
             })
             .collect(),
     });
@@ -307,7 +364,7 @@ fn a_row_with_its_own_session_uuid_never_falls_back_to_the_pane() {
 }
 
 #[test]
-fn a_row_without_a_session_uuid_joins_by_the_hello_pane() {
+fn a_row_without_a_session_uuid_does_not_join_by_the_hello_pane() {
     let state = fleet(&[("wH:p1", None, None)]);
     let mut app = app_for(&state);
     app.apply_bus_event(BusEvent::Connected {
@@ -321,7 +378,7 @@ fn a_row_without_a_session_uuid_joins_by_the_hello_pane() {
 
     select_agent(&mut app, "wH:p1");
     let screen = pages(&state, &mut app);
-    assert!(screen.contains("task: bg-1"), "{screen}");
+    assert!(!screen.contains("task: bg-1"), "{screen}");
 }
 
 #[test]

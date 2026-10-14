@@ -1,19 +1,18 @@
 # Agent Radar
 
-A full-screen fleet overview for coding agents in one local Herdr
-instance. Agents are grouped by workspace and nested under their reported owners;
-tabs remain location details. Herdr is a connector, not the application model.
+A full-screen fleet control plane for coding agents. Radar uses the daemon by
+default, with tmux as its physical backend; Herdr is available only as an
+explicit backend during the cutover. The tree abstracts tmux workspaces and
+windows into Radar's workspace and tab hierarchy, with agent ownership kept
+within a window.
 
-Radar observes Herdr, and acts on it only when asked. `Enter` focuses the
-selected row's pane. `x` and `X` ask to close a pane or a tab, and `r` asks a
-managed worker's owner to restart it: each opens a confirmation first and sends
-nothing until it is confirmed, each routes a managed pane to its owner rather
-than the mux, and a tab holding a managed pane is refused whole. Everything else
-Radar shows is observed, never changed.
+The TUI is a display and control client, not an ingest authority. The daemon
+owns lifecycle operations, managed containers, and background-task publisher
+ingest; task detail reaches the TUI through `tasks.list.v1`. Confirmed actions
+are sent to the daemon and their durable outcomes remain readable by request ID.
 
-`plan.md` is the roadmap: interactivity, the nested tree, sorting, peek, process
-links, session search and failure reporting, each with the decision it still
-needs.
+See [the daemon guide](docs/daemon.md) for operation and adoption status and
+[ideas.md](ideas.md) for deferred functionality and options.
 
 ## Development
 
@@ -845,37 +844,30 @@ refresh cycles. Continuity across Herdr restarts or session moves is not promise
 
 ## Background-task detail (the bus)
 
-The pane tokens are a pointer: `pi_bg_running` counts the background tasks a
-pane currently has running, and `pi_bg_tasks` names what is unresolved as
-comma-separated `<id>:<phase>` entries — `review` for a task that has exited with
-its capture still unread, `flushing` for one whose capture is not yet certified.
-Herdr's 32-key limit leaves no room for the rest, so the extension that owns them
-— today `pi-bash-processes` — pushes their detail
-instead. **Radar only listens**, on one Unix socket per user
+Herdr's `pi_bg_*` pane tokens summarize background-task state but cannot carry
+the task detail, so `pi-bash-processes` publishes full snapshots. The daemon
+owns that ingest and exposes volatile detail through `tasks.list.v1`; the TUI
+never listens to publisher connections. Until the publisher migrates, the daemon
+accepts its existing line protocol on a temporary compatibility socket path
 (`$RADAR_SOCKET`, else `$XDG_RUNTIME_DIR/agent-radar/radar.sock`, else
-`/tmp/agent-radar-<uid>/radar.sock`), and never connects back. Nothing in the
-protocol acknowledges, settles or consumes anything, so reading a task through
-the bus leaves it and its result exactly as they were; `pi-bg get` stays the only
-way an agent consumes one. The protocol, its limits and the publisher's
-obligations are in [`docs/radar-bus.md`](docs/radar-bus.md), with example lines
-in [`docs/radar-bus.fixture.json`](docs/radar-bus.fixture.json).
+`/tmp/agent-radar-<uid>/radar.sock`). This entry shares transport and task state
+with the versioned control socket. Reading tasks does not acknowledge, settle
+or consume anything; `pi-bg get` remains the retrieval path. See
+[`docs/radar-bus.md`](docs/radar-bus.md) and its
+[`docs/radar-bus.fixture.json`](docs/radar-bus.fixture.json) for the protocol.
 
-A task list is joined to an agent row by the **exact session UUID** the row
-publishes as its ownership lineage (`pi_herdsman_session`). A row that publishes
-no UUID falls back to the pane its `hello` named — a registered row publishes no
-lineage UUID in the row, so a publisher's `hello` pane is how its tasks reach
-it, and only while **exactly one**
-connected publisher names that pane: two of them are an ambiguity, so that row
-gets no publisher's list rather than whichever entry came first. Nothing else
-joins them — not the cwd, not a title, not the human session name. A session
-with no matching row is held and shown nowhere.
+A publisher task list joins an agent row only by the exact Pi session UUID
+reported by that row. The optional `pane` in a legacy publisher `hello` is not a
+join fallback. Nothing else joins task detail — not pane, cwd, title or human
+session name. A connected session with no matching agent row remains in the
+daemon snapshot but is not attached to another row.
 
 One projection decides what a row's tasks are, and the task rows, the `N bg`
 badge and the details all read that same projection, so they cannot disagree. A
 matched publisher's list is authoritative, an **empty list included** — the pane's
-own `pi_bg_tasks` ids are never unioned into it. They are the fallback for a row
-no publisher matches, and each of those rows is marked `tokens`, or
-`last-observed` when the agent itself is retained. A row a publisher speaks for
+own `pi_bg_tasks` ids are never unioned into it. They are the fallback for a row with no connected publisher for its exact
+session, and each of those rows is marked `tokens`, or `last-observed` when the
+agent itself is retained. A row a publisher speaks for
 shows the publisher's phase word, and when `pi_bg_running` disagrees the panel
 says so instead of choosing. Since the token counts only `running` tasks, only
 those are compared with it. A phase word Radar does not know is shown as
@@ -918,16 +910,12 @@ a file, the configuration or a log. Task rows move only while their source
 reports the process alive now: a `running` word on a `last-observed` row is
 stated and stays still.
 
-Bus data lives only as long as its connection. A disconnect removes that
-session's entry immediately and the row falls back to its token facts, because a
-gone publisher is not evidence that its tasks ended. An explicit empty list is
-different: the publisher is connected and reports nothing unresolved, which the
-details state in words.
+Task data lives in daemon memory only while its publisher connection is active. A disconnect removes that session's entry immediately and the row falls back to its token facts, because a gone publisher is not evidence that its tasks ended. An explicit empty list is different: the publisher is connected and reports nothing unresolved, which the details state in words.
 
-The bus is a subsystem of its own, and its failures are never reported as source
-failures: a socket that cannot be bound (a directory that is not ours, or
-another Radar answering on it) leaves the fleet observed as usual, marks the
-heading `· bus off`, and writes the diagnostic on the `bus:` line of the details.
+Publisher ingest is a daemon service, separate from registry and inventory
+freshness. If it cannot bind its compatibility socket or is otherwise
+unavailable, `tasks.list` reports that diagnostic; the TUI keeps the rest of the
+daemon-backed fleet visible and labels task detail `· bus off`.
 
 ## Layout and verification
 
@@ -939,10 +927,8 @@ One Cargo package, with `radar` as its binary:
   evidence, and focus asks it to move to a normalized workspace or pane target;
   the adapter owns Herdr's executable, CLI arguments, socket discovery, wire
   decoding and the bounded runner that kills and reaps a stalled command.
-  Managed-agent lifecycle never uses this seam: a managed close or restart is
-  asked of the worker's owner through the file client below, so a second mux
-  would still be a second adapter at assembly rather than a change to the
-  collector, focuser or the view.
+  Managed-agent lifecycle controls go through the daemon's semantic lifecycle
+  methods; they do not use the in-process adapter or an owner-file request.
 - `src/collector.rs`: the refresh schedule. One refresh in flight at a time on
   its own thread, cancellation that abandons rather than waits, the
   assignment-age stamp taken once per refresh, and the local `/proc` facts
@@ -950,7 +936,7 @@ One Cargo package, with `radar` as its binary:
   a failed call: an inventory error is a stale source that keeps the last-good
   inventory, and unreadable foreground evidence is inconclusive rather than
   proof that a pane went away.
-- `src/bus.rs`: the bus line protocol and the listener that accepts extensions.
+- `src/bus.rs` and `src/control_plane/ingest.rs`: publisher protocol decoding and daemon-owned volatile task ingestion; `src/control_plane/transport/` provides the shared bounded socket runtime.
 - `src/model.rs` / `src/observation.rs`: normalized facts and reconciliation.
 - `src/config.rs` / `src/theme.rs`: the colours, where they come from, and the
   vocabulary they paint (state marks, vendor icons, title rules).

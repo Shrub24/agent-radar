@@ -9,9 +9,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
 use crate::control_plane::registry::ProcessVerifier;
 use crate::model::ProcessIdentity;
@@ -91,7 +94,7 @@ pub fn acquire(
     }
     let fd = match open(identity.pid) {
         Ok(fd) => fd,
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(Acquired::Absent),
+        Err(rustix::io::Errno::SRCH) => return Ok(Acquired::Absent),
         Err(error) => return Err(format!("pidfd_open: {error}")),
     };
     match verifier.inspect(identity.pid)? {
@@ -103,52 +106,27 @@ pub fn acquire(
 
 /// Sends SIGTERM to the process the descriptor names, and nothing else.
 pub fn terminate(fd: &OwnedFd) -> io::Result<()> {
-    // SAFETY: the arguments are a valid pidfd, a signal number and a null siginfo
-    // (as pidfd_send_signal(2) defines it for a plain signal). No memory is
-    // written through them.
-    let sent = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            fd.as_raw_fd(),
-            libc::SIGTERM,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    pidfd_send_signal(fd, Signal::TERM).map_err(io::Error::from)
 }
 
 /// Whether the process exits within `timeout`. A pidfd becomes readable when its
 /// process terminates, so this waits on the descriptor, not on the PID.
 pub fn exited_within(fd: &OwnedFd, timeout: Duration) -> bool {
-    let mut poll = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
+    let timeout = rustix::time::Timespec {
+        tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(timeout.subsec_nanos()),
     };
-    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut fds = [PollFd::new(fd, PollFlags::IN)];
     loop {
-        // SAFETY: one valid pollfd is passed with its count.
-        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
-        match ready {
-            1.. => return poll.revents & libc::POLLIN != 0,
-            0 => return false,
-            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
-            _ => return false,
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(ready) => return ready != 0 && fds[0].revents().contains(PollFlags::IN),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return false,
         }
     }
 }
 
-fn open(pid: i32) -> io::Result<OwnedFd> {
-    // SAFETY: pidfd_open takes a PID and flags, and returns a new descriptor the
-    // caller owns.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the kernel returned a fresh descriptor that nothing else owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+fn open(pid: i32) -> Result<OwnedFd, rustix::io::Errno> {
+    let pid = Pid::from_raw(pid).ok_or(rustix::io::Errno::INVAL)?;
+    pidfd_open(pid, PidfdFlags::empty())
 }

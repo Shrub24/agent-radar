@@ -1234,10 +1234,8 @@ fn run(config: &HerdrConfig, args: &[&str], cancel: &AtomicBool) -> Result<Strin
     // Descendants may keep the output pipes open after the CLI exits. The
     // adapter owns this isolated group, so end it before joining readers.
     #[cfg(unix)]
-    unsafe {
-        // SAFETY: process_group(0) assigned this child its own group; a negative
-        // PID targets only that group, never Radar or the pane it observes.
-        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    if let Some(group) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
     let stdout = stdout.join().expect("stdout drain thread panicked");
     let stderr = stderr.join().expect("stderr drain thread panicked");

@@ -15,9 +15,9 @@ use agent_radar::control_plane::registry::PublicSpawnTopology;
 use agent_radar::focus;
 use agent_radar::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Location, Pane,
-    RuntimeStatus, SessionUuid, Tab, Workspace,
+    RuntimeStatus, SessionIdentity, SessionUuid, Tab, Workspace,
 };
-use agent_radar::registry_observation::{self, RegistryAgent, RegistryRead};
+use agent_radar::registry_observation::{self, RegistryAgent, RegistryRead, RegistryView};
 use agent_radar::runtime::BackendIdentity;
 use agent_radar::tree::{RowKind, TaskId, TaskProjection, TaskRow, TaskSource, TreeNode};
 use agent_radar::{Action, App, Geometry, ObservationState, Operation, PaneView, RowId, theme, ui};
@@ -121,7 +121,10 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                 name: Some("pi".into()),
                 label: Some(format!("worker {}", agent.pane_id)),
                 status: Some(RuntimeStatus::Working),
-                session: None,
+                session: agent
+                    .session
+                    .and_then(SessionUuid::parse)
+                    .map(SessionIdentity::Uuid),
                 lineage: agent.session.map(|uuid| Lineage {
                     session: SessionUuid::parse(uuid).expect("test UUID"),
                     parent: agent.parent.and_then(SessionUuid::parse),
@@ -135,7 +138,51 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                         .collect(),
                     ..HerdsmanFacts::default()
                 },
-                registry: None,
+                registry: agent.session.map(|session| {
+                    let agent_id = format!("test-{}", agent.pane_id);
+                    let mut registered = registration(
+                        &agent_id,
+                        json!({
+                            "backend": "test",
+                            "workspace": "wH",
+                            "tab": "wH:t1",
+                            "pane": agent.pane_id
+                        }),
+                        false,
+                        Vec::new(),
+                    );
+                    registered.context = Some(
+                        serde_json::from_value(json!({
+                            "version": 1,
+                            "agent_id": agent_id,
+                            "writer": {
+                                "source": "herdsman",
+                                "incarnation": REGISTRY_INCARNATION,
+                                "generation": 1,
+                                "sequence": 1
+                            },
+                            "context": {
+                                "source": "herdsman",
+                                "incarnation": REGISTRY_INCARNATION,
+                                "generation": 1,
+                                "sequence": 1,
+                                "lease_ms": 30_000,
+                                "received_at": "2026-01-01T00:00:00.000Z",
+                                "expires_at": "2026-01-01T00:00:30.000Z",
+                                "restored": false,
+                                "freshness": "fresh",
+                                "session": session
+                            }
+                        }))
+                        .expect("fresh registry context fixture"),
+                    );
+                    RegistryView {
+                        agent: registered,
+                        binding: registry_observation::Binding::Joined,
+                        spawn: None,
+                        managed: None,
+                    }
+                }),
             })
             .collect(),
     }
@@ -468,9 +515,9 @@ fn a_disconnect_returns_the_row_to_its_token_ids() {
 }
 
 #[test]
-fn an_ambiguous_pane_fallback_is_no_join() {
-    // A row that publishes no session UUID: the publisher's `hello` pane is the
-    // only join left, and only while it names the pane once.
+fn publisher_hello_pane_is_never_used_to_join_tasks() {
+    // A row without a published session UUID cannot receive a publisher's
+    // task list, even when the legacy hello names its pane.
     let state = fleet(&[Agent::new("wH:p1")]);
     let mut app = app_for(&state);
     publish(
@@ -479,13 +526,10 @@ fn an_ambiguous_pane_fallback_is_no_join() {
         Some("wH:p1"),
         vec![task("bg-1", TaskState::Running)],
     );
-    assert_eq!(ids(&tasks(&app, "wH:p1")), ["bg-1"]);
-    assert_eq!(
-        projection(&app, "wH:p1").tasks[0].id.session.as_deref(),
-        Some(session('1'))
-    );
+    assert!(tasks(&app, "wH:p1").is_empty());
+    assert_eq!(projection(&app, "wH:p1").source, None);
 
-    // A second publisher naming the same pane is an ambiguity, not a coin toss.
+    // A second publisher naming the same pane is still not a join candidate.
     publish(
         &mut app,
         session('2'),

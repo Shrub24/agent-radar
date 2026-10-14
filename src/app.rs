@@ -1590,6 +1590,17 @@ impl App {
         self.prune_disclosures();
     }
 
+    pub fn replace_bus_snapshot(&mut self, events: Vec<BusEvent>) {
+        let mut bus = BusState::default();
+        for event in events {
+            bus.apply(event);
+        }
+        self.bus = bus;
+        self.tree.attach_tasks(&self.bus);
+        self.reconcile_selection();
+        self.prune_disclosures();
+    }
+
     /// Records why the bus is not running, or clears it.
     pub fn set_bus_diagnostic(&mut self, diagnostic: Option<String>) {
         self.bus_diagnostic = diagnostic;
@@ -3101,6 +3112,60 @@ mod tests {
             .session
             .as_str()
             .to_string();
+        // Publisher task snapshots join by fresh registry context, not by the
+        // legacy lineage fact in this Herdr-shaped fixture.
+        let agent_id = "task-owner";
+        let mut registry_agent: crate::registry_observation::RegistryAgent =
+            serde_json::from_value(serde_json::json!({
+                "registration": {
+                    "version": 1,
+                    "agent_id": agent_id,
+                    "registered_at": "2026-01-01T00:00:00Z",
+                    "source": "herdsman",
+                    "incarnation": "11111111-1111-4111-8111-111111111111",
+                    "session": session,
+                    "label": "owner",
+                    "location": {"backend":"test", "workspace":"wA", "tab":"wA:t1", "pane":"wA:p1"},
+                    "process_claimed": false,
+                    "launch": {"available":false}
+                },
+                "process": {"claimed":false,"claim":null,"verification":"unavailable"},
+                "execution": null,
+                "assignment": null,
+                "facts": null
+            }))
+            .expect("task owner registration fixture");
+        registry_agent.context = Some(
+            serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "agent_id": agent_id,
+                "writer": {
+                    "source":"herdsman",
+                    "incarnation":"22222222-2222-4222-8222-222222222222",
+                    "generation":1,
+                    "sequence":1
+                },
+                "context": {
+                    "source":"herdsman",
+                    "incarnation":"22222222-2222-4222-8222-222222222222",
+                    "generation":1,
+                    "sequence":1,
+                    "lease_ms":30000,
+                    "received_at":"2026-01-01T00:00:00Z",
+                    "expires_at":"2026-01-01T00:00:30Z",
+                    "restored":false,
+                    "freshness":"fresh",
+                    "session":session
+                }
+            }))
+            .expect("fresh task session context fixture"),
+        );
+        owner.registry = Some(crate::registry_observation::RegistryView {
+            agent: registry_agent,
+            binding: crate::registry_observation::Binding::Joined,
+            spawn: None,
+            managed: None,
+        });
         // Long enough that the panel puts it behind a marker rather than
         // drawing it over everything below it.
         owner.facts.assignment = Some("x".repeat(200));

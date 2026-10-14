@@ -12,12 +12,14 @@
 pub mod client;
 pub mod containers;
 pub mod events;
+pub mod ingest;
 pub mod lifecycle;
 pub mod ops;
 pub mod protocol;
 pub mod registry;
 pub mod server;
 pub mod store;
+pub mod transport;
 
 pub use crate::runtime::{RuntimeProvider, Target};
 pub use client::{DaemonRuntime, Selected, connect, connect_at};

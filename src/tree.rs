@@ -280,10 +280,9 @@ pub struct AgentRow {
     /// records why the association is believed to be at rest (or not).
     pub retained: Option<RetentionBasis>,
     pub session: Option<crate::model::SessionIdentity>,
-    /// The exact session UUID the source published as this agent's ownership
-    /// lineage (`pi_herdsman_session`), when it published one. It is the
-    /// identity a bus publisher's `hello` is joined by, and is never derived
-    /// from a path, a human name or a pane's position.
+    /// The exact, fresh session UUID from this agent's daemon registry context.
+    /// Publisher task snapshots join only through this identity, never through
+    /// the publisher's pane field or legacy lineage.
     pub session_uuid: Option<String>,
     /// What Herdsman publishes about this agent, as decoded. Presentation
     /// draws these as they are: a fact the source does not publish is absent,
@@ -741,10 +740,10 @@ fn agent_node(
                 state: agent.state(),
                 retained,
                 session: agent.session.clone(),
-                session_uuid: agent
-                    .lineage
+                session_uuid: registry
                     .as_ref()
-                    .map(|lineage| lineage.session.as_str().to_string()),
+                    .and_then(|view| view.agent.current_session_uuid())
+                    .map(|session| session.as_str().to_string()),
                 facts: agent.facts.clone(),
                 // Filled by `FleetTree::attach_tasks`: the observation cannot
                 // say what a publisher is connected with.
@@ -818,7 +817,7 @@ fn project_tasks(
     last_observed: bool,
     bus: &BusState,
 ) -> TaskProjection {
-    if let Some((session, held)) = matched_session(pane_id, session_uuid, bus) {
+    if let Some((session, held)) = matched_session(session_uuid, bus) {
         return TaskProjection {
             source: Some(TaskSource::Bus),
             tasks: held
@@ -854,18 +853,11 @@ fn project_tasks(
 /// and only when one connected session names that pane — two publishers naming
 /// one pane are an ambiguity, not a coin toss.
 fn matched_session<'a>(
-    pane_id: &str,
     session_uuid: Option<&'a str>,
     bus: &'a BusState,
 ) -> Option<(&'a str, &'a BusSession)> {
-    if let Some(session) = session_uuid {
-        return bus.get(session).map(|held| (session, held));
-    }
-    let mut candidates = bus
-        .sessions()
-        .filter(|(_, held)| held.pane.as_deref() == Some(pane_id));
-    let (session, held) = candidates.next()?;
-    candidates.next().is_none().then_some((session, held))
+    let session = session_uuid?;
+    bus.get(session).map(|held| (session, held))
 }
 
 /// The token fallback for a row no publisher matches: the pane's own unresolved

@@ -16,13 +16,17 @@ of the detail.
 | Clear stuck unfinished operations | (a) operator command that marks an operation abandoned with a durable reason; (b) reaper after a deadline with visible outcome | P1 | medium | First real stuck record blocks a server stop |
 | Restart rollback gap | (a) accept and reconcile on next start (current); (b) compensating successor record | P3 | medium | A failed successor write is observed in live use |
 | Restart and recovery live acceptance | Disposable tmux/Pi run: daemon kill, TUI quit, server replacement, lost response | P1 | high | Live run (user) |
-| Lifecycle tracing spans | Add `tracing` spans correlated by subject and operation IDs around admission, effect dispatch, observation and recovery; keep the durable typed event log authoritative | P2 | high | Production diagnosis needs timing/cross-thread context beyond replayable events |
+| Tracing | `tracing` with journal output for the daemon and file output for the TUI (never the terminal); spans keyed by request, subject and operation IDs; the typed event log stays authoritative. Folded into the `shared-observation` change | P1 | high | Shared observation lands (sampler timing needs diagnosing) |
 | Native systemd ordering and switch behaviour | Verify `keep-old` / `X-SwitchMethod` keeps a tmux server through a real Home Manager switch; add `Wants=`/`After=` for daemon edges | P1 | medium | Live switch on a real machine |
 | Checked Home Manager evaluation (daemon-service 6.3) | (a) add a Home Manager input used only by a check; (b) rely on live acceptance (current choice) | P3 | medium | Module option wiring breaks unnoticed |
 | Non-Nix unit generation | (a) keep Nix as the only module (current); (b) generate FHS unit files from the flake in CI | P3 | medium | A non-Nix install is actually needed, or packaging diverges from the module |
-| Tmux 3.8 event-driven observation | hooks plus control-mode notifications, `set-hook -B` monitors, OSC 133 shell panes; keep reconciliation as the recovery path; no capability gate, 3.8 required | P2 | medium (not testable locally, tmux 3.8 not installed) | Obtain tmux 3.8 for isolated verification; a second source is needed for timeliness |
+| tmux control mode observer | Read-only, output-free control-mode client per session as wake source for the sampler; verified on tmux 3.7c, no 3.8 needed. Change `tmux-control-mode` | P1 | high | After `shared-observation` |
+| Tmux 3.8 shell-boundary events | OSC 133 pane-command events and `set-hook -B` monitors as more wakes plus separate typed shell-boundary evidence; keep reconciliation as the recovery path; 3.8 required, no capability gate | P2 | medium (not testable locally, tmux 3.8 not installed) | tmux 3.8 available for isolated verification |
 | Process evidence row | pidfd/procfs as a separate evidence lane beside tmux events | P2 | medium | Tmux 3.8 observation lands |
-| Shared daemon-owned sampled observation | Move collection behind a daemon seam with immutable revisions, freshness and projection-tied pagination | P2 | medium | Sidebar or a second client needs one consistent view |
+| Shared daemon-owned sampled observation | Daemon sampler producing an immutable snapshot (revision, collection time, per-source freshness); `observation.get` with `since_revision` and "not modified"; sampling only while subscribed; tree, fold, selection and filter stay in the client; full snapshots first, deltas deferred. Slices: (1) sampler plus read, TUI switched with no fallback; (2) demand-driven, event-woken scheduling; (3) tmux 3.8 monitors feed the sampler. Open decisions: per-client foreground/focus evidence, wire size; measure registry-read cost at N agents first. Publisher ingest is daemon-owned through `tasks.list.v1`; the old publisher socket remains only as a temporary compatibility entry. | P1 | medium | Sidebar needs it; registry read re-verifies processes on every call |
+| Agent status surface for a lead | A bounded `status` read per agent for a lead to replace the pane-text `inspect`: state, context, run time, last N tool names and intents (no output), optional recent messages or recap. Needs a new producer-published channel, since no tool, intent or recap fact exists today; daemon composes it with lifecycle, execution, facts and assignment as a named view of the shared observation. Footguns: producer claims are not verified, privacy of intents and messages, bounded retention, who may inspect whom (same-UID trust today) | P2 | low | Shared observation lands and a lead needs to supervise children without reading panes |
+| Bus merged into the control socket | A `tasks` lane on the control socket with the bus's volatile, connection-scoped semantics; `pi-bash-processes` migrates; the compatibility bus socket and `extension-bus` spec are removed. `consolidate-daemon-ingest` leaves the lane, state and read in final shape | P2 | high | pi-extensions is out of the Herdsman cutover |
+| Log retention and snapshots | Compaction and periodic snapshots for the durable event log, per-domain schema versioning | P1 | high | Prerequisite for any new event domain (messaging, tasks); log is unbounded today |
 
 ## Query and filtering
 
@@ -54,6 +58,27 @@ of the detail.
 | Archive finished changes | `contract-v2`, `window-tabs`, `managed-topology` still unarchived | P1 | high | Next housekeeping pass |
 | Supersede `managed-lead-restart` | Mark superseded by `daemon-managed-lifecycle` section 3; its Herdr readiness contract no longer applies | P1 | high | Next housekeeping pass |
 | Socket-level enrollment and restart refusal tests | Lifecycle 3.1 to 3.3 socket tests, including malformed enrollment requests | P1 | high | Before section 4 wires restart |
+
+## Rust crates
+
+| Crate | Verdict | Priority | Confidence | Trigger / caveat |
+| --- | --- | --- | --- | --- |
+| `rustix` | Folded into `consolidate-daemon-ingest`. Replace the 51 `libc::` references in 10 `src` files (pidfd open/signal, poll, termios, sysconf, uid, `O_NOFOLLOW` opens) in `process_control.rs`, `procfs.rs`, `store.rs`, `registry.rs`, `server.rs`; `sigaction` stays or moves to `signal-hook`; API coverage not fully checked | P1 | medium | Part of `consolidate-daemon-ingest` |
+| `tracing` | See Tracing above | P1 | high | With shared observation |
+| `specta` 2 / `schemars` | Generate contract types for Herdsman (TypeScript) and validate Python fixtures; unchecked: how many wire shapes are typed serde structs, specta 2 release status | P2 | low | Contract drift between Rust and consumers causes a bug |
+| `tokio` | Adopted in the daemon transport only (`consolidate-daemon-ingest`): handlers stay synchronous on a bounded blocking pool; control mode and waits build on it | P1 | high | Done in that change; do not convert domain code |
+| `nucleo` | Fuzzy TUI filtering | P3 | high | See Structured TUI filters |
+
+## Long-term
+
+| Item | Options | Priority | Confidence | Trigger |
+| --- | --- | --- | --- | --- |
+| Messaging as an event-bus projection | New message domain (sent, delivered, acknowledged) on the typed log, mailboxes as projections, subscriber cursors already exist. Hard part is authority: Herdsman owns mailbox and assignment today, so moving it is a contract migration. Needs log retention, schema versioning, backpressure and per-subject access rules. Delivery, acknowledgment and process exit stay separate facts | P3 | low | Log retention done and a concrete need to move mailbox authority |
+| Daemon-managed background tasks | A task is a subject kind on tracked launch plus verified stop (both exist) with output capture. Hard parts: output retention and descendants (daemon refuses to claim descendant termination). Completion notification depends on messaging; pull-only until then. Today rows come from the pi-bash-processes bus | P3 | low | Messaging exists, or a task needs supervision beyond display |
+
+Principle: the TUI is an optional display with no ingest and no authority; anything it still owns (bus listener, reconciler, `/proc` sampling) moves to the daemon.
+
+Order: consolidate daemon ingest, shared observation, tmux control mode, sidebar, log retention and snapshots, messaging, then tasks.
 
 ## Deferred by decision (see plan.md)
 

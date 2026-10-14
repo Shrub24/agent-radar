@@ -2,7 +2,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_radar::bus::Listener;
 use agent_radar::managed_control as radar;
 use agent_radar::topology::ContainerControl;
 use agent_radar::{
@@ -254,8 +253,13 @@ fn run() -> io::Result<()> {
     let Some(selected) = await_daemon(&mut terminal)? else {
         return Ok(());
     };
-    let (runtime, container_controls, lifecycle_controls) =
-        (selected.provider, selected.containers, selected.lifecycle);
+    let (runtime, container_controls, lifecycle_controls, task_client, task_diagnostic) = (
+        selected.provider,
+        selected.containers,
+        selected.lifecycle,
+        selected.tasks,
+        selected.task_diagnostic,
+    );
     // One runtime, shared: the collector, the focuser and the closer read and act
     // on the same adapter through the same seam.
     let mut collector = Collector::new(CollectorConfig::default(), Arc::clone(&runtime));
@@ -269,16 +273,10 @@ fn run() -> io::Result<()> {
     let mut state = ObservationState::new();
     let mut app = App::new();
     let mut list = ListState::default();
-    // The bus is the only inbound surface Radar has and nothing depends on it:
-    // a listener that could not bind leaves the fleet observed as usual and is
-    // reported as a diagnostic of its own.
-    let mut listener = match Listener::bind() {
-        Ok(listener) => Some(listener),
-        Err(diagnostic) => {
-            app.set_bus_diagnostic(Some(diagnostic));
-            None
-        }
-    };
+    let mut task_revision = None;
+    let mut task_diagnostic = task_diagnostic;
+    app.set_bus_diagnostic(task_diagnostic.clone());
+    let mut next_task_read = Instant::now();
     // The animation frame, and the clock it is derived from: a mark has to move
     // at the same rate whether or not anything else made the loop redraw.
     let started = Instant::now();
@@ -294,12 +292,30 @@ fn run() -> io::Result<()> {
             app.refresh(&state);
             dirty = true;
         }
-        // Bus events are produced by the listener's own threads; draining them
-        // is what makes them visible, and any of them changes what is drawn.
-        if let Some(listener) = &listener {
-            for event in listener.drain() {
-                app.apply_bus_event(event);
-                dirty = true;
+        // The daemon owns publisher ingest; the TUI replaces its local projection
+        // from revisioned snapshots and never accepts publisher messages itself.
+        if Instant::now() >= next_task_read {
+            next_task_read = Instant::now() + Duration::from_secs(1);
+            if let Some(tasks) = &task_client {
+                match tasks.task_snapshot() {
+                    Ok(snapshot) => {
+                        if task_revision != Some(snapshot.revision) {
+                            app.replace_bus_snapshot(snapshot.events);
+                            task_revision = Some(snapshot.revision);
+                            dirty = true;
+                        }
+                        if task_diagnostic.take().is_some() {
+                            app.set_bus_diagnostic(None);
+                            dirty = true;
+                        }
+                    }
+                    Err(problem) if task_diagnostic.as_deref() != Some(problem.as_str()) => {
+                        task_diagnostic = Some(problem.clone());
+                        app.set_bus_diagnostic(Some(problem));
+                        dirty = true;
+                    }
+                    Err(_) => {}
+                }
             }
         }
         // A focus request is answered on its own thread; applying the outcome
@@ -417,9 +433,6 @@ fn run() -> io::Result<()> {
             Event::Resize(_, _) => dirty = true,
             _ => {}
         }
-    }
-    if let Some(listener) = &mut listener {
-        listener.stop();
     }
     focuser.shutdown();
     closer.shutdown();

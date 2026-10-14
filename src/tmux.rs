@@ -961,10 +961,8 @@ impl TmuxRuntime {
         // group, so ending the group ends the command and whatever it left
         // holding the pipes, never the server.
         #[cfg(unix)]
-        unsafe {
-            // SAFETY: process_group(0) assigned this child its own group; a
-            // negative PID targets only that group, never Radar itself.
-            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        if let Some(group) = rustix::process::Pid::from_raw(child.id() as i32) {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
         let (stdout, truncated) = stdout.join().expect("stdout drain thread panicked");
         let (stderr, _) = stderr.join().expect("stderr drain thread panicked");

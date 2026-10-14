@@ -26,6 +26,7 @@ pub use crate::runtime::{
 pub const REGISTRY_CONTRACT: &str = "registry.v1";
 pub const REGISTRY_FACTS_CONTRACT: &str = "registry.facts.v1";
 pub const EVENTS_CONTRACT: &str = "events.v1";
+pub const TASKS_LIST_CONTRACT: &str = "tasks.list.v1";
 pub const SPAWN_CONTRACT: &str = "spawn.v1";
 pub const SPAWN_CLOSE_CONTRACT: &str = "spawn.close.v1";
 pub const SPAWN_LAUNCH_CONTEXT_CONTRACT: &str = "spawn.launch_context.v1";
@@ -100,6 +101,12 @@ const CONTRACTS: &[(&str, &[&str])] = &[
 /// What the handshake advertises: what the backend declares, then the daemon
 /// contracts those capabilities can serve.
 pub fn advertised(backend: &[&'static str]) -> Vec<&'static str> {
+    advertised_with_tasks(backend, false)
+}
+
+/// Handshake contracts, including the volatile task lane only while its socket
+/// is bound and serving.
+pub fn advertised_with_tasks(backend: &[&'static str], tasks_available: bool) -> Vec<&'static str> {
     let mut advertised: Vec<&'static str> = Vec::new();
     for capability in backend {
         if !advertised.contains(capability) {
@@ -112,6 +119,9 @@ pub fn advertised(backend: &[&'static str]) -> Vec<&'static str> {
             .filter(|(_, needs)| needs.iter().all(|needed| backend.contains(needed)))
             .map(|(contract, _)| *contract),
     );
+    if tasks_available {
+        advertised.push(TASKS_LIST_CONTRACT);
+    }
     advertised
 }
 
@@ -275,6 +285,8 @@ pub enum Method {
     Read,
     /// Resumable read of the durable event journal.
     Events,
+    /// Volatile task sessions received from extension publishers.
+    Tasks,
     /// Registry reads and writes: the daemon's own durable records, answered
     /// whether or not a mux backend is wired.
     Registry,
@@ -297,6 +309,7 @@ pub fn classify(method: &str) -> Option<Method> {
         "mux.request.get" => Method::Request,
         "mux.request.list" => Method::Requests,
         "events.read" => Method::Events,
+        "tasks.list" => Method::Tasks,
         "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
         | "agent.get" | "agent.list" => Method::Registry,
         // A spawn read reports the daemon's own edge records; whether the backend
@@ -357,6 +370,7 @@ mod tests {
         assert_eq!(classify("mux.request.get"), Some(Method::Request));
         assert_eq!(classify("mux.request.list"), Some(Method::Requests));
         assert_eq!(classify("events.read"), Some(Method::Events));
+        assert_eq!(classify("tasks.list"), Some(Method::Tasks));
         assert_eq!(classify("agent.context"), Some(Method::Registry));
         assert_eq!(classify("spawn.get"), Some(Method::Registry));
         assert_eq!(classify("spawn.list"), Some(Method::Registry));

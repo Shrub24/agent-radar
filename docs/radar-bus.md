@@ -1,152 +1,130 @@
-# Radar bus
+# Background-task publisher bridge
 
-The radar bus is how an extension that owns a background task pushes the detail
-behind the `pi_bg_*` pane tokens — per task its id, state, run time, output
-activity and exit code. The extension dials Radar; Radar only listens and never
-connects back. Today's publisher is `pi-bash-processes`.
+The publisher protocol carries the detail behind `pi_bg_*` task tokens: task id,
+state, command, working directory, process id, output activity and exit code.
+`pi-bash-processes` is the current publisher. This is an advisory snapshot feed,
+not a control channel: Radar sends no acknowledgement or command, and reading a
+task does not consume its output. `pi-bg get` remains the way to retrieve a
+background task's output.
 
-Nothing in the protocol asks Radar to act. There is no acknowledgement, no
-receipt, no generation token and no lifecycle operation: reading a task's
-detail through the bus leaves that task and its result exactly as they were.
-`pi-bg get` stays the only way an agent consumes a task.
+Radar's daemon now owns ingest and task state. The TUI is only a client of
+`tasks.list.v1`; it does not bind a publisher socket or apply publisher messages.
+For compatibility, the daemon temporarily accepts publishers on the existing
+bus socket path as a second socket entry into the same bounded Tokio transport.
+The versioned control socket and this compatibility entry share transport,
+trust checks, runtime, shutdown and lane admission. This temporary entry can be
+removed after the publisher migrates to the control socket's ingest lane.
 
-## Socket
+Task state is volatile, in-memory and connection-scoped. It is not written to
+the durable event log or operation store. A daemon restart loses the current
+snapshot; a publisher must reconnect and send a full list.
 
-Radar binds, in this order:
+## Socket and trust
 
-1. `$RADAR_SOCKET` when set (tests, nested runs; there is no settings key),
+The compatibility socket path resolves in this order:
+
+1. `$RADAR_SOCKET` when set (tests and nested runs),
 2. `$XDG_RUNTIME_DIR/agent-radar/radar.sock`,
 3. `/tmp/agent-radar-<uid>/radar.sock` when no runtime directory is set.
 
-The directory is created `0700` and checked before binding: it must be owned by
-the current uid, have mode `0700`, and not be a symlink. A directory that fails
-the check means Radar runs without the bus; it never falls back to a looser
-location. A publisher checks the same three properties before it connects.
+The daemon creates a missing parent with mode `0700` and checks that it is a
+real, non-symlink directory owned by the current uid with exactly that mode.
+An existing live socket or an untrusted path prevents startup; Radar does not
+fall back to a looser path. Filesystem trust is not authentication between
+processes running as the same user. The publisher performs the same directory
+check before connecting.
 
-Radar is a listener for the whole local user: any process of that user can
-connect, and bus data is advisory like the tokens. If the socket already exists,
-Radar connects to it once — a refusal means a dead Radar left it behind and the
-file is removed, a success means another Radar owns it and this one runs without
-the bus. Radar does not read peer credentials.
+## Framing and ownership
 
-## Framing
-
-- One JSON object per line, UTF-8, terminated by `\n`.
-- A line is at most **1 MiB** (`1048576` bytes, excluding the terminator). A
-  longer line closes the connection.
-- The connection closes on: a line that is not valid JSON or lacks a required
-  field, a `hello` naming a version other than `1`, and a `tasks` message before
-  that connection's `hello`.
-- At most **16** connections at once. Further connections are closed until one
-  ends.
-- A line that Radar cannot act on — an unknown `type`, or a field this version
-  does not model — is ignored and the connection stays open, so a newer
-  publisher does not break an older Radar.
+- UTF-8 JSON Lines, one object per line, terminated by `\n`.
+- A line is at most **1 MiB** excluding the terminator. Longer input closes the
+  connection.
+- Unknown message types and unknown fields are ignored; malformed required
+  fields, an unsupported protocol version, or `tasks` before `hello` closes
+  that connection.
+- Shared transport admits at most 32 connections across its socket entries,
+  with reserved handler capacity for control (8), ingest (4) and waiting reads
+  (8). Excess work is bounded; it cannot consume the control lane's reserved
+  capacity.
+- A session has one current publisher connection. A new connection greeting
+  the same session replaces and closes the previous connection. Disconnecting
+  the current owner clears that session's volatile task snapshot.
 
 ## Messages
 
-### `hello` — first message on a connection, once
+### `hello`
+
+The first message on a connection identifies the Pi session:
 
 ```json
 {"type":"hello","v":1,"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d","pane":"8c7d:p2","ops":[]}
 ```
 
-| field     | meaning                                                                                                            |
-| --------- | ------------------------------------------------------------------------------------------------------------------ |
-| `v`       | protocol version; `1` is the only version this Radar accepts                                                        |
-| `session` | the exact Pi session UUID the tasks belong to, as published (a `hello` is per Pi session, not per pane or process)   |
-| `pane`    | optional; the Herdr pane id (`HERDR_PANE_ID`) where the publisher has one. Used only as a join fallback              |
-| `ops`     | operations the client supports. Version 1 advertises none, so it is always `[]`                                      |
+`session` is the exact Pi session UUID; tasks are keyed by it, not by pane or
+process. `pane` is an optional legacy hint and is never used as a task identity
+or join fallback. Version 1 advertises no operations, so `ops` is `[]`.
 
-The session UUID changes on `/new` and `/resume` in the same pane: a new session
-means a new connection with its own `hello`, and the old connection is closed. A
-second `hello` on one connection closes it.
+### `tasks`
 
-### `tasks` — the complete current list
+A message replaces the complete current list for the greeted session:
 
 ```json
 {"type":"tasks","tasks":[{"id":"bg-1","state":"running","pid":48213,"started_at":1759218000123,"last_output_at":1759218074567,"output_bytes":18244}]}
 ```
 
-`tasks` replaces the previous list for that session. There are no deltas: a task
-that is no longer unresolved is simply absent from the next list, and it is
-never reported in a final state. An empty list is a real message and means "no
-unresolved tasks"; it is not the same as going silent.
+There are no deltas. An empty list means no unresolved tasks; a disconnect means
+there is no current publisher and removes the volatile session detail. Neither
+case proves that an underlying process exited.
 
-### Task object
-
-| field            | meaning                                                                                        |
-| ---------------- | ---------------------------------------------------------------------------------------------- |
-| `id`             | required; the publisher's task id, `bg-<n>`                                                     |
-| `state`          | required; see below                                                                             |
-| `command`        | optional; the raw command line the task was spawned with                                         |
-| `cwd`            | optional; the task's working directory                                                           |
-| `pid`            | optional; the process id while the task is alive                                                |
-| `started_at`     | optional; Unix milliseconds when the task started                                               |
-| `last_output_at` | optional; Unix milliseconds of the last output written                                          |
-| `output_bytes`   | optional; bytes captured so far                                                                 |
-| `exit_code`      | optional; present once the process has exited. Missing is not the same as `0`                    |
-
-`state` uses the publisher's vocabulary:
+Each task has a required publisher `id` and `state`, and optional `command`,
+`cwd`, `pid`, `started_at`, `last_output_at`, `output_bytes` and `exit_code`.
+Optional fields are omitted when absent. `state` values currently used are:
 
 - `running` — the process is alive.
-- `flushing` — it has exited and its capture is not yet certified.
-- `review` — it has exited, the capture is ready, and the agent has not yet
-  retrieved it.
+- `flushing` — it exited, but output capture is not yet certified.
+- `review` — capture is ready and has not yet been retrieved.
 
-A state word Radar does not know is kept and shown as published. It is a newer
-publisher's word, not a rejection.
+Unknown state words are preserved and displayed as published.
+
+## Read contract and display join
+
+Negotiate `tasks.list.v1` in `daemon.ping`, then call `tasks.list` with optional
+`after` and `limit` (default 100, maximum 256). A page returns a daemon-local
+`revision`, `sessions`, and `next_after`. Each session item includes its exact
+`session` UUID, `connected`, `last_updated_at` and complete `tasks` list. Follow
+`next_after` immediately to drain pages. If the revision changes while paging,
+discard the partial result and read again; do not combine different snapshots.
+
+Radar joins task detail to a registry row only by exact session UUID. It never
+falls back to `pane`, aliases or process identity. Unmatched task sessions
+remain task detail, not fabricated agent rows. The revision is a snapshot
+version, not a durable cursor and not comparable across daemon restarts.
+
+`command` and `cwd` are held in daemon memory and shown as ordinary same-user
+display data. They are not written to a file, configuration, log or durable
+lifecycle event. No output path is sent or opened by Radar.
 
 ## Publisher obligations
 
-These are the properties Radar relies on; they are the publisher's to keep.
-
-1. **One connection per session, one writer.** A session has one ordered
-   connection and one writer on it. Messages are never interleaved, and a
-   reconnect starts with a fresh `hello` and a full list.
-2. **One full list per state change.** Every change to the set of unresolved
-   tasks is followed by a `tasks` message carrying every unresolved task.
-3. **An explicit empty list when the last task resolves.** A live connection
-   sends `{"type":"tasks","tasks":[]}` rather than going silent. Radar clears
-   the rows on that message; closing the connection clears them too, but the
-   empty list is what distinguishes "nothing unresolved" from "no publisher".
-4. **Throttle `tasks` to about once per second.** `output_bytes` and
-   `last_output_at` change continuously; a state change is published promptly,
-   and the byte counters ride along on that same schedule.
-5. **Check the socket directory before connecting** — owned by the current user,
-   mode `0700`, not a symlink — and do not connect when the check fails.
-6. **Send `command` and `cwd` on every task, bounded to 256 characters.** Both
-   ride on every task in every list, a task in `review` included, so a row keeps
-   its label. A field that is genuinely absent is omitted — never `null` and
-   never an empty string — and the bound is plain truncation. Both are ordinary
-   display data: the same command line and directory a background-task dashboard
-   or a fleet view already shows a same-user operator, with no redaction policy
-   to keep. No log path is ever sent; `last_output_at` and `output_bytes`
-   already show activity, and a path is an invitation to read the file.
-
-Radar keeps `command` and `cwd` in memory for the running process and writes
-them only to the terminal: never to a file, the configuration or a log.
-
-Radar holds a session's tasks only while its connection is open; a disconnect
-removes that session's data immediately, and a gone publisher is never evidence
-that its tasks ended. Radar joins the list to an agent row by exact `session`,
-falling back to the row's Herdr pane id when the row publishes no session.
-`pi_bg_running` counts only `running` tasks, so Radar compares the two on
-running tasks alone and states a disagreement rather than resolving it.
+1. Keep one ordered connection per session. Reconnect with a fresh `hello` and
+   immediately send the full current task list.
+2. Send a full `tasks` list after changes, including an explicit empty list when
+   the last unresolved task goes away. Throttle continuously changing output
+   counters to about once per second while publishing state changes promptly.
+3. Send bounded `command` and `cwd` strings on each task when available; do not
+   send an output-file path.
+4. Check the socket directory before connecting. Treat connection refusal as
+   the daemon being unavailable, not as evidence that a task finished.
 
 ## Fixture
 
-`docs/radar-bus.fixture.json` holds example lines, one JSON object per line, and
-is what both Radar's tests and the publisher's tests run against. In file order
-it shows: a `hello` with `pane`; a `hello` without `pane`; a `hello` carrying an
-unknown field from a newer publisher; a `tasks` list with a `running`, a
-`flushing` and a `review` task with an `exit_code`; a task with only `id` and
-`state`, every optional field absent; a task with an unknown state word; an
-explicit empty list; and an unknown message type.
+`docs/radar-bus.fixture.json` holds example protocol lines. Unit tests validate
+decoding; the publisher fixture runs against a disposable daemon and checks the
+served task read and registry-session join.
 
 ## Version
 
-Version 1 is this document. `log_file` is deliberately not a field: a path to
-output invites reading it, and `last_output_at` with `output_bytes` already show
-activity. A later version can add a field or a message type without breaking
-this one, since unknown ones are ignored.
+Version 1 is the publisher wire format. Unknown types and fields are ignored so
+a newer publisher does not break an older reader. The separate compatibility
+socket is temporary; migrating it does not change task authority or the
+volatile snapshot semantics.

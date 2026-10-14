@@ -37,12 +37,43 @@ const MAX_EVENTS: usize = 512;
 const MAX_EVENT_BYTES: usize = 512 * 1024;
 static JOURNAL_LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>> =
     OnceLock::new();
-type EventWake = Arc<(Mutex<u64>, std::sync::Condvar)>;
-type EventWakes = Mutex<std::collections::HashMap<PathBuf, EventWake>>;
+#[derive(Default)]
+struct EventWake {
+    generation: Mutex<u64>,
+    condition: std::sync::Condvar,
+    notifier: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for EventWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EventWake")
+    }
+}
+
+impl EventWake {
+    fn notify(&self) {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) += 1;
+        self.condition.notify_all();
+        let notifier = self
+            .notifier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(notifier) = notifier {
+            notifier();
+        }
+    }
+}
+
+type EventWakeHandle = Arc<EventWake>;
+type EventWakes = Mutex<std::collections::HashMap<PathBuf, EventWakeHandle>>;
 
 static EVENT_WAKES: OnceLock<EventWakes> = OnceLock::new();
 
-fn event_wake(root: &Path) -> EventWake {
+fn event_wake(root: &Path) -> EventWakeHandle {
     let wakes = EVENT_WAKES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut wakes = wakes
@@ -51,7 +82,7 @@ fn event_wake(root: &Path) -> EventWake {
     Arc::clone(
         wakes
             .entry(key)
-            .or_insert_with(|| Arc::new((Mutex::new(0), std::sync::Condvar::new()))),
+            .or_insert_with(|| Arc::new(EventWake::default())),
     )
 }
 
@@ -324,14 +355,12 @@ pub struct Store {
     directory: PathBuf,
     root: PathBuf,
     journal_lock: Arc<Mutex<()>>,
-    event_wake: Arc<(Mutex<u64>, std::sync::Condvar)>,
+    event_wake: EventWakeHandle,
     events: Arc<Mutex<super::events::Log>>,
 }
 
 pub(crate) fn notify_events(root: &Path) {
-    let wake = event_wake(root);
-    *wake.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-    wake.1.notify_all();
+    event_wake(root).notify();
 }
 
 mod delivery;
@@ -441,6 +470,14 @@ impl Store {
     /// Callers must treat failure as a lost event, not a failed fact: log/ignore
     /// the error and return the durable fact. An unclean restart changes the
     /// journal epoch so consumers know to resynchronise after such a gap.
+    pub fn set_event_notifier(&self, notifier: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .event_wake
+            .notifier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(notifier);
+    }
+
     pub fn append_event(&self, mut event: Event) -> Result<Event, String> {
         if event.kind.is_empty()
             || event.kind.len() > 64
@@ -491,17 +528,14 @@ impl Store {
                 serde_json::to_vec(&journal).map_err(|error| format!("event journal: {error}"))?;
         }
         self.write_journal(&journal)?;
-        let (generation, wake) = &*self.event_wake;
-        *generation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
-        wake.notify_all();
+        self.event_wake.notify();
         Ok(event)
     }
 
     pub fn event_generation(&self) -> u64 {
-        let (generation, _) = &*self.event_wake;
-        *generation
+        *self
+            .event_wake
+            .generation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -511,11 +545,14 @@ impl Store {
         observed: u64,
         duration: std::time::Duration,
     ) -> std::sync::WaitTimeoutResult {
-        let (generation, wake) = &*self.event_wake;
-        let generation = generation
+        let generation = self
+            .event_wake
+            .generation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (_guard, result) = wake
+        let (_guard, result) = self
+            .event_wake
+            .condition
             .wait_timeout_while(generation, duration, |current| *current == observed)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         result
@@ -793,11 +830,13 @@ fn read_record_file(path: &Path) -> Result<Vec<u8>, String> {
             path.display()
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| format!("request record {}: {error}", path.display()))?;
+    let file = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(|error| format!("request record {}: {error}", path.display()))?;
     let opened = file
         .metadata()
         .map_err(|error| format!("request record {}: {error}", path.display()))?;
@@ -848,7 +887,7 @@ fn prepare_directory(directory: &Path) -> Result<(), String> {
             directory.display()
         ));
     }
-    if metadata.uid() != unsafe { libc::getuid() } {
+    if metadata.uid() != rustix::process::getuid().as_raw() {
         return Err(format!(
             "control state directory {} is owned by uid {}",
             directory.display(),

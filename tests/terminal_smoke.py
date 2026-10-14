@@ -28,9 +28,10 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples/agent-publisher"))
 import publisher  # noqa: E402
 
-# The session UUID the registered worker publishes, and the session the stub
-# publisher greets with.
+# The current-session context published for the worker, and the session the
+# stub publisher greets with.
 SESSION = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+CONTEXT_INCARNATION = "8e9f0a1b-2c3d-4e5f-6a7b-8c9d0e1f2a3b"
 # The identities the disposable registration and its channel publishers use.
 WORKER_INCARNATION = "5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e"
 FACTS_INCARNATION = "6c7d8e9f-0a1b-4c2d-9e3f-4a5b6c7d8e9f"
@@ -48,10 +49,10 @@ def birth_identity(pid):
     return {"pid": pid, "boot_id": boot_id, "start_ticks": int(fields[19])}
 
 
-def start_daemon(binary, directory, control_path):
-    """A disposable daemon over the fake Herdr CLI. The dashboard reads its
-    agents from here, and nothing else."""
+def start_daemon(binary, directory, control_path, publisher_path):
+    """A disposable daemon over fake Herdr and publisher sockets."""
     env = {**os.environ, "RADAR_CONTROL_SOCKET": str(control_path),
+           "RADAR_SOCKET": str(publisher_path),
            "RADAR_CONTROL_BACKEND": "herdr",
            "RADAR_CONTROL_STATE": str(directory / "control-state"),
            "PATH": f"{directory}:{os.environ['PATH']}"}
@@ -82,12 +83,16 @@ def register_worker(control_path, pid):
     its process claim, with its own facts and execution. Its Herdr record says
     otherwise, so only the registration can make these rows."""
     registered = publisher.call(control_path, "agent.register", {
-        "source": "herdsman", "incarnation": WORKER_INCARNATION, "session": SESSION,
+        "source": "herdsman", "incarnation": WORKER_INCARNATION,
         "label": "worker task",
         "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
         "process": birth_identity(pid),
     })["registration"]
     agent_id = registered["agent_id"]
+    publisher.publish_context(
+        control_path, agent_id,
+        {"source": "herdsman", "incarnation": CONTEXT_INCARNATION},
+        None, 1, SESSION, lease_ms=MAX_LEASE_MS)
     publisher.publish_facts(
         control_path, agent_id, {"source": "pi", "incarnation": FACTS_INCARNATION},
         {"background_tasks": [{"id": "bg-7", "phase": "running"},
@@ -204,22 +209,21 @@ if [ "$1" = "pane" ] && [ "$2" = "process-info" ]; then cat '{process_info}'; ex
 cat '{snapshot}'
 ''')
         fake.chmod(0o755)
-        # The main run's agent is the daemon's registration, so the dashboard
-        # reads its facts through the daemon in both runs: the bus is a separate
-        # listener, so bus-off changes only the bus.
+        # Both the dashboard and publisher reach daemon-owned services. The
+        # bus-off case occupies the compatibility ingest socket before daemon
+        # startup, leaving control/registry available while task detail is down.
         config = directory / "config.toml"
         control_path = directory / "control.sock"
-        mode.write_text("ok\n")
-        daemon = start_daemon(binary, directory, control_path)
-        register_worker(control_path, helper.pid)
-        config.write_text("")
-        mode.write_text("error\n")
         squatter = None
         if bus_off:
-            # A listener that answers a connect: another Radar owns the path.
             squatter = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             squatter.bind(str(socket_path))
             squatter.listen(1)
+        mode.write_text("ok\n")
+        daemon = start_daemon(binary, directory, control_path, socket_path)
+        register_worker(control_path, helper.pid)
+        config.write_text("")
+        mode.write_text("error\n")
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))

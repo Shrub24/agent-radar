@@ -38,6 +38,7 @@ use super::containers::PublicContainer;
 use super::ops;
 use super::registry::PublicSpawnTopology;
 use super::{MAX_LINE_BYTES, PROTOCOL_VERSION, random_uuid, socket_path, trusted_socket};
+use crate::bus::{BusEvent, Task, TaskState};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::registry_observation::{LifecycleSubject, RegistryAgent, RegistryRead};
@@ -57,6 +58,7 @@ const WAIT_GRANULARITY: Duration = Duration::from_millis(10);
 
 /// Agents asked for per `agent.list` page: the daemon's own maximum.
 const REGISTRY_PAGE_LIMIT: usize = 100;
+const TASKS_PAGE_LIMIT: usize = 100;
 
 /// How long reading every registered agent may take in one refresh.
 const REGISTRY_READ_DEADLINE: Duration = Duration::from_secs(10);
@@ -89,6 +91,40 @@ struct LifecyclePage {
     next_after: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TasksPage {
+    revision: u64,
+    sessions: Vec<TaskSession>,
+    next_after: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TaskSession {
+    session: String,
+    connected: bool,
+    last_updated_at: u64,
+    tasks: Vec<TaskValue>,
+}
+
+#[derive(Deserialize)]
+struct TaskValue {
+    id: String,
+    state: String,
+    command: Option<String>,
+    cwd: Option<String>,
+    pid: Option<u32>,
+    started_at: Option<u64>,
+    last_output_at: Option<u64>,
+    output_bytes: Option<u64>,
+    exit_code: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskSnapshot {
+    pub revision: u64,
+    pub events: Vec<BusEvent>,
+}
+
 /// The label this caller's records carry, so an operator reading the store knows
 /// who asked.
 const REQUESTER: &str = "radar";
@@ -114,6 +150,7 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     ops::REGISTRY_CONTRACT,
     ops::REGISTRY_FACTS_CONTRACT,
     ops::EVENTS_CONTRACT,
+    ops::TASKS_LIST_CONTRACT,
     ops::TOPOLOGY_CREATE_CONTRACT,
     ops::TOPOLOGY_DELETE_CONTRACT,
     ops::TOPOLOGY_GET_CONTRACT,
@@ -137,6 +174,7 @@ pub struct DaemonRuntime {
     socket: PathBuf,
     declared: &'static [&'static str],
     identity: BackendIdentity,
+    task_diagnostic: Option<String>,
 }
 
 impl DaemonRuntime {
@@ -198,9 +236,16 @@ impl DaemonRuntime {
                 ));
             }
         }
+        let task_diagnostic = answer
+            .get("tasks")
+            .filter(|tasks| tasks.get("available").and_then(Value::as_bool) == Some(false))
+            .and_then(|tasks| tasks.get("error"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         Ok(Self {
             socket: socket.to_path_buf(),
             declared: intern(&declared),
+            task_diagnostic,
             identity: BackendIdentity {
                 name: answer
                     .get("backend")
@@ -213,6 +258,91 @@ impl DaemonRuntime {
                     .map(str::to_string),
             },
         })
+    }
+
+    /// Volatile publisher task state, fetched as one revision-consistent snapshot.
+    pub fn task_snapshot(&self) -> Result<TaskSnapshot, String> {
+        if !self.declared.contains(&ops::TASKS_LIST_CONTRACT) {
+            return Err(self.task_diagnostic.clone().unwrap_or_else(|| {
+                "the control daemon does not provide `tasks.list.v1`".to_string()
+            }));
+        }
+        let deadline = Instant::now() + REGISTRY_READ_DEADLINE;
+        let cancel = AtomicBool::new(false);
+        let mut after: Option<String> = None;
+        let mut revision = None;
+        let mut events = Vec::new();
+        loop {
+            if Instant::now() >= deadline {
+                return Err(self.describe(format!(
+                    "did not finish reading tasks within {REGISTRY_READ_DEADLINE:?}"
+                )));
+            }
+            let mut params = json!({"limit": TASKS_PAGE_LIMIT});
+            if let Some(cursor) = &after {
+                params["after"] = json!(cursor);
+            }
+            let result = self
+                .call("tasks.list", params, &cancel)
+                .map_err(|failure| failure.message)?;
+            let page: TasksPage = serde_json::from_value(result).map_err(|error| {
+                self.describe(format!("sent an unreadable tasks page: {error}"))
+            })?;
+            if revision.is_some_and(|current| current != page.revision) {
+                return Err(self.describe("task snapshot changed while paging".to_string()));
+            }
+            revision = Some(page.revision);
+            for session in page.sessions {
+                if !session.connected {
+                    continue;
+                }
+                let _last_updated_at = session.last_updated_at;
+                let session_id = session.session;
+                events.push(BusEvent::Connected {
+                    session: session_id.clone(),
+                    pane: None,
+                });
+                events.push(BusEvent::Tasks {
+                    session: session_id,
+                    tasks: session
+                        .tasks
+                        .into_iter()
+                        .map(|task| Task {
+                            id: task.id,
+                            state: match task.state.as_str() {
+                                "running" => TaskState::Running,
+                                "flushing" => TaskState::Flushing,
+                                "review" => TaskState::Review,
+                                state => TaskState::Unknown(state.to_string()),
+                            },
+                            command: task.command,
+                            cwd: task.cwd,
+                            pid: task.pid,
+                            started_at: task.started_at,
+                            last_output_at: task.last_output_at,
+                            output_bytes: task.output_bytes,
+                            exit_code: task.exit_code,
+                        })
+                        .collect(),
+                });
+            }
+            match page.next_after {
+                None => {
+                    return Ok(TaskSnapshot {
+                        revision: revision.unwrap_or_default(),
+                        events,
+                    });
+                }
+                Some(next) if after.as_deref() == Some(next.as_str()) => {
+                    return Err(self.describe("task page cursor did not advance".to_string()));
+                }
+                Some(next) => after = Some(next),
+            }
+        }
+    }
+
+    pub fn task_diagnostic(&self) -> Option<&str> {
+        self.task_diagnostic.as_deref()
     }
 
     /// Every page of one cursor-paged read, to the end.
@@ -459,6 +589,8 @@ pub struct Selected {
     pub provider: Arc<dyn RuntimeProvider>,
     pub containers: Option<Arc<dyn ContainerControls>>,
     pub lifecycle: Option<Arc<dyn LifecycleControls>>,
+    pub tasks: Option<Arc<DaemonRuntime>>,
+    pub task_diagnostic: Option<String>,
 }
 
 /// Connects to the daemon at its documented socket and proves it usable.
@@ -505,6 +637,11 @@ pub fn connect_at(socket: &Path) -> Result<Selected, String> {
         provider: Arc::clone(&daemon) as Arc<dyn RuntimeProvider>,
         containers: Some(Arc::clone(&daemon) as Arc<dyn ContainerControls>),
         lifecycle: Some(Arc::clone(&daemon) as Arc<dyn LifecycleControls>),
+        tasks: daemon
+            .declared
+            .contains(&ops::TASKS_LIST_CONTRACT)
+            .then(|| Arc::clone(&daemon)),
+        task_diagnostic: daemon.task_diagnostic.clone(),
     })
 }
 

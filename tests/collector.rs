@@ -13,12 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use agent_radar::control_plane::registry::Freshness;
 use agent_radar::model::{
     AgentObservation, CpuPercent, FleetObservation, ForegroundEvidence, HerdsmanFacts, LocalFacts,
     Location, Pane, ProcessResources, ProcessState, RuntimeStatus, SessionIdentity, Total,
 };
 use agent_radar::procfs::{Procs, Sampler};
-use agent_radar::registry_observation::{Binding, RegistryAgent, RegistryRead, Unjoined};
+use agent_radar::registry_observation::{self, Binding, RegistryAgent, RegistryRead, Unjoined};
 use agent_radar::runtime::BackendIdentity;
 use agent_radar::{
     CloseTarget, Collector, CollectorConfig, ObservationState, RetentionBasis, RuntimeProvider,
@@ -664,6 +665,57 @@ fn registered_at(agent_id: &str, pane_id: &str, claim: Option<(u64, i32)>) -> Re
         "facts": null
     }))
     .expect("registration decodes")
+}
+
+#[test]
+fn only_fresh_registry_context_is_projected_as_the_task_session() {
+    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let mut agent = registered_at("a1", "wA:p1", None);
+    agent.context = Some(
+        serde_json::from_value(json!({
+            "version": 1,
+            "agent_id": "a1",
+            "writer": {
+                "source": "herdsman",
+                "incarnation": "11111111-1111-4111-8111-111111111111",
+                "generation": 1,
+                "sequence": 1
+            },
+            "context": {
+                "source": "herdsman",
+                "incarnation": "11111111-1111-4111-8111-111111111111",
+                "generation": 1,
+                "sequence": 1,
+                "lease_ms": 30_000,
+                "received_at": "2026-01-01T00:00:00.000Z",
+                "expires_at": "2026-01-01T00:00:30.000Z",
+                "restored": false,
+                "freshness": "fresh",
+                "session": session
+            }
+        }))
+        .expect("published context decodes"),
+    );
+    let project = |agent| {
+        registry_observation::project(
+            &inventory(&["wA:p1"], vec![]),
+            &BackendIdentity::named("fake"),
+            RegistryRead {
+                agents: vec![agent],
+                ..RegistryRead::default()
+            },
+            &[],
+        )
+    };
+
+    assert_eq!(
+        project(agent.clone())[0].session,
+        Some(agent_radar::model::SessionIdentity::Uuid(
+            agent_radar::model::SessionUuid::parse(session).expect("canonical session UUID"),
+        )),
+    );
+    agent.context.as_mut().expect("context").context.freshness = Freshness::Stale;
+    assert_eq!(project(agent)[0].session, None);
 }
 
 #[test]

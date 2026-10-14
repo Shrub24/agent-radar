@@ -11,6 +11,19 @@ use crate::control_plane::lifecycle::Origin;
 const DELIVERY_BATCH: usize = 256;
 
 impl Store {
+    pub(crate) fn event_ready(&self, after: u64, epoch: Option<&str>) -> bool {
+        match self.event_snapshot() {
+            Ok((current, tail, earliest, _, pending)) => {
+                epoch.is_some_and(|requested| requested != current)
+                    || after > tail
+                    || after.saturating_add(1) < earliest
+                    || tail > after
+                    || pending
+            }
+            Err(_) => true,
+        }
+    }
+
     pub(crate) fn event_snapshot(&self) -> Result<(String, u64, u64, Vec<Event>, bool), String> {
         let _guard = self.journal_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut journal = self.load_journal()?;

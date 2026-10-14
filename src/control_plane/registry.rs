@@ -1038,11 +1038,13 @@ pub(crate) fn read_record_file(path: &Path, bound: usize) -> Result<Vec<u8>, Str
     if metadata.len() > bound as u64 {
         return Err(format!("record {} exceeds {bound} bytes", path.display()));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| format!("record {}: {error}", path.display()))?;
+    let file = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(|error| format!("record {}: {error}", path.display()))?;
     let opened = file
         .metadata()
         .map_err(|error| format!("record {}: {error}", path.display()))?;
@@ -1090,7 +1092,7 @@ pub(crate) fn prepare_directory(directory: &Path) -> Result<(), String> {
             directory.display()
         ));
     }
-    if metadata.uid() != unsafe { libc::getuid() } {
+    if metadata.uid() != rustix::process::getuid().as_raw() {
         return Err(format!(
             "registry directory {} is owned by uid {}",
             directory.display(),

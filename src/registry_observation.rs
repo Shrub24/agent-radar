@@ -18,13 +18,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::control_plane::containers::PublicContainer;
 use crate::control_plane::registry::{
-    Channel, Freshness, PublicChannelFacts, PublicRegistration, PublicSpawnTopology, Report,
-    SpawnState,
+    Channel, Freshness, PublicChannelFacts, PublicContext, PublicRegistration, PublicSpawnTopology,
+    Report, SpawnState,
 };
 use crate::control_plane::store::format_millis;
 use crate::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Location,
-    ProcessIdentity, RuntimeStatus, SemanticState,
+    ProcessIdentity, RuntimeStatus, SemanticState, SessionIdentity, SessionUuid,
 };
 use crate::runtime::BackendIdentity;
 
@@ -33,9 +33,22 @@ use crate::runtime::BackendIdentity;
 pub struct RegistryAgent {
     pub registration: PublicRegistration,
     pub process: ProcessEvidence,
+    /// Mutable current-session context, kept separate from registration identity.
+    pub context: Option<PublicContext>,
     pub execution: Option<PublicChannelFacts>,
     pub assignment: Option<PublicChannelFacts>,
     pub facts: Option<PublicChannelFacts>,
+}
+
+impl RegistryAgent {
+    /// The exact current session a publisher task snapshot may join to.
+    pub fn current_session_uuid(&self) -> Option<SessionUuid> {
+        let context = self.context.as_ref()?;
+        if context.context.freshness != Freshness::Fresh {
+            return None;
+        }
+        SessionUuid::parse(context.context.session.as_deref()?)
+    }
 }
 
 /// What one registry read returns: every registered agent, every spawn edge and
@@ -216,12 +229,13 @@ pub fn project(
             let managed = (binding == Binding::Joined)
                 .then(|| managed_subject(&agent, &lifecycle, spawn.as_ref()))
                 .flatten();
+            let session = agent.current_session_uuid().map(SessionIdentity::Uuid);
             AgentObservation {
                 location,
                 name: None,
                 label: None,
                 status: execution_status(&agent),
-                session: None,
+                session,
                 lineage: None,
                 facts: facts_of(&agent),
                 registry: Some(RegistryView {
