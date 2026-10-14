@@ -70,7 +70,8 @@ pub fn ensure_tmux_server(server: &str) -> Result<(), String> {
              Radar serves only the server its own unit owns and refuses this one"
         ));
     }
-    let started = systemctl(&["start", &unit])?;
+    let started =
+        systemctl(&["start", &unit]).map_err(|problem| format!("starting {unit}: {problem}"))?;
     if !started.status.success() {
         return Err(format!(
             "starting {unit}: {}",
