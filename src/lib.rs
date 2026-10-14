@@ -17,6 +17,7 @@ pub mod process_icons;
 pub mod procfs;
 pub mod registry_observation;
 pub mod runtime;
+pub mod service;
 pub mod theme;
 pub mod title;
 pub mod tmux;

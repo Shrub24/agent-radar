@@ -53,7 +53,8 @@ def main():
         root = Path(directory)
         os.chmod(root, 0o700)
         sock, state = root / "daemon.sock", root / "state"
-        env = {**os.environ, "RADAR_CONTROL_SOCKET": str(sock), "RADAR_CONTROL_STATE": str(state)}
+        env = {**os.environ, "RADAR_CONTROL_SOCKET": str(sock), "RADAR_CONTROL_STATE": str(state),
+               "RADAR_CONTROL_BACKEND": "herdr"}
         daemon = subprocess.Popen([str(binary), "daemon"], env=env,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:

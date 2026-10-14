@@ -38,8 +38,6 @@ use super::containers::PublicContainer;
 use super::ops;
 use super::registry::PublicSpawnTopology;
 use super::{MAX_LINE_BYTES, PROTOCOL_VERSION, random_uuid, socket_path, trusted_socket};
-use crate::config::{RuntimeBackend, RuntimeConfig};
-use crate::herdr::{HerdrConfig, HerdrRuntime};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::registry_observation::{RegistryAgent, RegistryRead};
@@ -427,56 +425,57 @@ impl RuntimeProvider for DaemonRuntime {
     }
 }
 
-/// What Radar will talk to this run, and the one line to tell the operator when
-/// the configured daemon was not the one used.
+/// The daemon's runtime for this run: the reads and the container controls travel
+/// through the same connection.
 pub struct Selected {
     pub provider: Arc<dyn RuntimeProvider>,
-    /// The daemon's own container controls, for a run that talks to one. A direct
-    /// adapter records no containers, so it has none and says so when asked.
     pub containers: Option<Arc<dyn ContainerControls>>,
-    /// The backend in use, in the protocol's own words: `direct` or `daemon`.
-    pub backend: &'static str,
-    /// The single diagnostic to print, when a configured daemon could not be
-    /// used. The provider is then the direct adapter.
-    pub diagnostic: Option<String>,
 }
 
-/// Chooses the runtime before anything is collected or acted on.
+/// Connects to the daemon at its documented socket and proves it usable.
 ///
-/// The direct adapter is both the default and the fallback: the daemon is used
-/// only when it answers, speaks this protocol version and declares the
-/// capabilities the dashboard needs. The choice is made once — nothing here
-/// switches later, and nothing retries an operation through the other backend,
-/// because an operation the daemon may have accepted is unknown rather than
-/// unperformed.
-pub fn select(runtime: &RuntimeConfig, direct: HerdrConfig) -> Selected {
-    let direct = || Selected {
-        provider: Arc::new(HerdrRuntime::new(direct)),
-        containers: None,
-        backend: "direct",
-        diagnostic: None,
-    };
-    if runtime.backend == RuntimeBackend::Direct {
-        return direct();
-    }
-    let socket = runtime.socket.clone().unwrap_or_else(socket_path);
-    match DaemonRuntime::handshake(&socket) {
-        Ok(daemon) => {
-            // The controls travel with the same client the reads come from: one
-            // handshake, one socket, and no second transport for an effect.
-            let daemon = Arc::new(daemon);
-            Selected {
-                provider: Arc::clone(&daemon) as Arc<dyn RuntimeProvider>,
-                containers: Some(Arc::clone(&daemon) as Arc<dyn ContainerControls>),
-                backend: "daemon",
-                diagnostic: None,
-            }
-        }
-        Err(failure) => Selected {
-            diagnostic: Some(format!("{failure}; using the direct Herdr adapter")),
-            ..direct()
-        },
-    }
+/// The failure names what was wrong. Nothing falls back to another source: an
+/// unreachable daemon is the caller's to show, and the caller retries.
+pub fn connect() -> Result<Selected, String> {
+    connect_at(&socket_path())
+}
+
+/// The ids of the daemon's records that are not yet completed, however old.
+///
+/// The caller must check that the socket unit is listening first: connecting to a
+/// listening socket starts the daemon, which a stop must not do.
+pub fn unfinished_requests() -> Result<Vec<String>, String> {
+    let socket = socket_path();
+    DaemonRuntime::handshake(&socket)?;
+    let answer = exchange_at(
+        &socket,
+        "mux.request.list",
+        json!({ "unfinished": true }),
+        &AtomicBool::new(false),
+    )
+    .map_err(|failure| failure.message)?;
+    Ok(answer
+        .get("requests")
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .filter_map(|record| record.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// [`connect`] at a socket the caller names, held to the same trust rule.
+pub fn connect_at(socket: &Path) -> Result<Selected, String> {
+    let daemon = Arc::new(DaemonRuntime::handshake(socket)?);
+    // The controls travel with the same client the reads come from: one handshake,
+    // one socket, and no second transport for an effect.
+    Ok(Selected {
+        provider: Arc::clone(&daemon) as Arc<dyn RuntimeProvider>,
+        containers: Some(Arc::clone(&daemon) as Arc<dyn ContainerControls>),
+    })
 }
 
 /// Interns a declared capability set against the protocol's own names.

@@ -34,12 +34,9 @@ cargo build --locked
 python3 tests/terminal_smoke.py
 ```
 
-Herdr must be installed separately and available on `PATH` to observe a live
-fleet. It is not a build dependency. The dashboard stays usable and reports a
-source diagnostic if Herdr is unavailable. Direct Herdr access remains the
-default; an optional local `radar daemon` provides backend-neutral physical mux
-wrapping for Radar and extension clients. The operator starts it separately;
-Radar does not start or supervise it. Start with the [daemon consumer guide](docs/daemon.md)
+Herdr is optional and is never the default: it is used only when selected with
+`RADAR_CONTROL_BACKEND=herdr`. Radar's control daemon and its tmux server run as user units
+(see [Daemon and tmux server](#daemon-and-tmux-server)), and `radar` starts them. Start with the [daemon consumer guide](docs/daemon.md)
 for the API, lifecycle and adoption path. The [mux integration contract](docs/mux.md)
 covers physical guarantees, backend responsibilities and remaining cutover work.
 See the [control-plane protocol and extension examples](docs/control-plane.md)
@@ -103,7 +100,30 @@ consumer's system; `programs.radar.package` replaces it with another one.
 one included — writes `$XDG_CONFIG_HOME/radar/config.toml`. Its `null` default
 manages no file at all, leaving Radar with the user's own configuration file or
 its built-in defaults. The module sets no `RADAR_CONFIG`, mirrors none of
-Radar's defaults, and adds no service or runtime directory.
+Radar's defaults, and adds no runtime directory of its own. It declares the user
+units described below.
+
+### Daemon and tmux server
+
+With `programs.radar.enable` the module declares three user units:
+
+- `radar-control.socket` holds the control socket at `$XDG_RUNTIME_DIR/agent-radar/control.sock`. A listening
+  socket starts the daemon on the first connection, so a stopped socket is the
+  single switch for explicit closure.
+- `radar-daemon.service` runs `radar daemon` with `KillMode=process`, so stopping the
+  daemon never stops the tmux server or its panes.
+- `radar-tmux@.service` runs one tmux server per instance name, with `KillMode=control-group` and
+  no restart. The daemon's default server is `radar`.
+
+```sh
+radar                  # start the socket, connect, open the dashboard
+radar daemon stop      # stop the socket, then the daemon; the tmux server keeps running
+radar server stop      # refused while the server holds a pane or a pending operation
+radar server status
+```
+
+An explicit stop holds until the next `radar` run or the next login, whichever comes
+first. A refused stop or restart sends no signal and names what is in the way.
 
 The package builds `radar` from `Cargo.lock` in the Nix sandbox and runs the
 crate's own checks; building or running it needs no development shell.
@@ -702,7 +722,7 @@ Those are historical, not running, so they stay out of the default `agents` view
 Radar observes in one of two modes, chosen once before anything is drawn, and
 neither reads agent facts from Herdr's own agent state:
 
-- **Through a daemon** (`[runtime] backend = "daemon"`), every agent fact comes
+- **Through the daemon** (the default), every agent fact comes
   from the daemon's registry. One refresh reads the daemon's pane inventory,
   every registered agent (`agent.list`, paged) and the spawn topology
   (`spawn.list`), and joins them in one pass, so a frame comes from one moment.
@@ -710,10 +730,9 @@ neither reads agent facts from Herdr's own agent state:
   read for anything the dashboard shows. A daemon that does not declare
   `registry.v1` and `spawn.v1` fails the refresh with that diagnostic rather
   than showing a fleet sourced from somewhere else.
-- **Direct** — with no daemon configured, or after the single diagnostic a failed
-  trust check or handshake prints — the tree lists ordinary panes only: no agent
-  rows and no registered facts. That is a deliberate degradation, not a fallback
-  to Herdr's agent state, and nothing switches adapters later.
+- **No direct mode.** If the daemon is unreachable the dashboard shows a blocking
+  diagnostic and retries. It never falls back to Herdr's agent state or to a
+  pane-only tree.
 
 ### Where an agent row's facts come from
 

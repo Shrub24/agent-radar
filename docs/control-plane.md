@@ -34,21 +34,25 @@ dispatched and no record is written.
 
 ## Start and select
 
-Run `radar daemon` separately. It prints the socket and record directory, serves until SIGINT/SIGTERM, and removes only its own socket on shutdown. It does not start a TUI. The daemon's physical adapter defaults to Herdr; select tmux explicitly with `RADAR_CONTROL_BACKEND=tmux` and `RADAR_TMUX_SERVER=<name>`. Missing server names and unknown backends refuse startup, with no fallback. The tmux adapter uses only the named `tmux -L <name>` server.
+The control daemon is started by the socket unit, or by `radar daemon` in the foreground. It prints the socket and record directory, serves until SIGINT/SIGTERM, and removes no socket it did not bind itself. It does not start a TUI. Its physical adapter is tmux on the server named by `[daemon] tmux_server` (default `radar`). The daemon ensures that server through its own user unit before it binds, and refuses a server answering on the socket that its unit did not start. Herdr is selected only with `RADAR_CONTROL_BACKEND=herdr`. Unknown backends and missing server names refuse startup, with no fallback.
 
-Radar's `[runtime]` config selects its client transport, not the daemon's physical backend:
+Settings live in a `[daemon]` table. Environment variables override them:
 
 ```toml
-[runtime]
-backend = "daemon" # or direct (the default)
-# socket = "/run/user/1000/agent-radar/control.sock"
+[daemon]
+backend = "tmux" # or "herdr"
+tmux_server = "radar"
 ```
+
+The former `[runtime]` table is removed. A configuration that still sets it is refused as containing unknown keys.
 
 For example, start a daemon on a named tmux server with:
 
 ```sh
 RADAR_CONTROL_BACKEND=tmux RADAR_TMUX_SERVER=work radar daemon
 ```
+
+That starts `radar-tmux@work.service` if it is not already running.
 
 An omitted socket uses `RADAR_CONTROL_SOCKET`, then `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then `/tmp/agent-radar-<uid>/control.sock`. The daemon record root uses `RADAR_CONTROL_STATE`, `$XDG_STATE_HOME/agent-radar/control`, then `~/.local/state/agent-radar/control`, with `/tmp/agent-radar-<uid>` as last resort when neither state-home nor HOME exists.
 

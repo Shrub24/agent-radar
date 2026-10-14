@@ -269,8 +269,10 @@ pub enum PhysicalBackend {
 pub enum BackendConfigError {
     /// The configured name matches no backend.
     UnknownBackend { name: String },
-    /// `tmux` was selected without naming the server it may use.
+    /// `tmux` was selected with an empty server name.
     TmuxServerMissing,
+    /// The configuration file could not be read, so no backend is chosen.
+    ConfigFile { problem: String },
     /// The backend is named in configuration but the adapter cannot serve that
     /// configuration, so no effect may be attempted through it.
     AdapterConfiguration {
@@ -290,9 +292,9 @@ impl std::fmt::Display for BackendConfigError {
             }
             Self::TmuxServerMissing => write!(
                 f,
-                "control backend `tmux`: no server named; set `RADAR_TMUX_SERVER` (the default \
-                 tmux server is never used)"
+                "control backend `tmux`: the server name is empty; set `daemon.tmux_server` or `RADAR_TMUX_SERVER`"
             ),
+            Self::ConfigFile { problem } => write!(f, "configuration: {problem}"),
             Self::AdapterConfiguration { backend, problem } => {
                 write!(f, "control backend `{backend}`: {problem}")
             }
@@ -300,34 +302,48 @@ impl std::fmt::Display for BackendConfigError {
     }
 }
 
-/// The physical backend `RADAR_CONTROL_BACKEND` names, else Herdr.
+/// The physical backend the daemon serves: the environment's choice when it sets
+/// one, else the configuration file's, else tmux on the `radar` server.
 ///
-/// `RADAR_TMUX_SERVER` names the tmux server, and is required by the tmux
-/// backend. An unknown name is refused rather than served, and nothing here
-/// falls back to another backend.
+/// An unknown name is refused rather than served, and nothing here falls back to
+/// another backend.
 pub fn physical_backend() -> Result<PhysicalBackend, BackendConfigError> {
-    physical_backend_in(
+    let file = crate::config::Config::load()
+        .map_err(|problem| BackendConfigError::ConfigFile { problem })?
+        .daemon;
+    physical_backend_with(
         std::env::var_os("RADAR_CONTROL_BACKEND").as_deref(),
         std::env::var_os("RADAR_TMUX_SERVER").as_deref(),
+        &file,
     )
 }
 
-/// [`physical_backend`] over an environment the caller supplies, so the rule can
-/// be read and tested without touching the process environment.
-pub fn physical_backend_in(
+/// [`physical_backend`] over an environment and a configuration the caller
+/// supplies, so the rule can be read and tested without touching either.
+pub fn physical_backend_with(
     backend: Option<&std::ffi::OsStr>,
     tmux_server: Option<&std::ffi::OsStr>,
+    file: &crate::config::DaemonConfig,
 ) -> Result<PhysicalBackend, BackendConfigError> {
-    let name = backend
-        .map(|value| value.to_string_lossy().trim().to_ascii_lowercase())
-        .unwrap_or_default();
+    let name = match backend.map(|value| value.to_string_lossy().trim().to_ascii_lowercase()) {
+        Some(name) if !name.is_empty() => name,
+        _ => match file.backend {
+            crate::config::ControlBackend::Tmux => "tmux".to_string(),
+            crate::config::ControlBackend::Herdr => "herdr".to_string(),
+        },
+    };
     match name.as_str() {
-        "" | "herdr" => Ok(PhysicalBackend::Herdr),
-        "tmux" => tmux_server
-            .map(|value| value.to_string_lossy().trim().to_string())
-            .filter(|server| !server.is_empty())
-            .map(|server| PhysicalBackend::Tmux { server })
-            .ok_or(BackendConfigError::TmuxServerMissing),
+        "herdr" => Ok(PhysicalBackend::Herdr),
+        "tmux" => {
+            let server = tmux_server
+                .map(|value| value.to_string_lossy().trim().to_string())
+                .filter(|server| !server.is_empty())
+                .unwrap_or_else(|| file.tmux_server.trim().to_string());
+            if server.is_empty() {
+                return Err(BackendConfigError::TmuxServerMissing);
+            }
+            Ok(PhysicalBackend::Tmux { server })
+        }
         _ => Err(BackendConfigError::UnknownBackend { name }),
     }
 }
@@ -471,7 +487,8 @@ pub struct Daemon {
     verification: Arc<VerificationBudget>,
     accept: Option<JoinHandle<()>>,
     sweeper: Option<JoinHandle<()>>,
-    socket_identity: (u64, u64),
+    /// The inode this daemon bound, or `None` for a socket systemd passed.
+    socket_identity: Option<(u64, u64)>,
     core: Arc<Mutex<Core>>,
 }
 
@@ -483,9 +500,12 @@ impl Daemon {
     /// socket is bound and before any directory is prepared: no other backend is
     /// served in its place.
     pub fn bind() -> Result<Self, String> {
-        let adapter = physical_backend()
-            .and_then(|backend| backend.adapter())
-            .map_err(|error| error.to_string())?;
+        let backend = physical_backend().map_err(|error| error.to_string())?;
+        // The adapter validates the server name before anything is started under it.
+        let adapter = backend.adapter().map_err(|error| error.to_string())?;
+        if let PhysicalBackend::Tmux { server } = &backend {
+            crate::service::ensure_tmux_server(server)?;
+        }
         Self::bind_with_backend(&socket_path(), &state_dir(), Some(adapter))
     }
 
@@ -531,10 +551,17 @@ impl Daemon {
         // The socket's own directory is what must be ours, not the socket path:
         // binding in a directory anyone can write is the thing being refused.
         prepare_directory(socket_directory(socket))?;
-        let listener = bind_socket(socket)?;
-        let metadata = std::fs::symlink_metadata(socket)
-            .map_err(|error| format!("control socket {}: {error}", socket.display()))?;
-        let socket_identity = (metadata.dev(), metadata.ino());
+        // A listener systemd passed belongs to the socket unit, which removes its
+        // path on stop, so this daemon neither binds nor unlinks it.
+        let (listener, socket_identity) = match inherited_listener(socket)? {
+            Some(listener) => (listener, None),
+            None => {
+                let listener = bind_socket(socket)?;
+                let metadata = std::fs::symlink_metadata(socket)
+                    .map_err(|error| format!("control socket {}: {error}", socket.display()))?;
+                (listener, Some((metadata.dev(), metadata.ino())))
+            }
+        };
         if let Err(error) = listener.set_nonblocking(true) {
             let _ = remove_socket_if_owned(socket, socket_identity);
             return Err(format!("control socket {}: {error}", socket.display()));
@@ -2933,6 +2960,23 @@ fn deliverable(
 }
 
 fn read_many(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
+    // Every record not yet completed, however old: a stop gate must see those,
+    // and the recency window below cannot show them.
+    if request
+        .params
+        .get("unfinished")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+    {
+        let core = locked(core);
+        return match core.store.unfinished() {
+            Ok(records) => Response::ok(
+                &request.id,
+                json!({ "requests": records.into_iter().take(MAX_LISTED).map(public_record).collect::<Vec<_>>() }),
+            ),
+            Err(message) => Response::refused(&request.id, &Refusal::new(Code::Internal, message)),
+        };
+    }
     let limit = match request.limit(DEFAULT_LISTED, MAX_LISTED) {
         Ok(limit) => limit,
         Err(refusal) => return Response::refused(&request.id, &refusal),
@@ -6198,9 +6242,55 @@ fn bind_socket(path: &Path) -> Result<UnixListener, String> {
     UnixListener::bind(path).map_err(|error| format!("control socket {}: {error}", path.display()))
 }
 
+/// The listener systemd passed this process for `socket`, when the socket unit
+/// started it. The passed socket must be the only one, and must be bound to the
+/// configured path; anything else is refused rather than served.
+fn inherited_listener(socket: &Path) -> Result<Option<UnixListener>, String> {
+    let for_us = std::env::var("LISTEN_PID")
+        .ok()
+        .and_then(|pid| pid.parse::<u32>().ok())
+        == Some(std::process::id());
+    if !for_us {
+        return Ok(None);
+    }
+    match std::env::var("LISTEN_FDS")
+        .ok()
+        .and_then(|count| count.parse::<u32>().ok())
+    {
+        None => return Ok(None),
+        Some(1) => {}
+        Some(count) => {
+            return Err(format!(
+                "systemd passed {count} sockets; the control daemon serves exactly one"
+            ));
+        }
+    }
+    // SAFETY: systemd's socket activation contract passes the first listener at
+    // descriptor 3 to the process it names in LISTEN_PID, and this branch runs
+    // only when that names this process. Nothing else in the process owns fd 3.
+    let listener = unsafe { <UnixListener as std::os::fd::FromRawFd>::from_raw_fd(3) };
+    let bound = listener
+        .local_addr()
+        .map_err(|error| format!("control socket passed by systemd: {error}"))?;
+    if bound.as_pathname() != Some(socket) {
+        return Err(format!(
+            "control socket passed by systemd is bound to {}, not {}",
+            bound
+                .as_pathname()
+                .map_or_else(|| "no path".to_string(), |path| path.display().to_string()),
+            socket.display()
+        ));
+    }
+    Ok(Some(listener))
+}
+
 /// Removes the socket pathname only when it still names the inode this daemon
-/// bound. A replacement daemon or administrator-created path is left untouched.
-fn remove_socket_if_owned(path: &Path, identity: (u64, u64)) -> Result<(), String> {
+/// bound. A replacement daemon or administrator-created path is left untouched,
+/// and a socket this daemon did not bind (`None`) is never removed.
+fn remove_socket_if_owned(path: &Path, identity: Option<(u64, u64)>) -> Result<(), String> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if (metadata.dev(), metadata.ino()) == identity => std::fs::remove_file(path)
             .map_err(|error| format!("control socket {}: {error}", path.display())),
@@ -6315,48 +6405,93 @@ mod tests {
     }
 
     #[test]
-    fn the_physical_backend_is_herdr_unless_configuration_names_another() {
-        let value = std::ffi::OsStr::new;
-        // Unset, empty and a named default are all the default, and a server
-        // nobody selected with a backend selects nothing either.
-        for backend in [
-            None,
-            Some(value("")),
-            Some(value("herdr")),
-            Some(value(" Herdr ")),
-        ] {
-            assert_eq!(
-                physical_backend_in(backend, Some(value("probe"))),
-                Ok(PhysicalBackend::Herdr),
-                "{backend:?}"
-            );
-        }
+    fn an_inherited_socket_path_is_never_unlinked_and_a_bound_one_is() {
+        let directory = std::env::temp_dir().join(format!(
+            "radar-socket-owner-{}-{}",
+            std::process::id(),
+            store::random_uuid()
+        ));
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let path = directory.join("control.sock");
+        let listener = UnixListener::bind(&path).expect("a socket");
+        let metadata = std::fs::symlink_metadata(&path).expect("metadata");
+        let identity = (metadata.dev(), metadata.ino());
+
+        // A socket systemd passed is the unit's to remove: this daemon keeps out
+        // of its way and leaves the path for the socket unit.
+        remove_socket_if_owned(&path, None).expect("no-op");
+        assert!(path.exists(), "an inherited socket path was unlinked");
+
+        // The socket this daemon bound is removed on the way out.
+        remove_socket_if_owned(&path, Some(identity)).expect("removed");
+        assert!(!path.exists(), "a bound socket path was left behind");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
-    fn a_tmux_backend_is_its_named_server_and_needs_one() {
+    fn the_physical_backend_is_the_configured_one_and_herdr_only_when_named() {
         let value = std::ffi::OsStr::new;
+        let file = crate::config::DaemonConfig::default();
+        // Unset and empty fall back to the configured backend, which is tmux on
+        // the `radar` server by default.
+        for backend in [None, Some(value(""))] {
+            assert_eq!(
+                physical_backend_with(backend, None, &file),
+                Ok(PhysicalBackend::Tmux {
+                    server: "radar".to_string()
+                }),
+                "{backend:?}"
+            );
+        }
         assert_eq!(
-            physical_backend_in(Some(value("tmux")), Some(value(" probe "))),
+            physical_backend_with(Some(value(" Herdr ")), None, &file),
+            Ok(PhysicalBackend::Herdr)
+        );
+    }
+
+    #[test]
+    fn the_environment_names_the_server_and_the_file_supplies_it_when_unset() {
+        let value = std::ffi::OsStr::new;
+        let file = crate::config::DaemonConfig {
+            backend: crate::config::ControlBackend::Tmux,
+            tmux_server: "work".to_string(),
+        };
+        assert_eq!(
+            physical_backend_with(None, None, &file),
+            Ok(PhysicalBackend::Tmux {
+                server: "work".to_string()
+            })
+        );
+        assert_eq!(
+            physical_backend_with(Some(value("tmux")), Some(value(" probe ")), &file),
             Ok(PhysicalBackend::Tmux {
                 server: "probe".to_string()
             })
         );
-        // No named server means no tmux backend: the default tmux server is
-        // never the one an unnamed selection would reach.
-        for server in [None, Some(value("")), Some(value("   "))] {
-            assert_eq!(
-                physical_backend_in(Some(value("tmux")), server),
-                Err(BackendConfigError::TmuxServerMissing),
-                "{server:?}"
-            );
-        }
+    }
+
+    #[test]
+    fn an_empty_server_name_never_reaches_tmux_default() {
+        let value = std::ffi::OsStr::new;
+        let file = crate::config::DaemonConfig {
+            backend: crate::config::ControlBackend::Tmux,
+            tmux_server: "   ".to_string(),
+        };
+        assert_eq!(
+            physical_backend_with(Some(value("tmux")), Some(value("")), &file),
+            Err(BackendConfigError::TmuxServerMissing)
+        );
     }
 
     #[test]
     fn an_unknown_physical_backend_names_itself() {
         assert_eq!(
-            physical_backend_in(Some(std::ffi::OsStr::new(" Docker ")), None),
+            physical_backend_with(
+                Some(std::ffi::OsStr::new(" Docker ")),
+                None,
+                &crate::config::DaemonConfig::default()
+            ),
             Err(BackendConfigError::UnknownBackend {
                 name: "docker".to_string()
             })
@@ -6369,9 +6504,10 @@ mod tests {
         // Nothing that is not a backend name may be read as the default: an
         // unreadable name is still a name that has to be refused.
         assert!(matches!(
-            physical_backend_in(
+            physical_backend_with(
                 Some(std::ffi::OsStr::from_bytes(b"tmux\xff")),
-                Some(std::ffi::OsStr::new("probe"))
+                Some(std::ffi::OsStr::new("probe")),
+                &crate::config::DaemonConfig::default()
             ),
             Err(BackendConfigError::UnknownBackend { .. })
         ));

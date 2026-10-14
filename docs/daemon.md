@@ -16,9 +16,9 @@ The daemon has two independent surfaces on one local control socket:
 | Physical mux adapter | Observe terminal locations/process evidence; focus, create, input, read output and guarded unmanaged close | [Control-plane protocol](control-plane.md) |
 | Direct agent registry | Register agent incarnations; publish execution, assignment and session facts; read current snapshots and process verification | [Agent registration](agent-registration.md) |
 
-The physical backend defaults to Herdr; the daemon can also select the tmux
-adapter explicitly with `RADAR_CONTROL_BACKEND=tmux` and a named
-`RADAR_TMUX_SERVER`. Registry calls work without a mux backend and do not publish
+The physical backend defaults to tmux on the server named `radar`. Herdr is
+selected only explicitly with `RADAR_CONTROL_BACKEND=herdr`. The server name comes from
+`RADAR_TMUX_SERVER` or the `[daemon] tmux_server` setting. Registry calls work without a mux backend and do not publish
 through Herdr. The older mux `report` method still forwards state/session/metadata
 to the backend; it is **not** direct registry publication.
 
@@ -68,6 +68,20 @@ created pane is not a bound child until that child registers with the private
 spawn token, and private launch/resume specifications stored on registrations
 remain inert unless explicitly used by a supported operation.
 
+## Stopping and refusals
+
+`radar daemon stop` stops the control socket, then the daemon. While the socket is
+stopped a connection is refused and nothing restarts the daemon, so a publisher
+must treat a refused connection as the daemon being down.
+
+`radar server stop` and `radar server restart` are refused, with no signal sent, while the
+tmux server holds a pane (live or retained) or while a durable operation is
+unfinished. The refusal names the panes and operations.
+
+Known limit: an operation whose record never completes, for example after a
+daemon crash, keeps the server refused while the daemon listens. The unfinished
+records are readable with `mux.request.list` and `"unfinished": true`. No command clears them yet.
+
 ## Dashboard consumption
 
 The Radar TUI is a registry consumer. With a daemon selected, it declares
@@ -87,9 +101,10 @@ comes from a Herdr token once a daemon serves the registry.
 
 ## Connect and negotiate
 
-Run `radar daemon` separately; it prints the socket and state paths. It serves
-until SIGINT/SIGTERM and removes only its own socket on shutdown. Radar does not
-start or supervise it.
+The socket unit starts `radar daemon` on the first connection, or the operator runs it
+in the foreground for development. It prints the socket and state paths, serves
+until SIGINT/SIGTERM, and removes no socket it did not bind itself. Radar's user
+units start and stop it; see [Stopping and refusals](#stopping-and-refusals).
 
 Clients connect directly using Unix-domain UTF-8 JSON Lines, protocol version
 `2`, with a canonical UUID request ID and one matching response per request.
@@ -104,7 +119,7 @@ Default socket resolution: `RADAR_CONTROL_SOCKET`, then
 `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then
 `/tmp/agent-radar-<uid>/control.sock`. This is separate from the background-task
 bus socket. See the [protocol reference](control-plane.md#start-and-select) for
-state-path resolution, Radar's `[runtime]` client transport, and the daemon's
+state-path resolution, the `[daemon]` table, and the daemon's
 physical-backend selection.
 
 Before connecting, check that the socket and its parent are not symlinks, the

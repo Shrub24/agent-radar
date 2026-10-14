@@ -4,12 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_radar::bus::Listener;
-use agent_radar::control_plane::client::ContainerControls;
-use agent_radar::runtime::RuntimeProvider;
 use agent_radar::topology::ContainerControl;
 use agent_radar::{
     Action, App, Closer, Collector, CollectorConfig, Config, Confirmed, Focuser, Geometry,
-    HerdrConfig, ManagedActions, ObservationState, PaneView, control_plane, theme, ui,
+    ManagedActions, ObservationState, PaneView, control_plane, theme, ui,
 };
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -21,11 +19,14 @@ const USAGE: &str = "\
 radar — read-only fleet overview for local coding agents
 
 usage: radar [--print-config] [--help]
-       radar daemon [--help]
+       radar daemon [start|stop|restart|status|--help]
+       radar server <start|stop|restart|status> [NAME]
 
   --print-config   print the configuration in use, to copy and edit
   --help           this message
-  daemon           serve the control plane and stay up until signalled
+  daemon           control the daemon's user units; with no action, serve in
+                   the foreground (what the service unit runs)
+  server           control the tmux server a daemon serves, by name
 
 Configuration is read from `$RADAR_CONFIG`, else
 `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
@@ -35,20 +36,22 @@ Radar draws without one.
 const DAEMON_USAGE: &str = "\
 radar daemon — the control plane Radar talks to
 
-usage: radar daemon
+usage: radar daemon [start|stop|restart|status]
 
-Serves one JSON request and one JSON response per line on the control socket at
-`$RADAR_CONTROL_SOCKET`, else `$XDG_RUNTIME_DIR/agent-radar/control.sock`, else
-`/tmp/agent-radar-<uid>/control.sock`, keeping one record per operation under
-`$RADAR_CONTROL_STATE`, else `$XDG_STATE_HOME/agent-radar/control`, else
-`~/.local/state/agent-radar/control`. Prints the socket it is serving on. Stops
-on SIGINT or SIGTERM, removing that socket file and leaving the records in place.
+With no action, serves one JSON request and one JSON response per line on the
+control socket, in the foreground, until signalled. The user units run it that
+way: under systemd the socket unit passes its listener, and the daemon serves it
+without unlinking the path. Standalone, it binds `$RADAR_CONTROL_SOCKET`, else
+`$XDG_RUNTIME_DIR/agent-radar/control.sock`, else `/tmp/agent-radar-<uid>/control.sock`.
 
-The physical backend is Herdr. `$RADAR_CONTROL_BACKEND` names one explicitly —
-`herdr` or `tmux` — and `$RADAR_TMUX_SERVER` names the tmux server a `tmux`
-backend uses, never tmux's own default server. A name that is no backend, or a
-configuration a backend cannot serve, refuses startup rather than falling back
-to another backend.
+`start` starts the control socket, which lets the daemon run on the next
+connection. `stop` stops the socket, then the daemon; the tmux server keeps
+running. `restart` restarts the daemon. `status` reports both units.
+
+The physical backend is tmux on the `radar` server, set by `daemon.backend` and
+`daemon.tmux_server` in the configuration. `$RADAR_CONTROL_BACKEND` and
+`$RADAR_TMUX_SERVER` override them. A name that is no backend, or a server the
+daemon cannot serve, refuses startup rather than falling back to another backend.
 ";
 
 fn main() -> io::Result<()> {
@@ -88,15 +91,42 @@ fn handle_arguments() -> Option<i32> {
                 print!("{DAEMON_USAGE}");
                 0
             }
+            Some(action @ ("start" | "stop" | "restart" | "status")) => {
+                let (message, code) = agent_radar::service::daemon_command(action);
+                println!("{message}");
+                code
+            }
             Some(other) => {
                 eprintln!("radar daemon: unknown argument `{other}`\n\n{DAEMON_USAGE}");
                 2
             }
             None => serve_daemon(),
         }),
+        Some("server") => Some(run_server_command()),
         Some(other) => {
             eprintln!("radar: unknown argument `{other}`\n\n{USAGE}");
             Some(2)
+        }
+    }
+}
+
+/// `radar server <action> [NAME]`: controls the tmux server a daemon serves. The
+/// name defaults to the configured server.
+fn run_server_command() -> i32 {
+    let mut arguments = std::env::args().skip(2);
+    let action = arguments.next();
+    let name = arguments
+        .next()
+        .unwrap_or_else(|| load_config().daemon.tmux_server);
+    match action.as_deref() {
+        Some(action @ ("start" | "stop" | "restart" | "status")) => {
+            let (message, code) = agent_radar::service::server_command(action, &name);
+            println!("{message}");
+            code
+        }
+        _ => {
+            eprintln!("radar server: expected start, stop, restart or status\n\n{USAGE}");
+            2
         }
     }
 }
@@ -150,29 +180,68 @@ fn load_config() -> Config {
     }
 }
 
-/// The runtime Radar will use this run, chosen and reported before anything is
-/// drawn.
+/// Waits for the daemon with the diagnostic on screen. Until it answers, the screen
+/// says why it cannot be reached and how to start it, and the connection is retried
+/// every two seconds. There is no other source to draw from, so the dashboard never
+/// starts without the daemon. `None` means the operator quit while waiting.
 ///
-/// The choice is made once: the daemon when it was configured and passed its
-/// handshake, the direct adapter otherwise. Nothing switches later, and nothing
-/// retries an operation the daemon may have accepted.
-fn selected_runtime(
-    config: &Config,
-) -> (Arc<dyn RuntimeProvider>, Option<Arc<dyn ContainerControls>>) {
-    let selection = control_plane::select(&config.runtime, HerdrConfig::default());
-    if let Some(diagnostic) = &selection.diagnostic {
-        eprintln!("radar: {diagnostic}");
+/// Starting the socket is what brings a stopped daemon back: an explicit stop lasts
+/// only until the next `radar` run, which starts it again here.
+fn await_daemon(
+    terminal: &mut ratatui::DefaultTerminal,
+) -> io::Result<Option<control_plane::Selected>> {
+    let mut reason = match agent_radar::service::start_control_socket() {
+        Ok(()) => "connecting to the control daemon".to_string(),
+        Err(problem) => problem,
+    };
+    let mut next_attempt = Instant::now();
+    loop {
+        if Instant::now() >= next_attempt {
+            next_attempt = Instant::now() + Duration::from_secs(2);
+            match control_plane::connect() {
+                Ok(selected) => return Ok(Some(selected)),
+                Err(problem) => reason = agent_radar::service::explain_unreachable(&problem),
+            }
+        }
+        terminal.draw(|frame| draw_daemon_diagnostic(frame, &reason))?;
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            return Ok(None);
+        }
     }
-    (selection.provider, selection.containers)
+}
+
+/// The screen drawn while the daemon cannot be reached: the reason, and what to do.
+fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Text};
+    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+    let text = Text::from(vec![
+        Line::styled(
+            "Radar cannot reach its control daemon.",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(reason.to_string()),
+        Line::raw(""),
+        Line::raw("Start it with `radar daemon start`, or see `radar daemon status`."),
+        Line::raw("Radar keeps retrying. Press q to quit."),
+    ]);
+    let block = Block::default().borders(Borders::ALL).title(" radar ");
+    frame.render_widget(
+        Paragraph::new(text).block(block).wrap(Wrap { trim: false }),
+        frame.area(),
+    );
 }
 
 fn run() -> io::Result<()> {
     let config = load_config();
     theme::install(config.clone());
-    // The runtime is chosen before the terminal is taken over and before anything
-    // is collected or acted on, so the one line explaining a configured daemon
-    // that could not be used is readable rather than drawn over.
-    let (runtime, container_controls) = selected_runtime(&config);
     let mut terminal = ratatui::try_init()?;
     enable_mouse_capture();
     // The panic path restores the terminal through the hook `try_init` installed;
@@ -182,6 +251,10 @@ fn run() -> io::Result<()> {
         disable_mouse_capture();
         restore_hook(info);
     }));
+    let Some(selected) = await_daemon(&mut terminal)? else {
+        return Ok(());
+    };
+    let (runtime, container_controls) = (selected.provider, selected.containers);
     // One runtime, shared: the collector, the focuser and the closer read and act
     // on the same adapter through the same seam.
     let mut collector = Collector::new(CollectorConfig::default(), Arc::clone(&runtime));

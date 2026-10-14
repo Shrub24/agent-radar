@@ -177,41 +177,36 @@ impl Default for Appearance {
     }
 }
 
-/// Which mux backend Radar talks to this run.
+/// The physical backend the control daemon serves, by the name the configuration
+/// uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeBackend {
-    /// The adapter in this process, as Radar has always run.
-    Direct,
-    /// A control daemon the operator started.
-    Daemon,
+pub enum ControlBackend {
+    /// tmux on the named server, which Radar owns and starts through its user unit.
+    Tmux,
+    /// Herdr, selected only explicitly.
+    Herdr,
 }
 
-/// How Radar reaches the multiplexer.
+/// The tmux server a daemon serves when none is named. Never tmux's own default.
+pub const DEFAULT_TMUX_SERVER: &str = "radar";
+
+/// What the control daemon serves. The daemon reads this at startup; the TUI
+/// reads nothing here, because it only ever talks to the daemon's socket.
 ///
-/// The direct adapter is the default, so a machine that runs no daemon is
-/// unaffected by this key existing. `daemon` asks for the control plane, and
-/// Radar reports once and uses the direct adapter when that daemon cannot be
-/// used — it never starts one, and it never switches after an operation has
-/// been handed over.
+/// Environment variables override the file: `RADAR_CONTROL_BACKEND` and
+/// `RADAR_TMUX_SERVER`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeConfig {
-    pub backend: RuntimeBackend,
-    /// The daemon's socket, when the operator names one instead of accepting the
-    /// documented path order.
-    ///
-    /// A named socket is held to the rule `radar daemon` binds under: this
-    /// user's own socket, in a real directory of this user's with mode `0700`.
-    /// Radar checks that before it connects, and a layout the daemon could not
-    /// have bound — `/tmp/probe.sock` among them — is reported once and answered
-    /// by the direct adapter rather than connected to.
-    pub socket: Option<PathBuf>,
+pub struct DaemonConfig {
+    pub backend: ControlBackend,
+    /// The tmux server a tmux backend serves. Never tmux's default server.
+    pub tmux_server: String,
 }
 
-impl Default for RuntimeConfig {
+impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            backend: RuntimeBackend::Direct,
-            socket: None,
+            backend: ControlBackend::Tmux,
+            tmux_server: DEFAULT_TMUX_SERVER.to_string(),
         }
     }
 }
@@ -225,8 +220,8 @@ pub struct Config {
     /// Program marks for pane rows, by program name. Unknown programs fall back
     /// to the pane's own mark, and a value of `"none"` removes a program's.
     pub processes: BTreeMap<String, String>,
-    /// Which mux backend to use, and where its daemon listens.
-    pub runtime: RuntimeConfig,
+    /// What the control daemon serves.
+    pub daemon: DaemonConfig,
 }
 
 impl Default for Config {
@@ -236,7 +231,7 @@ impl Default for Config {
             brands: default_brands(),
             appearance: Appearance::default(),
             processes: default_processes(),
-            runtime: RuntimeConfig::default(),
+            daemon: DaemonConfig::default(),
         }
     }
 }
@@ -354,29 +349,26 @@ impl Config {
             }
             config.appearance.fps = fps;
         }
-        let runtime = file.runtime.unwrap_or_default();
-        if let Some(backend) = runtime.backend {
-            config.runtime.backend = match backend.trim().to_ascii_lowercase().as_str() {
-                "direct" => RuntimeBackend::Direct,
-                "daemon" => RuntimeBackend::Daemon,
+        let daemon = file.daemon.unwrap_or_default();
+        if let Some(backend) = daemon.backend {
+            config.daemon.backend = match backend.trim().to_ascii_lowercase().as_str() {
+                "tmux" => ControlBackend::Tmux,
+                "herdr" => ControlBackend::Herdr,
                 other => {
                     return Err(format!(
-                        "runtime.backend: `{other}` is not a backend; use `direct` or `daemon`"
+                        "daemon.backend: `{other}` is not a backend; use `tmux` or `herdr`"
                     ));
                 }
             };
         }
-        if let Some(socket) = &runtime.socket {
-            // An empty path names nothing, and resolving it would silently fall
-            // back to a different socket than the one the user wrote.
-            if socket.trim().is_empty() {
-                return Err(
-                    "runtime.socket: an empty path names no socket; remove the key to use the \
-                     documented path"
-                        .to_string(),
-                );
+        if let Some(server) = &daemon.tmux_server {
+            // An empty name would reach tmux's own default server, which Radar
+            // never targets, so it is refused here rather than read as unset.
+            let server = server.trim();
+            if server.is_empty() {
+                return Err("daemon.tmux_server: an empty name names no tmux server".to_string());
             }
-            config.runtime.socket = Some(PathBuf::from(socket.trim()));
+            config.daemon.tmux_server = server.to_string();
         }
         Ok(config)
     }
@@ -475,29 +467,19 @@ impl Config {
                 out.push_str(&format!("\n\"{program}\" = \"none\""));
             }
         }
-        let backend = match self.runtime.backend {
-            RuntimeBackend::Direct => "direct",
-            RuntimeBackend::Daemon => "daemon",
+        let backend = match self.daemon.backend {
+            ControlBackend::Tmux => "tmux",
+            ControlBackend::Herdr => "herdr",
         };
-        // The socket is written as a comment when none was set: the documented
-        // path order is the default, and naming a path here would override it.
-        let socket = match &self.runtime.socket {
-            Some(socket) => format!("socket = \"{}\"", socket.display()),
-            None => "# socket = \"/run/agent-radar/control.sock\"".to_string(),
-        };
+        let server = &self.daemon.tmux_server;
         out.push_str(&format!(
-            "\n\n# Which multiplexer Radar talks to. `direct` runs the adapter in this process;\n\
-             # `daemon` uses the control plane from a `radar daemon` you started, and falls\n\
-             # back to `direct` — saying so once — when that daemon is unreachable, is a\n\
-             # socket Radar may not trust, or speaks a protocol this build does not. Radar\n\
-             # never starts a daemon.\n\
-             [runtime]\n\
-             # `direct` or `daemon`\n\
+            "\n\n# What the control daemon serves. `tmux` serves the named tmux server, which\n\
+             # Radar owns and starts through its own user unit; `herdr` serves Herdr instead.\n\
+             [daemon]\n\
+             # `tmux` or `herdr`\n\
              backend = \"{backend}\"\n\
-             # the daemon's socket; leave it out for the documented path order. It must be\n\
-             # one the daemon could have bound: this user's own socket, in a real directory\n\
-             # of this user's with mode 0700\n\
-             {socket}"
+             # the tmux server a `tmux` backend serves; never tmux's default server\n\
+             tmux_server = \"{server}\""
         ));
         out.push('\n');
         out
@@ -662,14 +644,14 @@ struct FileConfig {
     brands: Option<BTreeMap<String, ColorSpec>>,
     appearance: Option<FileAppearance>,
     processes: Option<BTreeMap<String, String>>,
-    runtime: Option<FileRuntime>,
+    daemon: Option<FileDaemon>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct FileRuntime {
+struct FileDaemon {
     backend: Option<String>,
-    socket: Option<String>,
+    tmux_server: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -925,44 +907,31 @@ htop = "none"
     }
 
     #[test]
-    fn the_direct_adapter_is_the_default_runtime() {
-        assert_eq!(RuntimeConfig::default().backend, RuntimeBackend::Direct);
-        assert_eq!(RuntimeConfig::default().socket, None);
-        // A file that names nothing keeps behaving as it did before the key
-        // existed, and so does one that names another section.
-        for document in ["", "[colors]\ndone = \"red\"\n", "[runtime]\n"] {
+    fn tmux_on_the_radar_server_is_the_default_daemon() {
+        assert_eq!(DaemonConfig::default().backend, ControlBackend::Tmux);
+        assert_eq!(DaemonConfig::default().tmux_server, "radar");
+        // A file that names nothing about the daemon serves the default, and so
+        // does one that names another section.
+        for document in ["", "[colors]\ndone = \"red\"\n", "[daemon]\n"] {
             let config = Config::parse(document).expect("parses");
-            assert_eq!(config.runtime, RuntimeConfig::default(), "{document}");
+            assert_eq!(config.daemon, DaemonConfig::default(), "{document}");
         }
     }
 
     #[test]
-    fn the_daemon_backend_and_its_socket_are_configurable() {
-        let config = Config::parse("[runtime]\nbackend = \"daemon\"\n").expect("parses");
-        assert_eq!(config.runtime.backend, RuntimeBackend::Daemon);
-        assert_eq!(config.runtime.socket, None, "the path order is the default");
+    fn the_daemon_backend_and_server_are_configurable() {
+        let config = Config::parse("[daemon]\nbackend = \"herdr\"\ntmux_server = \"work\"\n")
+            .expect("parses");
+        assert_eq!(config.daemon.backend, ControlBackend::Herdr);
+        assert_eq!(config.daemon.tmux_server, "work");
 
-        let config =
-            Config::parse("[runtime]\nbackend = \"daemon\"\nsocket = \"/tmp/probe.sock\"\n")
-                .expect("parses");
-        assert_eq!(config.runtime.backend, RuntimeBackend::Daemon);
-        assert_eq!(
-            config.runtime.socket,
-            Some(PathBuf::from("/tmp/probe.sock"))
-        );
-
-        // The document prints the choice and reads back as the same config, with
-        // the socket left as a comment when the path order is in use.
+        // The document prints the choice and reads back as the same config.
         let printed = config.to_document();
-        assert!(printed.contains("backend = \"daemon\""), "{printed}");
-        assert!(
-            printed.contains("socket = \"/tmp/probe.sock\""),
-            "{printed}"
-        );
+        assert!(printed.contains("backend = \"herdr\""), "{printed}");
+        assert!(printed.contains("tmux_server = \"work\""), "{printed}");
         assert_eq!(Config::parse(&printed).expect("round trips"), config);
         let printed = Config::default().to_document();
-        assert!(printed.contains("backend = \"direct\""), "{printed}");
-        assert!(!printed.contains("\nsocket = "), "{printed}");
+        assert!(printed.contains("backend = \"tmux\""), "{printed}");
         assert_eq!(
             Config::parse(&printed).expect("round trips"),
             Config::default()
@@ -970,13 +939,23 @@ htop = "none"
     }
 
     #[test]
-    fn a_backend_it_does_not_know_says_so() {
-        let error = Config::parse("[runtime]\nbackend = \"tmux\"\n").expect_err("unknown");
-        assert!(error.contains("runtime.backend"), "{error}");
-        assert!(error.contains("tmux"), "{error}");
-        let error = Config::parse("[runtime]\nbackend = \"daemon\"\nsockett = \"/x\"\n")
-            .expect_err("unknown key");
-        assert!(error.contains("sockett"), "{error}");
-        assert!(Config::parse("[runtime]\nsocket = \"\"\n").is_err());
+    fn a_daemon_setting_it_does_not_know_says_so() {
+        let error = Config::parse("[daemon]\nbackend = \"docker\"\n").expect_err("unknown");
+        assert!(error.contains("daemon.backend"), "{error}");
+        assert!(error.contains("docker"), "{error}");
+        let error = Config::parse("[daemon]\ntmux_servr = \"x\"\n").expect_err("unknown key");
+        assert!(error.contains("tmux_servr"), "{error}");
+        assert!(Config::parse("[daemon]\ntmux_server = \"\"\n").is_err());
+    }
+
+    #[test]
+    fn the_removed_runtime_table_is_refused_as_an_unknown_key() {
+        for document in [
+            "[runtime]\nbackend = \"daemon\"\n",
+            "[runtime]\nsocket = \"/tmp/probe.sock\"\n",
+        ] {
+            let error = Config::parse(document).expect_err("removed");
+            assert!(error.contains("runtime"), "{error}");
+        }
     }
 }

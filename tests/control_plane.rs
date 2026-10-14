@@ -28,13 +28,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::Daemon;
-use agent_radar::HerdrConfig;
-use agent_radar::config::{RuntimeBackend, RuntimeConfig};
 use agent_radar::control_plane::ops::Operation;
 use agent_radar::control_plane::registry::{MAX_LISTED, MAX_TEXT_BYTES, ProcessVerifier};
 use agent_radar::control_plane::{
     Category, DaemonRuntime, Derived, MAX_LINE_BYTES, MAX_VERIFICATION_JOBS, PROTOCOL_VERSION,
-    RecordState, RequestOutcome, RequestRecord, Store, now_ms, random_uuid, select,
+    RecordState, RequestOutcome, RequestRecord, Store, connect_at, now_ms, random_uuid,
 };
 use agent_radar::lifecycle;
 use agent_radar::model::{
@@ -3283,7 +3281,9 @@ fn the_daemon_subcommand_serves_prints_and_stops_cleanly_on_a_signal() {
         let sandbox = Sandbox::new(name);
         let socket = sandbox.socket();
         let state = sandbox.state();
-        let mut child = DaemonChild::spawn(&socket, &state);
+        // Herdr starts without a systemd unit, so the serving path runs here.
+        let mut child =
+            DaemonChild::spawn_with(&socket, &state, &[("RADAR_CONTROL_BACKEND", "herdr")]);
         let mut lines = BufReader::new(child.process.stdout.take().expect("stdout")).lines();
         let greeting = lines
             .next()
@@ -3388,9 +3388,6 @@ fn a_physical_backend_the_daemon_cannot_serve_refuses_startup() {
         assert!(unknown.contains(supported), "{unknown}");
     }
 
-    let unnamed = refused_startup("backend-tmux-unnamed", &[("RADAR_CONTROL_BACKEND", "tmux")]);
-    assert!(unnamed.contains("RADAR_TMUX_SERVER"), "{unnamed}");
-
     // The tmux adapter targets one named server and never tmux's default one,
     // so a configuration that names the default server refuses startup.
     let shared = refused_startup(
@@ -3403,21 +3400,19 @@ fn a_physical_backend_the_daemon_cannot_serve_refuses_startup() {
     assert!(shared.contains("tmux"), "{shared}");
     assert!(shared.contains("default server"), "{shared}");
 
-    // Three different mistakes, three different diagnostics: an operator who
-    // reads one is told what to change, not handed another one's problem.
-    assert_ne!(unknown, unnamed);
-    assert_ne!(unnamed, shared);
+    // Two different mistakes, two different diagnostics: an operator who reads one
+    // is told what to change, not handed the other one's problem.
     assert_ne!(unknown, shared);
 }
 
-/// The tmux backend is served by the tmux adapter: the daemon starts against the
-/// server name it was given, and an observation of a server that is not running
-/// is reported as an unavailable backend rather than an unsupported operation.
+/// The daemon serves the tmux server its own unit owns. A server whose unit cannot
+/// start is a refusal at startup: nothing is served, nothing is created, and the
+/// reason names the unit.
 #[test]
-fn a_tmux_backend_serves_and_reports_a_server_that_is_not_running() {
+fn a_tmux_daemon_whose_server_unit_cannot_start_refuses_startup() {
     let name = format!("radar-test-absent-{}", std::process::id());
     let socket_file = tmux_socket(&name);
-    let sandbox = Sandbox::new("backend-tmux-served");
+    let sandbox = Sandbox::new("backend-tmux-refused");
     let socket = sandbox.socket();
     let state = sandbox.state();
     let mut child = DaemonChild::spawn_with(
@@ -3428,33 +3423,75 @@ fn a_tmux_backend_serves_and_reports_a_server_that_is_not_running() {
             ("RADAR_TMUX_SERVER", &name),
         ],
     );
-    let mut lines = BufReader::new(child.process.stdout.take().expect("stdout")).lines();
-    let greeting = lines
-        .next()
-        .expect("a greeting line")
-        .expect("a readable greeting");
-    assert!(
-        greeting.contains(&socket.display().to_string()),
-        "{greeting}"
-    );
+    let status = child.wait(DEADLINE);
+    let mut stderr = String::new();
+    child
+        .process
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut stderr)
+        .expect("readable stderr");
 
-    let mut client = Client::dial(&socket);
-    let observed = client.call("mux.observe", json!({}));
-    assert_eq!(error_code(&observed), "backend_unavailable", "{observed}");
-    // The adapter reaches one server and reads it: it neither starts tmux's
-    // default server nor invents the one it was pointed at.
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    assert!(stderr.contains(&format!("radar-tmux@{name}")), "{stderr}");
+    assert!(!socket.exists(), "a refused daemon bound its socket");
     assert!(
         !socket_file.exists(),
-        "the daemon created a tmux server for an observation"
+        "the daemon created a tmux server it does not own"
     );
-    assert_eq!(
-        client.call("daemon.ping", json!({}))["result"]["protocol"],
-        PROTOCOL_VERSION,
-        "a backend that cannot observe still serves the daemon"
-    );
+}
 
-    let status = child.stop(libc::SIGTERM, DEADLINE);
-    assert_eq!(status.code(), Some(0), "{status:?}");
+/// A tmux server started outside its unit is foreign. The daemon refuses it and
+/// does not adopt it, so a server the operator started by hand is never served.
+#[test]
+fn a_foreign_tmux_server_is_refused_and_not_adopted() {
+    if !user_manager_available() {
+        eprintln!("skipping a foreign tmux server: no systemd user manager");
+        return;
+    }
+    let name = format!("radar-foreign-{}", std::process::id());
+    let _ = Command::new("tmux")
+        .args([
+            "-f",
+            "/dev/null",
+            "-L",
+            &name,
+            "new-session",
+            "-d",
+            "-s",
+            "main",
+        ])
+        .env_remove("TMUX")
+        .status();
+    let sandbox = Sandbox::new("backend-tmux-foreign");
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    let mut child = DaemonChild::spawn_with(
+        &socket,
+        &state,
+        &[
+            ("RADAR_CONTROL_BACKEND", "tmux"),
+            ("RADAR_TMUX_SERVER", &name),
+        ],
+    );
+    let status = child.wait(DEADLINE);
+    let mut stderr = String::new();
+    child
+        .process
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut stderr)
+        .expect("readable stderr");
+
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    assert!(stderr.contains("did not start it"), "{stderr}");
+    assert!(!socket.exists(), "a refused daemon bound its socket");
+    let _ = Command::new("tmux")
+        .args(["-L", &name, "kill-server"])
+        .env_remove("TMUX")
+        .status();
 }
 
 /// A disposable tmux server for the tests that serve one through the daemon.
@@ -3477,13 +3514,57 @@ impl TmuxServer {
             eprintln!("skipping {label}: tmux is not installed");
             return None;
         }
+        if !user_manager_available() {
+            eprintln!("skipping {label}: no systemd user manager");
+            return None;
+        }
         let name = format!("radar-daemon-{}-{label}", std::process::id());
+        // The server runs under the unit the daemon requires for its own servers,
+        // so the daemon's ownership check sees the server it is meant to serve.
+        let started = Command::new("systemd-run")
+            .args(["--user", "--collect", "--quiet"])
+            .arg(format!("--unit=radar-tmux@{name}"))
+            .args([
+                "--property=Type=simple",
+                "--property=KillMode=control-group",
+                "tmux",
+                "-D",
+                "-L",
+                &name,
+                "-f",
+                "/dev/null",
+            ])
+            .status()
+            .expect("run systemd-run");
+        assert!(started.success(), "systemd-run did not start {name}");
         let server = Self {
             socket: tmux_socket(&name),
             name,
         };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !server.answers() {
+            assert!(
+                Instant::now() < deadline,
+                "tmux server {} never answered",
+                server.name
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
         server.tmux(&["new-session", "-d", "-s", "main", "-x", "100", "-y", "30"]);
         Some(server)
+    }
+
+    /// Whether the server answers, without starting one: `show-options` never does.
+    fn answers(&self) -> bool {
+        Command::new("tmux")
+            .arg("-L")
+            .arg(&self.name)
+            .args(["show-options", "-g"])
+            .env_remove("TMUX")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     /// Runs one tmux command against this server, returning its stdout.
@@ -3506,6 +3587,16 @@ impl TmuxServer {
     }
 }
 
+/// Whether the test can run the server under a unit: a systemd user manager.
+fn user_manager_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 impl Drop for TmuxServer {
     fn drop(&mut self) {
         let _ = Command::new("tmux")
@@ -3513,6 +3604,15 @@ impl Drop for TmuxServer {
             .arg(&self.name)
             .env_remove("TMUX")
             .args(["kill-server"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new("systemctl")
+            .args([
+                "--user",
+                "stop",
+                &format!("radar-tmux@{}.service", self.name),
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -7303,14 +7403,6 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     "mux.report",
 ];
 
-/// The configuration that selects the daemon at `socket`.
-fn daemon_at(socket: &Path) -> RuntimeConfig {
-    RuntimeConfig {
-        backend: RuntimeBackend::Daemon,
-        socket: Some(socket.to_path_buf()),
-    }
-}
-
 /// A fake backend that serves everything a client can ask for, so one daemon
 /// exercises the whole client surface. Nothing here is a mux.
 struct ClientBackend {
@@ -7425,29 +7517,6 @@ impl RuntimeProvider for ClientBackend {
     }
     fn report(&self, _request: &ReportRequest, _cancel: &AtomicBool) -> ReportOutcome {
         ReportOutcome::Completed
-    }
-}
-
-/// Where a [`recording_herdr`] writes what it was asked to serve.
-fn asked_marker(root: &Path) -> PathBuf {
-    root.join("asked")
-}
-
-/// A direct adapter that records being asked anything, so a test can prove it was
-/// used — or never was. The script answers nothing: whether it ran at all is what
-/// these tests assert.
-fn recording_herdr(root: &Path) -> HerdrConfig {
-    let executable = root.join("herdr");
-    fs::write(
-        &executable,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/asked\"\nexit 1\n",
-    )
-    .expect("write the recording adapter");
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
-        .expect("an executable adapter");
-    HerdrConfig {
-        executable,
-        ..HerdrConfig::default()
     }
 }
 
@@ -7691,32 +7760,18 @@ fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client()
     daemon.stop();
 }
 
-/// A daemon that cannot be reached leaves Radar on the direct adapter, with one
-/// line saying so — and that adapter is the one that answers.
+/// A daemon that cannot be reached is a refusal that names why. Nothing is
+/// substituted for it: the caller shows the reason and retries.
 #[test]
-fn an_unreachable_daemon_leaves_the_direct_adapter_in_use() {
+fn an_unreachable_daemon_is_refused_with_its_reason() {
     let sandbox = Sandbox::new("client-unreachable");
     let socket = sandbox.root.join("absent.sock");
-    let selection = select(&daemon_at(&socket), recording_herdr(&sandbox.root));
+    let diagnostic = connect_at(&socket).err().expect("a refusal");
 
-    assert_eq!(selection.backend, "direct");
-    let diagnostic = selection.diagnostic.expect("the fallback is reported once");
     assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
     assert!(
         diagnostic.contains("No such file or directory"),
         "{diagnostic}"
-    );
-    assert!(diagnostic.contains("direct Herdr"), "{diagnostic}");
-    assert!(!diagnostic.contains('\n'), "{diagnostic}");
-
-    // The selected provider is really the direct adapter: asking it anything runs
-    // it, which the recording script proves.
-    assert!(!asked_marker(&sandbox.root).exists());
-    let cancel = AtomicBool::new(false);
-    assert!(selection.provider.inventory(&cancel).is_err());
-    assert!(
-        asked_marker(&sandbox.root).exists(),
-        "the direct adapter was not the one selected"
     );
 }
 
@@ -7727,8 +7782,6 @@ fn an_unreachable_daemon_leaves_the_direct_adapter_in_use() {
 #[test]
 fn a_socket_path_radar_may_not_trust_is_refused_before_any_connection() {
     let sandbox = Sandbox::new("client-planted");
-    let direct = recording_herdr(&sandbox.root);
-    let cancel = AtomicBool::new(false);
 
     // A working fake daemon in a directory its owner left group-writable. This is
     // the socket-ahead-of-the-daemon case: it answers a handshake, and it is
@@ -7739,21 +7792,16 @@ fn a_socket_path_radar_may_not_trust_is_refused_before_any_connection() {
     fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).expect("a mode");
     let marker = sandbox.root.join("shared-was-asked");
     let planted = planted_daemon(&shared, "control.sock", marker.clone());
-    let selection = select(&daemon_at(&planted), direct.clone());
-    assert_eq!(selection.backend, "direct");
-    let diagnostic = selection.diagnostic.expect("the fallback is reported once");
+    let diagnostic = connect_at(&planted).err().expect("a refusal");
     assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
     assert!(diagnostic.contains("not mode 0700"), "{diagnostic}");
-    assert!(diagnostic.contains("direct Herdr"), "{diagnostic}");
     assert!(!marker.exists(), "Radar dialled a socket it may not trust");
 
     // The same live socket reached through a symlink at the name: the rule is
     // about the path, not about what the path points at.
     let linked = sandbox.root.join("linked.sock");
     std::os::unix::fs::symlink(&planted, &linked).expect("a symlink");
-    let selection = select(&daemon_at(&linked), direct.clone());
-    assert_eq!(selection.backend, "direct");
-    let diagnostic = selection.diagnostic.expect("a diagnostic");
+    let diagnostic = connect_at(&linked).err().expect("a refusal");
     assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
     assert!(diagnostic.contains("is a symlink"), "{diagnostic}");
     assert!(!marker.exists(), "Radar dialled a socket it may not trust");
@@ -7761,19 +7809,9 @@ fn a_socket_path_radar_may_not_trust_is_refused_before_any_connection() {
     // A regular file wearing a control socket's name.
     let file = sandbox.root.join("file.sock");
     fs::write(&file, b"not a socket").expect("a file");
-    let selection = select(&daemon_at(&file), direct);
-    assert_eq!(selection.backend, "direct");
-    let diagnostic = selection.diagnostic.expect("a diagnostic");
+    let diagnostic = connect_at(&file).err().expect("a refusal");
     assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
     assert!(diagnostic.contains("is not a socket"), "{diagnostic}");
-
-    // The provider the refusal selected is really the direct adapter.
-    assert!(!asked_marker(&sandbox.root).exists());
-    assert!(selection.provider.inventory(&cancel).is_err());
-    assert!(
-        asked_marker(&sandbox.root).exists(),
-        "the direct adapter was not the one selected"
-    );
 }
 
 /// A working fake daemon planted at `root/name`, which records in `marker` that
@@ -7787,19 +7825,16 @@ fn planted_daemon(root: &Path, name: &str, marker: PathBuf) -> PathBuf {
 }
 
 /// A daemon that is listening but does not provide what the dashboard needs is
-/// not used either, and the line names what is missing.
+/// refused, and the line names what is missing.
 #[test]
-fn an_incompatible_daemon_is_reported_and_not_used() {
+fn an_incompatible_daemon_is_refused_and_named() {
     let sandbox = Sandbox::new("client-incompatible");
     let backend = ClientBackend::new(&["mux.observe", "mux.process_info", "mux.focus"]);
     let mut daemon = sandbox.daemon_with(backend);
-    let selection = select(&daemon_at(daemon.path()), recording_herdr(&sandbox.root));
+    let diagnostic = connect_at(daemon.path()).err().expect("a refusal");
 
-    assert_eq!(selection.backend, "direct");
-    let diagnostic = selection.diagnostic.expect("the fallback is reported once");
     assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
     assert!(diagnostic.contains("`mux.close`"), "{diagnostic}");
-    assert!(diagnostic.contains("direct Herdr"), "{diagnostic}");
     daemon.stop();
 }
 
@@ -7810,19 +7845,13 @@ fn a_usable_daemon_is_selected_without_a_diagnostic() {
     let sandbox = Sandbox::new("client-selected");
     let backend = ClientBackend::new(CLIENT_CAPABILITIES);
     let mut daemon = sandbox.daemon_with(backend);
-    let selection = select(&daemon_at(daemon.path()), recording_herdr(&sandbox.root));
+    let selection = connect_at(daemon.path()).expect("a usable daemon");
 
-    assert_eq!(selection.backend, "daemon");
-    assert_eq!(selection.diagnostic, None);
     let cancel = AtomicBool::new(false);
     let (inventory, _) = populated_graph();
     assert_eq!(
         selection.provider.inventory(&cancel).expect("inventory"),
         inventory
-    );
-    assert!(
-        !asked_marker(&sandbox.root).exists(),
-        "the direct adapter was used under a selected daemon"
     );
     daemon.stop();
 }
@@ -7934,7 +7963,8 @@ fn the_real_daemon_passes_the_clients_handshake() {
     let sandbox = Sandbox::new("client-real-daemon");
     let socket = sandbox.socket();
     let state = sandbox.state();
-    let mut child = DaemonChild::spawn(&socket, &state);
+    // Herdr starts without a systemd unit, so the handshake runs against it here.
+    let mut child = DaemonChild::spawn_with(&socket, &state, &[("RADAR_CONTROL_BACKEND", "herdr")]);
     let mut lines = BufReader::new(child.process.stdout.take().expect("stdout")).lines();
     lines
         .next()
@@ -7943,16 +7973,13 @@ fn the_real_daemon_passes_the_clients_handshake() {
 
     // The handshake alone: the daemon's own capabilities are static, so nothing
     // here asks the mux anything.
-    let selection = select(&daemon_at(&socket), recording_herdr(&sandbox.root));
-    assert_eq!(selection.backend, "daemon");
-    assert_eq!(selection.diagnostic, None);
+    let selection = connect_at(&socket).expect("a usable daemon");
     for required in DaemonRuntime::REQUIRED {
         assert!(
             selection.provider.capabilities().contains(required),
             "a real daemon does not declare `{required}`"
         );
     }
-    assert!(!asked_marker(&sandbox.root).exists());
 
     let status = child.stop(libc::SIGTERM, DEADLINE);
     assert!(status.success(), "{status:?}");
@@ -8005,9 +8032,7 @@ fn an_uncertain_daemon_close_is_never_retried_through_direct_herdr() {
         .observing(inventory.clone())
         .closing(CloseAnswer::Unknown("the reply was lost".into()));
     let mut daemon = sandbox.daemon_with(backend.clone());
-    let selection = select(&daemon_at(daemon.path()), recording_herdr(&sandbox.root));
-    assert_eq!(selection.backend, "daemon");
-    assert_eq!(selection.diagnostic, None);
+    let selection = connect_at(daemon.path()).expect("a usable daemon");
 
     let target = CloseTarget::Pane("wA:p1".into());
     let request = lifecycle::CloseRequest {
@@ -8025,10 +8050,6 @@ fn an_uncertain_daemon_close_is_never_retried_through_direct_herdr() {
     );
     assert!(backend.told_to_close(&target));
     assert_eq!(backend.closes_seen(), 1, "the close was asked for twice");
-    assert!(
-        !asked_marker(&sandbox.root).exists(),
-        "an uncertain daemon close was retried through the direct adapter"
-    );
     daemon.stop();
 }
 

@@ -17,13 +17,12 @@ promised stable third-party Rust API. The daemon owns durable operation records,
 spawn correlation and target admission; the adapter performs physical effects
 and reports their certainty. Assignment decisions remain outside the adapter.
 
-The daemon's physical adapter defaults to Herdr. Set `RADAR_CONTROL_BACKEND=tmux`
-and `RADAR_TMUX_SERVER=<name>` before starting `radar daemon` to select the
-production tmux adapter; an unknown backend or missing server name refuses startup,
-with no fallback. The adapter uses only `tmux -L <name>` and does not touch the
-default server. Radar's `[runtime] backend = "daemon"` selects its client
-transport, not the daemon's physical backend; direct mode and its startup fallback
-still use Herdr.
+The daemon's physical adapter is tmux on the server named by `[daemon] tmux_server`
+(default `radar`); `RADAR_CONTROL_BACKEND` and `RADAR_TMUX_SERVER` override the file. Herdr is
+selected only with `RADAR_CONTROL_BACKEND=herdr`. An unknown backend or missing server name refuses
+startup, with no fallback. The adapter uses only `tmux -L <name>` and does not touch the
+default server. The server is started and verified by its own user unit. The
+dashboard has no direct mode and no Herdr fallback.
 
 ## Physical operations
 

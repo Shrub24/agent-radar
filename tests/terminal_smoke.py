@@ -37,6 +37,7 @@ FACTS_INCARNATION = "6c7d8e9f-0a1b-4c2d-9e3f-4a5b6c7d8e9f"
 EXECUTION_INCARNATION = "7d8e9f0a-1b2c-4d3e-8f4a-5b6c7d8e9f0a"
 # The longest lease a publisher may ask for: the run must not outlive it.
 MAX_LEASE_MS = 300_000
+WAIT = 10
 
 
 def birth_identity(pid):
@@ -51,6 +52,7 @@ def start_daemon(binary, directory, control_path):
     """A disposable daemon over the fake Herdr CLI. The dashboard reads its
     agents from here, and nothing else."""
     env = {**os.environ, "RADAR_CONTROL_SOCKET": str(control_path),
+           "RADAR_CONTROL_BACKEND": "herdr",
            "RADAR_CONTROL_STATE": str(directory / "control-state"),
            "PATH": f"{directory}:{os.environ['PATH']}"}
     with open(directory / "daemon.log", "w") as log:
@@ -99,10 +101,52 @@ def register_worker(control_path, pid):
         "sequence": 1, "snapshot": {"activity": "working"}, "lease_ms": MAX_LEASE_MS})
 
 
+def check_daemon_absent(binary):
+    """With no daemon, the dashboard draws the diagnostic instead of rows, keeps
+    retrying, and quits on `q`. Nothing is drawn from another source."""
+    with tempfile.TemporaryDirectory(prefix="radar-terminal-absent-") as directory:
+        directory = Path(directory)
+        config = directory / "config.toml"
+        config.write_text("")
+        env = {**os.environ, "TERM": "xterm-256color", "RADAR_CONFIG": str(config),
+               "RADAR_CONTROL_SOCKET": str(directory / "absent.sock"),
+               "RADAR_CONTROL_STATE": str(directory / "control-state"),
+               "RADAR_SOCKET": str(directory / "bus.sock"),
+               "PATH": f"{directory}:{os.environ['PATH']}"}
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        process = subprocess.Popen([str(binary)], stdin=slave, stdout=slave,
+                                   stderr=slave, env=env, start_new_session=True)
+        seen = bytearray()
+
+        def drain(seconds):
+            end = time.monotonic() + seconds
+            while time.monotonic() < end and select.select([master], [], [], 0.05)[0]:
+                seen.extend(os.read(master, 65536))
+
+        deadline = time.monotonic() + WAIT
+        while b"cannot reach its control daemon" not in seen and time.monotonic() < deadline:
+            drain(0.1)
+        try:
+            assert b"cannot reach its control daemon" in seen, \
+                "the dashboard drew no daemon diagnostic"
+            assert process.poll() is None, "the dashboard exited while the daemon was absent"
+            os.write(master, b"q")
+            exit_deadline = time.monotonic() + WAIT
+            while process.poll() is None and time.monotonic() < exit_deadline:
+                drain(0.05)
+            assert process.poll() == 0, f"the dashboard did not quit on q: exit {process.poll()}"
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
+
 def check(binary, bus_off=False):
     """One dashboard run. The main run reads a registered agent from a disposable
-    daemon; `bus_off` runs the direct adapter, which presents no agents, and
-    squats the bus socket first, so binding the bus fails and the run must stay
+    daemon; `bus_off` squats the bus socket first, so binding the bus fails and the run must stay
     usable and quit promptly anyway."""
     with tempfile.TemporaryDirectory(prefix="radar-terminal-") as directory:
         directory = Path(directory)
@@ -161,17 +205,14 @@ cat '{snapshot}'
 ''')
         fake.chmod(0o755)
         # The main run's agent is the daemon's registration, so the dashboard
-        # reads its facts through the daemon. The bus-off run has no daemon.
+        # reads its facts through the daemon in both runs: the bus is a separate
+        # listener, so bus-off changes only the bus.
         config = directory / "config.toml"
         control_path = directory / "control.sock"
-        daemon = None
-        if not bus_off:
-            mode.write_text("ok\n")
-            daemon = start_daemon(binary, directory, control_path)
-            register_worker(control_path, helper.pid)
-            config.write_text(f'[runtime]\nbackend = "daemon"\nsocket = "{control_path}"\n')
-        else:
-            config.write_text("")
+        mode.write_text("ok\n")
+        daemon = start_daemon(binary, directory, control_path)
+        register_worker(control_path, helper.pid)
+        config.write_text("")
         mode.write_text("error\n")
         squatter = None
         if bus_off:
@@ -185,7 +226,8 @@ cat '{snapshot}'
         process = subprocess.Popen(
             [str(binary)], stdin=slave, stdout=slave, stderr=slave,
             env={**os.environ, "TERM": "xterm-256color", "PATH": f"{directory}:{os.environ['PATH']}",
-                 "RADAR_SOCKET": str(socket_path), "RADAR_CONFIG": str(config)},
+                 "RADAR_SOCKET": str(socket_path), "RADAR_CONFIG": str(config),
+                 "RADAR_CONTROL_SOCKET": str(control_path)},
             start_new_session=True,
         )
 
@@ -476,5 +518,6 @@ if __name__ == "__main__":
     target = subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"], text=True)
     binary = args.binary or Path(json.loads(target)["target_directory"]) / "debug" / "radar"
     binary = binary.resolve()
+    check_daemon_absent(binary)
     check(binary)
     check(binary, bus_off=True)

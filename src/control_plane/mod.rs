@@ -20,7 +20,7 @@ pub mod server;
 pub mod store;
 
 pub use crate::runtime::{RuntimeProvider, Target};
-pub use client::{DaemonRuntime, Selected, select};
+pub use client::{DaemonRuntime, Selected, connect, connect_at};
 pub use ops::{Method, Operation};
 pub use protocol::{
     Code, ErrorBody, MAX_LINE_BYTES, PROTOCOL_VERSION, Refusal, Request, Response, decode_request,

@@ -731,6 +731,16 @@ impl Store {
         Ok(records)
     }
 
+    /// Every record that is not yet completed, however old. `recent` is bounded
+    /// by recency, so it cannot answer whether an operation is still pending.
+    pub fn unfinished(&self) -> Result<Vec<RequestRecord>, String> {
+        Ok(self
+            .recent(usize::MAX)?
+            .into_iter()
+            .filter(|record| record.state != RecordState::Completed)
+            .collect())
+    }
+
     /// The newest unresolved mutation, regardless of method, over `target`.
     ///
     /// A request that has been claimed or started has no recorded outcome yet,
@@ -1275,6 +1285,54 @@ mod tests {
             ..pending.clone()
         };
         assert_eq!(unreadable.derive(1_300), Derived::Unknown);
+    }
+
+    #[test]
+    fn unfinished_lists_an_old_pending_record_behind_newer_completed_ones() {
+        let directory = tempdir("unfinished");
+        let store = Store::open(&directory).expect("store");
+        let old = RequestRecord::new(
+            "00000000-0000-4000-8000-000000000000",
+            "lifecycle.stop",
+            Some("radar".into()),
+            Some("subject".into()),
+            1_000,
+        );
+        store.create(&old).expect("pending record");
+        for n in 0..201 {
+            let newer = RequestRecord::new(
+                &format!("00000000-0000-4000-8000-{:012}", n + 1),
+                "lifecycle.stop",
+                Some("radar".into()),
+                Some("subject".into()),
+                2_000 + n,
+            );
+            store.create(&newer).expect("pending record");
+            let done = newer.complete(
+                RequestOutcome::Completed,
+                None,
+                Some("done"),
+                Vec::new(),
+                3_000,
+            );
+            store.write(&done).expect("completed record");
+        }
+        // The recency window is full of completed records, so only the unfinished
+        // query can still reach the old pending one.
+        let recent: Vec<String> = store
+            .recent(200)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert!(!recent.contains(&old.id));
+        let unfinished: Vec<String> = store
+            .unfinished()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(unfinished, vec![old.id.clone()]);
     }
 
     #[test]

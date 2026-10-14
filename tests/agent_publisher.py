@@ -227,7 +227,7 @@ def validate_fixture(path):
 
 def spawn_daemon(binary, socket_path, state_path, herdr_fake=None):
     env = {**os.environ, "RADAR_CONTROL_SOCKET": str(socket_path),
-           "RADAR_CONTROL_STATE": str(state_path)}
+           "RADAR_CONTROL_STATE": str(state_path), "RADAR_CONTROL_BACKEND": "herdr"}
     if herdr_fake is not None:
         env["PATH"] = f"{herdr_fake.parent}:{os.environ['PATH']}"
         env["RADAR_SPAWN_FAKE_STATE"] = str(herdr_fake.parent / "fake-state")

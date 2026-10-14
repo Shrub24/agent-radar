@@ -171,9 +171,18 @@ class Fleet:
 
     def start_tmux(self):
         self.sentinel()
-        # `-f /dev/null` keeps this machine's tmux configuration out of the run,
-        # and the server name is ours alone.
-        subprocess.run(["tmux", "-L", self.server, "-f", "/dev/null", "new-session",
+        # The server runs under the unit the daemon requires for its own servers, so
+        # the daemon's ownership check sees the server it is meant to serve.
+        subprocess.run(["systemd-run", "--user", "--collect", "--quiet",
+                        f"--unit=radar-tmux@{self.server}",
+                        "--property=Type=simple", "--property=KillMode=control-group",
+                        "tmux", "-D", "-L", self.server, "-f", "/dev/null"], check=True)
+        deadline = time.monotonic() + WAIT
+        while subprocess.run(["tmux", "-L", self.server, "show-options", "-g"],
+                             capture_output=True).returncode != 0:
+            check(time.monotonic() < deadline, f"tmux server {self.server} never answered")
+            time.sleep(0.05)
+        subprocess.run(["tmux", "-L", self.server, "new-session",
                         "-d", "-x", str(WINDOW[1]), "-y", str(WINDOW[0]), PANE_COMMAND],
                        check=True)
         subprocess.run(["tmux", "-L", self.server, "new-window", "-d", PANE_COMMAND],
@@ -278,9 +287,9 @@ class Fleet:
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", *WINDOW, 0, 0))
         self.original_termios = termios.tcgetattr(slave)
-        self.config.write_text(
-            f'[runtime]\nbackend = "daemon"\nsocket = "{self.socket}"\n')
+        self.config.write_text("")
         env = {**os.environ, "TERM": "xterm-256color", "RADAR_CONFIG": str(self.config),
+               "RADAR_CONTROL_SOCKET": str(self.socket),
                "RADAR_SOCKET": str(self.bus), "PATH": f"{self.root}:{os.environ['PATH']}"}
         self.master, self.slave = master, slave
         self.dashboard = subprocess.Popen([str(self.binary)], stdin=slave, stdout=slave,
@@ -415,6 +424,9 @@ class Fleet:
         if self.server:
             subprocess.run(["tmux", "-L", self.server, "kill-server"],
                            capture_output=True, text=True)
+            subprocess.run(["systemctl", "--user", "stop",
+                            f"radar-tmux@{self.server}.service"],
+                           capture_output=True, text=True)
             deadline = time.monotonic() + WAIT
             gone = False
             while time.monotonic() < deadline:
@@ -518,8 +530,6 @@ def accept(binary, dump=False):
 
         fleet.start_dashboard()
         fleet.expect(b"current")
-        check(b"using the direct Herdr adapter" not in fleet.seen,
-              "the dashboard fell back to the direct adapter")
 
         names = ("accept worker", "accept stale", "accept orphan", unnamed)
         captures = fleet.read_rows(names)
