@@ -1924,6 +1924,36 @@ fn details(state: &ObservationState, id: &RowId) -> String {
     pages(state, &mut app)
 }
 
+/// A registration whose publisher still holds a live lease, which is what keeps
+/// an unplaced registration in the view.
+fn leased(mut agent: RegistryAgent) -> RegistryAgent {
+    agent.context = Some(
+        serde_json::from_value(json!({
+            "version": 1,
+            "agent_id": agent.registration.agent_id,
+            "writer": {
+                "source": "herdsman",
+                "incarnation": REGISTRY_INCARNATION,
+                "generation": 1,
+                "sequence": 1
+            },
+            "context": {
+                "source": "herdsman",
+                "incarnation": REGISTRY_INCARNATION,
+                "generation": 1,
+                "sequence": 1,
+                "lease_ms": 30_000,
+                "received_at": "2026-01-01T00:00:00.000Z",
+                "expires_at": "2026-01-01T00:00:30.000Z",
+                "restored": false,
+                "freshness": "fresh"
+            }
+        }))
+        .expect("leased context fixture"),
+    );
+    agent
+}
+
 /// Registrations that cannot join a pane stay distinct rows that own no pane:
 /// the reported pane keeps its own row, and the controls they would reach are
 /// refused.
@@ -1934,7 +1964,7 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
         vec![
             registration("r1", at("wA:p1"), false, Vec::new()),
             registration("r2", at("wA:p1"), false, Vec::new()),
-            registration("r3", Value::Null, false, Vec::new()),
+            leased(registration("r3", Value::Null, false, Vec::new())),
         ],
         Vec::new(),
     );

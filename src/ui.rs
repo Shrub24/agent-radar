@@ -648,7 +648,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("n/N", "next".to_string()),
         ("w/W", "work".to_string()),
         ("x/X", "close pane/tab".to_string()),
-        ("a/D/R", "add/delete/reload".to_string()),
+        ("a/A/D/R", "add/workspace/delete/reload".to_string()),
         ("s", app.order().label().to_string()),
         ("p", app.pane_view().label().to_string()),
         ("d", toggle_label(app.shows_details(), "details")),

@@ -206,7 +206,7 @@ pub fn project(
     agents
         .into_iter()
         .zip(bound)
-        .map(|(agent, bound)| {
+        .filter_map(|(agent, bound)| {
             let binding = match bound {
                 Ok(pane_id) if ambiguous.contains(&pane_id) => {
                     Binding::Unjoined(Unjoined::Ambiguous)
@@ -226,11 +226,16 @@ pub fn project(
                 _ => last_location(&agent),
             };
             let spawn = spawn_binding(&agent, &topology);
+            if matches!(binding, Binding::Unjoined(_))
+                && !belongs_in_view(&agent, backend, inventory, spawn.is_some())
+            {
+                return None;
+            }
             let managed = (binding == Binding::Joined)
                 .then(|| managed_subject(&agent, &lifecycle, spawn.as_ref()))
                 .flatten();
             let session = agent.current_session_uuid().map(SessionIdentity::Uuid);
-            AgentObservation {
+            Some(AgentObservation {
                 location,
                 name: None,
                 label: None,
@@ -244,9 +249,55 @@ pub fn project(
                     spawn,
                     managed,
                 }),
-            }
+            })
         })
         .collect()
+}
+
+/// Whether a registration that did not join a pane still belongs in this
+/// backend's fleet view.
+///
+/// A registration for another backend or server is not this fleet's, so it is
+/// never shown. One that names no pane, or a pane this inventory lacks, is shown
+/// only while a publisher still holds a live lease or the daemon recorded a spawn
+/// edge for it: a registration is durable but its freshness is not, so a dead
+/// agent's record ages out of the view instead of piling up. Every other reason
+/// names a pane that is here, and that pane stays protected.
+fn belongs_in_view(
+    agent: &RegistryAgent,
+    backend: &BackendIdentity,
+    inventory: &FleetObservation,
+    has_spawn: bool,
+) -> bool {
+    let foreign = agent
+        .registration
+        .location
+        .as_ref()
+        .is_some_and(|location| {
+            location.backend != backend.name
+                || (location.instance.is_some() && location.instance != backend.instance)
+        });
+    if foreign {
+        return false;
+    }
+    let pane_here = agent
+        .registration
+        .location
+        .as_ref()
+        .and_then(|location| location.pane.as_deref())
+        .is_some_and(|pane| inventory.pane(pane).is_some());
+    pane_here || has_spawn || has_live_lease(agent)
+}
+
+/// Whether any channel of this registration was reported within its lease.
+fn has_live_lease(agent: &RegistryAgent) -> bool {
+    [&agent.execution, &agent.assignment, &agent.facts]
+        .into_iter()
+        .any(|channel| channel_freshness(channel) == Some(Freshness::Fresh))
+        || agent
+            .context
+            .as_ref()
+            .is_some_and(|context| context.context.freshness == Freshness::Fresh)
 }
 
 /// The pane a registration exactly joins, or why it does not.
@@ -553,6 +604,74 @@ mod tests {
         BackendIdentity::named("herdr")
     }
 
+    /// A registration whose publisher still holds a live lease.
+    fn leased(mut agent: RegistryAgent) -> RegistryAgent {
+        agent.context = Some(
+            serde_json::from_value(json!({
+                "version": 1,
+                "agent_id": agent.registration.agent_id,
+                "writer": {
+                    "source": "herdsman",
+                    "incarnation": "22222222-2222-4222-8222-222222222222",
+                    "generation": 1,
+                    "sequence": 1
+                },
+                "context": {
+                    "source": "herdsman",
+                    "incarnation": "22222222-2222-4222-8222-222222222222",
+                    "generation": 1,
+                    "sequence": 1,
+                    "lease_ms": 30_000,
+                    "received_at": "2026-01-01T00:00:00.000Z",
+                    "expires_at": "2026-01-01T00:00:30.000Z",
+                    "restored": false,
+                    "freshness": "fresh"
+                }
+            }))
+            .expect("leased context fixture"),
+        );
+        agent
+    }
+
+    #[test]
+    fn another_servers_registration_is_never_this_fleets() {
+        let tmux = BackendIdentity::tmux("radar");
+        let elsewhere = json!({
+            "backend": "tmux", "instance": "herdsman", "workspace": "w1",
+            "tab": "t1", "pane": "p1"
+        });
+        // Live or not, a registration for another server is not shown.
+        let projected = project(
+            &inventory(vec![pane("p1", "t1")]),
+            &tmux,
+            read(vec![
+                leased(registered("live", elsewhere.clone(), None)),
+                registered("dead", elsewhere, None),
+            ]),
+            &[],
+        );
+        assert!(projected.is_empty(), "{projected:?}");
+    }
+
+    #[test]
+    fn an_unplaced_registration_shows_only_while_its_lease_is_live() {
+        let panes = inventory(vec![pane("p1", "t1")]);
+        let gone = at("p9");
+        let ids = |agents: Vec<RegistryAgent>| -> Vec<String> {
+            project(&panes, &herdr(), read(agents), &[])
+                .into_iter()
+                .filter_map(|agent| Some(agent.registry?.agent.registration.agent_id))
+                .collect()
+        };
+        // No pane here and no live lease: it ages out of the view.
+        assert!(ids(vec![registered("dead", gone.clone(), None)]).is_empty());
+        // The same registration with a live publisher stays, unresolved.
+        assert_eq!(ids(vec![leased(registered("live", gone, None))]), ["live"]);
+        // A pane that is here keeps its registration however stale: the pane stays
+        // protected.
+        assert_eq!(ids(vec![registered("held", at("p1"), None)]), ["held"]);
+    }
+
     fn at(pane_id: &str) -> Value {
         json!({"backend": "herdr", "workspace": "w1", "tab": "t1", "pane": pane_id})
     }
@@ -611,7 +730,7 @@ mod tests {
     #[test]
     fn a_registration_on_an_absent_pane_keeps_its_last_location_unjoined() {
         let panes = inventory(vec![pane("p1", "t1")]);
-        let agent = registered("a", at("p9"), Some(identity(7, 5)));
+        let agent = leased(registered("a", at("p9"), Some(identity(7, 5))));
         let projected = project(&panes, &herdr(), read(vec![agent]), &[]);
         let view = projected[0].registry.as_ref().expect("registry view");
         assert_eq!(view.binding, Binding::Unjoined(Unjoined::PaneAbsent));
@@ -662,18 +781,18 @@ mod tests {
             Some(&Binding::Joined)
         );
 
-        // A registration that names no server never joins a named backend, and a
-        // named registration never joins a backend that reports none.
-        for (backend, agent) in [
-            (on(Some("srv-a")), named(None)),
-            (on(None), named(Some("srv-a"))),
-        ] {
-            let projected = project(&panes, &backend, read(vec![agent]), &fg());
-            assert_eq!(
-                projected[0].registry.as_ref().map(|v| &v.binding),
-                Some(&Binding::Unjoined(Unjoined::LocationMismatch))
-            );
-        }
+        // A registration that names no server never joins a named backend, and its
+        // pane stays protected, so the row stays.
+        let projected = project(&panes, &on(Some("srv-a")), read(vec![named(None)]), &fg());
+        assert_eq!(
+            projected[0].registry.as_ref().map(|v| &v.binding),
+            Some(&Binding::Unjoined(Unjoined::LocationMismatch))
+        );
+
+        // A registration naming a server the backend does not report is another
+        // server's and is not shown at all.
+        let projected = project(&panes, &on(None), read(vec![named(Some("srv-a"))]), &fg());
+        assert!(projected.is_empty(), "{projected:?}");
     }
 
     #[test]

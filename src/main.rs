@@ -394,6 +394,16 @@ fn run() -> io::Result<()> {
                     match action {
                         Action::Focus(target) => focuser.start(target),
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
+                        Action::NewWorkspace => {
+                            let control = Some(app.new_workspace());
+                            dispatch(
+                                control,
+                                &mut app,
+                                &mut closer,
+                                &mut managed,
+                                &mut containers,
+                            );
+                        }
                         Action::ConfirmAction => {
                             let confirmed = app.confirm(&state);
                             dispatch(
@@ -413,6 +423,16 @@ fn run() -> io::Result<()> {
                     match action {
                         Action::Focus(target) => focuser.start(target),
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
+                        Action::NewWorkspace => {
+                            let control = Some(app.new_workspace());
+                            dispatch(
+                                control,
+                                &mut app,
+                                &mut closer,
+                                &mut managed,
+                                &mut containers,
+                            );
+                        }
                         Action::ConfirmAction => {
                             let confirmed = app.confirm(&state);
                             dispatch(

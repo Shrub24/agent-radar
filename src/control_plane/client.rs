@@ -1113,6 +1113,8 @@ pub trait ContainerControls: Send + Sync {
 /// What one container creation makes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContainerCreateKind {
+    /// A new workspace, which needs no existing place to start from.
+    Workspace,
     /// A tab in this workspace.
     Tab { workspace_id: String },
     /// A pane slot split from this pane.
@@ -1360,6 +1362,10 @@ impl ContainerControls for DaemonRuntime {
         cancel: &AtomicBool,
     ) -> Result<ContainerAnswer, String> {
         let request_kind = match &request.kind {
+            ContainerCreateKind::Workspace => json!({
+                "kind": "workspace",
+                "focus": false,
+            }),
             ContainerCreateKind::Tab { workspace_id } => json!({
                 "kind": "tab",
                 "workspace_id": workspace_id,

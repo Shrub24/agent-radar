@@ -283,6 +283,15 @@ class Fleet:
                          "last_outcome": {"result": "partial", "detail": "pending"}}})["channel"]
         check(channel["snapshot"]["freshness"] == "fresh", str(channel))
 
+    def hold_lease(self, agent_id):
+        """A live session-context lease and nothing else. An unplaced
+        registration stays in the fleet view only while some publisher holds
+        one, so a registration that is meant to stay visible needs it."""
+        publisher.publish_context(
+            self.socket, agent_id,
+            {"source": "pi", "incarnation": str(uuid.uuid4())},
+            None, 1, SESSION, lease_ms=MAX_LEASE_MS)
+
     def publish_facts(self, agent_id, lease_ms, snapshot):
         return publisher.publish_facts(
             self.socket, agent_id, {"source": "pi", "incarnation": str(uuid.uuid4())},
@@ -532,6 +541,8 @@ def accept(binary, dump=False):
         # A registration is allowed to have no label. It is still named by what it
         # has — its agent id — and not by the native name it does not have.
         unnamed = fleet.register(None, location(joined, absent), birth_identity(joined_pid))
+        fleet.hold_lease(orphan)
+        fleet.hold_lease(unnamed)
         check(len({worker, expiring, orphan, unnamed}) == 4,
               "the registrations are not distinct")
 

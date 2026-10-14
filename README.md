@@ -822,7 +822,11 @@ title and label, which describe the pane rather than an agent.
   not contradict the pane because of it. `settling`, `delivered` and `unknown`
   projections stay reachable in the details.
 - A registration is placed at the workspace and tab its location names, or under
-  an `unplaced` root when it reports none. Children are not nested under their
+  an `unplaced` root when it reports none. A registration for another backend or
+  server is never shown, and one that names no pane, or a pane the inventory
+  lacks, is shown only while a publisher holds a live lease or the daemon
+  recorded a spawn edge for it, so a dead agent's record ages out of the tree.
+  `A` creates a new workspace whatever row is selected. Children are not nested under their
   parent: the exact spawn edge is shown in the details. An ordinary pane never
   duplicates a current or retained agent row.
 - Radar does not read Herdsman mailboxes, does not treat Herdr's agent name or

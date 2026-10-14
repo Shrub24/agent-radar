@@ -56,6 +56,9 @@ pub enum Action {
     /// opens it against the current observation, because eligibility is a
     /// property of the evidence, not of the cursor.
     BeginAction(Operation),
+    /// Create a new workspace. It needs no selected row, so it works when every
+    /// row on screen is unresolved.
+    NewWorkspace,
     /// Confirm was activated; the caller revalidates the frozen target and
     /// starts the close or manages the request when it still holds.
     ConfirmAction,
@@ -1681,6 +1684,9 @@ impl App {
             // Container controls act on a container Radar records rather than on an
             // owner: `a` adds a place inside it, `D` deletes it, `R` reloads its slot.
             KeyCode::Char('a') => return Some(Action::BeginAction(Operation::CreateContainer)),
+            // `A` starts a workspace from nowhere: nothing is selected, replaced or
+            // confirmed, because an addition cannot take anything away.
+            KeyCode::Char('A') => return Some(Action::NewWorkspace),
             KeyCode::Char('D') => return Some(Action::BeginAction(Operation::DeleteContainer)),
             KeyCode::Char('R') => return Some(Action::BeginAction(Operation::ReloadContainer)),
             KeyCode::Char('c') => self.dismiss_notices(),
@@ -2010,6 +2016,16 @@ impl App {
             subject: None,
             container_id: None,
         });
+    }
+
+    /// The control that creates a new workspace, whatever row is selected.
+    pub fn new_workspace(&self) -> Confirmed {
+        Confirmed::Container(crate::topology::Control::Create(ContainerCreate {
+            request_id: crate::control_plane::random_uuid(),
+            kind: ContainerCreateKind::Workspace,
+            label: None,
+            recipe: None,
+        }))
     }
 
     /// The container the selected row shows, when Radar records one for it.
@@ -3368,6 +3384,27 @@ mod tests {
     }
 
     /// Cycles to the view that lists every pane, for tests about pane rows.
+    #[test]
+    fn a_new_workspace_needs_no_selected_container() {
+        // A plain pane row records no container, so `a` has nothing to act on, but
+        // `A` still asks for a workspace.
+        let (_state, mut app) = fixture();
+        show_all_panes(&mut app);
+        select_row(&mut app, &RowId::Pane("wA:p3".into()));
+        assert!(app.selected_container().is_none());
+        assert_eq!(
+            press(&mut app, KeyCode::Char('A')),
+            Some(Action::NewWorkspace)
+        );
+        match app.new_workspace() {
+            Confirmed::Container(crate::topology::Control::Create(create)) => {
+                assert_eq!(create.kind, ContainerCreateKind::Workspace);
+                assert!(create.recipe.is_none());
+            }
+            _ => panic!("a workspace creation"),
+        }
+    }
+
     fn show_all_panes(app: &mut App) {
         while app.pane_view() != PaneView::All {
             app.cycle_panes();
