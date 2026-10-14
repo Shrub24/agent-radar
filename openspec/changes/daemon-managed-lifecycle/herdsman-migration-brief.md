@@ -4,7 +4,7 @@
 
 No Herdsman change is required just because Radar moved lifecycle state into its internal typed event log. Keep Herdsman's assignment, readiness, mailbox, result and supervision authority. Consume only Radar's documented daemon contracts; do not read its event-log files or reproduce its reducers.
 
-The current published Radar `main` observed in this workspace is `bef528ff`. It includes daemon-managed lifecycle contracts. This session did not verify which Radar binary or commit Herdsman currently runs; `daemon.ping` reports protocol and capabilities, not the build commit. Record the deployed pin separately before relying on a contract.
+The current published Radar `main` observed in this workspace is `4e62d6a1`. It includes daemon-managed lifecycle contracts and the TUI extraction. This session did not verify which Radar binary or commit Herdsman currently runs; `daemon.ping` reports protocol and capabilities, not the build commit. Record the deployed pin separately before relying on a contract.
 
 ## Existing integration
 
@@ -24,6 +24,6 @@ Only adopt this after deliberately selecting a Radar pin and checking its advert
 
 The public capability table and method semantics are in `docs/control-plane.md`; the spawn edge's optional subject binding is in `src/control_plane/registry/spawn.rs`. The end-to-end safety decisions are in `openspec/changes/daemon-managed-lifecycle/design.md`.
 
-## Not released from the current working copy
+## Current verification boundary
 
-The TUI extraction and the new muted rows for unbound/unjoined lifecycle subjects are still uncommitted here. They do not change Herdsman's contract, and should not be treated as deployed behavior. Final validation is in progress. No Herdsman-side pin change or migration is authorized by this brief.
+The TUI extraction and muted rows for unbound/unjoined lifecycle subjects are now pushed. Focused and full automated gates passed, but a PTY-specific managed-action test and live Pi/Herdsman acceptance remain open. These do not change Herdsman's contract. This brief does not authorize a Herdsman-side pin change or migration.
