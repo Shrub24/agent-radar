@@ -3415,6 +3415,12 @@ fn a_physical_backend_the_daemon_cannot_serve_refuses_startup() {
 /// reason names the unit.
 #[test]
 fn a_tmux_daemon_whose_server_unit_cannot_start_refuses_startup() {
+    // An installed template starts a server for any name, so the unit can start
+    // and there is no refusal to observe on this machine.
+    if tmux_unit_template_installed() {
+        eprintln!("skipping an unstartable server unit: the unit template is installed");
+        return;
+    }
     let name = format!("radar-test-absent-{}", std::process::id());
     let socket_file = tmux_socket(&name);
     let sandbox = Sandbox::new("backend-tmux-refused");
@@ -3499,6 +3505,17 @@ fn a_foreign_tmux_server_is_refused_and_not_adopted() {
         .status();
 }
 
+/// Whether this user's systemd already defines `radar-tmux@.service`, as the
+/// installed Home Manager module does.
+fn tmux_unit_template_installed() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "cat", "radar-tmux@.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// A disposable tmux server for the tests that serve one through the daemon.
 struct TmuxServer {
     name: String,
@@ -3526,22 +3543,31 @@ impl TmuxServer {
         let name = format!("radar-daemon-{}-{label}", std::process::id());
         // The server runs under the unit the daemon requires for its own servers,
         // so the daemon's ownership check sees the server it is meant to serve.
-        let started = Command::new("systemd-run")
-            .args(["--user", "--collect", "--quiet"])
-            .arg(format!("--unit=radar-tmux@{name}"))
-            .args([
-                "--property=Type=simple",
-                "--property=KillMode=control-group",
-                "tmux",
-                "-D",
-                "-L",
-                &name,
-                "-f",
-                "/dev/null",
-            ])
-            .status()
-            .expect("run systemd-run");
-        assert!(started.success(), "systemd-run did not start {name}");
+        // Where the real template is installed a transient unit of the same name
+        // is refused, so the template itself starts it.
+        let started = if tmux_unit_template_installed() {
+            Command::new("systemctl")
+                .args(["--user", "start", &format!("radar-tmux@{name}.service")])
+                .status()
+                .expect("run systemctl")
+        } else {
+            Command::new("systemd-run")
+                .args(["--user", "--collect", "--quiet"])
+                .arg(format!("--unit=radar-tmux@{name}"))
+                .args([
+                    "--property=Type=simple",
+                    "--property=KillMode=control-group",
+                    "tmux",
+                    "-D",
+                    "-L",
+                    &name,
+                    "-f",
+                    "/dev/null",
+                ])
+                .status()
+                .expect("run systemd-run")
+        };
+        assert!(started.success(), "the tmux unit did not start for {name}");
         let server = Self {
             socket: tmux_socket(&name),
             name,

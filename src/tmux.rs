@@ -375,6 +375,22 @@ impl RuntimeProvider for TmuxRuntime {
         // pane whose window or session record is missing, which the tree
         // tolerates rather than inventing a label for it.
         let sessions = self.run_whole(&["list-sessions", "-F", SESSION_FORMAT], cancel)?;
+        // A server the daemon owns starts with no session, and `list-windows -a`
+        // and `list-panes -a` fail with "no current target" there. An empty
+        // session list is an empty fleet, not an unreachable server; a session
+        // that vanishes between these reads still fails the sample and is kept
+        // stale like any other failed read.
+        if sessions.trim().is_empty() {
+            return Ok(FleetObservation {
+                metadata_agents: Vec::new(),
+                containers: Vec::new(),
+                lifecycle_subjects: Vec::new(),
+                workspaces: Vec::new(),
+                tabs: Vec::new(),
+                panes: Vec::new(),
+                agents: Vec::new(),
+            });
+        }
         let windows = self.run_whole(&["list-windows", "-a", "-F", WINDOW_FORMAT], cancel)?;
         let panes = self.run_whole(&["list-panes", "-a", "-F", PANE_FORMAT], cancel)?;
         Ok(FleetObservation {

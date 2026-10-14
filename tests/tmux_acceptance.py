@@ -173,10 +173,17 @@ class Fleet:
         self.sentinel()
         # The server runs under the unit the daemon requires for its own servers, so
         # the daemon's ownership check sees the server it is meant to serve.
-        subprocess.run(["systemd-run", "--user", "--collect", "--quiet",
-                        f"--unit=radar-tmux@{self.server}",
-                        "--property=Type=simple", "--property=KillMode=control-group",
-                        "tmux", "-D", "-L", self.server, "-f", "/dev/null"], check=True)
+        # An installed template refuses a transient unit of the same name, so it
+        # starts the server itself when present.
+        if subprocess.run(["systemctl", "--user", "cat", "radar-tmux@.service"],
+                          capture_output=True).returncode == 0:
+            subprocess.run(["systemctl", "--user", "start",
+                            f"radar-tmux@{self.server}.service"], check=True)
+        else:
+            subprocess.run(["systemd-run", "--user", "--collect", "--quiet",
+                            f"--unit=radar-tmux@{self.server}",
+                            "--property=Type=simple", "--property=KillMode=control-group",
+                            "tmux", "-D", "-L", self.server, "-f", "/dev/null"], check=True)
         deadline = time.monotonic() + WAIT
         while subprocess.run(["tmux", "-L", self.server, "show-options", "-g"],
                              capture_output=True).returncode != 0:

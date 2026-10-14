@@ -694,6 +694,34 @@ fn process_exists(pid: i32) -> bool {
         .success()
 }
 
+/// The daemon's server starts with no session, and `list-windows -a` and
+/// `list-panes -a` fail with "no current target" there, so a naive read would
+/// report the server unreachable when it is simply empty.
+#[test]
+fn an_inventory_of_a_server_with_no_session_is_an_empty_fleet_not_a_failure() {
+    let Some(probe) =
+        Probe::start("an_inventory_of_a_server_with_no_session_is_an_empty_fleet_not_a_failure")
+    else {
+        return;
+    };
+    probe.tmux(&["set-option", "-s", "exit-empty", "off"]);
+    probe.tmux(&["kill-session", "-t", "main"]);
+    assert!(
+        probe
+            .ids(&["list-sessions", "-F", "#{session_id}"])
+            .is_empty(),
+        "the server must still be up with no session"
+    );
+
+    let inventory = probe
+        .runtime
+        .inventory(&cancel())
+        .expect("an empty server is an empty fleet");
+    assert!(inventory.workspaces.is_empty());
+    assert!(inventory.tabs.is_empty());
+    assert!(inventory.panes.is_empty());
+}
+
 #[test]
 fn an_inventory_lists_the_server_with_handles_that_survive_reordering() {
     let Some(probe) =
