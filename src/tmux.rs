@@ -140,7 +140,7 @@ impl TmuxConfig {
     /// everything else.
     pub fn for_server(server: impl Into<String>) -> Self {
         Self {
-            executable: PathBuf::from("tmux"),
+            executable: PathBuf::from(crate::service::program("RADAR_TMUX", "tmux")),
             server: server.into(),
             command_timeout: Duration::from_secs(5),
         }

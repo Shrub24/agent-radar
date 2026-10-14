@@ -106,13 +106,14 @@ in
           # its panes: only the main process is signalled.
           KillMode = "process";
           Restart = "on-failure";
-          # The daemon runs `tmux` and `systemctl --user`; user units do not
-          # inherit the login shell's PATH.
+          # The daemon names `tmux` and `systemctl` by absolute path and carries no
+          # `PATH` of its own. tmux gives a new session the creating client's
+          # `PATH`, so a `PATH` set here would be the `PATH` of every pane. Left
+          # unset, panes inherit the user manager's, which holds the user's
+          # profiles.
           Environment = [
-            "PATH=${lib.makeBinPath [
-              cfg.tmuxPackage
-              pkgs.systemd
-            ]}"
+            "RADAR_TMUX=${cfg.tmuxPackage}/bin/tmux"
+            "RADAR_SYSTEMCTL=${pkgs.systemd}/bin/systemctl"
           ];
         };
       };

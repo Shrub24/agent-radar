@@ -23,8 +23,20 @@ pub fn tmux_unit(server: &str) -> String {
 }
 
 /// Runs `systemctl --user` with `arguments`.
+/// The executable the daemon runs for a tool.
+///
+/// A unit module names its tools by absolute path through `variable`, so the
+/// daemon needs no `PATH` of its own. That matters because tmux hands a session
+/// the creating client's `PATH`: a daemon given a minimal one would give every
+/// pane the same, instead of the user's own.
+pub fn program(variable: &str, default: &str) -> std::ffi::OsString {
+    std::env::var_os(variable)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.into())
+}
+
 pub fn systemctl(arguments: &[&str]) -> Result<Output, String> {
-    Command::new("systemctl")
+    Command::new(program("RADAR_SYSTEMCTL", "systemctl"))
         .arg("--user")
         .args(arguments)
         .output()
@@ -41,7 +53,7 @@ pub fn unit_active(unit: &str) -> bool {
 /// `show-options` reads global state and never starts a server, so asking does
 /// not change what is running.
 pub fn server_answers(server: &str) -> bool {
-    Command::new("tmux")
+    Command::new(program("RADAR_TMUX", "tmux"))
         .args(["-L", server, "show-options", "-g"])
         .output()
         .is_ok_and(|output| output.status.success())
@@ -95,7 +107,7 @@ pub fn server_panes(server: &str) -> Result<Option<Vec<String>>, String> {
     if !server_answers(server) {
         return Ok(None);
     }
-    let listing = Command::new("tmux")
+    let listing = Command::new(program("RADAR_TMUX", "tmux"))
         .args([
             "-L",
             server,
@@ -269,6 +281,28 @@ fn settle(result: Result<String, String>) -> (String, i32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tool_is_named_by_its_variable_and_otherwise_by_its_bare_name() {
+        // Distinct names, so no other test's environment is involved.
+        assert_eq!(
+            program("RADAR_TEST_TOOL_UNSET", "tmux"),
+            std::ffi::OsString::from("tmux")
+        );
+        // SAFETY: only this test reads or writes these two names.
+        unsafe {
+            std::env::set_var("RADAR_TEST_TOOL_SET", "/nix/store/x/bin/tmux");
+            std::env::set_var("RADAR_TEST_TOOL_EMPTY", "");
+        }
+        assert_eq!(
+            program("RADAR_TEST_TOOL_SET", "tmux"),
+            std::ffi::OsString::from("/nix/store/x/bin/tmux")
+        );
+        assert_eq!(
+            program("RADAR_TEST_TOOL_EMPTY", "tmux"),
+            std::ffi::OsString::from("tmux")
+        );
+    }
+
     use super::*;
 
     #[test]

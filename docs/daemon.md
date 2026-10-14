@@ -19,7 +19,12 @@ The daemon exposes physical control, registry reads/publications, and volatile b
 
 The physical backend defaults to tmux on the server named `radar`. Herdr is
 selected only explicitly with `RADAR_CONTROL_BACKEND=herdr`. The server name comes from
-`RADAR_TMUX_SERVER` or the `[daemon] tmux_server` setting. Registry calls work without a mux backend and do not publish
+`RADAR_TMUX_SERVER` or the `[daemon] tmux_server` setting. The daemon runs the
+executables named by `RADAR_TMUX` and `RADAR_SYSTEMCTL` (absolute paths in the
+Home Manager unit, `tmux` and `systemctl` from `PATH` otherwise), so its unit
+needs no `PATH`: tmux gives a new session its creator's `PATH`, and a unit with
+a minimal one would give every pane that instead of the user's profiles. A pane
+started before this change keeps its old `PATH`; make a new workspace. Registry calls work without a mux backend and do not publish
 through Herdr. The older mux `report` method still forwards state/session/metadata
 to the backend; it is **not** direct registry publication.
 
