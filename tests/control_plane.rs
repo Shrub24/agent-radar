@@ -220,6 +220,7 @@ impl RuntimeProvider for GatedBackend {
         Ok(FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: Vec::new(),
             tabs: Vec::new(),
             panes: Vec::new(),
@@ -262,6 +263,7 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
     FleetObservation {
         metadata_agents: Vec::new(),
         containers: Vec::new(),
+        lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: None,
@@ -413,6 +415,7 @@ const MUX_CAPABILITIES: &[&str] = &[
 /// both create a pane and run a command in it.
 const SPAWN_CAPABILITIES: &[&str] = &[
     "mux.observe",
+    "mux.focus",
     "mux.process_info",
     "mux.create",
     "mux.input",
@@ -762,6 +765,7 @@ impl MuxBackend {
             inventory: FleetObservation {
                 metadata_agents: Vec::new(),
                 containers: Vec::new(),
+                lifecycle_subjects: Vec::new(),
                 workspaces: Vec::new(),
                 tabs: Vec::new(),
                 panes: panes
@@ -1251,6 +1255,7 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
     let inventory = FleetObservation {
         metadata_agents: Vec::new(),
         containers: Vec::new(),
+        lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: Some("main".into()),
@@ -3730,37 +3735,49 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
     let pid = subject["process"]["pid"].as_i64().expect("captured pid") as i32;
 
     let cancel_id = random_uuid();
-    let cancelled = client.call_id(
-        &cancel_id,
-        "lifecycle.cancel",
-        json!({"request": {"subject_id": subject_id}}),
-    );
+    let selected =
+        agent_radar::control_plane::client::connect_at(&socket).expect("dashboard client");
+    let cancelled = selected
+        .lifecycle
+        .as_ref()
+        .expect("daemon lifecycle controls")
+        .cancel_subject(
+            &agent_radar::control_plane::client::LifecycleControlRequest {
+                request_id: cancel_id.clone(),
+                subject_id: subject_id.clone(),
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("lifecycle.cancel socket control");
+    assert_eq!(cancelled.outcome(), "completed", "{cancelled:?}");
     assert_eq!(
-        result_record(&cancelled)["outcome"],
-        "completed",
-        "{cancelled}"
-    );
-    assert_eq!(
-        result_record(&cancelled)["effects"],
+        cancelled.request["effects"],
         json!([
             "launch revoked",
             "sigterm dispatched",
             "pane cleaned up",
             "process exit verified"
         ]),
-        "{cancelled}"
+        "{cancelled:?}"
     );
     assert!(
         !Path::new(&format!("/proc/{pid}")).exists(),
         "captured process {pid} still runs"
     );
-    let replayed = client.call_id(
-        &cancel_id,
-        "lifecycle.cancel",
-        json!({"request": {"subject_id": subject_id}}),
-    );
+    let replayed = selected
+        .lifecycle
+        .as_ref()
+        .expect("daemon lifecycle controls")
+        .cancel_subject(
+            &agent_radar::control_plane::client::LifecycleControlRequest {
+                request_id: cancel_id,
+                subject_id,
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("same-ID lifecycle.cancel replay");
     assert_eq!(
-        replayed, cancelled,
+        replayed.request, cancelled.request,
         "a same-ID cancel replays without a second signal"
     );
 
@@ -5847,14 +5864,25 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
         .to_owned();
     let registration = client.call("agent.get", json!({"agent_id": &agent_id}));
     let close_id = random_uuid();
-    let first = client.call_id(
-        &close_id,
-        "spawn.close",
-        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
-    );
-    assert_eq!(first["result"]["close"]["outcome"], "completed", "{first}");
-    assert_eq!(first["result"]["close"]["intent"], "cancel");
-    assert_eq!(first["result"]["close"]["pane"], "wA:p2");
+    let selected =
+        agent_radar::control_plane::client::connect_at(daemon.path()).expect("dashboard client");
+    let first = selected
+        .lifecycle
+        .as_ref()
+        .expect("daemon lifecycle controls")
+        .close_child(
+            &close_id,
+            &agent_radar::registry_observation::ChildCloseTarget {
+                spawn_request_id: edge_id.clone(),
+                source: "test-publisher".into(),
+                incarnation: CHILD_INCARNATION.into(),
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("spawn.close through dashboard client");
+    assert_eq!(first.outcome(), "completed", "{first:?}");
+    assert_eq!(first.request["intent"], "cancel");
+    assert_eq!(first.request["pane"], "wA:p2");
     assert_eq!(
         backend.closed_targets(),
         vec![CloseTarget::Pane("wA:p2".into())]
@@ -7262,6 +7290,7 @@ fn empty_inventory() -> FleetObservation {
     FleetObservation {
         metadata_agents: Vec::new(),
         containers: Vec::new(),
+        lifecycle_subjects: Vec::new(),
         workspaces: Vec::new(),
         tabs: Vec::new(),
         panes: Vec::new(),
@@ -9038,6 +9067,7 @@ fn workspace_inventory(workspace_id: &str) -> FleetObservation {
     FleetObservation {
         metadata_agents: Vec::new(),
         containers: Vec::new(),
+        lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: workspace_id.into(),
             label: None,
@@ -9633,4 +9663,443 @@ fn the_client_refuses_a_container_control_the_daemon_does_not_serve() {
         "a contract the daemon does not serve is refused before it is sent"
     );
     daemon.stop();
+}
+
+/// What a fake backend serves for lead enrollment and restart: the spawn surface plus
+/// the tracking capability those operations are admitted under.
+const LEAD_CAPABILITIES: &[&str] = &[
+    "mux.observe",
+    "mux.focus",
+    "mux.process_info",
+    "mux.create",
+    "mux.input",
+    "mux.output",
+    "mux.report",
+    "mux.launch",
+    "mux.close",
+    "mux.launch_context",
+    "mux.lifecycle_tracking",
+];
+
+/// A real process standing in for a running lead. It is a shell that waits on its
+/// stdin and takes only flags, so its captured command line can be resumed. A reaper
+/// owns it, so a stopped lead is a gone process rather than a zombie.
+struct LeadProcess {
+    pid: i32,
+    identity: ProcessIdentity,
+}
+
+impl LeadProcess {
+    fn start() -> Self {
+        // A clean environment: the captured launch carries it into a restart, and the
+        // test runner's own variables are not part of a lead's launch.
+        let child = Command::new("/bin/sh")
+            .args(["-s", "--"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("a lead process");
+        let pid = child.id() as i32;
+        let identity = process_identity_from_proc(pid);
+        // `Child::wait` would close the piped stdin first and end the lead at once,
+        // so the reaper waits on the pid while it keeps the stdin open.
+        thread::spawn(move || {
+            let _stdin_kept_open = child;
+            let mut status = 0;
+            // SAFETY: reaping the pid this test spawned.
+            unsafe {
+                libc::waitpid(pid, &mut status, 0);
+            }
+        });
+        Self { pid, identity }
+    }
+
+    fn kill(&self) {
+        // SAFETY: signalling a pid this test started; a gone pid is refused by the kernel.
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Registers a lead whose claimed process is `lead`, in `pane`, publishing `session`.
+fn registered_lead(
+    client: &mut Client,
+    lead: &LeadProcess,
+    pane: &str,
+    session: &str,
+) -> (String, String) {
+    let mut body = registration_body(PARENT_INCARNATION, Some(lead.identity.clone()), None);
+    body["location"] = json!({"backend":"tmux", "pane":pane});
+    let agent = agent_id(&client.call("agent.register", body));
+    let context = client.call(
+        "agent.context",
+        json!({
+            "agent_id": agent,
+            "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
+            "sequence": 1,
+            "lease_ms": 10_000,
+            "context": {"session": session}
+        }),
+    );
+    assert!(context["result"].is_object(), "{context}");
+    let writer = context["result"]["writer"]["handle"]
+        .as_str()
+        .expect("context writer handle")
+        .to_owned();
+    (agent, writer)
+}
+
+fn enroll_lead(client: &mut Client, agent: &str, session: &str) -> Value {
+    client.call_id(
+        &random_uuid(),
+        "lifecycle.enroll",
+        json!({"request": {"agent_id": agent, "session": session}}),
+    )
+}
+
+/// The subject id an enrollment recorded, read from its settled effects.
+fn enrolled_subject(enrolled: &Value) -> String {
+    result_record(enrolled)["effects"]
+        .as_array()
+        .and_then(|effects| {
+            effects
+                .iter()
+                .filter_map(Value::as_str)
+                .find_map(|effect| effect.strip_prefix("enrolled subject "))
+        })
+        .expect("an enrolled subject effect")
+        .to_string()
+}
+
+fn restart_lead_subject_with_id(client: &mut Client, request_id: &str, subject: &str) -> Value {
+    client.call_id(
+        request_id,
+        "lifecycle.restart",
+        json!({"request": {"subject_id": subject}}),
+    )
+}
+
+fn restart_lead_subject(client: &mut Client, subject: &str) -> Value {
+    restart_lead_subject_with_id(client, &random_uuid(), subject)
+}
+
+#[test]
+fn enrollment_binds_a_verified_lead_and_refuses_a_second_binding() {
+    let sandbox = Sandbox::new("lead-enroll");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
+
+    let enrolled = enroll_lead(&mut client, &agent, TRACKED_SESSION);
+    assert_eq!(
+        result_record(&enrolled)["outcome"],
+        "completed",
+        "{enrolled}"
+    );
+    let subject = enrolled_subject(&enrolled);
+    let view = client.call("lifecycle.get", json!({"subject_id": subject}));
+    assert_eq!(view["result"]["subject"]["state"], "bound", "{view}");
+    let selected =
+        agent_radar::control_plane::client::connect_at(daemon.path()).expect("dashboard client");
+    let registry = selected
+        .provider
+        .registry(&AtomicBool::new(false))
+        .expect("registry read")
+        .expect("daemon registry");
+    assert!(
+        registry
+            .lifecycle
+            .iter()
+            .any(|record| record.subject_id == subject),
+        "lifecycle.list was not included in the registry projection: {registry:?}"
+    );
+    let public = view.to_string();
+    assert!(!public.contains("/bin/sh"), "private launch leaked: {view}");
+    assert!(
+        !public.contains("PATH"),
+        "private environment leaked: {view}"
+    );
+
+    let again = enroll_lead(&mut client, &agent, TRACKED_SESSION);
+    assert_eq!(result_record(&again)["outcome"], "refused", "{again}");
+    assert!(
+        result_record(&again)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already tracked")),
+        "{again}"
+    );
+    let stop_id = random_uuid();
+    let stopped = selected
+        .lifecycle
+        .as_ref()
+        .expect("daemon lifecycle controls")
+        .stop_subject(
+            &agent_radar::control_plane::client::LifecycleControlRequest {
+                request_id: stop_id.clone(),
+                subject_id: subject.clone(),
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("lifecycle.stop socket control");
+    assert_eq!(stopped.outcome(), "completed", "{stopped:?}");
+    let second_client = agent_radar::control_plane::client::connect_at(daemon.path())
+        .expect("second dashboard client");
+    let readback = second_client
+        .lifecycle
+        .as_ref()
+        .expect("second lifecycle controls")
+        .read_operation(&stop_id, &AtomicBool::new(false))
+        .expect("operation readback")
+        .expect("durable stop record");
+    assert_eq!(readback.outcome(), "completed", "{readback:?}");
+    assert!(
+        !process_exists(lead.pid),
+        "lifecycle.stop left the lead alive"
+    );
+
+    daemon.stop();
+    lead.kill();
+}
+
+#[test]
+fn enrollment_refuses_a_session_mismatch_and_a_foreign_foreground_without_binding() {
+    let sandbox = Sandbox::new("lead-enroll-refusals");
+    let lead = LeadProcess::start();
+    let other = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            other.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
+
+    let wrong_session = enroll_lead(&mut client, &agent, &random_uuid());
+    assert_eq!(error_code(&wrong_session), "refused", "{wrong_session}");
+
+    // The pane's foreground is another process, not the one the registration claims.
+    let foreign = enroll_lead(&mut client, &agent, TRACKED_SESSION);
+    assert_eq!(result_record(&foreign)["outcome"], "refused", "{foreign}");
+
+    let malformed = client.call(
+        "lifecycle.enroll",
+        json!({"request": {"agent_id": agent, "session": "not-a-uuid"}}),
+    );
+    assert_eq!(error_code(&malformed), "bad_params", "{malformed}");
+
+    let listed = client.call("lifecycle.list", json!({}));
+    assert_eq!(
+        listed["result"]["subjects"].as_array().map(Vec::len),
+        Some(0),
+        "a refused enrollment recorded a subject: {listed}"
+    );
+
+    daemon.stop();
+    lead.kill();
+    other.kill();
+}
+
+#[test]
+fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
+    let sandbox = Sandbox::new("lead-restart");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
+    let enrolled = enroll_lead(&mut client, &agent, TRACKED_SESSION);
+    let subject = enrolled_subject(&enrolled);
+
+    let restart_id = random_uuid();
+    let selected =
+        agent_radar::control_plane::client::connect_at(daemon.path()).expect("dashboard client");
+    let restarted = selected
+        .lifecycle
+        .as_ref()
+        .expect("daemon lifecycle controls")
+        .restart_subject(
+            &agent_radar::control_plane::client::LifecycleControlRequest {
+                request_id: restart_id.clone(),
+                subject_id: subject.clone(),
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("lifecycle.restart socket control");
+    let record = &restarted.request;
+    assert_eq!(record["outcome"], "completed", "{restarted:?}");
+    let effects = record["effects"].as_array().expect("effects");
+    assert_eq!(effects[0], "signalled previous process", "{restarted:?}");
+    assert_eq!(effects[1], "previous process exited", "{restarted:?}");
+    assert!(!process_exists(lead.pid), "the previous lead still runs");
+
+    let launches = backend.launches();
+    assert_eq!(launches.len(), 1, "one successor, got {launches:?}");
+    assert!(
+        launches[0]
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["--session", TRACKED_SESSION]),
+        "the successor resumes the live session: {:?}",
+        launches[0].argv
+    );
+
+    // A second restart of the same process generation names its successor and
+    // launches nothing more.
+    let replay = selected
+        .lifecycle
+        .as_ref()
+        .expect("daemon lifecycle controls")
+        .restart_subject(
+            &agent_radar::control_plane::client::LifecycleControlRequest {
+                request_id: restart_id.clone(),
+                subject_id: subject.clone(),
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("same-ID lifecycle.restart replay");
+    assert_eq!(
+        replay.request, restarted.request,
+        "same-ID replay returns the stored outcome"
+    );
+    assert_eq!(
+        backend.launches().len(),
+        1,
+        "a replay launched a second successor"
+    );
+
+    let again = restart_lead_subject(&mut client, &subject);
+    assert_eq!(result_record(&again)["outcome"], "refused", "{again}");
+    assert_eq!(
+        backend.launches().len(),
+        1,
+        "a second restart launched again"
+    );
+
+    daemon.stop();
+    lead.kill();
+}
+
+#[test]
+fn restart_refuses_before_any_signal_when_the_session_context_changes() {
+    let sandbox = Sandbox::new("lead-restart-refusals");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
+    let subject = enrolled_subject(&enroll_lead(&mut client, &agent, TRACKED_SESSION));
+
+    let unknown = restart_lead_subject(&mut client, &random_uuid());
+    assert_eq!(error_code(&unknown), "not_found", "{unknown}");
+    let malformed = client.call(
+        "lifecycle.restart",
+        json!({"request": {"subject_id": "not-a-uuid"}}),
+    );
+    assert_eq!(error_code(&malformed), "bad_params", "{malformed}");
+
+    // The lead's session changes after enrollment, so its resume recipe no longer
+    // names the live session.
+    let moved = client.call(
+        "agent.context",
+        json!({
+            "agent_id": agent,
+            "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
+            "writer_handle": _writer,
+            "sequence": 2,
+            "lease_ms": 10_000,
+            "context": {"session": random_uuid()}
+        }),
+    );
+    assert!(moved["result"].is_object(), "{moved}");
+    let stale = restart_lead_subject(&mut client, &subject);
+    assert_eq!(result_record(&stale)["outcome"], "refused", "{stale}");
+    assert!(
+        result_record(&stale)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no longer matches")),
+        "{stale}"
+    );
+    assert!(
+        process_exists(lead.pid),
+        "a session refusal signalled the lead"
+    );
+    assert!(backend.launches().is_empty());
+
+    daemon.stop();
+    lead.kill();
+}
+
+#[test]
+fn restart_refuses_when_the_lead_pane_is_no_longer_present() {
+    let sandbox = Sandbox::new("lead-restart-anchor");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+        .observing(&["wA:p9"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
+    let subject = enrolled_subject(&enroll_lead(&mut client, &agent, TRACKED_SESSION));
+
+    let anchorless = restart_lead_subject(&mut client, &subject);
+    assert_eq!(
+        result_record(&anchorless)["outcome"],
+        "refused",
+        "{anchorless}"
+    );
+    assert!(
+        result_record(&anchorless)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no longer present")),
+        "{anchorless}"
+    );
+    assert!(
+        process_exists(lead.pid),
+        "an anchor refusal signalled the lead"
+    );
+    assert!(backend.launches().is_empty());
+
+    daemon.stop();
+    lead.kill();
 }

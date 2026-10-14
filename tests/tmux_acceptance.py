@@ -578,11 +578,10 @@ def accept(binary, dump=False):
         check("execution: unknown — nothing reported" in orphan_panel, orphan_panel)
         check("facts: not reported" in orphan_panel, orphan_panel)
 
-        # A joined registration is managed by its owner but publishes no session
-        # lineage, so the owner-routed close has nothing to route to and refuses;
-        # an unresolved one is not joined to a pane at all. Neither falls through
-        # to a generic close, and neither offers a confirmation.
-        for name, refusal in (("accept worker", b"is managed but publishes no session lineage"),
+        # A registered worker without a daemon lifecycle subject cannot be
+        # controlled from its pane row; an unresolved registration is not joined
+        # to a pane at all. Neither falls back to owner files or generic close.
+        for name, refusal in (("accept worker", b"no daemon lifecycle subject"),
                               ("accept orphan", b"not joined to a pane")):
             fleet.select(name)
             pressed = fleet.keys(b"x", 0.4)

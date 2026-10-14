@@ -989,6 +989,24 @@ fn row_item(
                 }
             }
         }
+        RowKind::Lifecycle(lifecycle) => {
+            let moving = matches!(
+                lifecycle.subject.state,
+                crate::control_plane::lifecycle::State::Pending
+                    | crate::control_plane::lifecycle::State::Captured
+            );
+            let mark = match theme::command_frames().filter(|_| moving) {
+                Some(frames) => theme::frame(frames, tick).to_string(),
+                None => theme::pane_mark().to_string(),
+            };
+            let ink = palette.subtle;
+            spans.push(Span::styled(format!("{mark} "), Style::new().fg(ink)));
+            flex = Some(spans.len());
+            spans.push(Span::styled(
+                sanitize(row.node.row.title()),
+                Style::new().fg(ink),
+            ));
+        }
         RowKind::Task(task) => {
             // A task leaf: the published command where there is one and its id
             // otherwise, then the phase word as published, the age its start
@@ -1894,6 +1912,36 @@ fn overview_lines(
             }
             activity_lines(&agent.facts, blocks, page);
         }
+        RowKind::Lifecycle(lifecycle) => {
+            let subject = &lifecycle.subject;
+            page.push(field("kind", "unjoined lifecycle subject".to_string()));
+            page.push(field("subject", subject.subject_id.clone()));
+            page.push(field(
+                "state",
+                format!("{:?}", subject.state).to_lowercase(),
+            ));
+            page.push(field(
+                "binding",
+                subject
+                    .bound_agent_id
+                    .as_deref()
+                    .map(|agent| format!("unresolved registration {agent}"))
+                    .unwrap_or_else(|| "awaiting registration".to_string()),
+            ));
+            if let Some(process) = &subject.process {
+                page.push(field("captured pid", process.pid.to_string()));
+                page.push(field(
+                    "process start ticks",
+                    process.start_ticks.to_string(),
+                ));
+            } else {
+                page.push(field("captured process", unavailable()));
+            }
+            page.push(field(
+                "session",
+                subject.session.clone().unwrap_or_else(unavailable),
+            ));
+        }
         RowKind::Task(task) => {
             page.push(field("kind", "background task".to_string()));
             page.push(field("task", sanitize(&task.id.id)));
@@ -2160,6 +2208,21 @@ fn process_lines(
             }
             observed_process_lines(state, row, blocks, selection, page);
         }
+        RowKind::Lifecycle(lifecycle) => {
+            page.push(field(
+                "process evidence",
+                lifecycle
+                    .subject
+                    .process
+                    .as_ref()
+                    .map(|process| format!("captured pid {}", process.pid))
+                    .unwrap_or_else(unavailable),
+            ));
+            page.push(field(
+                "sample",
+                "not a joined agent process; no live metrics are attributed".to_string(),
+            ));
+        }
         RowKind::Task(task) => {
             let published = task.published.as_ref();
             page.push(match published.and_then(|published| published.pid) {
@@ -2344,6 +2407,10 @@ fn task_page_lines(row: &VisibleRow<'_>, blocks: &Blocks<'_>, page: &mut PageLin
         RowKind::Workspace { .. } => page.push(field(
             "tasks",
             "none — tasks are published per pane".to_string(),
+        )),
+        RowKind::Lifecycle(_) => page.push(field(
+            "tasks",
+            "not available until this subject joins an agent registration".to_string(),
         )),
     }
 }
@@ -3717,6 +3784,7 @@ mod tests {
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
@@ -3800,6 +3868,7 @@ mod tests {
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
@@ -4131,6 +4200,7 @@ mod tests {
         let mut observation = FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![crate::model::Workspace {
                 workspace_id: "wL".into(),
                 label: Some("long".into()),
@@ -8525,6 +8595,7 @@ mod tests {
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),
@@ -8558,7 +8629,34 @@ mod tests {
                     state: Some(SemanticState::Idle),
                     ..Default::default()
                 },
-                registry: None,
+                registry: Some(crate::registry_observation::RegistryView {
+                    agent: serde_json::from_value(serde_json::json!({
+                        "registration": {
+                            "version": 1,
+                            "agent_id": "managed-agent",
+                            "registered_at": "2026-01-01T00:00:00Z",
+                            "source": "test",
+                            "incarnation": "11111111-1111-4111-8111-111111111111",
+                            "location": {"backend":"tmux", "workspace":"wM", "tab":"wM:t1", "pane":"wM:p1"},
+                            "process_claimed": true,
+                            "launch": {"available": false}
+                        },
+                        "process": {"claim": {"boot_id":"boot", "pid":1234, "start_ticks":55}},
+                        "execution": null,
+                        "assignment": null,
+                        "facts": null
+                    })).expect("registry agent"),
+                    binding: crate::registry_observation::Binding::Joined,
+                    spawn: None,
+                    managed: Some(crate::registry_observation::ManagedSubject {
+                        subject_id: "subject-managed".into(),
+                        process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
+                        child_close: None,
+                        state: crate::control_plane::lifecycle::State::Bound,
+                        session: Some("01a10c77-8a6b-7035-8a0e-b1fa607bb507".into()),
+                        successor: None,
+                    }),
+                }),
             }],
         });
         state
@@ -8581,19 +8679,23 @@ mod tests {
     fn lifecycle_outcomes_render_on_the_footer_apart_from_the_source() {
         let state = fixture_state();
         let mut app = app_for(&state);
-        app.apply_managed_update(crate::lifecycle::Update {
-            id: "r1".into(),
-            label: "implementer-1".into(),
-            operation: crate::control::Operation::Close,
-            kind: crate::lifecycle::UpdateKind::Started,
+        app.apply_subject_outcome(crate::managed_control::Finished {
+            operation: crate::managed_control::Operation::Stop,
+            request_id: "r1".into(),
+            subject_id: "subject-1".into(),
+            result: Ok(crate::control_plane::client::LifecycleAnswer {
+                request: serde_json::json!({"outcome":"completed"}),
+            }),
+            close_request_id: None,
+            close_result: None,
         });
         let screen = render_text(&state, &app, 120, 30);
-        assert!(screen.contains("implementer-1"), "{screen}");
-        assert!(screen.contains("started"), "{screen}");
+        assert!(screen.contains("subject-1"), "{screen}");
+        assert!(screen.contains("completed"), "{screen}");
         assert!(screen.contains("c dismiss"), "{screen}");
         let notice = screen
             .lines()
-            .find(|line| line.contains("started"))
+            .find(|line| line.contains("completed"))
             .expect("a lifecycle line");
         assert!(
             !notice.contains("source:"),
@@ -8604,7 +8706,7 @@ mod tests {
         press(&mut app, 'c');
         assert!(app.lifecycle_notices().is_empty());
         let screen = render_text(&state, &app, 120, 30);
-        assert!(!screen.contains("started"), "{screen}");
+        assert!(!screen.contains("completed"), "{screen}");
         assert!(screen.contains("focus"), "{screen}");
     }
 }

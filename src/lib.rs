@@ -10,6 +10,7 @@ pub mod control_plane;
 pub mod focus;
 pub mod herdr;
 pub mod lifecycle;
+pub mod managed_control;
 pub mod model;
 pub mod observation;
 pub mod process_control;

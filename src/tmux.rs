@@ -380,6 +380,7 @@ impl RuntimeProvider for TmuxRuntime {
         Ok(FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: self.decode_sessions(&sessions)?,
             tabs: self.decode_windows(&windows)?,
             panes: self.decode_panes(&panes)?,

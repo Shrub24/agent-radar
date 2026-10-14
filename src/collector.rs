@@ -379,6 +379,22 @@ fn collect(
         .as_ref()
         .map(|read| read.containers.clone())
         .unwrap_or_default();
+    let lifecycle_subjects = registry
+        .as_ref()
+        .map(|read| {
+            read.lifecycle
+                .iter()
+                .map(|subject| crate::model::LifecycleObservation {
+                    subject_id: subject.subject_id.clone(),
+                    bound_agent_id: subject.bound_agent_id.clone(),
+                    process: subject.process.clone(),
+                    state: subject.state,
+                    session: subject.session.clone(),
+                    successor: subject.successor.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // Presented agents come from the registry alone. Where there is no registry,
     // none are presented; the backend's own records stay as containment evidence.
     let metadata_agents = std::mem::take(&mut observation.agents);
@@ -387,6 +403,7 @@ fn collect(
     });
     observation.metadata_agents = metadata_agents;
     observation.containers = containers;
+    observation.lifecycle_subjects = lifecycle_subjects;
     stamp_assignment_ages(&mut observation);
     RefreshOutcome::Success {
         observation,
@@ -470,6 +487,7 @@ mod tests {
             Ok(FleetObservation {
                 metadata_agents: Vec::new(),
                 containers: Vec::new(),
+                lifecycle_subjects: Vec::new(),
                 workspaces: Vec::new(),
                 tabs: Vec::new(),
                 panes: Vec::new(),

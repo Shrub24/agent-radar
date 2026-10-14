@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::bus::{BusEvent, BusState, Task};
-use crate::control::{self, ControlResult, Outcome};
 use crate::control_plane::client::{
     ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
 };
@@ -522,7 +521,7 @@ impl Visibility {
                 PaneView::Running => pane.command().is_some(),
                 PaneView::All => true,
             },
-            RowKind::Workspace { .. } | RowKind::Agent(_) => true,
+            RowKind::Workspace { .. } | RowKind::Agent(_) | RowKind::Lifecycle(_) => true,
         }
     }
 }
@@ -686,20 +685,26 @@ pub struct Confirmation {
     pub losses: Vec<String>,
     /// Whether Confirm is selected. Cancel is the default.
     pub confirm_selected: bool,
-    /// The exact owner-routed action, when this confirmation is a managed close
-    /// or restart rather than a direct runtime close.
-    pub managed: Option<lifecycle::ManagedRequest>,
+    /// Daemon-owned subject target for a managed lifecycle operation.
+    pub subject: Option<crate::registry_observation::ManagedSubject>,
     /// The container this confirmation acts on, when it is a container control:
     /// the daemon revalidates that exact record before it changes anything.
     pub container_id: Option<String>,
 }
 
-/// A confirmed action ready to run: a direct runtime close, or an owner-routed
-/// managed request.
+/// A confirmed action ready to run: direct unmanaged close, daemon lifecycle
+/// operation, or daemon topology control.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirmed {
     Direct(CloseRequest),
-    Managed(lifecycle::ManagedRequest),
+    /// A daemon-owned lifecycle control, targeted by stable subject id.
+    Subject {
+        operation: Operation,
+        request_id: String,
+        subject_id: String,
+        child_close: Option<crate::registry_observation::ChildCloseTarget>,
+        close_request_id: Option<String>,
+    },
     /// A container control, dispatched to the daemon under its own request id.
     Container(crate::topology::Control),
 }
@@ -1526,6 +1531,14 @@ impl App {
                 }
                 RowKind::Task(task) => command && task.is_running(),
                 RowKind::Pane(pane) => command && pane.command().is_some(),
+                RowKind::Lifecycle(row) => {
+                    command
+                        && matches!(
+                            row.subject.state,
+                            crate::control_plane::lifecycle::State::Pending
+                                | crate::control_plane::lifecycle::State::Captured
+                        )
+                }
                 RowKind::Workspace { .. } => false,
             })
     }
@@ -1825,6 +1838,7 @@ impl App {
                     RowId::Agent(pane_id) | RowId::Pane(pane_id) => format!("pane {pane_id}"),
                     RowId::Registered(agent_id) => format!("unresolved agent {agent_id}"),
                     RowId::Task(_) => unreachable!("a task is looked up through its owner row"),
+                    RowId::Lifecycle(subject_id) => format!("lifecycle subject {subject_id}"),
                 };
                 self.set_focus_message(Some(format!("{described} is not observed")));
                 None
@@ -1841,8 +1855,6 @@ impl App {
     /// the runtime, and only positive unmanaged evidence reaches the direct
     /// path. Nothing is sent here — Confirm is a separate act.
     pub fn begin_action(&mut self, operation: Operation, state: &ObservationState) {
-        // A container control names a container, not an owner-file request: it is
-        // confirmed against the container Radar records.
         if operation.is_container() {
             self.begin_container(operation, state);
             return;
@@ -1851,17 +1863,18 @@ impl App {
             self.set_focus_message(Some("nothing selected: no action target".to_string()));
             return;
         };
-        let (pane_id, tab_id, losses, is_agent) = match selected {
+        let (pane_id, tab_id, losses, is_agent, subject) = match selected {
             Selected::Agent {
                 pane_id,
                 tab_id,
                 losses,
-            } => (pane_id, tab_id, losses, true),
+                subject,
+            } => (pane_id, tab_id, losses, true, subject),
             Selected::Pane {
                 pane_id,
                 tab_id,
                 losses,
-            } => (pane_id, tab_id, losses, false),
+            } => (pane_id, tab_id, losses, false, None),
             Selected::Refused(reason) => {
                 let message = if operation == Operation::Restart {
                     "restart is only for a managed worker".to_string()
@@ -1880,35 +1893,32 @@ impl App {
             self.set_focus_message(Some("no current inventory: not acting".to_string()));
             return;
         };
-
-        // Restart is only ever a managed worker: an ordinary pane, a task or a
-        // workspace row refuses rather than inferring a process to signal.
         if operation == Operation::Restart {
             if !is_agent {
                 self.set_focus_message(Some("restart is only for a managed worker".to_string()));
                 return;
             }
-            let Some(agent) = inventory.agent_on_pane(&pane_id) else {
-                self.set_focus_message(Some(format!(
-                    "pane {pane_id} is not currently observed: nothing to restart"
-                )));
+            let Some(subject) = subject else {
+                self.set_focus_message(Some(
+                    "this agent has no daemon lifecycle subject".to_string(),
+                ));
                 return;
             };
-            if let Err(reason) = lifecycle::restartable(agent) {
-                self.set_focus_message(Some(format!(
-                    "pane {pane_id} cannot be restarted: {reason}"
-                )));
+            if subject.state != crate::control_plane::lifecycle::State::Bound
+                || subject.session.is_none()
+                || subject.successor.is_some()
+            {
+                self.set_focus_message(Some(
+                    "this lifecycle subject is not restartable".to_string(),
+                ));
                 return;
             }
-            match lifecycle::managed_request(inventory, &pane_id, control::Operation::Restart) {
-                Ok(managed) => {
-                    let mut losses = losses;
-                    losses.push("the worker is restarted in place; its session is retained".into());
-                    losses.push("asked of the worker's owner, not signalled directly".into());
-                    self.open_managed(operation, managed, losses);
-                }
-                Err(reason) => self.set_focus_message(Some(reason)),
-            }
+            let target = CloseTarget::Pane(pane_id);
+            let identity = lifecycle::identity(inventory, &target);
+            let mut losses = losses;
+            losses
+                .push("the verified process is stopped and resumed in its recorded session".into());
+            self.open_subject(operation, target, identity, subject, losses);
             return;
         }
 
@@ -1918,31 +1928,27 @@ impl App {
             Operation::Restart => unreachable!("restart returned above"),
             Operation::CreateContainer
             | Operation::DeleteContainer
-            | Operation::ReloadContainer => {
-                unreachable!("a container control returned above")
-            }
+            | Operation::ReloadContainer => unreachable!("a container control returned above"),
         };
         match containment_of(inventory, state, &target) {
-            // A tab with any managed or uncertain member refuses whole, so a
-            // container close never becomes a partial managed request.
             Containment::Managed if !matches!(operation, Operation::ClosePane) => {
                 if let Some(reason) = containment_refusal(Containment::Managed, &target) {
                     self.set_focus_message(Some(reason));
                 }
             }
-            // A managed pane close is the owner's to run, with exact identity.
             Containment::Managed => {
-                match lifecycle::managed_request(inventory, &pane_id, control::Operation::Close) {
-                    Ok(managed) => {
-                        let mut losses = losses;
-                        losses.push(
-                            "the owner decides; an active assignment may be abandoned".into(),
-                        );
-                        losses.push("asked of the worker's owner, not signalled directly".into());
-                        self.open_managed(operation, managed, losses);
-                    }
-                    Err(reason) => self.set_focus_message(Some(reason)),
-                }
+                let Some(subject) = subject else {
+                    self.set_focus_message(Some(
+                        "this managed agent has no daemon lifecycle subject".to_string(),
+                    ));
+                    return;
+                };
+                let identity = lifecycle::identity(inventory, &target);
+                let mut losses = losses;
+                losses.push(
+                    "Radar cancels the exact process; a recorded child pane closes only after verified exit".into(),
+                );
+                self.open_subject(operation, target, identity, subject, losses);
             }
             Containment::Uncertain => {
                 if let Some(reason) = containment_refusal(Containment::Uncertain, &target) {
@@ -1953,41 +1959,44 @@ impl App {
         }
     }
 
-    /// Opens the confirmation for a direct runtime close of unmanaged evidence.
-    fn open_direct(
+    fn open_subject(
         &mut self,
         operation: Operation,
         target: CloseTarget,
+        identity: TargetIdentity,
+        subject: crate::registry_observation::ManagedSubject,
         losses: Vec<String>,
-        state: &ObservationState,
     ) {
-        let Some(inventory) = state.inventory() else {
-            return;
-        };
-        // Freeze the observed identity now, not the cursor at Confirm: moving
-        // the selection while the dialog is up must not retarget it.
-        let identity = lifecycle::identity(inventory, &target);
-        let losses = match &target {
-            // A tab names what it holds: the selected row's own losses plus
-            // every member pane, so nothing closed with it is unnamed.
-            CloseTarget::Tab(tab_id) => {
-                let mut all = losses;
-                all.extend(tab_losses(inventory, tab_id));
-                all
-            }
-            CloseTarget::Pane(_) => losses,
-            // A workspace is deleted through the daemon's own container operation,
-            // whose losses are its members; this owner-file path has no workspace
-            // form and never opens a confirmation for one.
-            CloseTarget::Workspace(_) => losses,
-        };
         self.confirmation = Some(Confirmation {
             operation,
             target,
             identity,
             losses,
             confirm_selected: false,
-            managed: None,
+            subject: Some(subject),
+            container_id: None,
+        });
+    }
+
+    fn open_direct(
+        &mut self,
+        operation: Operation,
+        target: CloseTarget,
+        mut losses: Vec<String>,
+        state: &ObservationState,
+    ) {
+        let inventory = state.inventory().expect("current inventory");
+        if let CloseTarget::Tab(tab) = &target {
+            losses.extend(tab_losses(inventory, tab));
+        }
+        let identity = lifecycle::identity(inventory, &target);
+        self.confirmation = Some(Confirmation {
+            operation,
+            target,
+            identity,
+            losses,
+            confirm_selected: false,
+            subject: None,
             container_id: None,
         });
     }
@@ -2003,7 +2012,7 @@ impl App {
             RowKind::Workspace { container, .. } => container.as_ref(),
             RowKind::Agent(agent) => agent.container.as_ref(),
             RowKind::Pane(pane) => pane.container.as_ref(),
-            RowKind::Task(_) => None,
+            RowKind::Task(_) | RowKind::Lifecycle(_) => None,
         }
     }
 
@@ -2103,7 +2112,7 @@ impl App {
             identity,
             losses,
             confirm_selected: false,
-            managed: None,
+            subject: None,
             container_id: Some(container.container_id),
         });
     }
@@ -2198,24 +2207,6 @@ impl App {
         Some(Confirmed::Container(control))
     }
 
-    /// Opens the confirmation for an owner-routed managed action.
-    fn open_managed(
-        &mut self,
-        operation: Operation,
-        managed: lifecycle::ManagedRequest,
-        losses: Vec<String>,
-    ) {
-        self.confirmation = Some(Confirmation {
-            operation,
-            target: managed.target.clone(),
-            identity: managed.identity.clone(),
-            losses,
-            confirm_selected: false,
-            managed: Some(managed),
-            container_id: None,
-        });
-    }
-
     /// Revalidates an open confirmation against the latest current observation
     /// and hands back the frozen action when it still holds. A stale source,
     /// disappeared target or changed containment cancels it with a reason.
@@ -2238,7 +2229,8 @@ impl App {
             return None;
         }
         let actual = containment_of(inventory, state, &confirmation.target);
-        let refusal = match (confirmation.managed.is_some(), actual) {
+        let subject_managed = confirmation.subject.is_some();
+        let refusal = match (subject_managed, actual) {
             // A managed confirmation is only ever an owner request; a direct
             // one is only ever positive unmanaged evidence.
             (false, Containment::Unmanaged) | (true, Containment::Managed) => None,
@@ -2258,36 +2250,37 @@ impl App {
             self.set_focus_message(Some(format!("{described} changed: nothing was sent")));
             return None;
         }
-        // A restart stays tied to the owner's current idle advertisement: a
-        // worker that became busy between the dialog and Confirm is not asked.
-        if let Some(managed) = &confirmation.managed
-            && managed.operation == control::Operation::Restart
-        {
-            let pane_id = match &managed.target {
-                CloseTarget::Pane(pane_id) => pane_id.clone(),
-                CloseTarget::Tab(_) | CloseTarget::Workspace(_) => String::new(),
-            };
-            let idle = inventory
-                .agent_on_pane(&pane_id)
-                .is_some_and(|agent| lifecycle::restartable(agent).is_ok());
-            if !idle {
+        if let Some(expected) = &confirmation.subject {
+            let mut matches = inventory
+                .agents
+                .iter()
+                .filter_map(|agent| agent.registry.as_ref()?.managed.as_ref())
+                .filter(|current| {
+                    current.subject_id == expected.subject_id && *current == expected
+                });
+            if matches.next().is_none() || matches.next().is_some() {
                 self.set_focus_message(Some(format!(
-                    "{described} is no longer idle: nothing was requested"
+                    "{described} lifecycle binding changed: nothing was sent"
                 )));
                 return None;
             }
+            return Some(Confirmed::Subject {
+                operation: confirmation.operation,
+                request_id: crate::control_plane::random_uuid(),
+                subject_id: expected.subject_id.clone(),
+                close_request_id: expected
+                    .child_close
+                    .as_ref()
+                    .map(|_| crate::control_plane::random_uuid()),
+                child_close: expected.child_close.clone(),
+            });
         }
-        Some(match confirmation.managed {
-            Some(managed) => Confirmed::Managed(managed),
-            None => Confirmed::Direct(CloseRequest {
-                target: confirmation.target,
-                identity: confirmation.identity,
-            }),
-        })
+        Some(Confirmed::Direct(CloseRequest {
+            target: confirmation.target,
+            identity: confirmation.identity,
+        }))
     }
 
-    /// Records a lifecycle outcome from the owner-control worker, refining the
-    /// line for the same request rather than adding another.
     /// Records what a confirmed container control reported.
     ///
     /// The line keeps the request id the control was dispatched under, so an
@@ -2324,6 +2317,53 @@ impl App {
         }
     }
 
+    /// Records a daemon lifecycle outcome with its subject and request identity.
+    pub fn apply_subject_outcome(&mut self, finished: crate::managed_control::Finished) {
+        let crate::managed_control::Finished {
+            operation,
+            request_id,
+            subject_id,
+            result,
+            close_request_id,
+            close_result,
+        } = finished;
+        let verb = operation.verb();
+        match result {
+            Ok(answer) => {
+                let outcome = answer.outcome().to_string();
+                let mut text = format!("{verb} {outcome} for subject {subject_id} [{request_id}]");
+                if let Some(message) = answer.message() {
+                    text.push_str(&format!(": {message}"));
+                }
+                self.record_notice(request_id, text, outcome != "completed");
+            }
+            Err(message) => self.record_notice(
+                request_id.clone(),
+                format!(
+                    "{verb} outcome unknown for subject {subject_id} [{request_id}]: {message}"
+                ),
+                true,
+            ),
+        }
+        if let (Some(close_id), Some(close_result)) = (close_request_id, close_result) {
+            match close_result {
+                Ok(answer) => {
+                    let outcome = answer.outcome().to_string();
+                    let mut text = format!("pane cleanup {outcome} for subject {subject_id} [{close_id}]");
+                    if let Some(message) = answer.message() {
+                        text.push_str(&format!(": {message}"));
+                    }
+                    self.record_notice(close_id, text, outcome != "completed");
+                }
+                Err(message) => self.record_notice(
+                    close_id.clone(),
+                    format!("pane cleanup outcome unknown for subject {subject_id} [{close_id}]: {message}"),
+                    true,
+                ),
+            }
+        }
+    }
+
     /// Records one outcome line, refining a notice for the same request id rather
     /// than adding another.
     fn record_notice(&mut self, id: String, text: String, failed: bool) {
@@ -2334,12 +2374,6 @@ impl App {
             }
             None => self.notices.push(Notice { id, text, failed }),
         }
-    }
-
-    /// Applies one update from an owner-routed request.
-    pub fn apply_managed_update(&mut self, update: lifecycle::Update) {
-        let (failed, text) = lifecycle_notice(&update);
-        self.record_notice(update.id, text, failed);
     }
 
     /// Lifecycle outcomes, newest last, kept until dismissed.
@@ -2373,6 +2407,10 @@ impl App {
                 pane_id: agent.pane_id.clone(),
                 tab_id: agent.tab_id.clone(),
                 losses: agent_losses(agent),
+                subject: agent
+                    .registry
+                    .as_ref()
+                    .and_then(|view| view.managed.clone()),
             },
             RowKind::Pane(pane) => Selected::Pane {
                 pane_id: pane.pane_id.clone(),
@@ -2383,6 +2421,9 @@ impl App {
                 Selected::Refused("a workspace is not a close target: close a pane or its tab")
             }
             RowKind::Task(_) => Selected::Refused("a background task is not a close target"),
+            RowKind::Lifecycle(_) => {
+                Selected::Refused("a lifecycle status entry is not a pane close target")
+            }
         })
     }
 
@@ -2633,6 +2674,7 @@ enum Selected {
         pane_id: String,
         tab_id: String,
         losses: Vec<String>,
+        subject: Option<crate::registry_observation::ManagedSubject>,
     },
     Pane {
         pane_id: String,
@@ -2640,76 +2682,6 @@ enum Selected {
         losses: Vec<String>,
     },
     Refused(&'static str),
-}
-
-/// One lifecycle line for the operator: a refusal or refusal-shaped answer is a
-/// failure, an applied outcome is not. The text names the exact target and the
-/// effects that were actually applied, never one inferred from the operation.
-fn lifecycle_notice(update: &lifecycle::Update) -> (bool, String) {
-    let verb = match update.operation {
-        control::Operation::Close => "close",
-        control::Operation::Restart => "restart",
-    };
-    let label = &update.label;
-    match &update.kind {
-        lifecycle::UpdateKind::Submitted => (
-            false,
-            format!("{verb} requested for {label}: waiting for its owner"),
-        ),
-        lifecycle::UpdateKind::Failed(message) => {
-            (true, format!("{verb} not sent for {label}: {message}"))
-        }
-        lifecycle::UpdateKind::Started => (
-            false,
-            format!("{verb} started for {label}: outcome unknown, not retried"),
-        ),
-        lifecycle::UpdateKind::NotExecuted => (
-            false,
-            format!("{verb} not executed for {label}: the request expired unclaimed"),
-        ),
-        lifecycle::UpdateKind::Invalid(message) => (
-            true,
-            format!("{verb} evidence invalid for {label}: {message}"),
-        ),
-        lifecycle::UpdateKind::Answered(result) => answered_notice(verb, label, result),
-    }
-}
-
-/// The line for an owner's answer. `effects` is read verbatim: a `closed` over a
-/// lost generation reports only `process_ended`, so it must not claim a pane
-/// was closed or that this request killed the process.
-fn answered_notice(verb: &str, label: &str, result: &ControlResult) -> (bool, String) {
-    let effects = if result.effects.is_empty() {
-        "no effects".to_string()
-    } else {
-        format!("effects: {}", result.effects.join(", "))
-    };
-    match result.outcome {
-        Outcome::Refused => (
-            true,
-            format!(
-                "{verb} refused for {label}: [{}] {}",
-                result.category.as_deref().unwrap_or("refused"),
-                result.message
-            ),
-        ),
-        Outcome::Closed => {
-            let pane = if result.pane_closed() {
-                "pane closed"
-            } else {
-                "no pane was closed"
-            };
-            (
-                false,
-                format!("{verb} applied for {label}: {effects} ({pane})"),
-            )
-        }
-        Outcome::Restarted => (false, format!("{verb} applied for {label}: {effects}")),
-        Outcome::Unknown => (
-            true,
-            format!("{verb} outcome unknown for {label}: {}", result.message),
-        ),
-    }
 }
 
 /// Whether the target still exists in this inventory.
@@ -2864,6 +2836,7 @@ fn state_rank(node: &TreeNode) -> u8 {
         RowKind::Task(task) => task_rank(task),
         // A pane carries no state of its own, and a workspace carries none
         // except through what is beneath it.
+        RowKind::Lifecycle(_) => u8::MAX - 1,
         RowKind::Pane(_) | RowKind::Workspace { .. } => u8::MAX,
     };
     node.children
@@ -3593,6 +3566,7 @@ mod tests {
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![],
             tabs: vec![],
             panes: vec![],
@@ -3613,6 +3587,7 @@ mod tests {
         let observation = FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -3691,7 +3666,9 @@ mod tests {
     fn direct(confirmed: Confirmed) -> CloseRequest {
         match confirmed {
             Confirmed::Direct(request) => request,
-            Confirmed::Managed(_) | Confirmed::Container(_) => panic!("expected a direct close"),
+            Confirmed::Subject { .. } | Confirmed::Container(_) => {
+                panic!("expected a direct close")
+            }
         }
     }
 
@@ -3798,6 +3775,7 @@ mod tests {
         let observation = FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -4125,6 +4103,7 @@ mod tests {
         let observation = |session: &str| FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -4255,6 +4234,7 @@ mod tests {
         let observation = FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
@@ -4414,6 +4394,7 @@ mod tests {
         state.apply_success(FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),
@@ -4438,43 +4419,94 @@ mod tests {
                 session: None,
                 lineage,
                 facts,
-                registry: None,
+                registry: Some(crate::registry_observation::RegistryView {
+                    agent: serde_json::from_value(serde_json::json!({
+                        "registration": {
+                            "version": 1,
+                            "agent_id": "managed-agent",
+                            "registered_at": "2026-01-01T00:00:00Z",
+                            "source": "test",
+                            "incarnation": "11111111-1111-4111-8111-111111111111",
+                            "location": {"backend":"tmux", "workspace":"wM", "tab":"wM:t1", "pane":"wM:p1"},
+                            "process_claimed": true,
+                            "launch": {"available": false}
+                        },
+                        "process": {"claim": {"boot_id":"boot", "pid":1234, "start_ticks":55}},
+                        "execution": null,
+                        "assignment": null,
+                        "facts": null
+                    })).expect("registry agent"),
+                    binding: crate::registry_observation::Binding::Joined,
+                    spawn: None,
+                    managed: Some(crate::registry_observation::ManagedSubject {
+                        subject_id: "subject-managed".into(),
+                        process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
+                        child_close: None,
+                        state: crate::control_plane::lifecycle::State::Bound,
+                        session: Some(MANAGED_OWNER.into()),
+                        successor: None,
+                    }),
+                }),
             }],
         });
         state
     }
 
     #[test]
-    fn a_managed_worker_opens_an_owner_routed_confirmation() {
-        let state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
+    fn a_managed_worker_opens_a_daemon_subject_confirmation() {
+        let mut state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
+        let mut observation = state.inventory().expect("current inventory").clone();
+        observation.agents[0]
+            .registry
+            .as_mut()
+            .and_then(|view| view.managed.as_mut())
+            .expect("managed subject")
+            .child_close = Some(crate::registry_observation::ChildCloseTarget {
+            spawn_request_id: "spawn-edge".into(),
+            source: "worker".into(),
+            incarnation: "11111111-1111-4111-8111-111111111111".into(),
+        });
+        state.apply_success(observation);
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('x')),
-            Some(Action::BeginAction(Operation::ClosePane))
-        );
         app.begin_action(Operation::ClosePane, &state);
         let confirmation = app.confirmation().expect("a managed close confirmation");
         assert!(!confirmation.confirm_selected, "Cancel is the default");
-        let managed = confirmation.managed.as_ref().expect("owner-routed");
-        assert_eq!(managed.operation, control::Operation::Close);
-        assert_eq!(managed.label, "implementer-1");
-        assert_eq!(managed.owner_session, MANAGED_OWNER);
-        assert_eq!(managed.run_id, MANAGED_RUN);
-
-        // Confirm hands back the frozen owner request, never a direct close.
-        assert_eq!(press(&mut app, KeyCode::Tab), None);
+        assert_eq!(
+            confirmation
+                .subject
+                .as_ref()
+                .map(|subject| subject.subject_id.as_str()),
+            Some("subject-managed")
+        );
         match app.confirm(&state).expect("unchanged") {
-            Confirmed::Managed(request) => assert_eq!(request.run_id, MANAGED_RUN),
-            Confirmed::Direct(_) | Confirmed::Container(_) => {
-                panic!("a managed target is never a direct close")
+            Confirmed::Subject {
+                operation: Operation::ClosePane,
+                subject_id,
+                child_close,
+                close_request_id,
+                ..
+            } => {
+                assert_eq!(subject_id, "subject-managed");
+                assert_eq!(
+                    child_close,
+                    Some(crate::registry_observation::ChildCloseTarget {
+                        spawn_request_id: "spawn-edge".into(),
+                        source: "worker".into(),
+                        incarnation: "11111111-1111-4111-8111-111111111111".into(),
+                    })
+                );
+                assert!(close_request_id.is_some(), "pane cleanup has its own id");
+            }
+            Confirmed::Direct(_) | Confirmed::Container(_) | Confirmed::Subject { .. } => {
+                panic!("managed control must target its daemon subject")
             }
         }
     }
 
     #[test]
-    fn restart_is_offered_only_for_an_idle_managed_worker() {
+    fn restart_is_offered_for_a_bound_daemon_subject_with_a_session() {
         let state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
         let mut app = App::new();
         app.refresh(&state);
@@ -4484,15 +4516,16 @@ mod tests {
             Some(Action::BeginAction(Operation::Restart))
         );
         app.begin_action(Operation::Restart, &state);
-        let managed = app
+        let subject = app
             .confirmation()
             .expect("a restart confirmation")
-            .managed
-            .clone()
-            .expect("owner-routed");
-        assert_eq!(managed.operation, control::Operation::Restart);
+            .subject
+            .as_ref()
+            .expect("daemon subject");
+        assert_eq!(subject.subject_id, "subject-managed");
 
-        // A busy owner projection refuses without a mux fallback.
+        // The daemon, not owner projection or locally inferred status, decides
+        // whether the exact process can be restarted.
         let mut busy = managed_facts();
         busy.state = Some(crate::model::SemanticState::Working);
         let busy = managed_state(busy, RuntimeStatus::Working, Some(MANAGED_OWNER));
@@ -4500,23 +4533,16 @@ mod tests {
         app.refresh(&busy);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
         app.begin_action(Operation::Restart, &busy);
-        assert!(app.confirmation().is_none());
-        assert!(app.focus_message().expect("a reason").contains("idle"));
+        assert!(app.confirmation().is_some());
 
-        // A parentless worker (a lead or standalone session) has no owner.
+        // An enrolled lead's session does not require a parent owner.
         let orphan = managed_state(managed_facts(), RuntimeStatus::Idle, None);
         let mut app = App::new();
         app.refresh(&orphan);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
         app.begin_action(Operation::Restart, &orphan);
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message()
-                .expect("a reason")
-                .contains("no owner session"),
-            "{:?}",
-            app.focus_message()
-        );
+        assert!(app.confirmation().is_some());
+        app.handle_key(key(KeyCode::Esc));
 
         // A workspace or task row never infers a process to signal.
         select_row(&mut app, &RowId::Workspace("wM".into()));
@@ -4526,6 +4552,32 @@ mod tests {
             app.focus_message()
                 .expect("a reason")
                 .contains("managed worker")
+        );
+    }
+
+    #[test]
+    fn confirm_refuses_a_managed_target_when_process_generation_changes() {
+        let mut state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
+        let mut app = App::new();
+        app.refresh(&state);
+        select_row(&mut app, &RowId::Agent("wM:p1".into()));
+        app.begin_action(Operation::ClosePane, &state);
+        assert!(app.confirmation().is_some());
+
+        let mut replacement = state.inventory().expect("current inventory").clone();
+        replacement.agents[0]
+            .registry
+            .as_mut()
+            .and_then(|view| view.managed.as_mut())
+            .expect("managed subject")
+            .process
+            .start_ticks += 1;
+        state.apply_success(replacement);
+        assert!(app.confirm(&state).is_none());
+        assert!(
+            app.focus_message()
+                .expect("refusal")
+                .contains("binding changed")
         );
     }
 
@@ -4549,7 +4601,7 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_managed_worker_is_not_restarted_at_confirm() {
+    fn a_busy_worker_is_still_subject_targeted_for_daemon_refusal() {
         let state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
         let mut app = App::new();
         app.refresh(&state);
@@ -4560,32 +4612,25 @@ mod tests {
         let mut busy = managed_facts();
         busy.state = Some(crate::model::SemanticState::Working);
         let busy = managed_state(busy, RuntimeStatus::Working, Some(MANAGED_OWNER));
-        assert_eq!(app.confirm(&busy), None);
-        assert!(
-            app.focus_message().expect("a reason").contains("idle"),
-            "{:?}",
-            app.focus_message()
-        );
+        assert!(matches!(
+            app.confirm(&busy),
+            Some(Confirmed::Subject { .. })
+        ));
+        assert!(app.focus_message().is_none());
     }
 
     #[test]
-    fn a_derived_unknown_worker_is_not_restartable_even_when_the_owner_projects_idle() {
-        // The owner projects idle, but the pane reads unknown, so the derived
-        // state is unknown: restart is neither offered nor confirmed.
+    fn unknown_runtime_state_does_not_change_the_daemon_subject_target() {
+        // Process eligibility belongs to the daemon's exact subject contract,
+        // not to a local reconstruction of owner state.
         let unknown = managed_state(managed_facts(), RuntimeStatus::Unknown, Some(MANAGED_OWNER));
         let mut app = App::new();
         app.refresh(&unknown);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
         app.begin_action(Operation::Restart, &unknown);
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message().expect("a reason").contains("idle"),
-            "{:?}",
-            app.focus_message()
-        );
+        assert!(app.confirmation().is_some());
 
-        // The same worker read idle is offered, so the refusal above is the
-        // derived unknown and not the owner projection.
+        // The same subject still targets the same daemon record at confirmation.
         let idle = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
         let mut app = App::new();
         app.refresh(&idle);
@@ -4593,81 +4638,72 @@ mod tests {
         app.begin_action(Operation::Restart, &idle);
         assert!(app.confirmation().is_some());
 
-        // Confirm revalidates: a worker that reads unknown by then is refused.
-        assert_eq!(app.confirm(&unknown), None);
-        assert!(
-            app.focus_message().expect("a reason").contains("idle"),
-            "{:?}",
-            app.focus_message()
-        );
+        assert!(matches!(
+            app.confirm(&unknown),
+            Some(Confirmed::Subject { .. })
+        ));
     }
 
-    fn answered(outcome: Outcome, category: Option<&str>, effects: &[&str]) -> ControlResult {
-        ControlResult {
-            version: 1,
-            request_id: "a0000000-0000-4000-8000-000000000001".into(),
-            operation: control::Operation::Close,
-            outcome,
-            category: category.map(str::to_string),
-            message: "implementer-1 handled".into(),
-            effects: effects.iter().map(|effect| effect.to_string()).collect(),
-            completed_at: "2026-01-01T00:00:01.000Z".into(),
-        }
+    #[test]
+    fn managed_cancel_and_spawn_close_are_separate_operation_notices() {
+        let (_, mut app) = fixture();
+        app.apply_subject_outcome(crate::managed_control::Finished {
+            operation: crate::managed_control::Operation::Cancel,
+            request_id: "cancel-id".into(),
+            subject_id: "subject-1".into(),
+            result: Ok(crate::control_plane::client::LifecycleAnswer {
+                request: serde_json::json!({"outcome":"completed"}),
+            }),
+            close_request_id: Some("close-id".into()),
+            close_result: Some(Ok(crate::control_plane::client::LifecycleAnswer {
+                request: serde_json::json!({"outcome":"refused", "message":"pane generation changed"}),
+            })),
+        });
+        assert_eq!(app.lifecycle_notices().len(), 2);
+        assert!(app.lifecycle_notices()[0].text.contains("cancel completed"));
+        assert!(
+            app.lifecycle_notices()[1]
+                .text
+                .contains("pane cleanup refused")
+        );
+        assert!(app.lifecycle_notices()[1].text.contains("close-id"));
+        assert!(app.lifecycle_notices()[1].failed);
     }
 
     #[test]
     fn lifecycle_outcomes_are_kept_separately_and_dismissed() {
         let (_, mut app) = fixture();
         let id = "a0000000-0000-4000-8000-000000000001".to_string();
-        let update = |kind| lifecycle::Update {
-            id: id.clone(),
-            label: "implementer-1".into(),
-            operation: control::Operation::Close,
-            kind,
+        let finished = |outcome: &str, message: Option<&str>| crate::managed_control::Finished {
+            operation: crate::managed_control::Operation::Stop,
+            request_id: id.clone(),
+            subject_id: "subject-1".into(),
+            result: Ok(crate::control_plane::client::LifecycleAnswer {
+                request: serde_json::json!({"outcome": outcome, "message": message}),
+            }),
+            close_request_id: None,
+            close_result: None,
         };
-        app.apply_managed_update(update(lifecycle::UpdateKind::Submitted));
+        app.apply_subject_outcome(finished("completed", None));
         assert_eq!(app.lifecycle_notices().len(), 1);
-        assert!(app.lifecycle_notices()[0].text.contains("requested"));
+        assert!(app.lifecycle_notices()[0].text.contains("completed"));
         assert!(
             app.focus_message().is_none(),
             "kept apart from source/focus"
         );
 
-        // A later update about the same request refines its line.
-        app.apply_managed_update(update(lifecycle::UpdateKind::Started));
-        assert_eq!(app.lifecycle_notices().len(), 1);
-        assert!(app.lifecycle_notices()[0].text.contains("started"));
-
-        // An applied close shows the effects actually reported, and a lost
-        // generation's process-only close never claims a pane was closed.
-        app.apply_managed_update(update(lifecycle::UpdateKind::Answered(answered(
-            Outcome::Closed,
-            None,
-            &["process_ended"],
-        ))));
-        assert_eq!(app.lifecycle_notices().len(), 1);
-        let text = &app.lifecycle_notices()[0].text;
-        assert!(text.contains("process_ended"), "{text}");
-        assert!(text.contains("no pane was closed"), "{text}");
-        assert!(!app.lifecycle_notices()[0].failed);
-
-        // A refusal preserves the owner's category and is a failure.
-        app.apply_managed_update(update(lifecycle::UpdateKind::Answered(answered(
-            Outcome::Refused,
-            Some("agent_busy"),
-            &[],
-        ))));
+        app.apply_subject_outcome(finished("refused", Some("process identity changed")));
+        assert_eq!(
+            app.lifecycle_notices().len(),
+            1,
+            "same request refines its notice"
+        );
         assert!(app.lifecycle_notices()[0].failed);
-        assert!(app.lifecycle_notices()[0].text.contains("agent_busy"));
-
-        // A publication failure is its own line, since no request id exists.
-        app.apply_managed_update(lifecycle::Update {
-            id: "target-key".into(),
-            label: "implementer-1".into(),
-            operation: control::Operation::Close,
-            kind: lifecycle::UpdateKind::Failed("the control directory is not available".into()),
-        });
-        assert_eq!(app.lifecycle_notices().len(), 2);
+        assert!(
+            app.lifecycle_notices()[0]
+                .text
+                .contains("process identity changed")
+        );
 
         press(&mut app, KeyCode::Char('c'));
         assert!(app.lifecycle_notices().is_empty(), "dismissed");

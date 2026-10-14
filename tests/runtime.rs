@@ -1570,6 +1570,7 @@ fn tab_containment_ignores_other_tabs_but_refuses_foreign_panes_inside_owned_tab
     let inventory = |tabs: &[(&str, &str)], panes: &[(&str, &str, &str)]| FleetObservation {
         metadata_agents: Vec::new(),
         containers: Vec::new(),
+        lifecycle_subjects: Vec::new(),
         workspaces: vec![agent_radar::model::Workspace {
             workspace_id: "wA".into(),
             label: None,

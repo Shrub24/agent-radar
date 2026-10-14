@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::containers::PublicContainer;
+use crate::control_plane::lifecycle::State as LifecycleState;
 use crate::registry_observation::RegistryView;
 
 mod option_duration_millis {
@@ -560,8 +561,20 @@ impl AgentObservation {
     }
 }
 
-/// One successful inventory: all workspaces, tabs, panes and reported agents.
+/// Public lifecycle identity carried into the display projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleObservation {
+    pub subject_id: String,
+    pub bound_agent_id: Option<String>,
+    pub process: Option<ProcessIdentity>,
+    pub state: LifecycleState,
+    pub session: Option<String>,
+    pub successor: Option<String>,
+}
+
+/// One successful inventory: workspaces, tabs, panes, reported agents and
+/// daemon lifecycle subjects not represented by a joined agent row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetObservation {
     pub workspaces: Vec<Workspace>,
     pub tabs: Vec<Tab>,
@@ -579,6 +592,10 @@ pub struct FleetObservation {
     /// container was read — not that none exists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub containers: Vec<PublicContainer>,
+    /// Public lifecycle records from the same daemon read as agent facts. The
+    /// tree suppresses subjects already represented by a joined agent row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_subjects: Vec<LifecycleObservation>,
 }
 
 impl FleetObservation {

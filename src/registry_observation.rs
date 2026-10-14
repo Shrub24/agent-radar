@@ -44,9 +44,40 @@ pub struct RegistryAgent {
 pub struct RegistryRead {
     pub agents: Vec<RegistryAgent>,
     pub topology: Vec<PublicSpawnTopology>,
+    /// Daemon-owned lifecycle subjects. Only a unique, exact registration and
+    /// process-incarnation match can become a managed TUI target.
+    pub lifecycle: Vec<LifecycleSubject>,
     /// Durable containers, which the backend's own inventory does not carry: a
     /// fleet Radar created has a topology of its own.
     pub containers: Vec<PublicContainer>,
+}
+
+/// The safe identity fields from `lifecycle.list`; private launch data is never
+/// part of the dashboard's registry read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleSubject {
+    pub subject_id: String,
+    #[serde(default)]
+    pub bound_agent_id: Option<String>,
+    #[serde(default)]
+    pub process: Option<ProcessIdentity>,
+    pub state: crate::control_plane::lifecycle::State,
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub successor: Option<String>,
+}
+
+/// A daemon-owned process lifecycle target, joined to one registration by exact
+/// agent id and process birth identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedSubject {
+    pub subject_id: String,
+    pub process: ProcessIdentity,
+    pub child_close: Option<ChildCloseTarget>,
+    pub state: crate::control_plane::lifecycle::State,
+    pub session: Option<String>,
+    pub successor: Option<String>,
 }
 
 /// The process evidence `agent.list` serves beside a registration. Only the
@@ -93,7 +124,19 @@ pub enum Binding {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnBinding {
     pub parent: String,
+    pub request_id: String,
+    pub subject_id: Option<String>,
+    pub child_source: Option<String>,
+    pub child_incarnation: Option<String>,
     pub state: SpawnState,
+}
+
+/// Exact spawn-edge child identity required by `spawn.close`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildCloseTarget {
+    pub spawn_request_id: String,
+    pub source: String,
+    pub incarnation: String,
 }
 
 /// A registered agent with its binding, carried on the agent it projects to.
@@ -102,6 +145,7 @@ pub struct RegistryView {
     pub agent: RegistryAgent,
     pub binding: Binding,
     pub spawn: Option<SpawnBinding>,
+    pub managed: Option<ManagedSubject>,
 }
 
 /// Projects a registry read onto `inventory`'s panes as agent observations.
@@ -117,6 +161,7 @@ pub fn project(
     let RegistryRead {
         agents,
         topology,
+        lifecycle,
         containers: _,
     } = read;
     let foreground: HashMap<&str, &ProcessIdentity> = evidence
@@ -168,6 +213,9 @@ pub fn project(
                 _ => last_location(&agent),
             };
             let spawn = spawn_binding(&agent, &topology);
+            let managed = (binding == Binding::Joined)
+                .then(|| managed_subject(&agent, &lifecycle, spawn.as_ref()))
+                .flatten();
             AgentObservation {
                 location,
                 name: None,
@@ -180,6 +228,7 @@ pub fn project(
                     agent,
                     binding,
                     spawn,
+                    managed,
                 }),
             }
         })
@@ -222,6 +271,40 @@ fn bind(
     }
 }
 
+/// The managed subject for a registration, if exactly one public subject names
+/// both its agent id and claimed process incarnation.
+fn managed_subject(
+    agent: &RegistryAgent,
+    subjects: &[LifecycleSubject],
+    spawn: Option<&SpawnBinding>,
+) -> Option<ManagedSubject> {
+    let claim = agent.process.claim.as_ref()?;
+    let mut matches = subjects.iter().filter(|subject| {
+        subject.bound_agent_id.as_deref() == Some(agent.registration.agent_id.as_str())
+            && subject.process.as_ref() == Some(claim)
+    });
+    let subject = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(ManagedSubject {
+        subject_id: subject.subject_id.clone(),
+        process: claim.clone(),
+        child_close: spawn
+            .filter(|spawn| spawn.subject_id.as_deref() == Some(subject.subject_id.as_str()))
+            .and_then(|spawn| {
+                Some(ChildCloseTarget {
+                    spawn_request_id: spawn.request_id.clone(),
+                    source: spawn.child_source.clone()?,
+                    incarnation: spawn.child_incarnation.clone()?,
+                })
+            }),
+        state: subject.state,
+        session: subject.session.clone(),
+        successor: subject.successor.clone(),
+    })
+}
+
 /// The spawn edge a registration's exact identity is bound by, when one exists.
 fn spawn_binding(agent: &RegistryAgent, topology: &[PublicSpawnTopology]) -> Option<SpawnBinding> {
     let id = agent.registration.agent_id.as_str();
@@ -235,6 +318,14 @@ fn spawn_binding(agent: &RegistryAgent, topology: &[PublicSpawnTopology]) -> Opt
         })
         .map(|edge| SpawnBinding {
             parent: edge.edge.parent.clone(),
+            request_id: edge.edge.request_id.clone(),
+            subject_id: edge.edge.subject_id.clone(),
+            child_source: edge.edge.bound.as_ref().map(|bound| bound.source.clone()),
+            child_incarnation: edge
+                .edge
+                .bound
+                .as_ref()
+                .map(|bound| bound.incarnation.clone()),
             state: edge.state,
         })
 }
@@ -384,6 +475,7 @@ mod tests {
         FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: Vec::new(),
             tabs: Vec::new(),
             panes,
@@ -588,7 +680,7 @@ mod tests {
         let read = RegistryRead {
             agents: vec![agent],
             topology: vec![edge],
-            containers: Vec::new(),
+            ..RegistryRead::default()
         };
         let projected = project(&panes, &herdr(), read, &[]);
         let view = projected[0].registry.as_ref().expect("registry view");
@@ -596,8 +688,103 @@ mod tests {
             view.spawn,
             Some(SpawnBinding {
                 parent: "parent-1".into(),
+                request_id: "r1".into(),
+                subject_id: None,
+                child_source: Some("test".into()),
+                child_incarnation: Some("11111111-1111-4111-8111-111111111111".into()),
                 state: SpawnState::Bound,
             })
+        );
+    }
+
+    #[test]
+    fn lifecycle_subject_joins_only_on_agent_and_process_birth_identity() {
+        let claim = identity(10, 1);
+        let panes = inventory(vec![pane("p1", "t1")]);
+        let agent = registered("lead", at("p1"), Some(claim.clone()));
+        let subject = LifecycleSubject {
+            subject_id: "subject-1".into(),
+            bound_agent_id: Some("lead".into()),
+            process: Some(claim.clone()),
+            state: crate::control_plane::lifecycle::State::Bound,
+            session: Some("session".into()),
+            successor: None,
+        };
+        let edge: PublicSpawnTopology = serde_json::from_value(json!({
+            "version": 1,
+            "request_id": "spawn-1",
+            "parent": "parent-1",
+            "subject_id": "subject-1",
+            "created": "completed",
+            "launched": "completed",
+            "bound": {"source":"lead", "incarnation":"11111111-1111-4111-8111-111111111111", "agent_id":"lead", "bound_at":"2026-01-01T00:00:00.000Z"},
+            "recorded_at": "2026-01-01T00:00:00.000Z",
+            "state": "bound"
+        })).expect("spawn edge");
+        let read = RegistryRead {
+            agents: vec![agent.clone()],
+            topology: vec![edge.clone()],
+            lifecycle: vec![subject.clone()],
+            ..RegistryRead::default()
+        };
+        let projected = project(&panes, &herdr(), read, &[foreground("p1", claim.clone())]);
+        assert_eq!(
+            projected[0]
+                .registry
+                .as_ref()
+                .and_then(|view| view.managed.as_ref())
+                .map(|managed| managed.subject_id.as_str()),
+            Some("subject-1")
+        );
+        assert_eq!(
+            projected[0]
+                .registry
+                .as_ref()
+                .and_then(|view| view.managed.as_ref())
+                .and_then(|managed| managed.child_close.as_ref()),
+            Some(&ChildCloseTarget {
+                spawn_request_id: "spawn-1".into(),
+                source: "lead".into(),
+                incarnation: "11111111-1111-4111-8111-111111111111".into(),
+            })
+        );
+
+        let replaced = LifecycleSubject {
+            process: Some(identity(10, 2)),
+            ..subject.clone()
+        };
+        let duplicate = LifecycleSubject {
+            subject_id: "subject-2".into(),
+            ..subject.clone()
+        };
+        for lifecycle in [vec![replaced], vec![duplicate.clone(), duplicate.clone()]] {
+            let read = RegistryRead {
+                agents: vec![agent.clone()],
+                lifecycle,
+                ..RegistryRead::default()
+            };
+            let projected = project(&panes, &herdr(), read, &[foreground("p1", claim.clone())]);
+            assert!(
+                projected[0]
+                    .registry
+                    .as_ref()
+                    .is_some_and(|view| view.managed.is_none())
+            );
+        }
+
+        let unjoined = registered("lead", at("p9"), Some(claim.clone()));
+        let read = RegistryRead {
+            agents: vec![unjoined],
+            topology: vec![edge],
+            lifecycle: vec![subject],
+            ..RegistryRead::default()
+        };
+        let projected = project(&panes, &herdr(), read, &[foreground("p1", claim)]);
+        assert!(
+            projected[0]
+                .registry
+                .as_ref()
+                .is_some_and(|view| view.managed.is_none())
         );
     }
 

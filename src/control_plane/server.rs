@@ -3331,7 +3331,7 @@ fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
 /// applies exactly the policy Radar's direct close applies — fresh inventory,
 /// frozen-identity match, positive-unmanaged containment — and never a second
 /// implementation of it. A location its owner manages is refused here; there is
-/// no daemon route that closes it directly, and managed close stays owner-routed.
+/// no generic close route may signal it; managed close uses subject cancellation followed by spawn.close.
 fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
     let allowed: &[&str] = &["request", "requester"];
     if request
@@ -5547,6 +5547,12 @@ fn execute_restart(
             );
         }
     };
+    if crate::model::SessionUuid::parse(&params.subject_id).is_none() {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(Code::BadParams, "`subject_id` must be a canonical UUID"),
+        );
+    }
     let requester = match request.optional_string("requester") {
         Ok(requester) => requester,
         Err(refusal) => return Response::refused(&request.id, &refusal),

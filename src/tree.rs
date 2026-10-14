@@ -17,8 +17,8 @@ use std::time::Duration;
 use crate::bus::{BusSession, BusState, Task};
 use crate::control_plane::containers::Kind;
 use crate::model::{
-    AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Pane,
-    TerminalMode,
+    AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, LifecycleObservation,
+    Lineage, Pane, TerminalMode,
 };
 use crate::observation::{ObservationState, RetentionBasis};
 use crate::registry_observation::{Binding, RegistryView};
@@ -135,6 +135,8 @@ pub enum RowId {
     Pane(String),
     /// Background-task row, keyed by owner, session and task id.
     Task(TaskId),
+    /// A daemon lifecycle subject not yet represented by a joined agent row.
+    Lifecycle(String),
 }
 
 /// A display-ready row: everything the tree needs to place it and the detail
@@ -157,6 +159,7 @@ impl TreeRow {
             } => label.as_deref().unwrap_or(workspace_id),
             RowKind::Agent(agent) => &agent.title,
             RowKind::Pane(pane) => &pane.title,
+            RowKind::Lifecycle(lifecycle) => &lifecycle.title,
             // A task's label is its published command where there is one and
             // its id otherwise: the id is the identity, the command is what a
             // human recognises.
@@ -180,6 +183,10 @@ impl TreeRow {
             // A task's label may be its command, so its id is matched beside
             // it: the id is what a filter is usually typed from.
             RowKind::Task(task) => [Some(&task.id.id), None],
+            RowKind::Lifecycle(lifecycle) => [
+                Some(&lifecycle.subject.subject_id),
+                Some(lifecycle_state_label(lifecycle.subject.state)),
+            ],
             _ => [None, None],
         };
         std::iter::once(Some(self.title()))
@@ -236,6 +243,15 @@ pub enum RowKind {
     Pane(Box<PaneRow>),
     /// A background task, a leaf under the agent row it joins.
     Task(Box<TaskRow>),
+    /// A daemon subject awaiting registration or a resolved physical join.
+    Lifecycle(Box<LifecycleRow>),
+}
+
+/// A daemon lifecycle subject without a joined agent row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleRow {
+    pub subject: LifecycleObservation,
+    pub title: String,
 }
 
 /// An agent row: current facts, or the last-observed facts of a retained
@@ -576,6 +592,33 @@ impl FleetTree {
             siblings.push(pane_node);
         }
 
+        let represented: HashSet<&str> = inventory
+            .agents
+            .iter()
+            .filter_map(|agent| agent.registry.as_ref()?.managed.as_ref())
+            .map(|subject| subject.subject_id.as_str())
+            .collect();
+        for subject in &inventory.lifecycle_subjects {
+            if subject.state == crate::control_plane::lifecycle::State::Revoked
+                || represented.contains(subject.subject_id.as_str())
+            {
+                continue;
+            }
+            let state = lifecycle_state_label(subject.state);
+            let short_id = subject.subject_id.get(..8).unwrap_or(&subject.subject_id);
+            let title = format!("{state} · subject {short_id}");
+            roots.push(TreeNode {
+                row: TreeRow {
+                    id: RowId::Lifecycle(subject.subject_id.clone()),
+                    kind: RowKind::Lifecycle(Box::new(LifecycleRow {
+                        subject: subject.clone(),
+                        title,
+                    })),
+                },
+                children: Vec::new(),
+            });
+        }
+
         FleetTree { roots }
     }
 
@@ -591,6 +634,15 @@ impl FleetTree {
         for node in &mut self.roots {
             attach_node_tasks(node, bus);
         }
+    }
+}
+
+fn lifecycle_state_label(state: crate::control_plane::lifecycle::State) -> &'static str {
+    match state {
+        crate::control_plane::lifecycle::State::Pending => "pending",
+        crate::control_plane::lifecycle::State::Captured => "starting",
+        crate::control_plane::lifecycle::State::Bound => "unresolved",
+        crate::control_plane::lifecycle::State::Revoked => "revoked",
     }
 }
 
@@ -1133,6 +1185,7 @@ mod tests {
             agents: Vec::new(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
         };
         let mut state = ObservationState::new();
         state.apply_success(observation.clone());
@@ -1222,6 +1275,7 @@ mod tests {
                 workspace_container("c1", "wA", "work", None),
                 pane_container("c2", "wA:p1", None),
             ],
+            lifecycle_subjects: Vec::new(),
         };
         let mut state = ObservationState::new();
         state.apply_success(observation.clone());
@@ -1439,6 +1493,7 @@ mod tests {
         let observation = FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
                 workspace_id: "wX".into(),
                 label: Some("mixed".into()),
@@ -1581,7 +1636,10 @@ mod tests {
         for (_, id, _) in &rows {
             let pane = match id {
                 RowId::Agent(pane) | RowId::Pane(pane) => Some(pane.as_str()),
-                RowId::Workspace(_) | RowId::Registered(_) | RowId::Task(_) => None,
+                RowId::Workspace(_)
+                | RowId::Registered(_)
+                | RowId::Task(_)
+                | RowId::Lifecycle(_) => None,
             };
             if let Some(pane) = pane {
                 assert!(seen_panes.insert(pane), "duplicate row for pane {pane}");
@@ -1656,5 +1714,52 @@ mod tests {
     fn pending_source_projects_an_empty_tree() {
         let state = ObservationState::new();
         assert_eq!(FleetTree::build(&state), FleetTree::default());
+    }
+
+    #[test]
+    fn unmatched_active_lifecycle_subjects_have_logical_rows_without_fake_panes() {
+        let observation = FleetObservation {
+            lifecycle_subjects: vec![
+                LifecycleObservation {
+                    subject_id: "subject-pending".into(),
+                    bound_agent_id: None,
+                    process: None,
+                    state: crate::control_plane::lifecycle::State::Pending,
+                    session: None,
+                    successor: None,
+                },
+                LifecycleObservation {
+                    subject_id: "subject-bound-unjoined".into(),
+                    bound_agent_id: Some("agent-old".into()),
+                    process: Some(crate::model::ProcessIdentity {
+                        boot_id: "boot".into(),
+                        pid: 42,
+                        start_ticks: 7,
+                    }),
+                    state: crate::control_plane::lifecycle::State::Bound,
+                    session: None,
+                    successor: None,
+                },
+                LifecycleObservation {
+                    subject_id: "subject-revoked".into(),
+                    bound_agent_id: None,
+                    process: None,
+                    state: crate::control_plane::lifecycle::State::Revoked,
+                    session: None,
+                    successor: None,
+                },
+            ],
+            ..FleetObservation::default()
+        };
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let tree = FleetTree::build(&state);
+        let rows = flatten(&tree);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, RowId::Lifecycle("subject-pending".into()));
+        assert!(rows[0].2.contains("pending"));
+        assert_eq!(rows[1].1, RowId::Lifecycle("subject-bound-unjoined".into()));
+        assert!(rows[1].2.contains("unresolved"));
+        assert!(rows.iter().all(|(_, id, _)| !matches!(id, RowId::Pane(_))));
     }
 }

@@ -16,6 +16,7 @@ of the detail.
 | Clear stuck unfinished operations | (a) operator command that marks an operation abandoned with a durable reason; (b) reaper after a deadline with visible outcome | P1 | medium | First real stuck record blocks a server stop |
 | Restart rollback gap | (a) accept and reconcile on next start (current); (b) compensating successor record | P3 | medium | A failed successor write is observed in live use |
 | Restart and recovery live acceptance | Disposable tmux/Pi run: daemon kill, TUI quit, server replacement, lost response | P1 | high | Live run (user) |
+| Lifecycle tracing spans | Add `tracing` spans correlated by subject and operation IDs around admission, effect dispatch, observation and recovery; keep the durable typed event log authoritative | P2 | high | Production diagnosis needs timing/cross-thread context beyond replayable events |
 | Native systemd ordering and switch behaviour | Verify `keep-old` / `X-SwitchMethod` keeps a tmux server through a real Home Manager switch; add `Wants=`/`After=` for daemon edges | P1 | medium | Live switch on a real machine |
 | Checked Home Manager evaluation (daemon-service 6.3) | (a) add a Home Manager input used only by a check; (b) rely on live acceptance (current choice) | P3 | medium | Module option wiring breaks unnoticed |
 | Non-Nix unit generation | (a) keep Nix as the only module (current); (b) generate FHS unit files from the flake in CI | P3 | medium | A non-Nix install is actually needed, or packaging diverges from the module |

@@ -40,7 +40,7 @@ use super::registry::PublicSpawnTopology;
 use super::{MAX_LINE_BYTES, PROTOCOL_VERSION, random_uuid, socket_path, trusted_socket};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::{FleetObservation, ForegroundEvidence};
-use crate::registry_observation::{RegistryAgent, RegistryRead};
+use crate::registry_observation::{LifecycleSubject, RegistryAgent, RegistryRead};
 use crate::runtime::{
     BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedIdentity,
     CreatedKind, CreatedLocation, FocusOutcome, InputOutcome, InputRequest, OutputOutcome,
@@ -82,6 +82,13 @@ struct ContainerPage {
     next: Option<String>,
 }
 
+/// One `lifecycle.list` answer.
+#[derive(Deserialize)]
+struct LifecyclePage {
+    subjects: Vec<LifecycleSubject>,
+    next_after: Option<String>,
+}
+
 /// The label this caller's records carry, so an operator reading the store knows
 /// who asked.
 const REQUESTER: &str = "radar";
@@ -117,6 +124,12 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     ops::SPAWN_CLOSE_CONTRACT,
     ops::SPAWN_LAUNCH_CONTEXT_CONTRACT,
     ops::SPAWN_EXIT_OBSERVATION_CONTRACT,
+    ops::LIFECYCLE_GET_CONTRACT,
+    ops::LIFECYCLE_LIST_CONTRACT,
+    ops::LIFECYCLE_CANCEL_CONTRACT,
+    ops::LIFECYCLE_STOP_CONTRACT,
+    ops::LIFECYCLE_ENROLL_CONTRACT,
+    ops::LIFECYCLE_RESTART_CONTRACT,
 ];
 
 /// The daemon as a [`RuntimeProvider`].
@@ -324,9 +337,24 @@ impl RuntimeProvider for DaemonRuntime {
         } else {
             Vec::new()
         };
+        let lifecycle = if self.declared.contains(&ops::LIFECYCLE_LIST_CONTRACT) {
+            self.read_all(
+                "lifecycle.list",
+                "managed lifecycle subjects",
+                deadline,
+                cancel,
+                |value| {
+                    let page: LifecyclePage = serde_json::from_value(value)?;
+                    Ok((page.subjects, page.next_after))
+                },
+            )?
+        } else {
+            Vec::new()
+        };
         Ok(Some(RegistryRead {
             agents,
             topology,
+            lifecycle,
             containers,
         }))
     }
@@ -430,6 +458,7 @@ impl RuntimeProvider for DaemonRuntime {
 pub struct Selected {
     pub provider: Arc<dyn RuntimeProvider>,
     pub containers: Option<Arc<dyn ContainerControls>>,
+    pub lifecycle: Option<Arc<dyn LifecycleControls>>,
 }
 
 /// Connects to the daemon at its documented socket and proves it usable.
@@ -475,6 +504,7 @@ pub fn connect_at(socket: &Path) -> Result<Selected, String> {
     Ok(Selected {
         provider: Arc::clone(&daemon) as Arc<dyn RuntimeProvider>,
         containers: Some(Arc::clone(&daemon) as Arc<dyn ContainerControls>),
+        lifecycle: Some(Arc::clone(&daemon) as Arc<dyn LifecycleControls>),
     })
 }
 
@@ -866,6 +896,62 @@ fn read_answer(
 /// confirmed control can be lost: the operator reads that id back rather than the
 /// client dispatching a second effect. A control the daemon does not serve is
 /// refused before it is sent, and nothing here falls back to another transport.
+pub trait LifecycleControls: Send + Sync {
+    fn supports_child_close(&self) -> bool;
+    fn read_operation(
+        &self,
+        request_id: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<LifecycleAnswer>, String>;
+    fn close_child(
+        &self,
+        request_id: &str,
+        target: &crate::registry_observation::ChildCloseTarget,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String>;
+    fn cancel_subject(
+        &self,
+        request: &LifecycleControlRequest,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String>;
+    fn stop_subject(
+        &self,
+        request: &LifecycleControlRequest,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String>;
+    fn restart_subject(
+        &self,
+        request: &LifecycleControlRequest,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String>;
+}
+
+/// One subject-targeted request; pane ids are not lifecycle targets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleControlRequest {
+    pub request_id: String,
+    pub subject_id: String,
+}
+
+/// The operation record the daemon committed, without private launch data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleAnswer {
+    pub request: Value,
+}
+
+impl LifecycleAnswer {
+    pub fn outcome(&self) -> &str {
+        self.request
+            .get("outcome")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.request.get("message").and_then(Value::as_str)
+    }
+}
+
 pub trait ContainerControls: Send + Sync {
     /// Splits a pane slot from a pane, running a command in it when one is given.
     fn create_container(
@@ -971,6 +1057,29 @@ impl ContainerAnswer {
 }
 
 impl DaemonRuntime {
+    fn lifecycle_control(
+        &self,
+        contract: &str,
+        method: &str,
+        request: &LifecycleControlRequest,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        if !self.declared.contains(&contract) {
+            return Err(self.describe(format!("does not provide `{contract}`")));
+        }
+        let result = exchange_with_id_at(
+            &self.socket,
+            &request.request_id,
+            method,
+            json!({"request": {"subject_id": request.subject_id}, "requester": REQUESTER}),
+            cancel,
+        )
+        .map_err(|failure| failure.message)?;
+        Ok(LifecycleAnswer {
+            request: result.get("request").cloned().unwrap_or(Value::Null),
+        })
+    }
+
     /// One container control, sent under the caller's own request id.
     ///
     /// The contract it needs is checked before the request is sent, so a caller
@@ -1018,6 +1127,92 @@ impl DaemonRuntime {
             .map(|value| serde_json::from_value(value.clone()))
             .collect::<Result<Vec<PublicContainer>, _>>()
             .map_err(|error| self.describe(format!("answered an unreadable container: {error}")))
+    }
+}
+
+impl LifecycleControls for DaemonRuntime {
+    fn supports_child_close(&self) -> bool {
+        self.declared.contains(&ops::SPAWN_CLOSE_CONTRACT)
+    }
+
+    fn read_operation(
+        &self,
+        request_id: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<LifecycleAnswer>, String> {
+        let result = self
+            .call("mux.request.get", json!({"id": request_id}), cancel)
+            .map_err(|failure| failure.message)?;
+        Ok(result
+            .get("request")
+            .cloned()
+            .map(|request| LifecycleAnswer { request }))
+    }
+
+    fn close_child(
+        &self,
+        request_id: &str,
+        target: &crate::registry_observation::ChildCloseTarget,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        if !self.declared.contains(&ops::SPAWN_CLOSE_CONTRACT) {
+            return Err(self.describe(format!("does not provide `{}`", ops::SPAWN_CLOSE_CONTRACT)));
+        }
+        let result = exchange_with_id_at(
+            &self.socket,
+            request_id,
+            "spawn.close",
+            json!({
+                "spawn_request_id": target.spawn_request_id,
+                "source": target.source,
+                "incarnation": target.incarnation,
+                "intent": "cancel",
+            }),
+            cancel,
+        )
+        .map_err(|failure| failure.message)?;
+        Ok(LifecycleAnswer {
+            request: result.get("close").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    fn cancel_subject(
+        &self,
+        request: &LifecycleControlRequest,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        self.lifecycle_control(
+            ops::LIFECYCLE_CANCEL_CONTRACT,
+            "lifecycle.cancel",
+            request,
+            cancel,
+        )
+    }
+
+    fn stop_subject(
+        &self,
+        request: &LifecycleControlRequest,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        self.lifecycle_control(
+            ops::LIFECYCLE_STOP_CONTRACT,
+            "lifecycle.stop",
+            request,
+            cancel,
+        )
+    }
+
+    fn restart_subject(
+        &self,
+        request: &LifecycleControlRequest,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        self.lifecycle_control(
+            ops::LIFECYCLE_RESTART_CONTRACT,
+            "lifecycle.restart",
+            request,
+            cancel,
+        )
     }
 }
 

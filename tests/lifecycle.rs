@@ -101,6 +101,7 @@ impl FakeRuntime {
         FleetObservation {
             metadata_agents: Vec::new(),
             containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
             workspaces: Vec::new(),
             tabs: vec![Tab {
                 tab_id: "wA:t1".into(),

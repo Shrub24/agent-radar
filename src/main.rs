@@ -1,13 +1,13 @@
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_radar::bus::Listener;
+use agent_radar::managed_control as radar;
 use agent_radar::topology::ContainerControl;
 use agent_radar::{
     Action, App, Closer, Collector, CollectorConfig, Config, Confirmed, Focuser, Geometry,
-    ManagedActions, ObservationState, PaneView, control_plane, theme, ui,
+    ObservationState, PaneView, control_plane, theme, ui,
 };
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -254,16 +254,15 @@ fn run() -> io::Result<()> {
     let Some(selected) = await_daemon(&mut terminal)? else {
         return Ok(());
     };
-    let (runtime, container_controls) = (selected.provider, selected.containers);
+    let (runtime, container_controls, lifecycle_controls) =
+        (selected.provider, selected.containers, selected.lifecycle);
     // One runtime, shared: the collector, the focuser and the closer read and act
     // on the same adapter through the same seam.
     let mut collector = Collector::new(CollectorConfig::default(), Arc::clone(&runtime));
     let mut focuser = Focuser::new(Arc::clone(&runtime));
     let mut closer = Closer::new(Arc::clone(&runtime));
-    // Managed close/restart goes through the owner's control directories, never
-    // the mux. The worker reads nothing until an operator confirms an action;
-    // an absent or untrusted root is the owner's transport being unavailable.
-    let mut managed = ManagedActions::new(control_root());
+    // Managed lifecycle actions target daemon-owned subjects and run off the UI thread.
+    let mut managed = radar::LifecycleControl::new(lifecycle_controls);
     // A confirmed container control goes to the daemon, one at a time and off the
     // UI thread. A run without a daemon has no container to act on and says so.
     let mut containers = ContainerControl::new(container_controls);
@@ -322,12 +321,12 @@ fn run() -> io::Result<()> {
             app.apply_container_outcome(finished);
             dirty = true;
         }
-        // Owner-routed outcomes arrive from the worker thread the same way: the
-        // UI only reads what is already waiting, and never blocks on a file.
-        while let Some(update) = managed.poll() {
-            app.apply_managed_update(update);
+        // A daemon lifecycle operation is read back and displayed by request id.
+        if let Some(finished) = managed.poll() {
+            app.apply_subject_outcome(finished);
             dirty = true;
         }
+
         // A message that has been up long enough goes away by itself: the
         // footer is the hint line again without the user having to press a key.
         if app.expire_focus_message(Instant::now()) {
@@ -432,21 +431,40 @@ fn run() -> io::Result<()> {
 
 /// Carries out one confirmed action.
 ///
-/// Every route keeps its own effect: a direct close runs on the runtime, an
-/// owner-routed request is published to the worker's owner, and a container
-/// control is dispatched to the daemon. None of them is retried through another,
-/// because an action that may have been accepted is unknown rather than unperformed.
+/// Unmanaged closes use the runtime; managed lifecycle and topology controls use
+/// daemon request IDs. A possibly accepted operation is read back by that ID,
+/// never repeated through a different control path.
 fn dispatch(
     confirmed: Option<Confirmed>,
     app: &mut App,
     closer: &mut Closer,
-    managed: &mut ManagedActions,
+    managed: &mut radar::LifecycleControl,
     containers: &mut ContainerControl,
 ) {
     match confirmed {
         Some(Confirmed::Direct(request)) => closer.start(request),
-        Some(Confirmed::Managed(request)) => {
-            if let Err(message) = managed.start(request) {
+        Some(Confirmed::Subject {
+            operation,
+            request_id,
+            subject_id,
+            child_close,
+            close_request_id,
+        }) => {
+            let operation = match operation {
+                agent_radar::app::Operation::Restart => radar::Operation::Restart,
+                agent_radar::app::Operation::ClosePane => radar::Operation::Cancel,
+                _ => {
+                    app.set_focus_message(Some("unsupported managed lifecycle action".into()));
+                    return;
+                }
+            };
+            if let Err(message) = managed.start(radar::Control {
+                operation,
+                request_id,
+                subject_id,
+                child_close,
+                close_request_id,
+            }) {
                 app.set_focus_message(Some(message));
             }
         }
@@ -470,18 +488,4 @@ fn enable_mouse_capture() {
 /// the loop, and the panic hook above.
 fn disable_mouse_capture() {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
-}
-
-/// The owner-control root (`~/.pi/agent/pi-herdsman/control`). Radar only ever
-/// reads it and never creates it, so a missing name is just an unavailable
-/// transport rather than something to make.
-fn control_root() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home)
-            .join(".pi")
-            .join("agent")
-            .join("pi-herdsman")
-            .join("control"),
-        None => PathBuf::new(),
-    }
 }

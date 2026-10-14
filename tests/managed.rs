@@ -107,6 +107,7 @@ fn managed_inventory() -> FleetObservation {
     FleetObservation {
         metadata_agents: Vec::new(),
         containers: Vec::new(),
+        lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {
             workspace_id: "wA".into(),
             label: Some("main".into()),
