@@ -75,12 +75,12 @@ The control socket and the temporary publisher-compatibility socket share one To
 `daemon.ping`, params `{}`:
 
 ```json
-{"protocol":2,"backend":"tmux","instance":"radar","capabilities":["mux.observe","mux.process_info","mux.focus","mux.close","mux.create","mux.input","mux.output","mux.launch","mux.launch_context","mux.exit_observation","registry.v1","registry.facts.v1","events.v1","tasks.list.v1","spawn.v1","spawn.close.v1","spawn.launch_context.v1","spawn.exit_observation.v1"]}
+{"protocol":2,"backend":"tmux","instance":"radar","revision":1,"contracts":["registry.v1","registry.facts.v1","events.v1","tasks.list.v1","spawn.v1","spawn.close.v1","spawn.launch_context.v1","spawn.exit_observation.v1"]}
 ```
 
-`backend` is the wired physical backend: `herdr`, `tmux` or `none`, never a placeholder. `instance` names the tmux server for a tmux backend and is null otherwise. `capabilities` is the backend's own `mux.*` declaration plus the daemon contracts those capabilities make servable.
+`backend` is the wired physical backend: `herdr`, `tmux` or `none`, never a placeholder. `instance` names the tmux server for a tmux backend and is null otherwise. `revision` is the wire revision of the daemon's build, which increases whenever a method or field is added; Radar's own clients require at least their own revision and show a blocking diagnostic that names the restart when a daemon that outlived an install is older. `contracts` lists the daemon contracts the backend makes servable, which is what an external consumer pins. The backend's `mux.*` declaration stays inside the daemon and is not on the wire. A contract name your build does not know is tolerated; ignore it.
 
-Backend capabilities are the adapter's declaration, one per physical behavior:
+Inside the daemon, each backend declares its behaviors as `mux.*` capabilities, one per physical behavior. They decide which contracts are advertised and which operations refuse before any effect:
 
 | Backend capability | Behavior |
 |---|---|
@@ -126,7 +126,7 @@ All method-specific parameter objects reject unknown keys unless noted; `daemon.
 
 ### Reads
 
-- `daemon.ping`, params `{}`: protocol/backend/instance/capabilities as above. No record.
+- `daemon.ping`, params `{}`: protocol/revision/backend/instance/contracts as above. No record.
 - `mux.observe`, params `{}`: `{ "inventory": FleetObservation }`. Requires `mux.observe`. No record.
 - `mux.process_info`, params `{"pane_id":"wA:p1"}`: `{ "evidence": ForegroundEvidence }`. Requires `mux.process_info`. No record; inconclusive evidence is a valid result.
 - `mux.output`, params `{"pane_id":"wA:p1","source":"recent","lines":100,"ansi":false}`. Requires `mux.output`. `source` is `visible`, `recent`, `recent_unwrapped`, or `detection`; `lines` is optional (runtime default), otherwise 1..=500; `ansi` defaults false. Result is `{ "output": {"text":"…","truncated":false,"revision":null} }`. Text is capped at 64 KiB on a UTF-8 boundary and `truncated` set. No record.
@@ -198,7 +198,7 @@ Result keys: one object takes the method's own noun, a page takes its plural plu
 
 | Method | Result keys |
 |---|---|
-| `daemon.ping` | `protocol`, `backend`, `instance`, `capabilities` |
+| `daemon.ping` | `protocol`, `revision`, `backend`, `instance`, `contracts`, `tasks` |
 | `mux.observe` | `inventory` |
 | `mux.process_info` | `evidence` |
 | `mux.output` | `output` (`text`, `truncated`, `revision`) |
@@ -299,7 +299,7 @@ def call(path, method, params):
     return answer
 ```
 
-Set `backend = "daemon"` and optionally `socket` in Radar config to use the daemon for Radar; extensions may connect directly using the resolved socket path. Use `daemon.ping` to negotiate the protocol version and capabilities. A capability absence is an explicit refusal, not a request to substitute a different method.
+Set `backend = "daemon"` and optionally `socket` in Radar config to use the daemon for Radar; extensions may connect directly using the resolved socket path. Use `daemon.ping` to check the protocol version and the contracts you need. A contract absence is an explicit refusal, not a request to substitute a different method.
 
 Typical calls (parameter objects are exactly the method shapes above):
 

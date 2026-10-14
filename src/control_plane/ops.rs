@@ -98,8 +98,15 @@ const CONTRACTS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// What the handshake advertises: what the backend declares, then the daemon
-/// contracts those capabilities can serve.
+/// The wire revision of this build: it increases whenever a method or a field is
+/// added to the protocol. A bundled client needs a daemon at least this new,
+/// because the two ship together and only a daemon that outlived an install can
+/// be older.
+pub const PROTOCOL_REVISION: u32 = 1;
+
+/// What the handshake advertises: the daemon contracts the backend's capabilities
+/// can serve, which is the list an external consumer pins. The backend's own
+/// `mux.*` capabilities are the daemon's business and are not on the wire.
 pub fn advertised(backend: &[&'static str]) -> Vec<&'static str> {
     advertised_with_tasks(backend, false)
 }
@@ -108,11 +115,6 @@ pub fn advertised(backend: &[&'static str]) -> Vec<&'static str> {
 /// is bound and serving.
 pub fn advertised_with_tasks(backend: &[&'static str], tasks_available: bool) -> Vec<&'static str> {
     let mut advertised: Vec<&'static str> = Vec::new();
-    for capability in backend {
-        if !advertised.contains(capability) {
-            advertised.push(capability);
-        }
-    }
     advertised.extend(
         CONTRACTS
             .iter()
@@ -474,7 +476,6 @@ mod tests {
         assert_eq!(
             advertised(&[LAUNCH_CAPABILITY]),
             vec![
-                LAUNCH_CAPABILITY,
                 REGISTRY_CONTRACT,
                 REGISTRY_FACTS_CONTRACT,
                 EVENTS_CONTRACT,
@@ -497,11 +498,10 @@ mod tests {
     }
 
     #[test]
-    fn a_capability_a_backend_states_twice_is_advertised_once() {
+    fn a_capability_a_backend_states_twice_advertises_each_contract_once() {
         assert_eq!(
             advertised(&[OBSERVE_CAPABILITY, OBSERVE_CAPABILITY]),
             vec![
-                OBSERVE_CAPABILITY,
                 REGISTRY_CONTRACT,
                 REGISTRY_FACTS_CONTRACT,
                 EVENTS_CONTRACT,

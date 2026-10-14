@@ -812,7 +812,7 @@ fn handle_line(
     };
     match method {
         Method::Ping => {
-            let (identity, capabilities, task_status) = {
+            let (identity, contracts, task_status) = {
                 let core = locked(core);
                 let (identity, backend) = match &core.backend {
                     Some(backend) => (backend.identity(), backend.capabilities()),
@@ -831,9 +831,10 @@ fn handle_line(
                     &request.id,
                     json!({
                         "protocol": PROTOCOL_VERSION,
+                        "revision": ops::PROTOCOL_REVISION,
                         "backend": identity.name,
                         "instance": identity.instance,
-                        "capabilities": capabilities,
+                        "contracts": contracts,
                         "tasks": task_status,
                     }),
                 ),
@@ -6671,7 +6672,7 @@ mod tests {
         .expect("bind daemon and publisher listener");
         let ping = call(&control, "daemon.ping", json!({}));
         assert!(
-            ping["result"]["capabilities"]
+            ping["result"]["contracts"]
                 .as_array()
                 .unwrap()
                 .iter()

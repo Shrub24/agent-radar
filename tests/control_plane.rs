@@ -452,16 +452,12 @@ const DEAD_CLOSE_CAPABILITIES: &[&str] = &[
     "mux.exit_observation",
 ];
 
-/// What the handshake advertises for a backend that declares `backend`: the
-/// declaration itself, then each daemon contract whose capabilities are all
-/// present. Nothing the daemon would refuse to serve is in this list.
+/// What the handshake advertises for a backend that declares `backend`: each
+/// daemon contract whose capabilities are all present. The backend's own `mux.*`
+/// names are not on the wire, and nothing the daemon would refuse to serve is in
+/// this list.
 fn advertised(backend: &[&str]) -> Value {
     let mut capabilities: Vec<Value> = Vec::new();
-    for name in backend {
-        if !capabilities.contains(&json!(name)) {
-            capabilities.push(json!(name));
-        }
-    }
     let serves = |needed: &[&str]| needed.iter().all(|name| backend.contains(name));
     for (contract, needed) in [
         ("registry.v1", &[][..]),
@@ -979,10 +975,10 @@ fn the_reporting_bridge_is_served_and_recorded() {
 
     let ping = client.call("daemon.ping", json!({}));
     assert!(
-        ping["result"]["capabilities"]
+        ping["result"]["contracts"]
             .as_array()
-            .expect("capabilities")
-            .contains(&json!("mux.report")),
+            .expect("contracts")
+            .contains(&json!("registry.v1")),
         "{ping}"
     );
 
@@ -1129,7 +1125,7 @@ fn a_backend_without_reporting_refuses_it_and_advertises_no_reporting() {
     let mut client = Client::dial(daemon.path());
 
     let ping = client.call("daemon.ping", json!({}));
-    assert_eq!(ping["result"]["capabilities"], advertised(&["mux.observe"]));
+    assert_eq!(ping["result"]["contracts"], advertised(&["mux.observe"]));
 
     let refused = client.call("mux.report", state_report("working"));
     let record = result_record(&refused);
@@ -2674,7 +2670,7 @@ fn ping_answers_the_version_backend_and_registry_capability_without_mux() {
     let response = client.call("daemon.ping", json!({}));
     assert_eq!(response["result"]["protocol"], PROTOCOL_VERSION);
     assert_eq!(response["result"]["backend"], "none");
-    assert_eq!(response["result"]["capabilities"], advertised(&[]));
+    assert_eq!(response["result"]["contracts"], advertised(&[]));
     let unsupported = client.call(
         "spawn.close",
         json!({
@@ -2717,7 +2713,7 @@ fn real_socket_serves_normalized_observation_and_focus_once() {
     assert_eq!(ping["result"]["backend"], "fake");
     assert_eq!(ping["result"]["instance"], Value::Null);
     assert_eq!(
-        ping["result"]["capabilities"],
+        ping["result"]["contracts"],
         advertised(&["mux.observe", "mux.process_info", "mux.focus"])
     );
     let observed = client.call("mux.observe", json!({}));
@@ -4371,9 +4367,9 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
     assert_eq!(ping["result"]["backend"], "tmux", "{ping}");
     assert_eq!(ping["result"]["instance"], json!(server.name), "{ping}");
     assert!(
-        ping["result"]["capabilities"]
+        ping["result"]["contracts"]
             .as_array()
-            .is_some_and(|capabilities| capabilities.contains(&json!("mux.exit_observation"))),
+            .is_some_and(|contracts| contracts.contains(&json!("spawn.exit_observation.v1"))),
         "{ping}"
     );
     let observed = client.call("mux.observe", json!({}));
@@ -5284,17 +5280,17 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
 
     let ping = client.call("daemon.ping", json!({}));
     assert_eq!(
-        ping["result"]["capabilities"],
+        ping["result"]["contracts"],
         advertised(MUX_CAPABILITIES),
         "a backend that does not implement launch advertises only its actual capabilities"
     );
     let ping_again = client.call("daemon.ping", json!({}));
     assert_eq!(
-        ping_again["result"]["capabilities"], ping["result"]["capabilities"],
+        ping_again["result"]["contracts"], ping["result"]["contracts"],
         "a refused spawn changes nothing that is advertised"
     );
     assert!(
-        !ping_again["result"]["capabilities"]
+        !ping_again["result"]["contracts"]
             .as_array()
             .expect("capabilities")
             .contains(&json!("spawn.launch_context.v1")),
@@ -5508,7 +5504,7 @@ fn a_backend_without_launch_refuses_a_spawn_before_any_effect() {
     // Capability advertisement is unchanged: this backend implements what it
     // says it does, and its refusal adds nothing to it.
     let ping = client.call("daemon.ping", json!({}));
-    assert_eq!(ping["result"]["capabilities"], advertised(MUX_CAPABILITIES));
+    assert_eq!(ping["result"]["contracts"], advertised(MUX_CAPABILITIES));
     daemon.stop();
 }
 
@@ -5958,7 +5954,7 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
     );
     let ping = client.call("daemon.ping", json!({}));
     assert!(
-        !ping["result"]["capabilities"]
+        !ping["result"]["contracts"]
             .as_array()
             .unwrap()
             .contains(&json!("managed_child_close"))
@@ -6963,7 +6959,7 @@ fn the_mux_primitives_are_served_and_recorded() {
     let mut client = Client::dial(daemon.path());
 
     let ping = client.call("daemon.ping", json!({}));
-    assert_eq!(ping["result"]["capabilities"], advertised(MUX_CAPABILITIES));
+    assert_eq!(ping["result"]["contracts"], advertised(MUX_CAPABILITIES));
 
     let create_id = random_uuid();
     let create_params = json!({
@@ -7121,7 +7117,7 @@ fn an_unimplemented_primitive_is_refused_without_dispatch() {
     let mut client = Client::dial(daemon.path());
 
     let ping = client.call("daemon.ping", json!({}));
-    assert_eq!(ping["result"]["capabilities"], advertised(&[]));
+    assert_eq!(ping["result"]["contracts"], advertised(&[]));
 
     // An operation this backend cannot serve leaves a settled refusal that names
     // the capability and claims no effect, not a request still claiming to be
@@ -7443,6 +7439,10 @@ fn wait_for_exit(child: &mut Child, deadline: Duration) -> ExitStatus {
 // Radar's own client, and the choice between it and the direct adapter
 // ---------------------------------------------------------------------------
 
+/// The contracts a scripted daemon advertises: none, so a scripted exchange is only
+/// about the mux method it scripts.
+const CLIENT_CONTRACTS: &[&str] = &[];
+
 /// Every capability Radar's client can ask a daemon for.
 const CLIENT_CAPABILITIES: &[&str] = &[
     "mux.observe",
@@ -7613,9 +7613,10 @@ fn scripted_socket(
 fn scripted_ping(request: &Value) -> Value {
     json!({"id": request["id"], "result": {
         "protocol": PROTOCOL_VERSION,
+        "revision": agent_radar::control_plane::ops::PROTOCOL_REVISION,
         "backend": "herdr",
         "instance": null,
-        "capabilities": CLIENT_CAPABILITIES,
+        "contracts": CLIENT_CONTRACTS,
     }})
 }
 
@@ -7638,12 +7639,6 @@ fn the_daemon_client_serves_every_method_over_a_real_socket() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let client = DaemonRuntime::handshake(daemon.path()).expect("the daemon is usable");
     let cancel = AtomicBool::new(false);
-    assert_eq!(
-        serde_json::to_value(client.capabilities()).expect("a capability list"),
-        advertised(CLIENT_CAPABILITIES),
-        "the client is what the daemon declared"
-    );
-
     let (_, evidence) = populated_graph();
     assert_eq!(client.inventory(&cancel).expect("inventory"), fleet);
     assert_eq!(client.foreground_evidence("wA:p1", &cancel), evidence);
@@ -7882,18 +7877,48 @@ fn planted_daemon(root: &Path, name: &str, marker: PathBuf) -> PathBuf {
     })
 }
 
-/// A daemon that is listening but does not provide what the dashboard needs is
-/// refused, and the line names what is missing.
+/// A daemon older than this build, which an install it outlived leaves behind, is
+/// refused with one line that says how to replace it. A daemon that answers no
+/// revision at all is older still.
 #[test]
-fn an_incompatible_daemon_is_refused_and_named() {
+fn an_older_daemon_is_refused_and_told_to_restart() {
     let sandbox = Sandbox::new("client-incompatible");
-    let backend = ClientBackend::new(&["mux.observe", "mux.process_info", "mux.focus"]);
-    let mut daemon = sandbox.daemon_with(backend);
-    let diagnostic = connect_at(daemon.path()).err().expect("a refusal");
+    for answer_revision in [None, Some(0_u64)] {
+        let name = format!("older-{}.sock", answer_revision.unwrap_or(99));
+        let path = scripted_socket(&sandbox.root, &name, move |request| {
+            let mut ping = scripted_ping(request);
+            match answer_revision {
+                Some(revision) => ping["result"]["revision"] = json!(revision),
+                None => {
+                    ping["result"].as_object_mut().unwrap().remove("revision");
+                }
+            }
+            (scripted_method(request) == "daemon.ping").then_some(ping)
+        });
+        let diagnostic = connect_at(&path).err().expect("a refusal");
+        assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
+        assert!(
+            diagnostic.contains("is older than this build"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("systemctl --user restart radar-daemon"),
+            "{diagnostic}"
+        );
+    }
+}
 
-    assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
-    assert!(diagnostic.contains("`mux.close`"), "{diagnostic}");
-    daemon.stop();
+/// A contract name this build does not know is tolerated and never used, so a
+/// newer daemon does not make an older client refuse to start.
+#[test]
+fn an_unknown_contract_name_is_tolerated() {
+    let sandbox = Sandbox::new("client-unknown-contract");
+    let path = scripted_socket(&sandbox.root, "newer.sock", |request| {
+        let mut ping = scripted_ping(request);
+        ping["result"]["contracts"] = json!(["from-the-future.v9"]);
+        (scripted_method(request) == "daemon.ping").then_some(ping)
+    });
+    assert!(connect_at(&path).is_ok());
 }
 
 /// A daemon that provides what the dashboard needs is the one used, with nothing
@@ -8709,7 +8734,7 @@ fn a_confirmed_create_records_one_owned_container() {
 
     let ping = client.call("daemon.ping", json!({}));
     assert!(
-        ping["result"]["capabilities"]
+        ping["result"]["contracts"]
             .as_array()
             .expect("capabilities")
             .contains(&json!("topology.get.v1")),
@@ -8982,7 +9007,7 @@ fn a_creation_this_backend_cannot_serve_is_refused_before_any_effect() {
     assert!(backend.creates().is_empty(), "nothing was created");
     assert!(refused["result"].get("container").is_none());
     assert_eq!(
-        client.call("daemon.ping", json!({}))["result"]["capabilities"],
+        client.call("daemon.ping", json!({}))["result"]["contracts"],
         advertised(&["mux.observe", "mux.focus", "mux.close"])
     );
     daemon.stop();

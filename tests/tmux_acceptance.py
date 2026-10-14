@@ -493,7 +493,7 @@ def accept(binary, dump=False):
         ping = call(fleet.socket, "daemon.ping", {})
         check(ping.get("backend") == "tmux", f"daemon backend: {ping.get('backend')}")
         for contract in ("registry.v1", "registry.facts.v1", "events.v1", "spawn.v1"):
-            check(contract in ping["capabilities"], f"missing capability {contract}: {ping}")
+            check(contract in ping["contracts"], f"missing contract {contract}: {ping}")
 
         inventory = fleet.inventory()
         check(len(inventory["panes"]) == 2, f"panes: {inventory['panes']}")

@@ -129,55 +129,22 @@ pub struct TaskSnapshot {
 /// who asked.
 const REQUESTER: &str = "radar";
 
-/// The capability names this protocol version defines: the backend
-/// capabilities a mux adapter declares, and the daemon contracts those can
-/// serve.
-///
-/// A daemon's answer is interned against these, so a name this build cannot
-/// implement is never credited to it.
-const KNOWN_CAPABILITIES: &[&str] = &[
-    ops::OBSERVE_CAPABILITY,
-    ops::PROCESS_INFO_CAPABILITY,
-    ops::FOCUS_CAPABILITY,
-    ops::CLOSE_CAPABILITY,
-    ops::CREATE_CAPABILITY,
-    ops::INPUT_CAPABILITY,
-    ops::OUTPUT_CAPABILITY,
-    ops::REPORT_CAPABILITY,
-    ops::LAUNCH_CAPABILITY,
-    ops::LAUNCH_CONTEXT_CAPABILITY,
-    ops::EXIT_OBSERVATION_CAPABILITY,
-    ops::REGISTRY_CONTRACT,
-    ops::REGISTRY_FACTS_CONTRACT,
-    ops::EVENTS_CONTRACT,
-    ops::TASKS_LIST_CONTRACT,
-    ops::TOPOLOGY_CREATE_CONTRACT,
-    ops::TOPOLOGY_DELETE_CONTRACT,
-    ops::TOPOLOGY_GET_CONTRACT,
-    ops::TOPOLOGY_LIST_CONTRACT,
-    ops::TOPOLOGY_RELOAD_CONTRACT,
-    ops::TOPOLOGY_RECONCILE_CONTRACT,
-    ops::SPAWN_CONTRACT,
-    ops::SPAWN_CLOSE_CONTRACT,
-    ops::SPAWN_LAUNCH_CONTEXT_CONTRACT,
-    ops::SPAWN_EXIT_OBSERVATION_CONTRACT,
-    ops::LIFECYCLE_GET_CONTRACT,
-    ops::LIFECYCLE_LIST_CONTRACT,
-    ops::LIFECYCLE_CANCEL_CONTRACT,
-    ops::LIFECYCLE_STOP_CONTRACT,
-    ops::LIFECYCLE_ENROLL_CONTRACT,
-    ops::LIFECYCLE_RESTART_CONTRACT,
-];
-
 /// The daemon as a [`RuntimeProvider`].
 pub struct DaemonRuntime {
     socket: PathBuf,
-    declared: &'static [&'static str],
+    /// The contracts the daemon advertised, by name. A name this build does not
+    /// know is kept and never used.
+    declared: Vec<String>,
     identity: BackendIdentity,
     task_diagnostic: Option<String>,
 }
 
 impl DaemonRuntime {
+    /// Whether the daemon advertised `contract`.
+    fn serves(&self, contract: &str) -> bool {
+        self.declared.iter().any(|name| name == contract)
+    }
+
     /// The capabilities Radar's dashboard cannot work without: it observes, asks
     /// for foreground evidence, focuses and closes.
     ///
@@ -223,19 +190,30 @@ impl DaemonRuntime {
                 PROTOCOL_VERSION
             ));
         }
-        let declared: Vec<&str> = answer
-            .get("capabilities")
-            .and_then(Value::as_array)
-            .map(|names| names.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        for required in Self::REQUIRED {
-            if !declared.contains(required) {
-                return Err(format!(
-                    "the control daemon at {} does not provide `{required}`",
-                    socket.display()
-                ));
-            }
+        // The daemon and this build ship together; only a daemon that outlived an
+        // install is older, and it is told apart by one number, not a name list.
+        let revision = answer.get("revision").and_then(Value::as_u64);
+        if revision.is_none_or(|revision| revision < u64::from(ops::PROTOCOL_REVISION)) {
+            let revision =
+                revision.map_or_else(|| "no revision".to_string(), |r| format!("revision {r}"));
+            return Err(format!(
+                "the control daemon at {} is older than this build ({revision}, needs {}); \
+                 restart it with `systemctl --user restart radar-daemon`",
+                socket.display(),
+                ops::PROTOCOL_REVISION
+            ));
         }
+        let declared: Vec<String> = answer
+            .get("contracts")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let task_diagnostic = answer
             .get("tasks")
             .filter(|tasks| tasks.get("available").and_then(Value::as_bool) == Some(false))
@@ -244,7 +222,7 @@ impl DaemonRuntime {
             .map(str::to_owned);
         Ok(Self {
             socket: socket.to_path_buf(),
-            declared: intern(&declared),
+            declared,
             task_diagnostic,
             identity: BackendIdentity {
                 name: answer
@@ -262,7 +240,7 @@ impl DaemonRuntime {
 
     /// Volatile publisher task state, fetched as one revision-consistent snapshot.
     pub fn task_snapshot(&self) -> Result<TaskSnapshot, String> {
-        if !self.declared.contains(&ops::TASKS_LIST_CONTRACT) {
+        if !self.serves(ops::TASKS_LIST_CONTRACT) {
             return Err(self.task_diagnostic.clone().unwrap_or_else(|| {
                 "the control daemon does not provide `tasks.list.v1`".to_string()
             }));
@@ -420,7 +398,9 @@ impl RuntimeProvider for DaemonRuntime {
     }
 
     fn capabilities(&self) -> &'static [&'static str] {
-        self.declared
+        // The daemon's own backend primitives are not on the wire. What this
+        // client asks of the daemon is fixed, so that is what it reports.
+        Self::REQUIRED
     }
 
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {
@@ -436,7 +416,7 @@ impl RuntimeProvider for DaemonRuntime {
         // Without the registry there are no agent facts, and the inventory's own
         // agent records are not a substitute. Refreshing fails visibly instead.
         for contract in [ops::REGISTRY_CONTRACT, ops::SPAWN_CONTRACT] {
-            if !self.declared.contains(&contract) {
+            if !self.serves(contract) {
                 return Err(self.describe(format!("does not provide `{contract}`")));
             }
         }
@@ -459,7 +439,7 @@ impl RuntimeProvider for DaemonRuntime {
         // Containers are the daemon's own records, and a daemon that does not
         // serve them has none: a missing contract reads as no containers rather
         // than as a refresh that failed.
-        let containers = if self.declared.contains(&ops::TOPOLOGY_LIST_CONTRACT) {
+        let containers = if self.serves(ops::TOPOLOGY_LIST_CONTRACT) {
             self.read_all("topology.list", "containers", deadline, cancel, |value| {
                 let page: ContainerPage = serde_json::from_value(value)?;
                 Ok((page.containers, page.next))
@@ -467,7 +447,7 @@ impl RuntimeProvider for DaemonRuntime {
         } else {
             Vec::new()
         };
-        let lifecycle = if self.declared.contains(&ops::LIFECYCLE_LIST_CONTRACT) {
+        let lifecycle = if self.serves(ops::LIFECYCLE_LIST_CONTRACT) {
             self.read_all(
                 "lifecycle.list",
                 "managed lifecycle subjects",
@@ -638,26 +618,10 @@ pub fn connect_at(socket: &Path) -> Result<Selected, String> {
         containers: Some(Arc::clone(&daemon) as Arc<dyn ContainerControls>),
         lifecycle: Some(Arc::clone(&daemon) as Arc<dyn LifecycleControls>),
         tasks: daemon
-            .declared
-            .contains(&ops::TASKS_LIST_CONTRACT)
+            .serves(ops::TASKS_LIST_CONTRACT)
             .then(|| Arc::clone(&daemon)),
         task_diagnostic: daemon.task_diagnostic.clone(),
     })
-}
-
-/// Interns a declared capability set against the protocol's own names.
-///
-/// [`RuntimeProvider::capabilities`] asks for a `'static` slice and the daemon's
-/// answer arrives at runtime, so the subset is kept for the life of the process:
-/// at most eight pointers, held for the one handshake this run performs. A
-/// capability list the trait owned rather than borrowed would retire this.
-fn intern(declared: &[&str]) -> &'static [&'static str] {
-    let names: Vec<&'static str> = KNOWN_CAPABILITIES
-        .iter()
-        .copied()
-        .filter(|known| declared.contains(known))
-        .collect();
-    Box::leak(names.into_boxed_slice())
 }
 
 /// How long one exchange has left, and where it may be interrupted.
@@ -1214,7 +1178,7 @@ impl DaemonRuntime {
         request: &LifecycleControlRequest,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
-        if !self.declared.contains(&contract) {
+        if !self.serves(contract) {
             return Err(self.describe(format!("does not provide `{contract}`")));
         }
         let result = exchange_with_id_at(
@@ -1242,7 +1206,7 @@ impl DaemonRuntime {
         params: Value,
         cancel: &AtomicBool,
     ) -> Result<ContainerAnswer, String> {
-        if !self.declared.contains(&contract) {
+        if !self.serves(contract) {
             return Err(self.describe(format!("does not provide `{contract}`")));
         }
         let result = exchange_with_id_at(&self.socket, request_id, method, params, cancel)
@@ -1282,7 +1246,7 @@ impl DaemonRuntime {
 
 impl LifecycleControls for DaemonRuntime {
     fn supports_child_close(&self) -> bool {
-        self.declared.contains(&ops::SPAWN_CLOSE_CONTRACT)
+        self.serves(ops::SPAWN_CLOSE_CONTRACT)
     }
 
     fn read_operation(
@@ -1305,7 +1269,7 @@ impl LifecycleControls for DaemonRuntime {
         target: &crate::registry_observation::ChildCloseTarget,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
-        if !self.declared.contains(&ops::SPAWN_CLOSE_CONTRACT) {
+        if !self.serves(ops::SPAWN_CLOSE_CONTRACT) {
             return Err(self.describe(format!("does not provide `{}`", ops::SPAWN_CLOSE_CONTRACT)));
         }
         let result = exchange_with_id_at(
@@ -1385,7 +1349,7 @@ impl DaemonRuntime {
         session: &str,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
-        if !self.declared.contains(&ops::LIFECYCLE_ENROLL_CONTRACT) {
+        if !self.serves(ops::LIFECYCLE_ENROLL_CONTRACT) {
             return Err(self.describe(format!(
                 "does not provide `{}`",
                 ops::LIFECYCLE_ENROLL_CONTRACT

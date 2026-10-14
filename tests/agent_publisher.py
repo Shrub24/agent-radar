@@ -307,7 +307,7 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
     try:
         ping = call(socket_path, "daemon.ping", {})
         check(ping["protocol"] == publisher.PROTOCOL_VERSION, str(ping))
-        check({"mux.create", "mux.launch"}.issubset(ping["capabilities"]), str(ping))
+        check("spawn.v1" in ping["contracts"], str(ping))
         parent = call(socket_path, "agent.register", {
             "source": "fixture-parent", "incarnation": "11111111-1111-4111-8111-111111111111",
             "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
@@ -433,10 +433,10 @@ def main():
         daemon = spawn_daemon(binary, socket_path, state_path)
         try:
             validate_fixture(socket_path)
-            check("events.v1" in call(socket_path, "daemon.ping", {})["capabilities"],
-                  "events.v1 capability missing")
+            check("events.v1" in call(socket_path, "daemon.ping", {})["contracts"],
+                  "events.v1 contract missing")
             ping = call(socket_path, "daemon.ping", {})
-            check("registry.v1" in ping["capabilities"], f"capability missing: {ping}")
+            check("registry.v1" in ping["contracts"], f"contract missing: {ping}")
 
             registered, channel = publisher.publish_assignment(
                 socket_path, registration, identity, snapshot, 1, lease_ms=1000)

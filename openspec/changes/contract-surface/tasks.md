@@ -2,8 +2,8 @@
 
 ## 1. Wire
 
-- [ ] 1.1 Add the revision and a contracts list to the ping answer and stop advertising `mux.*` names. Test the answer for a tmux backend and a backend lacking a need of one contract.
-- [ ] 1.2 Make bundled clients (TUI, CLI) require a minimum revision and show the blocking diagnostic on a gap; remove the client whitelist and `intern`. Test an older daemon, a matching daemon and an unknown contract name.
+- [x] 1.1 Add the revision and a contracts list to the ping answer and stop advertising `mux.*` names. Test the answer for a tmux backend and a backend lacking a need of one contract.
+- [x] 1.2 Make bundled clients (TUI, CLI) require a minimum revision and show the blocking diagnostic on a gap; remove the client whitelist and `intern`. Test an older daemon, a matching daemon and an unknown contract name.
 
 ## 2. Typed internals
 
