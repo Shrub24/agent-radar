@@ -89,3 +89,7 @@ Order: consolidate daemon ingest, shared observation, tmux control mode, sidebar
 - Pi program status and OSC 7501 for Pi state. No native tmux support even in 3.8.
 - Upstream Herdsman and pi-bash-processes contract changes, which are owned by
   the pi-extensions side.
+
+## Publishers must publish `context_window`
+
+`facts.context_usage` text is no longer accepted: the facts channel takes `context_window { tokens, window }` integers and refuses anything else. The Pi extension (pi-extensions) and Herdsman must publish it before their next release or their whole facts snapshot is refused. The Herdr `context_usage` token stays a percentage-only legacy input.

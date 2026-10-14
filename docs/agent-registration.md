@@ -416,8 +416,11 @@ Facts (`channel: "facts"`) are self-authored by the session, with no owner:
 
 - `model`, `provider`, `thinking` and `session_name`: optional bounded text.
   `session_name` is a display label; the session UUID stays in `agent.context`.
-- `context_usage`: optional bounded producer display text. It is not state and
-  carries no authority over freshness, lifecycle or assignment.
+- `context_window`: optional `{"tokens","window"}` of two non-negative integers,
+  the tokens in context and the window size. `window` is above zero and `tokens`
+  does not exceed it; anything else refuses the snapshot. A display derives the
+  percentage, so none is published. It carries no authority over freshness,
+  lifecycle or assignment.
 - `background_tasks`: optional list of at most 64 `{"id","phase"}` objects. Both
   fields are bounded text, and `id` is unique within the snapshot. `phase` is
   producer vocabulary.

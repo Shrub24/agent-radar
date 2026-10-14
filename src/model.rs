@@ -328,6 +328,35 @@ impl From<&RuntimeStatus> for AgentState {
 /// additive, so an absent key means unavailable rather than a default.
 /// [`Self::session_name`] is the source's human name and is deliberately not an
 /// identity — identity lives in [`AgentObservation::session`].
+/// How much of a model's context window a session has used, as counts.
+///
+/// `window` is positive and `tokens` does not exceed it; the percentage a display
+/// shows is derived from these and never published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextWindow {
+    pub tokens: u64,
+    pub window: u64,
+}
+
+impl ContextWindow {
+    /// Whether the counts describe a possible usage.
+    pub fn is_valid(&self) -> bool {
+        self.window > 0 && self.tokens <= self.window
+    }
+
+    /// The whole-number percentage used, rounded to nearest. A window of zero,
+    /// which validation refuses, reads as zero rather than dividing by it.
+    pub fn percent(&self) -> u64 {
+        if self.window == 0 {
+            return 0;
+        }
+        // u128 so no pair of counts overflows the multiplication.
+        ((u128::from(self.tokens) * 100 + u128::from(self.window) / 2) / u128::from(self.window))
+            as u64
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HerdsmanFacts {
     /// The role the agent runs as: a lead role, or a worker's agent definition.
@@ -372,8 +401,11 @@ pub struct HerdsmanFacts {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub thinking: Option<String>,
-    /// Context usage as published, percent sign included.
+    /// The percentage a Herdr token states, percent sign included. It carries no
+    /// counts, so it is never presented as a typed window.
     pub context_usage: Option<String>,
+    /// The context window a registry publisher reports as counts.
+    pub context_window: Option<ContextWindow>,
     /// The source's human session name.
     pub session_name: Option<String>,
     /// What this pane is waiting on: `agent:<label>` for each outstanding
@@ -1175,6 +1207,55 @@ mod tests {
                 .activity_state()
                 .word(),
             "done"
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::ContextWindow;
+
+    #[test]
+    fn the_percentage_is_derived_and_rounded_from_the_counts() {
+        let window = |tokens, window| ContextWindow { tokens, window };
+        assert_eq!(window(86_000, 200_000).percent(), 43);
+        assert_eq!(window(0, 200_000).percent(), 0);
+        assert_eq!(window(200_000, 200_000).percent(), 100);
+        assert_eq!(window(1, 3).percent(), 33);
+        assert_eq!(window(2, 3).percent(), 67);
+        // The widest counts do not overflow.
+        assert_eq!(window(u64::MAX, u64::MAX).percent(), 100);
+    }
+
+    #[test]
+    fn a_window_is_possible_only_above_zero_with_tokens_within_it() {
+        assert!(
+            ContextWindow {
+                tokens: 0,
+                window: 1
+            }
+            .is_valid()
+        );
+        assert!(
+            ContextWindow {
+                tokens: 5,
+                window: 5
+            }
+            .is_valid()
+        );
+        assert!(
+            !ContextWindow {
+                tokens: 0,
+                window: 0
+            }
+            .is_valid()
+        );
+        assert!(
+            !ContextWindow {
+                tokens: 6,
+                window: 5
+            }
+            .is_valid()
         );
     }
 }

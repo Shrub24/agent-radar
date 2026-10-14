@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::timestamp_millis;
 use crate::control_plane::store::{format_millis, random_uuid};
-use crate::model::SessionUuid;
+use crate::model::{ContextWindow, SessionUuid};
 
 use super::{Registry, bounded_text, read_record_file, validate_agent_id};
 
@@ -229,7 +229,7 @@ pub struct BackgroundTask {
 /// The agent's own process facts. Self-authored by any Pi session, with no owner
 /// or assignment, and kept separate from execution and assignment. Every field
 /// is optional and a published snapshot replaces the whole value, so omission
-/// withdraws a fact. `context_usage` is producer display text, not state.
+/// withdraws a fact. `context_window` is counts; a display derives the percentage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FactsSnapshot {
@@ -240,7 +240,7 @@ pub struct FactsSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_usage: Option<String>,
+    pub context_window: Option<ContextWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -255,12 +255,18 @@ impl FactsSnapshot {
             ("model", &self.model),
             ("provider", &self.provider),
             ("thinking", &self.thinking),
-            ("context_usage", &self.context_usage),
             ("session_name", &self.session_name),
         ] {
             if let Some(value) = value {
                 bounded_text(field, value, false)?;
             }
+        }
+        if let Some(window) = &self.context_window
+            && !window.is_valid()
+        {
+            return Err(
+                "`context_window` needs a window above zero and tokens within it".to_string(),
+            );
         }
         if self.background_tasks.len() > MAX_BACKGROUND_TASKS {
             return Err(format!(

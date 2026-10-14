@@ -471,7 +471,7 @@ fn facts_of(agent: &RegistryAgent) -> HerdsmanFacts {
         facts.model = own.model.clone();
         facts.provider = own.provider.clone();
         facts.thinking = own.thinking.clone();
-        facts.context_usage = own.context_usage.clone();
+        facts.context_window = own.context_window;
         facts.session_name = own.session_name.clone();
         facts.background_tasks = own
             .background_tasks

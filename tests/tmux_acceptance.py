@@ -515,7 +515,7 @@ def accept(binary, dump=False):
         fleet.publish_assignment(worker)
         fleet.publish_facts(worker, MAX_LEASE_MS, {
             "model": "accept-model", "provider": "accept-provider", "thinking": "high",
-            "context_usage": "61%", "session_name": "accept-session",
+            "context_window": {"tokens": 122000, "window": 200000}, "session_name": "accept-session",
             "background_tasks": [{"id": "bg-7", "phase": "running"},
                                  {"id": "bg-8", "phase": "running"}]})
 

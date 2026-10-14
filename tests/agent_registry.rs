@@ -3884,7 +3884,7 @@ fn facts_publish_without_an_owner_and_never_touch_execution() {
             1,
             json!({
                 "model": "claude-x", "provider": "anthropic", "thinking": "high",
-                "context_usage": "42%", "session_name": "review",
+                "context_window": {"tokens": 84000, "window": 200000}, "session_name": "review",
                 "background_tasks": [{"id": "task-1", "phase": "running"}],
                 "background_started_unix_ms": 900
             }),
@@ -3904,6 +3904,10 @@ fn facts_publish_without_an_owner_and_never_touch_execution() {
         panic!("a facts channel carries a facts snapshot");
     };
     assert_eq!(fields.model.as_deref(), Some("claude-x"));
+    // The counts are read back as integers, and the percentage is derived.
+    let window = fields.context_window.expect("a typed context window");
+    assert_eq!((window.tokens, window.window), (84_000, 200_000));
+    assert_eq!(window.percent(), 42);
     assert_eq!(fields.background_tasks[0].id, "task-1");
     assert!(
         registry
@@ -3946,6 +3950,17 @@ fn facts_schema_is_strict_and_a_refused_report_keeps_the_prior_snapshot() {
         json!({"awaited": ["child"]}),
         json!({"background_tasks": too_many}),
         json!({"background_tasks": [{"id": "t", "phase": "p"}, {"id": "t", "phase": "q"}]}),
+        // A window is two counts: a zero window, tokens beyond it, a negative or
+        // fractional count, text, a lone field and a field it does not define are
+        // all refused, and so is the old percentage text.
+        json!({"context_window": {"tokens": 0, "window": 0}}),
+        json!({"context_window": {"tokens": 200_001, "window": 200_000}}),
+        json!({"context_window": {"tokens": -1, "window": 200_000}}),
+        json!({"context_window": {"tokens": 1.5, "window": 200_000}}),
+        json!({"context_window": {"tokens": "86000", "window": 200_000}}),
+        json!({"context_window": {"tokens": 10}}),
+        json!({"context_window": {"tokens": 10, "window": 100, "percent": 10}}),
+        json!({"context_usage": "43%"}),
     ];
     for snapshot in refused {
         assert!(

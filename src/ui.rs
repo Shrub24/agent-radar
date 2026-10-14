@@ -3204,7 +3204,19 @@ fn activity_lines(facts: &HerdsmanFacts, blocks: &Blocks<'_>, page: &mut PageLin
     if let Some(thinking) = facts.thinking.as_deref() {
         page.push(field("thinking", sanitize(thinking)));
     }
-    if let Some(usage) = facts.context_usage.as_deref() {
+    // Counts, when a registry publisher gave them, are the better fact: the
+    // percentage is derived from them. A Herdr token has only the percentage.
+    if let Some(window) = facts.context_window {
+        page.push(field(
+            "context usage",
+            format!(
+                "{}% ({} of {} tokens)",
+                window.percent(),
+                window.tokens,
+                window.window
+            ),
+        ));
+    } else if let Some(usage) = facts.context_usage.as_deref() {
         page.push(field("context usage", sanitize(usage)));
     }
 }
@@ -4622,6 +4634,32 @@ mod tests {
         ] {
             assert!(screen.contains(fact), "missing `{fact}`: {screen}");
         }
+    }
+
+    #[test]
+    fn a_published_window_shows_the_derived_percentage_with_its_counts() {
+        // Counts win over a percentage text beside them: the percentage is derived,
+        // and a source that gave only a percentage still shows it as given.
+        let state = state_with_facts(
+            HerdsmanFacts {
+                label: Some("typed".into()),
+                context_window: Some(crate::model::ContextWindow {
+                    tokens: 86_000,
+                    window: 200_000,
+                }),
+                context_usage: Some("99%".into()),
+                ..HerdsmanFacts::default()
+            },
+            RuntimeStatus::Working,
+        );
+        let mut app = app_for(&state);
+        select_agent(&mut app, "wH:p1");
+        let screen = render_pages(&state, &mut app, 180, 34);
+        assert!(
+            screen.contains("context usage: 43% (86000 of 200000 tokens)"),
+            "{screen}"
+        );
+        assert!(!screen.contains("99%"), "{screen}");
     }
 
     #[test]
