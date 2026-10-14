@@ -3303,6 +3303,22 @@ mod tests {
         fixture().1
     }
 
+    /// The fixture with the worker moved into its owner's window, so it nests
+    /// under the owner: the shape that folds and filters act on.
+    fn nested_fixture() -> (ObservationState, App) {
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        for agent in &mut observation.agents {
+            if agent.location.pane_id == "wA:p2" {
+                agent.location.tab_id = "wA:t1".into();
+            }
+        }
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let mut app = App::new();
+        app.refresh(&state);
+        (state, app)
+    }
+
     /// The fixture observation and a view refreshed against it, for tests that
     /// need to revalidate against the same state the view drew.
     fn fixture() -> (ObservationState, App) {
@@ -3374,7 +3390,7 @@ mod tests {
 
     #[test]
     fn collapsing_hides_descendants_and_keeps_selection_valid() {
-        let mut app = app_with_fixture();
+        let mut app = nested_fixture().1;
         select(&mut app, "wA:p1"); // the owner, with the worker nested under it
         assert!(row_ids(&app).contains(&RowId::Agent("wA:p2".into())));
 
@@ -3404,7 +3420,7 @@ mod tests {
 
     #[test]
     fn nested_filter_match_keeps_ancestors_and_is_case_insensitive() {
-        let mut app = app_with_fixture();
+        let mut app = nested_fixture().1;
         app.handle_key(key(KeyCode::Char('/')));
         assert!(app.is_filter_editing());
         for c in "WORKER TASK".chars() {
@@ -3439,7 +3455,7 @@ mod tests {
 
     #[test]
     fn clearing_the_filter_restores_prior_fold_state() {
-        let mut app = app_with_fixture();
+        let mut app = nested_fixture().1;
         select(&mut app, "wA:p1");
         app.handle_key(key(KeyCode::Char(' ')));
         let folded = row_ids(&app);
@@ -3481,10 +3497,7 @@ mod tests {
 
     #[test]
     fn refresh_preserves_selection_and_fold_state_for_surviving_rows() {
-        let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
-        let mut app = App::new();
-        app.refresh(&state);
+        let (mut state, mut app) = nested_fixture();
         // Fold the owner's branch, select it, then hide panes so a refresh has
         // a second kind of change to survive.
         show_all_panes(&mut app);
@@ -3496,6 +3509,7 @@ mod tests {
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
                 agent.status = Some(RuntimeStatus::Done);
+                agent.location.tab_id = "wA:t1".into();
             }
         }
         state.apply_success(observation);

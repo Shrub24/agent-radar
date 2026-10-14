@@ -428,6 +428,8 @@ impl FleetTree {
         let mut claimed: HashSet<&str> = HashSet::new();
         let mut roots: Vec<TreeNode> = Vec::new();
         let mut workspace_index: HashMap<&str, usize> = HashMap::new();
+        // The tab row of each window drawn as a tab, by workspace and tab id.
+        let mut tab_rows: HashMap<(String, String), usize> = HashMap::new();
 
         for workspace_id in &workspace_ids {
             // A registration that reports no workspace is placed here, under a
@@ -437,7 +439,7 @@ impl FleetTree {
                 .get(workspace_id.as_str())
                 .copied()
                 .or_else(|| workspace_id.is_empty().then_some("unplaced"));
-            let mut agents: Vec<(TreeNode, Option<Lineage>)> = Vec::new();
+            let mut agents: Vec<(TreeNode, Option<Lineage>, String)> = Vec::new();
 
             for agent in &inventory.agents {
                 if agent.location.workspace_id != *workspace_id {
@@ -462,6 +464,7 @@ impl FleetTree {
                 agents.push((
                     agent_node(agent, None, pane, foreground, &places),
                     agent.lineage.clone(),
+                    agent.location.tab_id.clone(),
                 ));
             }
 
@@ -485,9 +488,14 @@ impl FleetTree {
                         &places,
                     ),
                     agent.lineage.clone(),
+                    agent.location.tab_id.clone(),
                 ));
             }
 
+            let (children, tabs) = nest_by_window(agents);
+            for (tab, position) in tabs {
+                tab_rows.insert((workspace_id.clone(), tab), position);
+            }
             workspace_index.insert(workspace_id.as_str(), roots.len());
             roots.push(TreeNode {
                 row: TreeRow {
@@ -499,7 +507,7 @@ impl FleetTree {
                         container: places.workspaces.get(workspace_id.as_str()).cloned(),
                     },
                 },
-                children: nest(agents),
+                children,
             });
         }
 
@@ -514,7 +522,7 @@ impl FleetTree {
             let Some(&root_index) = workspace_index.get(pane.location.workspace_id.as_str()) else {
                 continue; // workspace_id_order covers every pane workspace
             };
-            roots[root_index].children.push(TreeNode {
+            let pane_node = TreeNode {
                 row: TreeRow {
                     id: RowId::Pane(pane_id.to_string()),
                     kind: RowKind::Pane(Box::new(PaneRow {
@@ -556,7 +564,16 @@ impl FleetTree {
                     })),
                 },
                 children: Vec::new(),
-            });
+            };
+            let window = (
+                pane.location.workspace_id.clone(),
+                pane.location.tab_id.clone(),
+            );
+            let siblings = match tab_rows.get(&window) {
+                Some(&position) => &mut roots[root_index].children[position].children,
+                None => &mut roots[root_index].children,
+            };
+            siblings.push(pane_node);
         }
 
         FleetTree { roots }
@@ -842,8 +859,56 @@ fn published_phase(entries: &[String], id: &str) -> Option<String> {
         })
 }
 
-/// Nests agent rows under unambiguous same-workspace owners and returns the
-/// rest at the workspace root, in original row order.
+/// Nests one workspace's agents by window. A window whose agents have exactly one
+/// root, an agent with no owner in that window, is drawn as a tab: that agent's row
+/// is the tab and the window's other agents nest beneath it. Any other window keeps
+/// its agents flat beneath the workspace, in original row order.
+///
+/// Returns the workspace's children and, for each tab row, its tab id and position.
+fn nest_by_window(
+    agents: Vec<(TreeNode, Option<Lineage>, String)>,
+) -> (Vec<TreeNode>, Vec<(String, usize)>) {
+    let mut slots: Vec<Option<(TreeNode, Option<Lineage>)>> = Vec::with_capacity(agents.len());
+    let mut windows: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, (node, lineage, tab)) in agents.into_iter().enumerate() {
+        match windows.iter_mut().find(|(window, _)| *window == tab) {
+            Some((_, members)) => members.push(index),
+            None => windows.push((tab, vec![index])),
+        }
+        slots.push(Some((node, lineage)));
+    }
+
+    // Each entry: the position of the window's first agent, the tab id when the
+    // node is a window's tab row, and the node.
+    let mut placed: Vec<(usize, Option<String>, TreeNode)> = Vec::new();
+    for (tab, members) in windows {
+        let first = members[0];
+        let group: Vec<(TreeNode, Option<Lineage>)> = members
+            .iter()
+            .map(|&index| slots[index].take().expect("each agent is grouped once"))
+            .collect();
+        let mut roots = nest(group);
+        if roots.len() == 1 {
+            placed.push((first, Some(tab), roots.remove(0)));
+        } else {
+            placed.extend(roots.into_iter().map(|node| (first, None, node)));
+        }
+    }
+    placed.sort_by_key(|(first, _, _)| *first);
+
+    let mut children = Vec::with_capacity(placed.len());
+    let mut tabs = Vec::new();
+    for (_, tab, node) in placed {
+        if let Some(tab) = tab {
+            tabs.push((tab, children.len()));
+        }
+        children.push(node);
+    }
+    (children, tabs)
+}
+
+/// Nests agent rows under unambiguous owners within the same group and returns the
+/// rest as roots, in original row order.
 ///
 /// A link is used only when exactly one agent in the workspace claims the
 /// parent session UUID and the link is not self-referential; cycles are then
@@ -1238,15 +1303,15 @@ mod tests {
             vec![RowId::Workspace("wA".into()), RowId::Workspace("wB".into())]
         );
 
-        // The worker sits under the owner even though they occupy different
-        // tabs, and its own tab stays on the row as location detail.
+        // An owner in another window is not used for nesting: the worker is
+        // the only agent in its own window, so it is that window's tab.
         let owner = node(&tree, &RowId::Agent("wA:p1".into()));
         assert!(
-            owner
+            !owner
                 .children
                 .iter()
                 .any(|child| child.row.id == RowId::Agent("wA:p2".into())),
-            "worker nests under owner"
+            "worker does not nest under an owner in another window"
         );
         let worker = node(&tree, &RowId::Agent("wA:p2".into()));
         match &worker.row.kind {
@@ -1262,6 +1327,72 @@ mod tests {
             tree.roots[0].children[0].row.id,
             RowId::Agent("wA:p1".into())
         );
+    }
+
+    #[test]
+    fn a_window_with_one_root_agent_is_a_tab_that_holds_its_other_agents() {
+        // Move the worker into its owner's window: the owner has no owner in that
+        // window, so it is the window's root and the tab, and the worker nests
+        // beneath it.
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        for agent in &mut observation.agents {
+            if agent.location.pane_id == "wA:p2" {
+                agent.location.tab_id = "wA:t1".into();
+            }
+        }
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let tree = FleetTree::build(&state);
+
+        let tab = node(&tree, &RowId::Agent("wA:p1".into()));
+        assert!(
+            tab.children
+                .iter()
+                .any(|child| child.row.id == RowId::Agent("wA:p2".into())),
+            "the window's other agent nests beneath its tab"
+        );
+        assert!(
+            tab.children
+                .iter()
+                .any(|child| child.row.id == RowId::Pane("wA:p3".into())),
+            "an ordinary pane of the window nests beneath its tab"
+        );
+        let workspace = node(&tree, &RowId::Workspace("wA".into()));
+        assert!(
+            !workspace
+                .children
+                .iter()
+                .any(|child| child.row.id == RowId::Agent("wA:p2".into())),
+            "the nested agent is not also a workspace child"
+        );
+    }
+
+    #[test]
+    fn a_window_with_two_unowned_agents_stays_flat() {
+        // Both agents are roots of the window and neither owns the other, so the
+        // window has no single identity and its agents stay flat beneath the
+        // workspace.
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        for agent in &mut observation.agents {
+            if agent.location.pane_id == "wA:p2" {
+                agent.location.tab_id = "wA:t1".into();
+                agent.lineage = None;
+            }
+        }
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let tree = FleetTree::build(&state);
+
+        let workspace = node(&tree, &RowId::Workspace("wA".into()));
+        for id in ["wA:p1", "wA:p2"] {
+            assert!(
+                workspace
+                    .children
+                    .iter()
+                    .any(|child| child.row.id == RowId::Agent(id.into())),
+                "{id} stays a flat child of the workspace"
+            );
+        }
     }
 
     #[test]
@@ -1479,9 +1610,10 @@ mod tests {
             }
             other => panic!("expected agent row, got {other:?}"),
         }
-        // The worker still nests under the retained owner (uniform join).
+        // The retained owner is still a window's tab: the worker sits in another
+        // window, so it does not nest under it.
         assert!(
-            retained
+            !retained
                 .children
                 .iter()
                 .any(|child| child.row.id == RowId::Agent("wA:p2".into()))

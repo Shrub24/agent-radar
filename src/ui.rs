@@ -3447,6 +3447,20 @@ mod tests {
         state
     }
 
+    /// The fixture with the worker moved into its owner's window, so it nests
+    /// under the owner: the shape a folded branch hides.
+    fn nested_fixture_state() -> ObservationState {
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        for agent in &mut observation.agents {
+            if agent.location.pane_id == "wA:p2" {
+                agent.location.tab_id = "wA:t1".into();
+            }
+        }
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        state
+    }
+
     fn render_with(
         state: &ObservationState,
         app: &App,
@@ -3923,7 +3937,7 @@ mod tests {
 
     #[test]
     fn collapsing_a_branch_hides_its_rows_on_screen() {
-        let state = fixture_state();
+        let state = nested_fixture_state();
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p1");
         assert!(render_text(&state, &app, 90, 30).contains("worker task"));
