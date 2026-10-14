@@ -699,7 +699,7 @@ impl Daemon {
                 return Err(format!("control transport: {error}"));
             }
         };
-        let sweeper = spawn_sweeper(&core, &stopping);
+        let sweeper = spawn_sweeper(&core, &stopping, &verification);
         Ok(Self {
             path: socket.to_path_buf(),
             state: state.to_path_buf(),
@@ -5935,7 +5935,11 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 /// Starts the bounded recovery sweep. It re-observes recorded launches on a fixed
 /// interval, so a missed exit notification is recovered without any client, and
 /// it stops with the daemon.
-fn spawn_sweeper(core: &Arc<Mutex<Core>>, stopping: &Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+fn spawn_sweeper(
+    core: &Arc<Mutex<Core>>,
+    stopping: &Arc<AtomicBool>,
+    verification: &Arc<VerificationBudget>,
+) -> Option<JoinHandle<()>> {
     let (registry, verifier, sweep_at) = {
         let core = locked(core);
         (
@@ -5945,9 +5949,14 @@ fn spawn_sweeper(core: &Arc<Mutex<Core>>, stopping: &Arc<AtomicBool>) -> Option<
         )
     };
     let stopping = Arc::clone(stopping);
+    let core = Arc::clone(core);
+    let verification = Arc::clone(verification);
     thread::Builder::new()
         .name("radar-control-sweep".to_string())
         .spawn(move || {
+            // What the last topology pass saw, so an unchanged server costs one
+            // read and no record.
+            let mut seen: Option<String> = None;
             while !stopping.load(Ordering::SeqCst) {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -5956,6 +5965,9 @@ fn spawn_sweeper(core: &Arc<Mutex<Core>>, stopping: &Arc<AtomicBool>) -> Option<
                     Ok(_) => sweep_at.store(now, Ordering::SeqCst),
                     Err(error) => eprintln!("launch recovery sweep failed: {error}"),
                 }
+                if let Err(error) = adopt_topology(&core, &registry, &verification, &mut seen) {
+                    eprintln!("topology adoption failed: {error}");
+                }
                 let deadline = std::time::Instant::now() + SWEEP_INTERVAL;
                 while std::time::Instant::now() < deadline && !stopping.load(Ordering::SeqCst) {
                     thread::sleep(Duration::from_millis(50));
@@ -5963,6 +5975,69 @@ fn spawn_sweeper(core: &Arc<Mutex<Core>>, stopping: &Arc<AtomicBool>) -> Option<
             }
         })
         .ok()
+}
+
+/// Records the places of this daemon's own server as observed containers, and
+/// reports the ones that have gone, when the server's places have changed since
+/// the last pass.
+///
+/// Adoption is scoped to the one server the daemon serves, runs under a verified
+/// serving incarnation, and dispatches nothing. A failed read leaves `seen`
+/// as it was, so the next pass looks again.
+fn adopt_topology(
+    core: &Arc<Mutex<Core>>,
+    registry: &Arc<Registry>,
+    verification: &Arc<VerificationBudget>,
+    seen: &mut Option<String>,
+) -> Result<(), String> {
+    let (backend, verifier, stopping) = {
+        let core = locked(core);
+        (
+            core.backend.clone(),
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let Some(backend) = backend else {
+        return Ok(());
+    };
+    // A creation records the container it made after the place exists. Adopting
+    // in between would record the same place twice, so the pass waits for it.
+    if locked(core)
+        .store
+        .unfinished()?
+        .iter()
+        .any(|record| record.method == "topology.create")
+    {
+        return Ok(());
+    }
+    let Some(observation) = observed_inventory(core) else {
+        return Ok(());
+    };
+    let incarnation = serving_identity(&backend, &verifier, &stopping, verification);
+    let inventory = containers::Inventory::from_observation(
+        &observation,
+        &backend.identity(),
+        incarnation.clone(),
+    );
+    let signature = format!(
+        "{:?}|{:?}|{:?}|{:?}",
+        inventory.incarnation, inventory.workspaces, inventory.tabs, inventory.panes
+    );
+    if seen.as_deref() == Some(signature.as_str()) {
+        return Ok(());
+    }
+    let at = store::format_millis(unix_millis());
+    containers::adopt(
+        registry,
+        &observation,
+        &backend.identity(),
+        incarnation.as_ref(),
+        &at,
+    )?;
+    containers::reconcile(registry, &inventory, &at, MAX_RECONCILE)?;
+    *seen = Some(signature);
+    Ok(())
 }
 
 /// A wake is honoured only from the server generation that created the pane and

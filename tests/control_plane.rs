@@ -4789,11 +4789,12 @@ fn tmux_socket(name: &str) -> PathBuf {
     parent.join(format!("tmux-{uid}")).join(name)
 }
 
-/// An uncertain outcome is not a licence to retry: the record stays `unknown`,
-/// a same-ID retry returns it without a second dispatch, and another request
-/// over the same target is refused as in flight.
+/// An uncertain outcome is not a licence to retry: the record stays `unknown` and
+/// a same-ID retry returns it without a second dispatch. A focus changes nothing
+/// durable, so unlike a mutation it never holds its target against another
+/// request.
 #[test]
-fn an_uncertain_focus_stays_unknown_and_suppresses_the_target() {
+fn an_uncertain_focus_stays_unknown_and_never_holds_its_target() {
     let sandbox = Sandbox::new("focus-unknown");
     let backend = Arc::new(FakeBackend::new(
         empty_inventory(),
@@ -4816,25 +4817,21 @@ fn an_uncertain_focus_stays_unknown_and_suppresses_the_target() {
         result_record(&first)["completed_at"]
     );
 
-    // A different request over the same target cannot dispatch: the effect may
-    // already have happened, so it is refused in flight and recorded as such.
+    // A focus changes nothing durable, so its unknown outcome protects nothing: a
+    // different request over the same target is dispatched, not held in flight.
     let other_id = random_uuid();
     let other = client.call_id(
         &other_id,
         "mux.focus",
         json!({"target":"wA:p1","target_kind":"pane"}),
     );
-    assert_eq!(error_code(&other), "refused");
-    assert!(
-        other["error"]["message"]
-            .as_str()
-            .expect("a message")
-            .contains(&id),
-        "{other}"
+    assert_eq!(result_record(&other)["outcome"], "unknown", "{other}");
+    assert_ne!(
+        result_record(&other)["category"],
+        Category::IN_FLIGHT,
+        "an unknown focus held its target"
     );
-    let refused = client.call("mux.request.get", json!({"id": other_id}));
-    assert_eq!(result_record(&refused)["category"], Category::IN_FLIGHT);
-    assert_eq!(backend.focused.lock().unwrap().len(), 1);
+    assert_eq!(backend.focused.lock().unwrap().len(), 2);
     daemon.stop();
 }
 
@@ -9402,6 +9399,108 @@ fn a_recipe_creation_holds_the_command_privately_and_runs_it_in_its_pane() {
     );
     assert_eq!(error_code(&refused), "bad_params", "{refused}");
     assert_eq!(backend.creates().len(), 1, "nothing was created for it");
+    daemon.stop();
+}
+
+/// A server's own places are recorded as observed containers by the daemon's
+/// own pass, with their parents, and a place that is not Radar's is never
+/// reloaded from an invented recipe.
+#[test]
+fn a_servers_own_places_are_adopted_as_observed_containers() {
+    let sandbox = Sandbox::new("topology-adopt");
+    let inventory = FleetObservation {
+        workspaces: vec![Workspace {
+            workspace_id: "wA".into(),
+            label: Some("by-hand".into()),
+            number: None,
+        }],
+        tabs: vec![Tab {
+            tab_id: "wA:t1".into(),
+            workspace_id: "wA".into(),
+            label: None,
+            number: None,
+        }],
+        panes: vec![Pane {
+            location: Location {
+                workspace_id: "wA".into(),
+                tab_id: "wA:t1".into(),
+                pane_id: "wA:p1".into(),
+            },
+            label: None,
+            title: None,
+        }],
+        ..FleetObservation::default()
+    };
+    let backend = MuxBackend::new(RECIPE_CAPABILITIES).with_inventory(inventory);
+    // The daemon's own pid is a live process its verifier can confirm.
+    backend.served_by(std::process::id() as i32);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let mut listed = Value::Null;
+    for _ in 0..100 {
+        listed = client.call("topology.list", json!({}));
+        if listed["result"]["containers"]
+            .as_array()
+            .is_some_and(|containers| containers.len() == 3)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let containers = listed["result"]["containers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(containers.len(), 3, "{listed}");
+    let by_kind = |kind: &str| {
+        containers
+            .iter()
+            .find(|container| container["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} container in {listed}"))
+    };
+    for container in containers {
+        assert_eq!(container["provenance"], "observed", "{container}");
+        assert_eq!(container["recipe"], json!(false), "{container}");
+        assert!(
+            container["binding"]["incarnation"].is_object(),
+            "{container}"
+        );
+    }
+    assert_eq!(by_kind("workspace")["parent"], Value::Null);
+    assert_eq!(
+        by_kind("tab")["parent"],
+        by_kind("workspace")["container_id"]
+    );
+    assert_eq!(by_kind("pane")["parent"], by_kind("tab")["container_id"]);
+    assert!(
+        backend.created_requests.lock().expect("creates").is_empty(),
+        "adoption creates nothing"
+    );
+    assert!(
+        backend.closed.lock().expect("closes").is_empty(),
+        "adoption closes nothing"
+    );
+
+    // Another pass over the same server records nothing more.
+    std::thread::sleep(Duration::from_millis(2_500));
+    let again = client.call("topology.list", json!({}));
+    assert_eq!(
+        again["result"]["containers"],
+        listed["result"]["containers"]
+    );
+
+    // An observed pane has no recipe, so a reload refuses by saying so.
+    let reload = client.call(
+        "topology.reload",
+        json!({"request": {"container_id": by_kind("pane")["container_id"]}, "requester": "test"}),
+    );
+    assert_eq!(result_record(&reload)["outcome"], "refused", "{reload}");
+    assert!(
+        result_record(&reload)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not one Radar created")),
+        "{reload}"
+    );
     daemon.stop();
 }
 

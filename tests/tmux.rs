@@ -537,6 +537,19 @@ fn visible(runtime: &TmuxRuntime, pane: &str) -> Option<String> {
     }
 }
 
+/// A client attached to a probe's server, detached when dropped.
+struct AttachedClient {
+    child: std::process::Child,
+    _stdin: Option<std::process::ChildStdin>,
+}
+
+impl Drop for AttachedClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A disposable tmux server, created and ended by the test that uses it.
 struct Probe {
     name: String,
@@ -597,6 +610,34 @@ impl Probe {
 
     fn runtime_handle(&self, id: &str) -> String {
         format!("tmux:{}:{id}", self.name)
+    }
+
+    /// Attaches a control-mode client, which tmux counts like any other, and
+    /// keeps it attached until the returned child is dropped.
+    fn attach_client(&self) -> AttachedClient {
+        let mut child = Command::new("tmux")
+            .args(["-f", "/dev/null", "-L"])
+            .arg(&self.name)
+            .env_remove("TMUX")
+            .args(["-C", "attach-session", "-t", "main"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("attach a control client");
+        let stdin = child.stdin.take();
+        // Owned by the guard from the start, so every path reaps it.
+        let client = AttachedClient {
+            child,
+            _stdin: stdin,
+        };
+        for _ in 0..100 {
+            if !self.tmux(&["list-clients"]).trim().is_empty() {
+                return client;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the control client never attached");
     }
 
     /// Ends the server, whether the test passed or not.
@@ -791,6 +832,23 @@ fn focus_moves_the_window_and_makes_the_pane_active() {
     let pane = pane.trim().to_string();
     let pane_handle = probe.runtime_handle(&pane);
 
+    // With nothing attached there is nothing to show a focus to: refused first,
+    // and nothing is changed.
+    let before = probe.tmux(&["list-panes", "-a", "-F", "#{pane_id} #{pane_active}"]);
+    let alone = probe
+        .runtime
+        .focus_outcome(&Target::Pane(pane_handle.clone()), &cancel());
+    assert_eq!(
+        alone,
+        FocusOutcome::Refused(agent_radar::runtime::NO_CLIENT.to_string())
+    );
+    assert_eq!(
+        before,
+        probe.tmux(&["list-panes", "-a", "-F", "#{pane_id} #{pane_active}"]),
+        "a refused focus changed the server"
+    );
+
+    let _client = probe.attach_client();
     let outcome = probe
         .runtime
         .focus_outcome(&Target::Pane(pane_handle), &cancel());

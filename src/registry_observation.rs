@@ -257,12 +257,12 @@ pub fn project(
 /// Whether a registration that did not join a pane still belongs in this
 /// backend's fleet view.
 ///
-/// A registration for another backend or server is not this fleet's, so it is
-/// never shown. One that names no pane, or a pane this inventory lacks, is shown
-/// only while a publisher still holds a live lease or the daemon recorded a spawn
-/// edge for it: a registration is durable but its freshness is not, so a dead
-/// agent's record ages out of the view instead of piling up. Every other reason
-/// names a pane that is here, and that pane stays protected.
+/// Radar reaches only what is inside its own server. A registration for another
+/// backend or server is never shown, and neither is one that names no pane, or a
+/// pane this inventory lacks, unless the daemon recorded a spawn edge for it: a
+/// registration is durable but a place is not, so a dead agent's record ages out
+/// of the view instead of piling up. A registration whose pane is here stays,
+/// joined or not, and that pane stays protected.
 fn belongs_in_view(
     agent: &RegistryAgent,
     backend: &BackendIdentity,
@@ -286,18 +286,7 @@ fn belongs_in_view(
         .as_ref()
         .and_then(|location| location.pane.as_deref())
         .is_some_and(|pane| inventory.pane(pane).is_some());
-    pane_here || has_spawn || has_live_lease(agent)
-}
-
-/// Whether any channel of this registration was reported within its lease.
-fn has_live_lease(agent: &RegistryAgent) -> bool {
-    [&agent.execution, &agent.assignment, &agent.facts]
-        .into_iter()
-        .any(|channel| channel_freshness(channel) == Some(Freshness::Fresh))
-        || agent
-            .context
-            .as_ref()
-            .is_some_and(|context| context.context.freshness == Freshness::Fresh)
+    pane_here || has_spawn
 }
 
 /// The pane a registration exactly joins, or why it does not.
@@ -604,6 +593,21 @@ mod tests {
         BackendIdentity::named("herdr")
     }
 
+    /// The daemon's spawn edge for a child already bound to `agent_id`.
+    fn spawn_edge(agent_id: &str) -> PublicSpawnTopology {
+        serde_json::from_value(json!({
+            "version": 1,
+            "request_id": "r1",
+            "parent": "parent-1",
+            "created": "completed",
+            "launched": "completed",
+            "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "agent_id": agent_id, "bound_at": "2026-01-01T00:00:00.000Z"},
+            "recorded_at": "2026-01-01T00:00:00.000Z",
+            "state": "bound"
+        }))
+        .expect("a topology fixture")
+    }
+
     /// A registration whose publisher still holds a live lease.
     fn leased(mut agent: RegistryAgent) -> RegistryAgent {
         agent.context = Some(
@@ -654,22 +658,44 @@ mod tests {
     }
 
     #[test]
-    fn an_unplaced_registration_shows_only_while_its_lease_is_live() {
+    fn a_registration_shows_only_for_a_pane_here_or_a_recorded_spawn() {
         let panes = inventory(vec![pane("p1", "t1")]);
         let gone = at("p9");
-        let ids = |agents: Vec<RegistryAgent>| -> Vec<String> {
-            project(&panes, &herdr(), read(agents), &[])
+        let ids = |agents: Vec<RegistryAgent>, topology: Vec<PublicSpawnTopology>| -> Vec<String> {
+            let read = RegistryRead {
+                agents,
+                topology,
+                ..RegistryRead::default()
+            };
+            project(&panes, &herdr(), read, &[])
                 .into_iter()
                 .filter_map(|agent| Some(agent.registry?.agent.registration.agent_id))
                 .collect()
         };
-        // No pane here and no live lease: it ages out of the view.
-        assert!(ids(vec![registered("dead", gone.clone(), None)]).is_empty());
-        // The same registration with a live publisher stays, unresolved.
-        assert_eq!(ids(vec![leased(registered("live", gone, None))]), ["live"]);
+        // Radar reaches only what is inside its own server: a pane it does not
+        // hold is not shown, however live its publisher is.
+        assert!(ids(vec![registered("dead", gone.clone(), None)], Vec::new()).is_empty());
+        assert!(
+            ids(
+                vec![leased(registered("live", gone.clone(), None))],
+                Vec::new()
+            )
+            .is_empty()
+        );
+        // The daemon's own spawn edge keeps a launch visible while it resolves.
+        assert_eq!(
+            ids(
+                vec![registered("child", gone, None)],
+                vec![spawn_edge("child")]
+            ),
+            ["child"]
+        );
         // A pane that is here keeps its registration however stale: the pane stays
         // protected.
-        assert_eq!(ids(vec![registered("held", at("p1"), None)]), ["held"]);
+        assert_eq!(
+            ids(vec![registered("held", at("p1"), None)], Vec::new()),
+            ["held"]
+        );
     }
 
     fn at(pane_id: &str) -> Value {
@@ -730,8 +756,13 @@ mod tests {
     #[test]
     fn a_registration_on_an_absent_pane_keeps_its_last_location_unjoined() {
         let panes = inventory(vec![pane("p1", "t1")]);
-        let agent = leased(registered("a", at("p9"), Some(identity(7, 5))));
-        let projected = project(&panes, &herdr(), read(vec![agent]), &[]);
+        let agent = registered("a", at("p9"), Some(identity(7, 5)));
+        let read = RegistryRead {
+            agents: vec![agent],
+            topology: vec![spawn_edge("a")],
+            ..RegistryRead::default()
+        };
+        let projected = project(&panes, &herdr(), read, &[]);
         let view = projected[0].registry.as_ref().expect("registry view");
         assert_eq!(view.binding, Binding::Unjoined(Unjoined::PaneAbsent));
         assert_eq!(projected[0].location.pane_id, "p9");

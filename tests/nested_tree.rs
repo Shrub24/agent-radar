@@ -1924,36 +1924,6 @@ fn details(state: &ObservationState, id: &RowId) -> String {
     pages(state, &mut app)
 }
 
-/// A registration whose publisher still holds a live lease, which is what keeps
-/// an unplaced registration in the view.
-fn leased(mut agent: RegistryAgent) -> RegistryAgent {
-    agent.context = Some(
-        serde_json::from_value(json!({
-            "version": 1,
-            "agent_id": agent.registration.agent_id,
-            "writer": {
-                "source": "herdsman",
-                "incarnation": REGISTRY_INCARNATION,
-                "generation": 1,
-                "sequence": 1
-            },
-            "context": {
-                "source": "herdsman",
-                "incarnation": REGISTRY_INCARNATION,
-                "generation": 1,
-                "sequence": 1,
-                "lease_ms": 30_000,
-                "received_at": "2026-01-01T00:00:00.000Z",
-                "expires_at": "2026-01-01T00:00:30.000Z",
-                "restored": false,
-                "freshness": "fresh"
-            }
-        }))
-        .expect("leased context fixture"),
-    );
-    agent
-}
-
 /// Registrations that cannot join a pane stay distinct rows that own no pane:
 /// the reported pane keeps its own row, and the controls they would reach are
 /// refused.
@@ -1964,19 +1934,25 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
         vec![
             registration("r1", at("wA:p1"), false, Vec::new()),
             registration("r2", at("wA:p1"), false, Vec::new()),
-            leased(registration("r3", Value::Null, false, Vec::new())),
+            // Names no place: Radar reaches only what is inside its own server, so
+            // it is not a row at all.
+            registration("r3", Value::Null, false, Vec::new()),
         ],
         Vec::new(),
     );
     let mut app = app_for(&state);
     {
         let tree = app.tree();
-        for id in ["r1", "r2", "r3"] {
+        for id in ["r1", "r2"] {
             assert!(
                 node_of(&tree.roots, &RowId::Registered(id.into())).is_some(),
                 "{id} lost its row"
             );
         }
+        assert!(
+            node_of(&tree.roots, &RowId::Registered("r3".into())).is_none(),
+            "a registration naming no place in this server was shown"
+        );
         assert!(
             node_of(&tree.roots, &RowId::Pane("wA:p1".into())).is_some(),
             "the pane lost its row"
@@ -1985,9 +1961,10 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
             node_of(&tree.roots, &RowId::Agent("wA:p1".into())).is_none(),
             "a registration claimed the pane"
         );
-        let unplaced =
-            node_of(&tree.roots, &RowId::Workspace(String::new())).expect("unplaced root");
-        assert_eq!(unplaced.row.title(), "unplaced");
+        assert!(
+            node_of(&tree.roots, &RowId::Workspace(String::new())).is_none(),
+            "an unplaced root appeared"
+        );
         let targets = focus::targets(tree, &state);
         assert!(
             !targets.contains_key(&RowId::Registered("r1".into())),

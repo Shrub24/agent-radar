@@ -679,6 +679,18 @@ impl TmuxRuntime {
             .map_err(Failure::unknown)
     }
 
+    /// Refuses a focus when no client is attached to the server: there is nothing
+    /// to show it to, and nothing has been changed, so a caller can attach one.
+    fn require_client(&self, cancel: &AtomicBool) -> Result<(), Failure> {
+        let clients = self
+            .run(&["list-clients", "-F", "#{client_name}"], cancel)
+            .map_err(Failure::unknown)?;
+        if clients.text.trim().is_empty() {
+            return Err(Failure::refused(crate::runtime::NO_CLIENT));
+        }
+        Ok(())
+    }
+
     /// Moves a pane's window into view and then makes the pane active in it.
     ///
     /// Two commands, because tmux splits them: `select-window` alone leaves the
@@ -687,6 +699,7 @@ impl TmuxRuntime {
     /// so either failure is `unknown`.
     fn focus_pane(&self, handle: &str, cancel: &AtomicBool) -> Result<(), Failure> {
         let pane = self.address(handle, Kind::Pane).map_err(Failure::refused)?;
+        self.require_client(cancel)?;
         self.run(&["select-window", "-t", &pane], cancel)
             .map_err(Failure::unknown)?;
         self.run(&["select-pane", "-t", &pane], cancel)
@@ -705,8 +718,17 @@ impl TmuxRuntime {
         let session = self
             .address(handle, Kind::Session)
             .map_err(Failure::refused)?;
+        self.require_client(cancel)?;
         self.run(&["switch-client", "-t", &session], cancel)
-            .map_err(Failure::unknown)?;
+            .map_err(|message| {
+                // With no client there is nothing to switch and nothing changed:
+                // a definite refusal, not an effect that may have happened.
+                if message.contains("no current client") {
+                    Failure::refused(message)
+                } else {
+                    Failure::unknown(message)
+                }
+            })?;
         Ok(())
     }
 

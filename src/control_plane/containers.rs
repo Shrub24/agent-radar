@@ -393,6 +393,82 @@ pub fn record_created(
     Ok(vec![container])
 }
 
+/// Records a container, as observed, for every place of this server's own
+/// inventory that has none, and returns how many it recorded.
+///
+/// The inventory is the one server this daemon serves, so adoption reaches
+/// nothing outside it. A place is adopted only under a verified serving
+/// incarnation: an unfenced handle cannot be told from a later server reusing it.
+/// An adopted container is `Observed`: it has no recipe, so it is never reloaded,
+/// and it is never claimed as Radar's. Places already recorded, including by a
+/// creation, are left exactly as they are, so a pass over an unchanged server
+/// appends nothing.
+pub fn adopt(
+    registry: &Registry,
+    observation: &FleetObservation,
+    backend: &BackendIdentity,
+    incarnation: Option<&ProcessIdentity>,
+    at: &str,
+) -> Result<usize, String> {
+    let Some(incarnation) = incarnation else {
+        return Ok(0);
+    };
+    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    let mut adopted = 0;
+    // Parents first, so a child resolves its parent in the same pass.
+    let mut places: Vec<(Kind, &str, Option<&str>)> = Vec::new();
+    for workspace in &observation.workspaces {
+        places.push((Kind::Workspace, workspace.workspace_id.as_str(), None));
+    }
+    for tab in &observation.tabs {
+        places.push((
+            Kind::Tab,
+            tab.tab_id.as_str(),
+            Some(tab.workspace_id.as_str()),
+        ));
+    }
+    for pane in &observation.panes {
+        places.push((
+            Kind::Pane,
+            pane.location.pane_id.as_str(),
+            Some(pane.location.tab_id.as_str()),
+        ));
+    }
+    for (kind, handle, parent) in places {
+        if recorded_container(&log, backend, Some(incarnation), Some(handle)).is_some() {
+            continue;
+        }
+        let parent = recorded_container(&log, backend, Some(incarnation), parent);
+        let container = Container {
+            id: crate::control_plane::store::random_uuid(),
+            kind,
+            parent,
+            label: None,
+            created_by: None,
+            recipe: false,
+            provenance: Provenance::Observed,
+            binding: Some(Binding {
+                backend: backend.name.clone(),
+                incarnation: Some(incarnation.clone()),
+                handle: handle.to_owned(),
+            }),
+            created_at: at.to_owned(),
+            observed_at: Some(at.to_owned()),
+            unresolved: None,
+            removed_at: None,
+            recorded_at: at.to_owned(),
+        };
+        log.append(
+            &container.id,
+            at,
+            Source::TopologyObservation,
+            Transition::ContainerCreated(container.clone()),
+        )?;
+        adopted += 1;
+    }
+    Ok(adopted)
+}
+
 /// The container this daemon records for a handle under one serving incarnation.
 ///
 /// A handle under a different incarnation is a different container, a removed

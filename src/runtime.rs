@@ -37,6 +37,10 @@ use serde::{Deserialize, Serialize};
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::registry_observation::RegistryRead;
 
+/// What a tmux focus refuses with when nothing is attached to the server, so a
+/// caller can tell that case from any other refusal and attach a client.
+pub const NO_CLIENT: &str = "no tmux client is attached to this server";
+
 /// The certainty of a focus attempt at the runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FocusOutcome {

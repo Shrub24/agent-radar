@@ -793,6 +793,7 @@ impl Store {
         let held = self.recent(usize::MAX)?;
         Ok(held.into_iter().find(|record| {
             record.target.as_deref() == target
+                && !changes_nothing(&record.method)
                 && matches!(
                     record.derive(now_ms),
                     Derived::Pending | Derived::Unknown | Derived::Settled(RequestOutcome::Unknown)
@@ -803,6 +804,13 @@ impl Store {
     fn path(&self, id: &str) -> PathBuf {
         self.directory.join(format!("{id}.json"))
     }
+}
+
+/// Whether a method only selects or displays, so that however its record ended
+/// it cannot have changed the target and must not hold the target against a later
+/// mutation.
+fn changes_nothing(method: &str) -> bool {
+    method == "mux.focus"
 }
 
 /// A store path is built from request ids, so the id has to be canonical before
@@ -1239,6 +1247,44 @@ mod tests {
                 .contains("already exists")
         );
         assert_eq!(store.get(ID).expect("read").expect("first remains"), first);
+        drop_store(directory);
+    }
+
+    #[test]
+    fn an_unknown_focus_never_holds_its_target_against_a_mutation() {
+        let directory = tempdir("focus-unknown");
+        let store = Store::open(&directory).expect("a store");
+        let focus = record("mux.focus", Some("ws:1"), 1_000).complete(
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            Some("no current client"),
+            Vec::new(),
+            1_100,
+        );
+        store.create(&focus).expect("a create");
+        assert!(
+            store
+                .unresolved(Some("ws:1"), 2_000)
+                .expect("a search")
+                .is_none(),
+            "a focus that came to unknown blocked a later creation"
+        );
+        // A mutation that came to unknown still does.
+        let mut close = record("mux.close", Some("ws:2"), 1_000).complete(
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            Some("lost"),
+            Vec::new(),
+            1_100,
+        );
+        close.id = random_uuid();
+        store.create(&close).expect("a create");
+        assert!(
+            store
+                .unresolved(Some("ws:2"), 2_000)
+                .expect("a search")
+                .is_some()
+        );
         drop_store(directory);
     }
 

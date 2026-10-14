@@ -283,15 +283,6 @@ class Fleet:
                          "last_outcome": {"result": "partial", "detail": "pending"}}})["channel"]
         check(channel["snapshot"]["freshness"] == "fresh", str(channel))
 
-    def hold_lease(self, agent_id):
-        """A live session-context lease and nothing else. An unplaced
-        registration stays in the fleet view only while some publisher holds
-        one, so a registration that is meant to stay visible needs it."""
-        publisher.publish_context(
-            self.socket, agent_id,
-            {"source": "pi", "incarnation": str(uuid.uuid4())},
-            None, 1, SESSION, lease_ms=MAX_LEASE_MS)
-
     def publish_facts(self, agent_id, lease_ms, snapshot):
         return publisher.publish_facts(
             self.socket, agent_id, {"source": "pi", "incarnation": str(uuid.uuid4())},
@@ -533,29 +524,33 @@ def accept(binary, dump=False):
         expiring = fleet.register("accept stale", location(stale), birth_identity(stale_pid))
         fleet.publish_facts(expiring, STALE_LEASE_MS, {"model": "expiring-model"})
 
-        # This one reports a pane the inventory does not hold and publishes
-        # nothing: it can never join, and every channel it has is unknown.
-        absent = joined["location"]["pane_id"].rsplit(":", 1)[0] + ":%99"
-        orphan = fleet.register("accept orphan", location(joined, absent),
-                                birth_identity(joined_pid))
+        # These two report a pane the inventory holds but claim no process, so
+        # they cannot join it: they stay as unresolved rows that own no pane, and
+        # every channel they have is unknown.
+        orphan = fleet.register("accept orphan", location(joined), None)
         # A registration is allowed to have no label. It is still named by what it
         # has — its agent id — and not by the native name it does not have.
-        unnamed = fleet.register(None, location(joined, absent), birth_identity(joined_pid))
-        fleet.hold_lease(orphan)
-        fleet.hold_lease(unnamed)
-        check(len({worker, expiring, orphan, unnamed}) == 4,
+        unnamed = fleet.register(None, location(joined), None)
+        # This one reports a pane this server does not hold. Radar reaches only
+        # what is inside its own server, so it is never shown.
+        absent = joined["location"]["pane_id"].rsplit(":", 1)[0] + ":%99"
+        ghost = fleet.register("accept ghost", location(joined, absent),
+                               birth_identity(joined_pid))
+        check(len({worker, expiring, orphan, unnamed, ghost}) == 5,
               "the registrations are not distinct")
 
         fleet.start_dashboard()
         fleet.expect(b"current")
 
         names = ("accept worker", "accept stale", "accept orphan", unnamed)
-        captures = fleet.read_rows(names)
+        captures = fleet.read_rows(names + ("accept ghost",))
         if dump:
             for name, panel in captures.items():
                 print(f"===== {name} =====\n{panel}")
         for name in names:
             check(name in captures, f"no row reached for {name}")
+        check("accept ghost" not in captures,
+              "a registration for a pane outside this server was shown")
 
         # The row is named by its registration, never by the Herdr name a
         # registry-backed row does not have.

@@ -292,6 +292,7 @@ fn registered_assignment(agent_id: &str, assigned_started_unix_ms: Option<u64>) 
             "registered_at": "2026-01-01T00:00:00.000Z",
             "source": "herdsman",
             "incarnation": "11111111-1111-4111-8111-111111111111",
+            "location": {"backend": "fake", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
             "process_claimed": false,
             "launch": {"available": false}
         },
