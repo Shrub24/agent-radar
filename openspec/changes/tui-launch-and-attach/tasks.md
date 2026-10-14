@@ -6,6 +6,9 @@
 - [x] 1.2 `L` opens a prompt that owns the keyboard, Enter reviews the resolved command in the container confirmation, and Confirm sends it as the creation's recipe. App tests for the prompt, the dialog text, the recipe, a missing program and Esc.
 - [ ] 1.3 Socket test that a confirmed launch through a disposable tmux server runs its command in the created pane.
 
+- [x] 1.4 Enroll a lead started with `L` once it registers, and `E` for any registered lead; tests for the control, the guards and the launched-place memory.
+- [ ] 1.5 Live acceptance: a Pi started with `L` becomes stoppable and restartable.
+
 ## 2. Attach
 
 - [x] 2.1 `[tui] terminal` in the configuration, the `$TERMINAL -e` default, and the printed document; tests.

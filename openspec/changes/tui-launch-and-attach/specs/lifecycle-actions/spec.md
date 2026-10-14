@@ -17,3 +17,18 @@ Radar SHALL split the line into an executable and arguments by quoting and backs
 #### Scenario: No shell is invented
 - **WHEN** the line contains `$HOME` or a pipe
 - **THEN** each is passed as ordinary text in the argument list
+
+### Requirement: A launched or registered lead can be enrolled
+Radar SHALL enroll a lead started with `L` through `lifecycle.enroll` once it has registered a joined pane and a fresh session, once per launched place, and SHALL offer `E` on any joined registered agent that is not a lifecycle subject through the default-Cancel confirmation. Enrollment SHALL revalidate the same registration and session before sending, SHALL record no spawn edge, and SHALL signal nothing.
+
+#### Scenario: A launched lead registers
+- **WHEN** a lead started with `L` registers a joined pane and a fresh session
+- **THEN** one enrollment is sent for it and the row becomes a lifecycle subject
+
+#### Scenario: A lead started elsewhere
+- **WHEN** the user presses `E` on a joined registered agent that is not a subject
+- **THEN** a confirmation names the session and Cancel is selected
+
+#### Scenario: Nothing to enroll
+- **WHEN** `E` is pressed on a pane that is not a registered agent
+- **THEN** no dialog opens and a one-line message says so

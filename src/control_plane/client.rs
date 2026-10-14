@@ -1061,6 +1061,16 @@ pub trait LifecycleControls: Send + Sync {
         request: &LifecycleControlRequest,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String>;
+    /// Enrolls a registered lead the daemon did not launch as a lifecycle subject.
+    fn enroll_agent(
+        &self,
+        _request_id: &str,
+        _agent_id: &str,
+        _session: &str,
+        _cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        Err("this run cannot enroll a lead".to_string())
+    }
 }
 
 /// One subject-targeted request; pane ids are not lifecycle targets.
@@ -1352,6 +1362,45 @@ impl LifecycleControls for DaemonRuntime {
             request,
             cancel,
         )
+    }
+
+    fn enroll_agent(
+        &self,
+        request_id: &str,
+        agent_id: &str,
+        session: &str,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        self.enroll_registered(request_id, agent_id, session, cancel)
+    }
+}
+
+impl DaemonRuntime {
+    /// One enrollment, sent under the caller's own request id.
+    fn enroll_registered(
+        &self,
+        request_id: &str,
+        agent_id: &str,
+        session: &str,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        if !self.declared.contains(&ops::LIFECYCLE_ENROLL_CONTRACT) {
+            return Err(self.describe(format!(
+                "does not provide `{}`",
+                ops::LIFECYCLE_ENROLL_CONTRACT
+            )));
+        }
+        let result = exchange_with_id_at(
+            &self.socket,
+            request_id,
+            "lifecycle.enroll",
+            json!({"request": {"agent_id": agent_id, "session": session}, "requester": REQUESTER}),
+            cancel,
+        )
+        .map_err(|failure| failure.message)?;
+        Ok(LifecycleAnswer {
+            request: result.get("request").cloned().unwrap_or(Value::Null),
+        })
     }
 }
 

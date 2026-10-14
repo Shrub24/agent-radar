@@ -18,6 +18,6 @@ The line is split by quotes and backslashes only. `$VAR`, `~`, globs, pipes and 
 
 The daemon's focus refuses with an exact, named refusal when no client is attached. The dashboard recognizes that refusal, opens `<terminal> tmux -L <server> attach-session -t <id>` (tmux resolves a pane, window or session id there), and asks again every 250 ms for six seconds. Any other answer ends the wait. A terminal that exits within three seconds with an error is reported with the setting to check.
 
-### 5. Unverified
+### 5. A launched lead is enrolled
 
-A launched lead is not a lifecycle subject. Pi registers itself, so the row appears as an agent; stopping and restarting it needs `lifecycle.enroll` after registration, which this change does not add.
+Pi started by `L` registers itself, so it appears as an agent with no lifecycle subject and could not be stopped or restarted. The dashboard remembers the place a recipe creation completed in; once an agent joined to that place has a fresh registered session it sends one `lifecycle.enroll` for it, because the operator already confirmed running the command. A place is offered once, so a daemon refusal is not retried. `E` on any joined, registered agent opens the same enrollment in a default-Cancel confirmation for leads started any other way. The daemon still verifies the live foreground process and the session before it records anything, and it fabricates no spawn edge.

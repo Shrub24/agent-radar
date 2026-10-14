@@ -294,6 +294,16 @@ fn run() -> io::Result<()> {
         if collector.tick(&mut state, sweeping) {
             app.refresh(&state);
             dirty = true;
+            // A lead launched from the tree is enrolled once it has registered.
+            if let Some(enroll) = app.enroll_launched(&state) {
+                dispatch(
+                    Some(enroll),
+                    &mut app,
+                    &mut closer,
+                    &mut managed,
+                    &mut containers,
+                );
+            }
         }
         // The daemon owns publisher ingest; the TUI replaces its local projection
         // from revisioned snapshots and never accepts publisher messages itself.
@@ -490,6 +500,22 @@ fn dispatch(
 ) {
     match confirmed {
         Some(Confirmed::Direct(request)) => closer.start(request),
+        Some(Confirmed::Enroll {
+            request_id,
+            agent_id,
+            session,
+        }) => {
+            if let Err(message) = managed.start(radar::Control {
+                operation: radar::Operation::Enroll,
+                request_id,
+                subject_id: agent_id.clone(),
+                child_close: None,
+                close_request_id: None,
+                enrollment: Some(radar::Enrollment { agent_id, session }),
+            }) {
+                app.set_focus_message(Some(message));
+            }
+        }
         Some(Confirmed::Subject {
             operation,
             request_id,
@@ -511,6 +537,7 @@ fn dispatch(
                 subject_id,
                 child_close,
                 close_request_id,
+                enrollment: None,
             }) {
                 app.set_focus_message(Some(message));
             }

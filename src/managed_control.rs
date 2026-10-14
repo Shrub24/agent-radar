@@ -15,6 +15,8 @@ pub enum Operation {
     Cancel,
     Stop,
     Restart,
+    /// Makes a registered lead the daemon did not launch a lifecycle subject.
+    Enroll,
 }
 
 impl Operation {
@@ -23,6 +25,7 @@ impl Operation {
             Self::Cancel => "cancel",
             Self::Stop => "stop",
             Self::Restart => "restart",
+            Self::Enroll => "enroll",
         }
     }
 }
@@ -34,6 +37,16 @@ pub struct Control {
     pub subject_id: String,
     pub child_close: Option<crate::registry_observation::ChildCloseTarget>,
     pub close_request_id: Option<String>,
+    /// The registration and session an enrollment names. `subject_id` is the
+    /// registration's agent id then, because no subject exists yet.
+    pub enrollment: Option<Enrollment>,
+}
+
+/// What the operator saw and confirmed for an enrollment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Enrollment {
+    pub agent_id: String,
+    pub session: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,10 +89,20 @@ fn execute(
         request_id: dispatched.request_id.clone(),
         subject_id: dispatched.subject_id.clone(),
     };
-    let primary = match dispatched.operation {
-        Operation::Cancel => controls.cancel_subject(&request, cancel),
-        Operation::Stop => controls.stop_subject(&request, cancel),
-        Operation::Restart => controls.restart_subject(&request, cancel),
+    let primary = match (dispatched.operation, dispatched.enrollment.as_ref()) {
+        (Operation::Enroll, Some(enrollment)) => controls.enroll_agent(
+            &dispatched.request_id,
+            &enrollment.agent_id,
+            &enrollment.session,
+            cancel,
+        ),
+        (Operation::Enroll, None) => Err("an enrollment names no registration".to_string()),
+        (operation, _) => match operation {
+            Operation::Cancel => controls.cancel_subject(&request, cancel),
+            Operation::Stop => controls.stop_subject(&request, cancel),
+            Operation::Restart => controls.restart_subject(&request, cancel),
+            Operation::Enroll => unreachable!("matched above"),
+        },
     };
     let primary = recover(controls, &dispatched.request_id, primary, cancel);
     let close = match (
@@ -272,6 +295,66 @@ mod tests {
         ) -> Result<LifecycleAnswer, String> {
             self.cancel_subject(request, cancel)
         }
+
+        fn enroll_agent(
+            &self,
+            request_id: &str,
+            agent_id: &str,
+            session: &str,
+            _: &AtomicBool,
+        ) -> Result<LifecycleAnswer, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("enroll:{request_id}:{agent_id}:{session}"));
+            Ok(Self::answer("completed"))
+        }
+    }
+
+    #[test]
+    fn an_enrollment_names_its_registration_and_session_and_never_cancels() {
+        let controls = FakeControls {
+            calls: Mutex::new(Vec::new()),
+            cancel_outcome: "completed",
+            cancel_loses_reply: false,
+            can_close_child: true,
+        };
+        let enroll = Control {
+            operation: Operation::Enroll,
+            request_id: "enroll-id".into(),
+            subject_id: "agent-1".into(),
+            child_close: None,
+            close_request_id: None,
+            enrollment: Some(Enrollment {
+                agent_id: "agent-1".into(),
+                session: "11111111-1111-4111-8111-111111111111".into(),
+            }),
+        };
+        let execution = execute(&controls, &enroll, &AtomicBool::new(false));
+        assert_eq!(execution.primary.unwrap().outcome(), "completed");
+        assert!(execution.close.is_none());
+        assert_eq!(
+            *controls.calls.lock().unwrap(),
+            ["enroll:enroll-id:agent-1:11111111-1111-4111-8111-111111111111"]
+        );
+        // An enrollment that names no registration sends nothing.
+        let none = Control {
+            enrollment: None,
+            ..enroll
+        };
+        let execution = execute(&controls, &none, &AtomicBool::new(false));
+        assert!(execution.primary.is_err());
+        // The failure is read back by its id, but no second enrollment is sent.
+        assert_eq!(
+            controls
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("enroll:"))
+                .count(),
+            1
+        );
     }
 
     fn control() -> Control {
@@ -285,6 +368,7 @@ mod tests {
                 incarnation: "11111111-1111-4111-8111-111111111111".into(),
             }),
             close_request_id: Some("close-id".into()),
+            enrollment: None,
         }
     }
 

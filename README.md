@@ -829,7 +829,9 @@ title and label, which describe the pane rather than an agent.
   `A` creates a new workspace whatever row is selected, and `L` runs a typed
   command in a new tab (on a workspace) or pane (on a pane) after a confirmation
   that shows the resolved program; the line is split by quoting alone, with no
-  `$VAR`, `~`, glob or pipe expansion, and a program must be on `PATH`.
+  `$VAR`, `~`, glob or pipe expansion, and a program must be on `PATH`. A lead started this way is enrolled
+  as a lifecycle subject when it registers, so it can be stopped and restarted;
+  `E` enrolls any other registered lead after a confirmation.
   Enter on a row focuses it; with no tmux client attached it opens a terminal
   attached to the server (`[tui] terminal`, else `$TERMINAL -e`) and asks again. Children are not nested under their
   parent: the exact spawn edge is shown in the details. An ordinary pane never

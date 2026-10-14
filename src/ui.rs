@@ -374,6 +374,7 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
         Operation::DeleteContainer => "Delete container",
         Operation::ReloadContainer => "Reload pane",
         Operation::LaunchContainer => "Run a command",
+        Operation::EnrollAgent => "Enroll lead",
     };
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
