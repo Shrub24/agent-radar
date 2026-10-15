@@ -444,6 +444,10 @@ struct Core {
     bootstrap: Option<Bootstrap>,
     /// Unix milliseconds of the last completed recovery sweep pass; 0 before one.
     sweep_at: Arc<std::sync::atomic::AtomicI64>,
+    /// The daemon's shared observation sampler. `None` when no backend is wired:
+    /// there is nothing to observe, and the read refuses rather than publishing
+    /// an empty fleet as a successful one.
+    hub: Option<Arc<crate::control_plane::observation::Hub>>,
 }
 
 fn stop_backend_for(connections: &ConnectionSet) {
@@ -641,6 +645,12 @@ impl Daemon {
         };
         registry.attach_journal(store.clone());
         let stopping = Arc::new(AtomicBool::new(false));
+        // The sampler observes the same backend the reads do, and is started
+        // below once `Core` exists to hold it.
+        let hub_backend = backend.clone();
+        let hub_tasks = task_ingest.clone();
+        let hub_task_error = task_ingest_error.clone();
+        let hub_store = store.clone();
         let verification = Arc::new(VerificationBudget {
             active: Mutex::new(0),
             workers: Mutex::new(Vec::new()),
@@ -656,7 +666,21 @@ impl Daemon {
             stopping: Arc::clone(&stopping),
             sweep_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bootstrap,
+            hub: None,
         }));
+        // One sampler for every display, sampling only while a reader asks. The
+        // lifecycle sweep keeps its own coverage, so a daemon with no display
+        // attached still observes what its managed state needs.
+        if let Some(provider) = hub_backend {
+            let hub = Arc::new(crate::control_plane::observation::Hub::start(
+                provider,
+                hub_tasks,
+                hub_task_error,
+                hub_store,
+                &stopping,
+            ));
+            locked(&core).hub = Some(hub);
+        }
         let dispatch_core = Arc::clone(&core);
         let dispatch_stopping = Arc::clone(&stopping);
         let dispatch_verification = Arc::clone(&verification);
@@ -850,6 +874,7 @@ fn handle_line(
         Method::Request => answer(writer, read_one(core, &request)),
         Method::Requests => answer(writer, read_many(core, &request)),
         Method::Events => answer(writer, read_events(core, &request, stopping)),
+        Method::Observation => answer(writer, read_observation(core, &request)),
         Method::Tasks => answer(writer, read_tasks(core, &request)),
         Method::Registry => answer(writer, registry_request(core, &request, verification)),
         Method::Bootstrap => answer(writer, bootstrap_request(core, &request, verification)),
@@ -860,6 +885,147 @@ fn handle_line(
             answer(writer, response);
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationGetParams {
+    /// The epoch a caller believes it is reading, when it names one.
+    #[serde(default)]
+    epoch: Option<String>,
+    /// The revision the caller already holds, for a not-modified answer.
+    #[serde(default)]
+    since_revision: Option<u64>,
+    /// How long to hold the read open for a newer revision.
+    #[serde(default)]
+    wait_ms: Option<u64>,
+    /// The data classes the caller wants sampled.
+    #[serde(default)]
+    classes: Option<Vec<String>>,
+}
+
+/// Serves the daemon's shared observation snapshot.
+///
+/// A read records nothing: it is a projection of what the sampler has already
+/// published, and publishing a revision appends nothing to the durable journal.
+/// The revision is epoch-qualified, because a restarted daemon counting from one
+/// again must not look like the revision a caller already holds.
+fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
+    let params: ObservationGetParams = match decode_params(request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let wait = params.wait_ms.unwrap_or(0);
+    if wait > crate::control_plane::observation::MAX_OBSERVATION_WAIT_MS {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BadParams,
+                format!(
+                    "`wait_ms` must not exceed {} ms",
+                    crate::control_plane::observation::MAX_OBSERVATION_WAIT_MS
+                ),
+            ),
+        );
+    }
+    let classes = match crate::control_plane::observation::Classes::parse(
+        params.classes.as_deref().unwrap_or(&[]),
+    ) {
+        Ok(classes) => classes,
+        Err(message) => {
+            return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+        }
+    };
+    let hub = { locked(core).hub.clone() };
+    let Some(hub) = hub else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BackendUnavailable,
+                "this daemon has no observation backend, so it has nothing to publish",
+            ),
+        );
+    };
+    let epoch = hub.epoch();
+    // A revision from another process is expired rather than answered as
+    // current, so an old reader never sees a new epoch's revision as its own.
+    if params.epoch.as_deref().is_some_and(|named| named != epoch) {
+        let (revision, _) = hub.current();
+        return Response::ok(
+            &request.id,
+            json!({"snapshot_expired": {"epoch": epoch, "revision": revision}}),
+        );
+    }
+    // Demand is recorded before the answer, so the class this read asked for is
+    // sampled for the next revision rather than the one after next. The revision
+    // this returns is the one that existed before the demand, which is what makes
+    // a first read deterministic: it cannot see a sample its own demand caused.
+    let mut revision = hub.demand(classes);
+    if revision == 0 && params.since_revision.is_none() {
+        // Nothing has ever been sampled: this read is the first demand, and a
+        // snapshot is not a thing that can be invented for it.
+        return Response::ok(
+            &request.id,
+            json!({"not_modified": {"epoch": epoch, "revision": 0}}),
+        );
+    }
+    if let Some(since) = params.since_revision {
+        // A revision this epoch never had is expired, not merely old.
+        if since > revision {
+            return Response::ok(
+                &request.id,
+                json!({"snapshot_expired": {"epoch": epoch, "revision": revision}}),
+            );
+        }
+        if since == revision && wait > 0 {
+            hub.wait_for_newer(revision, Duration::from_millis(wait));
+            revision = hub.current().0;
+        }
+        if since == revision {
+            return Response::ok(
+                &request.id,
+                json!({"not_modified": {"epoch": epoch, "revision": revision}}),
+            );
+        }
+    }
+    let (current, snapshot) = hub.current();
+    let Some(snapshot) = snapshot else {
+        // Nothing has been sampled yet: that is not a fleet, and not a failure.
+        return Response::ok(
+            &request.id,
+            json!({"not_modified": {"epoch": epoch, "revision": current}}),
+        );
+    };
+    if !snapshot.fits() {
+        return Response::ok(
+            &request.id,
+            json!({"snapshot_too_large": {
+                "epoch": snapshot.epoch,
+                "revision": snapshot.revision,
+                "limit_bytes": crate::control_plane::observation::MAX_SNAPSHOT_BYTES,
+            }}),
+        );
+    }
+    let value = match serde_json::to_value(&*snapshot) {
+        Ok(value) => value,
+        Err(error) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::Internal,
+                    format!("the observation snapshot is not serializable: {error}"),
+                ),
+            );
+        }
+    };
+    Response::ok(
+        &request.id,
+        json!({
+            "epoch": snapshot.epoch,
+            "revision": snapshot.revision,
+            "snapshot": value,
+        }),
+    )
 }
 
 #[derive(serde::Deserialize)]

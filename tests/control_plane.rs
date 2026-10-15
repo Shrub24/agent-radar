@@ -2330,6 +2330,175 @@ impl Drop for Sandbox {
     }
 }
 
+/// The normalized fleet one fake backend serves, used by the observation tests.
+fn observation_fleet() -> FleetObservation {
+    serde_json::from_value(json!({
+        "workspaces":[{"workspace_id":"wA","label":"main","number":1}],
+        "tabs":[{"tab_id":"wA:t1","workspace_id":"wA","label":null,"number":1}],
+        "panes":[{"location":{"workspace_id":"wA","tab_id":"wA:t1","pane_id":"wA:p1"},"label":null,"title":null}],
+        "agents":[]
+    }))
+    .expect("normalized fixture")
+}
+
+/// Reads the snapshot the daemon has published, waiting for one to exist.
+fn published_observation(client: &mut Client) -> Value {
+    for _ in 0..40 {
+        let answer = client.call(
+            "observation.get",
+            json!({"wait_ms": 2000, "classes": ["fleet", "processes"]}),
+        );
+        if let Some(snapshot) = answer["result"].get("snapshot") {
+            return snapshot.clone();
+        }
+    }
+    panic!("the daemon published no observation");
+}
+
+/// One observation read is a revision every reader shares, naming the revision a
+/// caller already holds is answered as not modified, and a revision from another
+/// daemon process is expired rather than answered as current.
+#[test]
+fn observation_reads_are_revisioned_and_never_append_to_the_journal() {
+    let sandbox = Sandbox::new("observation-read");
+    let backend = Arc::new(FakeBackend::new(
+        observation_fleet(),
+        FocusAnswer::Completed,
+    ));
+    let mut daemon = sandbox.daemon_with(backend);
+    let mut client = Client::dial(daemon.path());
+
+    let ping = client.call("daemon.ping", json!({}));
+    assert!(
+        ping["result"]["contracts"]
+            .as_array()
+            .expect("contracts")
+            .contains(&json!("observation.get.v1")),
+        "{ping}"
+    );
+    let head_before = client.call("events.read", json!({"after": 0}))["result"]["tail"].clone();
+
+    let snapshot = published_observation(&mut client);
+    let epoch = snapshot["epoch"].as_str().expect("an epoch").to_string();
+    let revision = snapshot["revision"].as_u64().expect("a revision");
+    assert!(revision >= 1, "{snapshot}");
+    // The payload is the daemon's fleet projection, with the last-good inventory
+    // under its own name rather than flattened into the envelope.
+    assert_eq!(
+        snapshot["observation"]["inventory"]["workspaces"][0]["workspace_id"],
+        "wA"
+    );
+    // One source per observation input, each reporting for itself.
+    let sources: Vec<&str> = snapshot["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .map(|source| source["name"].as_str().expect("a source name"))
+        .collect();
+    assert_eq!(sources, ["inventory", "registry", "processes", "tasks"]);
+    assert_eq!(snapshot["sources"][0]["state"], "current");
+    assert!(snapshot["sources"][0]["last_success_at"].is_string());
+
+    // A reader that already holds this revision is told so rather than sent it
+    // again.
+    let same = client.call(
+        "observation.get",
+        json!({"epoch": epoch, "since_revision": revision, "classes": ["fleet"]}),
+    );
+    assert!(
+        same["result"].get("not_modified").is_some(),
+        "expected not_modified, got {same}"
+    );
+
+    // A revision from another process is not this daemon's revision 7.
+    let other = client.call(
+        "observation.get",
+        json!({"epoch": "11111111-1111-4111-8111-111111111111", "since_revision": revision}),
+    );
+    assert!(
+        other["result"].get("snapshot_expired").is_some(),
+        "expected snapshot_expired, got {other}"
+    );
+
+    // Publishing revisions is not a durable event.
+    let head_after = client.call("events.read", json!({"after": 0}))["result"]["tail"].clone();
+    assert_eq!(
+        head_before, head_after,
+        "publishing a revision must not append to the durable journal"
+    );
+    daemon.stop();
+}
+
+/// Nothing is sampled while nobody asks, so a daemon with no display attached
+/// collects nothing — and the first read cannot be handed a snapshot its own
+/// demand caused.
+#[test]
+fn observation_samples_nothing_before_a_reader_asks() {
+    let sandbox = Sandbox::new("observation-idle");
+    let backend = Arc::new(FakeBackend::new(
+        observation_fleet(),
+        FocusAnswer::Completed,
+    ));
+    let mut daemon = sandbox.daemon_with(backend);
+    // Long enough that a sampler collecting on its own would have published.
+    std::thread::sleep(Duration::from_millis(400));
+    let mut client = Client::dial(daemon.path());
+
+    let first = client.call("observation.get", json!({"classes": ["fleet"]}));
+    assert_eq!(
+        first["result"]["not_modified"]["revision"], 0,
+        "a daemon with no reader must not have sampled: {first}"
+    );
+
+    let snapshot = published_observation(&mut client);
+    assert!(snapshot["revision"].as_u64().expect("a revision") >= 1);
+    daemon.stop();
+}
+
+/// The read is bounded and its parameters are checked rather than guessed at.
+#[test]
+fn observation_refuses_unknown_classes_and_unbounded_waits() {
+    let sandbox = Sandbox::new("observation-params");
+    let backend = Arc::new(FakeBackend::new(
+        observation_fleet(),
+        FocusAnswer::Completed,
+    ));
+    let mut daemon = sandbox.daemon_with(backend);
+    let mut client = Client::dial(daemon.path());
+
+    let unknown = client.call("observation.get", json!({"classes": ["processors"]}));
+    assert_eq!(error_code(&unknown), "bad_params", "{unknown}");
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("processors")
+    );
+
+    let long = client.call("observation.get", json!({"wait_ms": 600_000}));
+    assert_eq!(error_code(&long), "bad_params", "{long}");
+    daemon.stop();
+}
+
+/// A daemon with no backend has nothing to observe, and says so rather than
+/// publishing an empty fleet as a successful reading.
+#[test]
+fn observation_refuses_without_a_backend_instead_of_publishing_an_empty_fleet() {
+    let sandbox = Sandbox::new("observation-no-backend");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+
+    let answer = client.call("observation.get", json!({}));
+    assert_eq!(error_code(&answer), "backend_unavailable", "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("nothing to publish")
+    );
+    daemon.stop();
+}
+
 /// One connection, one line at a time.
 struct Client {
     reader: BufReader<UnixStream>,
@@ -2632,7 +2801,10 @@ fn ping_answers_the_revision_and_backend_contracts_without_a_mux() {
     let mut client = Client::dial(daemon.path());
     let response = client.call("daemon.ping", json!({}));
     assert_eq!(response["result"]["protocol"], PROTOCOL_VERSION);
-    assert_eq!(response["result"]["revision"], json!(1));
+    assert_eq!(
+        response["result"]["revision"],
+        json!(agent_radar::control_plane::ops::PROTOCOL_REVISION)
+    );
     assert_eq!(response["result"]["backend"], "none");
     assert_eq!(
         response["result"]["contracts"],

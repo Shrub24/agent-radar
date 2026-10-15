@@ -12,6 +12,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::{AgentObservation, FleetObservation, ForegroundEvidence, SessionIdentity};
 
 /// Source-wide freshness of the latest collection outcome.
@@ -19,7 +21,8 @@ use crate::model::{AgentObservation, FleetObservation, ForegroundEvidence, Sessi
 /// Presentation distinguishes all four states: current observations, a stale
 /// last-good inventory, a source that never produced an inventory, and a
 /// source whose first outcome is still pending.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceFreshness {
     /// Started; no collection outcome has arrived yet.
     #[default]
@@ -35,7 +38,8 @@ pub enum SourceFreshness {
 }
 
 /// Why a retained association is currently believed to be at rest.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RetentionBasis {
     /// process-info showed the pane shell owning the foreground.
     ShellForeground,
@@ -45,7 +49,7 @@ pub enum RetentionBasis {
 }
 
 /// A last-observed agent association kept alive through an idle-shell gap.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedAgent {
     /// The last observed facts for this pane. Never merged into newer
     /// observations: a returning agent replaces these wholesale.
@@ -55,10 +59,19 @@ pub struct RetainedAgent {
 
 /// The normalized observation surface: last-good inventory, source freshness
 /// and pane-backed continuity, reconciled by pure transitions.
-#[derive(Debug, Default)]
+///
+/// This is the daemon's projection and the display's read model: it carries no
+/// launch values, environment overlays or private recipes, so it is what a
+/// snapshot publishes. Serialization is how a display receives it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObservationState {
     inventory: Option<FleetObservation>,
     source: SourceFreshness,
+    /// Freshness of the registry source alone. A registry read that fails leaves
+    /// the last-good projection standing and is reported here, never as a fleet
+    /// failure: the fleet was not what was unreadable.
+    #[serde(default)]
+    registry: SourceFreshness,
     /// Display continuity: retained presented agents keyed by connector-scoped
     /// pane id. Invariant maintained by the transitions: every retained pane
     /// exists in the inventory and has no presented agent reported on it.
@@ -130,6 +143,9 @@ impl ObservationState {
             .retain(|pane_id, _| panes.contains(pane_id.as_str()));
         self.inventory = Some(observation);
         self.source = SourceFreshness::Current;
+        // One successful pass read both sources: the projection it built came
+        // from the registry it read.
+        self.registry = SourceFreshness::Current;
     }
 
     /// Applies one failed collection.
@@ -141,6 +157,23 @@ impl ObservationState {
     pub fn apply_failure(&mut self, diagnostic: impl Into<String>) {
         let diagnostic = diagnostic.into();
         self.source = if self.inventory.is_some() {
+            SourceFreshness::Stale { diagnostic }
+        } else {
+            SourceFreshness::Unavailable { diagnostic }
+        };
+    }
+
+    /// Applies one failed registry read.
+    ///
+    /// The registry is its own source: its failure leaves the inventory and the
+    /// last-good registry projection standing, so agents are neither presented
+    /// as vanished nor reported as a stale fleet. Freshness records it here.
+    pub fn apply_registry_failure(&mut self, diagnostic: impl Into<String>) {
+        let diagnostic = diagnostic.into();
+        self.registry = if matches!(
+            self.registry,
+            SourceFreshness::Current | SourceFreshness::Stale { .. }
+        ) {
             SourceFreshness::Stale { diagnostic }
         } else {
             SourceFreshness::Unavailable { diagnostic }
@@ -195,6 +228,11 @@ impl ObservationState {
     /// Source-wide freshness, including the latest collection diagnostic.
     pub fn source_freshness(&self) -> &SourceFreshness {
         &self.source
+    }
+
+    /// Registry-source freshness, separate from the fleet source.
+    pub fn registry_freshness(&self) -> &SourceFreshness {
+        &self.registry
     }
 
     /// Retained presented agents keyed by pane id, for display (empty when
@@ -390,6 +428,41 @@ mod tests {
             vec![agent("wA:p1", Some(reported(SESSION)), RuntimeStatus::Idle)],
         ));
         state
+    }
+
+    #[test]
+    fn a_registry_failure_is_its_own_source_and_leaves_the_fleet_standing() {
+        let mut state = ObservationState::new();
+        state.apply_success(FleetObservation::default());
+        state.apply_registry_failure("the registry could not be read");
+
+        assert_eq!(state.source_freshness(), &SourceFreshness::Current);
+        assert!(matches!(
+            state.registry_freshness(),
+            SourceFreshness::Stale { diagnostic } if diagnostic == "the registry could not be read"
+        ));
+        assert!(
+            state.inventory().is_some(),
+            "a registry failure is not a fleet that vanished"
+        );
+    }
+
+    #[test]
+    fn a_registry_failure_before_any_success_is_unavailable_not_stale() {
+        let mut state = ObservationState::new();
+        state.apply_registry_failure("no registry yet");
+        assert!(matches!(
+            state.registry_freshness(),
+            SourceFreshness::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_successful_collection_reads_both_sources() {
+        let mut state = ObservationState::new();
+        state.apply_registry_failure("first attempt failed");
+        state.apply_success(FleetObservation::default());
+        assert_eq!(state.registry_freshness(), &SourceFreshness::Current);
     }
 
     #[test]

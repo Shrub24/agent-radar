@@ -110,8 +110,29 @@ records are readable with `mux.request.list` and `"unfinished": true`. No comman
 
 ## Dashboard consumption
 
-The Radar TUI is an optional display client. It declares `registry.v1` and `spawn.v1`, reads the daemon's pane inventory plus paged `agent.list` and `spawn.list`, and joins each registration to a pane by its backend-qualified location and the exact `process.claim` birth identity of that pane's own foreground process. It reads background-task snapshots through `tasks.list.v1` and joins them only by exact Pi session UUID; it does not bind publisher sockets or ingest messages. A daemon that omits either contract fails the
-refresh with that diagnostic rather than showing a fleet from another source.
+The Radar TUI is an optional display client, and it collects nothing itself. The
+daemon runs one sampler and publishes an immutable revisioned snapshot; the
+dashboard reads that through `observation.get.v1` and keeps only its own tree
+build, folds, selection and filter. Two displays therefore share one sample and
+one continuity memory, and closing the dashboard does not lose what it learned —
+the daemon still holds it.
+
+Sampling follows demand: a read names the classes it wants, and the process table
+is swept only while a display has asked for it recently. A daemon with no display
+attached samples nothing here; its managed state does not depend on this, because
+the lifecycle sweep keeps its own coverage.
+
+The snapshot carries per-source freshness. The daemon reads the pane inventory
+from its backend and the registry in process, and reports the fleet, registry,
+process and task sources separately, so a registry that cannot be read is
+reported as the registry rather than as a fleet that vanished. The dashboard joins
+each registration to a pane by its backend-qualified location and the exact
+`process.claim` birth identity of that pane's own foreground process, and joins
+background tasks only by exact Pi session UUID; it does not bind publisher sockets
+or ingest messages. A daemon that does not serve `observation.get.v1` fails the
+dashboard's startup with that diagnostic rather than showing a fleet from another
+source, and there is no fallback to collecting locally. Publishing a revision is
+not a durable event: nothing about a sample enters the journal.
 Herdr's agent records, its display metadata and its native agent status are never
 display facts: a registered row is named by its registration and shows the
 execution, assignment and facts channels, each with its own provenance and
@@ -127,7 +148,7 @@ units start and stop it; see [Stopping and refusals](#stopping-and-refusals).
 
 Clients connect directly using Unix-domain UTF-8 JSON Lines, protocol version
 `2`, with a canonical UUID request ID and one matching response per request.
-Send `daemon.ping` first. The answer includes protocol `2`, a wire `revision`, and the contracts this daemon serves. External consumers pin only what they use: `registry.v1` for a registry publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader, `tasks.list.v1` for background-task snapshots, and `spawn.v1`/`spawn.close.v1` for managed children. Unknown contract names are tolerated. The bundled Radar client requires its minimum revision and shows a blocking diagnostic with the daemon restart command if a daemon outlived an install. `mux.*` primitives are internal and are not sent in the handshake.
+Send `daemon.ping` first. The answer includes protocol `2`, a wire `revision`, and the contracts this daemon serves. External consumers pin only what they use: `registry.v1` for a registry publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader, `observation.get.v1` for a display or any reader of the shared observation snapshot, `tasks.list.v1` for background-task snapshots, and `spawn.v1`/`spawn.close.v1` for managed children. Unknown contract names are tolerated. The bundled Radar client requires its minimum revision and shows a blocking diagnostic with the daemon restart command if a daemon outlived an install. `mux.*` primitives are internal and are not sent in the handshake.
 
 Default control socket resolution: `RADAR_CONTROL_SOCKET`, then `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then `/tmp/agent-radar-<uid>/control.sock`. The daemon temporarily also binds the legacy publisher socket path described in [the publisher bridge](radar-bus.md); it is an ingest-only compatibility entry into the same transport and task state. See the [protocol reference](control-plane.md#start-and-select) for state-path resolution, the `[daemon]` table, and physical-backend selection.
 
@@ -146,6 +167,7 @@ processes running as the same user. Do not expose this socket remotely.
 | Mutation readback | `mux.request.get`, `mux.request.list` | None |
 | Durable lifecycle events | `events.read` | `events.v1` |
 | Volatile task snapshot | `tasks.list` | `tasks.list.v1` |
+| Shared observation snapshot | `observation.get` | `observation.get.v1` |
 | Register a subject | `agent.register` | `registry.v1` |
 | Acquire or explicitly replace a channel writer | `agent.acquire` | `registry.v1` |
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `registry.v1` |

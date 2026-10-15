@@ -22,6 +22,7 @@ pub mod project;
 pub mod registry_observation;
 pub mod runtime;
 pub mod service;
+pub mod snapshot_fetch;
 pub mod theme;
 pub mod title;
 pub mod tmux;

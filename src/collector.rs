@@ -96,6 +96,20 @@ impl Default for CollectorConfig {
     }
 }
 
+/// Which source a failed collection pass could not read.
+///
+/// The fleet and the registry are separate sources: a registry read that fails
+/// leaves the last-good inventory and the last-good registry projection
+/// standing, so it is reported against the registry rather than as a fleet
+/// failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailedSource {
+    /// The runtime could not be read: there is no new inventory at all.
+    Fleet,
+    /// The registry could not be read: the fleet observation may be fine.
+    Registry,
+}
+
 /// One finished collection cycle, ready to be applied to the reconciler.
 enum RefreshOutcome {
     Success {
@@ -106,6 +120,7 @@ enum RefreshOutcome {
     },
     Failure {
         diagnostic: String,
+        source: FailedSource,
     },
 }
 
@@ -179,17 +194,7 @@ impl Collector {
         if self.stopped {
             return false;
         }
-        let applied = self.apply_finished(state);
-        // The deadline is enforced here, on the caller's thread, so a refresh
-        // stuck in one call is still cancelled. Tick at least as often as the
-        // poll interval for this to hold promptly.
-        if let Some(refresh) = self
-            .in_flight
-            .as_ref()
-            .filter(|r| Instant::now() >= r.deadline)
-        {
-            refresh.cancel.store(true, Ordering::SeqCst);
-        }
+        let applied = self.drain(state);
         if self.in_flight.is_none() && Instant::now() >= self.next_refresh {
             // A whole-fleet process sweep covers every pane; otherwise the
             // candidates are the continuity retentions plus the live agent panes
@@ -200,6 +205,30 @@ impl Collector {
                 state.evidence_candidates()
             };
             self.start_refresh(candidates);
+        }
+        applied
+    }
+
+    /// Applies a finished refresh and enforces the in-flight deadline, without
+    /// starting another.
+    ///
+    /// A sampler that must not collect while nothing is reading still has to
+    /// reap the refresh it already started and apply its outcome, so the
+    /// worker it owns never outlives the demand that asked for it.
+    pub fn drain(&mut self, state: &mut ObservationState) -> bool {
+        if self.stopped {
+            return false;
+        }
+        let applied = self.apply_finished(state);
+        // The deadline is enforced here, on the caller's thread, so a refresh
+        // stuck in one call is still cancelled. Tick at least as often as the
+        // poll interval for this to hold promptly.
+        if let Some(refresh) = self
+            .in_flight
+            .as_ref()
+            .filter(|r| Instant::now() >= r.deadline)
+        {
+            refresh.cancel.store(true, Ordering::SeqCst);
         }
         applied
     }
@@ -233,6 +262,7 @@ impl Collector {
             // Collection fails visibly instead of silently stopping.
             Err(TryRecvError::Disconnected) => RefreshOutcome::Failure {
                 diagnostic: "collection worker stopped unexpectedly".to_string(),
+                source: FailedSource::Fleet,
             },
         };
         let refresh = self.in_flight.take().expect("checked above");
@@ -250,7 +280,10 @@ impl Collector {
                     state.apply_evidence(&pane_id, evidence);
                 }
             }
-            RefreshOutcome::Failure { diagnostic } => state.apply_failure(diagnostic),
+            RefreshOutcome::Failure { diagnostic, source } => match source {
+                FailedSource::Fleet => state.apply_failure(diagnostic),
+                FailedSource::Registry => state.apply_registry_failure(diagnostic),
+            },
         }
         self.next_refresh = Instant::now() + self.config.poll_interval;
         true
@@ -317,11 +350,21 @@ fn collect(
 ) -> RefreshOutcome {
     let mut observation = match provider.inventory(cancel) {
         Ok(observation) => observation,
-        Err(diagnostic) => return RefreshOutcome::Failure { diagnostic },
+        Err(diagnostic) => {
+            return RefreshOutcome::Failure {
+                diagnostic,
+                source: FailedSource::Fleet,
+            };
+        }
     };
     let registry = match provider.registry(cancel) {
         Ok(registry) => registry,
-        Err(diagnostic) => return RefreshOutcome::Failure { diagnostic },
+        Err(diagnostic) => {
+            return RefreshOutcome::Failure {
+                diagnostic,
+                source: FailedSource::Registry,
+            };
+        }
     };
     // A set: a pane named by the continuity candidates and by a registration is
     // sampled once.
@@ -370,6 +413,7 @@ fn collect(
     if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
         return RefreshOutcome::Failure {
             diagnostic: format!("collection did not finish within {REFRESH_DEADLINE:?}"),
+            source: FailedSource::Fleet,
         };
     }
     // Containers are read with the registry facts, and they are the daemon's

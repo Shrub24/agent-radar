@@ -59,6 +59,8 @@ pub enum Contract {
     LifecycleEnroll,
     #[serde(rename = "lifecycle.restart.v1")]
     LifecycleRestart,
+    #[serde(rename = "observation.get.v1")]
+    ObservationGet,
     #[serde(other)]
     Unknown,
 }
@@ -84,6 +86,7 @@ impl Contract {
         Self::LifecycleList,
         Self::LifecycleEnroll,
         Self::LifecycleRestart,
+        Self::ObservationGet,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -108,6 +111,7 @@ impl Contract {
             Self::LifecycleList => "lifecycle.list.v1",
             Self::LifecycleEnroll => "lifecycle.enroll.v1",
             Self::LifecycleRestart => "lifecycle.restart.v1",
+            Self::ObservationGet => "observation.get.v1",
             Self::Unknown => "unknown",
         }
     }
@@ -135,6 +139,9 @@ impl Contract {
             Self::TopologyReconcile => P::OBSERVE,
             Self::LifecycleEnroll => P::LIFECYCLE_TRACKING.union(P::OBSERVE),
             Self::LifecycleRestart => P::LIFECYCLE_TRACKING.union(P::CREATE).union(P::LAUNCH),
+            // The snapshot is built from the same observation a `mux.observe`
+            // read is, so a backend that cannot observe has nothing to publish.
+            Self::ObservationGet => P::OBSERVE,
             Self::Unknown => P::NONE,
         }
     }
@@ -144,7 +151,7 @@ impl Contract {
 /// added to the protocol. A bundled client needs a daemon at least this new,
 /// because the two ship together and only a daemon that outlived an install can
 /// be older.
-pub const PROTOCOL_REVISION: u32 = 1;
+pub const PROTOCOL_REVISION: u32 = 2;
 
 /// What the handshake advertises: the daemon contracts the backend's primitive set
 /// can serve, which is the list an external consumer pins. The backend's own
@@ -319,6 +326,9 @@ pub enum Method {
     Read,
     /// Resumable read of the durable event journal.
     Events,
+    /// The daemon's shared observation snapshot: one sampler's output for every
+    /// reader, revisioned and demand-driven. A read, never recorded.
+    Observation,
     /// Volatile task sessions received from extension publishers.
     Tasks,
     /// Registry reads and writes: the daemon's own durable records, answered
@@ -343,6 +353,7 @@ pub fn classify(method: &str) -> Option<Method> {
         "mux.request.get" => Method::Request,
         "mux.request.list" => Method::Requests,
         "events.read" => Method::Events,
+        "observation.get" => Method::Observation,
         "tasks.list" => Method::Tasks,
         "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
         | "agent.get" | "agent.list" => Method::Registry,

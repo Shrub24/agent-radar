@@ -14,6 +14,7 @@ pub mod containers;
 pub mod events;
 pub mod ingest;
 pub mod lifecycle;
+pub mod observation;
 pub mod ops;
 pub mod protocol;
 pub mod public_contracts;

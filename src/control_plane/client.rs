@@ -92,16 +92,17 @@ struct LifecyclePage {
 }
 
 #[derive(Deserialize)]
-struct TasksPage {
-    revision: u64,
-    sessions: Vec<TaskSession>,
-    next_after: Option<String>,
+pub struct TasksPage {
+    pub revision: u64,
+    pub sessions: Vec<TaskSession>,
+    pub next_after: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct TaskSession {
+pub struct TaskSession {
     session: String,
     connected: bool,
+    #[allow(dead_code, reason = "the wire carries it; no reader presents it yet")]
     last_updated_at: u64,
     tasks: Vec<TaskValue>,
 }
@@ -128,6 +129,21 @@ pub struct TaskSnapshot {
 /// The label this caller's records carry, so an operator reading the store knows
 /// who asked.
 const REQUESTER: &str = "radar";
+
+/// What one observation read returned.
+#[derive(Clone, Debug)]
+pub enum ObservationRead {
+    /// The daemon's current revision.
+    Snapshot(Box<crate::control_plane::observation::Snapshot>),
+    /// The caller already holds the current revision.
+    NotModified { epoch: String, revision: u64 },
+    /// The caller named a revision or epoch this daemon does not hold; it must
+    /// restart from the current revision rather than merge the two.
+    Expired { epoch: String, revision: u64 },
+    /// The snapshot is larger than one response may carry: the caller asked for
+    /// more classes than it can receive in one read.
+    TooLarge,
+}
 
 /// The daemon as a [`RuntimeProvider`].
 pub struct DaemonRuntime {
@@ -268,40 +284,7 @@ impl DaemonRuntime {
                 return Err(self.describe("task snapshot changed while paging".to_string()));
             }
             revision = Some(page.revision);
-            for session in page.sessions {
-                if !session.connected {
-                    continue;
-                }
-                let _last_updated_at = session.last_updated_at;
-                let session_id = session.session;
-                events.push(BusEvent::Connected {
-                    session: session_id.clone(),
-                    pane: None,
-                });
-                events.push(BusEvent::Tasks {
-                    session: session_id,
-                    tasks: session
-                        .tasks
-                        .into_iter()
-                        .map(|task| Task {
-                            id: task.id,
-                            state: match task.state.as_str() {
-                                "running" => TaskState::Running,
-                                "flushing" => TaskState::Flushing,
-                                "review" => TaskState::Review,
-                                state => TaskState::Unknown(state.to_string()),
-                            },
-                            command: task.command,
-                            cwd: task.cwd,
-                            pid: task.pid,
-                            started_at: task.started_at,
-                            last_output_at: task.last_output_at,
-                            output_bytes: task.output_bytes,
-                            exit_code: task.exit_code,
-                        })
-                        .collect(),
-                });
-            }
+            events.extend(bus_events(page.sessions));
             match page.next_after {
                 None => {
                     return Ok(TaskSnapshot {
@@ -385,6 +368,66 @@ impl DaemonRuntime {
         let params = json!({"request": request, "requester": REQUESTER});
         self.call(method, params, cancel)
             .and_then(|result| Settled::of(&result))
+    }
+
+    /// Reads the daemon's shared observation snapshot.
+    ///
+    /// `since_revision` is the epoch-qualified revision the caller already
+    /// holds: naming it lets the daemon answer `not_modified`, and `wait_ms`
+    /// holds the read open for a newer one. The classes asked for are demanded
+    /// of the sampler for as long as this reader keeps asking.
+    pub fn observation_get(
+        &self,
+        epoch: Option<&str>,
+        since_revision: Option<u64>,
+        wait_ms: u64,
+        classes: &[&str],
+        cancel: &AtomicBool,
+    ) -> Result<ObservationRead, String> {
+        if !self.serves(ops::Contract::ObservationGet) {
+            return Err(self.describe(format!(
+                "does not provide `{}`",
+                ops::Contract::ObservationGet.as_str()
+            )));
+        }
+        let mut params = json!({"classes": classes});
+        if let Some(epoch) = epoch {
+            params["epoch"] = json!(epoch);
+        }
+        if let Some(revision) = since_revision {
+            params["since_revision"] = json!(revision);
+        }
+        if wait_ms > 0 {
+            params["wait_ms"] = json!(wait_ms);
+        }
+        let result = self
+            .call("observation.get", params, cancel)
+            .map_err(|failure| failure.message)?;
+        if let Some(expired) = result.get("snapshot_expired") {
+            let epoch = expired
+                .get("epoch")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let revision = expired.get("revision").and_then(Value::as_u64).unwrap_or(0);
+            return Ok(ObservationRead::Expired { epoch, revision });
+        }
+        if result.get("not_modified").is_some() {
+            let epoch = result
+                .get("epoch")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let revision = result.get("revision").and_then(Value::as_u64).unwrap_or(0);
+            return Ok(ObservationRead::NotModified { epoch, revision });
+        }
+        if result.get("snapshot_too_large").is_some() {
+            return Ok(ObservationRead::TooLarge);
+        }
+        let snapshot = result.get("snapshot").cloned().unwrap_or(Value::Null);
+        serde_json::from_value(snapshot)
+            .map(|snapshot| ObservationRead::Snapshot(Box::new(snapshot)))
+            .map_err(|error| self.describe(format!("sent an unreadable observation: {error}")))
     }
 }
 
@@ -567,7 +610,11 @@ pub struct Selected {
     pub provider: Arc<dyn RuntimeProvider>,
     pub containers: Option<Arc<dyn ContainerControls>>,
     pub lifecycle: Option<Arc<dyn LifecycleControls>>,
+    /// The daemon client itself, when this daemon serves the volatile task lane.
     pub tasks: Option<Arc<DaemonRuntime>>,
+    /// The daemon client for the shared observation read. Present whenever the
+    /// daemon serves `observation.get.v1`, which is what a display renders from.
+    pub observation: Option<Arc<DaemonRuntime>>,
     pub task_diagnostic: Option<String>,
 }
 
@@ -618,8 +665,64 @@ pub fn connect_at(socket: &Path) -> Result<Selected, String> {
         tasks: daemon
             .serves(ops::Contract::TasksList)
             .then(|| Arc::clone(&daemon)),
+        observation: daemon
+            .serves(ops::Contract::ObservationGet)
+            .then(|| Arc::clone(&daemon)),
         task_diagnostic: daemon.task_diagnostic.clone(),
     })
+}
+
+/// The dashboard's events for one page of volatile task sessions.
+///
+/// A session that is not connected is not presented: the ingest keeps a
+/// disconnected session's last tasks for its own bookkeeping, and a display must
+/// not show work it can no longer see.
+fn bus_events(sessions: Vec<TaskSession>) -> Vec<BusEvent> {
+    let mut events = Vec::new();
+    for session in sessions {
+        if !session.connected {
+            continue;
+        }
+        let session_id = session.session;
+        events.push(BusEvent::Connected {
+            session: session_id.clone(),
+            pane: None,
+        });
+        events.push(BusEvent::Tasks {
+            session: session_id,
+            tasks: session
+                .tasks
+                .into_iter()
+                .map(|task| Task {
+                    id: task.id,
+                    state: match task.state.as_str() {
+                        "running" => TaskState::Running,
+                        "flushing" => TaskState::Flushing,
+                        "review" => TaskState::Review,
+                        state => TaskState::Unknown(state.to_string()),
+                    },
+                    command: task.command,
+                    cwd: task.cwd,
+                    pid: task.pid,
+                    started_at: task.started_at,
+                    last_output_at: task.last_output_at,
+                    output_bytes: task.output_bytes,
+                    exit_code: task.exit_code,
+                })
+                .collect(),
+        });
+    }
+    events
+}
+
+/// The volatile task state a snapshot carried, as the dashboard's own events.
+///
+/// The snapshot's task source is the same `tasks.list` page the standalone read
+/// returns, so both paths present one shape.
+pub fn tasks_from_snapshot(tasks: &Value) -> Result<Vec<BusEvent>, String> {
+    let page: TasksPage = serde_json::from_value(tasks.clone())
+        .map_err(|error| format!("the snapshot's task source is unreadable: {error}"))?;
+    Ok(bus_events(page.sessions))
 }
 
 /// How long one exchange has left, and where it may be interrupted.

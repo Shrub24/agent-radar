@@ -2,11 +2,13 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agent_radar::control_plane::observation::Snapshot;
 use agent_radar::managed_control as radar;
+use agent_radar::snapshot_fetch::{Fetched, SnapshotFetcher};
 use agent_radar::topology::ContainerControl;
 use agent_radar::{
-    Action, App, Closer, Collector, CollectorConfig, Config, Confirmed, Focuser, Geometry,
-    ObservationState, PaneView, control_plane, theme, ui,
+    Action, App, Closer, Config, Confirmed, Focuser, Geometry, ObservationState, PaneView,
+    control_plane, theme, ui,
 };
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -217,6 +219,24 @@ fn await_daemon(
 }
 
 /// The screen drawn while the daemon cannot be reached: the reason, and what to do.
+/// The diagnostic one source of a snapshot carries, if it has one.
+///
+/// A source that is stale or unavailable names why, and the footer shows that
+/// rather than a fleet-wide verdict the source did not make.
+fn source_diagnostic(snapshot: &Snapshot, name: &str) -> Option<String> {
+    snapshot
+        .sources
+        .iter()
+        .find(|source| source.name == name)
+        .and_then(|source| match &source.state {
+            agent_radar::observation::SourceFreshness::Stale { diagnostic }
+            | agent_radar::observation::SourceFreshness::Unavailable { diagnostic } => {
+                Some(diagnostic.clone())
+            }
+            _ => None,
+        })
+}
+
 fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Text};
@@ -256,16 +276,16 @@ fn run() -> io::Result<()> {
     let Some(selected) = await_daemon(&mut terminal)? else {
         return Ok(());
     };
-    let (runtime, container_controls, lifecycle_controls, task_client, task_diagnostic) = (
+    let (runtime, container_controls, lifecycle_controls, observation, task_diagnostic) = (
         selected.provider,
         selected.containers,
         selected.lifecycle,
-        selected.tasks,
+        selected.observation,
         selected.task_diagnostic,
     );
-    // One runtime, shared: the collector, the focuser and the closer read and act
-    // on the same adapter through the same seam.
-    let mut collector = Collector::new(CollectorConfig::default(), Arc::clone(&runtime));
+    // One runtime, shared: the focuser and the closer read and act on the same
+    // adapter through the same seam. The dashboard collects nothing itself: the
+    // daemon's sampler owns that, and this reads its snapshot.
     let mut focuser = Focuser::new(Arc::clone(&runtime));
     let mut closer = Closer::new(Arc::clone(&runtime));
     // Managed lifecycle actions target daemon-owned subjects and run off the UI thread.
@@ -279,10 +299,11 @@ fn run() -> io::Result<()> {
         app.set_focus_message(Some(format!("no dashboard log: {reason}")));
     }
     let mut list = ListState::default();
-    let mut task_revision = None;
-    let mut task_diagnostic = task_diagnostic;
-    app.set_bus_diagnostic(task_diagnostic.clone());
-    let mut next_task_read = Instant::now();
+    app.set_bus_diagnostic(task_diagnostic);
+    // The daemon samples for every display; this fetcher is how the dashboard
+    // reads what it published, and it is absent only from a daemon that does not
+    // serve the observation contract, which the diagnostic screen refuses.
+    let fetcher = observation.map(SnapshotFetcher::new);
     // The animation frame, and the clock it is derived from: a mark has to move
     // at the same rate whether or not anything else made the loop redraw.
     let started = Instant::now();
@@ -297,44 +318,41 @@ fn run() -> io::Result<()> {
         // while finished sessions are listed: telling a session that has gone
         // from a pane in use again needs the foreground either way.
         let sweeping = app.pane_view() != PaneView::Hidden || app.shows_finished();
-        if collector.tick(&mut state, sweeping) {
-            app.refresh(&state);
-            dirty = true;
-            // A lead launched from the tree is enrolled once it has registered.
-            if let Some(enroll) = app.enroll_launched(&state) {
-                dispatch(
-                    Some(enroll),
-                    &mut app,
-                    &mut closer,
-                    &mut managed,
-                    &mut containers,
-                );
-            }
-        }
-        // The daemon owns publisher ingest; the TUI replaces its local projection
-        // from revisioned snapshots and never accepts publisher messages itself.
-        if Instant::now() >= next_task_read {
-            next_task_read = Instant::now() + Duration::from_secs(1);
-            if let Some(tasks) = &task_client {
-                match tasks.task_snapshot() {
-                    Ok(snapshot) => {
-                        if task_revision != Some(snapshot.revision) {
-                            app.replace_bus_snapshot(snapshot.events);
-                            task_revision = Some(snapshot.revision);
-                            dirty = true;
-                        }
-                        if task_diagnostic.take().is_some() {
-                            app.set_bus_diagnostic(None);
-                            dirty = true;
+        if let Some(fetcher) = &fetcher {
+            fetcher.wants(sweeping);
+            match fetcher.poll() {
+                Some(Fetched::Snapshot(snapshot)) => {
+                    // Task sessions arrive as one source of the same revision, so
+                    // the dashboard no longer reads them separately.
+                    if let Some(tasks) = snapshot.tasks.as_ref() {
+                        match control_plane::client::tasks_from_snapshot(tasks) {
+                            Ok(events) => app.replace_bus_snapshot(events),
+                            Err(problem) => app.set_bus_diagnostic(Some(problem)),
                         }
                     }
-                    Err(problem) if task_diagnostic.as_deref() != Some(problem.as_str()) => {
-                        task_diagnostic = Some(problem.clone());
-                        app.set_bus_diagnostic(Some(problem));
-                        dirty = true;
+                    app.set_bus_diagnostic(source_diagnostic(&snapshot, "tasks"));
+                    state = snapshot.observation.clone();
+                    app.refresh(&state);
+                    dirty = true;
+                    // A lead launched from the tree is enrolled once it has
+                    // registered.
+                    if let Some(enroll) = app.enroll_launched(&state) {
+                        dispatch(
+                            Some(enroll),
+                            &mut app,
+                            &mut closer,
+                            &mut managed,
+                            &mut containers,
+                        );
                     }
-                    Err(_) => {}
                 }
+                // The previous view stands, and the reason it is not moving is
+                // on the footer rather than in a half-updated screen.
+                Some(Fetched::Stale(reason)) => {
+                    app.set_focus_message(Some(reason));
+                    dirty = true;
+                }
+                None => {}
             }
         }
         // A focus request is answered on its own thread; applying the outcome
@@ -396,10 +414,11 @@ fn run() -> io::Result<()> {
         }
         let timeout = if animating {
             Duration::from_millis(1000 / fps as u64)
-        } else if collector.is_refreshing() {
-            Duration::from_millis(50)
         } else {
-            Duration::from_millis(200)
+            // A fetch that is waiting for a newer revision is answered off this
+            // thread; polling a little more often keeps a published revision
+            // from sitting unapplied behind the idle interval.
+            Duration::from_millis(50)
         };
         if !event::poll(timeout)? {
             continue;
@@ -522,7 +541,6 @@ fn run() -> io::Result<()> {
     closer.shutdown();
     managed.shutdown();
     containers.shutdown();
-    collector.shutdown();
     Ok(())
 }
 

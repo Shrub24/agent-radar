@@ -935,13 +935,19 @@ One Cargo package, with `radar` as its binary:
   decoding and the bounded runner that kills and reaps a stalled command.
   Managed-agent lifecycle controls go through the daemon's semantic lifecycle
   methods; they do not use the in-process adapter or an owner-file request.
-- `src/collector.rs`: the refresh schedule. One refresh in flight at a time on
-  its own thread, cancellation that abandons rather than waits, the
-  assignment-age stamp taken once per refresh, and the local `/proc` facts
-  composed into the evidence the adapter returned. Two facts are never lost on
-  a failed call: an inventory error is a stale source that keeps the last-good
-  inventory, and unreadable foreground evidence is inconclusive rather than
-  proof that a pane went away.
+- `src/collector.rs`: the refresh schedule the daemon's sampler drives. One
+  refresh in flight at a time on its own thread, cancellation that abandons
+  rather than waits, the assignment-age stamp taken once per refresh, and the
+  local `/proc` facts composed into the evidence the adapter returned. Sources
+  fail independently: an inventory error is a stale fleet that keeps the
+  last-good inventory, a registry error is reported as the registry and leaves
+  the fleet standing, and unreadable foreground evidence is inconclusive rather
+  than proof that a pane went away.
+- `src/control_plane/observation.rs`: the daemon's one observation sampler and
+  the immutable revisioned snapshot every reader shares. It samples only while a
+  reader has asked, and publishing a revision appends nothing to the journal.
+- `src/snapshot_fetch.rs`: the dashboard's read of that snapshot. The dashboard
+  collects nothing itself and has no local fallback.
 - `src/bus.rs` and `src/control_plane/ingest.rs`: publisher protocol decoding and daemon-owned volatile task ingestion; `src/control_plane/transport/` provides the shared bounded socket runtime.
 - `src/model.rs` / `src/observation.rs`: normalized facts and reconciliation.
 - `src/config.rs` / `src/theme.rs`: the colours, where they come from, and the

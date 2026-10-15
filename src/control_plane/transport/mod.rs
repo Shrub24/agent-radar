@@ -367,13 +367,17 @@ fn lane(line: &[u8]) -> Lane {
     let Ok(request) = protocol::decode_request(line) else {
         return Lane::Control;
     };
-    if request.method == "events.read"
+    // A read that holds its connection open is a waiting read, whatever it is
+    // waiting for. It takes a waiting-lane slot rather than a control one, so a
+    // display that long-polls for a newer revision cannot starve the effectful
+    // requests that share the socket.
+    let waiting_read = matches!(request.method.as_str(), "events.read" | "observation.get")
         && request
             .params
             .get("wait_ms")
             .and_then(serde_json::Value::as_u64)
-            .is_some_and(|wait| wait > 0)
-    {
+            .is_some_and(|wait| wait > 0);
+    if waiting_read {
         Lane::Waiting
     } else if matches!(
         request.method.as_str(),
@@ -661,6 +665,16 @@ mod tests {
         );
         assert_eq!(
             lane(&request("events.read", json!({"wait_ms":0}))),
+            Lane::Control
+        );
+        // A long-polling observation read waits in the waiting lane, so eight
+        // displays waiting for a revision cannot occupy the control lane.
+        assert_eq!(
+            lane(&request("observation.get", json!({"wait_ms":1000}))),
+            Lane::Waiting
+        );
+        assert_eq!(
+            lane(&request("observation.get", json!({"wait_ms":0}))),
             Lane::Control
         );
         assert_eq!(lane(&request("lifecycle.stop", json!({}))), Lane::Control);
