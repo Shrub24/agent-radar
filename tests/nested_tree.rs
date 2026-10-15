@@ -99,6 +99,7 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
             workspace_id: "wH".into(),
             label: Some("home".into()),
             number: None,
+            session_path: None,
         }],
         tabs: vec![Tab {
             tab_id: "wH:t1".into(),
@@ -112,6 +113,7 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                 location: location(pane_id),
                 label: None,
                 title: None,
+                current_path: None,
             })
             .collect(),
         agents: agents
@@ -1879,6 +1881,7 @@ fn wa_inventory(pane_ids: &[&str]) -> FleetObservation {
             workspace_id: "wA".into(),
             label: Some("alpha".into()),
             number: None,
+            session_path: None,
         }],
         tabs: Vec::new(),
         panes: pane_ids
@@ -1891,6 +1894,7 @@ fn wa_inventory(pane_ids: &[&str]) -> FleetObservation {
                 },
                 label: None,
                 title: None,
+                current_path: None,
             })
             .collect(),
         agents: Vec::new(),

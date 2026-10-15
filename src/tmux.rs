@@ -59,7 +59,7 @@ const FIELD: char = '\u{1f}';
 const FIELD_ESCAPED: &str = "\\037";
 
 /// One `list-sessions` record: the session, then its name.
-const SESSION_FORMAT: &str = "#{session_id}\u{1f}#{session_name}";
+const SESSION_FORMAT: &str = "#{session_id}\u{1f}#{session_path}\u{1f}#{session_name}";
 
 /// One `list-windows` record: the window, its session, its index, its name.
 ///
@@ -69,7 +69,8 @@ const WINDOW_FORMAT: &str =
     "#{window_id}\u{1f}#{session_id}\u{1f}#{window_index}\u{1f}#{window_name}";
 
 /// One `list-panes` record: the pane, its window, its session, its title.
-const PANE_FORMAT: &str = "#{pane_id}\u{1f}#{window_id}\u{1f}#{session_id}\u{1f}#{pane_title}";
+const PANE_FORMAT: &str =
+    "#{pane_id}\u{1f}#{window_id}\u{1f}#{session_id}\u{1f}#{pane_current_path}\u{1f}#{pane_title}";
 
 /// What one `display-message` answer reports about a pane's foreground.
 const FOREGROUND_FORMAT: &str = "#{pane_pid}\u{1f}#{pane_current_command}";
@@ -897,8 +898,8 @@ impl TmuxRuntime {
     fn decode_sessions(&self, text: &str) -> Result<Vec<Workspace>, String> {
         let mut workspaces = Vec::new();
         for line in records(text) {
-            let [id, name] =
-                split_record::<2>(line).ok_or_else(|| malformed("session list", line))?;
+            let [id, session_path, name] =
+                split_record::<3>(line).ok_or_else(|| malformed("session list", line))?;
             if !Kind::Session.names(id) {
                 return Err(malformed("session list", line));
             }
@@ -907,6 +908,7 @@ impl TmuxRuntime {
                 label: text_field(name),
                 // A tmux session has a name, not a number.
                 number: None,
+                session_path: text_field(session_path),
             });
         }
         Ok(workspaces)
@@ -933,8 +935,8 @@ impl TmuxRuntime {
     fn decode_panes(&self, text: &str) -> Result<Vec<Pane>, String> {
         let mut panes = Vec::new();
         for line in records(text) {
-            let [id, window, session, title] =
-                split_record::<4>(line).ok_or_else(|| malformed("pane list", line))?;
+            let [id, window, session, current_path, title] =
+                split_record::<5>(line).ok_or_else(|| malformed("pane list", line))?;
             if !Kind::Pane.names(id) || !Kind::Window.names(window) || !Kind::Session.names(session)
             {
                 return Err(malformed("pane list", line));
@@ -950,6 +952,7 @@ impl TmuxRuntime {
                 // program in it sets and may clear.
                 label: None,
                 title: text_field(title),
+                current_path: text_field(current_path),
             });
         }
         Ok(panes)
@@ -1373,11 +1376,12 @@ mod tests {
     fn sessions_windows_and_panes_are_read_into_normalized_locations() {
         let runtime = runtime("probe");
         let sessions = runtime
-            .decode_sessions("$0\u{1f}main\n$1\u{1f}second\n")
+            .decode_sessions("$0\u{1f}/tmp/main\u{1f}main\n$1\u{1f}/tmp/second\u{1f}second\n")
             .expect("a session list");
         assert_eq!(sessions[0].workspace_id, "tmux:probe:$0");
         assert_eq!(sessions[0].label.as_deref(), Some("main"));
         assert_eq!(sessions[0].number, None);
+        assert_eq!(sessions[0].session_path.as_deref(), Some("/tmp/main"));
 
         let tabs = runtime
             .decode_windows("@1\u{1f}$0\u{1f}2\u{1f}editor\n")
@@ -1388,12 +1392,13 @@ mod tests {
         assert_eq!(tabs[0].number, Some(2));
 
         let panes = runtime
-            .decode_panes("%3\u{1f}@1\u{1f}$0\u{1f}a title\n")
+            .decode_panes("%3\u{1f}@1\u{1f}$0\u{1f}/tmp/main\u{1f}a title\n")
             .expect("a pane list");
         assert_eq!(panes[0].location.pane_id, "tmux:probe:%3");
         assert_eq!(panes[0].location.tab_id, "tmux:probe:@1");
         assert_eq!(panes[0].location.workspace_id, "tmux:probe:$0");
         assert_eq!(panes[0].title.as_deref(), Some("a title"));
+        assert_eq!(panes[0].current_path.as_deref(), Some("/tmp/main"));
         assert_eq!(panes[0].label, None);
     }
 
@@ -1401,7 +1406,7 @@ mod tests {
     fn a_title_that_holds_the_separator_stays_one_field() {
         let runtime = runtime("probe");
         let panes = runtime
-            .decode_panes("%3\u{1f}@1\u{1f}$0\u{1f}odd\u{1f}title\n")
+            .decode_panes("%3\u{1f}@1\u{1f}$0\u{1f}/tmp/main\u{1f}odd\u{1f}title\n")
             .expect("a pane list");
         assert_eq!(panes[0].title.as_deref(), Some("odd\u{1f}title"));
         assert_eq!(panes[0].location.pane_id, "tmux:probe:%3");
@@ -1417,10 +1422,10 @@ mod tests {
 
         assert_eq!(
             runtime
-                .decode_panes("%3\\037@1\\037$0\\037a title\n")
+                .decode_panes("%3\\037@1\\037$0\\037/tmp/main\\037a title\n")
                 .expect("an escaped pane list"),
             runtime
-                .decode_panes("%3\u{1f}@1\u{1f}$0\u{1f}a title\n")
+                .decode_panes("%3\u{1f}@1\u{1f}$0\u{1f}/tmp/main\u{1f}a title\n")
                 .expect("a raw pane list")
         );
         assert_eq!(
@@ -1432,10 +1437,11 @@ mod tests {
                 .expect("a raw window list")
         );
         let sessions = runtime
-            .decode_sessions("$0\\037herdsman\n")
+            .decode_sessions("$0\\037/tmp/herdsman\\037herdsman\n")
             .expect("an escaped session list");
         assert_eq!(sessions[0].workspace_id, "tmux:probe:$0");
         assert_eq!(sessions[0].label.as_deref(), Some("herdsman"));
+        assert_eq!(sessions[0].session_path.as_deref(), Some("/tmp/herdsman"));
         assert_eq!(
             decode_foreground("100\\037pi"),
             ForegroundEvidence::command(100, Some("pi".to_string()), None)
@@ -1449,7 +1455,7 @@ mod tests {
         // stays the text tmux sent, and one in a field that should be an id is
         // a malformed record rather than a shifted location.
         let panes = runtime
-            .decode_panes("%3\\037@1\\037$0\\037back\\037slash\n")
+            .decode_panes("%3\\037@1\\037$0\\037/tmp/main\\037back\\037slash\n")
             .expect("an escaped pane list");
         assert_eq!(panes[0].title.as_deref(), Some("back\\037slash"));
         assert!(

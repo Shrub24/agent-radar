@@ -269,6 +269,7 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
             workspace_id: "wA".into(),
             label: None,
             number: Some(1),
+            session_path: None,
         }],
         tabs: vec![Tab {
             tab_id: tab_id.into(),
@@ -282,6 +283,7 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
                 location: location(pane_id),
                 label: None,
                 title: None,
+                current_path: None,
             })
             .collect(),
         agents: occupants
@@ -732,6 +734,7 @@ impl MuxBackend {
                         },
                         label: None,
                         title: None,
+                        current_path: None,
                     })
                     .collect(),
                 agents: Vec::new(),
@@ -1214,6 +1217,7 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
             workspace_id: "wA".into(),
             label: Some("main".into()),
             number: Some(1),
+            session_path: None,
         }],
         tabs: vec![Tab {
             tab_id: "wA:t1".into(),
@@ -1225,6 +1229,7 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
             location: location.clone(),
             label: Some("editor".into()),
             title: Some("nvim".into()),
+            current_path: None,
         }],
         agents: vec![AgentObservation {
             location,
@@ -9098,6 +9103,7 @@ fn workspace_inventory(workspace_id: &str) -> FleetObservation {
             workspace_id: workspace_id.into(),
             label: None,
             number: Some(1),
+            session_path: None,
         }],
         tabs: Vec::new(),
         panes: Vec::new(),
@@ -9416,6 +9422,7 @@ fn a_servers_own_places_are_adopted_as_observed_containers() {
             workspace_id: "wA".into(),
             label: Some("by-hand".into()),
             number: None,
+            session_path: None,
         }],
         tabs: vec![Tab {
             tab_id: "wA:t1".into(),
@@ -9431,6 +9438,7 @@ fn a_servers_own_places_are_adopted_as_observed_containers() {
             },
             label: None,
             title: None,
+            current_path: None,
         }],
         ..FleetObservation::default()
     };

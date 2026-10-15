@@ -1575,6 +1575,7 @@ fn tab_containment_ignores_other_tabs_but_refuses_foreign_panes_inside_owned_tab
             workspace_id: "wA".into(),
             label: None,
             number: None,
+            session_path: None,
         }],
         tabs: tabs
             .iter()
@@ -1595,6 +1596,7 @@ fn tab_containment_ignores_other_tabs_but_refuses_foreign_panes_inside_owned_tab
                 },
                 label: Some((*label).into()),
                 title: None,
+                current_path: None,
             })
             .collect(),
         agents: vec![],

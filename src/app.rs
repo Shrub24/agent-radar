@@ -65,6 +65,8 @@ pub enum Action {
     /// Confirm was activated; the caller revalidates the frozen target and
     /// starts the close or manages the request when it still holds.
     ConfirmAction,
+    /// Immediately create a managed-agent pane using `[tui].launch_command`.
+    LaunchConfigured,
 }
 
 /// Which page of the selected row's details the panel shows.
@@ -395,9 +397,6 @@ pub enum Operation {
     /// Make the selected registered lead a lifecycle subject, so it can be
     /// stopped and restarted.
     EnrollAgent,
-    /// Run a typed command in a new place inside the selected container: a new tab
-    /// in a workspace, or a pane split from a pane.
-    LaunchContainer,
 }
 
 impl Operation {
@@ -406,10 +405,7 @@ impl Operation {
     pub fn is_container(self) -> bool {
         matches!(
             self,
-            Self::CreateContainer
-                | Self::DeleteContainer
-                | Self::ReloadContainer
-                | Self::LaunchContainer
+            Self::CreateContainer | Self::DeleteContainer | Self::ReloadContainer
         )
     }
 }
@@ -592,15 +588,10 @@ pub struct App {
     /// Filter query as typed; empty means "no filter".
     filter: String,
     filter_editing: bool,
-    /// The places a typed command was launched into and whose lead has not yet been
-    /// enrolled. A lead started from the tree is one the operator already
-    /// confirmed, so it is enrolled once its registration names its session.
+    /// The places launched with the managed-agent shortcut and whose lead has not yet
+    /// been enrolled. A lead started from the tree is one the operator chose to manage,
+    /// so it is enrolled once its registration names its session.
     launched: HashSet<String>,
-    /// The command line being typed for a launch, while one is.
-    launch_prompt: Option<String>,
-    /// The words a launch will run, once the line was accepted and its
-    /// confirmation is open.
-    launch_command: Option<Vec<String>>,
     view: PaneView,
     /// Whether the details panel is hidden. Stored inverted so `Default` — the
     /// state a run starts in — is "details shown".
@@ -1700,10 +1691,6 @@ impl App {
         if self.confirmation.is_some() {
             return self.handle_confirmation_key(key);
         }
-        // A launch prompt owns the keyboard: its text is never a command key.
-        if self.launch_prompt.is_some() {
-            return self.handle_launch_key(key);
-        }
         self.focus_message = None;
         if self.filter_editing {
             self.handle_filter_key(key);
@@ -1722,10 +1709,10 @@ impl App {
             // `A` starts a workspace from nowhere: nothing is selected, replaced or
             // confirmed, because an addition cannot take anything away.
             KeyCode::Char('A') => return Some(Action::NewWorkspace),
-            // `L` runs a typed command in a new tab or pane.
+            // `L` launches the configured managed agent in a new tab or pane.
             // `E` makes a registered lead restartable and stoppable.
             KeyCode::Char('E') => return Some(Action::BeginAction(Operation::EnrollAgent)),
-            KeyCode::Char('L') => return Some(Action::BeginAction(Operation::LaunchContainer)),
+            KeyCode::Char('L') => return Some(Action::LaunchConfigured),
             KeyCode::Char('D') => return Some(Action::BeginAction(Operation::DeleteContainer)),
             KeyCode::Char('R') => return Some(Action::BeginAction(Operation::ReloadContainer)),
             KeyCode::Char('c') => self.dismiss_notices(),
@@ -1988,8 +1975,9 @@ impl App {
             Operation::Restart => unreachable!("restart returned above"),
             Operation::CreateContainer
             | Operation::DeleteContainer
-            | Operation::ReloadContainer
-            | Operation::LaunchContainer => unreachable!("a container control returned above"),
+            | Operation::ReloadContainer => {
+                unreachable!("a container control returned above")
+            }
             Operation::EnrollAgent => unreachable!("an enrollment returned above"),
         };
         match containment_of(inventory, state, &target) {
@@ -2162,6 +2150,97 @@ impl App {
         }
     }
 
+    /// Build the configured managed-agent launch without a prompt or confirmation.
+    pub fn launch_configured(
+        &mut self,
+        state: &ObservationState,
+        command: &[String],
+        shell: Option<&str>,
+        path: Option<&std::ffi::OsStr>,
+    ) -> Option<Confirmed> {
+        if !matches!(state.source_freshness(), SourceFreshness::Current) {
+            self.set_focus_message(Some("the fleet is stale: nothing was sent".into()));
+            return None;
+        }
+        let Some(inventory) = state.inventory() else {
+            self.set_focus_message(Some("no current inventory: nothing was sent".into()));
+            return None;
+        };
+        let Some(container) = self.selected_container().cloned() else {
+            self.set_focus_message(Some("select a workspace or pane to launch into".into()));
+            return None;
+        };
+        let Some(recorded) = inventory
+            .containers
+            .iter()
+            .find(|item| item.container_id == container.container_id && item.removed_at.is_none())
+        else {
+            self.set_focus_message(Some("the selected container is no longer current".into()));
+            return None;
+        };
+        let Some(binding) = recorded
+            .binding
+            .as_ref()
+            .filter(|binding| binding.handle == container.handle && recorded.unresolved.is_none())
+        else {
+            self.set_focus_message(Some("the selected container is unresolved".into()));
+            return None;
+        };
+        let (kind, directory) = match recorded.kind {
+            crate::control_plane::containers::Kind::Workspace => (
+                crate::control_plane::client::ContainerCreateKind::Tab {
+                    workspace_id: binding.handle.clone(),
+                },
+                inventory
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == binding.handle)
+                    .and_then(|workspace| workspace.session_path.as_deref()),
+            ),
+            crate::control_plane::containers::Kind::Pane => (
+                crate::control_plane::client::ContainerCreateKind::PaneSplit {
+                    pane_id: binding.handle.clone(),
+                },
+                inventory
+                    .panes
+                    .iter()
+                    .find(|pane| pane.location.pane_id == binding.handle)
+                    .and_then(|pane| pane.current_path.as_deref()),
+            ),
+            crate::control_plane::containers::Kind::Tab => {
+                self.set_focus_message(Some(
+                    "select a workspace or pane to launch an agent".into(),
+                ));
+                return None;
+            }
+        };
+        let Some(directory) = directory else {
+            self.set_focus_message(Some(
+                "the selected place has no current directory: nothing was sent".into(),
+            ));
+            return None;
+        };
+        let Some(shell) = shell.filter(|shell| !shell.trim().is_empty()) else {
+            self.set_focus_message(Some("SHELL is unset; set it to fish, bash, or zsh".into()));
+            return None;
+        };
+        let recipe = match crate::topology::target_shell_recipe(command, shell, path, directory) {
+            Ok(recipe) => recipe,
+            Err(message) => {
+                self.set_focus_message(Some(format!("{message}: nothing was sent")));
+                return None;
+            }
+        };
+        Some(Confirmed::Container(crate::topology::Control::Create(
+            crate::control_plane::client::ContainerCreate {
+                request_id: crate::control_plane::random_uuid(),
+                kind,
+                label: None,
+                recipe: Some(recipe),
+            },
+        )))
+    }
+
     /// Opens the confirmation for one container control.
     ///
     /// The container, its place and the occupant of that place are frozen now, not
@@ -2230,7 +2309,7 @@ impl App {
                     "a command of its own that has not exited refuses the reload".to_string(),
                 );
             }
-            Operation::CreateContainer | Operation::LaunchContainer => match container.kind {
+            Operation::CreateContainer => match container.kind {
                 crate::control_plane::containers::Kind::Pane => {
                     losses.push("a new pane is split from this one".to_string())
                 }
@@ -2251,31 +2330,6 @@ impl App {
             _ => return,
         }
         losses.push("nothing already running is replaced".to_string());
-        if operation == Operation::LaunchContainer {
-            let Some(words) = self.launch_command.as_ref() else {
-                // No command yet: ask for one. The place is chosen again, from the
-                // selection, when the line is accepted, and the prompt is modal so
-                // it cannot have moved.
-                self.launch_prompt = Some(String::new());
-                return;
-            };
-            let resolved =
-                crate::topology::resolve_executable(&words[0], std::env::var_os("PATH").as_deref());
-            match resolved {
-                Ok(executable) => {
-                    let mut shown = vec![executable];
-                    shown.extend(words[1..].iter().cloned());
-                    losses.insert(1, format!("runs: {}", shown.join(" ")));
-                }
-                Err(message) => {
-                    self.launch_command = None;
-                    self.set_focus_message(Some(message));
-                    return;
-                }
-            }
-        } else {
-            self.launch_command = None;
-        }
         let identity = lifecycle::identity(inventory, &target);
         self.confirmation = Some(Confirmation {
             operation,
@@ -2348,7 +2402,7 @@ impl App {
                 request_id,
                 container_id: id.to_string(),
             }),
-            Operation::CreateContainer | Operation::LaunchContainer => {
+            Operation::CreateContainer => {
                 let kind = match recorded.kind {
                     crate::control_plane::containers::Kind::Workspace => ContainerCreateKind::Tab {
                         workspace_id: recorded
@@ -2367,27 +2421,7 @@ impl App {
                             .clone(),
                     },
                 };
-                let recipe = if confirmation.operation == Operation::LaunchContainer {
-                    let words = self.launch_command.take()?;
-                    let executable = match crate::topology::resolve_executable(
-                        &words[0],
-                        std::env::var_os("PATH").as_deref(),
-                    ) {
-                        Ok(executable) => executable,
-                        Err(message) => {
-                            self.set_focus_message(Some(format!("{message}: nothing was sent")));
-                            return None;
-                        }
-                    };
-                    Some(crate::control_plane::containers::Recipe {
-                        executable,
-                        argv: words[1..].to_vec(),
-                        cwd: None,
-                        env: Default::default(),
-                    })
-                } else {
-                    None
-                };
+                let recipe = None;
                 crate::topology::Control::Create(ContainerCreate {
                     request_id,
                     kind,
@@ -2796,40 +2830,7 @@ impl App {
         }
     }
 
-    /// Whether a launch command line is being typed.
-    pub fn launch_prompt(&self) -> Option<&str> {
-        self.launch_prompt.as_deref()
-    }
-
-    /// Reads one key of the launch prompt. Enter hands the line to the same
-    /// confirmation the other container controls use, which is where its words
-    /// are shown; nothing runs from the prompt itself.
-    fn handle_launch_key(&mut self, key: KeyEvent) -> Option<Action> {
-        let line = self.launch_prompt.as_mut()?;
-        match key.code {
-            KeyCode::Esc => self.launch_prompt = None,
-            KeyCode::Enter => {
-                return match crate::topology::split_command_line(line) {
-                    Ok(words) => {
-                        self.launch_command = Some(words);
-                        self.launch_prompt = None;
-                        Some(Action::BeginAction(Operation::LaunchContainer))
-                    }
-                    Err(message) => {
-                        self.set_focus_message(Some(message));
-                        None
-                    }
-                };
-            }
-            KeyCode::Backspace => {
-                line.pop();
-            }
-            KeyCode::Char(c) if !c.is_control() => line.push(c),
-            _ => {}
-        }
-        None
-    }
-
+    /// Reads one key of the filter editor.
     fn handle_filter_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -4004,6 +4005,7 @@ mod tests {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
                 number: None,
+                session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wX:t1".into(),
@@ -4019,6 +4021,7 @@ mod tests {
                 },
                 label: None,
                 title: None,
+                current_path: None,
             }],
             agents: vec![AgentObservation {
                 location: Location {
@@ -4192,6 +4195,7 @@ mod tests {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
                 number: None,
+                session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wX:t1".into(),
@@ -4207,6 +4211,7 @@ mod tests {
                 },
                 label: None,
                 title: None,
+                current_path: None,
             }],
             agents: vec![AgentObservation {
                 location: Location {
@@ -4345,6 +4350,16 @@ mod tests {
     fn fixture_with_container(removed: Option<&str>) -> (ObservationState, App) {
         let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
         observation.containers = vec![pane_container("c1", "wA:p3", removed)];
+        if let Some(workspace) = observation.workspaces.first_mut() {
+            workspace.session_path = Some("/home/saurabhj/Projects/dev/agent-radar".into());
+        }
+        if let Some(pane) = observation
+            .panes
+            .iter_mut()
+            .find(|pane| pane.location.pane_id == "wA:p3")
+        {
+            pane.current_path = Some("/home/saurabhj/Projects/dev/agent-radar".into());
+        }
         let mut state = ObservationState::new();
         state.apply_success(observation);
         let mut app = App::new();
@@ -4395,69 +4410,110 @@ mod tests {
         assert!(app.confirmation().is_none());
     }
 
+    fn launch_test_shell(name: &str) -> (std::path::PathBuf, std::ffi::OsString) {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("radar-app-launch-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let shell = root.join("bash");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([&root]).unwrap();
+        (root, path)
+    }
+
     #[test]
-    fn a_launch_asks_for_a_command_then_shows_what_it_runs_before_confirming() {
+    fn l_launches_the_configured_agent_immediately_in_the_selected_pane_directory() {
         let (state, mut app) = fixture_with_container(None);
+        let (root, path) = launch_test_shell("pane");
+        let shell = root.join("bash").to_string_lossy().into_owned();
         assert_eq!(
             press(&mut app, KeyCode::Char('L')),
-            Some(Action::BeginAction(Operation::LaunchContainer))
+            Some(Action::LaunchConfigured)
         );
-        // The first press only opens the prompt: nothing is confirmed or sent.
-        app.begin_action(Operation::LaunchContainer, &state);
-        assert!(app.confirmation().is_none());
-        assert_eq!(app.launch_prompt(), Some(""));
-
-        // The prompt owns the keyboard, so its letters are text, not commands.
-        for c in "sh -c 'exit 0'".chars() {
-            assert_eq!(press(&mut app, KeyCode::Char(c)), None);
-        }
-        assert_eq!(app.launch_prompt(), Some("sh -c 'exit 0'"));
-        assert!(app.confirmation().is_none());
-        // An empty line is refused with a reason and keeps the prompt open.
-        let mut empty = app_with_prompt(&state);
-        assert_eq!(press(&mut empty, KeyCode::Enter), None);
-        assert!(empty.launch_prompt().is_some());
         assert!(
-            empty
-                .focus_message()
-                .is_some_and(|message| message.contains("type a command")),
-            "{:?}",
-            empty.focus_message()
+            app.confirmation().is_none(),
+            "L has no prompt or confirmation"
         );
 
-        // Enter reviews it in the same dialog the other controls use, with the
-        // resolved program shown, and Cancel is still the default.
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::BeginAction(Operation::LaunchContainer))
-        );
-        app.begin_action(Operation::LaunchContainer, &state);
-        assert!(app.launch_prompt().is_none());
-        let confirmation = app.confirmation().expect("a confirmation");
-        assert!(!confirmation.confirm_selected);
-        assert!(
-            confirmation
-                .losses
-                .iter()
-                .any(|line| line.starts_with("runs: /") && line.ends_with("sh -c exit 0")),
-            "{:?}",
-            confirmation.losses
-        );
-        match app.confirm(&state).expect("still held") {
+        let confirmed = app
+            .launch_configured(
+                &state,
+                &["pi".into(), "an argument with spaces".into()],
+                Some("bash"),
+                Some(path.as_os_str()),
+            )
+            .unwrap_or_else(|| panic!("launch refused: {:?}", app.focus_message()));
+        match confirmed {
             Confirmed::Container(crate::topology::Control::Create(request)) => {
-                let recipe = request.recipe.expect("the command rides as the recipe");
-                assert!(recipe.executable.starts_with('/'), "{}", recipe.executable);
-                assert_eq!(recipe.argv, ["-c", "exit 0"]);
+                let recipe = request.recipe.expect("launch uses a private recipe");
+                assert_eq!(
+                    recipe.cwd.as_deref(),
+                    Some("/home/saurabhj/Projects/dev/agent-radar")
+                );
+                assert_eq!(recipe.executable, shell);
+                assert_eq!(recipe.argv[0], "-ilc");
+                assert!(recipe.argv[1].contains("exec \"$@\""));
+                assert_eq!(recipe.argv[3], "pi");
+                assert_eq!(recipe.argv[4], "an argument with spaces");
+                assert!(recipe.env.is_empty(), "TUI environment is not copied");
             }
             other => panic!("a launch: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
-        // Esc leaves the prompt and nothing is queued behind it.
-        let mut cancelled = app_with_prompt(&state);
-        press(&mut cancelled, KeyCode::Char('x'));
-        assert_eq!(press(&mut cancelled, KeyCode::Esc), None);
-        assert!(cancelled.launch_prompt().is_none());
-        assert!(cancelled.confirmation().is_none());
+    #[test]
+    fn l_on_a_workspace_uses_its_recorded_directory_and_creates_a_tab() {
+        let (mut state, mut app) = fixture_with_container(None);
+        let (root, path) = launch_test_shell("workspace");
+        let shell = root.join("bash").to_string_lossy().into_owned();
+        let mut observation = state.inventory().expect("inventory").clone();
+        let mut workspace = pane_container("c2", "wA", None);
+        workspace.kind = ContainerKind::Workspace;
+        workspace.recipe = false;
+        observation.containers.push(workspace);
+        state.apply_success(observation);
+        app.refresh(&state);
+        select_row(&mut app, &RowId::Workspace("wA".into()));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('L')),
+            Some(Action::LaunchConfigured)
+        );
+        let confirmed = app
+            .launch_configured(&state, &["pi".into()], Some("bash"), Some(path.as_os_str()))
+            .expect("workspace launch");
+        match confirmed {
+            Confirmed::Container(crate::topology::Control::Create(request)) => {
+                assert!(matches!(request.kind, ContainerCreateKind::Tab { .. }));
+                let recipe = request.recipe.unwrap();
+                assert_eq!(recipe.executable, shell);
+                assert_eq!(
+                    recipe.cwd.as_deref(),
+                    Some("/home/saurabhj/Projects/dev/agent-radar")
+                );
+            }
+            other => panic!("workspace launch: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_empty_configured_launch_command_refuses_before_creating_a_pane() {
+        let (state, mut app) = fixture_with_container(None);
+        assert!(
+            app.launch_configured(
+                &state,
+                &[],
+                Some("/bin/bash"),
+                Some(std::ffi::OsStr::new("/bin:/usr/bin")),
+            )
+            .is_none()
+        );
+        assert!(
+            app.focus_message()
+                .is_some_and(|message| message.contains("configured launch command is empty"))
+        );
     }
 
     #[test]
@@ -4497,37 +4553,6 @@ mod tests {
         // No registration yet, so nothing is offered, and the place stays pending.
         assert!(app.enroll_launched(&state).is_none());
         assert!(app.launched.contains("wA:p3"));
-    }
-
-    #[test]
-    fn a_launch_of_a_program_not_on_path_is_refused_before_a_dialog() {
-        let (state, mut app) = fixture_with_container(None);
-        app.begin_action(Operation::LaunchContainer, &state);
-        for c in "radar-no-such-program --x".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::BeginAction(Operation::LaunchContainer))
-        );
-        app.begin_action(Operation::LaunchContainer, &state);
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message()
-                .is_some_and(|message| message.contains("not an executable on PATH")),
-            "{:?}",
-            app.focus_message()
-        );
-    }
-
-    /// An app whose launch prompt is open over the container fixture's selection.
-    fn app_with_prompt(state: &ObservationState) -> App {
-        let mut app = App::new();
-        app.refresh(state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::LaunchContainer, state);
-        app
     }
 
     #[test]
@@ -4655,6 +4680,7 @@ mod tests {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
                 number: None,
+                session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wX:t1".into(),
@@ -4670,6 +4696,7 @@ mod tests {
                 },
                 label: None,
                 title: None,
+                current_path: None,
             }],
             agents: vec![AgentObservation {
                 location: Location {
@@ -4786,6 +4813,7 @@ mod tests {
                 workspace_id: "wX".into(),
                 label: Some("solo".into()),
                 number: None,
+                session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wX:t1".into(),
@@ -4801,6 +4829,7 @@ mod tests {
                 },
                 label: None,
                 title: None,
+                current_path: None,
             }],
             agents: vec![AgentObservation {
                 location: Location {
@@ -4946,6 +4975,7 @@ mod tests {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),
                 number: None,
+                            session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wM:t1".into(),
@@ -4957,6 +4987,7 @@ mod tests {
                 location: location.clone(),
                 label: None,
                 title: None,
+                            current_path: None,
             }],
             agents: vec![AgentObservation {
                 location,

@@ -1,22 +1,44 @@
 ## ADDED Requirements
 
-### Requirement: A command can be run in a new place from the tree
-Radar SHALL, on `L` over a recorded container, take a one-line command and run it in a new tab (from a workspace) or a split pane (from a pane) as the created container's recipe, after the same default-Cancel confirmation the other container controls use. The confirmation SHALL show the resolved command and its place.
+### Requirement: L launches the configured managed-agent command
+Radar SHALL expose `[tui].launch_command` as an argv vector defaulting to `["pi"]`. Pressing `L` on a recorded workspace or pane SHALL immediately create a tab or split pane running that command as a private recipe, without a command prompt or confirmation.
 
-#### Scenario: A command is typed and reviewed
-- **WHEN** the user presses `L` on a workspace, types a command and presses Enter
-- **THEN** a confirmation shows the resolved command, Cancel is selected, and nothing has been sent
+#### Scenario: Launch the default agent
+- **WHEN** the user presses `L` on a recorded workspace or pane without a launch-command override
+- **THEN** Radar starts `pi` in the corresponding new tab or pane
 
-### Requirement: A typed command is split by quoting alone
-Radar SHALL split the line into an executable and arguments by quoting and backslashes only, SHALL NOT expand or interpret anything else, and SHALL resolve the executable to an absolute path from its own `PATH`. A line that is empty, unfinished or names a program not on `PATH` SHALL be refused with a reason before any request is sent. The command SHALL NOT appear in any record, read or event.
+### Requirement: L uses the selected place's shell context
+A launch SHALL use the workspace's recorded directory or the pane's current directory. It SHALL start through the user's login/interactive shell and apply direnv in that target directory. It SHALL NOT copy the TUI environment wholesale or persist environment values in public records, reads, or events.
 
-#### Scenario: A program that is not installed
-- **WHEN** the typed program is not on `PATH`
-- **THEN** no dialog opens and a one-line message says so
+#### Scenario: Launch from a workspace
+- **WHEN** the user presses `L` on a workspace
+- **THEN** the new tab starts in the workspace's recorded directory
 
-#### Scenario: No shell is invented
-- **WHEN** the line contains `$HOME` or a pipe
-- **THEN** each is passed as ordinary text in the argument list
+#### Scenario: Launch from a pane
+- **WHEN** the user presses `L` on a pane
+- **THEN** the split pane starts in that pane's current directory
+
+#### Scenario: The TUI uses another project's environment
+- **WHEN** the TUI runs with project-specific variables and `L` targets a different directory
+- **THEN** the launched process uses shell startup and the target directory's direnv values without copying those TUI-only variables
+
+### Requirement: Invalid managed launches are refused before creation
+Radar SHALL refuse a launch without creating a pane or tab when its argv is empty, the user shell is missing or unsupported, or the selected place has no absolute working directory. The target shell SHALL resolve the configured executable after startup and target-directory direnv activation.
+
+#### Scenario: The shell or directory is unavailable
+- **WHEN** `SHELL` is unset or unsupported, or no absolute target directory is known
+- **THEN** Radar reports the refusal and creates no tab or pane
+
+#### Scenario: The target shell cannot find the configured executable
+- **WHEN** the target shell cannot resolve the configured program after startup and direnv activation
+- **THEN** the target shell reports the command failure in the launched place; the dashboard does not pre-resolve it using its own `PATH`
+
+### Requirement: An empty shell remains available
+The `a` action SHALL create an empty shell in the selected place for arbitrary interactive commands; it SHALL NOT require those commands to be configured as managed-agent launches.
+
+#### Scenario: Run an arbitrary command
+- **WHEN** the user wants an interactive command instead of the configured managed agent
+- **THEN** the user can create an empty shell with `a` and run the command there
 
 ### Requirement: A launched or registered lead can be enrolled
 Radar SHALL enroll a lead started with `L` through `lifecycle.enroll` once it has registered a joined pane and a fresh session, once per launched place, and SHALL offer `E` on any joined registered agent that is not a lifecycle subject through the default-Cancel confirmation. Enrollment SHALL revalidate the same registration and session before sending, SHALL record no spawn edge, and SHALL signal nothing.

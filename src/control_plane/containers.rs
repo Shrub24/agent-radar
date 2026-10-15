@@ -904,6 +904,7 @@ mod tests {
                 workspace_id: "wA".into(),
                 label: None,
                 number: None,
+                session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wA:t1".into(),
@@ -919,6 +920,7 @@ mod tests {
                 },
                 label: None,
                 title: None,
+                current_path: None,
             }],
             agents: Vec::new(),
             metadata_agents: Vec::new(),

@@ -221,6 +221,7 @@ pub fn decode_snapshot(output: &str) -> Result<FleetObservation, DecodeError> {
                 workspace_id: w.workspace_id,
                 label: w.label,
                 number: w.number,
+                session_path: None,
             })
             .collect(),
         tabs: inventory
@@ -244,6 +245,7 @@ pub fn decode_snapshot(output: &str) -> Result<FleetObservation, DecodeError> {
                 },
                 label: non_empty(p.label),
                 title: non_empty(p.terminal_title_stripped).or_else(|| non_empty(p.terminal_title)),
+                current_path: None,
             })
             .collect(),
         agents: inventory

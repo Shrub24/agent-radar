@@ -9,9 +9,9 @@
 # here — a backslash in printf's own format string would become the byte.
 case "$*" in
   *pane_dead*) printf '%s\n' '%1\0371\0370\037\0371700000001' ;;
-  *list-sessions*) printf '%s\n' '$0\037herdsman' ;;
+  *list-sessions*) printf '%s\n' '$0\037/tmp/herdr\037herdsman' ;;
   *list-windows*) printf '%s\n' '@1\037$0\0372\037editor' ;;
-  *list-panes*) printf '%s\n' '%1\037@1\037$0\037a title' ;;
+  *list-panes*) printf '%s\n' '%1\037@1\037$0\037/tmp/herdr\037a title' ;;
   *display-message*) printf '%s\n' '4242\037pi' ;;
   *new-window*) printf '%s\n' '@2\037$0' ;;
   *split-window*) printf '%s\n' '%3\037@2\037$0' ;;

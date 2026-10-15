@@ -38,8 +38,12 @@ anything changes, and a focus never holds its target against a later mutation.
 The dashboard, not the daemon, opens a terminal when a focus is refused for
 want of a client, because only it holds the user's desktop session: it runs
 `[tui] terminal` (else `$TERMINAL -e`) with `tmux -L <server> attach-session -t
-<id>` and asks again. `L` in the dashboard is `topology.create` with the typed
-command as the recipe.
+<id>` and asks again. `L` immediately launches `[tui] launch_command` (default
+`["pi"]`) through the user's login/interactive shell, in the selected workspace's
+recorded directory or pane's current directory. The shell initializes its normal
+environment and applies direnv for that target; Radar does not copy the dashboard's
+environment. The launch is a managed `topology.create` recipe. Use `a` to add an
+empty shell for arbitrary commands.
 Registry calls work without a mux backend and do not publish
 through Herdr. The older mux `report` method still forwards state/session/metadata
 to the backend; it is **not** direct registry publication.

@@ -113,6 +113,7 @@ impl FakeRuntime {
                 location,
                 label: None,
                 title: None,
+                current_path: None,
             }],
             agents,
         }
@@ -295,6 +296,7 @@ fn a_changed_tab_membership_is_refused() {
         },
         label: None,
         title: None,
+        current_path: None,
     });
     let frozen = identity(&frozen_inventory, &target);
     let message =

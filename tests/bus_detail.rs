@@ -102,6 +102,7 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
             workspace_id: "wH".into(),
             label: Some("home".into()),
             number: None,
+            session_path: None,
         }],
         tabs: vec![Tab {
             tab_id: "wH:t1".into(),
@@ -115,6 +116,7 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
                 location: location(pane_id),
                 label: None,
                 title: None,
+                current_path: None,
             })
             .collect(),
         agents: agents

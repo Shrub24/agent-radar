@@ -341,6 +341,7 @@ fn inventory(pane_ids: &[&str], agents: Vec<AgentObservation>) -> FleetObservati
                 location: location(pane_id),
                 label: None,
                 title: None,
+                current_path: None,
             })
             .collect(),
         agents,

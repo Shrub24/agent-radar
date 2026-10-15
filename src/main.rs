@@ -421,6 +421,23 @@ fn run() -> io::Result<()> {
                             focuser.start(target);
                         }
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
+                        Action::LaunchConfigured => {
+                            let shell = std::env::var("SHELL").ok();
+                            let path = std::env::var_os("PATH");
+                            let confirmed = app.launch_configured(
+                                &state,
+                                &config.tui.launch_command,
+                                shell.as_deref(),
+                                path.as_deref(),
+                            );
+                            dispatch(
+                                confirmed,
+                                &mut app,
+                                &mut closer,
+                                &mut managed,
+                                &mut containers,
+                            );
+                        }
                         Action::NewWorkspace => {
                             let control = choose_project(&mut terminal, &config.tui, &mut app)?;
                             dispatch(
@@ -453,6 +470,23 @@ fn run() -> io::Result<()> {
                             focuser.start(target);
                         }
                         Action::BeginAction(operation) => app.begin_action(operation, &state),
+                        Action::LaunchConfigured => {
+                            let shell = std::env::var("SHELL").ok();
+                            let path = std::env::var_os("PATH");
+                            let confirmed = app.launch_configured(
+                                &state,
+                                &config.tui.launch_command,
+                                shell.as_deref(),
+                                path.as_deref(),
+                            );
+                            dispatch(
+                                confirmed,
+                                &mut app,
+                                &mut closer,
+                                &mut managed,
+                                &mut containers,
+                            );
+                        }
                         Action::NewWorkspace => {
                             let control = choose_project(&mut terminal, &config.tui, &mut app)?;
                             dispatch(

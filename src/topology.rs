@@ -15,77 +15,6 @@ use crate::control_plane::client::{
     ContainerAnswer, ContainerControls, ContainerCreate, ContainerDelete, ContainerReload,
 };
 
-/// Splits a typed command line into the words a launch runs, the way the recipe
-/// contract takes them: an executable and its arguments.
-///
-/// Only quoting is understood. Whitespace separates words, single quotes keep
-/// everything inside literal, double quotes keep it literal except `\\` and `\"`,
-/// and a backslash outside quotes escapes the next character. Nothing is expanded:
-/// `$VAR`, `~`, globs, pipes and redirections are ordinary text, because the
-/// daemon runs an argv and refuses to invent a shell.
-pub fn split_command_line(line: &str) -> Result<Vec<String>, String> {
-    let mut words: Vec<String> = Vec::new();
-    let mut word = String::new();
-    let mut started = false;
-    let mut characters = line.chars();
-    while let Some(character) = characters.next() {
-        match character {
-            '\'' => {
-                started = true;
-                loop {
-                    match characters.next() {
-                        Some('\'') => break,
-                        Some(inside) => word.push(inside),
-                        None => return Err("an opening ' is never closed".to_string()),
-                    }
-                }
-            }
-            '"' => {
-                started = true;
-                loop {
-                    match characters.next() {
-                        Some('"') => break,
-                        Some('\\') => match characters.next() {
-                            Some(escaped @ ('"' | '\\')) => word.push(escaped),
-                            Some(other) => {
-                                word.push('\\');
-                                word.push(other);
-                            }
-                            None => return Err("an opening \" is never closed".to_string()),
-                        },
-                        Some(inside) => word.push(inside),
-                        None => return Err("an opening \" is never closed".to_string()),
-                    }
-                }
-            }
-            '\\' => match characters.next() {
-                Some(escaped) => {
-                    started = true;
-                    word.push(escaped);
-                }
-                None => return Err("the line ends after a backslash".to_string()),
-            },
-            space if space.is_whitespace() => {
-                if started {
-                    words.push(std::mem::take(&mut word));
-                    started = false;
-                }
-            }
-            other => {
-                started = true;
-                word.push(other);
-            }
-        }
-    }
-    if started {
-        words.push(word);
-    }
-    if words.is_empty() {
-        return Err("type a command to run".to_string());
-    }
-    Ok(words)
-}
-
 /// The absolute path a launch runs `name` as: the name itself when it is already
 /// an absolute path, otherwise the first executable file named `name` on `path`.
 ///
@@ -115,6 +44,59 @@ pub fn resolve_executable(name: &str, path: Option<&std::ffi::OsStr>) -> Result<
         }
     }
     Err(format!("{name} is not an executable on PATH"))
+}
+
+/// Build a private launch recipe that starts in `cwd` through the user's login
+/// shell, then lets direnv evaluate that directory before execing the configured
+/// argv. The command remains positional data, never shell-interpolated text.
+pub fn target_shell_recipe(
+    command: &[String],
+    shell: &str,
+    path: Option<&std::ffi::OsStr>,
+    cwd: &str,
+) -> Result<crate::control_plane::containers::Recipe, String> {
+    use std::path::Path;
+
+    let Some(program) = command.first().filter(|program| !program.trim().is_empty()) else {
+        return Err("the configured launch command is empty".into());
+    };
+    if !Path::new(cwd).is_absolute() {
+        return Err("the selected launch directory is not absolute".into());
+    }
+    let program = program.clone();
+    let shell = resolve_executable(shell, path)
+        .map_err(|_| "SHELL is not an executable; set it to fish, bash, or zsh".to_string())?;
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let script = match shell_name {
+        "fish" => "type -q direnv; and eval (direnv export fish); exec $argv",
+        "bash" => {
+            "if command -v direnv >/dev/null 2>&1; then eval \"$(direnv export bash)\"; fi; exec \"$@\""
+        }
+        "zsh" => {
+            "if command -v direnv >/dev/null 2>&1; then eval \"$(direnv export zsh)\"; fi; exec \"$@\""
+        }
+        _ => {
+            return Err(format!(
+                "SHELL `{shell_name}` is unsupported for managed launches; use fish, bash, or zsh"
+            ));
+        }
+    };
+    let mut argv = vec![
+        "-ilc".to_string(),
+        script.to_string(),
+        "--".to_string(),
+        program,
+    ];
+    argv.extend(command.iter().skip(1).cloned());
+    Ok(crate::control_plane::containers::Recipe {
+        executable: shell,
+        argv,
+        cwd: Some(cwd.to_string()),
+        env: Default::default(),
+    })
 }
 
 /// One confirmed control, as the operator asked for it.
@@ -282,43 +264,6 @@ fn run(
 mod launch_tests {
     use super::*;
 
-    fn words(line: &str) -> Vec<String> {
-        split_command_line(line).expect("a command line")
-    }
-
-    #[test]
-    fn a_command_line_splits_on_whitespace_and_understands_only_quotes() {
-        assert_eq!(words("pi --model fast"), ["pi", "--model", "fast"]);
-        assert_eq!(words("  pi   -p  "), ["pi", "-p"]);
-        assert_eq!(
-            words("echo 'a b' \"c d\" e\\ f"),
-            ["echo", "a b", "c d", "e f"]
-        );
-        // Quotes join to the text beside them, and an empty pair is an empty word.
-        assert_eq!(words("a'b c'\"d\""), ["ab cd"]);
-        assert_eq!(words("run '' x"), ["run", "", "x"]);
-        // Nothing is expanded or interpreted.
-        assert_eq!(
-            words("echo $HOME ~ *.rs | tee > out"),
-            ["echo", "$HOME", "~", "*.rs", "|", "tee", ">", "out"]
-        );
-        assert_eq!(words("say \"a\\\"b\" 'c\\d'"), ["say", "a\"b", "c\\d"]);
-    }
-
-    #[test]
-    fn a_line_that_is_empty_or_unfinished_is_refused_with_a_reason() {
-        for line in ["", "   ", "\t"] {
-            assert!(
-                split_command_line(line)
-                    .unwrap_err()
-                    .contains("type a command")
-            );
-        }
-        for line in ["echo 'x", "echo \"x", "echo x\\"] {
-            assert!(split_command_line(line).is_err(), "{line}");
-        }
-    }
-
     #[test]
     fn an_executable_resolves_to_the_first_match_on_path_as_an_absolute_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -355,6 +300,43 @@ mod launch_tests {
             absolute.to_str().unwrap()
         );
         assert!(resolve_executable("one/tool", Some(&path)).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_launch_runs_the_configured_argv_in_a_target_login_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("radar-launch-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fish = root.join("fish");
+        std::fs::write(&fish, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([&root]).unwrap();
+        let recipe = target_shell_recipe(
+            &[
+                "pi".into(),
+                "--model".into(),
+                "a value; still one argument".into(),
+            ],
+            "fish",
+            Some(&path),
+            "/tmp/project",
+        )
+        .expect("a user fish shell");
+
+        assert_eq!(recipe.executable, fish.to_string_lossy());
+        assert_eq!(recipe.cwd.as_deref(), Some("/tmp/project"));
+        assert!(recipe.env.is_empty(), "do not copy the TUI environment");
+        assert_eq!(recipe.argv[0], "-ilc");
+        assert!(recipe.argv[1].contains("direnv export fish"));
+        assert!(recipe.argv[1].contains("exec $argv"));
+        assert_eq!(recipe.argv[2], "--");
+        assert_eq!(
+            recipe.argv[3], "pi",
+            "resolve the command after shell and direnv setup"
+        );
+        assert_eq!(recipe.argv[4], "--model");
+        assert_eq!(recipe.argv[5], "a value; still one argument");
         let _ = std::fs::remove_dir_all(root);
     }
 }

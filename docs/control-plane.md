@@ -128,7 +128,7 @@ All method-specific parameter objects reject unknown keys unless noted; `daemon.
 ### Reads
 
 - `daemon.ping`, params `{}`: protocol/revision/backend/instance/contracts as above. No record.
-- `mux.observe`, params `{}`: `{ "inventory": FleetObservation }`. Requires `mux.observe`. No record.
+- `mux.observe`, params `{}`: `{ "inventory": FleetObservation }`. Requires `mux.observe`. `Workspace.session_path` (session start directory) and `Pane.current_path` (current pane directory) are optional observed fields; `L` uses them as the launch cwd. They are not durable container metadata. No record.
 - `mux.process_info`, params `{"pane_id":"wA:p1"}`: `{ "evidence": ForegroundEvidence }`. Requires `mux.process_info`. No record; inconclusive evidence is a valid result.
 - `mux.output`, params `{"pane_id":"wA:p1","source":"recent","lines":100,"ansi":false}`. Requires `mux.output`. `source` is `visible`, `recent`, `recent_unwrapped`, or `detection`; `lines` is optional (runtime default), otherwise 1..=500; `ansi` defaults false. Result is `{ "output": {"text":"…","truncated":false,"revision":null} }`. Text is capped at 64 KiB on a UTF-8 boundary and `truncated` set. No record.
 - `mux.request.get`, params `{"id":"<canonical UUID>"}`: `{ "request": RequestRecord }`, or `not_found`. No record for the lookup.

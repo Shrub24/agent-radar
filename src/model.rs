@@ -162,6 +162,9 @@ pub struct Workspace {
     pub workspace_id: String,
     pub label: Option<String>,
     pub number: Option<u32>,
+    /// tmux's workspace directory, used as the default target for a new launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<String>,
 }
 
 /// A Herdr tab within a workspace; shown as location detail, not a tree level.
@@ -183,6 +186,9 @@ pub struct Pane {
     pub location: Location,
     pub label: Option<String>,
     pub title: Option<String>,
+    /// Current tmux pane directory, used as the target for a new launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_path: Option<String>,
 }
 
 impl Pane {

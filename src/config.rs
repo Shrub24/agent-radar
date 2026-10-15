@@ -212,8 +212,10 @@ impl Default for DaemonConfig {
 }
 
 /// What the dashboard itself does on the user's desktop.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiConfig {
+    /// The argv used by `L` for a managed-agent launch. Defaults to `pi`.
+    pub launch_command: Vec<String>,
     /// The program and leading arguments that run a command in a new terminal,
     /// used to attach to the server when a focus finds no client. Unset runs
     /// `$TERMINAL -e`.
@@ -224,6 +226,17 @@ pub struct TuiConfig {
     pub project_source: Option<Vec<String>>,
     /// Which of the source's directories are offered.
     pub project_filter: ProjectFilter,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            launch_command: vec!["pi".into()],
+            terminal: None,
+            project_source: None,
+            project_filter: ProjectFilter::default(),
+        }
+    }
 }
 
 /// Which candidate directories a new-workspace picker offers.
@@ -399,6 +412,15 @@ impl Config {
             config.daemon.tmux_server = server.to_string();
         }
         let tui = file.tui.unwrap_or_default();
+        if let Some(command) = tui.launch_command {
+            if command
+                .first()
+                .is_none_or(|program| program.trim().is_empty())
+            {
+                return Err("tui.launch_command: name a program, for example [\"pi\"]".to_string());
+            }
+            config.tui.launch_command = command;
+        }
         if let Some(source) = tui.project_source {
             if source
                 .first()
@@ -556,6 +578,16 @@ impl Config {
              # `git` offers only directories containing `.git`; `none` offers every directory.\n\
              # project_filter = \"git\"\n",
         );
+        out.push_str("# `L` launches this argv as a managed agent; unset defaults to `pi`. Use `a` for an empty shell.\n# launch_command = [\"pi\"]\n");
+        if self.tui.launch_command != ["pi"] {
+            let quoted: Vec<String> = self
+                .tui
+                .launch_command
+                .iter()
+                .map(|word| format!("{word:?}"))
+                .collect();
+            out.push_str(&format!("launch_command = [{}]\n", quoted.join(", ")));
+        }
         if let Some(source) = &self.tui.project_source {
             let quoted: Vec<String> = source.iter().map(|word| format!("{word:?}")).collect();
             out.push_str(&format!("project_source = [{}]\n", quoted.join(", ")));
@@ -736,6 +768,7 @@ struct FileConfig {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct FileTui {
+    launch_command: Option<Vec<String>>,
     terminal: Option<Vec<String>>,
     project_source: Option<Vec<String>>,
     project_filter: Option<String>,
@@ -1055,6 +1088,39 @@ htop = "none"
             assert!(Config::parse(document).is_err(), "{document}");
         }
         assert!(Config::parse("[tui]\nterm = []\n").is_err());
+    }
+
+    #[test]
+    fn managed_launch_command_defaults_to_pi_and_round_trips_overrides() {
+        let default = Config::default();
+        assert_eq!(default.tui.launch_command, ["pi"]);
+        assert!(
+            default
+                .to_document()
+                .contains("# launch_command = [\"pi\"]")
+        );
+        assert_eq!(
+            Config::parse(&default.to_document()).expect("round trips"),
+            default
+        );
+
+        let configured =
+            Config::parse("[tui]\nlaunch_command = [\"pi\", \"--model\", \"test model\"]\n")
+                .expect("parses argv");
+        assert_eq!(
+            configured.tui.launch_command,
+            ["pi", "--model", "test model"]
+        );
+        assert_eq!(
+            Config::parse(&configured.to_document()).expect("round trips"),
+            configured
+        );
+        for document in [
+            "[tui]\nlaunch_command = []\n",
+            "[tui]\nlaunch_command = [\" \"]\n",
+        ] {
+            assert!(Config::parse(document).is_err(), "{document}");
+        }
     }
 
     #[test]

@@ -373,7 +373,6 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
         Operation::CreateContainer => "Add to container",
         Operation::DeleteContainer => "Delete container",
         Operation::ReloadContainer => "Reload pane",
-        Operation::LaunchContainer => "Run a command",
         Operation::EnrollAgent => "Enroll lead",
     };
     let mut lines: Vec<Line<'static>> = vec![
@@ -647,19 +646,6 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     if !action_lines.is_empty() {
         return action_lines;
-    }
-    if let Some(line) = app.launch_prompt() {
-        // The line is the user's own typing, so it is shown whole at the front of
-        // the footer, ahead of the keys that answer it.
-        let mut lines = vec![Line::from(format!("run: {line}\u{2588}"))];
-        lines.extend(wrap_hints(
-            &[
-                ("Enter", "review".to_string()),
-                ("Esc", "cancel".to_string()),
-            ],
-            width,
-        ));
-        return lines;
     }
     if app.is_filter_editing() {
         let pairs = vec![
@@ -3849,6 +3835,7 @@ mod tests {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
                 number: None,
+                session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wH:t1".into(),
@@ -3860,6 +3847,7 @@ mod tests {
                 location: location.clone(),
                 label: None,
                 title: None,
+                current_path: None,
             }],
             agents: vec![AgentObservation {
                 location,
@@ -3922,6 +3910,7 @@ mod tests {
                 location: agent.location.clone(),
                 label: None,
                 title: None,
+                current_path: None,
             })
             .collect();
         let mut state = ObservationState::new();
@@ -3933,6 +3922,7 @@ mod tests {
                 workspace_id: "wH".into(),
                 label: Some("herdsman".into()),
                 number: None,
+                session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wH:t1".into(),
@@ -4265,6 +4255,7 @@ mod tests {
                 workspace_id: "wL".into(),
                 label: Some("long".into()),
                 number: None,
+                session_path: None,
             }],
             tabs: vec![crate::model::Tab {
                 tab_id: "wL:t1".into(),
@@ -4278,6 +4269,7 @@ mod tests {
                     location: agent.location.clone(),
                     label: None,
                     title: None,
+                    current_path: None,
                 })
                 .collect(),
             agents,
@@ -8695,6 +8687,7 @@ mod tests {
                 workspace_id: "wM".into(),
                 label: Some("managed".into()),
                 number: None,
+                session_path: None,
             }],
             tabs: vec![Tab {
                 tab_id: "wM:t1".into(),
@@ -8706,6 +8699,7 @@ mod tests {
                 location: location.clone(),
                 label: None,
                 title: None,
+                current_path: None,
             }],
             agents: vec![AgentObservation {
                 location,

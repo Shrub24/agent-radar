@@ -1061,6 +1061,7 @@ mod tests {
             location: location(pane_id),
             label: None,
             title: None,
+            current_path: None,
         }
     }
 

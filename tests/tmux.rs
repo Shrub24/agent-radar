@@ -523,6 +523,10 @@ fn records_with_tmux_3_5as_escaped_separator_decode_the_same_way() {
     assert_eq!(observation.workspaces.len(), 1, "{observation:?}");
     assert_eq!(observation.workspaces[0].workspace_id, workspace);
     assert_eq!(observation.workspaces[0].label.as_deref(), Some("herdsman"));
+    assert_eq!(
+        observation.workspaces[0].session_path.as_deref(),
+        Some("/tmp/herdr")
+    );
     assert_eq!(observation.tabs.len(), 1, "{observation:?}");
     assert_eq!(observation.tabs[0].tab_id, fake.handle("@1"));
     assert_eq!(observation.tabs[0].workspace_id, workspace);
@@ -533,6 +537,10 @@ fn records_with_tmux_3_5as_escaped_separator_decode_the_same_way() {
     assert_eq!(observation.panes[0].location.tab_id, fake.handle("@1"));
     assert_eq!(observation.panes[0].location.workspace_id, workspace);
     assert_eq!(observation.panes[0].title.as_deref(), Some("a title"));
+    assert_eq!(
+        observation.panes[0].current_path.as_deref(),
+        Some("/tmp/herdr")
+    );
 
     assert_eq!(
         runtime.foreground_evidence(&pane, &cancel),

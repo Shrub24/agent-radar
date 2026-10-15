@@ -112,6 +112,7 @@ fn managed_inventory() -> FleetObservation {
             workspace_id: "wA".into(),
             label: Some("main".into()),
             number: None,
+            session_path: None,
         }],
         tabs: vec![Tab {
             tab_id: "wA:t1".into(),
@@ -123,6 +124,7 @@ fn managed_inventory() -> FleetObservation {
             location: location.clone(),
             label: None,
             title: None,
+            current_path: None,
         }],
         agents: vec![AgentObservation {
             location,
