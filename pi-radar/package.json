@@ -9,7 +9,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Shrub24/agent-radar.git",
+    "url": "git+https://github.com/Shrub24/agent-radar.git",
     "directory": "pi-radar"
   },
   "types": "./index.ts",
