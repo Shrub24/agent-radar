@@ -16,6 +16,7 @@ pub mod ingest;
 pub mod lifecycle;
 pub mod ops;
 pub mod protocol;
+pub mod public_contracts;
 pub mod registry;
 pub mod server;
 pub mod store;

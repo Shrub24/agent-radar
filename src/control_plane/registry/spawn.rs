@@ -212,7 +212,7 @@ impl SpawnEdge {
 }
 
 /// What a spawn topology read can say about a child's process exit.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PublicSpawnExitObservation {
     Unknown,
@@ -777,4 +777,46 @@ fn canonical_uuid(field: &str, value: &str) -> Result<(), String> {
         return Err(format!("`{field}` must be a canonical UUID"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod public_schema_tests {
+    use super::PublicSpawnExitObservation;
+
+    #[test]
+    fn public_exit_observation_uses_the_tagged_wire_shape() {
+        let unknown = PublicSpawnExitObservation::Unknown;
+        assert_eq!(
+            serde_json::to_value(unknown).expect("serialize unknown"),
+            serde_json::json!({ "state": "unknown" })
+        );
+
+        let exited = PublicSpawnExitObservation::Exited {
+            code: Some(17),
+            signal: None,
+            observed_at: "2026-01-01T00:00:00.000Z".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(exited).expect("serialize exited"),
+            serde_json::json!({
+                "state": "exited",
+                "code": 17,
+                "signal": null,
+                "observed_at": "2026-01-01T00:00:00.000Z"
+            })
+        );
+        let partial: PublicSpawnExitObservation = serde_json::from_value(serde_json::json!({
+            "state": "exited",
+            "observed_at": "2026-01-01T00:00:00.000Z"
+        }))
+        .expect("optional exit values may be absent on input");
+        assert_eq!(
+            partial,
+            PublicSpawnExitObservation::Exited {
+                code: None,
+                signal: None,
+                observed_at: "2026-01-01T00:00:00.000Z".into(),
+            }
+        );
+    }
 }

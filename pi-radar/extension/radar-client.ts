@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
+import type {
+	DaemonPingSerialize,
+	FactsSnapshotDeserialize,
+	SpawnExitObservationSerialize,
+} from "./generated-contracts.ts";
 
 /**
  * Transport for Radar's control plane (agent-radar `docs/control-plane.md`,
@@ -148,18 +153,13 @@ export type RadarSnapshot = {
  * published snapshot replaces the whole value, so omission withdraws a fact.
  * Context usage is counts, not a producer-formatted percentage.
  */
-export type RadarContextWindow = { tokens: number; window: number };
-export type RadarBackgroundTask = { id: string; phase: string };
-
-export type RadarFactsSnapshot = {
-	model?: string;
-	provider?: string;
-	thinking?: string;
-	context_window?: RadarContextWindow;
-	session_name?: string;
-	background_tasks?: RadarBackgroundTask[];
-	background_started_unix_ms?: number;
-};
+export type RadarContextWindow = NonNullable<
+	NonNullable<FactsSnapshotDeserialize["context_window"]>
+>;
+export type RadarBackgroundTask = NonNullable<
+	FactsSnapshotDeserialize["background_tasks"]
+>[number];
+export type RadarFactsSnapshot = FactsSnapshotDeserialize;
 
 /**
  * The assignment channel's interim fields. `request` is the owner's active
@@ -295,9 +295,7 @@ export type RadarSpawnEdge = {
  * that disappears is never an exit, and `unknown` is the only value that says
  * no exit was observed.
  */
-export type RadarSpawnExitObservation =
-	| { state: "unknown" }
-	| { state: "exited"; code?: number; signal?: number; observed_at?: string };
+export type RadarSpawnExitObservation = SpawnExitObservationSerialize;
 
 /**
  * One edge with what *that read* learned about the location it recorded.
@@ -343,19 +341,7 @@ export type RadarAgentProcess = {
 	activity?: string;
 };
 
-export type RadarHandshake = {
-	protocol: number;
-	revision: number;
-	backend?: string;
-	/**
-	 * The instance the wired backend addresses: the tmux server name, and null
-	 * (absent here) for a backend that addresses none. It is what qualifies a
-	 * local pane id into a handle the daemon recognises.
-	 */
-	instance?: string;
-	/** Known and future public contract names; unknown entries are preserved. */
-	contracts: string[];
-};
+export type RadarHandshake = DaemonPingSerialize;
 
 export type RadarTimer = { unref?: () => void };
 export type RadarScheduler = {
@@ -814,14 +800,20 @@ function agentProcessAt(agent: unknown): RadarResult<RadarAgentProcess> {
 function exitAt(value: unknown): RadarSpawnExitObservation | undefined {
 	if (value === undefined) return undefined;
 	if (stringAt(value, "state") === "unknown") return { state: "unknown" };
-	const code = numberAt(value, "code");
-	const signal = numberAt(value, "signal");
+	if (stringAt(value, "state") !== "exited") return undefined;
+	const code = recordAt(value, "code");
+	const signal = recordAt(value, "signal");
 	const observedAt = stringAt(value, "observed_at");
+	const isInt32OrNull = (found: unknown) =>
+		found === null ||
+		(typeof found === "number" && Number.isInteger(found) && found >= -2147483648 && found <= 2147483647);
+	if (!isInt32OrNull(code) || !isInt32OrNull(signal) || observedAt === undefined)
+		return undefined;
 	return {
 		state: "exited",
-		...(code !== undefined ? { code } : {}),
-		...(signal !== undefined ? { signal } : {}),
-		...(observedAt !== undefined ? { observed_at: observedAt } : {}),
+		code: code as number | null,
+		signal: signal as number | null,
+		observed_at: observedAt,
 	};
 }
 
@@ -1285,22 +1277,30 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				code: "unsupported",
 				message: `the daemon at ${currentPath()} does not support wire revision ${RADAR_MINIMUM_REVISION}; run systemctl --user restart radar-daemon`,
 			};
-		const rawContracts = (answer.value as { contracts?: unknown }).contracts;
-		if (!Array.isArray(rawContracts) || rawContracts.some((name) => typeof name !== "string"))
-			return protocol("daemon.ping reply has no valid contracts list");
-		const advertised = rawContracts as string[];
+		const backend = stringAt(answer.value, "backend");
+		const instance = recordAt(answer.value, "instance");
+		const rawContracts = recordAt(answer.value, "contracts");
+		const rawTasks = recordAt(answer.value, "tasks");
+		const taskError = recordAt(rawTasks, "error");
+		const taskAvailable = recordAt(rawTasks, "available");
+		if (
+			backend === undefined ||
+			(instance !== null && typeof instance !== "string") ||
+			!Array.isArray(rawContracts) ||
+			rawContracts.some((name) => typeof name !== "string") ||
+			typeof taskAvailable !== "boolean" ||
+			(taskError !== null && typeof taskError !== "string")
+		)
+			return protocol("daemon.ping reply does not match the public response schema");
 		return {
 			ok: true,
 			value: {
 				protocol: protocolVersion,
 				revision,
-				...(stringAt(answer.value, "backend") !== undefined
-					? { backend: stringAt(answer.value, "backend") }
-					: {}),
-				...(stringAt(answer.value, "instance") !== undefined
-					? { instance: stringAt(answer.value, "instance") }
-					: {}),
-				contracts: advertised,
+				backend,
+				instance,
+				contracts: rawContracts as string[],
+				tasks: { available: taskAvailable, error: taskError },
 			},
 		};
 	};
@@ -1818,10 +1818,9 @@ export function boundedRadarFacts(facts: RadarFactsSnapshot): RadarFactsSnapshot
 		return bounded(value, 1024);
 	};
 	const contextWindow = facts.context_window;
-	if (contextWindow !== undefined) {
+	if (contextWindow !== undefined && contextWindow !== null) {
 		if (
 			typeof contextWindow !== "object" ||
-			contextWindow === null ||
 			Object.keys(contextWindow).sort().join(",") !== "tokens,window" ||
 			!Number.isSafeInteger(contextWindow.tokens) ||
 			contextWindow.tokens < 0 ||
@@ -1852,16 +1851,25 @@ export function boundedRadarFacts(facts: RadarFactsSnapshot): RadarFactsSnapshot
 		return { id, phase: text(task.phase) };
 	});
 	const started = facts.background_started_unix_ms;
-	if (started !== undefined && (!Number.isSafeInteger(started) || started < 0))
+	if (started !== undefined && started !== null && (!Number.isSafeInteger(started) || started < 0))
 		throw new RangeError("background_started_unix_ms must be a non-negative integer");
+	const optionalText = (value: string | null | undefined) =>
+		value === undefined ? undefined : value === null ? null : text(value);
 	return {
-		...(facts.model !== undefined ? { model: text(facts.model) } : {}),
-		...(facts.provider !== undefined ? { provider: text(facts.provider) } : {}),
-		...(facts.thinking !== undefined ? { thinking: text(facts.thinking) } : {}),
+		...(facts.model !== undefined ? { model: optionalText(facts.model) } : {}),
+		...(facts.provider !== undefined ? { provider: optionalText(facts.provider) } : {}),
+		...(facts.thinking !== undefined ? { thinking: optionalText(facts.thinking) } : {}),
 		...(contextWindow !== undefined
-			? { context_window: { tokens: contextWindow.tokens, window: contextWindow.window } }
+			? {
+					context_window:
+						contextWindow === null
+							? null
+							: { tokens: contextWindow.tokens, window: contextWindow.window },
+				}
 			: {}),
-		...(facts.session_name !== undefined ? { session_name: text(facts.session_name) } : {}),
+		...(facts.session_name !== undefined
+			? { session_name: optionalText(facts.session_name) }
+			: {}),
 		...(boundedTasks !== undefined ? { background_tasks: boundedTasks } : {}),
 		...(started !== undefined ? { background_started_unix_ms: started } : {}),
 	};

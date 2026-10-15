@@ -416,7 +416,8 @@ Facts (`channel: "facts"`) are self-authored by the session, with no owner:
 
 - `model`, `provider`, `thinking` and `session_name`: optional bounded text.
   `session_name` is a display label; the session UUID stays in `agent.context`.
-- `context_window`: optional `{"tokens","window"}` of two non-negative integers,
+- `context_window`: optional `{"tokens","window"}` of two non-negative integers
+  no greater than `9,007,199,254,740,991` (JavaScript's safe-integer maximum),
   the tokens in context and the window size. `window` is above zero and `tokens`
   does not exceed it; anything else refuses the snapshot. A display derives the
   percentage, so none is published. It carries no authority over freshness,
@@ -424,8 +425,8 @@ Facts (`channel: "facts"`) are self-authored by the session, with no owner:
 - `background_tasks`: optional list of at most 64 `{"id","phase"}` objects. Both
   fields are bounded text, and `id` is unique within the snapshot. `phase` is
   producer vocabulary.
-- `background_started_unix_ms`: optional nonnegative Unix milliseconds when the
-  unresolved background work began.
+- `background_started_unix_ms`: optional nonnegative Unix milliseconds no
+  greater than `9,007,199,254,740,991`, when the unresolved background work began.
 
 Assignment (`channel: "assignment"`) adds owner-authored optional fields to the
 base:

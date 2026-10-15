@@ -219,7 +219,7 @@ impl From<Snapshot> for AssignmentSnapshot {
 }
 
 /// One background task the agent process reports as unresolved.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BackgroundTask {
     pub id: String,
@@ -230,7 +230,7 @@ pub struct BackgroundTask {
 /// or assignment, and kept separate from execution and assignment. Every field
 /// is optional and a published snapshot replaces the whole value, so omission
 /// withdraws a fact. `context_window` is counts; a display derives the percentage.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FactsSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +246,7 @@ pub struct FactsSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<BackgroundTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 9007199254740991u64))]
     pub background_started_unix_ms: Option<u64>,
 }
 
@@ -261,11 +262,18 @@ impl FactsSnapshot {
                 bounded_text(field, value, false)?;
             }
         }
+        if let Some(timestamp) = self.background_started_unix_ms
+            && timestamp > crate::model::MAX_SAFE_JSON_INTEGER
+        {
+            return Err(
+                "`background_started_unix_ms` exceeds JavaScript's safe integer range".into(),
+            );
+        }
         if let Some(window) = &self.context_window
             && !window.is_valid()
         {
             return Err(
-                "`context_window` needs a window above zero and tokens within it".to_string(),
+                "`context_window` needs safe integer counts, a window above zero, and tokens within it".to_string(),
             );
         }
         if self.background_tasks.len() > MAX_BACKGROUND_TASKS {
@@ -1326,5 +1334,48 @@ mod tests {
         );
         assert!(serde_json::from_str::<Snapshot>(r#"{"activity":"idle","extra":true}"#).is_err());
         assert!(serde_json::from_str::<Outcome>(r#"{"result":"failed","code":1}"#).is_err());
+    }
+
+    #[test]
+    fn facts_timestamp_is_limited_to_the_javascript_safe_integer_range() {
+        let facts = |timestamp| FactsSnapshot {
+            model: None,
+            provider: None,
+            thinking: None,
+            context_window: None,
+            session_name: None,
+            background_tasks: Vec::new(),
+            background_started_unix_ms: timestamp,
+        };
+        assert!(
+            facts(Some(crate::model::MAX_SAFE_JSON_INTEGER))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            facts(Some(crate::model::MAX_SAFE_JSON_INTEGER + 1))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn facts_serde_omits_absent_output_fields_but_accepts_null_input() {
+        let empty = FactsSnapshot {
+            model: None,
+            provider: None,
+            thinking: None,
+            context_window: None,
+            session_name: None,
+            background_tasks: Vec::new(),
+            background_started_unix_ms: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&empty).expect("serialize facts"),
+            serde_json::json!({})
+        );
+        let decoded: FactsSnapshot = serde_json::from_value(serde_json::json!({ "model": null }))
+            .expect("null optional input is accepted");
+        assert_eq!(decoded.model, None);
     }
 }

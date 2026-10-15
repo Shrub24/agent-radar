@@ -1,0 +1,100 @@
+{
+  "$defs": {
+    "BackgroundTask": {
+      "additionalProperties": false,
+      "description": "One background task the agent process reports as unresolved.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "phase": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "ContextWindow": {
+      "additionalProperties": false,
+      "description": "How much of a model's context window a session has used, as counts.\n\n`window` is positive and `tokens` does not exceed it; the percentage a display\nshows is derived from these and never published. Wire counts stay exact in JS.",
+      "properties": {
+        "tokens": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tokens",
+        "window"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The agent's own process facts. Self-authored by any Pi session, with no owner\nor assignment, and kept separate from execution and assignment. Every field\nis optional and a published snapshot replaces the whole value, so omission\nwithdraws a fact. `context_window` is counts; a display derives the percentage.",
+  "properties": {
+    "background_started_unix_ms": {
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "background_tasks": {
+      "items": {
+        "$ref": "#/$defs/BackgroundTask"
+      },
+      "type": "array"
+    },
+    "context_window": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContextWindow"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "thinking": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "title": "facts-snapshot-deserialize",
+  "type": "object"
+}

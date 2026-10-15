@@ -83,8 +83,18 @@ function currentPingAnswers(): any[] {
 /** The raw reply line a fake daemon writes, or `undefined` for silence. */
 type Answer = (request: any) => string | undefined;
 
-const reply = (request: any, result: unknown): string =>
+const rawReply = (request: any, result: unknown): string =>
 	JSON.stringify({ id: request.id, result });
+const reply = (request: any, result: unknown): string => {
+	if (request.method !== "daemon.ping" || typeof result !== "object" || result === null)
+		return rawReply(request, result);
+	return rawReply(request, {
+		backend: "tmux",
+		instance: null,
+		tasks: { available: false, error: null },
+		...(result as Record<string, unknown>),
+	});
+};
 
 const refuse = (request: any, code: string, message = ""): string =>
 	JSON.stringify({ id: request.id, error: { code, message } });
@@ -929,7 +939,9 @@ test("daemon.ping requires protocol 2, revision 1, and registry.v1", async () =>
 				protocol: 2,
 				backend: "sqlite",
 				revision: 1,
+				instance: null,
 				contracts: ["registry.v1", "future.contract.v9"],
+				tasks: { available: false, error: null },
 			},
 		});
 	} finally {

@@ -1,0 +1,69 @@
+{
+  "$defs": {
+    "TaskLaneStatus": {
+      "additionalProperties": false,
+      "description": "Status of the daemon's volatile task-publication lane.",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "available",
+        "error"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "`daemon.ping` result. Contract names remain strings so older clients can\npreserve and ignore names introduced by newer daemon builds.",
+  "properties": {
+    "backend": {
+      "type": "string"
+    },
+    "contracts": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "instance": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "protocol": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "revision": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "tasks": {
+      "$ref": "#/$defs/TaskLaneStatus"
+    }
+  },
+  "required": [
+    "protocol",
+    "revision",
+    "backend",
+    "instance",
+    "contracts",
+    "tasks"
+  ],
+  "title": "daemon-ping-serialize",
+  "type": "object"
+}

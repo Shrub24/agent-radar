@@ -49,7 +49,14 @@ function harness(
 	const calls: Array<{ method: string; params: any }> = [];
 	let minted = 0;
 	const client: RadarPublicationClient = {
-		ping: async () => ok({ protocol: 2, revision: 1, contracts: ["registry.v1", "registry.facts.v1"] }),
+		ping: async () => ok({
+			protocol: 2,
+			revision: 1,
+			backend: "tmux",
+			instance: null,
+			contracts: ["registry.v1", "registry.facts.v1"],
+			tasks: { available: false, error: null },
+		}),
 		register: async (params) => {
 			calls.push({ method: "agent.register", params });
 			minted += 1;

@@ -66,7 +66,14 @@ function fakeDaemon(script: Script = {}) {
 		client: undefined as unknown as RadarPublicationClient,
 	};
 	daemon.client = {
-		ping: async () => ok({ protocol: 2, revision: 1, contracts: ["registry.v1", "registry.facts.v1"] }),
+		ping: async () => ok({
+			protocol: 2,
+			revision: 1,
+			backend: "tmux",
+			instance: null,
+			contracts: ["registry.v1", "registry.facts.v1"],
+			tasks: { available: false, error: null },
+		}),
 		register: async (params) => answer("agent.register", params, () => {
 			const agentId = mint();
 			agentIds.push(agentId);

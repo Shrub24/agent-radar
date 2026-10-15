@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What a spawn topology read can say about a child's process exit.",
+  "oneOf": [
+    {
+      "properties": {
+        "state": {
+          "const": "unknown",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "signal": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "const": "exited",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "observed_at"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "spawn-exit-observation-deserialize"
+}

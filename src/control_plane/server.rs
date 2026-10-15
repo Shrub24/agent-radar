@@ -32,6 +32,7 @@ use crate::control_plane::containers;
 use crate::control_plane::lifecycle::{self as subjects, Bootstrap};
 use crate::control_plane::ops::{self, Method};
 use crate::control_plane::protocol::{self, Code, PROTOCOL_VERSION, Refusal, Request, Response};
+use crate::control_plane::public_contracts::{PingResult, TaskLaneStatus};
 use crate::control_plane::registry::{
     self, AcquireRequest, Channel, CloseAdmission, CloseOutcome, CloseResult, LocalProcfsVerifier,
     LocationEvidence, ProcessVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
@@ -822,23 +823,27 @@ fn handle_line(
                     identity,
                     ops::advertised_with_tasks(backend, available)
                         .into_iter()
-                        .map(ops::Contract::as_str)
+                        .map(|contract| ops::Contract::as_str(contract).to_string())
                         .collect::<Vec<_>>(),
-                    json!({"available": available, "error": core.task_ingest_error}),
+                    TaskLaneStatus {
+                        available,
+                        error: core.task_ingest_error.clone(),
+                    },
                 )
+            };
+            let result = PingResult {
+                protocol: PROTOCOL_VERSION,
+                revision: ops::PROTOCOL_REVISION,
+                backend: identity.name,
+                instance: identity.instance,
+                contracts,
+                tasks: task_status,
             };
             answer(
                 writer,
                 Response::ok(
                     &request.id,
-                    json!({
-                        "protocol": PROTOCOL_VERSION,
-                        "revision": ops::PROTOCOL_REVISION,
-                        "backend": identity.name,
-                        "instance": identity.instance,
-                        "contracts": contracts,
-                        "tasks": task_status,
-                    }),
+                    serde_json::to_value(result).expect("ping result is JSON-serializable"),
                 ),
             );
         }

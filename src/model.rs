@@ -328,21 +328,30 @@ impl From<&RuntimeStatus> for AgentState {
 /// additive, so an absent key means unavailable rather than a default.
 /// [`Self::session_name`] is the source's human name and is deliberately not an
 /// identity — identity lives in [`AgentObservation::session`].
+/// Highest integer JavaScript can represent exactly when the facts channel is
+/// consumed by the TypeScript SDK.
+pub const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+
 /// How much of a model's context window a session has used, as counts.
 ///
 /// `window` is positive and `tokens` does not exceed it; the percentage a display
-/// shows is derived from these and never published.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// shows is derived from these and never published. Wire counts stay exact in JS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextWindow {
+    #[schemars(range(max = 9007199254740991u64))]
     pub tokens: u64,
+    #[schemars(range(max = 9007199254740991u64))]
     pub window: u64,
 }
 
 impl ContextWindow {
     /// Whether the counts describe a possible usage.
     pub fn is_valid(&self) -> bool {
-        self.window > 0 && self.tokens <= self.window
+        self.window > 0
+            && self.tokens <= self.window
+            && self.tokens <= MAX_SAFE_JSON_INTEGER
+            && self.window <= MAX_SAFE_JSON_INTEGER
     }
 
     /// The whole-number percentage used, rounded to nearest. A window of zero,
@@ -1213,7 +1222,7 @@ mod tests {
 
 #[cfg(test)]
 mod context_window_tests {
-    use super::ContextWindow;
+    use super::{ContextWindow, MAX_SAFE_JSON_INTEGER};
 
     #[test]
     fn the_percentage_is_derived_and_rounded_from_the_counts() {
@@ -1254,6 +1263,20 @@ mod context_window_tests {
             !ContextWindow {
                 tokens: 6,
                 window: 5
+            }
+            .is_valid()
+        );
+        assert!(
+            ContextWindow {
+                tokens: MAX_SAFE_JSON_INTEGER,
+                window: MAX_SAFE_JSON_INTEGER,
+            }
+            .is_valid()
+        );
+        assert!(
+            !ContextWindow {
+                tokens: MAX_SAFE_JSON_INTEGER + 1,
+                window: MAX_SAFE_JSON_INTEGER + 1,
             }
             .is_valid()
         );
