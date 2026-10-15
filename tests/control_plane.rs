@@ -44,7 +44,7 @@ use agent_radar::runtime::{
     BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation,
     FocusOutcome, InputOutcome, InputPayload, InputRequest, LaunchOutcome, LaunchRequest,
     MAX_REPORTED_TEXT_BYTES, OutputOutcome, OutputRead, OutputRequest, OutputSource,
-    PaneExitObservation, ReportOutcome, ReportRequest, ReportedState, RuntimeProvider,
+    PaneExitObservation, Primitives, ReportOutcome, ReportRequest, ReportedState, RuntimeProvider,
     SplitDirection, StateReport, Target,
 };
 use serde_json::{Value, json};
@@ -78,8 +78,10 @@ impl RuntimeProvider for FakeBackend {
         BackendIdentity::named("fake")
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        &["mux.observe", "mux.process_info", "mux.focus"]
+    fn primitives(&self) -> Primitives {
+        Primitives::OBSERVE
+            .union(Primitives::PROCESS_INFO)
+            .union(Primitives::FOCUS)
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(self.inventory.clone())
@@ -212,9 +214,8 @@ impl RuntimeProvider for GatedBackend {
         BackendIdentity::named("fake")
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        // `observe` because the daemon reads this backend while a focus is held.
-        &["mux.observe", "mux.focus"]
+    fn primitives(&self) -> Primitives {
+        Primitives::OBSERVE.union(Primitives::FOCUS)
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(FleetObservation {
@@ -365,8 +366,8 @@ impl RuntimeProvider for CloseBackend {
         BackendIdentity::named("fake")
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        &["mux.close"]
+    fn primitives(&self) -> Primitives {
+        Primitives::CLOSE
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         self.inventory.clone()
@@ -401,90 +402,47 @@ impl RuntimeProvider for CloseBackend {
     }
 }
 
-/// Every capability the fake mux backend declares.
-const MUX_CAPABILITIES: &[&str] = &[
-    "mux.observe",
-    "mux.process_info",
-    "mux.create",
-    "mux.input",
-    "mux.output",
-    "mux.report",
-];
+/// Backend primitive sets used by the fake runtime.
+const MUX_PRIMITIVES: Primitives = Primitives::OBSERVE
+    .union(Primitives::PROCESS_INFO)
+    .union(Primitives::CREATE)
+    .union(Primitives::INPUT)
+    .union(Primitives::OUTPUT)
+    .union(Primitives::REPORT);
+const SPAWN_PRIMITIVES: Primitives = Primitives::OBSERVE
+    .union(Primitives::FOCUS)
+    .union(Primitives::PROCESS_INFO)
+    .union(Primitives::CREATE)
+    .union(Primitives::INPUT)
+    .union(Primitives::OUTPUT)
+    .union(Primitives::REPORT)
+    .union(Primitives::LAUNCH)
+    .union(Primitives::CLOSE)
+    .union(Primitives::LAUNCH_CONTEXT);
+const RECIPE_PRIMITIVES: Primitives = Primitives::OBSERVE
+    .union(Primitives::PROCESS_INFO)
+    .union(Primitives::CREATE)
+    .union(Primitives::LAUNCH)
+    .union(Primitives::LAUNCH_CONTEXT)
+    .union(Primitives::EXIT_OBSERVATION);
+const DEAD_CLOSE_PRIMITIVES: Primitives = Primitives::OBSERVE
+    .union(Primitives::PROCESS_INFO)
+    .union(Primitives::CREATE)
+    .union(Primitives::INPUT)
+    .union(Primitives::OUTPUT)
+    .union(Primitives::REPORT)
+    .union(Primitives::LAUNCH)
+    .union(Primitives::CLOSE)
+    .union(Primitives::EXIT_OBSERVATION);
 
-/// The same, plus `launch`: a backend that can serve a spawn, because it can
-/// both create a pane and run a command in it.
-const SPAWN_CAPABILITIES: &[&str] = &[
-    "mux.observe",
-    "mux.focus",
-    "mux.process_info",
-    "mux.create",
-    "mux.input",
-    "mux.output",
-    "mux.report",
-    "mux.launch",
-    "mux.close",
-    "mux.launch_context",
-];
-
-/// What a backend must state to create a pane, run a command in it with a private
-/// context, and report what that pane's command did: what a container recipe needs
-/// on both ends.
-const RECIPE_CAPABILITIES: &[&str] = &[
-    "mux.observe",
-    "mux.process_info",
-    "mux.create",
-    "mux.launch",
-    "mux.launch_context",
-    "mux.exit_observation",
-];
-
-/// What a backend must declare to close a child whose pane is already dead: the
-/// same primitives plus the retained-exit read the dead-pane evidence comes from.
-const DEAD_CLOSE_CAPABILITIES: &[&str] = &[
-    "mux.observe",
-    "mux.process_info",
-    "mux.create",
-    "mux.input",
-    "mux.output",
-    "mux.report",
-    "mux.launch",
-    "mux.close",
-    "mux.exit_observation",
-];
-
-/// What the handshake advertises for a backend that declares `backend`: each
-/// daemon contract whose capabilities are all present. The backend's own `mux.*`
-/// names are not on the wire, and nothing the daemon would refuse to serve is in
-/// this list.
-fn advertised(backend: &[&str]) -> Value {
-    let mut capabilities: Vec<Value> = Vec::new();
-    let serves = |needed: &[&str]| needed.iter().all(|name| backend.contains(name));
-    for (contract, needed) in [
-        ("registry.v1", &[][..]),
-        ("registry.facts.v1", &[][..]),
-        ("events.v1", &[][..]),
-        ("topology.create.v1", &["mux.create"][..]),
-        ("topology.delete.v1", &["mux.close"][..]),
-        ("topology.get.v1", &[][..]),
-        ("topology.list.v1", &[][..]),
-        (
-            "topology.reload.v1",
-            &["mux.launch", "mux.exit_observation"][..],
-        ),
-        ("topology.reconcile.v1", &["mux.observe"][..]),
-        ("spawn.v1", &["mux.create", "mux.launch"][..]),
-        ("spawn.close.v1", &["mux.observe", "mux.close"][..]),
-        (
-            "spawn.launch_context.v1",
-            &["mux.create", "mux.launch", "mux.launch_context"][..],
-        ),
-        ("spawn.exit_observation.v1", &["mux.exit_observation"][..]),
-    ] {
-        if serves(needed) {
-            capabilities.push(json!(contract));
-        }
-    }
-    Value::Array(capabilities)
+/// Wire contracts derived from a fake backend's typed primitive set.
+fn advertised(backend: Primitives) -> Value {
+    Value::Array(
+        agent_radar::control_plane::ops::advertised(backend)
+            .into_iter()
+            .map(|contract| json!(contract.as_str()))
+            .collect(),
+    )
 }
 
 /// What a fake backend answers to a report.
@@ -506,7 +464,7 @@ enum LaunchAnswer {
 /// A fake backend for the mux primitives: what the test staged it answers, and
 /// what the daemon asked it for. Nothing here is a mux.
 struct MuxBackend {
-    capabilities: &'static [&'static str],
+    primitives: Primitives,
     created: CreatedLocation,
     output: OutputRead,
     report: ReportAnswer,
@@ -537,18 +495,18 @@ struct MuxBackend {
 }
 
 impl MuxBackend {
-    fn new(capabilities: &'static [&'static str]) -> Arc<Self> {
-        Self::staged(capabilities, None)
+    fn new(primitives: Primitives) -> Arc<Self> {
+        Self::staged(primitives, None)
     }
 
     /// The same backend, answering a report with this outcome.
     fn reporting(&self, report: ReportAnswer) -> Arc<Self> {
-        Self::staged(self.capabilities, Some(report))
+        Self::staged(self.primitives, Some(report))
     }
 
-    fn staged(capabilities: &'static [&'static str], report: Option<ReportAnswer>) -> Arc<Self> {
+    fn staged(primitives: Primitives, report: Option<ReportAnswer>) -> Arc<Self> {
         Arc::new(Self {
-            capabilities,
+            primitives,
             created: CreatedLocation {
                 workspace_id: None,
                 tab_id: None,
@@ -580,7 +538,7 @@ impl MuxBackend {
     /// The same backend answering an output read with this snapshot.
     fn closing(self: &Arc<Self>, close: CloseAnswer) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             created: self.created.clone(),
             output: self.output.clone(),
             report: self.report.clone(),
@@ -603,7 +561,7 @@ impl MuxBackend {
 
     fn with_foreground(self: &Arc<Self>, evidence: ForegroundEvidence) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             created: self.created.clone(),
             output: self.output.clone(),
             report: self.report.clone(),
@@ -630,7 +588,7 @@ impl MuxBackend {
 
     fn reading(self: &Arc<Self>, output: OutputRead) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             created: self.created.clone(),
             output,
             report: self.report.clone(),
@@ -654,7 +612,7 @@ impl MuxBackend {
     /// The same backend, answering a launch with this outcome.
     fn launching(self: &Arc<Self>, launch: LaunchAnswer) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             created: self.created.clone(),
             output: self.output.clone(),
             report: self.report.clone(),
@@ -678,7 +636,7 @@ impl MuxBackend {
     /// The same backend confirming a create with this answer's identities.
     fn naming(self: &Arc<Self>, created: CreatedLocation) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             created,
             output: self.output.clone(),
             report: self.report.clone(),
@@ -705,7 +663,7 @@ impl MuxBackend {
     /// says is there, so a test that deletes one states what its backend serves.
     fn with_inventory(self: &Arc<Self>, inventory: FleetObservation) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             created: self.created.clone(),
             output: self.output.clone(),
             report: self.report.clone(),
@@ -729,7 +687,7 @@ impl MuxBackend {
     /// The same backend, holding its first create open until the test releases it.
     fn gated(self: &Arc<Self>, gate: Arc<Gate>) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             created: self.created.clone(),
             output: self.output.clone(),
             report: self.report.clone(),
@@ -753,7 +711,7 @@ impl MuxBackend {
     /// The same backend, reporting exactly these panes as its inventory.
     fn observing(self: &Arc<Self>, panes: &[&str]) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             created: self.created.clone(),
             output: self.output.clone(),
             report: self.report.clone(),
@@ -840,8 +798,8 @@ impl RuntimeProvider for MuxBackend {
         BackendIdentity::named("fake")
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        self.capabilities
+    fn primitives(&self) -> Primitives {
+        self.primitives
     }
 
     fn server_process(&self, _cancel: &AtomicBool) -> Option<i32> {
@@ -969,7 +927,7 @@ fn state_report(state: &str) -> Value {
 #[test]
 fn the_reporting_bridge_is_served_and_recorded() {
     let sandbox = Sandbox::new("report");
-    let backend = MuxBackend::new(MUX_CAPABILITIES);
+    let backend = MuxBackend::new(MUX_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
@@ -1120,12 +1078,12 @@ fn the_reporting_bridge_is_served_and_recorded() {
 #[test]
 fn a_backend_without_reporting_refuses_it_and_advertises_no_reporting() {
     let sandbox = Sandbox::new("report-unsupported");
-    let backend = MuxBackend::new(&["mux.observe"]);
+    let backend = MuxBackend::new(Primitives::OBSERVE);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
     let ping = client.call("daemon.ping", json!({}));
-    assert_eq!(ping["result"]["contracts"], advertised(&["mux.observe"]));
+    assert_eq!(ping["result"]["contracts"], advertised(Primitives::OBSERVE));
 
     let refused = client.call("mux.report", state_report("working"));
     let record = result_record(&refused);
@@ -1149,7 +1107,7 @@ fn a_backend_without_reporting_refuses_it_and_advertises_no_reporting() {
 #[test]
 fn a_backend_report_refusal_is_recorded_as_refused() {
     let sandbox = Sandbox::new("report-refused");
-    let backend = MuxBackend::new(MUX_CAPABILITIES)
+    let backend = MuxBackend::new(MUX_PRIMITIVES)
         .reporting(ReportAnswer::Refused("herdr refused the report".into()));
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
@@ -1171,7 +1129,7 @@ fn a_backend_report_refusal_is_recorded_as_refused() {
 #[test]
 fn an_uncertain_report_stays_unknown_and_suppresses_the_target() {
     let sandbox = Sandbox::new("report-unknown");
-    let backend = MuxBackend::new(MUX_CAPABILITIES)
+    let backend = MuxBackend::new(MUX_PRIMITIVES)
         .reporting(ReportAnswer::Unknown("herdr timed out after 5s".into()));
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
@@ -1208,7 +1166,7 @@ fn an_uncertain_report_stays_unknown_and_suppresses_the_target() {
 #[test]
 fn the_wire_shapes_of_report_are_validated_before_dispatch() {
     let sandbox = Sandbox::new("report-validation");
-    let backend = MuxBackend::new(MUX_CAPABILITIES);
+    let backend = MuxBackend::new(MUX_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
@@ -2663,14 +2621,24 @@ fn result_record(response: &Value) -> &Value {
 /// The daemon answers liveness with what it is, so a client can tell a daemon
 /// with no backend from a daemon of another version before asking it anything.
 #[test]
-fn ping_answers_the_version_backend_and_registry_capability_without_mux() {
+fn ping_answers_the_revision_and_backend_contracts_without_a_mux() {
     let sandbox = Sandbox::new("ping");
     let mut daemon = sandbox.daemon();
     let mut client = Client::dial(daemon.path());
     let response = client.call("daemon.ping", json!({}));
     assert_eq!(response["result"]["protocol"], PROTOCOL_VERSION);
+    assert_eq!(response["result"]["revision"], json!(1));
     assert_eq!(response["result"]["backend"], "none");
-    assert_eq!(response["result"]["contracts"], advertised(&[]));
+    assert_eq!(
+        response["result"]["contracts"],
+        json!([
+            "registry.v1",
+            "registry.facts.v1",
+            "events.v1",
+            "topology.get.v1",
+            "topology.list.v1"
+        ])
+    );
     let unsupported = client.call(
         "spawn.close",
         json!({
@@ -2714,7 +2682,11 @@ fn real_socket_serves_normalized_observation_and_focus_once() {
     assert_eq!(ping["result"]["instance"], Value::Null);
     assert_eq!(
         ping["result"]["contracts"],
-        advertised(&["mux.observe", "mux.process_info", "mux.focus"])
+        advertised(
+            Primitives::OBSERVE
+                .union(Primitives::PROCESS_INFO)
+                .union(Primitives::FOCUS),
+        )
     );
     let observed = client.call("mux.observe", json!({}));
     assert_eq!(
@@ -2803,7 +2775,7 @@ fn a_foreign_version_is_refused_and_the_connection_keeps_serving() {
 #[test]
 fn the_version_one_wire_is_refused_without_aliases() {
     let sandbox = Sandbox::new("wire-v1");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
@@ -5264,7 +5236,7 @@ fn stopping_the_daemon_cancels_an_in_flight_close_into_a_durable_unknown() {
 #[test]
 fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertisement() {
     let sandbox = Sandbox::new("launch-readiness");
-    let backend = MuxBackend::new(MUX_CAPABILITIES);
+    let backend = MuxBackend::new(MUX_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -5281,7 +5253,7 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
     let ping = client.call("daemon.ping", json!({}));
     assert_eq!(
         ping["result"]["contracts"],
-        advertised(MUX_CAPABILITIES),
+        advertised(MUX_PRIMITIVES),
         "a backend that does not implement launch advertises only its actual capabilities"
     );
     let ping_again = client.call("daemon.ping", json!({}));
@@ -5296,7 +5268,8 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
             .contains(&json!("spawn.launch_context.v1")),
         "a backend that cannot launch earns no launch-context contract: {ping_again}"
     );
-    let refusal = Operation::readiness("spawn.create", "mux.launch", backend.capabilities)
+    let refusal = Operation::Spawn
+        .ready_for(backend.primitives)
         .expect_err("launch is not implemented by this backend");
     assert_eq!(
         refusal,
@@ -5313,10 +5286,10 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
 
     // Other operations keep their own capability gates; they do not inherit
     // launch merely because a backend can create or accept terminal input.
-    assert!(Operation::readiness("mux.create", "mux.create", backend.capabilities).is_ok());
-    assert!(Operation::readiness("mux.input", "mux.input", backend.capabilities).is_ok());
-    let no_launch = ["mux.create", "mux.input"];
-    assert!(Operation::readiness("spawn.create", "mux.launch", &no_launch).is_err());
+    assert!(Operation::Create.ready_for(backend.primitives).is_ok());
+    assert!(Operation::Input.ready_for(backend.primitives).is_ok());
+    let no_launch = Primitives::CREATE.union(Primitives::INPUT);
+    assert!(Operation::Spawn.ready_for(no_launch).is_err());
     daemon.stop();
 }
 
@@ -5325,7 +5298,7 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
 #[test]
 fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effects() {
     let sandbox = Sandbox::new("spawn-served");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -5460,7 +5433,7 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
 #[test]
 fn a_backend_without_launch_refuses_a_spawn_before_any_effect() {
     let sandbox = Sandbox::new("spawn-without-launch");
-    let backend = MuxBackend::new(MUX_CAPABILITIES);
+    let backend = MuxBackend::new(MUX_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -5504,7 +5477,7 @@ fn a_backend_without_launch_refuses_a_spawn_before_any_effect() {
     // Capability advertisement is unchanged: this backend implements what it
     // says it does, and its refusal adds nothing to it.
     let ping = client.call("daemon.ping", json!({}));
-    assert_eq!(ping["result"]["contracts"], advertised(MUX_CAPABILITIES));
+    assert_eq!(ping["result"]["contracts"], advertised(MUX_PRIMITIVES));
     daemon.stop();
 }
 
@@ -5513,7 +5486,7 @@ fn a_backend_without_launch_refuses_a_spawn_before_any_effect() {
 #[test]
 fn a_replayed_spawn_request_id_answers_the_recorded_effects_once() {
     let sandbox = Sandbox::new("spawn-replay");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -5554,7 +5527,7 @@ fn a_replayed_spawn_request_id_answers_the_recorded_effects_once() {
 #[test]
 fn a_refused_spawn_launch_leaves_the_created_pane_named() {
     let sandbox = Sandbox::new("spawn-launch-refused");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES).launching(LaunchAnswer::Refused(
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES).launching(LaunchAnswer::Refused(
         "echo SECRET_VALUE PI_RADAR_SPAWN_TOKEN=secret-token".into(),
     ));
     let mut daemon = sandbox.daemon_with(backend.clone());
@@ -5608,7 +5581,7 @@ fn a_refused_spawn_launch_leaves_the_created_pane_named() {
 #[test]
 fn an_unconfirmed_spawn_launch_reads_unknown_and_is_never_claimed_launched() {
     let sandbox = Sandbox::new("spawn-launch-unknown");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES)
         .launching(LaunchAnswer::Unknown("the pane never answered".into()));
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
@@ -5651,7 +5624,7 @@ fn an_unconfirmed_spawn_launch_reads_unknown_and_is_never_claimed_launched() {
 #[test]
 fn a_spawn_without_a_parent_pane_is_refused_before_any_effect() {
     let sandbox = Sandbox::new("spawn-parent");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
@@ -5702,7 +5675,7 @@ fn a_spawn_without_a_parent_pane_is_refused_before_any_effect() {
 fn spawn_refuses_missing_stale_null_and_mismatched_exact_parent_context_before_create() {
     const SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let sandbox = Sandbox::new("spawn-context-refusal");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = client.call(
@@ -5754,7 +5727,7 @@ fn spawn_refuses_missing_stale_null_and_mismatched_exact_parent_context_before_c
 #[test]
 fn the_wire_shapes_of_spawn_are_validated_before_dispatch() {
     let sandbox = Sandbox::new("spawn-shapes");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -5847,7 +5820,7 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
         pid: 200,
         identity: process.clone(),
     });
-    let base = MuxBackend::new(SPAWN_CAPABILITIES)
+    let base = MuxBackend::new(SPAWN_PRIMITIVES)
         .observing(&["wA:p2"])
         .with_foreground(ForegroundEvidence::command(200, Some("pi".into()), None));
     let backend = base.closing(CloseAnswer::Completed);
@@ -5977,7 +5950,7 @@ fn child_close_persists_a_backend_refusal_and_replays_it_without_dispatching() {
         pid: 200,
         identity: process.clone(),
     });
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES)
         .observing(&["wA:p2"])
         .with_foreground(ForegroundEvidence::command(200, Some("pi".into()), None))
         .closing(CloseAnswer::Refused("no such pane".into()));
@@ -6074,7 +6047,7 @@ fn a_restarted_daemon_reads_the_recorded_close_outcome_without_dispatching() {
             pid: 200,
             identity: process.clone(),
         });
-        let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+        let backend = MuxBackend::new(SPAWN_PRIMITIVES)
             .observing(&["wA:p2"])
             .with_foreground(ForegroundEvidence::command(200, Some("pi".into()), None))
             .closing(CloseAnswer::Unknown("the reply was lost".into()));
@@ -6118,7 +6091,7 @@ fn a_restarted_daemon_reads_the_recorded_close_outcome_without_dispatching() {
     // The restarted daemon has the same records and a backend it could dispatch
     // to. It answers from the record: no second close, and no reading of the pane
     // or the process behind it as gone.
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES)
         .observing(&["wA:p2"])
         .with_foreground(ForegroundEvidence::command(200, Some("pi".into()), None));
     let verifier: Arc<dyn ProcessVerifier> = Arc::new(MatchingVerifier {
@@ -6208,7 +6181,7 @@ fn child_close_refuses_foreground_and_containment_mismatches_without_recording()
                 }
             },
         });
-        let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+        let backend = MuxBackend::new(SPAWN_PRIMITIVES)
             .observing(&panes)
             .with_foreground(evidence);
         let mut daemon = Daemon::bind_with_backend_and_verifier(
@@ -6256,7 +6229,7 @@ fn child_close_refuses_foreground_and_containment_mismatches_without_recording()
 #[test]
 fn a_dead_child_pane_closes_only_from_a_recorded_exit_and_a_dead_report_now() {
     let sandbox = Sandbox::new("dead-child-close");
-    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p2"]);
+    let backend = MuxBackend::new(DEAD_CLOSE_PRIMITIVES).observing(&["wA:p2"]);
     let verifier = stage_dead_pane(&backend, "wA:p2", Some(900));
     let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier);
     let mut client = Client::dial(daemon.path());
@@ -6359,7 +6332,7 @@ fn a_close_refuses_before_recording_when_the_pane_cannot_be_established_now() {
         pid: 200,
         start_ticks: 400,
     };
-    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p2"]);
+    let backend = MuxBackend::new(DEAD_CLOSE_PRIMITIVES).observing(&["wA:p2"]);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -6402,7 +6375,7 @@ fn a_close_refuses_before_recording_when_the_pane_cannot_be_established_now() {
     // The same recorded edge and child, read by a daemon whose inventory does not
     // hold the pane: the pane it would close is not there, so the dead-pane
     // evidence is never reached and nothing is dispatched.
-    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p9"]);
+    let backend = MuxBackend::new(DEAD_CLOSE_PRIMITIVES).observing(&["wA:p9"]);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     backend.reporting_exit(
@@ -6439,7 +6412,7 @@ fn a_close_refuses_before_recording_when_the_pane_cannot_be_established_now() {
 #[test]
 fn a_dead_pane_close_the_backend_refuses_is_not_reported_as_cleanup() {
     let sandbox = Sandbox::new("dead-child-close-refused");
-    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES)
+    let backend = MuxBackend::new(DEAD_CLOSE_PRIMITIVES)
         .observing(&["wA:p2"])
         .closing(CloseAnswer::Refused("no such pane".into()));
     let verifier = stage_dead_pane(&backend, "wA:p2", Some(900));
@@ -6487,7 +6460,7 @@ fn a_dead_pane_close_the_backend_refuses_is_not_reported_as_cleanup() {
 #[test]
 fn a_dead_pane_close_refuses_when_the_edge_records_no_instance() {
     let sandbox = Sandbox::new("dead-child-close-unfenced");
-    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p2"]);
+    let backend = MuxBackend::new(DEAD_CLOSE_PRIMITIVES).observing(&["wA:p2"]);
     // The backend names no serving process, so the create records no instance.
     let verifier = stage_dead_pane(&backend, "wA:p2", None);
     let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier);
@@ -6541,7 +6514,7 @@ fn a_dead_pane_close_refuses_when_the_edge_records_no_instance() {
 #[test]
 fn a_dead_pane_close_refuses_when_the_serving_instance_changed() {
     let sandbox = Sandbox::new("dead-child-close-refenced");
-    let backend = MuxBackend::new(DEAD_CLOSE_CAPABILITIES).observing(&["wA:p2"]);
+    let backend = MuxBackend::new(DEAD_CLOSE_PRIMITIVES).observing(&["wA:p2"]);
     let verifier = stage_dead_pane(&backend, "wA:p2", Some(900));
     let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier.clone());
     let mut client = Client::dial(daemon.path());
@@ -6598,7 +6571,7 @@ fn a_stalled_creation_verifier_is_abandoned_on_the_daemons_verification_budget()
     const STALL_BOUND: Duration = Duration::from_secs(6);
     let sandbox = Sandbox::new("spawn-verifier-stall");
     let verifier = Arc::new(GatedVerifier::new());
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p1", "wA:p2"]);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES).observing(&["wA:p1", "wA:p2"]);
     // The backend names a serving process, so a create asks the verifier about it
     // — and this verifier never answers.
     backend.served_by(900);
@@ -6739,7 +6712,7 @@ fn stage_dead_pane(
 #[test]
 fn the_topology_read_reports_the_edge_its_own_operation_recorded() {
     let sandbox = Sandbox::new("spawn-read");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p1", "wA:p2"]);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES).observing(&["wA:p1", "wA:p2"]);
     let mut daemon = sandbox.daemon_with(backend);
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -6783,7 +6756,7 @@ fn a_location_the_backend_no_longer_reports_reads_unresolved_without_revising_th
     // The backend reports the parent's pane and not the pane the child was
     // created in: the recorded location is gone, and the record says nothing
     // about what became of the child.
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p1"]);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES).observing(&["wA:p1"]);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -6819,7 +6792,7 @@ fn a_location_the_backend_no_longer_reports_reads_unresolved_without_revising_th
 #[test]
 fn a_restarted_daemon_reads_its_edges_and_never_confirms_an_unchecked_location() {
     let sandbox = Sandbox::new("spawn-restart");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p2"]);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES).observing(&["wA:p2"]);
     let mut daemon = sandbox.daemon_with(backend);
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -6863,7 +6836,7 @@ fn a_restarted_daemon_reads_its_edges_and_never_confirms_an_unchecked_location()
 #[test]
 fn spawn_edges_page_in_key_order_and_a_client_can_read_one_it_lost_the_answer_for() {
     let sandbox = Sandbox::new("spawn-page");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p2"]);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES).observing(&["wA:p2"]);
     let mut daemon = sandbox.daemon_with(backend);
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -6918,7 +6891,7 @@ fn an_agent_the_daemon_did_not_spawn_has_no_edge_and_is_not_an_error() {
     // The backend reports a pane the daemon never created: a read must not adopt
     // it into the topology from what it observes, and the second pane is the
     // decoy that would show up if it did.
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES).observing(&["wA:p2", "wA:p9"]);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES).observing(&["wA:p2", "wA:p9"]);
     let mut daemon = sandbox.daemon_with(backend);
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -6954,12 +6927,12 @@ fn an_agent_the_daemon_did_not_spawn_has_no_edge_and_is_not_an_error() {
 #[test]
 fn the_mux_primitives_are_served_and_recorded() {
     let sandbox = Sandbox::new("mux-primitives");
-    let backend = MuxBackend::new(MUX_CAPABILITIES);
+    let backend = MuxBackend::new(MUX_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
     let ping = client.call("daemon.ping", json!({}));
-    assert_eq!(ping["result"]["contracts"], advertised(MUX_CAPABILITIES));
+    assert_eq!(ping["result"]["contracts"], advertised(MUX_PRIMITIVES));
 
     let create_id = random_uuid();
     let create_params = json!({
@@ -7057,7 +7030,7 @@ fn the_mux_primitives_are_served_and_recorded() {
 #[test]
 fn a_create_that_named_nothing_carries_no_identity() {
     let sandbox = Sandbox::new("mux-silent-create");
-    let backend = MuxBackend::new(MUX_CAPABILITIES).naming(CreatedLocation::default());
+    let backend = MuxBackend::new(MUX_PRIMITIVES).naming(CreatedLocation::default());
     let mut daemon = sandbox.daemon_with(backend);
     let mut client = Client::dial(daemon.path());
 
@@ -7085,7 +7058,7 @@ fn a_create_that_named_nothing_carries_no_identity() {
 fn an_oversized_output_read_is_cut_to_one_answer_line() {
     let sandbox = Sandbox::new("mux-output-bound");
     let long = "a".repeat(MAX_LINE_BYTES);
-    let backend = MuxBackend::new(MUX_CAPABILITIES).reading(OutputRead {
+    let backend = MuxBackend::new(MUX_PRIMITIVES).reading(OutputRead {
         text: long.clone(),
         truncated: false,
         revision: None,
@@ -7112,12 +7085,12 @@ fn an_oversized_output_read_is_cut_to_one_answer_line() {
 #[test]
 fn an_unimplemented_primitive_is_refused_without_dispatch() {
     let sandbox = Sandbox::new("mux-unsupported");
-    let backend = MuxBackend::new(&[]);
+    let backend = MuxBackend::new(Primitives::NONE);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
     let ping = client.call("daemon.ping", json!({}));
-    assert_eq!(ping["result"]["contracts"], advertised(&[]));
+    assert_eq!(ping["result"]["contracts"], advertised(Primitives::NONE));
 
     // An operation this backend cannot serve leaves a settled refusal that names
     // the capability and claims no effect, not a request still claiming to be
@@ -7176,7 +7149,7 @@ fn an_unimplemented_primitive_is_refused_without_dispatch() {
 #[test]
 fn the_wire_shapes_of_create_and_input_are_validated_before_dispatch() {
     let sandbox = Sandbox::new("mux-validation");
-    let backend = MuxBackend::new(MUX_CAPABILITIES);
+    let backend = MuxBackend::new(MUX_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
@@ -7240,7 +7213,7 @@ fn the_wire_shapes_of_create_and_input_are_validated_before_dispatch() {
 fn an_unscoped_create_suppresses_another_unscoped_mutation_but_not_a_pane_one() {
     let sandbox = Sandbox::new("mux-lane");
     let (gate, rendezvous) = Rendezvous::new();
-    let backend = MuxBackend::new(MUX_CAPABILITIES).gated(Arc::clone(&gate));
+    let backend = MuxBackend::new(MUX_PRIMITIVES).gated(Arc::clone(&gate));
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut held_client = Client::dial(daemon.path());
     let mut other = Client::dial(daemon.path());
@@ -7443,22 +7416,20 @@ fn wait_for_exit(child: &mut Child, deadline: Duration) -> ExitStatus {
 /// about the mux method it scripts.
 const CLIENT_CONTRACTS: &[&str] = &[];
 
-/// Every capability Radar's client can ask a daemon for.
-const CLIENT_CAPABILITIES: &[&str] = &[
-    "mux.observe",
-    "mux.process_info",
-    "mux.focus",
-    "mux.close",
-    "mux.create",
-    "mux.input",
-    "mux.output",
-    "mux.report",
-];
+/// The client fake's complete typed primitive set.
+const CLIENT_PRIMITIVES: Primitives = Primitives::OBSERVE
+    .union(Primitives::PROCESS_INFO)
+    .union(Primitives::FOCUS)
+    .union(Primitives::CLOSE)
+    .union(Primitives::CREATE)
+    .union(Primitives::INPUT)
+    .union(Primitives::OUTPUT)
+    .union(Primitives::REPORT);
 
 /// A fake backend that serves everything a client can ask for, so one daemon
 /// exercises the whole client surface. Nothing here is a mux.
 struct ClientBackend {
-    capabilities: &'static [&'static str],
+    primitives: Primitives,
     inventory: FleetObservation,
     evidence: ForegroundEvidence,
     close: CloseAnswer,
@@ -7466,10 +7437,10 @@ struct ClientBackend {
 }
 
 impl ClientBackend {
-    fn new(capabilities: &'static [&'static str]) -> Arc<Self> {
+    fn new(primitives: Primitives) -> Arc<Self> {
         let (inventory, evidence) = populated_graph();
         Arc::new(Self {
-            capabilities,
+            primitives,
             inventory,
             evidence,
             close: CloseAnswer::Completed,
@@ -7480,7 +7451,7 @@ impl ClientBackend {
     /// The same backend observing this fleet instead.
     fn observing(self: &Arc<Self>, inventory: FleetObservation) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             inventory,
             evidence: self.evidence.clone(),
             close: self.close.clone(),
@@ -7491,7 +7462,7 @@ impl ClientBackend {
     /// The same backend answering a close with this outcome.
     fn closing(self: &Arc<Self>, close: CloseAnswer) -> Arc<Self> {
         Arc::new(Self {
-            capabilities: self.capabilities,
+            primitives: self.primitives,
             inventory: self.inventory.clone(),
             evidence: self.evidence.clone(),
             close,
@@ -7513,8 +7484,8 @@ impl RuntimeProvider for ClientBackend {
         BackendIdentity::named("fake")
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        self.capabilities
+    fn primitives(&self) -> Primitives {
+        self.primitives
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(self.inventory.clone())
@@ -7635,7 +7606,7 @@ fn the_daemon_client_serves_every_method_over_a_real_socket() {
     // own containment check can prove unmanaged: a Pi pane publishing no owner
     // metadata is deliberately neither managed nor closable.
     let fleet = close_inventory("wA:t1", &[("wA:p1", None), ("wA:p2", None)]);
-    let backend = ClientBackend::new(CLIENT_CAPABILITIES).observing(fleet.clone());
+    let backend = ClientBackend::new(CLIENT_PRIMITIVES).observing(fleet.clone());
     let mut daemon = sandbox.daemon_with(backend.clone());
     let client = DaemonRuntime::handshake(daemon.path()).expect("the daemon is usable");
     let cancel = AtomicBool::new(false);
@@ -7753,8 +7724,7 @@ fn the_daemon_client_serves_every_method_over_a_real_socket() {
 #[test]
 fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client() {
     let sandbox = Sandbox::new("client-missing-capability");
-    let backend =
-        ClientBackend::new(&["mux.observe", "mux.process_info", "mux.focus", "mux.close"]);
+    let backend = ClientBackend::new(DaemonRuntime::REQUIRED);
     let mut daemon = sandbox.daemon_with(backend);
     let client = DaemonRuntime::handshake(daemon.path()).expect("the dashboard's needs are met");
     let cancel = AtomicBool::new(false);
@@ -7926,7 +7896,7 @@ fn an_unknown_contract_name_is_tolerated() {
 #[test]
 fn a_usable_daemon_is_selected_without_a_diagnostic() {
     let sandbox = Sandbox::new("client-selected");
-    let backend = ClientBackend::new(CLIENT_CAPABILITIES);
+    let backend = ClientBackend::new(CLIENT_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend);
     let selection = connect_at(daemon.path()).expect("a usable daemon");
 
@@ -8057,12 +8027,12 @@ fn the_real_daemon_passes_the_clients_handshake() {
     // The handshake alone: the daemon's own capabilities are static, so nothing
     // here asks the mux anything.
     let selection = connect_at(&socket).expect("a usable daemon");
-    for required in DaemonRuntime::REQUIRED {
-        assert!(
-            selection.provider.capabilities().contains(required),
-            "a real daemon does not declare `{required}`"
-        );
-    }
+    assert!(
+        selection
+            .provider
+            .primitives()
+            .contains(DaemonRuntime::REQUIRED)
+    );
 
     let status = child.stop(libc::SIGTERM, DEADLINE);
     assert!(status.success(), "{status:?}");
@@ -8111,7 +8081,7 @@ fn a_stalled_daemon_is_abandoned_when_the_caller_cancels() {
 fn an_uncertain_daemon_close_is_never_retried_through_direct_herdr() {
     let sandbox = Sandbox::new("client-no-retry");
     let inventory = close_inventory("wA:t1", &[("wA:p1", None)]);
-    let backend = ClientBackend::new(CLIENT_CAPABILITIES)
+    let backend = ClientBackend::new(CLIENT_PRIMITIVES)
         .observing(inventory.clone())
         .closing(CloseAnswer::Unknown("the reply was lost".into()));
     let mut daemon = sandbox.daemon_with(backend.clone());
@@ -8145,7 +8115,7 @@ impl RuntimeProvider for IdentifiedBackend {
         self.0.clone()
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
+    fn primitives(&self) -> Primitives {
         DaemonRuntime::REQUIRED
     }
 
@@ -8724,7 +8694,7 @@ fn a_launch_too_large_to_track_is_refused_before_any_effect() {
 #[test]
 fn a_confirmed_create_records_one_owned_container() {
     let sandbox = Sandbox::new("topology-create");
-    let backend = MuxBackend::new(MUX_CAPABILITIES).naming(CreatedLocation {
+    let backend = MuxBackend::new(MUX_PRIMITIVES).naming(CreatedLocation {
         workspace_id: Some("wA".into()),
         tab_id: Some("wA:t2".into()),
         pane_id: Some("wA:p2".into()),
@@ -8844,7 +8814,7 @@ fn reconciling_reports_drift_without_dispatching_or_deleting() {
     let sandbox = Sandbox::new("topology-reconcile");
     // The test backend names no serving instance, so its inventory cannot fence a
     // handle: a reconciliation says so rather than calling the pane present.
-    let backend = MuxBackend::new(MUX_CAPABILITIES).observing(&["wA:p2"]);
+    let backend = MuxBackend::new(MUX_PRIMITIVES).observing(&["wA:p2"]);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
@@ -8903,7 +8873,7 @@ fn reconciling_reports_drift_without_dispatching_or_deleting() {
 #[test]
 fn a_spawn_records_the_pane_it_dispatched_into_as_a_container() {
     let sandbox = Sandbox::new("spawn-container");
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES);
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -8933,7 +8903,7 @@ fn a_spawn_records_the_pane_it_dispatched_into_as_a_container() {
 #[test]
 fn a_radar_creation_answers_with_the_container_it_recorded() {
     let sandbox = Sandbox::new("topology-create-verb");
-    let backend = MuxBackend::new(MUX_CAPABILITIES).naming(CreatedLocation {
+    let backend = MuxBackend::new(MUX_PRIMITIVES).naming(CreatedLocation {
         workspace_id: Some("wA".into()),
         tab_id: Some("wA:t2".into()),
         pane_id: Some("wA:p2".into()),
@@ -8985,7 +8955,11 @@ fn a_radar_creation_answers_with_the_container_it_recorded() {
 #[test]
 fn a_creation_this_backend_cannot_serve_is_refused_before_any_effect() {
     let sandbox = Sandbox::new("topology-create-unsupported");
-    let backend = MuxBackend::new(&["mux.observe", "mux.focus", "mux.close"]);
+    let backend = MuxBackend::new(
+        Primitives::OBSERVE
+            .union(Primitives::FOCUS)
+            .union(Primitives::CLOSE),
+    );
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
 
@@ -9008,7 +8982,11 @@ fn a_creation_this_backend_cannot_serve_is_refused_before_any_effect() {
     assert!(refused["result"].get("container").is_none());
     assert_eq!(
         client.call("daemon.ping", json!({}))["result"]["contracts"],
-        advertised(&["mux.observe", "mux.focus", "mux.close"])
+        advertised(
+            Primitives::OBSERVE
+                .union(Primitives::FOCUS)
+                .union(Primitives::CLOSE)
+        )
     );
     daemon.stop();
 }
@@ -9016,7 +8994,7 @@ fn a_creation_this_backend_cannot_serve_is_refused_before_any_effect() {
 #[test]
 fn a_replayed_creation_answers_with_the_same_container_and_creates_nothing() {
     let sandbox = Sandbox::new("topology-create-replay");
-    let backend = MuxBackend::new(MUX_CAPABILITIES).naming(CreatedLocation {
+    let backend = MuxBackend::new(MUX_PRIMITIVES).naming(CreatedLocation {
         workspace_id: Some("wA".into()),
         tab_id: None,
         pane_id: None,
@@ -9068,17 +9046,11 @@ fn the_client_reads_the_containers_the_daemon_records() {
     // The capabilities the dashboard client's handshake requires, plus launch:
     // its registry read requires the spawn contract, which a backend can only
     // serve when it can both create a pane and run a command in it.
-    let backend = MuxBackend::new(&[
-        "mux.observe",
-        "mux.process_info",
-        "mux.focus",
-        "mux.close",
-        "mux.create",
-        "mux.input",
-        "mux.output",
-        "mux.report",
-        "mux.launch",
-    ])
+    let backend = MuxBackend::new(
+        CLIENT_PRIMITIVES
+            .union(Primitives::CREATE)
+            .union(Primitives::LAUNCH),
+    )
     .naming(CreatedLocation {
         workspace_id: Some("wA".into()),
         tab_id: None,
@@ -9151,7 +9123,7 @@ fn deletion_setup(name: &str, handle: &str) -> (Sandbox, Arc<MuxBackend>, Daemon
     let sandbox = Sandbox::new(name);
     // A backend that can both create and close locations is what a container
     // deletion asks of it, so the test states both capabilities.
-    let backend = MuxBackend::new(SPAWN_CAPABILITIES)
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES)
         .naming(CreatedLocation {
             workspace_id: Some(handle.into()),
             tab_id: None,
@@ -9342,7 +9314,7 @@ fn a_deletion_of_another_place_than_the_container_binds_is_refused() {
 fn recipe_backend() -> Arc<MuxBackend> {
     // Served by this test process, so the container it creates records a verified
     // serving instance: the fence a reload checks before it replaces anything.
-    let backend = MuxBackend::new(RECIPE_CAPABILITIES).naming(CreatedLocation {
+    let backend = MuxBackend::new(RECIPE_PRIMITIVES).naming(CreatedLocation {
         workspace_id: Some("wA".into()),
         tab_id: Some("wA:t1".into()),
         pane_id: Some("wA:p2".into()),
@@ -9462,7 +9434,7 @@ fn a_servers_own_places_are_adopted_as_observed_containers() {
         }],
         ..FleetObservation::default()
     };
-    let backend = MuxBackend::new(RECIPE_CAPABILITIES).with_inventory(inventory);
+    let backend = MuxBackend::new(RECIPE_PRIMITIVES).with_inventory(inventory);
     // The daemon's own pid is a live process its verifier can confirm.
     backend.served_by(std::process::id() as i32);
     let mut daemon = sandbox.daemon_with(backend.clone());
@@ -9639,21 +9611,18 @@ fn a_reload_runs_the_recorded_recipe_only_over_a_command_that_exited() {
 
 /// What the dashboard client needs from any daemon it dials: the reads and the
 /// controls the TUI itself asks for.
-const DASHBOARD_CAPABILITIES: &[&str] =
-    &["mux.observe", "mux.process_info", "mux.focus", "mux.close"];
+const DASHBOARD_PRIMITIVES: Primitives = DaemonRuntime::REQUIRED;
 
 /// What a backend must state to serve the container controls end to end: create a
 /// place, run a command in it, report what that command did, and close it.
-const CONTAINER_CAPABILITIES: &[&str] = &[
-    "mux.observe",
-    "mux.process_info",
-    "mux.focus",
-    "mux.create",
-    "mux.close",
-    "mux.launch",
-    "mux.launch_context",
-    "mux.exit_observation",
-];
+const CONTAINER_PRIMITIVES: Primitives = Primitives::OBSERVE
+    .union(Primitives::PROCESS_INFO)
+    .union(Primitives::FOCUS)
+    .union(Primitives::CREATE)
+    .union(Primitives::CLOSE)
+    .union(Primitives::LAUNCH)
+    .union(Primitives::LAUNCH_CONTEXT)
+    .union(Primitives::EXIT_OBSERVATION);
 
 #[test]
 fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
@@ -9662,7 +9631,7 @@ fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
     };
 
     let sandbox = Sandbox::new("client-containers");
-    let backend = MuxBackend::new(CONTAINER_CAPABILITIES)
+    let backend = MuxBackend::new(CONTAINER_PRIMITIVES)
         .naming(CreatedLocation {
             workspace_id: Some("wA".into()),
             tab_id: Some("wA:t1".into()),
@@ -9794,7 +9763,7 @@ fn the_client_refuses_a_container_control_the_daemon_does_not_serve() {
     let sandbox = Sandbox::new("client-containers-unsupported");
     // A backend that serves the dashboard's own reads and controls but cannot
     // create a place: this daemon serves no container creation.
-    let backend = MuxBackend::new(DASHBOARD_CAPABILITIES);
+    let backend = MuxBackend::new(DASHBOARD_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let controls = DaemonRuntime::handshake(daemon.path()).expect("the daemon is usable");
     let refused = controls.create_container(
@@ -9823,19 +9792,17 @@ fn the_client_refuses_a_container_control_the_daemon_does_not_serve() {
 
 /// What a fake backend serves for lead enrollment and restart: the spawn surface plus
 /// the tracking capability those operations are admitted under.
-const LEAD_CAPABILITIES: &[&str] = &[
-    "mux.observe",
-    "mux.focus",
-    "mux.process_info",
-    "mux.create",
-    "mux.input",
-    "mux.output",
-    "mux.report",
-    "mux.launch",
-    "mux.close",
-    "mux.launch_context",
-    "mux.lifecycle_tracking",
-];
+const LEAD_PRIMITIVES: Primitives = Primitives::OBSERVE
+    .union(Primitives::FOCUS)
+    .union(Primitives::PROCESS_INFO)
+    .union(Primitives::CREATE)
+    .union(Primitives::INPUT)
+    .union(Primitives::OUTPUT)
+    .union(Primitives::REPORT)
+    .union(Primitives::LAUNCH)
+    .union(Primitives::CLOSE)
+    .union(Primitives::LAUNCH_CONTEXT)
+    .union(Primitives::LIFECYCLE_TRACKING);
 
 /// A real process standing in for a running lead. It is a shell that waits on its
 /// stdin and takes only flags, so its captured command line can be resumed. A reaper
@@ -9947,7 +9914,7 @@ fn restart_lead_subject(client: &mut Client, subject: &str) -> Value {
 fn enrollment_binds_a_verified_lead_and_refuses_a_second_binding() {
     let sandbox = Sandbox::new("lead-enroll");
     let lead = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
         .observing(&["wA:p1"])
         .with_foreground(ForegroundEvidence::command(
             lead.pid,
@@ -10036,7 +10003,7 @@ fn enrollment_refuses_a_session_mismatch_and_a_foreign_foreground_without_bindin
     let sandbox = Sandbox::new("lead-enroll-refusals");
     let lead = LeadProcess::start();
     let other = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
         .observing(&["wA:p1"])
         .with_foreground(ForegroundEvidence::command(
             other.pid,
@@ -10078,7 +10045,7 @@ fn enrollment_refuses_a_session_mismatch_and_a_foreign_foreground_without_bindin
 fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
     let sandbox = Sandbox::new("lead-restart");
     let lead = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
         .observing(&["wA:p1"])
         .with_foreground(ForegroundEvidence::command(
             lead.pid,
@@ -10166,7 +10133,7 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
 fn restart_refuses_before_any_signal_when_the_session_context_changes() {
     let sandbox = Sandbox::new("lead-restart-refusals");
     let lead = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
         .observing(&["wA:p1"])
         .with_foreground(ForegroundEvidence::command(
             lead.pid,
@@ -10224,7 +10191,7 @@ fn restart_refuses_before_any_signal_when_the_session_context_changes() {
 fn restart_refuses_when_the_lead_pane_is_no_longer_present() {
     let sandbox = Sandbox::new("lead-restart-anchor");
     let lead = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_CAPABILITIES)
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
         .observing(&["wA:p9"])
         .with_foreground(ForegroundEvidence::command(
             lead.pid,

@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use agent_radar::control_plane::{PROTOCOL_VERSION, random_uuid};
 use agent_radar::model::{FleetObservation, ForegroundEvidence, LocalFacts};
 use agent_radar::runtime::{
-    CloseOutcome, CreateOutcome, CreateRequest, LAUNCH_CAPABILITY, LAUNCH_TOKEN_ENV, LaunchOutcome,
-    LaunchRequest, RuntimeProvider,
+    CloseOutcome, CreateOutcome, CreateRequest, LAUNCH_TOKEN_ENV, LaunchOutcome, LaunchRequest,
+    Primitives, RuntimeProvider,
 };
 use agent_radar::{CloseTarget, Daemon, FocusOutcome, HerdrConfig, HerdrRuntime, Target};
 
@@ -1114,7 +1114,7 @@ fn herdr_launch_context_is_quoted_and_preflighted_without_loss() {
     runtime
         .validate_launch(&request)
         .expect("representable launch");
-    assert!(runtime.capabilities().contains(&"mux.launch_context"));
+    assert!(runtime.primitives().contains(Primitives::LAUNCH_CONTEXT));
     request
         .env
         .insert("PI_RADAR_SPAWN_TOKEN".into(), "override".into());
@@ -1156,9 +1156,9 @@ fn a_launch_types_one_quoted_line_the_pane_shell_yields_the_argv_from() {
     );
     let runtime = fake.runtime(Duration::from_secs(2));
     assert!(
-        runtime.capabilities().contains(&LAUNCH_CAPABILITY),
+        runtime.primitives().contains(Primitives::LAUNCH),
         "an adapter that implements launch must declare it: {:?}",
-        runtime.capabilities()
+        runtime.primitives()
     );
 
     let dir = fake.path("child");

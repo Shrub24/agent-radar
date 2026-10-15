@@ -1265,8 +1265,18 @@ fn launch_runs_argv_with_overlay_and_preserves_immediate_exit_status() {
             signal: None,
         })
     );
-    assert!(probe.runtime.capabilities().contains(&"mux.launch"));
-    assert!(probe.runtime.capabilities().contains(&"mux.launch_context"));
+    assert!(
+        probe
+            .runtime
+            .primitives()
+            .contains(agent_radar::runtime::Primitives::LAUNCH)
+    );
+    assert!(
+        probe
+            .runtime
+            .primitives()
+            .contains(agent_radar::runtime::Primitives::LAUNCH_CONTEXT)
+    );
 }
 
 #[test]

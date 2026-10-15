@@ -1,0 +1,44 @@
+{
+  "name": "pi-radar",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Radar daemon client, publication, execution, location, launch and inspection surface for Pi extensions.",
+  "license": "Apache-2.0",
+  "engines": { "node": ">=22.19.0" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Shrub24/agent-radar.git",
+    "directory": "pi-radar"
+  },
+  "types": "./index.ts",
+  "exports": {
+    ".": { "types": "./index.ts", "import": "./dist/index.js" },
+    "./client": { "types": "./extension/radar-client.ts", "import": "./dist/extension/radar-client.js" },
+    "./execution": { "types": "./extension/radar-execution.ts", "import": "./dist/extension/radar-execution.js" },
+    "./publication": { "types": "./extension/radar-publication.ts", "import": "./dist/extension/radar-publication.js" },
+    "./launch": { "types": "./extension/radar-launch.ts", "import": "./dist/extension/radar-launch.js" },
+    "./location": { "types": "./extension/radar-location.ts", "import": "./dist/extension/radar-location.js" },
+    "./inspection": { "types": "./extension/radar-inspection.ts", "import": "./dist/extension/radar-inspection.js" },
+    "./extension/*.ts": { "types": "./extension/*.ts", "import": "./dist/extension/*.js" }
+  },
+  "files": [
+    "dist/**",
+    "LICENSE",
+    "index.ts",
+    "README.md",
+    "extension/radar-client.ts",
+    "extension/radar-execution.ts",
+    "extension/radar-inspection.ts",
+    "extension/radar-launch.ts",
+    "extension/radar-location.ts",
+    "extension/radar-publication.ts"
+  ],
+  "scripts": {
+    "build": "esbuild index.ts extension/radar-client.ts extension/radar-execution.ts extension/radar-inspection.ts extension/radar-launch.ts extension/radar-location.ts extension/radar-publication.ts --outbase=. --outdir=dist --bundle --platform=node --format=esm --target=node22",
+    "prepack": "npm run build",
+    "test": "node --experimental-strip-types --test extension/*.test.ts"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

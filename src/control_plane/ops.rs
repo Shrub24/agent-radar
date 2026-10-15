@@ -7,96 +7,138 @@
 //! Effectful operations are recorded before dispatch. Reads are never recorded.
 //! Unsupported methods are refused as unknown methods rather than emulated.
 //!
-//! The backend capability vocabulary lives with the seam it describes
-//! (`crate::runtime`) and is re-exported here; the daemon's own contracts are
-//! derived from the capabilities their methods need rather than pushed by hand,
+//! Backend primitives live with the seam they describe (`crate::runtime`); the
+//! daemon's own contracts derive their primitive needs exhaustively rather than
+//! being pushed by hand,
 //! so what the handshake advertises and what the serving paths accept cannot
 //! drift apart.
 
-pub use crate::runtime::{
-    CLOSE_CAPABILITY, CREATE_CAPABILITY, EXIT_OBSERVATION_CAPABILITY, FOCUS_CAPABILITY,
-    INPUT_CAPABILITY, LAUNCH_CAPABILITY, LAUNCH_CONTEXT_CAPABILITY, LIFECYCLE_TRACKING_CAPABILITY,
-    OBSERVE_CAPABILITY, OUTPUT_CAPABILITY, PROCESS_INFO_CAPABILITY, REPORT_CAPABILITY,
-};
+pub use crate::runtime::Primitives;
 
-/// A contract the daemon itself serves, versioned because a consumer pins it.
-///
-/// The `*.v1` names are the daemon's own, not the backend's: they say which of
-/// the daemon's methods a backend's capabilities make servable.
-pub const REGISTRY_CONTRACT: &str = "registry.v1";
-pub const REGISTRY_FACTS_CONTRACT: &str = "registry.facts.v1";
-pub const EVENTS_CONTRACT: &str = "events.v1";
-pub const TASKS_LIST_CONTRACT: &str = "tasks.list.v1";
-pub const SPAWN_CONTRACT: &str = "spawn.v1";
-pub const SPAWN_CLOSE_CONTRACT: &str = "spawn.close.v1";
-pub const SPAWN_LAUNCH_CONTEXT_CONTRACT: &str = "spawn.launch_context.v1";
-pub const SPAWN_EXIT_OBSERVATION_CONTRACT: &str = "spawn.exit_observation.v1";
-pub const LIFECYCLE_CANCEL_CONTRACT: &str = "lifecycle.cancel.v1";
-pub const LIFECYCLE_STOP_CONTRACT: &str = "lifecycle.stop.v1";
-pub const TOPOLOGY_CREATE_CONTRACT: &str = "topology.create.v1";
-pub const TOPOLOGY_DELETE_CONTRACT: &str = "topology.delete.v1";
-pub const TOPOLOGY_RELOAD_CONTRACT: &str = "topology.reload.v1";
-pub const TOPOLOGY_GET_CONTRACT: &str = "topology.get.v1";
-pub const TOPOLOGY_LIST_CONTRACT: &str = "topology.list.v1";
-pub const TOPOLOGY_RECONCILE_CONTRACT: &str = "topology.reconcile.v1";
-pub const LIFECYCLE_GET_CONTRACT: &str = "lifecycle.get.v1";
-pub const LIFECYCLE_LIST_CONTRACT: &str = "lifecycle.list.v1";
-pub const LIFECYCLE_ENROLL_CONTRACT: &str = "lifecycle.enroll.v1";
-pub const LIFECYCLE_RESTART_CONTRACT: &str = "lifecycle.restart.v1";
+/// A daemon contract that an external consumer may pin. Backend primitives are
+/// deliberately absent from this public vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub enum Contract {
+    #[serde(rename = "registry.v1")]
+    Registry,
+    #[serde(rename = "registry.facts.v1")]
+    RegistryFacts,
+    #[serde(rename = "events.v1")]
+    Events,
+    #[serde(rename = "tasks.list.v1")]
+    TasksList,
+    #[serde(rename = "spawn.v1")]
+    Spawn,
+    #[serde(rename = "spawn.close.v1")]
+    SpawnClose,
+    #[serde(rename = "spawn.launch_context.v1")]
+    SpawnLaunchContext,
+    #[serde(rename = "spawn.exit_observation.v1")]
+    SpawnExitObservation,
+    #[serde(rename = "lifecycle.cancel.v1")]
+    LifecycleCancel,
+    #[serde(rename = "lifecycle.stop.v1")]
+    LifecycleStop,
+    #[serde(rename = "topology.create.v1")]
+    TopologyCreate,
+    #[serde(rename = "topology.delete.v1")]
+    TopologyDelete,
+    #[serde(rename = "topology.reload.v1")]
+    TopologyReload,
+    #[serde(rename = "topology.get.v1")]
+    TopologyGet,
+    #[serde(rename = "topology.list.v1")]
+    TopologyList,
+    #[serde(rename = "topology.reconcile.v1")]
+    TopologyReconcile,
+    #[serde(rename = "lifecycle.get.v1")]
+    LifecycleGet,
+    #[serde(rename = "lifecycle.list.v1")]
+    LifecycleList,
+    #[serde(rename = "lifecycle.enroll.v1")]
+    LifecycleEnroll,
+    #[serde(rename = "lifecycle.restart.v1")]
+    LifecycleRestart,
+    #[serde(other)]
+    Unknown,
+}
 
-/// Every daemon contract, with the backend capabilities its methods are served
-/// from.
-///
-/// Advertising a contract promises that its methods are served, so a contract
-/// appears only when every capability it names is present. The registry and the
-/// event journal are answered from the daemon's own records and need no backend.
-const CONTRACTS: &[(&str, &[&str])] = &[
-    (REGISTRY_CONTRACT, &[]),
-    (REGISTRY_FACTS_CONTRACT, &[]),
-    (EVENTS_CONTRACT, &[]),
-    (TOPOLOGY_CREATE_CONTRACT, &[CREATE_CAPABILITY]),
-    (TOPOLOGY_DELETE_CONTRACT, &[CLOSE_CAPABILITY]),
-    (
-        TOPOLOGY_RELOAD_CONTRACT,
-        &[LAUNCH_CAPABILITY, EXIT_OBSERVATION_CAPABILITY],
-    ),
-    (TOPOLOGY_GET_CONTRACT, &[]),
-    (TOPOLOGY_LIST_CONTRACT, &[]),
-    (TOPOLOGY_RECONCILE_CONTRACT, &[OBSERVE_CAPABILITY]),
-    (SPAWN_CONTRACT, &[CREATE_CAPABILITY, LAUNCH_CAPABILITY]),
-    (
-        SPAWN_CLOSE_CONTRACT,
-        &[OBSERVE_CAPABILITY, CLOSE_CAPABILITY],
-    ),
-    (
-        SPAWN_LAUNCH_CONTEXT_CONTRACT,
-        &[
-            CREATE_CAPABILITY,
-            LAUNCH_CAPABILITY,
-            LAUNCH_CONTEXT_CAPABILITY,
-        ],
-    ),
-    (
-        SPAWN_EXIT_OBSERVATION_CONTRACT,
-        &[EXIT_OBSERVATION_CAPABILITY],
-    ),
-    (LIFECYCLE_CANCEL_CONTRACT, &[LIFECYCLE_TRACKING_CAPABILITY]),
-    (LIFECYCLE_STOP_CONTRACT, &[LIFECYCLE_TRACKING_CAPABILITY]),
-    (LIFECYCLE_GET_CONTRACT, &[LIFECYCLE_TRACKING_CAPABILITY]),
-    (LIFECYCLE_LIST_CONTRACT, &[LIFECYCLE_TRACKING_CAPABILITY]),
-    (
-        LIFECYCLE_ENROLL_CONTRACT,
-        &[LIFECYCLE_TRACKING_CAPABILITY, OBSERVE_CAPABILITY],
-    ),
-    (
-        LIFECYCLE_RESTART_CONTRACT,
-        &[
-            LIFECYCLE_TRACKING_CAPABILITY,
-            CREATE_CAPABILITY,
-            LAUNCH_CAPABILITY,
-        ],
-    ),
-];
+impl Contract {
+    pub const ALL: &'static [Self] = &[
+        Self::Registry,
+        Self::RegistryFacts,
+        Self::Events,
+        Self::Spawn,
+        Self::SpawnClose,
+        Self::SpawnLaunchContext,
+        Self::SpawnExitObservation,
+        Self::LifecycleCancel,
+        Self::LifecycleStop,
+        Self::TopologyCreate,
+        Self::TopologyDelete,
+        Self::TopologyReload,
+        Self::TopologyGet,
+        Self::TopologyList,
+        Self::TopologyReconcile,
+        Self::LifecycleGet,
+        Self::LifecycleList,
+        Self::LifecycleEnroll,
+        Self::LifecycleRestart,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registry => "registry.v1",
+            Self::RegistryFacts => "registry.facts.v1",
+            Self::Events => "events.v1",
+            Self::TasksList => "tasks.list.v1",
+            Self::Spawn => "spawn.v1",
+            Self::SpawnClose => "spawn.close.v1",
+            Self::SpawnLaunchContext => "spawn.launch_context.v1",
+            Self::SpawnExitObservation => "spawn.exit_observation.v1",
+            Self::LifecycleCancel => "lifecycle.cancel.v1",
+            Self::LifecycleStop => "lifecycle.stop.v1",
+            Self::TopologyCreate => "topology.create.v1",
+            Self::TopologyDelete => "topology.delete.v1",
+            Self::TopologyReload => "topology.reload.v1",
+            Self::TopologyGet => "topology.get.v1",
+            Self::TopologyList => "topology.list.v1",
+            Self::TopologyReconcile => "topology.reconcile.v1",
+            Self::LifecycleGet => "lifecycle.get.v1",
+            Self::LifecycleList => "lifecycle.list.v1",
+            Self::LifecycleEnroll => "lifecycle.enroll.v1",
+            Self::LifecycleRestart => "lifecycle.restart.v1",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub const fn needs(self) -> Primitives {
+        use Primitives as P;
+        match self {
+            Self::Registry
+            | Self::RegistryFacts
+            | Self::Events
+            | Self::TasksList
+            | Self::TopologyGet
+            | Self::TopologyList => P::NONE,
+            Self::Spawn => P::CREATE.union(P::LAUNCH),
+            Self::SpawnClose => P::OBSERVE.union(P::CLOSE),
+            Self::SpawnLaunchContext => P::CREATE.union(P::LAUNCH).union(P::LAUNCH_CONTEXT),
+            Self::SpawnExitObservation => P::EXIT_OBSERVATION,
+            Self::LifecycleCancel
+            | Self::LifecycleStop
+            | Self::LifecycleGet
+            | Self::LifecycleList => P::LIFECYCLE_TRACKING,
+            Self::TopologyCreate => P::CREATE,
+            Self::TopologyDelete => P::CLOSE,
+            Self::TopologyReload => P::LAUNCH.union(P::EXIT_OBSERVATION),
+            Self::TopologyReconcile => P::OBSERVE,
+            Self::LifecycleEnroll => P::LIFECYCLE_TRACKING.union(P::OBSERVE),
+            Self::LifecycleRestart => P::LIFECYCLE_TRACKING.union(P::CREATE).union(P::LAUNCH),
+            Self::Unknown => P::NONE,
+        }
+    }
+}
 
 /// The wire revision of this build: it increases whenever a method or a field is
 /// added to the protocol. A bundled client needs a daemon at least this new,
@@ -104,27 +146,22 @@ const CONTRACTS: &[(&str, &[&str])] = &[
 /// be older.
 pub const PROTOCOL_REVISION: u32 = 1;
 
-/// What the handshake advertises: the daemon contracts the backend's capabilities
+/// What the handshake advertises: the daemon contracts the backend's primitive set
 /// can serve, which is the list an external consumer pins. The backend's own
-/// `mux.*` capabilities are the daemon's business and are not on the wire.
-pub fn advertised(backend: &[&'static str]) -> Vec<&'static str> {
+/// `mux.*` primitives are the daemon's business and are not on the wire.
+pub fn advertised(backend: Primitives) -> Vec<Contract> {
     advertised_with_tasks(backend, false)
 }
 
 /// Handshake contracts, including the volatile task lane only while its socket
 /// is bound and serving.
-pub fn advertised_with_tasks(backend: &[&'static str], tasks_available: bool) -> Vec<&'static str> {
-    let mut advertised: Vec<&'static str> = Vec::new();
-    advertised.extend(
-        CONTRACTS
-            .iter()
-            .filter(|(_, needs)| needs.iter().all(|needed| backend.contains(needed)))
-            .map(|(contract, _)| *contract),
-    );
-    if tasks_available {
-        advertised.push(TASKS_LIST_CONTRACT);
-    }
-    advertised
+pub fn advertised_with_tasks(backend: Primitives, tasks_available: bool) -> Vec<Contract> {
+    Contract::ALL
+        .iter()
+        .copied()
+        .filter(|contract| contract.needs().missing_name(backend).is_none())
+        .chain(tasks_available.then_some(Contract::TasksList))
+        .collect()
 }
 
 /// An operation that changes or asks something of the multiplexer, and therefore
@@ -200,75 +237,70 @@ impl Operation {
         }
     }
 
-    /// The backend capabilities this operation cannot be served without.
-    pub fn capabilities(self) -> &'static [&'static str] {
+    /// The backend primitives this operation cannot be served without.
+    pub const fn needs(self) -> Primitives {
+        use Primitives as P;
         match self {
-            Self::Focus => &[FOCUS_CAPABILITY],
-            Self::Close => &[CLOSE_CAPABILITY],
-            Self::Create => &[CREATE_CAPABILITY],
-            Self::Input => &[INPUT_CAPABILITY],
-            Self::Report => &[REPORT_CAPABILITY],
-            // A spawn does both, so a backend that can do only one of them
-            // cannot serve it: a pane with no command in it is not a child.
-            Self::Spawn => &[CREATE_CAPABILITY, LAUNCH_CAPABILITY],
-            Self::CreateContainer => &[CREATE_CAPABILITY],
-            Self::DeleteContainer => &[CLOSE_CAPABILITY],
-            // A reload runs a command, and it needs the pane's own retained exit
-            // evidence to prove the previous command is gone before it does.
-            Self::ReloadContainer => &[LAUNCH_CAPABILITY, EXIT_OBSERVATION_CAPABILITY],
-            Self::Cancel | Self::Stop => &[LIFECYCLE_TRACKING_CAPABILITY],
-            Self::Enroll => &[LIFECYCLE_TRACKING_CAPABILITY, OBSERVE_CAPABILITY],
-            Self::Restart => &[
-                LIFECYCLE_TRACKING_CAPABILITY,
-                CREATE_CAPABILITY,
-                LAUNCH_CAPABILITY,
-            ],
+            Self::Focus => P::FOCUS,
+            Self::Close | Self::DeleteContainer => P::CLOSE,
+            Self::Create | Self::CreateContainer => P::CREATE,
+            Self::Input => P::INPUT,
+            Self::Report => P::REPORT,
+            Self::Spawn => P::CREATE.union(P::LAUNCH),
+            Self::ReloadContainer => P::LAUNCH.union(P::EXIT_OBSERVATION),
+            Self::Cancel | Self::Stop => P::LIFECYCLE_TRACKING,
+            Self::Enroll => P::LIFECYCLE_TRACKING.union(P::OBSERVE),
+            Self::Restart => P::LIFECYCLE_TRACKING.union(P::CREATE).union(P::LAUNCH),
         }
     }
 
-    /// Whether a backend declared every capability this operation needs.
-    ///
-    /// A capability is the backend's promise that it implements that part of the
-    /// operation, not an optimistic request: [`Operation::Spawn`] needs both the
-    /// creation it is asked for and the launch that follows it. The message names
-    /// the first capability that is missing.
-    pub fn ready_for(self, capabilities: &[&str]) -> Result<(), String> {
-        self.capabilities()
-            .iter()
-            .try_for_each(|capability| Self::readiness(self.as_str(), capability, capabilities))
-    }
-
-    /// Whether a backend declared the capability required by an operation.
-    ///
-    /// Use this before recording or dispatch.
-    pub fn readiness(
-        operation: &str,
-        capability: &str,
-        capabilities: &[&str],
-    ) -> Result<(), String> {
-        if capabilities.contains(&capability) {
-            Ok(())
-        } else {
-            Err(format!(
-                "{operation} needs the `{capability}` capability; this backend does not provide it"
-            ))
+    /// Whether a backend declared every primitive this operation needs.
+    pub fn ready_for(self, primitives: Primitives) -> Result<(), String> {
+        match self.needs().missing_name(primitives) {
+            None => Ok(()),
+            Some(name) => Err(format!(
+                "{} needs the `{name}` capability; this backend does not provide it",
+                self.as_str()
+            )),
         }
     }
 
     /// The message a record carries while no backend is wired.
     pub fn unavailable_message(self) -> String {
-        let capabilities = self.capabilities();
-        let named = if capabilities.len() == 1 {
-            format!("the `{}` capability", capabilities[0])
+        let needs = self.needs();
+        let names = [
+            Primitives::OBSERVE,
+            Primitives::PROCESS_INFO,
+            Primitives::FOCUS,
+            Primitives::CLOSE,
+            Primitives::CREATE,
+            Primitives::INPUT,
+            Primitives::OUTPUT,
+            Primitives::REPORT,
+            Primitives::LAUNCH,
+            Primitives::LAUNCH_CONTEXT,
+            Primitives::EXIT_OBSERVATION,
+            Primitives::LIFECYCLE_TRACKING,
+        ];
+        let named: Vec<&str> = names
+            .into_iter()
+            .filter(|primitive| needs.contains(*primitive))
+            .filter_map(|primitive| primitive.missing_name(Primitives::NONE))
+            .collect();
+        let phrase = if named.len() == 1 {
+            format!("the `{}` capability", named[0])
         } else {
-            let quoted: Vec<String> = capabilities
-                .iter()
-                .map(|capability| format!("`{capability}`"))
-                .collect();
-            format!("the {} capabilities", quoted.join(" and "))
+            format!(
+                "the {} capabilities",
+                named
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )
         };
         format!(
-            "{} needs {named}; this daemon has no backend wired",
+            "{} needs {phrase}; this daemon has no backend wired",
             self.as_str()
         )
     }
@@ -277,7 +309,7 @@ impl Operation {
 /// How the daemon serves one method name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
-    /// Liveness and identity: the version, the backend and its capabilities.
+    /// Liveness and identity: the version, the backend and its contracts.
     Ping,
     /// Read one recorded request by id.
     Request,
@@ -328,16 +360,16 @@ pub fn classify(method: &str) -> Option<Method> {
     })
 }
 
-/// The capability a read needs from the backend, so a read is served only by a
+/// The primitive a read needs from the backend, so a read is served only by a
 /// backend that says it can answer it.
 ///
 /// A read has no record, so nothing about it is durable: what it needs is the
 /// backend's own statement that this is a request it implements.
-pub fn read_capability(method: &str) -> &'static str {
+pub fn read_primitives(method: &str) -> Primitives {
     match method {
-        "mux.process_info" => PROCESS_INFO_CAPABILITY,
-        "mux.output" => OUTPUT_CAPABILITY,
-        _ => OBSERVE_CAPABILITY,
+        "mux.process_info" => Primitives::PROCESS_INFO,
+        "mux.output" => Primitives::OUTPUT,
+        _ => Primitives::OBSERVE,
     }
 }
 
@@ -345,11 +377,11 @@ pub fn read_capability(method: &str) -> &'static str {
 /// record, so the refusal is the whole answer.
 pub fn read_unsupported(
     method: &str,
-    capability: &str,
+    primitive: &str,
 ) -> (crate::control_plane::protocol::Code, String) {
     (
         crate::control_plane::protocol::Code::BackendUnavailable,
-        format!("{method} needs the `{capability}` capability; this backend does not provide it"),
+        format!("{method} needs the `{primitive}` capability; this backend does not provide it"),
     )
 }
 
@@ -432,156 +464,133 @@ mod tests {
     }
 
     #[test]
-    fn a_read_names_the_capability_it_needs() {
-        assert_eq!(read_capability("mux.observe"), OBSERVE_CAPABILITY);
-        assert_eq!(read_capability("mux.process_info"), PROCESS_INFO_CAPABILITY);
-        assert_eq!(read_capability("mux.output"), OUTPUT_CAPABILITY);
+    fn a_read_names_the_primitive_it_needs() {
+        assert!(read_primitives("mux.observe").contains(Primitives::OBSERVE));
+        assert!(read_primitives("mux.process_info").contains(Primitives::PROCESS_INFO));
+        assert!(read_primitives("mux.output").contains(Primitives::OUTPUT));
     }
 
-    /// Every contract a backend can serve is advertised, and each one needs what
-    /// its serving path checks. A hand-pushed flag is what this replaces.
     #[test]
-    fn every_contract_needs_the_capabilities_its_methods_use() {
-        let able = [
-            OBSERVE_CAPABILITY,
-            PROCESS_INFO_CAPABILITY,
-            FOCUS_CAPABILITY,
-            CLOSE_CAPABILITY,
-            CREATE_CAPABILITY,
-            INPUT_CAPABILITY,
-            OUTPUT_CAPABILITY,
-            REPORT_CAPABILITY,
-            LAUNCH_CAPABILITY,
-            LAUNCH_CONTEXT_CAPABILITY,
-            EXIT_OBSERVATION_CAPABILITY,
-            LIFECYCLE_TRACKING_CAPABILITY,
+    fn every_contract_is_advertised_only_when_its_needs_are_met() {
+        let primitives = [
+            Primitives::OBSERVE,
+            Primitives::PROCESS_INFO,
+            Primitives::FOCUS,
+            Primitives::CLOSE,
+            Primitives::CREATE,
+            Primitives::INPUT,
+            Primitives::OUTPUT,
+            Primitives::REPORT,
+            Primitives::LAUNCH,
+            Primitives::LAUNCH_CONTEXT,
+            Primitives::EXIT_OBSERVATION,
+            Primitives::LIFECYCLE_TRACKING,
         ];
-        for (contract, needs) in CONTRACTS {
-            assert!(
-                advertised(&able).contains(contract),
-                "a backend with every capability serves {contract}"
-            );
-            for needed in *needs {
-                let without: Vec<&str> = able
-                    .iter()
-                    .copied()
-                    .filter(|capability| capability != needed)
-                    .collect();
-                assert!(
-                    !advertised(&without).contains(contract),
-                    "{contract} is not advertised without {needed}"
-                );
+        let all = primitives
+            .into_iter()
+            .fold(Primitives::NONE, Primitives::union);
+        for contract in Contract::ALL {
+            assert!(advertised(all).contains(contract), "{contract:?}");
+            for omitted in primitives {
+                let without = primitives
+                    .into_iter()
+                    .filter(|primitive| primitive != &omitted)
+                    .fold(Primitives::NONE, Primitives::union);
+                if contract.needs().contains(omitted) {
+                    assert!(
+                        !advertised(without).contains(contract),
+                        "{contract:?} without {omitted:?}"
+                    );
+                }
             }
         }
+        let empty = advertised(Primitives::NONE);
         assert_eq!(
-            advertised(&[LAUNCH_CAPABILITY]),
+            empty,
             vec![
-                REGISTRY_CONTRACT,
-                REGISTRY_FACTS_CONTRACT,
-                EVENTS_CONTRACT,
-                TOPOLOGY_GET_CONTRACT,
-                TOPOLOGY_LIST_CONTRACT
-            ],
-            "a backend that can only launch serves spawn.create no better than none"
-        );
-        assert_eq!(
-            advertised(&[]),
-            vec![
-                REGISTRY_CONTRACT,
-                REGISTRY_FACTS_CONTRACT,
-                EVENTS_CONTRACT,
-                TOPOLOGY_GET_CONTRACT,
-                TOPOLOGY_LIST_CONTRACT
-            ],
-            "the daemon's own records need no backend"
-        );
-    }
-
-    #[test]
-    fn a_capability_a_backend_states_twice_advertises_each_contract_once() {
-        assert_eq!(
-            advertised(&[OBSERVE_CAPABILITY, OBSERVE_CAPABILITY]),
-            vec![
-                REGISTRY_CONTRACT,
-                REGISTRY_FACTS_CONTRACT,
-                EVENTS_CONTRACT,
-                TOPOLOGY_GET_CONTRACT,
-                TOPOLOGY_LIST_CONTRACT,
-                TOPOLOGY_RECONCILE_CONTRACT
+                Contract::Registry,
+                Contract::RegistryFacts,
+                Contract::Events,
+                Contract::TopologyGet,
+                Contract::TopologyList,
             ]
         );
     }
 
-    /// A contract's capability list is exactly what its operation checks, so an
-    /// advertised contract is never refused for a capability it did not name.
     #[test]
-    fn a_contract_names_what_its_operation_needs() {
-        let spawn_needs = CONTRACTS
-            .iter()
-            .find(|(contract, _)| *contract == SPAWN_CONTRACT)
-            .expect("the spawn contract")
-            .1;
-        assert_eq!(Operation::Spawn.capabilities(), spawn_needs);
-        let close_needs = CONTRACTS
-            .iter()
-            .find(|(contract, _)| *contract == SPAWN_CLOSE_CONTRACT)
-            .expect("the close contract")
-            .1;
-        assert!(close_needs.contains(&CLOSE_CAPABILITY));
+    fn contracts_have_stable_wire_names_and_unknown_names_are_tolerated() {
+        for contract in Contract::ALL.iter().copied().chain([Contract::TasksList]) {
+            assert!(
+                matches!(
+                    serde_json::from_str::<Contract>(&format!("\"{}\"", contract.as_str())),
+                    Ok(decoded) if decoded == contract
+                ),
+                "serde and the advertised name agree for {contract:?}"
+            );
+        }
+        assert!(matches!(
+            serde_json::from_str::<Contract>("\"future.v9\""),
+            Ok(Contract::Unknown)
+        ));
+        assert!(!advertised_with_tasks(Primitives::NONE, false).contains(&Contract::TasksList));
+        assert!(advertised_with_tasks(Primitives::NONE, true).contains(&Contract::TasksList));
     }
 
     #[test]
-    fn a_refusal_names_the_capability_it_needs() {
-        assert!(
-            Operation::Focus
-                .unavailable_message()
-                .contains("`mux.focus`")
-        );
-        assert!(
-            Operation::Spawn
-                .unavailable_message()
-                .contains("`mux.create` and `mux.launch`"),
-            "a spawn names everything it needs"
-        );
-        assert_eq!(
-            Operation::readiness(
-                "spawn.create",
-                LAUNCH_CAPABILITY,
-                &[CREATE_CAPABILITY, INPUT_CAPABILITY]
+    fn contract_needs_cover_the_operations_they_advertise() {
+        use Primitives as P;
+        let checks = [
+            (Contract::Spawn, Operation::Spawn.needs()),
+            (
+                Contract::SpawnClose,
+                P::OBSERVE.union(Operation::Close.needs()),
             ),
+            (
+                Contract::SpawnLaunchContext,
+                P::LAUNCH_CONTEXT.union(Operation::Spawn.needs()),
+            ),
+            (Contract::SpawnExitObservation, P::EXIT_OBSERVATION),
+            (Contract::TopologyCreate, Operation::CreateContainer.needs()),
+            (Contract::TopologyDelete, Operation::DeleteContainer.needs()),
+            (Contract::TopologyReload, Operation::ReloadContainer.needs()),
+            (Contract::TopologyReconcile, P::OBSERVE),
+            (Contract::LifecycleCancel, Operation::Cancel.needs()),
+            (Contract::LifecycleStop, Operation::Stop.needs()),
+            (Contract::LifecycleEnroll, Operation::Enroll.needs()),
+            (Contract::LifecycleRestart, Operation::Restart.needs()),
+            (Contract::LifecycleGet, P::LIFECYCLE_TRACKING),
+            (Contract::LifecycleList, P::LIFECYCLE_TRACKING),
+        ];
+        for (contract, method_needs) in checks {
+            assert!(
+                contract.needs().contains(method_needs),
+                "{contract:?} omits {method_needs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_readiness_refuses_before_dispatch_with_the_missing_primitive_named() {
+        let spawn = Primitives::CREATE.union(Primitives::LAUNCH);
+        assert!(Operation::Spawn.ready_for(spawn).is_ok());
+        assert_eq!(
+            Operation::Spawn.ready_for(Primitives::CREATE),
             Err(
                 "spawn.create needs the `mux.launch` capability; this backend does not provide it"
                     .into()
             )
         );
         assert_eq!(
-            Operation::readiness("spawn.create", LAUNCH_CAPABILITY, &[LAUNCH_CAPABILITY]),
-            Ok(()),
-            "readiness is separate from implementing dispatch"
-        );
-    }
-
-    #[test]
-    fn an_operation_needs_every_capability_it_lists() {
-        let able = [CREATE_CAPABILITY, LAUNCH_CAPABILITY, REPORT_CAPABILITY];
-        assert_eq!(Operation::Spawn.ready_for(&able), Ok(()));
-        assert!(Operation::Create.ready_for(&able).is_ok());
-        assert!(Operation::Report.ready_for(&able).is_ok());
-        assert_eq!(
-            Operation::Spawn.ready_for(&[CREATE_CAPABILITY, INPUT_CAPABILITY]),
-            Err(
-                "spawn.create needs the `mux.launch` capability; this backend does not provide it"
-                    .into()
-            ),
-            "creating a pane is not launching a child"
-        );
-        assert_eq!(
-            Operation::Spawn.ready_for(&[LAUNCH_CAPABILITY]),
+            Operation::Spawn.ready_for(Primitives::LAUNCH),
             Err(
                 "spawn.create needs the `mux.create` capability; this backend does not provide it"
                     .into()
-            ),
-            "launching is not creating the pane a child runs in"
+            )
+        );
+        assert!(
+            Operation::Spawn
+                .unavailable_message()
+                .contains("`mux.create` and `mux.launch`")
         );
     }
 }

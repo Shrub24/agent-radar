@@ -75,14 +75,14 @@ The control socket and the temporary publisher-compatibility socket share one To
 `daemon.ping`, params `{}`:
 
 ```json
-{"protocol":2,"backend":"tmux","instance":"radar","revision":1,"contracts":["registry.v1","registry.facts.v1","events.v1","tasks.list.v1","spawn.v1","spawn.close.v1","spawn.launch_context.v1","spawn.exit_observation.v1"]}
+{"protocol":2,"backend":"tmux","instance":"radar","revision":1,"contracts":["registry.v1","registry.facts.v1","events.v1","tasks.list.v1","spawn.v1","spawn.close.v1","spawn.launch_context.v1","spawn.exit_observation.v1","lifecycle.cancel.v1","lifecycle.stop.v1","topology.create.v1","topology.delete.v1","topology.reload.v1","topology.get.v1","topology.list.v1","topology.reconcile.v1","lifecycle.get.v1","lifecycle.list.v1","lifecycle.enroll.v1","lifecycle.restart.v1"]}
 ```
 
 `backend` is the wired physical backend: `herdr`, `tmux` or `none`, never a placeholder. `instance` names the tmux server for a tmux backend and is null otherwise. `revision` is the wire revision of the daemon's build, which increases whenever a method or field is added; Radar's own clients require at least their own revision and show a blocking diagnostic that names the restart when a daemon that outlived an install is older. `contracts` lists the daemon contracts the backend makes servable, which is what an external consumer pins. The backend's `mux.*` declaration stays inside the daemon and is not on the wire. A contract name your build does not know is tolerated; ignore it.
 
-Inside the daemon, each backend declares its behaviors as `mux.*` capabilities, one per physical behavior. They decide which contracts are advertised and which operations refuse before any effect:
+Inside the daemon, each backend returns a typed `Primitives` flag set, one bit per physical behavior. Diagnostic names use the internal `mux.*` vocabulary; that vocabulary is not sent to clients. The flags decide which contracts are advertised and which operations refuse before any effect:
 
-| Backend capability | Behavior |
+| Internal primitive | Behavior |
 |---|---|
 | `mux.observe` | Normalized workspace/tab/pane inventory |
 | `mux.process_info` | Current foreground process evidence for a pane |
@@ -95,8 +95,9 @@ Inside the daemon, each backend declares its behaviors as `mux.*` capabilities, 
 | `mux.launch` | Launch a resolved command in a created pane |
 | `mux.launch_context` | Carry cwd and an environment overlay into that launch |
 | `mux.exit_observation` | Report a retained typed pane-command exit |
+| `mux.lifecycle_tracking` | Capture the launched process identity for fenced lifecycle controls |
 
-Daemon contracts are versioned promises that the daemon serves the methods a capability set makes possible. They are derived, not hand-pushed, so advertising and serving cannot drift:
+Daemon contracts are versioned promises that the daemon serves the methods its internal typed primitive set makes possible. The `mux.*` primitives are not part of the handshake; external consumers pin contracts. Contract needs are exhaustive in the implementation, and the advertised set is derived from them:
 
 | Contract | Needs | Serves |
 |---|---|---|
@@ -116,9 +117,9 @@ Daemon contracts are versioned promises that the daemon serves the methods a cap
 | `lifecycle.cancel.v1`, `lifecycle.stop.v1` | `mux.lifecycle_tracking` | `lifecycle.cancel`, `lifecycle.stop` |
 | `lifecycle.enroll.v1` | `mux.lifecycle_tracking` + `mux.observe` | `lifecycle.enroll` |
 | `lifecycle.restart.v1` | `mux.lifecycle_tracking` + `mux.create` + `mux.launch` | `lifecycle.restart` |
-| `lifecycle.get.v1`, `lifecycle.list.v1` | — | managed launch subjects |
+| `lifecycle.get.v1`, `lifecycle.list.v1` | `mux.lifecycle_tracking` | managed launch subjects |
 
-`registry.v1`, `registry.facts.v1` and `events.v1` need no backend and are advertised even for backend `none`. A contract that the daemon would refuse to serve is never advertised, and a capability is never advertised by a backend that cannot serve it. Check the protocol version and the contracts your client needs at handshake; other absences refuse only their own methods. `daemon.ping` cannot prove which build is running — a daemon built before a contract existed simply omits it and answers its methods `unknown_method` — so treat an absent contract or an `unknown_method` answer as the compatibility signal and keep your existing path.
+`registry.v1`, `registry.facts.v1` and `events.v1` need no backend and are advertised even for backend `none`. A contract that the daemon cannot serve is never advertised. Bundled Radar clients require their minimum `revision` and show a blocking restart diagnostic when a daemon outlived an install; external consumers check the contracts they need. Unknown contract names are tolerated. An absent required contract or `unknown_method` is the compatibility signal for external consumers.
 
 ## Methods
 
@@ -299,7 +300,7 @@ def call(path, method, params):
     return answer
 ```
 
-Set `backend = "daemon"` and optionally `socket` in Radar config to use the daemon for Radar; extensions may connect directly using the resolved socket path. Use `daemon.ping` to check the protocol version and the contracts you need. A contract absence is an explicit refusal, not a request to substitute a different method.
+Set `backend = "daemon"` and optionally `socket` in Radar config to use the daemon for Radar; extensions may connect directly using the resolved socket path. Use `daemon.ping` to check the protocol version and the contracts you need. Bundled Radar clients additionally require the current wire `revision`; external consumers should ignore unfamiliar contract names and pin only the contracts they use. A contract absence is an explicit refusal, not a request to substitute a different method.
 
 Typical calls (parameter objects are exactly the method shapes above):
 

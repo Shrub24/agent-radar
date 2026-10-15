@@ -24,8 +24,8 @@
 //!   effect, positively rejected it before applying it, or left the outcome
 //!   unestablished. A caller that might have acted is never told it certainly
 //!   did not.
-//! - **Capabilities are declared, not assumed.** [`Self::capabilities`] lists
-//!   what this backend implements, and an operation outside that list is refused
+//! - **Primitives are declared, not assumed.** [`Self::primitives`] lists
+//!   what this backend implements, and an operation outside that set is refused
 //!   as unsupported rather than attempted.
 
 use std::collections::BTreeMap;
@@ -277,29 +277,65 @@ pub struct LaunchRequest {
 /// Environment variable carrying [`LaunchRequest::spawn_token`] to the child.
 pub const LAUNCH_TOKEN_ENV: &str = "PI_RADAR_SPAWN_TOKEN";
 
-/// What a backend declares it implements, in the protocol's own words.
-///
-/// Each name is the backend's own promise about that part of the seam: an
-/// operation whose capability is absent is refused rather than attempted, and
-/// the daemon derives its contracts from these rather than restating them.
-pub const OBSERVE_CAPABILITY: &str = "mux.observe";
-pub const PROCESS_INFO_CAPABILITY: &str = "mux.process_info";
-pub const FOCUS_CAPABILITY: &str = "mux.focus";
-pub const CLOSE_CAPABILITY: &str = "mux.close";
-pub const CREATE_CAPABILITY: &str = "mux.create";
-pub const INPUT_CAPABILITY: &str = "mux.input";
-pub const OUTPUT_CAPABILITY: &str = "mux.output";
-pub const REPORT_CAPABILITY: &str = "mux.report";
-/// The capability a backend declares when it can run a resolved child command.
-pub const LAUNCH_CAPABILITY: &str = "mux.launch";
-/// The capability a backend declares when it can carry a child's launch context.
-pub const LAUNCH_CONTEXT_CAPABILITY: &str = "mux.launch_context";
-/// The capability a backend declares when it can observe retained pane exits.
-pub const EXIT_OBSERVATION_CAPABILITY: &str = "mux.exit_observation";
-/// The capability a backend declares when a launch can be tracked from its own
-/// process: the launched program's birth identity is captured before it runs,
-/// so cancelling the launch can signal exactly that process.
-pub const LIFECYCLE_TRACKING_CAPABILITY: &str = "mux.lifecycle_tracking";
+/// Typed backend primitives. These stay inside Radar; external consumers pin the
+/// daemon contracts derived from them instead of adapter implementation details.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Primitives(u16);
+
+impl Primitives {
+    pub const NONE: Self = Self(0);
+    pub const OBSERVE: Self = Self(1 << 0);
+    pub const PROCESS_INFO: Self = Self(1 << 1);
+    pub const FOCUS: Self = Self(1 << 2);
+    pub const CLOSE: Self = Self(1 << 3);
+    pub const CREATE: Self = Self(1 << 4);
+    pub const INPUT: Self = Self(1 << 5);
+    pub const OUTPUT: Self = Self(1 << 6);
+    pub const REPORT: Self = Self(1 << 7);
+    pub const LAUNCH: Self = Self(1 << 8);
+    pub const LAUNCH_CONTEXT: Self = Self(1 << 9);
+    pub const EXIT_OBSERVATION: Self = Self(1 << 10);
+    pub const LIFECYCLE_TRACKING: Self = Self(1 << 11);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    pub const fn missing_name(self, available: Self) -> Option<&'static str> {
+        let missing = self.0 & !available.0;
+        if missing & Self::OBSERVE.0 != 0 {
+            Some("mux.observe")
+        } else if missing & Self::PROCESS_INFO.0 != 0 {
+            Some("mux.process_info")
+        } else if missing & Self::FOCUS.0 != 0 {
+            Some("mux.focus")
+        } else if missing & Self::CLOSE.0 != 0 {
+            Some("mux.close")
+        } else if missing & Self::CREATE.0 != 0 {
+            Some("mux.create")
+        } else if missing & Self::INPUT.0 != 0 {
+            Some("mux.input")
+        } else if missing & Self::OUTPUT.0 != 0 {
+            Some("mux.output")
+        } else if missing & Self::REPORT.0 != 0 {
+            Some("mux.report")
+        } else if missing & Self::LAUNCH.0 != 0 {
+            Some("mux.launch")
+        } else if missing & Self::LAUNCH_CONTEXT.0 != 0 {
+            Some("mux.launch_context")
+        } else if missing & Self::EXIT_OBSERVATION.0 != 0 {
+            Some("mux.exit_observation")
+        } else if missing & Self::LIFECYCLE_TRACKING.0 != 0 {
+            Some("mux.lifecycle_tracking")
+        } else {
+            None
+        }
+    }
+}
 
 /// Read-only observation of a pane's current command lifecycle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -933,14 +969,10 @@ pub trait RuntimeProvider: Send + Sync {
     /// backend would be a location no dashboard can join on.
     fn identity(&self) -> BackendIdentity;
 
-    /// The capabilities this runtime implements, in the protocol's words.
-    ///
-    /// Advertising one is a promise: an operation whose capability is absent is
-    /// refused as unsupported rather than attempted. The default advertises
-    /// nothing, so a runtime that has not stated its capabilities is never
-    /// credited with one.
-    fn capabilities(&self) -> &'static [&'static str] {
-        &[]
+    /// The backend primitives this runtime implements. An operation requiring
+    /// absent primitives is refused before dispatch.
+    fn primitives(&self) -> Primitives {
+        Primitives::default()
     }
 
     /// The process that serves this backend's instance now, when the backend
@@ -1044,7 +1076,7 @@ pub trait RuntimeProvider: Send + Sync {
     ///
     /// The request has already been validated ([`LaunchRequest::validate`]), and
     /// the command was resolved here: no shell interprets it and the adapter adds
-    /// no arguments of its own. Launch is an explicit capability, deliberately
+    /// no arguments of its own. Launch is an explicit primitive, deliberately
     /// separate from pane input: a runtime may accept both, either, or neither,
     /// and advertising `launch` promises exactly this one create-and-run step,
     /// never ongoing process lifecycle. Implementations report
@@ -1065,7 +1097,7 @@ pub trait RuntimeProvider: Send + Sync {
     /// Reads one bounded exit-state snapshot for each requested pane id.
     ///
     /// A missing pane, unreadable server, malformed record, or backend without
-    /// the capability is `Unknown`, never proof that the command exited. The
+    /// the missing primitive yields `Unknown`, never proof that the command exited. The
     /// default is deliberately inconclusive.
     fn exit_observations(
         &self,
@@ -1081,8 +1113,8 @@ pub trait RuntimeProvider: Send + Sync {
 
     /// Reads a bounded snapshot of one pane's output, consuming nothing.
     ///
-    /// A runtime that has no non-consuming read must not advertise `output` in
-    /// [`Self::capabilities`]: a read that drained the pane's scrollback or
+    /// A runtime that has no non-consuming read must not include `output` in
+    /// [`Self::primitives`]: a read that drained the pane's scrollback or
     /// advanced a cursor would change what the operator sees.
     fn output(&self, _request: &OutputRequest, _cancel: &AtomicBool) -> OutputOutcome {
         OutputOutcome::Refused("this runtime does not implement output reads".to_string())
@@ -1124,8 +1156,8 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
         (**self).remove_exit_wake(subject_id, cancel)
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        (**self).capabilities()
+    fn primitives(&self) -> Primitives {
+        (**self).primitives()
     }
 
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {

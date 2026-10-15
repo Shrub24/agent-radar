@@ -56,6 +56,7 @@ of the detail.
 | Item | Options | Priority | Confidence | Trigger |
 | --- | --- | --- | --- | --- |
 | `remove-herdr-backend` change | Remove backend code first; display labels and `pi_herdsman_*` tokens later, tokens only after Herdsman cutover acceptance | P1 | high | Daemon-service committed (done) and cutover accepted |
+| Remove typed backend-primitive gates | Once Herdr is removed, delete `Primitives` and its preflight gates if tmux is the sole backend; keep public `Contract` names and revision negotiation | P2 | high | `remove-herdr-backend` lands
 | Archive finished changes | `contract-v2`, `window-tabs`, `managed-topology` still unarchived | P1 | high | Next housekeeping pass |
 | Supersede `managed-lead-restart` | Mark superseded by `daemon-managed-lifecycle` section 3; its Herdr readiness contract no longer applies | P1 | high | Next housekeeping pass |
 | Socket-level enrollment and restart refusal tests | Lifecycle 3.1 to 3.3 socket tests, including malformed enrollment requests | P1 | high | Before section 4 wires restart |

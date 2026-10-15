@@ -30,13 +30,10 @@ use std::time::{Duration, Instant};
 
 use crate::model::{FleetObservation, ForegroundEvidence, Location, Pane, Tab, Workspace};
 use crate::runtime::{
-    BackendIdentity, CLOSE_CAPABILITY, CREATE_CAPABILITY, CloseOutcome, CloseTarget, CreateOutcome,
-    CreateRequest, CreatedLocation, EXIT_OBSERVATION_CAPABILITY, FOCUS_CAPABILITY, FocusOutcome,
-    INPUT_CAPABILITY, InputOutcome, InputPayload, InputRequest, LAUNCH_CAPABILITY,
-    LAUNCH_CONTEXT_CAPABILITY, LAUNCH_TOKEN_ENV, LIFECYCLE_TRACKING_CAPABILITY, LaunchOutcome,
-    LaunchRequest, OBSERVE_CAPABILITY, OUTPUT_CAPABILITY, OutputOutcome, OutputRead, OutputRequest,
-    OutputSource, PROCESS_INFO_CAPABILITY, PaneExitObservation, RuntimeProvider, SplitDirection,
-    Target,
+    BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation,
+    FocusOutcome, InputOutcome, InputPayload, InputRequest, LAUNCH_TOKEN_ENV, LaunchOutcome,
+    LaunchRequest, OutputOutcome, OutputRead, OutputRequest, OutputSource, PaneExitObservation,
+    Primitives, RuntimeProvider, SplitDirection, Target,
 };
 
 /// The backend word in every handle this adapter names.
@@ -291,20 +288,18 @@ impl RuntimeProvider for TmuxRuntime {
         BackendIdentity::tmux(self.config.server.clone())
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        &[
-            OBSERVE_CAPABILITY,
-            PROCESS_INFO_CAPABILITY,
-            FOCUS_CAPABILITY,
-            CLOSE_CAPABILITY,
-            CREATE_CAPABILITY,
-            INPUT_CAPABILITY,
-            OUTPUT_CAPABILITY,
-            LAUNCH_CAPABILITY,
-            LAUNCH_CONTEXT_CAPABILITY,
-            EXIT_OBSERVATION_CAPABILITY,
-            LIFECYCLE_TRACKING_CAPABILITY,
-        ]
+    fn primitives(&self) -> Primitives {
+        Primitives::OBSERVE
+            .union(Primitives::PROCESS_INFO)
+            .union(Primitives::FOCUS)
+            .union(Primitives::CLOSE)
+            .union(Primitives::CREATE)
+            .union(Primitives::INPUT)
+            .union(Primitives::OUTPUT)
+            .union(Primitives::LAUNCH)
+            .union(Primitives::LAUNCH_CONTEXT)
+            .union(Primitives::EXIT_OBSERVATION)
+            .union(Primitives::LIFECYCLE_TRACKING)
     }
 
     fn validate_launch(&self, request: &LaunchRequest) -> Result<(), String> {

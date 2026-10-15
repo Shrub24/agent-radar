@@ -123,11 +123,7 @@ units start and stop it; see [Stopping and refusals](#stopping-and-refusals).
 
 Clients connect directly using Unix-domain UTF-8 JSON Lines, protocol version
 `2`, with a canonical UUID request ID and one matching response per request.
-Send `daemon.ping` first and check the served protocol and the contracts your
-client needs: `registry.v1` for a registry publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader, `tasks.list.v1` for background-task snapshots, and `spawn.v1`/`spawn.close.v1` for managed children. Do not require mux
-capabilities for a registry-only publisher. The handshake states what this build
-serves; it cannot prove which build is running, so treat an absent contract or an
-`unknown_method` answer as the signal to keep your previous path.
+Send `daemon.ping` first. The answer includes protocol `2`, a wire `revision`, and the contracts this daemon serves. External consumers pin only what they use: `registry.v1` for a registry publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader, `tasks.list.v1` for background-task snapshots, and `spawn.v1`/`spawn.close.v1` for managed children. Unknown contract names are tolerated. The bundled Radar client requires its minimum revision and shows a blocking diagnostic with the daemon restart command if a daemon outlived an install. `mux.*` primitives are internal and are not sent in the handshake.
 
 Default control socket resolution: `RADAR_CONTROL_SOCKET`, then `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then `/tmp/agent-radar-<uid>/control.sock`. The daemon temporarily also binds the legacy publisher socket path described in [the publisher bridge](radar-bus.md); it is an ingest-only compatibility entry into the same transport and task state. See the [protocol reference](control-plane.md#start-and-select) for state-path resolution, the `[daemon]` table, and physical-backend selection.
 
@@ -138,11 +134,11 @@ processes running as the same user. Do not expose this socket remotely.
 
 ## API map
 
-| Purpose | Methods | Capability |
+| Purpose | Methods | Gate (internal primitive or public contract) |
 |---|---|---|
 | Handshake | `daemon.ping` | None |
-| Physical observations | `mux.observe`, `mux.process_info`, `mux.output` | Respective mux capability |
-| Physical mutations | `mux.focus`, `mux.close`, `mux.create`, `mux.input`, `mux.report`, `spawn.create` | Respective mux capabilities (`spawn.create` also `mux.launch`) |
+| Physical observations | `mux.observe`, `mux.process_info`, `mux.output` | Respective internal primitive |
+| Physical mutations | `mux.focus`, `mux.close`, `mux.create`, `mux.input`, `mux.report`, `spawn.create` | Respective internal primitives (`spawn.create` also needs `mux.launch`) |
 | Mutation readback | `mux.request.get`, `mux.request.list` | None |
 | Durable lifecycle events | `events.read` | `events.v1` |
 | Volatile task snapshot | `tasks.list` | `tasks.list.v1` |
@@ -161,8 +157,9 @@ processes running as the same user. Do not expose this socket remotely.
 Use `events.read` to resume ordered journal pointers with bounded long polling; it does not replace current-state reads. `cursor` is the position after the last delivered event, so following it never skips an event, while `tail` and `more` say whether a backlog remains: while `more` is true, read again immediately instead of waiting. On `cursor_expired`, resynchronise using paged `agent.list` and `spawn.list`, plus `mux.request.list` for operation records, then resume from the returned cursor. Events may be lost between fact durability and append, so an unclean restart changes the epoch. Absence of an event is not evidence of freshness or liveness.
 
 Use the method references for parameter and result shapes rather than treating
-this table as a second schema. Unsupported methods/capabilities are not an
-invitation to synthesize an equivalent operation with terminal input.
+this table as a second schema. `mux.*` primitives are daemon-internal gates, not
+handshake contracts. Unsupported methods or contracts are not an invitation to
+synthesize an equivalent operation with terminal input.
 
 ## Agent and publisher lifecycle
 
@@ -316,11 +313,11 @@ The first port can be small:
   Adoption is additive: a dashboard shows the assignment extension and `facts`
   rows as unavailable until a publisher writes them, and nothing else changes.
 - Route child creation through `spawn.create` only after `daemon.ping` confirms
-  protocol 2 and the `spawn.v1` contract (the backend's `mux.create` and
-  `mux.launch` capabilities), plus `mux.launch_context` when supplying
-  cwd/environment. Capture/remove the token in the child and use the returned
-  bound `agent_id` for subsequent registry reads. Binding is not application or
-  assignment readiness. The server states which contracts it serves; the method
+  protocol 2 and the `spawn.v1` contract, plus `spawn.launch_context.v1` when
+  supplying cwd/environment. The backend's `mux.*` primitives are internal to
+  the daemon and are not part of client preflight. Capture/remove the token in
+  the child and use the returned bound `agent_id` for subsequent registry reads.
+  Binding is not application or assignment readiness. The server states which contracts it serves; the method
   names themselves are not advertised, so attempt `spawn.create` once after
   those checks. An `unknown_method` response means this daemon does not implement
   the method; keep the existing Herdsman path. Never fall back to another launch
@@ -372,9 +369,10 @@ process lifetime; a production publisher must define durable reconnect state.
 The real Herdr launch smoke belongs to the independent final verification gate;
 there is no live user-fleet integration.
 
-Consumers should negotiate capabilities, preserve unfamiliar vocabulary, and
-switch on error codes rather than human-readable messages. Keep wire-version
-compatibility explicit as the API grows. Transport guarantees, identity fencing,
-privacy and uncertain-effect handling are requirements of the current contract;
+Consumers should negotiate contracts, tolerate unfamiliar contract names, and
+switch on error codes rather than human-readable messages. Bundled Radar clients
+also require the wire revision. Keep wire compatibility explicit as the API grows.
+Transport guarantees, identity fencing, privacy and uncertain-effect handling
+are requirements of the current contract;
 state vocabulary, placement policy, richer topology and recovery responsibilities
 can evolve without turning this overview into a fixed domain model.

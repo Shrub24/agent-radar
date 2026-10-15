@@ -45,10 +45,9 @@ use crate::model::SessionUuid;
 use crate::model::{FleetObservation, ProcessIdentity};
 use crate::process_control::{self, Acquired};
 use crate::runtime::{
-    BackendIdentity, CLOSE_CAPABILITY, CreateOutcome, CreateRequest, CreatedKind, CreatedLocation,
-    EXIT_OBSERVATION_CAPABILITY, FocusOutcome, InputOutcome, InputPayload, InputRequest,
-    LAUNCH_CONTEXT_CAPABILITY, LIFECYCLE_TRACKING_CAPABILITY, LaunchOutcome, LaunchRequest,
-    OutputOutcome, OutputRead, OutputRequest, PaneExitObservation, ReportOutcome, ReportRequest,
+    BackendIdentity, CreateOutcome, CreateRequest, CreatedKind, CreatedLocation, FocusOutcome,
+    InputOutcome, InputPayload, InputRequest, LaunchOutcome, LaunchRequest, OutputOutcome,
+    OutputRead, OutputRequest, PaneExitObservation, Primitives, ReportOutcome, ReportRequest,
     RuntimeProvider, SplitDirection, Target, validate_command,
 };
 use crate::{HerdrConfig, HerdrRuntime, TmuxConfig, TmuxRuntime};
@@ -339,7 +338,7 @@ impl PhysicalBackend {
     /// The adapter this backend is served through.
     ///
     /// Capabilities are the adapter's own declaration for the backend it
-    /// implements ([`RuntimeProvider::capabilities`]); nothing here restates
+    /// implements ([`RuntimeProvider::primitives`]); nothing here restates
     /// them. An adapter that cannot serve the configuration it was given is a
     /// startup refusal, never a backend that quietly serves another one.
     fn adapter(&self) -> Result<Arc<dyn RuntimeProvider>, BackendConfigError> {
@@ -815,13 +814,16 @@ fn handle_line(
             let (identity, contracts, task_status) = {
                 let core = locked(core);
                 let (identity, backend) = match &core.backend {
-                    Some(backend) => (backend.identity(), backend.capabilities()),
-                    None => (BackendIdentity::named("none"), &[][..]),
+                    Some(backend) => (backend.identity(), backend.primitives()),
+                    None => (BackendIdentity::named("none"), Primitives::NONE),
                 };
                 let available = core.task_ingest.is_some();
                 (
                     identity,
-                    ops::advertised_with_tasks(backend, available),
+                    ops::advertised_with_tasks(backend, available)
+                        .into_iter()
+                        .map(ops::Contract::as_str)
+                        .collect::<Vec<_>>(),
                     json!({"available": available, "error": core.task_ingest_error}),
                 )
             };
@@ -1204,10 +1206,7 @@ fn dead_pane_evidence(
     stopping: &Arc<AtomicBool>,
     budget: &Arc<VerificationBudget>,
 ) -> DeadPane {
-    if !backend
-        .capabilities()
-        .contains(&EXIT_OBSERVATION_CAPABILITY)
-    {
+    if !backend.primitives().contains(Primitives::EXIT_OBSERVATION) {
         return DeadPane::Unresolved;
     }
     let Ok(Some(edge)) = registry.spawn_edge(&close.spawn_request_id) else {
@@ -1427,10 +1426,7 @@ fn cleanup_unbound_pane(
             ));
         }
     }
-    if !backend
-        .capabilities()
-        .contains(&EXIT_OBSERVATION_CAPABILITY)
-    {
+    if !backend.primitives().contains(Primitives::EXIT_OBSERVATION) {
         return Some(PaneCleanup::Refused(
             "this backend cannot report whether the pane's command has exited".into(),
         ));
@@ -1539,9 +1535,9 @@ fn observed_inventory(core: &Arc<Mutex<Core>>) -> Option<FleetObservation> {
         (core.backend.clone(), Arc::clone(&core.stopping))
     };
     let backend = backend?;
-    // The same capability the wire `mux.observe` read needs: a backend that
+    // The same primitive the wire `mux.observe` read needs: a backend that
     // cannot answer that read cannot confirm a location here either.
-    if capabilities_refuse(&backend, protocol::OBSERVE_METHOD).is_some()
+    if primitive_refuse(&backend, protocol::OBSERVE_METHOD).is_some()
         || cancel.load(Ordering::SeqCst)
     {
         return None;
@@ -1573,10 +1569,7 @@ fn observe_spawn_exits(
     let Some(backend) = backend else {
         return Ok(edges.to_vec());
     };
-    if cancel.load(Ordering::SeqCst)
-        || !backend
-            .capabilities()
-            .contains(&EXIT_OBSERVATION_CAPABILITY)
+    if cancel.load(Ordering::SeqCst) || !backend.primitives().contains(Primitives::EXIT_OBSERVATION)
     {
         return Ok(edges.to_vec());
     }
@@ -1707,7 +1700,7 @@ fn execute_child_close(
     if stopping.load(Ordering::SeqCst) {
         return Response::refused(&request.id, &Refusal::new(Code::Busy, "daemon is stopping"));
     }
-    if let Some(refusal) = capabilities_refuse(&backend, protocol::OBSERVE_METHOD) {
+    if let Some(refusal) = primitive_refuse(&backend, protocol::OBSERVE_METHOD) {
         return Response::refused(&request.id, &refusal);
     }
     let inventory = match bounded_inventory(
@@ -1767,15 +1760,13 @@ fn execute_child_close(
         };
     // A close backend is required before recording admission; otherwise this
     // request cannot reach a truthful dispatch result.
-    if !backend.capabilities().contains(&CLOSE_CAPABILITY) {
+    if !backend.primitives().contains(Primitives::CLOSE) {
         return Response::refused(
             &request.id,
             &Refusal::new(
                 Code::BackendUnavailable,
-                format!(
-                    "spawn.close needs the `{CLOSE_CAPABILITY}` capability; this backend does not \
-                     provide it"
-                ),
+                "spawn.close needs the `mux.close` capability; this backend does not provide it"
+                    .to_string(),
             ),
         );
     }
@@ -2547,11 +2538,11 @@ fn valid_identifier(value: &str) -> bool {
 }
 
 /// A read the backend does not implement refuses explicitly, naming the
-/// capability, rather than answering with a plausible-looking empty result.
-fn capabilities_refuse(backend: &Arc<dyn RuntimeProvider>, method: &str) -> Option<Refusal> {
-    let capability = ops::read_capability(method);
-    (!backend.capabilities().contains(&capability)).then(|| {
-        let (code, message) = ops::read_unsupported(method, capability);
+/// primitive, rather than answering with a plausible-looking empty result.
+fn primitive_refuse(backend: &Arc<dyn RuntimeProvider>, method: &str) -> Option<Refusal> {
+    let needed = ops::read_primitives(method);
+    needed.missing_name(backend.primitives()).map(|primitive| {
+        let (code, message) = ops::read_unsupported(method, primitive);
         Refusal::new(code, message)
     })
 }
@@ -2619,7 +2610,7 @@ fn read_backend(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         let (code, message) = ops::read_unavailable(&request.method);
         return Response::refused(&request.id, &Refusal::new(code, message));
     };
-    if let Some(refusal) = capabilities_refuse(&backend, &request.method) {
+    if let Some(refusal) = primitive_refuse(&backend, &request.method) {
         return Response::refused(&request.id, &refusal);
     }
     if let Some(pane_id) = pane {
@@ -2711,7 +2702,7 @@ fn read_output(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         let (code, message) = ops::read_unavailable(&request.method);
         return Response::refused(&request.id, &Refusal::new(code, message));
     };
-    if let Some(refusal) = capabilities_refuse(&backend, &request.method) {
+    if let Some(refusal) = primitive_refuse(&backend, &request.method) {
         return Response::refused(&request.id, &refusal);
     }
     match backend.output(&output, &cancel) {
@@ -3110,7 +3101,7 @@ enum Admission {
     /// in-flight refusal, or a store error.
     Answered(Response),
     /// The operation cannot be served: no backend is wired, or the wired backend
-    /// does not declare the capability it needs. The message says which.
+    /// does not provide the primitive it needs. The message says which.
     Unsupported(String),
     /// Admitted and recorded as started: dispatch to this backend.
     Dispatch(Arc<dyn RuntimeProvider>, Arc<AtomicBool>),
@@ -3118,7 +3109,7 @@ enum Admission {
 
 /// The admission every effectful request shares: exact same-ID replay, the
 /// same-ID-different-contents conflict, conflicting unresolved targets across
-/// methods, the capability the operation needs, and the Started record written
+/// methods, the primitive the operation needs, and the Started record written
 /// before any dispatch. Never holds the store lock over backend I/O.
 ///
 /// A request this backend cannot serve returns [`Admission::Unsupported`] before
@@ -3184,7 +3175,7 @@ fn admit(
         let backend = core.backend.clone();
         let capable = backend
             .as_ref()
-            .is_some_and(|backend| operation.ready_for(backend.capabilities()).is_ok());
+            .is_some_and(|backend| operation.ready_for(backend.primitives()).is_ok());
         // Only a request that will be dispatched is recorded as started: an
         // operation this backend cannot serve leaves no claim that it ran.
         if held.is_none() && capable {
@@ -3246,7 +3237,7 @@ fn admit(
     }
     match backend {
         None => Admission::Unsupported(operation.unavailable_message()),
-        Some(backend) => match operation.ready_for(backend.capabilities()) {
+        Some(backend) => match operation.ready_for(backend.primitives()) {
             Ok(()) => Admission::Dispatch(backend, cancel),
             Err(message) => Admission::Unsupported(message),
         },
@@ -4421,7 +4412,7 @@ fn execute_input(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
 /// reported. The record's target is the location reported about, so a report
 /// conflicts with another mutation of that pane instead of racing it.
 ///
-/// Where the backend cannot report, the capability gate refuses before dispatch
+/// Where the backend cannot report, the primitive gate refuses before dispatch
 /// and the record says so, rather than the daemon substituting an operation.
 fn execute_report(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
     let frozen = match frozen_params(request, &[]) {
@@ -4538,7 +4529,7 @@ fn preflight_command(
         let core = locked(core);
         core.backend.as_ref().map(|backend| {
             if (!env.is_empty() || cwd.is_some())
-                && !backend.capabilities().contains(&LAUNCH_CONTEXT_CAPABILITY)
+                && !backend.primitives().contains(Primitives::LAUNCH_CONTEXT)
             {
                 Err("selected backend does not support launch context".to_string())
             } else {
@@ -4662,8 +4653,8 @@ fn execute_spawn(
     }
     let tracks_launches = locked(core).backend.as_ref().is_some_and(|backend| {
         backend
-            .capabilities()
-            .contains(&LIFECYCLE_TRACKING_CAPABILITY)
+            .primitives()
+            .contains(Primitives::LIFECYCLE_TRACKING)
     });
     if tracks_launches && let Err(message) = subjects::check_bounds(&requested_launch(&params)) {
         return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
@@ -4800,8 +4791,8 @@ fn spawn_child(
     // A backend that tracks its launches gets the subject before any effect, so
     // the bootstrap's correlation is recorded before the launch can run it.
     let tracking = if backend
-        .capabilities()
-        .contains(&LIFECYCLE_TRACKING_CAPABILITY)
+        .primitives()
+        .contains(Primitives::LIFECYCLE_TRACKING)
     {
         match track_launch(
             core,
@@ -5096,8 +5087,8 @@ fn bootstrap_request(
         )
     };
     if !backend
-        .capabilities()
-        .contains(&LIFECYCLE_TRACKING_CAPABILITY)
+        .primitives()
+        .contains(Primitives::LIFECYCLE_TRACKING)
     {
         return not_awaiting();
     }
@@ -6676,7 +6667,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|capability| capability == ops::TASKS_LIST_CONTRACT)
+                .any(|capability| capability == ops::Contract::TasksList.as_str())
         );
 
         let event_tail = call(&control, "events.read", json!({"after": 0, "limit": 500}))["result"]

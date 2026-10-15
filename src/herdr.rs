@@ -30,12 +30,10 @@ use crate::model::{
     RuntimeStatus, SemanticState, SessionIdentity, SessionUuid, Tab, Workspace,
 };
 use crate::runtime::{
-    BackendIdentity, CLOSE_CAPABILITY, CREATE_CAPABILITY, CloseOutcome, CloseTarget, CreateOutcome,
-    CreateRequest, CreatedLocation, FOCUS_CAPABILITY, FocusOutcome, INPUT_CAPABILITY, InputOutcome,
-    InputPayload, InputRequest, LAUNCH_CAPABILITY, LAUNCH_CONTEXT_CAPABILITY, LAUNCH_TOKEN_ENV,
-    LaunchOutcome, LaunchRequest, OBSERVE_CAPABILITY, OUTPUT_CAPABILITY, OutputOutcome, OutputRead,
-    OutputRequest, OutputSource, PROCESS_INFO_CAPABILITY, REPORT_CAPABILITY, ReportOutcome,
-    ReportRequest, ReportTarget, RuntimeProvider, SplitDirection, Target,
+    BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation,
+    FocusOutcome, InputOutcome, InputPayload, InputRequest, LAUNCH_TOKEN_ENV, LaunchOutcome,
+    LaunchRequest, OutputOutcome, OutputRead, OutputRequest, OutputSource, Primitives,
+    ReportOutcome, ReportRequest, ReportTarget, RuntimeProvider, SplitDirection, Target,
 };
 
 /// Metadata tokens carrying explicit pi-herdsman ownership UUIDs.
@@ -506,19 +504,17 @@ impl RuntimeProvider for HerdrRuntime {
         BackendIdentity::named("herdr")
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        &[
-            OBSERVE_CAPABILITY,
-            PROCESS_INFO_CAPABILITY,
-            FOCUS_CAPABILITY,
-            CLOSE_CAPABILITY,
-            CREATE_CAPABILITY,
-            INPUT_CAPABILITY,
-            OUTPUT_CAPABILITY,
-            REPORT_CAPABILITY,
-            LAUNCH_CAPABILITY,
-            LAUNCH_CONTEXT_CAPABILITY,
-        ]
+    fn primitives(&self) -> Primitives {
+        Primitives::OBSERVE
+            .union(Primitives::PROCESS_INFO)
+            .union(Primitives::FOCUS)
+            .union(Primitives::CLOSE)
+            .union(Primitives::CREATE)
+            .union(Primitives::INPUT)
+            .union(Primitives::OUTPUT)
+            .union(Primitives::REPORT)
+            .union(Primitives::LAUNCH)
+            .union(Primitives::LAUNCH_CONTEXT)
     }
 
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {

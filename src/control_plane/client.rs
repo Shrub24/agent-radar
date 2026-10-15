@@ -14,7 +14,7 @@
 //!   An operation the daemon may have accepted stays unknown: it is never retried
 //!   through the direct adapter, because that would be a second execution of
 //!   something that may already have happened.
-//! * **The daemon's capabilities are the client's.** A backend that cannot create
+//! * **The daemon revision must match the client's.** A backend that cannot create
 //!   or report is not answered by a different operation here; the daemon's own
 //!   refusal is passed on as a refusal.
 //! * **A socket is vouched for before it is dialled.** [`DaemonRuntime::handshake`]
@@ -141,22 +141,20 @@ pub struct DaemonRuntime {
 
 impl DaemonRuntime {
     /// Whether the daemon advertised `contract`.
-    fn serves(&self, contract: &str) -> bool {
-        self.declared.iter().any(|name| name == contract)
+    fn serves(&self, contract: ops::Contract) -> bool {
+        self.declared.iter().any(|name| name == contract.as_str())
     }
 
-    /// The capabilities Radar's dashboard cannot work without: it observes, asks
-    /// for foreground evidence, focuses and closes.
+    /// The primitives the dashboard implements: observation, foreground evidence,
+    /// focus and close.
     ///
     /// Anything beyond these is asked for and answered by the daemon: a backend
     /// that cannot create or report refuses that operation by name rather than
     /// making the whole daemon unusable.
-    pub const REQUIRED: &'static [&'static str] = &[
-        ops::OBSERVE_CAPABILITY,
-        ops::PROCESS_INFO_CAPABILITY,
-        ops::FOCUS_CAPABILITY,
-        ops::CLOSE_CAPABILITY,
-    ];
+    pub const REQUIRED: ops::Primitives = ops::Primitives::OBSERVE
+        .union(ops::Primitives::PROCESS_INFO)
+        .union(ops::Primitives::FOCUS)
+        .union(ops::Primitives::CLOSE);
 
     /// Pings the daemon at `socket` and proves it is one Radar can use: the path
     /// is one Radar may trust, it answers, it speaks this protocol version, and it
@@ -240,7 +238,7 @@ impl DaemonRuntime {
 
     /// Volatile publisher task state, fetched as one revision-consistent snapshot.
     pub fn task_snapshot(&self) -> Result<TaskSnapshot, String> {
-        if !self.serves(ops::TASKS_LIST_CONTRACT) {
+        if !self.serves(ops::Contract::TasksList) {
             return Err(self.task_diagnostic.clone().unwrap_or_else(|| {
                 "the control daemon does not provide `tasks.list.v1`".to_string()
             }));
@@ -397,9 +395,9 @@ impl RuntimeProvider for DaemonRuntime {
         self.identity.clone()
     }
 
-    fn capabilities(&self) -> &'static [&'static str] {
-        // The daemon's own backend primitives are not on the wire. What this
-        // client asks of the daemon is fixed, so that is what it reports.
+    fn primitives(&self) -> ops::Primitives {
+        // What this client implements is fixed; the daemon's own backend
+        // primitives are private and are never returned on the wire.
         Self::REQUIRED
     }
 
@@ -415,9 +413,9 @@ impl RuntimeProvider for DaemonRuntime {
     fn registry(&self, cancel: &AtomicBool) -> Result<Option<RegistryRead>, String> {
         // Without the registry there are no agent facts, and the inventory's own
         // agent records are not a substitute. Refreshing fails visibly instead.
-        for contract in [ops::REGISTRY_CONTRACT, ops::SPAWN_CONTRACT] {
+        for contract in [ops::Contract::Registry, ops::Contract::Spawn] {
             if !self.serves(contract) {
-                return Err(self.describe(format!("does not provide `{contract}`")));
+                return Err(self.describe(format!("does not provide `{}`", contract.as_str())));
             }
         }
         let deadline = Instant::now() + REGISTRY_READ_DEADLINE;
@@ -439,7 +437,7 @@ impl RuntimeProvider for DaemonRuntime {
         // Containers are the daemon's own records, and a daemon that does not
         // serve them has none: a missing contract reads as no containers rather
         // than as a refresh that failed.
-        let containers = if self.serves(ops::TOPOLOGY_LIST_CONTRACT) {
+        let containers = if self.serves(ops::Contract::TopologyList) {
             self.read_all("topology.list", "containers", deadline, cancel, |value| {
                 let page: ContainerPage = serde_json::from_value(value)?;
                 Ok((page.containers, page.next))
@@ -447,7 +445,7 @@ impl RuntimeProvider for DaemonRuntime {
         } else {
             Vec::new()
         };
-        let lifecycle = if self.serves(ops::LIFECYCLE_LIST_CONTRACT) {
+        let lifecycle = if self.serves(ops::Contract::LifecycleList) {
             self.read_all(
                 "lifecycle.list",
                 "managed lifecycle subjects",
@@ -618,7 +616,7 @@ pub fn connect_at(socket: &Path) -> Result<Selected, String> {
         containers: Some(Arc::clone(&daemon) as Arc<dyn ContainerControls>),
         lifecycle: Some(Arc::clone(&daemon) as Arc<dyn LifecycleControls>),
         tasks: daemon
-            .serves(ops::TASKS_LIST_CONTRACT)
+            .serves(ops::Contract::TasksList)
             .then(|| Arc::clone(&daemon)),
         task_diagnostic: daemon.task_diagnostic.clone(),
     })
@@ -1173,13 +1171,13 @@ impl ContainerAnswer {
 impl DaemonRuntime {
     fn lifecycle_control(
         &self,
-        contract: &str,
+        contract: ops::Contract,
         method: &str,
         request: &LifecycleControlRequest,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
         if !self.serves(contract) {
-            return Err(self.describe(format!("does not provide `{contract}`")));
+            return Err(self.describe(format!("does not provide `{}`", contract.as_str())));
         }
         let result = exchange_with_id_at(
             &self.socket,
@@ -1200,14 +1198,14 @@ impl DaemonRuntime {
     /// refuses work this daemon does not serve instead of discovering it mid-effect.
     fn container_control(
         &self,
-        contract: &str,
+        contract: ops::Contract,
         request_id: &str,
         method: &str,
         params: Value,
         cancel: &AtomicBool,
     ) -> Result<ContainerAnswer, String> {
         if !self.serves(contract) {
-            return Err(self.describe(format!("does not provide `{contract}`")));
+            return Err(self.describe(format!("does not provide `{}`", contract.as_str())));
         }
         let result = exchange_with_id_at(&self.socket, request_id, method, params, cancel)
             .map_err(|failure| failure.message)?;
@@ -1246,7 +1244,7 @@ impl DaemonRuntime {
 
 impl LifecycleControls for DaemonRuntime {
     fn supports_child_close(&self) -> bool {
-        self.serves(ops::SPAWN_CLOSE_CONTRACT)
+        self.serves(ops::Contract::SpawnClose)
     }
 
     fn read_operation(
@@ -1269,8 +1267,11 @@ impl LifecycleControls for DaemonRuntime {
         target: &crate::registry_observation::ChildCloseTarget,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
-        if !self.serves(ops::SPAWN_CLOSE_CONTRACT) {
-            return Err(self.describe(format!("does not provide `{}`", ops::SPAWN_CLOSE_CONTRACT)));
+        if !self.serves(ops::Contract::SpawnClose) {
+            return Err(self.describe(format!(
+                "does not provide `{}`",
+                ops::Contract::SpawnClose.as_str()
+            )));
         }
         let result = exchange_with_id_at(
             &self.socket,
@@ -1296,7 +1297,7 @@ impl LifecycleControls for DaemonRuntime {
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
         self.lifecycle_control(
-            ops::LIFECYCLE_CANCEL_CONTRACT,
+            ops::Contract::LifecycleCancel,
             "lifecycle.cancel",
             request,
             cancel,
@@ -1309,7 +1310,7 @@ impl LifecycleControls for DaemonRuntime {
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
         self.lifecycle_control(
-            ops::LIFECYCLE_STOP_CONTRACT,
+            ops::Contract::LifecycleStop,
             "lifecycle.stop",
             request,
             cancel,
@@ -1322,7 +1323,7 @@ impl LifecycleControls for DaemonRuntime {
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
         self.lifecycle_control(
-            ops::LIFECYCLE_RESTART_CONTRACT,
+            ops::Contract::LifecycleRestart,
             "lifecycle.restart",
             request,
             cancel,
@@ -1349,10 +1350,10 @@ impl DaemonRuntime {
         session: &str,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
-        if !self.serves(ops::LIFECYCLE_ENROLL_CONTRACT) {
+        if !self.serves(ops::Contract::LifecycleEnroll) {
             return Err(self.describe(format!(
                 "does not provide `{}`",
-                ops::LIFECYCLE_ENROLL_CONTRACT
+                ops::Contract::LifecycleEnroll.as_str()
             )));
         }
         let result = exchange_with_id_at(
@@ -1407,7 +1408,7 @@ impl ContainerControls for DaemonRuntime {
                 .map_err(|error| self.describe(format!("cannot carry the recipe: {error}")))?;
         }
         self.container_control(
-            ops::TOPOLOGY_CREATE_CONTRACT,
+            ops::Contract::TopologyCreate,
             &request.request_id,
             "topology.create",
             params,
@@ -1428,7 +1429,7 @@ impl ContainerControls for DaemonRuntime {
             "requester": REQUESTER,
         });
         self.container_control(
-            ops::TOPOLOGY_DELETE_CONTRACT,
+            ops::Contract::TopologyDelete,
             &request.request_id,
             "topology.delete",
             params,
@@ -1446,7 +1447,7 @@ impl ContainerControls for DaemonRuntime {
             "requester": REQUESTER,
         });
         self.container_control(
-            ops::TOPOLOGY_RELOAD_CONTRACT,
+            ops::Contract::TopologyReload,
             &request.request_id,
             "topology.reload",
             params,
