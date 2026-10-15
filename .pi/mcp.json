@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "rust-docs": {
+      "command": "nix",
+      "args": [
+        "run",
+        "github:snowmead/rust-docs-mcp/8c89df058f3be23db74435569c63fa8d08601767"
+      ],
+      "description": "Search Rust crate documentation, inspect source and types, and examine dependencies."
+    }
+  }
+}
