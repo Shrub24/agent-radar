@@ -153,7 +153,8 @@ export async function resolveRadarProcessLocation(
 	const backend = ready.value.backend;
 	if (backend === undefined || backend === "none")
 		return { state: "absent", reason: "the daemon serves no physical backend" };
-	const own = qualifiedOwnPane(env, backend, ready.value.instance);
+	const instance = ready.value.instance ?? undefined;
+	const own = qualifiedOwnPane(env, backend, instance);
 	if ("absent" in own) return { state: "absent", reason: own.absent };
 	if ("pending" in own) return { state: "pending", reason: own.pending };
 	const paneId = own.pane;
@@ -186,7 +187,6 @@ export async function resolveRadarProcessLocation(
 	if ("ambiguous" in containment)
 		return { state: "pending", reason: containment.ambiguous };
 	const row = containment.pane;
-	const instance = ready.value.instance;
 	return {
 		state: "resolved",
 		location: {

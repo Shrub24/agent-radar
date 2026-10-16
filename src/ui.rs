@@ -8740,6 +8740,9 @@ mod tests {
                     managed: Some(crate::registry_observation::ManagedSubject {
                         subject_id: "subject-managed".into(),
                         process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
+                        identity_unresolved: false,
+                        launch_identity: crate::registry_observation::LaunchIdentityEvidence::Missing,
+                        metadata: crate::control_plane::lifecycle::ManagedMetadata::default(),
                         child_close: None,
                         state: crate::control_plane::lifecycle::State::Bound,
                         session: Some("01a10c77-8a6b-7035-8a0e-b1fa607bb507".into()),

@@ -44,6 +44,10 @@ try {
 	for (const file of [
 		"daemon-ping.serialize.schema.json",
 		"daemon-ping.deserialize.schema.json",
+		"managed-launch-metadata.serialize.schema.json",
+		"managed-launch-metadata.deserialize.schema.json",
+		"launch-identity-marker.serialize.schema.json",
+		"launch-identity-marker.deserialize.schema.json",
 		"facts-snapshot.serialize.schema.json",
 		"facts-snapshot.deserialize.schema.json",
 		"spawn-exit-observation.serialize.schema.json",
@@ -57,6 +61,8 @@ try {
 
 	const types = [
 		["daemon-ping.serialize.schema.json", "DaemonPingResult"],
+		["managed-launch-metadata.deserialize.schema.json", "ManagedLaunchMetadataDeserialize"],
+		["launch-identity-marker.serialize.schema.json", "LaunchIdentityMarker"],
 		["facts-snapshot.deserialize.schema.json", "FactsSnapshotInput"],
 		["spawn-exit-observation.serialize.schema.json", "SpawnExitObservation"],
 	];

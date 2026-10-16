@@ -94,3 +94,27 @@ Order: consolidate daemon ingest, shared observation, tmux control mode, sidebar
 ## Publishers must publish `context_window`
 
 `facts.context_usage` text is no longer accepted: the facts channel takes `context_window { tokens, window }` integers and refuses anything else. The Pi extension (pi-extensions) and Herdsman must publish it before their next release or their whole facts snapshot is refused. The Herdr `context_usage` token stays a percentage-only legacy input.
+
+## Lifecycle-authority acceptance still owed
+
+The `lifecycle-authority` code is in place; these are the verification gaps that
+remain, deliberately deferred rather than claimed:
+
+- **Crash injection at each durable boundary.** There is no shared transaction
+  across the operation store, spawn edges and the lifecycle log, so the designed
+  write order (`openspec/changes/lifecycle-authority/design.md`, decision 6a) is
+  unverified. Inject a crash after each durable step, reopen the daemon, and prove
+  accepted intent stays visible, a possibly-dispatched launch is never repeated,
+  and a partial record stays unresolved.
+- **Beyond-one-page sweeps on a real fleet.** Fair paging is unit-tested; a real
+  registry or container set larger than one page is not.
+- **Event coalescing versus expiry.** `events.read` already answers
+  `cursor_expired` with no partial sequence; a test that committed semantic events
+  are either delivered or explicitly expired is still owed.
+- **Live acceptance.** PTY/tmux managed actions, live Pi marker persistence across
+  restart and reload, two-display and no-display coverage, and the Herdsman
+  cutover to the shared runtime handle.
+- **`observation.get` still serializes internal types.** `server::read_observation`
+  returns the observation snapshot directly instead of through dedicated
+  Schemars DTOs, so the public observation contract is not yet separated the way
+  the rest of the protocol is. Small follow-up change.

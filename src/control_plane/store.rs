@@ -99,8 +99,15 @@ fn journal_lock(root: &Path) -> Arc<Mutex<()>> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub seq: u64,
+    /// Stable logical lifecycle subject ID, or a container ID for topology events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
+    /// Exact lifecycle execution affected by a subject event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    /// One-based logical execution generation for lifecycle events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_generation: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_event_id: Option<String>,
     pub kind: String,
@@ -217,6 +224,13 @@ pub struct RequestRecord {
     pub created: Option<CreatedIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+    /// Set when an operator abandoned this record's recovery obligation. The
+    /// uncertainty is preserved — an abandoned record still says the daemon
+    /// cannot establish what the operation did — and only its administrative
+    /// block is released. Independent process and pane safety checks never
+    /// consult this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned_at: Option<String>,
 }
 
 impl RequestRecord {
@@ -246,6 +260,7 @@ impl RequestRecord {
             effects: Vec::new(),
             created: None,
             completed_at: None,
+            abandoned_at: None,
         }
     }
 
@@ -300,6 +315,37 @@ impl RequestRecord {
             completed_at: Some(format_millis(now_ms)),
             ..self.clone()
         }
+    }
+
+    /// Ends this record's recovery obligation without establishing its outcome.
+    ///
+    /// The uncertainty is preserved: the record keeps — or gains — the
+    /// [`RequestOutcome::Unknown`] answer, because abandoning a record does not
+    /// make its effect known. What changes is only that the administrative block
+    /// it held is released, so the target it named can be operated on again.
+    /// Nothing here authorizes a replay, and nothing here is consulted by a
+    /// process or pane safety check.
+    pub fn abandoned(&self, now_ms: i64) -> Self {
+        Self {
+            state: RecordState::Completed,
+            outcome: Some(self.outcome.unwrap_or(RequestOutcome::Unknown)),
+            message: Some(
+                self.message
+                    .clone()
+                    .unwrap_or_else(|| "an operator abandoned this record's recovery obligation; its effect is still unestablished".to_string()),
+            ),
+            completed_at: self
+                .completed_at
+                .clone()
+                .or_else(|| Some(format_millis(now_ms))),
+            abandoned_at: Some(format_millis(now_ms)),
+            ..self.clone()
+        }
+    }
+
+    /// Whether this record's recovery obligation was abandoned.
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned_at.is_some()
     }
 }
 
@@ -785,6 +831,10 @@ impl Store {
     /// a trustworthy account of what it did. Both suppress another mutation over
     /// the same target: an unknown effect must not be replayed. `None` is a
     /// daemon-wide lane when the request did not name a target.
+    ///
+    /// An abandoned record does not suppress anything: an operator ended its
+    /// recovery obligation. It stays unresolved in every read — its effect is
+    /// still unestablished — but it no longer holds its target.
     pub fn unresolved(
         &self,
         target: Option<&str>,
@@ -793,12 +843,49 @@ impl Store {
         let held = self.recent(usize::MAX)?;
         Ok(held.into_iter().find(|record| {
             record.target.as_deref() == target
+                && !record.is_abandoned()
                 && !changes_nothing(&record.method)
                 && matches!(
                     record.derive(now_ms),
                     Derived::Pending | Derived::Unknown | Derived::Settled(RequestOutcome::Unknown)
                 )
         }))
+    }
+
+    /// Ends one record's recovery obligation, releasing only its administrative
+    /// block.
+    ///
+    /// Refused when the record is already settled with a definite outcome, or was
+    /// never claimed: there is nothing unresolved to abandon. Abandoning twice is
+    /// idempotent and answers with the record as it stands.
+    pub fn abandon(&self, id: &str, now_ms: i64) -> Result<RequestRecord, String> {
+        // `recent` is the one reader that applies the event log's operation
+        // projection, so an abandonment is decided against the same view every
+        // other reader gets.
+        let record = self
+            .recent(usize::MAX)?
+            .into_iter()
+            .find(|record| record.id == id)
+            .ok_or_else(|| format!("no request `{id}` is recorded"))?;
+        if record.is_abandoned() {
+            return Ok(record);
+        }
+        match record.derive(now_ms) {
+            Derived::Unknown | Derived::Settled(RequestOutcome::Unknown) => {}
+            Derived::Settled(outcome) => {
+                return Err(format!(
+                    "request `{id}` has a definite outcome ({outcome:?}); there is nothing to abandon"
+                ));
+            }
+            Derived::Pending | Derived::NotExecuted => {
+                return Err(format!(
+                    "request `{id}` was never claimed, so nothing ran and nothing is unresolved"
+                ));
+            }
+        }
+        let abandoned = record.abandoned(now_ms);
+        self.write(&abandoned)?;
+        Ok(abandoned)
     }
 
     fn path(&self, id: &str) -> PathBuf {
@@ -966,6 +1053,30 @@ fn fallback_bytes() -> [u8; 16] {
     bytes
 }
 
+/// One bounded page of a sorted listing, starting after `after`, with the cursor
+/// the next pass continues from.
+///
+/// A cursor names the last record examined, so paging resumes after it whether or
+/// not that record still exists; `None` means this page reached the end of the
+/// listing and the next pass starts over. Every record is therefore examined
+/// within a bounded number of passes, whatever the listing's size — which is what
+/// keeps a periodic sweep fair instead of re-examining the same first page.
+pub fn page_after(
+    ids: &[String],
+    after: Option<&str>,
+    limit: usize,
+) -> (Vec<String>, Option<String>) {
+    let start = match after {
+        None => 0,
+        Some(after) => ids.partition_point(|id| id.as_str() <= after),
+    };
+    let page: Vec<String> = ids[start..].iter().take(limit).cloned().collect();
+    let next = (ids.len() > start + page.len())
+        .then(|| page.last().cloned())
+        .flatten();
+    (page, next)
+}
+
 /// Now, in the store's timestamp format, for a caller that has no clock of its
 /// own to hand.
 pub fn now() -> String {
@@ -1040,6 +1151,106 @@ mod tests {
     }
 
     #[test]
+    fn bounded_paging_reaches_every_record_instead_of_only_the_first_page() {
+        let ids: Vec<String> = (1..=5).map(|n| format!("{n:020}")).collect();
+        let mut after: Option<String> = None;
+        let mut seen: Vec<String> = Vec::new();
+        let mut passes = 0;
+        loop {
+            let (page, next) = page_after(&ids, after.as_deref(), 2);
+            assert!(page.len() <= 2, "a pass stays bounded");
+            seen.extend(page);
+            passes += 1;
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+            assert!(passes < 10, "paging must terminate");
+        }
+        assert_eq!(seen, ids, "every record is examined in turn");
+        assert_eq!(
+            passes, 3,
+            "a five-record listing takes three bounded passes"
+        );
+
+        // A cursor whose record is gone still resumes after its position.
+        let (page, next) = page_after(&ids, Some("00000000000000000002"), 2);
+        assert_eq!(page, vec![ids[2].clone(), ids[3].clone()]);
+        assert_eq!(next.as_deref(), Some(ids[3].as_str()));
+        // A cursor past the end reports the end, so the next pass starts over.
+        let (page, next) = page_after(&ids, Some(&ids[4]), 2);
+        assert!(page.is_empty());
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn an_abandoned_record_releases_its_target_but_keeps_its_uncertainty() {
+        let directory = tempdir("abandon");
+        let store = Store::open(&directory).expect("store");
+        let held = record("mux.close", Some("pane:9"), 0);
+        store.create(&held).expect("create");
+        store.write(&held.claim().start()).expect("start");
+        assert!(
+            store
+                .unresolved(Some("pane:9"), 1)
+                .expect("lookup")
+                .is_some()
+        );
+
+        let abandoned = store.abandon(&held.id, 2).expect("abandon");
+        assert!(abandoned.is_abandoned());
+        assert_eq!(abandoned.state, RecordState::Completed);
+        // The uncertainty is preserved: abandoning does not establish the effect.
+        assert_eq!(abandoned.outcome, Some(RequestOutcome::Unknown));
+        // Only the administrative block is gone, so the target is free again.
+        assert!(
+            store
+                .unresolved(Some("pane:9"), 3)
+                .expect("lookup")
+                .is_none()
+        );
+        // Abandoning twice answers with the record as it already stands.
+        assert_eq!(
+            store.abandon(&held.id, 4).expect("abandon twice"),
+            abandoned
+        );
+    }
+
+    #[test]
+    fn abandoning_a_record_that_never_ran_or_is_already_settled_is_refused() {
+        let directory = tempdir("abandon-refused");
+        let store = Store::open(&directory).expect("store");
+        // A recorded but unclaimed request is not uncertain: nothing ran, and its
+        // own expiry releases the target.
+        let pending = record("mux.close", Some("pane:9"), 0);
+        store.create(&pending).expect("create");
+        let refused = store
+            .abandon(&pending.id, 1)
+            .expect_err("a pending record is not unresolved");
+        assert!(refused.contains("never claimed"), "{refused}");
+
+        let other = RequestRecord::new(
+            &random_uuid(),
+            "mux.close",
+            Some("radar".into()),
+            Some("pane:8".into()),
+            0,
+        );
+        store.create(&other).expect("create");
+        let settled = other.complete(RequestOutcome::Completed, None, None, Vec::new(), 1);
+        store.write(&settled).expect("settle");
+        let refused = store
+            .abandon(&other.id, 2)
+            .expect_err("a settled record has nothing to abandon");
+        assert!(refused.contains("definite outcome"), "{refused}");
+
+        let missing = store
+            .abandon(&random_uuid(), 3)
+            .expect_err("no such record");
+        assert!(missing.contains("no request"), "{missing}");
+    }
+
+    #[test]
     fn journal_is_ordered_bounded_and_persistent_and_has_safe_event_shape() {
         let directory = tempdir("journal");
         let store = Store::open(&directory).expect("store");
@@ -1048,6 +1259,8 @@ mod tests {
             store
                 .append_event(Event {
                     subject_id: None,
+                    execution_id: None,
+                    execution_generation: None,
                     lifecycle_event_id: None,
                     seq: 0,
                     kind: format!("k{n}"),
@@ -1071,6 +1284,8 @@ mod tests {
         let event = reopened
             .append_event(Event {
                 subject_id: None,
+                execution_id: None,
+                execution_generation: None,
                 lifecycle_event_id: None,
                 seq: 0,
                 kind: "publication".into(),
@@ -1098,6 +1313,8 @@ mod tests {
                         store
                             .append_event(Event {
                                 subject_id: None,
+                                execution_id: None,
+                                execution_generation: None,
                                 lifecycle_event_id: None,
                                 seq: 0,
                                 kind: "concurrent".into(),

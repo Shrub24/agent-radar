@@ -14,9 +14,12 @@
 //! The lock is never held across a wait for a process to exit.
 
 mod observation;
-pub use observation::{Evidence, Observation, Observer, observe_exit_from};
+pub use observation::{
+    ABSENCE_CONFIRMATIONS, ABSENCE_WINDOW, EndedEvidence, EndedReason, Evidence, Observation,
+    Observer, PaneAbsence, PaneEvidence, observe_exit_from, observe_pane,
+};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -41,6 +44,9 @@ use crate::runtime::LaunchRequest;
 /// Environment variables the bootstrap reads and removes before the program runs.
 pub const SUBJECT_ENV: &str = "PI_RADAR_LAUNCH_SUBJECT";
 pub const CORRELATION_ENV: &str = "PI_RADAR_LAUNCH_CORRELATION";
+pub const MANAGED_SUBJECT_ENV: &str = "PI_RADAR_MANAGED_SUBJECT_ID";
+pub const MANAGED_LAUNCH_ENV: &str = "PI_RADAR_MANAGED_LAUNCH_ID";
+pub const MANAGED_GENERATION_ENV: &str = "PI_RADAR_MANAGED_EXECUTION_GENERATION";
 
 /// The internal method a bootstrap calls to claim its process.
 pub const BOOTSTRAP_METHOD: &str = "spawn.bootstrap";
@@ -59,7 +65,7 @@ pub const NOT_AWAITING: &str = "launch is not awaiting a bootstrap";
 /// Refusal for a captured process that was not started with the requested launch.
 pub const LAUNCH_MISMATCH: &str = "launch context does not match the requested launch";
 
-const SUBJECT_VERSION: u32 = 1;
+const SUBJECT_VERSION: u32 = 2;
 const MAX_SUBJECT_BYTES: usize = 64 * 1024;
 /// How long a cancelled process gets to exit after SIGTERM before the operation
 /// reports the exit as not verified.
@@ -129,15 +135,70 @@ pub enum Origin {
 
 /// One durable launch subject. The correlation is a private credential and is
 /// spent at capture; no public read returns it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_subject_id: Option<String>,
+}
+
+impl ManagedMetadata {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("owner", &self.owner),
+            ("run", &self.run),
+            ("label", &self.label),
+            ("role", &self.role),
+        ] {
+            if let Some(value) = value
+                && (value.trim().is_empty()
+                    || value.len() > 256
+                    || value.chars().any(char::is_control))
+            {
+                return Err(format!(
+                    "managed {name} must be non-empty, control-free, and at most 256 bytes"
+                ));
+            }
+        }
+        if self
+            .parent_subject_id
+            .as_deref()
+            .is_some_and(|id| SessionUuid::parse(id).is_none())
+        {
+            return Err("managed parent_subject_id must be a canonical UUID".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Subject {
     pub version: u32,
+    /// Execution-record ID retained for private storage and exact process fences.
     pub subject_id: String,
+    /// Stable logical subject ID shared by every exact successor execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_subject_id: Option<String>,
+    /// One-based generation within the logical subject; absent only before migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_generation: Option<u32>,
+    #[serde(default)]
+    pub identity_unresolved: bool,
     pub spawn_request_id: String,
     #[serde(default)]
     pub origin: Origin,
     pub state: State,
+    #[serde(default)]
+    pub managed: ManagedMetadata,
     pub launch: LaunchContext,
     /// The Pi session a restart resumes. Present only on a restartable subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +214,17 @@ pub struct Subject {
     pub process: Option<ProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<Observation>,
+    /// A bound pane's absence under confirmation. Weak evidence, so it is a
+    /// pending window rather than a transition until it is confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_absence: Option<PaneAbsence>,
+    /// Set when a launch ended without a verified process exit, with the evidence
+    /// that established it. Distinct from `exited_at`, which only a verified
+    /// process exit sets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_externally_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_evidence: Option<EndedEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_agent_id: Option<String>,
     /// Recorded before a SIGTERM is sent, so a signal is never sent twice.
@@ -170,7 +242,13 @@ pub struct Subject {
 /// What a spawn needs to launch a tracked child: the subject it belongs to and
 /// the correlation its bootstrap presents.
 pub struct Ticket {
+    /// Exact execution record ID bound to the spawn edge.
     pub subject_id: String,
+    /// Stable logical subject identity issued for this process.
+    pub logical_subject_id: String,
+    /// The exact Radar launch operation that created this execution.
+    pub launch_id: String,
+    pub execution_generation: u32,
     pub correlation: String,
 }
 
@@ -242,15 +320,27 @@ fn draft(
     spawn_request_id: &str,
     launch: LaunchContext,
     session: Option<String>,
+    identity: Option<(String, u32)>,
+    managed: ManagedMetadata,
     now_ms: i64,
 ) -> Subject {
+    let execution_id = random_uuid();
+    let (logical_subject_id, execution_generation) =
+        identity.unwrap_or_else(|| (execution_id.clone(), 1));
     Subject {
         observation: None,
+        pane_absence: None,
+        ended_externally_at: None,
+        ended_evidence: None,
         version: SUBJECT_VERSION,
-        subject_id: random_uuid(),
+        subject_id: execution_id,
+        logical_subject_id: Some(logical_subject_id),
+        execution_generation: Some(execution_generation),
+        identity_unresolved: false,
         spawn_request_id: spawn_request_id.to_string(),
         origin: Origin::Spawned,
         state: State::Pending,
+        managed,
         launch,
         correlation: Some(random_uuid()),
         process: None,
@@ -267,7 +357,15 @@ fn draft(
 /// Refuses a launch whose subject record would exceed its bound. The record is
 /// the launch's only durable correlation, so an oversized launch is never started.
 pub fn check_bounds(launch: &LaunchContext) -> Result<(), String> {
-    let draft = draft("", launch.clone(), None, 0);
+    check_bounds_with_metadata(launch, &ManagedMetadata::default())
+}
+
+pub fn check_bounds_with_metadata(
+    launch: &LaunchContext,
+    managed: &ManagedMetadata,
+) -> Result<(), String> {
+    managed.validate()?;
+    let draft = draft("", launch.clone(), None, None, managed.clone(), 0);
     let bytes = serde_json::to_vec_pretty(&draft).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_SUBJECT_BYTES {
         return Err("the launch is too large to track".into());
@@ -284,11 +382,62 @@ pub fn create(
     session: Option<String>,
     now_ms: i64,
 ) -> Result<Ticket, String> {
+    create_with_intent(
+        registry,
+        spawn_request_id,
+        launch,
+        session,
+        None,
+        ManagedMetadata::default(),
+        now_ms,
+    )
+}
+
+/// Creates one execution under an existing logical subject. The caller supplies
+/// this only for a durable, exact successor operation.
+pub fn create_with_identity(
+    registry: &Registry,
+    spawn_request_id: &str,
+    launch: LaunchContext,
+    session: Option<String>,
+    identity: Option<(String, u32)>,
+    now_ms: i64,
+) -> Result<Ticket, String> {
+    create_with_intent(
+        registry,
+        spawn_request_id,
+        launch,
+        session,
+        identity,
+        ManagedMetadata::default(),
+        now_ms,
+    )
+}
+
+pub fn create_with_intent(
+    registry: &Registry,
+    spawn_request_id: &str,
+    launch: LaunchContext,
+    session: Option<String>,
+    identity: Option<(String, u32)>,
+    managed: ManagedMetadata,
+    now_ms: i64,
+) -> Result<Ticket, String> {
     let _transition = registry.transition();
-    let subject = draft(spawn_request_id, launch, session, now_ms);
+    if identity
+        .as_ref()
+        .is_some_and(|(_, generation)| *generation == 0)
+    {
+        return Err("execution generation must be positive".into());
+    }
+    managed.validate()?;
+    let subject = draft(spawn_request_id, launch, session, identity, managed, now_ms);
     write(registry, &subject)?;
     Ok(Ticket {
         subject_id: subject.subject_id,
+        logical_subject_id: subject.logical_subject_id.unwrap_or_default(),
+        launch_id: subject.spawn_request_id,
+        execution_generation: subject.execution_generation.unwrap_or(1),
         correlation: subject.correlation.unwrap_or_default(),
     })
 }
@@ -317,9 +466,12 @@ pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Subject>, St
     let bytes = read_record_file(&path, MAX_SUBJECT_BYTES)?;
     let mut subject: Subject =
         serde_json::from_slice(&bytes).map_err(|error| format!("not a launch subject: {error}"))?;
-    if subject.version != SUBJECT_VERSION || subject.subject_id != subject_id {
+    if !matches!(subject.version, 1 | SUBJECT_VERSION) || subject.subject_id != subject_id {
         return Err("launch subject does not match its name or version".into());
     }
+    // Reading a legacy file upgrades only the in-memory view. The event log is
+    // migrated separately and remains the authoritative durable record.
+    subject.version = SUBJECT_VERSION;
     if let Some(facts) = facts {
         facts.apply_to(&mut subject);
     }
@@ -328,6 +480,143 @@ pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Subject>, St
 
 fn read_recorded(registry: &Registry, subject_id: &str) -> Result<Subject, String> {
     read(registry, subject_id)?.ok_or_else(|| "tracked launch subject is unavailable".to_string())
+}
+
+/// Reads the current execution for a stable public logical subject ID.
+pub fn read_logical(
+    registry: &Registry,
+    logical_subject_id: &str,
+) -> Result<Option<Subject>, String> {
+    if SessionUuid::parse(logical_subject_id).is_none() {
+        return Err("`subject_id` must be a canonical UUID".into());
+    }
+    let mut execution: Option<(u32, String)> = None;
+    let mut matching_count = 0usize;
+    let mut has_unresolved = false;
+    for (execution_id, facts) in registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .all_facts()
+    {
+        if facts.logical_subject_id.as_deref() != Some(logical_subject_id) {
+            continue;
+        }
+        matching_count += 1;
+        has_unresolved |= facts.identity_unresolved;
+        let generation = facts.execution_generation.unwrap_or(0);
+        match &execution {
+            Some((current_generation, _current_id)) if *current_generation > generation => {}
+            Some((current_generation, current_id))
+                if *current_generation == generation && current_id != &execution_id =>
+            {
+                return Err(format!(
+                    "logical subject {logical_subject_id} has multiple executions at generation {generation}"
+                ));
+            }
+            _ => execution = Some((generation, execution_id)),
+        }
+    }
+    if matching_count > 1 && has_unresolved {
+        return Err(format!(
+            "logical subject {logical_subject_id} has unresolved execution continuity"
+        ));
+    }
+    match execution.map(|(_, execution_id)| execution_id) {
+        Some(execution_id) => read(registry, &execution_id),
+        None => read(registry, logical_subject_id),
+    }
+}
+
+/// All exact execution IDs durably assigned to one stable logical subject.
+pub fn execution_ids_for_logical(registry: &Registry, logical_subject_id: &str) -> Vec<String> {
+    registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .all_facts()
+        .into_iter()
+        .filter(|(_, facts)| facts.logical_subject_id.as_deref() == Some(logical_subject_id))
+        .map(|(execution_id, _)| execution_id)
+        .collect()
+}
+
+/// Lists one latest execution per stable logical subject, ordered by logical ID.
+pub fn list_logical_after(
+    registry: &Registry,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Subject>, String> {
+    let facts = registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .all_facts();
+    let mut known_executions = BTreeSet::new();
+    let mut latest = BTreeMap::<String, (u32, String)>::new();
+    let mut logical_counts = BTreeMap::<String, usize>::new();
+    let mut unresolved_logicals = BTreeSet::new();
+    for (execution_id, facts) in facts {
+        known_executions.insert(execution_id.clone());
+        let logical_id = facts
+            .logical_subject_id
+            .unwrap_or_else(|| execution_id.clone());
+        let generation = facts.execution_generation.unwrap_or(1);
+        *logical_counts.entry(logical_id.clone()).or_default() += 1;
+        if facts.identity_unresolved {
+            unresolved_logicals.insert(logical_id.clone());
+        }
+        match latest.get(&logical_id) {
+            Some((old_generation, _old_id)) if *old_generation > generation => {}
+            Some((old_generation, old_id))
+                if *old_generation == generation && old_id != &execution_id =>
+            {
+                return Err(format!(
+                    "logical subject {logical_id} has multiple executions at generation {generation}"
+                ));
+            }
+            _ => {
+                latest.insert(logical_id, (generation, execution_id));
+            }
+        }
+    }
+    if let Some(logical_id) = unresolved_logicals
+        .iter()
+        .find(|id| logical_counts.get(*id).copied().unwrap_or_default() > 1)
+    {
+        return Err(format!(
+            "logical subject {logical_id} has unresolved execution continuity"
+        ));
+    }
+    // Include pre-event legacy records without deserializing every record in the
+    // page scan. A record with no event facts is its own generation-one root.
+    let entries = match fs::read_dir(registry.subjects()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("launch subjects: {error}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("launch subject directory entry: {error}"))?;
+        let filename = entry.file_name();
+        let Some(id) = filename
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|id| SessionUuid::parse(id).is_some())
+        else {
+            continue;
+        };
+        if !known_executions.contains(id) {
+            latest
+                .entry(id.to_string())
+                .or_insert_with(|| (1, id.to_string()));
+        }
+    }
+    latest
+        .into_iter()
+        .filter(|(logical_id, _)| after.is_none_or(|cursor| logical_id.as_str() > cursor))
+        .take(limit)
+        .map(|(_, (_, execution_id))| read_recorded(registry, &execution_id))
+        .collect()
 }
 
 /// Records what a cancel did about the launch's own pane. The first outcome is
@@ -478,13 +767,21 @@ pub fn enroll_subject(
     launch: LaunchContext,
     now_ms: i64,
 ) -> Result<String, String> {
+    let subject_id = random_uuid();
     let subject = Subject {
         observation: None,
+        pane_absence: None,
+        ended_externally_at: None,
+        ended_evidence: None,
         version: SUBJECT_VERSION,
-        subject_id: random_uuid(),
+        subject_id: subject_id.clone(),
+        logical_subject_id: Some(subject_id),
+        execution_generation: Some(1),
+        identity_unresolved: false,
         spawn_request_id: enrollment_id.to_string(),
         origin: Origin::Enrolled,
         state: State::Bound,
+        managed: ManagedMetadata::default(),
         launch,
         session: Some(session.to_string()),
         successor: None,
@@ -498,6 +795,28 @@ pub fn enroll_subject(
     };
     enroll(registry, &subject)?;
     Ok(subject.subject_id)
+}
+
+/// The tracked subject that names `agent_id`, if one does.
+///
+/// Public so a daemon-owned pass can ask whether a registration already has a
+/// managed subject before it enrolls one. Paging is the same bounded, fair walk
+/// `bound_elsewhere` uses.
+pub fn bound_subject(registry: &Registry, agent_id: &str) -> Result<Option<String>, String> {
+    let mut after: Option<String> = None;
+    loop {
+        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
+        if let Some(subject) = page
+            .iter()
+            .find(|subject| subject.bound_agent_id.as_deref() == Some(agent_id))
+        {
+            return Ok(Some(subject.subject_id.clone()));
+        }
+        match page.last() {
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
+            _ => return Ok(None),
+        }
+    }
 }
 
 /// Whether a tracked subject other than `except` names `agent_id`.
@@ -644,6 +963,9 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
             ![
                 SUBJECT_ENV,
                 CORRELATION_ENV,
+                MANAGED_SUBJECT_ENV,
+                MANAGED_LAUNCH_ENV,
+                MANAGED_GENERATION_ENV,
                 crate::runtime::LAUNCH_TOKEN_ENV,
             ]
             .contains(&name.as_str())
@@ -662,11 +984,18 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
 /// It carries no launch data and no correlation, which are private.
 pub fn public_view(subject: &Subject) -> Value {
     json!({
-        "subject_id": subject.subject_id,
+        "subject_id": subject.logical_subject_id.as_deref().unwrap_or(&subject.subject_id),
+        "execution_id": subject.subject_id,
+        "execution_generation": subject.execution_generation.unwrap_or(1),
+        "identity_unresolved": subject.identity_unresolved,
+        "managed": subject.managed,
         "spawn_request_id": subject.spawn_request_id,
         "state": subject.state,
         "process": subject.process,
         "observation": subject.observation,
+        "pane_absence": subject.pane_absence,
+        "ended_externally_at": subject.ended_externally_at,
+        "ended_evidence": subject.ended_evidence,
         "pane_cleanup": subject.pane_cleanup,
         "bound_agent_id": subject.bound_agent_id,
         "signalled_at": subject.signalled_at,
@@ -680,6 +1009,211 @@ pub fn public_view(subject: &Subject) -> Value {
 
 /// Subjects in id order after `after`, at most `limit`, for a bounded listing.
 /// Only names are sorted; each returned record is read and validated.
+/// Assigns legacy execution records a stable logical subject and generation.
+///
+/// The mapping follows only a predecessor's exact successor request to the
+/// spawn edge that names the exact child execution record. Missing, forked or
+/// cyclic links are left as separate roots; they never cause a merge or replay.
+pub fn migrate_identity(registry: &Registry, now_ms: i64) -> Result<(), String> {
+    let _transition = registry.transition();
+    let records = registry
+        .events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .all_facts();
+    if records.iter().all(|(_, facts)| {
+        facts.logical_subject_id.is_some() && facts.execution_generation.is_some()
+    }) {
+        return Ok(());
+    }
+    let records: BTreeMap<_, _> = records.into_iter().collect();
+    let mut after = None;
+    let mut edges = BTreeMap::new();
+    loop {
+        let page = registry.spawn_edges_after(after.as_deref(), 256)?;
+        if page.is_empty() {
+            break;
+        }
+        for edge in &page {
+            edges.insert(edge.request_id.clone(), edge.subject_id.clone());
+        }
+        after = page.last().map(|edge| edge.request_id.clone());
+        if page.len() < 256 {
+            break;
+        }
+    }
+
+    let mut outgoing = BTreeMap::new();
+    let mut incoming_count = BTreeMap::<String, usize>::new();
+    let mut unresolved = BTreeSet::new();
+    for (execution_id, facts) in &records {
+        let Some(successor_request) = facts.successor.as_ref() else {
+            continue;
+        };
+        let Some(Some(next_id)) = edges.get(successor_request) else {
+            unresolved.insert(execution_id.clone());
+            continue;
+        };
+        let Some(next) = records.get(next_id) else {
+            unresolved.insert(execution_id.clone());
+            continue;
+        };
+        if next.spawn_request_id != *successor_request {
+            unresolved.insert(execution_id.clone());
+            unresolved.insert(next_id.clone());
+            continue;
+        }
+        outgoing.insert(execution_id.clone(), next_id.clone());
+        *incoming_count.entry(next_id.clone()).or_default() += 1;
+    }
+    // A fork is ambiguous: retain no selected edge and mark the affected root
+    // and child unresolved rather than choosing a successor by sort order.
+    for (parent, child) in &outgoing {
+        if incoming_count.get(child).is_some_and(|count| *count > 1) {
+            unresolved.insert(parent.clone());
+            unresolved.insert(child.clone());
+        }
+    }
+    outgoing.retain(|_, child| incoming_count.get(child) == Some(&1));
+
+    // Find cycles before constructing roots, then discard their links so every
+    // affected execution gets an independent, non-speculative identity.
+    let mut cyclic = BTreeSet::new();
+    for start in records.keys() {
+        let mut path = Vec::new();
+        let mut positions = BTreeMap::new();
+        let mut current = start;
+        while let Some(next) = outgoing.get(current) {
+            if let Some(position) = positions.get(current) {
+                cyclic.extend(path[*position..].iter().cloned());
+                break;
+            }
+            positions.insert(current.clone(), path.len());
+            path.push(current.clone());
+            current = next;
+        }
+    }
+    unresolved.extend(cyclic.iter().cloned());
+    outgoing.retain(|parent, child| !cyclic.contains(parent) && !cyclic.contains(child));
+    let mut incoming = BTreeMap::<String, String>::new();
+    for (parent, child) in &outgoing {
+        incoming.insert(child.clone(), parent.clone());
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut mappings = Vec::new();
+    for execution_id in records.keys() {
+        if cyclic.contains(execution_id)
+            || visited.contains(execution_id)
+            || incoming.contains_key(execution_id)
+        {
+            continue;
+        }
+        let mut chain = Vec::new();
+        let mut current = execution_id.clone();
+        loop {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            chain.push(current.clone());
+            match outgoing.get(&current) {
+                Some(next) => current = next.clone(),
+                None => break,
+            }
+        }
+        if chain.is_empty() {
+            continue;
+        }
+        let logical_id = chain[0].clone();
+        let expected: Option<Vec<_>> = chain
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                Some((
+                    id.clone(),
+                    logical_id.clone(),
+                    u32::try_from(index).ok()?.checked_add(1)?,
+                ))
+            })
+            .collect();
+        let Some(expected) = expected else {
+            unresolved.extend(chain.iter().cloned());
+            continue;
+        };
+        // A partially completed migration is safe to resume only when every
+        // already-written identity agrees with the deterministic chain mapping.
+        if expected.iter().any(|(id, logical, generation)| {
+            let facts = &records[id];
+            facts
+                .logical_subject_id
+                .as_ref()
+                .is_some_and(|old| old != logical)
+                || facts
+                    .execution_generation
+                    .is_some_and(|old| old != *generation)
+        }) {
+            unresolved.extend(chain.iter().cloned());
+            continue;
+        }
+        mappings.extend(expected.into_iter().filter(|(id, _, _)| {
+            records[id].logical_subject_id.is_none() || records[id].execution_generation.is_none()
+        }));
+    }
+    // Cyclic records were not visited by a root walk; assign each a distinct root.
+    for execution_id in cyclic {
+        let facts = &records[&execution_id];
+        if facts.logical_subject_id.is_none() && facts.execution_generation.is_none() {
+            mappings.push((execution_id.clone(), execution_id, 1));
+        }
+    }
+
+    let pending_unresolved: Vec<_> = unresolved
+        .iter()
+        .filter(|id| {
+            records.get(id.as_str()).is_some_and(|facts| {
+                facts.logical_subject_id.is_some()
+                    && facts.execution_generation.is_some()
+                    && !facts.identity_unresolved
+            })
+        })
+        .cloned()
+        .collect();
+    if mappings.is_empty() && pending_unresolved.is_empty() {
+        return Ok(());
+    }
+    let at = format_millis(now_ms);
+    let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    for (execution_id, logical_subject_id, execution_generation) in mappings {
+        log.append(
+            &execution_id,
+            &at,
+            crate::control_plane::events::Source::IdentityMigration,
+            crate::control_plane::events::Transition::IdentityMapped {
+                logical_subject_id,
+                execution_generation,
+                identity_unresolved: unresolved.contains(&execution_id),
+            },
+        )
+        .map_err(|error| {
+            let prior = records.get(&execution_id).expect("migration record");
+            format!(
+                "migrate lifecycle execution {execution_id} (logical={:?}, generation={:?}): {error}",
+                prior.logical_subject_id, prior.execution_generation
+            )
+        })?;
+    }
+    for execution_id in pending_unresolved {
+        log.append(
+            &execution_id,
+            &at,
+            crate::control_plane::events::Source::IdentityMigration,
+            crate::control_plane::events::Transition::IdentityUnresolved,
+        )
+        .map_err(|error| format!("mark lifecycle execution {execution_id} unresolved: {error}"))?;
+    }
+    Ok(())
+}
+
 pub fn list_after(
     registry: &Registry,
     after: Option<&str>,
@@ -725,13 +1259,20 @@ pub const SWEEP_LIMIT: usize = 256;
 /// including ones whose daemon restarted while the process ran or exited.
 ///
 /// Each launch is judged only by its verified birth identity, through the same
-/// path as a wake. Nothing is signalled, relaunched or repeated here. Returns how
-/// many examined launches are verified exited, including ones already recorded.
+/// path as a wake. Nothing is signalled, relaunched or repeated here.
+///
+/// Paging is fair rather than a sorted prefix: the pass continues after the last
+/// execution it examined and reports where to resume, so a fleet larger than one
+/// page is covered over successive passes instead of only the first page. Returns
+/// how many examined launches are verified exited, including ones already
+/// recorded, and the cursor the next pass continues from — `None` when the pass
+/// reached the end of the listing.
 pub fn sweep(
     registry: &Registry,
     verifier: &dyn ProcessVerifier,
+    after: Option<&str>,
     now_ms: i64,
-) -> Result<usize, String> {
+) -> Result<(usize, Option<String>), String> {
     let mut ids: Vec<String> = registry
         .events
         .lock()
@@ -752,13 +1293,14 @@ pub fn sweep(
     }
     ids.sort();
     ids.dedup();
+    let (page, next) = crate::control_plane::store::page_after(&ids, after, SWEEP_LIMIT);
     let mut exited = 0;
-    for id in ids.into_iter().take(SWEEP_LIMIT) {
+    for id in page {
         if observe_exit_from(registry, &id, verifier, now_ms, Observer::Sweep) == Ok(true) {
             exited += 1;
         }
     }
-    Ok(exited)
+    Ok((exited, next))
 }
 
 /// Revokes a launch that is still unbound, and says whether it did.
@@ -902,6 +1444,15 @@ pub fn wrap(bootstrap: &Bootstrap, ticket: &Ticket, target: LaunchRequest) -> La
     wrapped.extend(argv);
     env.insert(SUBJECT_ENV.to_string(), ticket.subject_id.clone());
     env.insert(CORRELATION_ENV.to_string(), ticket.correlation.clone());
+    env.insert(
+        MANAGED_SUBJECT_ENV.to_string(),
+        ticket.logical_subject_id.clone(),
+    );
+    env.insert(MANAGED_LAUNCH_ENV.to_string(), ticket.launch_id.clone());
+    env.insert(
+        MANAGED_GENERATION_ENV.to_string(),
+        ticket.execution_generation.to_string(),
+    );
     LaunchRequest {
         pane_id,
         executable: bootstrap.executable.clone(),
@@ -1175,6 +1726,21 @@ fn write(registry: &Registry, subject: &Subject) -> Result<(), String> {
                     .ok_or("cannot remove a successor")?,
             },
         )
+    } else if previous.ended_externally_at != target.ended_externally_at {
+        (
+            Source::ProcessObservation,
+            Transition::EndedExternally(
+                target
+                    .ended_evidence
+                    .clone()
+                    .ok_or("an ended-externally outcome needs its evidence")?,
+            ),
+        )
+    } else if previous.pane_absence != target.pane_absence {
+        (
+            Source::ProcessObservation,
+            Transition::AbsencePending(target.pane_absence.clone()),
+        )
     } else {
         return Err("unsupported lifecycle transition".into());
     };
@@ -1350,6 +1916,304 @@ mod tests {
         );
     }
 
+    fn legacy_facts(
+        spawn_request_id: &str,
+        successor: Option<&str>,
+    ) -> crate::control_plane::events::Facts {
+        crate::control_plane::events::Facts {
+            logical_subject_id: None,
+            execution_generation: None,
+            identity_unresolved: false,
+            managed: ManagedMetadata::default(),
+            spawn_request_id: spawn_request_id.to_string(),
+            origin: Origin::Spawned,
+            state: State::Bound,
+            session: None,
+            successor: successor.map(str::to_string),
+            process: None,
+            observation: None,
+            pane_absence: None,
+            ended_externally_at: None,
+            ended_evidence: None,
+            pane_cleanup: None,
+            bound_agent_id: None,
+            signalled_at: None,
+            exited_at: None,
+            recorded_at: "2026-01-01T00:00:00.000Z".into(),
+        }
+    }
+
+    fn record_legacy_execution(
+        registry: &Registry,
+        execution_id: &str,
+        spawn_request_id: &str,
+        successor: Option<&str>,
+    ) {
+        registry
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(
+                execution_id,
+                "2026-01-01T00:00:00.000Z",
+                crate::control_plane::events::Source::Launch,
+                crate::control_plane::events::Transition::Created(legacy_facts(
+                    spawn_request_id,
+                    successor,
+                )),
+            )
+            .expect("legacy execution");
+    }
+
+    fn record_exact_spawn(
+        registry: &Registry,
+        parent: &crate::control_plane::registry::Registration,
+        request_id: &str,
+        execution_id: &str,
+    ) {
+        registry
+            .record_spawn(
+                &crate::control_plane::registry::SpawnRequest {
+                    request_id: request_id.into(),
+                    parent: parent.agent_id.clone(),
+                    parent_session_id: "2a4c6e80-1357-4b9d-8f01-23456789abcd".into(),
+                },
+                1,
+            )
+            .expect("spawn intent");
+        registry
+            .attach_subject(request_id, execution_id)
+            .expect("exact execution attachment");
+    }
+
+    #[test]
+    fn identity_migration_follows_only_exact_unique_successor_edges_and_is_idempotent() {
+        let scratch = Scratch::new("identity-migration");
+        let registry = scratch.registry();
+        let root = random_uuid();
+        let next = random_uuid();
+        let isolated = random_uuid();
+        let missing = random_uuid();
+        let missing_request = random_uuid();
+        let fork_a = random_uuid();
+        let fork_b = random_uuid();
+        let fork_child = random_uuid();
+        let cycle_a = random_uuid();
+        let cycle_b = random_uuid();
+        let parent = registry
+            .register(
+                &crate::control_plane::registry::RegistrationRequest {
+                    source: "migration-test".into(),
+                    incarnation: random_uuid(),
+                    session: Some("2a4c6e80-1357-4b9d-8f01-23456789abcd".into()),
+                    owner: None,
+                    run: None,
+                    label: None,
+                    location: None,
+                    process: None,
+                    launch: None,
+                    spawn_token: None,
+                },
+                1,
+            )
+            .expect("parent registration");
+        registry
+            .publish_context(
+                &crate::control_plane::registry::ContextRequest {
+                    agent_id: parent.agent_id.clone(),
+                    publisher: crate::control_plane::registry::PublisherIdentity {
+                        source: parent.request.source.clone(),
+                        incarnation: parent.request.incarnation.clone(),
+                        reporting_owner: None,
+                    },
+                    writer_handle: None,
+                    replace: None,
+                    sequence: 1,
+                    lease_ms: Some(10_000),
+                    observed_at: None,
+                    context: crate::control_plane::registry::ContextValue {
+                        session: Some("2a4c6e80-1357-4b9d-8f01-23456789abcd".into()),
+                        launch_identity: None,
+                    },
+                },
+                1,
+            )
+            .expect("publish parent context");
+        let root_request = random_uuid();
+        let next_request = random_uuid();
+        let fork_request = random_uuid();
+        let cycle_request_a = random_uuid();
+        let cycle_request_b = random_uuid();
+
+        record_legacy_execution(&registry, &root, &root_request, Some(&next_request));
+        record_legacy_execution(&registry, &next, &next_request, None);
+        record_legacy_execution(&registry, &isolated, &random_uuid(), None);
+        record_legacy_execution(&registry, &missing, &random_uuid(), Some(&missing_request));
+        record_legacy_execution(&registry, &fork_a, &random_uuid(), Some(&fork_request));
+        record_legacy_execution(&registry, &fork_b, &random_uuid(), Some(&fork_request));
+        record_legacy_execution(&registry, &fork_child, &fork_request, None);
+        record_legacy_execution(
+            &registry,
+            &cycle_a,
+            &cycle_request_a,
+            Some(&cycle_request_b),
+        );
+        record_legacy_execution(
+            &registry,
+            &cycle_b,
+            &cycle_request_b,
+            Some(&cycle_request_a),
+        );
+        record_exact_spawn(&registry, &parent, &next_request, &next);
+        record_exact_spawn(&registry, &parent, &fork_request, &fork_child);
+        record_exact_spawn(&registry, &parent, &cycle_request_a, &cycle_a);
+        record_exact_spawn(&registry, &parent, &cycle_request_b, &cycle_b);
+
+        migrate_identity(&registry, 2).expect("migrate legacy identities");
+        let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            log.facts(&root)
+                .and_then(|facts| facts.logical_subject_id.as_deref()),
+            Some(root.as_str())
+        );
+        assert_eq!(
+            log.facts(&root)
+                .and_then(|facts| facts.execution_generation),
+            Some(1)
+        );
+        assert_eq!(
+            log.facts(&next)
+                .and_then(|facts| facts.logical_subject_id.as_deref()),
+            Some(root.as_str())
+        );
+        assert_eq!(
+            log.facts(&next)
+                .and_then(|facts| facts.execution_generation),
+            Some(2)
+        );
+        for execution in [
+            &isolated,
+            &missing,
+            &fork_a,
+            &fork_b,
+            &fork_child,
+            &cycle_a,
+            &cycle_b,
+        ] {
+            let facts = log.facts(execution).expect("execution facts");
+            assert_eq!(
+                facts.logical_subject_id.as_deref(),
+                Some(execution.as_str())
+            );
+            assert_eq!(facts.execution_generation, Some(1));
+            assert_eq!(facts.identity_unresolved, execution != &isolated);
+        }
+        let migrated_tail = log.tail();
+        drop(log);
+
+        let reopened = scratch.registry();
+        migrate_identity(&reopened, 3).expect("repeat migration");
+        assert_eq!(
+            reopened
+                .events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .tail(),
+            migrated_tail,
+            "reopen and rerun must not append duplicate identity mappings"
+        );
+        assert_eq!(
+            reopened
+                .events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .facts(&next)
+                .and_then(|facts| facts.logical_subject_id.as_deref()),
+            Some(root.as_str())
+        );
+    }
+
+    #[test]
+    fn accepted_managed_launch_metadata_is_durable_and_inherited_by_successors() {
+        let scratch = Scratch::new("managed-metadata");
+        let registry = scratch.registry();
+        let metadata = ManagedMetadata {
+            owner: Some("herdr".into()),
+            run: Some("run-17".into()),
+            label: Some("reviewer".into()),
+            role: Some("worker".into()),
+            parent_subject_id: Some("01a10c77-8a6b-7035-8a0e-b1fa607bb507".into()),
+        };
+        let first = create_with_intent(&registry, SPAWN, launch(), None, None, metadata.clone(), 1)
+            .expect("accepted launch intent");
+        let persisted = read(&registry, &first.subject_id)
+            .expect("read subject")
+            .expect("subject");
+        assert_eq!(persisted.managed, metadata);
+        assert_eq!(public_view(&persisted)["managed"]["owner"], "herdr");
+
+        let successor = create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((first.subject_id.clone(), 2)),
+            persisted.managed.clone(),
+            2,
+        )
+        .expect("successor intent");
+        assert_eq!(
+            read(&registry, &successor.subject_id)
+                .expect("read successor")
+                .expect("successor")
+                .managed,
+            metadata
+        );
+        let invalid = ManagedMetadata {
+            label: Some("x".repeat(257)),
+            ..ManagedMetadata::default()
+        };
+        assert!(
+            create_with_intent(&registry, &random_uuid(), launch(), None, None, invalid, 3,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn public_logical_subject_resolves_to_its_latest_execution() {
+        let scratch = Scratch::new("logical-current");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("first execution");
+        let logical_id = first.subject_id.clone();
+        let second = create_with_identity(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((logical_id.clone(), 2)),
+            2,
+        )
+        .expect("successor execution");
+
+        let current = read_logical(&registry, &logical_id)
+            .expect("read logical subject")
+            .expect("current execution");
+        assert_eq!(current.subject_id, second.subject_id);
+        assert_eq!(
+            current.logical_subject_id.as_deref(),
+            Some(logical_id.as_str())
+        );
+        assert_eq!(current.execution_generation, Some(2));
+        let view = public_view(&current);
+        assert_eq!(view["subject_id"], logical_id);
+        assert_eq!(view["execution_id"], second.subject_id);
+        assert_eq!(view["execution_generation"], 2);
+
+        let listed = list_logical_after(&registry, None, 10).expect("logical list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].subject_id, second.subject_id);
+    }
+
     #[test]
     fn a_captured_claim_is_spent_and_survives_reopen() {
         let scratch = Scratch::new("spent");
@@ -1460,6 +2324,225 @@ mod tests {
         );
     }
 
+    fn pane(pane: &str) -> crate::control_plane::registry::RegistryLocation {
+        crate::control_plane::registry::RegistryLocation {
+            backend: "tmux".into(),
+            instance: None,
+            workspace: Some("wA".into()),
+            tab: None,
+            pane: Some(pane.into()),
+        }
+    }
+
+    /// A captured child bound to the test's agent, which is what a pane's absence
+    /// is evidence about.
+    fn bound_child(registry: &Registry) -> (String, Child) {
+        let (subject_id, child, process) = captured_child(registry);
+        fence_registration(registry, &subject_id, Some(&process), Some(AGENT), 2).expect("bind");
+        (subject_id, child)
+    }
+
+    #[test]
+    fn one_missing_listing_never_ends_a_launch_and_is_cleared_by_the_next_present_read() {
+        let scratch = Scratch::new("absence-cleared");
+        let registry = scratch.registry();
+        let (subject_id, _child) = bound_child(&registry);
+        let location = pane("%1");
+
+        assert!(
+            !observe_pane(
+                &registry,
+                &subject_id,
+                &location,
+                PaneEvidence::Absent,
+                1_000
+            )
+            .expect("absent")
+        );
+        let pending = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject")
+            .pane_absence
+            .expect("a pending window");
+        assert_eq!(pending.confirmations, 1);
+
+        assert!(
+            !observe_pane(
+                &registry,
+                &subject_id,
+                &location,
+                PaneEvidence::Present,
+                1_100
+            )
+            .expect("present")
+        );
+        let subject = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject");
+        assert!(
+            subject.pane_absence.is_none(),
+            "a present read clears the window"
+        );
+        assert!(subject.ended_externally_at.is_none());
+        assert!(subject.exited_at.is_none());
+    }
+
+    #[test]
+    fn a_burst_of_absences_inside_one_window_is_not_confirmation() {
+        let scratch = Scratch::new("absence-burst");
+        let registry = scratch.registry();
+        let (subject_id, _child) = bound_child(&registry);
+        let location = pane("%1");
+
+        for now in [1_000, 1_100, 1_200] {
+            assert!(
+                !observe_pane(&registry, &subject_id, &location, PaneEvidence::Absent, now)
+                    .expect("absent")
+            );
+        }
+        let subject = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject");
+        assert!(
+            subject.ended_externally_at.is_none(),
+            "the window has not elapsed"
+        );
+        assert_eq!(subject.pane_absence.expect("pending").confirmations, 3);
+    }
+
+    #[test]
+    fn a_confirmed_pane_loss_ends_the_launch_externally_with_its_evidence() {
+        let scratch = Scratch::new("absence-confirmed");
+        let registry = scratch.registry();
+        let (subject_id, _child) = bound_child(&registry);
+        let location = pane("%1");
+
+        assert!(
+            !observe_pane(
+                &registry,
+                &subject_id,
+                &location,
+                PaneEvidence::Absent,
+                1_000
+            )
+            .expect("absent")
+        );
+        assert!(
+            !observe_pane(
+                &registry,
+                &subject_id,
+                &location,
+                PaneEvidence::Absent,
+                4_000
+            )
+            .expect("absent")
+        );
+        assert!(
+            observe_pane(
+                &registry,
+                &subject_id,
+                &location,
+                PaneEvidence::Absent,
+                8_000
+            )
+            .expect("absent")
+        );
+
+        let subject = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject");
+        assert!(
+            subject.pane_absence.is_none(),
+            "the window is consumed by the outcome"
+        );
+        assert!(subject.ended_externally_at.is_some());
+        // A pane's absence is not a process's death, so no exit is claimed.
+        assert!(subject.exited_at.is_none());
+        let evidence = subject.ended_evidence.expect("evidence summary");
+        assert_eq!(evidence.reason, EndedReason::PaneLost);
+        assert_eq!(evidence.source, "tmux");
+        assert_eq!(evidence.location, location);
+        assert!(evidence.confirmations >= ABSENCE_CONFIRMATIONS);
+    }
+
+    #[test]
+    fn an_unavailable_read_never_confirms_absence_and_never_ends_a_launch() {
+        let scratch = Scratch::new("absence-unavailable");
+        let registry = scratch.registry();
+        let (subject_id, _child) = bound_child(&registry);
+        let location = pane("%1");
+
+        for now in [1_000, 8_000, 20_000] {
+            assert!(
+                !observe_pane(
+                    &registry,
+                    &subject_id,
+                    &location,
+                    PaneEvidence::Unavailable,
+                    now
+                )
+                .expect("unavailable")
+            );
+        }
+        let subject = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject");
+        assert!(
+            subject.pane_absence.is_none(),
+            "an unavailable read is not a confirmation"
+        );
+        assert!(subject.ended_externally_at.is_none());
+    }
+
+    #[test]
+    fn a_verified_process_exit_outranks_later_pane_evidence() {
+        let scratch = Scratch::new("exit-outranks-pane");
+        let registry = scratch.registry();
+        let (subject_id, mut child) = bound_child(&registry);
+        let location = pane("%1");
+
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+        assert!(observe_exit(&registry, &subject_id, &LocalProcfsVerifier, 2_000).expect("exit"));
+        assert!(
+            observe_pane(
+                &registry,
+                &subject_id,
+                &location,
+                PaneEvidence::Absent,
+                9_000
+            )
+            .expect("already ended")
+        );
+
+        let subject = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject");
+        assert!(subject.exited_at.is_some(), "the verified exit stands");
+        assert!(subject.ended_externally_at.is_none());
+        assert!(subject.ended_evidence.is_none());
+    }
+
+    #[test]
+    fn an_unbound_launch_has_no_pane_evidence_to_confirm() {
+        let scratch = Scratch::new("absence-unbound");
+        let registry = scratch.registry();
+        let (subject_id, _child, _process) = captured_child(&registry);
+        let location = pane("%1");
+
+        for now in [1_000, 4_000, 8_000] {
+            assert!(
+                !observe_pane(&registry, &subject_id, &location, PaneEvidence::Absent, now)
+                    .expect("absent")
+            );
+        }
+        let subject = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject");
+        assert!(subject.pane_absence.is_none());
+        assert!(subject.ended_externally_at.is_none());
+    }
+
     /// Captures a live child as a tracked launch, bound to the test's agent.
     fn captured_child(registry: &Registry) -> (String, Child, ProcessIdentity) {
         let ticket = create(registry, SPAWN, launch(), None, 1).expect("subject");
@@ -1490,7 +2573,10 @@ mod tests {
 
         // A restarted daemon opens the same records and runs its first pass.
         let restarted = scratch.registry();
-        assert_eq!(sweep(&restarted, &LocalProcfsVerifier, 3), Ok(1));
+        assert_eq!(
+            sweep(&restarted, &LocalProcfsVerifier, None, 3),
+            Ok((1, None))
+        );
         let recorded = read(&restarted, &subject).expect("read").expect("subject");
         assert!(recorded.exited_at.is_some());
         assert!(recorded.signalled_at.is_none(), "the sweep never signals");
@@ -1502,7 +2588,10 @@ mod tests {
         let registry = scratch.registry();
         let (subject, mut child, _) = captured_child(&registry);
 
-        assert_eq!(sweep(&registry, &LocalProcfsVerifier, 3), Ok(0));
+        assert_eq!(
+            sweep(&registry, &LocalProcfsVerifier, None, 3),
+            Ok((0, None))
+        );
         assert!(
             child.0.try_wait().expect("try_wait").is_none(),
             "still running"
@@ -1514,7 +2603,10 @@ mod tests {
         assert_eq!(observation.evidence, Evidence::Running);
         assert_eq!(observation.source, Observer::Sweep);
         let tail = registry.events.lock().unwrap().tail();
-        assert_eq!(sweep(&registry, &LocalProcfsVerifier, 4), Ok(0));
+        assert_eq!(
+            sweep(&registry, &LocalProcfsVerifier, None, 4),
+            Ok((0, None))
+        );
         assert_eq!(
             registry.events.lock().unwrap().tail(),
             tail,
@@ -1580,6 +2672,71 @@ mod tests {
         let restored = read(&reopened, subject).expect("read").expect("subject");
         assert_eq!(restored.pane_cleanup, Some(refused));
         assert_eq!(restored.state, State::Revoked);
+    }
+
+    #[test]
+    fn stop_and_exit_observation_race_commits_one_terminal_transition() {
+        use std::sync::{Arc, Barrier};
+
+        let scratch = Scratch::new("stop-observation-race");
+        let registry = Arc::new(scratch.registry());
+        let (subject_id, mut child, _) = captured_child(&registry);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let cancelling_registry = Arc::clone(&registry);
+        let cancelling_barrier = Arc::clone(&barrier);
+        let cancelling_subject = subject_id.clone();
+        let cancel = std::thread::spawn(move || {
+            cancelling_barrier.wait();
+            cancel(
+                &cancelling_registry,
+                &cancelling_subject,
+                &LocalProcfsVerifier,
+                10,
+            )
+        });
+
+        let observing_registry = Arc::clone(&registry);
+        let observing_barrier = Arc::clone(&barrier);
+        let observing_subject = subject_id.clone();
+        let observe = std::thread::spawn(move || {
+            observing_barrier.wait();
+            observe_exit(
+                &observing_registry,
+                &observing_subject,
+                &LocalProcfsVerifier,
+                10,
+            )
+        });
+
+        barrier.wait();
+        let cancellation = cancel.join().expect("cancel thread").expect("cancel");
+        let observation = observe.join().expect("observe thread");
+        assert!(cancellation.revoked);
+        assert!(observation.is_ok());
+        assert!(child.0.try_wait().expect("wait child").is_some());
+
+        let subject = read(&registry, &subject_id)
+            .expect("read terminal subject")
+            .expect("subject");
+        assert!(subject.exited_at.is_some());
+        assert!(subject.signalled_at.is_some());
+        let exits = registry
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read_after(0, 128)
+            .expect("read lifecycle events")
+            .into_iter()
+            .filter(|event| event.subject_id.as_deref() == Some(subject_id.as_str()))
+            .filter(|event| {
+                matches!(
+                    event.transition,
+                    crate::control_plane::events::Transition::ExitVerified
+                )
+            })
+            .count();
+        assert_eq!(exits, 1, "stop and observation commit one exit transition");
     }
 
     #[test]
@@ -1777,6 +2934,9 @@ mod resume_recipe_tests {
         let mut env = BTreeMap::new();
         env.insert(SUBJECT_ENV.to_string(), "s".to_string());
         env.insert(CORRELATION_ENV.to_string(), "c".to_string());
+        env.insert(MANAGED_SUBJECT_ENV.to_string(), "logical".to_string());
+        env.insert(MANAGED_LAUNCH_ENV.to_string(), "launch".to_string());
+        env.insert(MANAGED_GENERATION_ENV.to_string(), "2".to_string());
         env.insert(
             crate::runtime::LAUNCH_TOKEN_ENV.to_string(),
             "t".to_string(),

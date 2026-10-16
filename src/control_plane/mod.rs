@@ -18,6 +18,7 @@ pub mod observation;
 pub mod ops;
 pub mod protocol;
 pub mod public_contracts;
+pub mod reconcile;
 pub mod registry;
 pub mod server;
 pub mod store;
@@ -29,6 +30,7 @@ pub use ops::{Method, Operation};
 pub use protocol::{
     Code, ErrorBody, MAX_LINE_BYTES, PROTOCOL_VERSION, Refusal, Request, Response, decode_request,
 };
+pub use reconcile::Trigger;
 pub use registry::{
     CHILD_CLOSE_VERSION, ChildClose, ChildCloseRequest, CloseAdmission, CloseIntent,
     ContextRequest, ContextValue, LaunchSession, LaunchSpec, LocalProcfsVerifier,

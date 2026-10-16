@@ -588,10 +588,6 @@ pub struct App {
     /// Filter query as typed; empty means "no filter".
     filter: String,
     filter_editing: bool,
-    /// The places launched with the managed-agent shortcut and whose lead has not yet
-    /// been enrolled. A lead started from the tree is one the operator chose to manage,
-    /// so it is enrolled once its registration names its session.
-    launched: HashSet<String>,
     view: PaneView,
     /// Whether the details panel is hidden. Stored inverted so `Default` — the
     /// state a run starts in — is "details shown".
@@ -1940,6 +1936,7 @@ impl App {
             self.set_focus_message(Some("no current inventory: not acting".to_string()));
             return;
         };
+        let subject = subject.map(|subject| *subject);
         if operation == Operation::Restart {
             if !is_agent {
                 self.set_focus_message(Some("restart is only for a managed worker".to_string()));
@@ -2573,15 +2570,6 @@ impl App {
                     text.push_str(&format!(": {message}"));
                 }
                 let failed = outcome != "completed";
-                // A command the operator launched from the tree is enrolled when
-                // its lead registers, so it can be stopped and restarted.
-                if verb == "create"
-                    && !failed
-                    && let Some(container) = answer.container.as_ref().filter(|c| c.recipe)
-                    && let Some(binding) = container.binding.as_ref()
-                {
-                    self.launched.insert(binding.handle.clone());
-                }
                 self.record_notice(request_id, text, failed);
             }
             Err(message) => self.record_notice(
@@ -2590,42 +2578,6 @@ impl App {
                 true,
             ),
         }
-    }
-
-    /// The enrollment of a lead launched from the tree, once it has registered a
-    /// joined pane and a fresh session. Each launched place is offered once: a lead
-    /// the daemon refuses is not retried, and `E` remains for an explicit attempt.
-    pub fn enroll_launched(&mut self, state: &ObservationState) -> Option<Confirmed> {
-        if self.launched.is_empty() || !matches!(state.source_freshness(), SourceFreshness::Current)
-        {
-            return None;
-        }
-        let inventory = state.inventory()?;
-        let found = inventory.agents.iter().find_map(|agent| {
-            let view = agent.registry.as_ref()?;
-            let pane = &agent.location;
-            let launched =
-                self.launched.contains(&pane.pane_id) || self.launched.contains(&pane.tab_id);
-            let session = view.agent.current_session_uuid()?;
-            (launched
-                && view.binding == crate::registry_observation::Binding::Joined
-                && view.managed.is_none())
-            .then(|| {
-                (
-                    pane.pane_id.clone(),
-                    pane.tab_id.clone(),
-                    view.agent.registration.agent_id.clone(),
-                    session.as_str().to_owned(),
-                )
-            })
-        })?;
-        self.launched.remove(&found.0);
-        self.launched.remove(&found.1);
-        Some(Confirmed::Enroll {
-            request_id: crate::control_plane::random_uuid(),
-            agent_id: found.2,
-            session: found.3,
-        })
     }
 
     /// Records a daemon lifecycle outcome with its subject and request identity.
@@ -2734,7 +2686,8 @@ impl App {
                 subject: agent
                     .registry
                     .as_ref()
-                    .and_then(|view| view.managed.clone()),
+                    .and_then(|view| view.managed.clone())
+                    .map(Box::new),
             },
             RowKind::Pane(pane) => Selected::Pane {
                 pane_id: pane.pane_id.clone(),
@@ -3009,7 +2962,7 @@ enum Selected {
         pane_id: String,
         tab_id: String,
         losses: Vec<String>,
-        subject: Option<crate::registry_observation::ManagedSubject>,
+        subject: Option<Box<crate::registry_observation::ManagedSubject>>,
     },
     Pane {
         pane_id: String,
@@ -4517,8 +4470,11 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_refuses_what_is_not_a_registered_lead_and_a_launch_is_remembered() {
-        // A pane with no registration is not a lead: the key opens nothing.
+    fn enrollment_refuses_what_is_not_a_registered_lead() {
+        // A pane with no registration is not a lead: the key opens nothing. A
+        // lead launched from the tree needs no remembering here, because the
+        // daemon enrolls it from its own records whether or not a display is
+        // connected.
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
@@ -4534,25 +4490,6 @@ mod tests {
             "{:?}",
             app.focus_message()
         );
-        // Nothing launched from the tree means nothing is enrolled on its own.
-        assert!(app.enroll_launched(&state).is_none());
-
-        // A completed creation that ran a command is remembered by its place.
-        let mut finished = pane_container("c9", "wA:p3", None);
-        finished.recipe = true;
-        app.apply_container_outcome(crate::topology::Finished {
-            verb: "create",
-            request_id: "r1".into(),
-            result: Ok(crate::control_plane::client::ContainerAnswer {
-                request: serde_json::json!({"outcome": "completed"}),
-                container: Some(finished),
-                removed: Vec::new(),
-            }),
-        });
-        assert!(app.launched.contains("wA:p3"));
-        // No registration yet, so nothing is offered, and the place stays pending.
-        assert!(app.enroll_launched(&state).is_none());
-        assert!(app.launched.contains("wA:p3"));
     }
 
     #[test]
@@ -5019,6 +4956,9 @@ mod tests {
                     managed: Some(crate::registry_observation::ManagedSubject {
                         subject_id: "subject-managed".into(),
                         process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
+                        identity_unresolved: false,
+                        launch_identity: crate::registry_observation::LaunchIdentityEvidence::Missing,
+                        metadata: crate::control_plane::lifecycle::ManagedMetadata::default(),
                         child_close: None,
                         state: crate::control_plane::lifecycle::State::Bound,
                         session: Some(MANAGED_OWNER.into()),

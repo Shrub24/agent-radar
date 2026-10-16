@@ -22,12 +22,15 @@ radar — read-only fleet overview for local coding agents
 usage: radar [--print-config] [--help]
        radar daemon [start|stop|restart|status|--help]
        radar server <start|stop|restart|status> [NAME]
+       radar lifecycle <reconcile|abandon REQUEST-ID>
 
   --print-config   print the configuration in use, to copy and edit
   --help           this message
   daemon           control the daemon's user units; with no action, serve in
                    the foreground (what the service unit runs)
   server           control the tmux server a daemon serves, by name
+  lifecycle        reconcile unresolved operations, or abandon one so the target
+                   it holds can be operated on again
 
 Configuration is read from `$RADAR_CONFIG`, else
 `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
@@ -104,9 +107,85 @@ fn handle_arguments() -> Option<i32> {
             None => serve_daemon(),
         }),
         Some("server") => Some(run_server_command()),
+        Some("lifecycle") => Some(run_lifecycle_command()),
         Some(other) => {
             eprintln!("radar: unknown argument `{other}`\n\n{USAGE}");
             Some(2)
+        }
+    }
+}
+
+/// `radar lifecycle <reconcile|abandon REQUEST-ID>`: the operator's end of
+/// unresolved-operation recovery.
+///
+/// `reconcile` re-reads current evidence and reports what it could establish and
+/// what it could not, with a reason. `abandon` ends one unresolved record's
+/// recovery obligation, releasing only the administrative block it holds; the
+/// uncertainty stays recorded and no effect is dispatched.
+fn run_lifecycle_command() -> i32 {
+    let mut arguments = std::env::args().skip(2);
+    let action = arguments.next();
+    // The argument is checked before anything is dialled: a mistyped command must
+    // not start a daemon to report itself.
+    let held = match action.as_deref() {
+        Some("reconcile") => None,
+        Some("abandon") => match arguments.next() {
+            Some(held) => Some(held),
+            None => {
+                eprintln!("radar lifecycle: abandon needs the unresolved request id\n\n{USAGE}");
+                return 2;
+            }
+        },
+        _ => {
+            eprintln!("radar lifecycle: expected reconcile or abandon REQUEST-ID\n\n{USAGE}");
+            return 2;
+        }
+    };
+    let runtime = match agent_radar::control_plane::connect() {
+        Ok(selected) => selected,
+        Err(error) => {
+            eprintln!("radar lifecycle: {error}");
+            return 1;
+        }
+    };
+    let Some(lifecycle) = runtime.lifecycle else {
+        eprintln!("radar lifecycle: the daemon serves no lifecycle contract");
+        return 1;
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let request_id = agent_radar::control_plane::random_uuid();
+    match (action.as_deref(), held) {
+        (Some("reconcile"), _) => {
+            let answer = match agent_radar::control_plane::client::reconcile(&cancel) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    eprintln!("radar lifecycle reconcile: {error}");
+                    return 1;
+                }
+            };
+            println!("{answer}");
+            0
+        }
+        (_, Some(held)) => match lifecycle.abandon_record(&request_id, &held, &cancel) {
+            Ok(answer) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "request_id": held,
+                        "outcome": answer.outcome(),
+                        "message": answer.message(),
+                    })
+                );
+                0
+            }
+            Err(error) => {
+                eprintln!("radar lifecycle abandon: {error}");
+                1
+            }
+        },
+        _ => {
+            eprintln!("radar lifecycle: expected reconcile or abandon REQUEST-ID\n\n{USAGE}");
+            2
         }
     }
 }
@@ -334,17 +413,6 @@ fn run() -> io::Result<()> {
                     state = snapshot.observation.clone();
                     app.refresh(&state);
                     dirty = true;
-                    // A lead launched from the tree is enrolled once it has
-                    // registered.
-                    if let Some(enroll) = app.enroll_launched(&state) {
-                        dispatch(
-                            Some(enroll),
-                            &mut app,
-                            &mut closer,
-                            &mut managed,
-                            &mut containers,
-                        );
-                    }
                 }
                 // The previous view stands, and the reason it is not moving is
                 // on the footer rather than in a half-updated screen.

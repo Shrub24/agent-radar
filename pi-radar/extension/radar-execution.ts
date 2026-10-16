@@ -3,6 +3,7 @@ import {
 	isUuid,
 	type RadarScheduler,
 	type RadarSnapshot,
+	type RadarLaunchIdentityMarker,
 } from "./radar-client.ts";
 import type { RadarLocationResolution } from "./radar-location.ts";
 import type { RadarFactsSnapshot } from "./radar-client.ts";
@@ -19,6 +20,11 @@ import {
 	type RadarPublication,
 	type RadarChannelWriter,
 } from "./radar-publication.ts";
+import {
+	activeRadarLaunchMarker,
+	persistRadarLaunchMarker,
+	radarLaunchMarkerFromEnvironment,
+} from "./radar-session-marker.ts";
 
 /**
  * The minimal Pi surface this adapter uses. It is declared structurally so the
@@ -26,6 +32,7 @@ import {
  * be lifted into its own extension without touching this module.
  */
 export type RadarExecutionEventApi = {
+	appendEntry?: (customType: string, data?: unknown) => void;
 	on(name: string, handler: (event: any, context: any) => unknown): unknown;
 	events?: {
 		on(name: string, handler: (event: any) => unknown): unknown;
@@ -63,6 +70,10 @@ export type RadarExecutionOptions = {
 	 * where no such event exists.
 	 */
 	questionnaireEvent?: string;
+	/** Best-effort diagnostic for durable session marker failures. */
+	diagnostic?: (message: string) => void;
+	/** Injectable only for tests; production reads the daemon-issued process env. */
+	markerEnvironment?: Record<string, string | undefined>;
 };
 
 export type RadarExecutionAdapter = {
@@ -258,11 +269,14 @@ export function createRadarExecutionAdapter(
 	 * canonical UUID is left unreported: absent context is unknown, and publishing
 	 * the explicit null would claim there is no session at all.
 	 */
-	function reportSession(context: any): void {
+	function reportSession(
+		context: any,
+		launchIdentity?: RadarLaunchIdentityMarker,
+	): void {
 		const session = context?.sessionManager?.getSessionId?.();
 		if (!isUuid(session)) return;
 		try {
-			publication.context.update(session);
+			publication.context.update(session, launchIdentity);
 		} catch {
 			// Optional publication must not interfere with Pi's lifecycle handler.
 		}
@@ -346,10 +360,49 @@ export function createRadarExecutionAdapter(
 		);
 
 	on("session_start", (_event, context) => {
+		const sessionHost = {
+			appendEntry: pi.appendEntry
+				? (customType: string, data?: unknown) => pi.appendEntry?.(customType, data)
+				: undefined,
+			sessionManager: context?.sessionManager,
+		};
+		let launchIdentity: RadarLaunchIdentityMarker | undefined;
+		try {
+			const result = persistRadarLaunchMarker(
+				sessionHost,
+				options.markerEnvironment,
+			);
+			if (result === "written" || result === "unchanged") {
+				const expected = radarLaunchMarkerFromEnvironment(options.markerEnvironment);
+				const activeMarker = activeRadarLaunchMarker(sessionHost);
+				if (
+					expected &&
+					activeMarker.status === "valid" &&
+					JSON.stringify(activeMarker.marker) === JSON.stringify(expected)
+				) {
+					launchIdentity = activeMarker.marker;
+				} else {
+					options.diagnostic?.("Radar launch marker was not visible on the active Pi session branch");
+				}
+			} else if (result === "unsupported") {
+				options.diagnostic?.("Pi host does not support Radar launch identity session entries");
+			} else if (
+				options.markerEnvironment &&
+				[
+					"PI_RADAR_MANAGED_SUBJECT_ID",
+					"PI_RADAR_MANAGED_LAUNCH_ID",
+					"PI_RADAR_MANAGED_EXECUTION_GENERATION",
+				].some((key) => options.markerEnvironment?.[key] !== undefined)
+			) {
+				options.diagnostic?.("incomplete or invalid Radar launch identity environment");
+			}
+		} catch (error) {
+			options.diagnostic?.(`could not persist Radar launch marker: ${String(error)}`);
+		}
 		rootSession = true;
 		// The session comes first: re-arming the publication must renew the session
 		// this process is in now, never the one a previous session left behind.
-		reportSession(context);
+		reportSession(context, launchIdentity);
 		// Facts follow the root flag, so they are published only after it is set.
 		publishFacts(context);
 		// A process can replace or resume its session without a new process, so the

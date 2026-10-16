@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use serde::{Deserialize, Serialize};
 
-use super::lifecycle::{Observation, Origin, PaneCleanup, State, Subject};
+use super::lifecycle::{
+    EndedEvidence, Observation, Origin, PaneAbsence, PaneCleanup, State, Subject,
+};
 use crate::control_plane::containers::{Container, ContainerObservation};
 use crate::control_plane::registry::publication::write_atomic;
 use crate::control_plane::registry::{prepare_directory, read_record_file};
@@ -49,6 +51,17 @@ const MAX_EVENT_BYTES: usize = 16 * 1024;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Facts {
+    /// Stable logical subject identity. Absent only in pre-migration events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_subject_id: Option<String>,
+    /// One-based execution generation within the logical subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_generation: Option<u32>,
+    /// True when legacy links or later evidence cannot establish this execution's continuity.
+    #[serde(default)]
+    pub identity_unresolved: bool,
+    #[serde(default)]
+    pub managed: crate::control_plane::lifecycle::ManagedMetadata,
     pub spawn_request_id: String,
     pub origin: Origin,
     pub state: State,
@@ -57,6 +70,12 @@ pub struct Facts {
     pub process: Option<ProcessIdentity>,
     #[serde(default)]
     pub observation: Option<Observation>,
+    #[serde(default)]
+    pub pane_absence: Option<PaneAbsence>,
+    #[serde(default)]
+    pub ended_externally_at: Option<String>,
+    #[serde(default)]
+    pub ended_evidence: Option<EndedEvidence>,
     #[serde(default)]
     pub pane_cleanup: Option<PaneCleanup>,
     pub bound_agent_id: Option<String>,
@@ -68,6 +87,10 @@ pub struct Facts {
 impl Facts {
     pub fn from_subject(subject: &Subject) -> Self {
         Self {
+            logical_subject_id: subject.logical_subject_id.clone(),
+            execution_generation: subject.execution_generation,
+            identity_unresolved: subject.identity_unresolved,
+            managed: subject.managed.clone(),
             spawn_request_id: subject.spawn_request_id.clone(),
             origin: subject.origin,
             state: subject.state,
@@ -75,6 +98,9 @@ impl Facts {
             successor: subject.successor.clone(),
             process: subject.process.clone(),
             observation: subject.observation.clone(),
+            pane_absence: subject.pane_absence.clone(),
+            ended_externally_at: subject.ended_externally_at.clone(),
+            ended_evidence: subject.ended_evidence.clone(),
             pane_cleanup: subject.pane_cleanup.clone(),
             bound_agent_id: subject.bound_agent_id.clone(),
             signalled_at: subject.signalled_at.clone(),
@@ -84,10 +110,17 @@ impl Facts {
     }
 
     pub fn apply_to(&self, subject: &mut Subject) {
+        subject.logical_subject_id = self.logical_subject_id.clone();
+        subject.execution_generation = self.execution_generation;
+        subject.identity_unresolved = self.identity_unresolved;
+        subject.managed = self.managed.clone();
         subject.state = self.state;
         subject.successor = self.successor.clone();
         subject.process = self.process.clone();
         subject.observation = self.observation.clone();
+        subject.pane_absence = self.pane_absence.clone();
+        subject.ended_externally_at = self.ended_externally_at.clone();
+        subject.ended_evidence = self.ended_evidence.clone();
         subject.pane_cleanup = self.pane_cleanup.clone();
         subject.bound_agent_id = self.bound_agent_id.clone();
         subject.signalled_at = self.signalled_at.clone();
@@ -110,14 +143,33 @@ pub enum Transition {
     Created(Facts),
     Enrolled(Facts),
     Imported(Facts),
+    /// Adds stable logical identity to one legacy execution record without
+    /// rewriting its existing event history.
+    IdentityMapped {
+        logical_subject_id: String,
+        execution_generation: u32,
+        identity_unresolved: bool,
+    },
+    /// Marks continuity evidence ambiguous without rewriting an existing mapping.
+    IdentityUnresolved,
     Captured(ProcessIdentity),
-    Bound { agent_id: String },
+    Bound {
+        agent_id: String,
+    },
     Revoked,
     SignalRequested,
     ExitVerified,
     Observed(Observation),
+    /// Starts, updates or clears the bounded confirmation of a bound pane's
+    /// absence. Weak evidence, so it is not itself a lifecycle outcome.
+    AbsencePending(Option<PaneAbsence>),
+    /// Ends a launch externally, naming the evidence that established it. Only a
+    /// verified process exit records `ExitVerified`.
+    EndedExternally(EndedEvidence),
     PaneCleanup(PaneCleanup),
-    SuccessorReserved { spawn_request_id: String },
+    SuccessorReserved {
+        spawn_request_id: String,
+    },
     OperationAdmitted(RequestRecord),
     OperationStarted(RequestRecord),
     OperationSettled(RequestRecord),
@@ -149,6 +201,7 @@ pub enum Source {
     ProcessObservation,
     PaneControl,
     RecoveryImport,
+    IdentityMigration,
     /// A topology effect this daemon dispatched: a container it created, deleted
     /// or reloaded.
     TopologyControl,
@@ -272,6 +325,15 @@ impl Log {
     }
     pub fn ids(&self) -> impl Iterator<Item = &String> {
         self.facts.keys()
+    }
+
+    /// Stable snapshot of current per-execution facts, used by one-time
+    /// migrations without exposing the reducer's mutable map.
+    pub fn all_facts(&self) -> Vec<(String, Facts)> {
+        self.facts
+            .iter()
+            .map(|(id, facts)| (id.clone(), facts.clone()))
+            .collect()
     }
     pub fn container(&self, id: &str) -> Option<&Container> {
         self.containers.get(id)
@@ -424,6 +486,28 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
         _ => return Err("lifecycle transition has no baseline".into()),
     };
     match &event.transition {
+        Transition::IdentityUnresolved => {
+            facts.identity_unresolved = true;
+        }
+        Transition::IdentityMapped {
+            logical_subject_id,
+            execution_generation,
+            identity_unresolved,
+        } => {
+            if facts.logical_subject_id.is_some()
+                || facts.execution_generation.is_some()
+                || logical_subject_id.is_empty()
+                || *execution_generation == 0
+            {
+                return Err(format!(
+                    "identity mapping conflicts with current facts (logical={:?}, generation={:?}, new logical={logical_subject_id:?}, new generation={execution_generation})",
+                    facts.logical_subject_id, facts.execution_generation
+                ));
+            }
+            facts.logical_subject_id = Some(logical_subject_id.clone());
+            facts.execution_generation = Some(*execution_generation);
+            facts.identity_unresolved = *identity_unresolved;
+        }
         Transition::Captured(process) if facts.state == State::Pending => {
             facts.state = State::Captured;
             facts.process = Some(process.clone());
@@ -447,6 +531,19 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
                 && facts.exited_at.is_none() =>
         {
             facts.observation = Some(observation.clone());
+        }
+        Transition::AbsencePending(absence)
+            if facts.exited_at.is_none() && facts.ended_externally_at.is_none() =>
+        {
+            facts.pane_absence = absence.clone();
+        }
+        Transition::EndedExternally(evidence)
+            if facts.exited_at.is_none() && facts.ended_externally_at.is_none() =>
+        {
+            facts.ended_externally_at = Some(event.at.clone());
+            facts.ended_evidence = Some(evidence.clone());
+            // The confirmed absence is the reason, so no window is left pending.
+            facts.pane_absence = None;
         }
         Transition::ExitVerified if facts.process.is_some() && facts.exited_at.is_none() => {
             facts.exited_at = Some(event.at.clone())

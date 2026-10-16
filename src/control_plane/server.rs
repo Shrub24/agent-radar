@@ -28,11 +28,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+use std::collections::BTreeSet;
+
 use crate::control_plane::containers;
 use crate::control_plane::lifecycle::{self as subjects, Bootstrap};
 use crate::control_plane::ops::{self, Method};
 use crate::control_plane::protocol::{self, Code, PROTOCOL_VERSION, Refusal, Request, Response};
 use crate::control_plane::public_contracts::{PingResult, TaskLaneStatus};
+use crate::control_plane::reconcile;
 use crate::control_plane::registry::{
     self, AcquireRequest, Channel, CloseAdmission, CloseOutcome, CloseResult, LocalProcfsVerifier,
     LocationEvidence, ProcessVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
@@ -724,6 +727,38 @@ impl Daemon {
             }
         };
         let sweeper = spawn_sweeper(&core, &stopping, &verification);
+        // One reconciliation at start, because no external baseline carries over
+        // from the last daemon: durable operations may be unresolved and nothing
+        // has established their effects yet. It dispatches nothing, and it is not
+        // the periodic pass — the sweeper above is that.
+        {
+            let (store, registry, verifier) = {
+                let core = locked(&core);
+                (
+                    core.store.clone(),
+                    Arc::clone(&core.registry),
+                    Arc::clone(&core.verifier),
+                )
+            };
+            match reconcile::unresolved(
+                &store,
+                &registry,
+                verifier.as_ref(),
+                reconcile::Trigger::DaemonStart,
+                store::now_ms(),
+            ) {
+                Ok(outcome) if outcome.resolved > 0 || !outcome.unresolved.is_empty() => {
+                    tracing::info!(
+                        examined = outcome.examined,
+                        resolved = outcome.resolved,
+                        unresolved = outcome.unresolved.len() + outcome.omitted,
+                        "reconciled unresolved operations at start"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "startup reconciliation failed"),
+            }
+        }
         Ok(Self {
             path: socket.to_path_buf(),
             state: state.to_path_buf(),
@@ -1101,6 +1136,10 @@ struct ContainerListParams {
 struct ContainerReconcileParams {
     #[serde(default)]
     limit: Option<usize>,
+    /// Where the previous pass stopped, so successive passes cover every recorded
+    /// container rather than re-examining the first page.
+    #[serde(default)]
+    after: Option<String>,
 }
 
 /// Unix milliseconds now.
@@ -1110,11 +1149,16 @@ fn unix_millis() -> i64 {
         .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
-/// Where lifecycle reads get their recovery evidence: the sweep interval and its
-/// last completed pass. No pass yet is reported as null, never as success.
-fn sweep_source(core: &Arc<Mutex<Core>>) -> serde_json::Value {
+/// Where lifecycle reads get their observation evidence: the observation
+/// interval and its last completed pass. No pass yet is reported as null, never
+/// as success.
+///
+/// This is steady-state observation, not reconciliation: it runs continuously so
+/// lifecycle coverage stays alive with no client connected. Reconciliation is a
+/// separate mechanism with its own triggers (`reconcile`).
+fn observation_source(core: &Arc<Mutex<Core>>) -> serde_json::Value {
     let last = locked(core).sweep_at.load(Ordering::SeqCst);
-    json!({"recovery_sweep": {
+    json!({"observation": {
         "interval_ms": SWEEP_INTERVAL.as_millis() as u64,
         "last_pass_at": (last > 0).then(|| crate::control_plane::store::format_millis(last)),
     }})
@@ -2348,8 +2392,8 @@ fn registry_request(
                 let core = locked(core);
                 (Arc::clone(&core.registry), Arc::clone(&core.verifier))
             };
-            match subjects::read(&registry, &params.subject_id) {
-                Ok(Some(_)) => {}
+            let current = match subjects::read_logical(&registry, &params.subject_id) {
+                Ok(Some(subject)) => subject,
                 Ok(None) => {
                     return Response::refused(
                         &request.id,
@@ -2357,20 +2401,21 @@ fn registry_request(
                     );
                 }
                 Err(error) => return registry_error(request, error),
-            }
-            // Observe exit by verified identity before answering, as spawn reads do.
+            };
+            // Observe exit for the latest execution by verified identity before
+            // answering; the public ID remains the stable logical subject.
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as i64);
             if let Err(error) =
-                subjects::observe_exit(&registry, &params.subject_id, verifier.as_ref(), now)
+                subjects::observe_exit(&registry, &current.subject_id, verifier.as_ref(), now)
             {
                 return registry_error(request, error);
             }
-            match subjects::read(&registry, &params.subject_id) {
+            match subjects::read_logical(&registry, &params.subject_id) {
                 Ok(Some(subject)) => Response::ok(
                     &request.id,
-                    json!({"subject": subjects::public_view(&subject), "source": sweep_source(core)}),
+                    json!({"subject": subjects::public_view(&subject), "source": observation_source(core)}),
                 ),
                 Ok(None) => Response::refused(
                     &request.id,
@@ -2418,40 +2463,76 @@ fn registry_request(
                 (Arc::clone(&core.registry), Arc::clone(&core.verifier))
             };
             // One record beyond the page tells whether a continuation exists.
-            let read = match subjects::list_after(&registry, params.after.as_deref(), limit + 1) {
-                Ok(read) => read,
-                Err(error) => return registry_error(request, error),
-            };
+            let read =
+                match subjects::list_logical_after(&registry, params.after.as_deref(), limit + 1) {
+                    Ok(read) => read,
+                    Err(error) => return registry_error(request, error),
+                };
             let has_more = read.len() > limit;
-            let page: Vec<String> = read
+            let page: Vec<(String, String)> = read
                 .iter()
                 .take(limit)
-                .map(|subject| subject.subject_id.clone())
+                .map(|subject| {
+                    (
+                        subject
+                            .logical_subject_id
+                            .clone()
+                            .unwrap_or_else(|| subject.subject_id.clone()),
+                        subject.subject_id.clone(),
+                    )
+                })
                 .collect();
             let now = unix_millis();
             let mut views = Vec::with_capacity(page.len());
-            for subject_id in &page {
+            for (logical_id, execution_id) in &page {
                 if let Err(error) =
-                    subjects::observe_exit(&registry, subject_id, verifier.as_ref(), now)
+                    subjects::observe_exit(&registry, execution_id, verifier.as_ref(), now)
                 {
                     return registry_error(request, error);
                 }
-                match subjects::read(&registry, subject_id) {
+                match subjects::read_logical(&registry, logical_id) {
                     Ok(Some(subject)) => views.push(subjects::public_view(&subject)),
                     Ok(None) => {}
                     Err(error) => return registry_error(request, error),
                 }
             }
-            let next_after = if has_more { page.last().cloned() } else { None };
+            let next_after = if has_more {
+                page.last().map(|(logical, _)| logical.clone())
+            } else {
+                None
+            };
             Response::ok(
                 &request.id,
                 json!({
                     "subjects": views,
                     "has_more": has_more,
                     "next_after": next_after,
-                    "source": sweep_source(core),
+                    "source": observation_source(core),
                 }),
             )
+        }
+        "lifecycle.reconcile" => {
+            // An explicit operator request is one of the two triggers; the other
+            // is daemon start. Nothing here dispatches an effect: a pass settles
+            // only what independent evidence establishes.
+            let (store, registry, verifier) = {
+                let core = locked(core);
+                (
+                    core.store.clone(),
+                    Arc::clone(&core.registry),
+                    Arc::clone(&core.verifier),
+                )
+            };
+            match reconcile::unresolved(
+                &store,
+                &registry,
+                verifier.as_ref(),
+                reconcile::Trigger::OperatorRequest,
+                unix_millis(),
+            ) {
+                Ok(outcome) => Response::ok(&request.id, json!({"reconciled": outcome})),
+                Err(error) => registry_error(request, error),
+            }
         }
         "topology.get" => {
             let params: ContainerGetParams = match decode_params(request) {
@@ -2600,7 +2681,8 @@ fn registry_request(
                 incarnation,
             );
             let at = store::format_millis(unix_millis());
-            match containers::reconcile(&registry, &inventory, &at, limit) {
+            match containers::reconcile(&registry, &inventory, params.after.as_deref(), &at, limit)
+            {
                 Ok(outcome) => Response::ok(&request.id, json!({"reconciled": outcome})),
                 Err(error) => registry_error(request, error),
             }
@@ -3263,7 +3345,111 @@ fn execute(
         ops::Operation::Cancel | ops::Operation::Stop => {
             execute_subject_control(request, core, operation, verification)
         }
+        ops::Operation::Abandon => execute_abandon(request, core),
     }
+}
+
+/// Ends one unresolved record's recovery obligation, releasing only the
+/// administrative block it held.
+///
+/// The record is named in params rather than being the request's own target: the
+/// record being abandoned is exactly the one holding that target, so admission
+/// must not consult it. No backend is touched, no outcome is established, and no
+/// effect is dispatched — every independent process and pane safety check is
+/// unchanged and still refuses on its own evidence.
+fn execute_abandon(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        request_id: String,
+    }
+    let params: Params = match decode_params(request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    if SessionUuid::parse(&params.request_id).is_none() {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(Code::BadParams, "`request_id` must be a canonical UUID"),
+        );
+    }
+    let requester = match request.optional_string("requester") {
+        Ok(requester) => requester,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let now = store::now_ms();
+    // The record being released is the target, not the daemon: naming it keeps the
+    // in-flight check per record, so releasing one record does not refuse releasing
+    // another, and the abandonment's own record says what it acted on.
+    let released = params.request_id.clone();
+    // `lifecycle.abandon` needs no backend primitive — it releases one of the
+    // daemon's own records. `admit` refuses every operation when no backend is
+    // wired, and a registry-only daemon still owns the record an operator needs
+    // released, so that one verdict is not a refusal here. Every other verdict is
+    // answered as usual: a replay, a content conflict, an in-flight refusal, a
+    // store error, or a wired backend that cannot serve the operation.
+    let wired = {
+        let core = locked(core);
+        core.backend.is_some()
+    };
+    match admit(
+        ops::Operation::Abandon,
+        request,
+        Some(&released),
+        &requester,
+        now,
+        core,
+    ) {
+        Admission::Answered(response) => return response,
+        Admission::Unsupported(message)
+            if !wired && ops::Operation::Abandon.needs() == ops::Primitives::NONE =>
+        {
+            tracing::debug!(%message, %released, "abandoning a record with no backend wired");
+        }
+        Admission::Unsupported(message) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::BackendUnavailable, message),
+            );
+        }
+        Admission::Dispatch(_, _) => {}
+    }
+    let record = RequestRecord::new(
+        &request.id,
+        ops::Operation::Abandon.as_str(),
+        requester,
+        Some(released.clone()),
+        now,
+    )
+    .with_params(request.params.clone());
+    let abandoned = {
+        let core = locked(core);
+        core.store.abandon(&released, now)
+    };
+    // Nothing is dispatched, so a refusal here is a definite answer about the
+    // record — there is no record, it was never claimed, or it is already settled.
+    // A failed abandonment therefore settles with a definite outcome and never
+    // leaves a record that blocks a later attempt.
+    let done = match abandoned {
+        Ok(abandoned) => record.complete(
+            RequestOutcome::Completed,
+            None,
+            Some(&format!(
+                "released the administrative block of `{}`; its effect remains unestablished",
+                abandoned.id
+            )),
+            vec!["abandon".into()],
+            store::now_ms(),
+        ),
+        Err(error) => record.complete(
+            RequestOutcome::Refused,
+            Some(Category::REFUSED),
+            Some(&error),
+            Vec::new(),
+            store::now_ms(),
+        ),
+    };
+    write_settled(request, done, core)
 }
 
 /// What the admission every effectful request shares decided.
@@ -3286,10 +3472,101 @@ enum Admission {
 /// A request this backend cannot serve returns [`Admission::Unsupported`] before
 /// any record claims to be started, so an unimplemented primitive is never
 /// recorded as having been dispatched.
+fn replay_existing_operation(
+    operation: ops::Operation,
+    request: &Request,
+    target: Option<&str>,
+    requester: &Option<String>,
+    core: &Arc<Mutex<Core>>,
+) -> Option<Response> {
+    replay_existing_operation_inner(operation, request, target, true, requester, core)
+}
+
+fn replay_existing_operation_contents(
+    operation: ops::Operation,
+    request: &Request,
+    requester: &Option<String>,
+    core: &Arc<Mutex<Core>>,
+) -> Option<Response> {
+    replay_existing_operation_inner(operation, request, None, false, requester, core)
+}
+
+fn replay_existing_operation_inner(
+    operation: ops::Operation,
+    request: &Request,
+    target: Option<&str>,
+    check_target: bool,
+    requester: &Option<String>,
+    core: &Arc<Mutex<Core>>,
+) -> Option<Response> {
+    let core = locked(core);
+    let record = match core.store.get(&request.id) {
+        Ok(record) => record,
+        Err(error) => {
+            return Some(Response::refused(
+                &request.id,
+                &Refusal::new(Code::Internal, error),
+            ));
+        }
+    }?;
+    let same = record.method == operation.as_str()
+        && (!check_target || record.target.as_deref() == target)
+        && record.requester == *requester
+        && record.params.as_ref() == Some(&request.params);
+    if same {
+        Some(Response::ok(
+            &request.id,
+            json!({ "request": public_record(record) }),
+        ))
+    } else {
+        let message = if record.params.is_none() {
+            "legacy record cannot establish content-equivalent replay"
+        } else {
+            "request id already names different contents"
+        };
+        Some(Response::refused(
+            &request.id,
+            &Refusal::new(Code::Refused, message),
+        ))
+    }
+}
+
 fn admit(
     operation: ops::Operation,
     request: &Request,
     target: Option<&str>,
+    requester: &Option<String>,
+    now: i64,
+    core: &Arc<Mutex<Core>>,
+) -> Admission {
+    admit_with_aliases(operation, request, target, &[], requester, now, core)
+}
+
+fn unresolved_for_targets(
+    store: &store::Store,
+    target: Option<&str>,
+    aliases: &[String],
+    now: i64,
+) -> Result<Option<RequestRecord>, String> {
+    if let Some(held) = store.unresolved(target, now)? {
+        return Ok(Some(held));
+    }
+    for alias in aliases {
+        if target == Some(alias.as_str()) {
+            continue;
+        }
+        if let Some(held) = store.unresolved(Some(alias), now)? {
+            return Ok(Some(held));
+        }
+    }
+    Ok(None)
+}
+
+fn admit_with_aliases(
+    operation: ops::Operation,
+    request: &Request,
+    target: Option<&str>,
+    target_aliases: &[String],
     requester: &Option<String>,
     now: i64,
     core: &Arc<Mutex<Core>>,
@@ -3334,7 +3611,7 @@ fn admit(
                 &Refusal::new(Code::Refused, message),
             ));
         }
-        let held = match core.store.unresolved(target, now) {
+        let held = match unresolved_for_targets(&core.store, target, target_aliases, now) {
             Ok(held) => held,
             Err(error) => {
                 return Admission::Answered(Response::refused(
@@ -3344,11 +3621,15 @@ fn admit(
             }
         };
         let backend = core.backend.clone();
-        let capable = backend
-            .as_ref()
-            .is_some_and(|backend| operation.ready_for(backend.primitives()).is_ok());
-        // Only a request that will be dispatched is recorded as started: an
-        // operation this backend cannot serve leaves no claim that it ran.
+        let capable = match backend.as_ref() {
+            Some(backend) => operation.ready_for(backend.primitives()).is_ok(),
+            // An operation that needs no primitive is served from the daemon's own
+            // records rather than by a backend, so a daemon with none still serves
+            // it and records it. `lifecycle.abandon` is the only such operation.
+            None => operation.needs() == ops::Primitives::NONE,
+        };
+        // Only a request this daemon can serve is recorded as started: an
+        // operation no backend can serve leaves no claim that it ran.
         if held.is_none() && capable {
             let pending = RequestRecord::new(
                 &request.id,
@@ -4662,6 +4943,8 @@ struct SpawnParams {
     cwd: Option<String>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    managed: subjects::ManagedMetadata,
 }
 
 /// Asks the selected backend whether it can carry this launch, before any record
@@ -4688,6 +4971,18 @@ fn preflight_command(
     cwd: Option<&str>,
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), Refusal> {
+    for name in [
+        subjects::MANAGED_SUBJECT_ENV,
+        subjects::MANAGED_LAUNCH_ENV,
+        subjects::MANAGED_GENERATION_ENV,
+    ] {
+        if env.contains_key(name) {
+            return Err(Refusal::new(
+                Code::BadParams,
+                format!("launch env cannot set Radar-issued identity variable {name}"),
+            ));
+        }
+    }
     let launch_context = LaunchRequest {
         pane_id: pane_id.to_string(),
         executable: executable.to_string(),
@@ -4806,6 +5101,15 @@ fn execute_spawn(
             );
         }
     };
+    let requester = match request.optional_string("requester") {
+        Ok(requester) => requester,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    if let Some(response) =
+        replay_existing_operation_contents(ops::Operation::Spawn, request, &requester, core)
+    {
+        return spawn_answer(request, response, core);
+    }
     // The command and the parent are validated at the wire boundary, before
     // anything is recorded: a request this seam cannot carry creates no pane.
     if let Err(message) = validate_command(&params.executable, &params.argv) {
@@ -4827,7 +5131,19 @@ fn execute_spawn(
             .primitives()
             .contains(Primitives::LIFECYCLE_TRACKING)
     });
-    if tracks_launches && let Err(message) = subjects::check_bounds(&requested_launch(&params)) {
+    if !tracks_launches && params.managed != subjects::ManagedMetadata::default() {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "managed launch metadata requires daemon lifecycle tracking",
+            ),
+        );
+    }
+    if tracks_launches
+        && let Err(message) =
+            subjects::check_bounds_with_metadata(&requested_launch(&params), &params.managed)
+    {
         return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
     }
     // The child is created beside the pane its parent registered: a spawn never
@@ -4901,8 +5217,14 @@ fn execute_spawn(
         &params,
         &intent,
         parent_pane,
-        None,
+        SpawnLineage::default(),
     )
+}
+
+#[derive(Default)]
+struct SpawnLineage {
+    session: Option<String>,
+    identity: Option<(String, u32)>,
 }
 
 /// Creates the pane a child runs in and launches it there, once its parent pane is
@@ -4915,12 +5237,42 @@ fn spawn_child(
     params: &SpawnParams,
     intent: &registry::SpawnRequest,
     parent_pane: String,
-    session: Option<String>,
+    lineage: SpawnLineage,
 ) -> Response {
     let requester = match request.optional_string("requester") {
         Ok(requester) => requester,
         Err(refusal) => return Response::refused(&request.id, &refusal),
     };
+    if let Some(response) =
+        replay_existing_operation_contents(ops::Operation::Spawn, request, &requester, core)
+    {
+        return spawn_answer(request, response, core);
+    }
+    if lineage.identity.is_none()
+        && let Some(parent_subject_id) = params.managed.parent_subject_id.as_deref()
+    {
+        let registry = Arc::clone(&locked(core).registry);
+        match subjects::read_logical(&registry, parent_subject_id) {
+            Ok(Some(parent_subject))
+                if parent_subject.bound_agent_id.as_deref() == Some(params.parent.as_str()) => {}
+            Ok(Some(_)) => {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(
+                        Code::BadParams,
+                        "managed parent_subject_id does not name this registered parent",
+                    ),
+                );
+            }
+            Ok(None) => {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::NotFound, "managed parent subject is not recorded"),
+                );
+            }
+            Err(error) => return registry_error(request, error),
+        }
+    }
     let now = store::now_ms();
     let operation = ops::Operation::Spawn;
     let (backend, cancel) = match admit(
@@ -4969,7 +5321,9 @@ fn spawn_child(
             core,
             &request.id,
             requested_launch(params),
-            session.clone(),
+            lineage.session.clone(),
+            lineage.identity.clone(),
+            params.managed.clone(),
             now,
         ) {
             Ok(tracking) => Some(tracking),
@@ -5190,6 +5544,8 @@ fn track_launch(
     request_id: &str,
     launch: subjects::LaunchContext,
     session: Option<String>,
+    identity: Option<(String, u32)>,
+    managed: subjects::ManagedMetadata,
     now: i64,
 ) -> Result<(Bootstrap, subjects::Ticket), String> {
     let (registry, bootstrap) = {
@@ -5198,7 +5554,9 @@ fn track_launch(
     };
     let bootstrap =
         bootstrap.ok_or("this daemon has no executable path a tracked launch can run through")?;
-    let ticket = subjects::create(&registry, request_id, launch, session, now)?;
+    let ticket = subjects::create_with_intent(
+        &registry, request_id, launch, session, identity, managed, now,
+    )?;
     registry.attach_subject(request_id, &ticket.subject_id)?;
     Ok((bootstrap, ticket))
 }
@@ -5422,8 +5780,20 @@ fn execute_subject_control(
         Ok(target) => target,
         Err(refusal) => return Response::refused(&request.id, &refusal),
     };
+    let mut aliases = subjects::execution_ids_for_logical(&registry, &target);
+    if !aliases.contains(&subject_id) {
+        aliases.push(subject_id.clone());
+    }
     let now = store::now_ms();
-    match admit(operation, request, Some(&target), &requester, now, core) {
+    match admit_with_aliases(
+        operation,
+        request,
+        Some(&target),
+        &aliases,
+        &requester,
+        now,
+        core,
+    ) {
         Admission::Answered(response) => return response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
@@ -5729,8 +6099,17 @@ fn execute_restart(
         Ok(requester) => requester,
         Err(refusal) => return Response::refused(&request.id, &refusal),
     };
+    if let Some(response) = replay_existing_operation(
+        ops::Operation::Restart,
+        request,
+        Some(&params.subject_id),
+        &requester,
+        core,
+    ) {
+        return response;
+    }
     let registry = Arc::clone(&locked(core).registry);
-    let subject = match subjects::read(&registry, &params.subject_id) {
+    let subject = match subjects::read_logical(&registry, &params.subject_id) {
         Ok(Some(subject)) => subject,
         Ok(None) => {
             return Response::refused(
@@ -5765,10 +6144,19 @@ fn execute_restart(
         );
     };
     let now = store::now_ms();
-    let cancel = match admit(
+    let logical_subject_id = subject
+        .logical_subject_id
+        .clone()
+        .unwrap_or_else(|| subject.subject_id.clone());
+    let mut aliases = subjects::execution_ids_for_logical(&registry, &logical_subject_id);
+    if !aliases.contains(&subject.subject_id) {
+        aliases.push(subject.subject_id.clone());
+    }
+    let cancel = match admit_with_aliases(
         ops::Operation::Restart,
         request,
-        Some(&subject.subject_id),
+        Some(&logical_subject_id),
+        &aliases,
         &requester,
         now,
         core,
@@ -5779,7 +6167,7 @@ fn execute_restart(
                 ops::Operation::Restart,
                 request,
                 &message,
-                Some(subject.subject_id.clone()),
+                Some(logical_subject_id.clone()),
                 core,
             );
         }
@@ -5789,7 +6177,7 @@ fn execute_restart(
         &request.id,
         ops::Operation::Restart.as_str(),
         requester,
-        Some(subject.subject_id.clone()),
+        Some(logical_subject_id),
         now,
     )
     .with_params(request.params.clone());
@@ -5843,6 +6231,9 @@ fn restart_lead(
             "this process is already superseded by spawn {successor}"
         ));
     }
+    let Some(next_generation) = subject.execution_generation.unwrap_or(1).checked_add(1) else {
+        return refusal_settlement("execution generation is exhausted");
+    };
     match backend.inventory(cancel) {
         Ok(fleet)
             if fleet
@@ -5883,11 +6274,14 @@ fn restart_lead(
         argv: resume.argv,
         cwd: resume.cwd,
         env: resume.env,
+        managed: subject.managed.clone(),
     };
     if let Err(message) = validate_command(&params.executable, &params.argv) {
         return refusal_settlement(message);
     }
-    if let Err(message) = subjects::check_bounds(&requested_launch(&params)) {
+    if let Err(message) =
+        subjects::check_bounds_with_metadata(&requested_launch(&params), &subject.managed)
+    {
         return refusal_settlement(message);
     }
     if let Err(refusal) = preflight_launch(core, &params) {
@@ -5968,7 +6362,16 @@ fn restart_lead(
         &params,
         &intent,
         anchor.to_string(),
-        Some(session.to_string()),
+        SpawnLineage {
+            session: Some(session.to_string()),
+            identity: Some((
+                subject
+                    .logical_subject_id
+                    .clone()
+                    .unwrap_or_else(|| subject.subject_id.clone()),
+                next_generation,
+            )),
+        },
     );
     match registry.spawn_edge(&successor) {
         Ok(Some(edge)) => match edge.launched {
@@ -6008,7 +6411,7 @@ fn restart_lead(
 fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String, String), Refusal> {
     let internal = |error: String| Refusal::new(Code::Internal, error);
     let subject = match (&params.subject_id, &params.spawn_request_id) {
-        (Some(subject_id), None) => subjects::read(registry, subject_id)
+        (Some(subject_id), None) => subjects::read_logical(registry, subject_id)
             .map_err(internal)?
             .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?,
         (None, Some(request_id)) => {
@@ -6030,7 +6433,10 @@ fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String,
             ));
         }
     };
-    Ok((subject.subject_id.clone(), subject.subject_id))
+    Ok((
+        subject.subject_id.clone(),
+        subject.logical_subject_id.unwrap_or(subject.subject_id),
+    ))
 }
 
 /// What a cancel's or stop's effects read as on its record: the outcome the caller
@@ -6120,15 +6526,53 @@ fn spawn_sweeper(
             // What the last topology pass saw, so an unchanged server costs one
             // read and no record.
             let mut seen: Option<String> = None;
+            // Where the last pane-evidence pass stopped, so every recorded launch
+            // is observed in turn rather than only the first page.
+            let mut pane_cursor: Option<String> = None;
+            // The same for the process-exit pass, which is bounded per pass too.
+            let mut sweep_cursor: Option<String> = None;
+            // And for container observation, so a record set larger than one page
+            // is reached over successive passes.
+            let mut reconcile_after: Option<String> = None;
+            // The launched places this run already offered for enrollment, so a
+            // refusal is attempted once rather than every pass.
+            let mut lead_attempts: BTreeSet<String> = BTreeSet::new();
             while !stopping.load(Ordering::SeqCst) {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |elapsed| elapsed.as_millis() as i64);
-                match subjects::sweep(&registry, verifier.as_ref(), now) {
-                    Ok(_) => sweep_at.store(now, Ordering::SeqCst),
+                match subjects::sweep(&registry, verifier.as_ref(), sweep_cursor.as_deref(), now) {
+                    Ok((_, next)) => {
+                        sweep_cursor = next;
+                        sweep_at.store(now, Ordering::SeqCst);
+                    }
                     Err(error) => tracing::error!(%error, "launch recovery sweep failed"),
                 }
-                if let Err(error) = adopt_topology(&core, &registry, &verification, &mut seen) {
+                // One inventory read serves both the pane evidence a bound launch
+                // needs and the adoption pass, so a pass costs one listing.
+                let observation = observed_inventory(&core);
+                if let Err(error) =
+                    observe_launch_panes(&registry, observation.as_ref(), &mut pane_cursor, now)
+                {
+                    tracing::error!(%error, "launch pane observation failed");
+                }
+                if let Err(error) = bind_launched_leads(
+                    &core,
+                    &registry,
+                    observation.as_ref(),
+                    &mut lead_attempts,
+                    &verification,
+                ) {
+                    tracing::error!(%error, "launch enrollment pass failed");
+                }
+                if let Err(error) = adopt_topology(
+                    &core,
+                    &registry,
+                    &verification,
+                    observation,
+                    &mut seen,
+                    &mut reconcile_after,
+                ) {
                     tracing::error!(%error, "topology adoption failed");
                 }
                 let deadline = std::time::Instant::now() + SWEEP_INTERVAL;
@@ -6138,6 +6582,197 @@ fn spawn_sweeper(
             }
         })
         .ok()
+}
+
+/// How many recorded spawn edges one pane-evidence pass may examine.
+const MAX_PANE_OBSERVATIONS: usize = 64;
+
+/// Most launched places one binding pass attempts, so a fleet larger than one
+/// page is still covered over successive passes.
+const MAX_LEAD_BINDINGS: usize = 16;
+
+/// How many registrations one page of the enrollment pass reads.
+const REGISTRY_SCAN: usize = 128;
+
+/// Enrolls a lead Radar launched from a container recipe once its registration
+/// joins that pane.
+///
+/// The display does not own this. A launch is Radar's durable intent, so the
+/// subject is recorded whether or not a dashboard is connected, and closing one
+/// cannot lose the work. The pane must be one Radar created with a recipe — the
+/// `L` shortcut, not an empty shell — and the registration's claimed process must
+/// be that pane's verified live occupant, so a registration cannot be attached to
+/// a pane it does not own. Each place is attempted once per daemon run: a refusal
+/// is recorded as a refusal, not retried in a loop.
+fn bind_launched_leads(
+    core: &Arc<Mutex<Core>>,
+    registry: &Arc<Registry>,
+    observation: Option<&FleetObservation>,
+    attempted: &mut BTreeSet<String>,
+    verification: &Arc<VerificationBudget>,
+) -> Result<usize, String> {
+    let Some(inventory) = observation else {
+        return Ok(0);
+    };
+    let (backend, verifier, stopping) = {
+        let core = locked(core);
+        (
+            core.backend.clone(),
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let Some(backend) = backend else {
+        return Ok(0);
+    };
+    // Places Radar created with a recipe, still reported by the backend, that no
+    // pass has attempted yet. In the steady state this is empty, so the registry
+    // is not scanned at all.
+    let pending: Vec<String> = {
+        let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut panes: Vec<String> = log
+            .container_ids()
+            .filter_map(|id| log.container(id))
+            .filter(|container| {
+                container.provenance == containers::Provenance::Created
+                    && container.recipe
+                    && container.removed_at.is_none()
+            })
+            .filter_map(|container| {
+                container
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.handle.clone())
+            })
+            .filter(|handle| !attempted.contains(handle))
+            .filter(|handle| inventory.pane(handle).is_some())
+            .collect();
+        panes.sort();
+        panes.dedup();
+        panes
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let candidates: Vec<(String, String, crate::model::ProcessIdentity)> = {
+        let mut after: Option<String> = None;
+        let mut found = Vec::new();
+        loop {
+            let page = registry.list_after(after.as_deref(), REGISTRY_SCAN)?;
+            for registration in &page {
+                let Some(pane) = registration
+                    .request
+                    .location
+                    .as_ref()
+                    .and_then(|location| location.pane.clone())
+                else {
+                    continue;
+                };
+                if !pending.contains(&pane) {
+                    continue;
+                }
+                let Some(claim) = registration.request.process.clone() else {
+                    continue;
+                };
+                found.push((pane, registration.agent_id.clone(), claim));
+            }
+            match page.last() {
+                Some(last) if page.len() == REGISTRY_SCAN => after = Some(last.agent_id.clone()),
+                _ => break,
+            }
+        }
+        found
+    };
+    let mut bound = 0;
+    for (pane, agent_id, claim) in candidates.into_iter().take(MAX_LEAD_BINDINGS) {
+        if !attempted.insert(pane.clone()) {
+            continue;
+        }
+        // A subject that already names this agent needs nothing: enrollment is a
+        // one-time association, not a repeated observation.
+        if subjects::bound_subject(registry, &agent_id)?.is_some() {
+            continue;
+        }
+        let now = store::now_ms();
+        let Some(context) = registry.context(&agent_id, now)? else {
+            continue;
+        };
+        if context.context.freshness != registry::Freshness::Fresh {
+            continue;
+        }
+        let Some(session) = context.context.session.clone() else {
+            continue;
+        };
+        // The registration's own claimed process must be this pane's verified
+        // occupant, so a registration cannot claim a pane that is not its own.
+        if verify_live_occupant(&backend, &verifier, &pane, &claim, &stopping, verification)
+            .is_err()
+        {
+            continue;
+        }
+        let params = EnrollParams {
+            agent_id: agent_id.clone(),
+            session,
+        };
+        let enrollment_id = store::random_uuid();
+        match record_enrollment(registry, &verifier, &params, &claim, &enrollment_id, now) {
+            Ok(_) => {
+                bound += 1;
+                tracing::info!(%agent_id, %pane, "enrolled a lead Radar launched");
+            }
+            Err(error) => tracing::warn!(%error, %agent_id, %pane, "launch enrollment refused"),
+        }
+    }
+    Ok(bound)
+}
+
+/// Records what one inventory read said about each bound launch's pane.
+///
+/// Paging is fair rather than a sorted prefix: the pass continues after the last
+/// edge it examined and wraps when the page ends, so a fleet larger than one page
+/// is still covered over successive passes. A failed or unavailable read is
+/// passed through as such and never counts as absence. Nothing is dispatched.
+fn observe_launch_panes(
+    registry: &Arc<Registry>,
+    observation: Option<&FleetObservation>,
+    cursor: &mut Option<String>,
+    now_ms: i64,
+) -> Result<usize, String> {
+    let edges = registry.spawn_edges_after(cursor.as_deref(), MAX_PANE_OBSERVATIONS)?;
+    *cursor = match edges.len() {
+        // A short page is the end of the listing, so the next pass starts over.
+        len if len < MAX_PANE_OBSERVATIONS => None,
+        _ => edges.last().map(|edge| edge.request_id.clone()),
+    };
+    let mut ended = 0;
+    for edge in edges {
+        // Only a bound launch's pane is evidence about a process: an unbound edge
+        // may never have released a program, and its absence says nothing.
+        if edge.bound.is_none() {
+            continue;
+        }
+        let Some(subject_id) = edge.subject_id.as_deref() else {
+            continue;
+        };
+        let Some(location) = edge.location.as_ref() else {
+            continue;
+        };
+        let evidence = match location_evidence(observation, &edge) {
+            LocationEvidence::Present => crate::control_plane::lifecycle::PaneEvidence::Present,
+            LocationEvidence::Absent => crate::control_plane::lifecycle::PaneEvidence::Absent,
+            LocationEvidence::Unavailable => {
+                crate::control_plane::lifecycle::PaneEvidence::Unavailable
+            }
+        };
+        match crate::control_plane::lifecycle::observe_pane(
+            registry, subject_id, location, evidence, now_ms,
+        ) {
+            Ok(true) => ended += 1,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, subject = %subject_id, "pane observation failed"),
+        }
+    }
+    Ok(ended)
 }
 
 /// Records the places of this daemon's own server as observed containers, and
@@ -6151,7 +6786,9 @@ fn adopt_topology(
     core: &Arc<Mutex<Core>>,
     registry: &Arc<Registry>,
     verification: &Arc<VerificationBudget>,
+    observation: Option<FleetObservation>,
     seen: &mut Option<String>,
+    reconcile_after: &mut Option<String>,
 ) -> Result<(), String> {
     let (backend, verifier, stopping) = {
         let core = locked(core);
@@ -6174,7 +6811,7 @@ fn adopt_topology(
     {
         return Ok(());
     }
-    let Some(observation) = observed_inventory(core) else {
+    let Some(observation) = observation else {
         return Ok(());
     };
     let incarnation = serving_identity(&backend, &verifier, &stopping, verification);
@@ -6187,19 +6824,29 @@ fn adopt_topology(
         "{:?}|{:?}|{:?}|{:?}",
         inventory.incarnation, inventory.workspaces, inventory.tabs, inventory.panes
     );
-    if seen.as_deref() == Some(signature.as_str()) {
-        return Ok(());
-    }
     let at = store::format_millis(unix_millis());
-    containers::adopt(
+    // Adoption is one-time per place, so an unchanged server costs no record.
+    if seen.as_deref() != Some(signature.as_str()) {
+        containers::adopt(
+            registry,
+            &observation,
+            &backend.identity(),
+            incarnation.as_ref(),
+            &at,
+        )?;
+        *seen = Some(signature);
+    }
+    // Observation is not one-time: a recorded container is re-observed whether or
+    // not the server changed, one bounded page per pass, resuming where the last
+    // pass stopped so every container is reached in turn.
+    let outcome = containers::reconcile(
         registry,
-        &observation,
-        &backend.identity(),
-        incarnation.as_ref(),
+        &inventory,
+        reconcile_after.as_deref(),
         &at,
+        MAX_RECONCILE,
     )?;
-    containers::reconcile(registry, &inventory, &at, MAX_RECONCILE)?;
-    *seen = Some(signature);
+    *reconcile_after = outcome.next_after;
     Ok(())
 }
 
@@ -6500,6 +7147,8 @@ mod tests {
     fn event(seq: u64) -> store::Event {
         store::Event {
             subject_id: None,
+            execution_id: None,
+            execution_generation: None,
             lifecycle_event_id: None,
             seq,
             kind: "agent.registered".to_string(),
@@ -6539,6 +7188,46 @@ mod tests {
 
     fn sequences(events: &[store::Event]) -> Vec<u64> {
         events.iter().map(|event| event.seq).collect()
+    }
+
+    #[test]
+    fn stable_subject_admission_still_sees_legacy_execution_target_blocks() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-radar-server-test-{}-{}",
+            std::process::id(),
+            store::now_ms()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temporary store root");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("secure temporary store root");
+        let store = store::Store::open(&directory).expect("open store");
+        let execution_id = "11111111-1111-4111-8111-111111111111";
+        let request = RequestRecord::new(
+            "22222222-2222-4222-8222-222222222222",
+            "lifecycle.restart",
+            None,
+            Some(execution_id.to_string()),
+            1,
+        )
+        .with_params(serde_json::json!({}));
+        store.create(&request).expect("create pending record");
+        store
+            .write(&request.claim().start())
+            .expect("write in-flight legacy record");
+
+        let aliases = vec![execution_id.to_string()];
+        let held = unresolved_for_targets(
+            &store,
+            Some("33333333-3333-4333-8333-333333333333"),
+            &aliases,
+            2,
+        )
+        .expect("look up aliases")
+        .expect("legacy record blocks the stable subject");
+        assert_eq!(held.id, request.id);
+        assert_eq!(held.target.as_deref(), Some(execution_id));
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove temporary store root");
     }
 
     #[test]

@@ -470,7 +470,7 @@ impl Registry {
         prepare_directory(&closes)?;
         let subjects = root.join(SUBJECTS);
         prepare_directory(&subjects)?;
-        Ok(Self {
+        let registry = Self {
             directory,
             root: root.to_path_buf(),
             served_since_ms: now_ms,
@@ -479,7 +479,9 @@ impl Registry {
             journal: std::sync::Mutex::new(None),
             observing: Mutex::new(std::collections::HashSet::new()),
             events: crate::control_plane::events::shared(&root.join("events"))?,
-        })
+        };
+        crate::control_plane::lifecycle::migrate_identity(&registry, now_ms)?;
+        Ok(registry)
     }
 
     /// Connects the daemon-owned journal without reopening or resetting it.
@@ -505,6 +507,8 @@ impl Registry {
         if let Some(store) = store {
             let event = crate::control_plane::store::Event {
                 subject_id: None,
+                execution_id: None,
+                execution_generation: None,
                 lifecycle_event_id: None,
                 seq: 0,
                 kind: kind.to_string(),

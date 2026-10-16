@@ -138,22 +138,38 @@ pub struct ContainerObservation {
 }
 
 impl ContainerObservation {
+    /// The reason a container in this state carries, or `None` when the binding is
+    /// trusted right now.
+    pub fn unresolved_reason(&self) -> Option<&'static str> {
+        match self.state {
+            Observed::Present => None,
+            Observed::Missing => Some("no backend reports this container's handle"),
+            Observed::Replaced => {
+                Some("this container's handle now exists under a different serving incarnation")
+            }
+            Observed::Unavailable => {
+                Some("the incarnation serving this container's handle could not be verified")
+            }
+        }
+    }
+
+    /// Whether this container already records exactly this observation, so a fresh
+    /// pass has nothing to write.
+    ///
+    /// Observation is edge-triggered like every other transition: looking again and
+    /// seeing the same thing is not a change, and `observed_at` says when the
+    /// binding was last observed *to change* rather than when it was last read.
+    pub fn is_recorded_by(&self, container: &Container) -> bool {
+        container.observed_at.is_some()
+            && container.unresolved.as_deref() == self.unresolved_reason()
+    }
+
     /// Applies one observation without rewriting identity or binding. A
     /// reconciliation reports drift; it never repairs a binding or adopts a
     /// handle.
     pub fn apply_to(&self, container: &mut Container, at: &str) {
         container.observed_at = Some(at.to_owned());
-        container.unresolved = match self.state {
-            Observed::Present => None,
-            Observed::Missing => Some("no backend reports this container's handle".to_owned()),
-            Observed::Replaced => Some(
-                "this container's handle now exists under a different serving incarnation"
-                    .to_owned(),
-            ),
-            Observed::Unavailable => Some(
-                "the incarnation serving this container's handle could not be verified".to_owned(),
-            ),
-        };
+        container.unresolved = self.unresolved_reason().map(str::to_owned);
     }
 }
 
@@ -652,7 +668,7 @@ pub fn record_removed(registry: &Registry, id: &str, at: &str) -> Result<Contain
 }
 
 /// What one reconciliation pass did, so a caller reads counts rather than prose.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconcileOutcome {
     pub present: usize,
@@ -662,6 +678,22 @@ pub struct ReconcileOutcome {
     /// Containers whose record moved while the pass ran, so their observation was
     /// not written over the newer record.
     pub skipped: usize,
+    /// Where the next pass continues, or `None` when this pass reached the end of
+    /// the recorded containers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+}
+
+impl ReconcileOutcome {
+    /// Counts one observation, whether or not it changed the record.
+    fn count(&mut self, state: Observed) {
+        match state {
+            Observed::Present => self.present += 1,
+            Observed::Missing => self.missing += 1,
+            Observed::Replaced => self.replaced += 1,
+            Observed::Unavailable => self.unavailable += 1,
+        }
+    }
 }
 
 /// Reconciles recorded containers against one inventory snapshot.
@@ -670,20 +702,27 @@ pub struct ReconcileOutcome {
 /// adopted or deleted: a container the backend no longer reports stays recorded
 /// and marked. Nothing is dispatched, so a reconciliation cannot close, reload
 /// or create anything.
+///
+/// Paging is fair rather than a sorted prefix: the pass resumes after the last
+/// container it examined and reports where to continue in `next_after`, so a
+/// record set larger than one page is covered over successive passes.
 pub fn reconcile(
     registry: &Registry,
     inventory: &Inventory,
+    after: Option<&str>,
     at: &str,
     limit: usize,
 ) -> Result<ReconcileOutcome, String> {
-    let ids: Vec<String> = {
+    let (ids, next_after) = {
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
         let mut ids: Vec<String> = log.container_ids().cloned().collect();
         ids.sort();
-        ids.truncate(limit);
-        ids
+        crate::control_plane::store::page_after(&ids, after, limit)
     };
-    let mut outcome = ReconcileOutcome::default();
+    let mut outcome = ReconcileOutcome {
+        next_after,
+        ..ReconcileOutcome::default()
+    };
     for id in ids {
         let previous = read(registry, &id)?.ok_or("container is not recorded")?;
         // A removed container is history, and a container with no binding has
@@ -693,6 +732,13 @@ pub fn reconcile(
             continue;
         }
         let observation = previous.observed(&inventory.bindings(previous.kind));
+        // Looking again and seeing the same thing is not a change: the record is
+        // counted and left as it stands, so a pass over a settled fleet appends
+        // nothing and `observed_at` keeps saying when the binding last moved.
+        if observation.is_recorded_by(&previous) {
+            outcome.count(observation.state);
+            continue;
+        }
         // The check is against the state this observation should produce, so a
         // record another pass changed in the meantime is not written over.
         let mut next = previous.clone();
@@ -716,12 +762,7 @@ pub fn reconcile(
             }
             return Err(error);
         }
-        match observation.state {
-            Observed::Present => outcome.present += 1,
-            Observed::Missing => outcome.missing += 1,
-            Observed::Replaced => outcome.replaced += 1,
-            Observed::Unavailable => outcome.unavailable += 1,
-        }
+        outcome.count(observation.state);
     }
     Ok(outcome)
 }
@@ -976,6 +1017,7 @@ mod tests {
                 panes: vec!["wA:p2".into()],
                 ..Inventory::default()
             },
+            None,
             "2000",
             16,
         )
@@ -1018,6 +1060,7 @@ mod tests {
                 panes: vec!["wA:p2".into()],
                 ..Inventory::default()
             },
+            None,
             "3000",
             16,
         )

@@ -20,6 +20,27 @@ export interface TaskLaneStatus {
   error: string | null;
 }
 /**
+ * Managed owner/parent metadata accepted with a spawn intent. Domain validation
+ * and parent-binding checks remain in the daemon handler.
+ */
+export interface ManagedLaunchMetadataDeserialize {
+  label?: string | null;
+  owner?: string | null;
+  parent_subject_id?: string | null;
+  role?: string | null;
+  run?: string | null;
+}
+/**
+ * A non-secret Pi-session breadcrumb issued by Radar. This is correlation
+ * evidence only and cannot establish lifecycle authority.
+ */
+export interface LaunchIdentityMarkerSerialize {
+  execution_generation: number;
+  launch_id: string;
+  subject_id: string;
+  version: number;
+}
+/**
  * The agent's own process facts. Self-authored by any Pi session, with no owner
  * or assignment, and kept separate from execution and assignment. Every field
  * is optional and a published snapshot replaces the whole value, so omission

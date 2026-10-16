@@ -54,6 +54,8 @@ pub const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 pub struct ContextValue {
     #[serde(default)]
     pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_identity: Option<crate::control_plane::public_contracts::LaunchIdentityMarker>,
 }
 
 /// A publish of one agent record's current session.
@@ -112,6 +114,14 @@ impl ContextRequest {
         {
             return Err("`context.session` must be a canonical UUID".into());
         }
+        if let Some(marker) = &self.context.launch_identity
+            && (marker.version != 1
+                || SessionUuid::parse(&marker.subject_id).is_none()
+                || SessionUuid::parse(&marker.launch_id).is_none()
+                || marker.execution_generation == 0)
+        {
+            return Err("`context.launch_identity` is not a valid Radar-issued marker".into());
+        }
         Ok(())
     }
 
@@ -145,6 +155,8 @@ pub struct AcceptedContext {
     /// The current session, or `None` for an explicit "no current session".
     #[serde(default)]
     pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_identity: Option<crate::control_plane::public_contracts::LaunchIdentityMarker>,
 }
 
 impl AcceptedContext {
@@ -152,6 +164,7 @@ impl AcceptedContext {
         self.lease_ms == request.lease_ms()
             && self.observed_at == request.observed_at
             && self.session == request.context.session
+            && self.launch_identity == request.context.launch_identity
     }
 }
 
@@ -216,6 +229,7 @@ impl SessionContext {
                 restored: self.context.serving_epoch != serving_epoch,
                 freshness: self.freshness(now_ms, serving_epoch),
                 session: self.context.session.clone(),
+                launch_identity: self.context.launch_identity.clone(),
             },
         }
     }
@@ -247,6 +261,8 @@ pub struct PublicSession {
     /// current session" from "never published", which is no context record at
     /// all.
     pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_identity: Option<crate::control_plane::public_contracts::LaunchIdentityMarker>,
 }
 
 /// One agent record's context as a client reads it. A `None` read of this whole
@@ -378,6 +394,7 @@ pub fn publish(
         serving_epoch: registry.serving_epoch().into(),
         observed_at: request.observed_at.clone(),
         session: request.context.session.clone(),
+        launch_identity: request.context.launch_identity.clone(),
     };
     let record = SessionContext {
         version: CONTEXT_VERSION,

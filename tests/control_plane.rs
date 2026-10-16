@@ -421,6 +421,7 @@ const SPAWN_PRIMITIVES: Primitives = Primitives::OBSERVE
     .union(Primitives::LAUNCH)
     .union(Primitives::CLOSE)
     .union(Primitives::LAUNCH_CONTEXT);
+const TRACKED_SPAWN_PRIMITIVES: Primitives = SPAWN_PRIMITIVES.union(Primitives::LIFECYCLE_TRACKING);
 const RECIPE_PRIMITIVES: Primitives = Primitives::OBSERVE
     .union(Primitives::PROCESS_INFO)
     .union(Primitives::CREATE)
@@ -1970,10 +1971,14 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     // never-published read absence.
     let first = client.call(
         "agent.context",
-        json!({"agent_id":id,"publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},"sequence":1,"lease_ms":10000,"context":{"session":SESSION}}),
+        json!({"agent_id":id,"publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},"sequence":1,"lease_ms":10000,"context":{"session":SESSION,"launch_identity":{"version":1,"subject_id":"3d6f021b-4718-4a2e-a8c9-9920ff71af12","launch_id":"97403b5a-f470-4c80-bcb0-2bc84ad0e1c0","execution_generation":2}}}),
     );
     assert!(first["result"]["context"].is_object(), "{first}");
     assert_eq!(first["result"]["context"]["context"]["session"], SESSION);
+    assert_eq!(
+        first["result"]["context"]["context"]["launch_identity"]["subject_id"],
+        "3d6f021b-4718-4a2e-a8c9-9920ff71af12"
+    );
     assert_eq!(first["result"]["context"]["writer"]["generation"], 1);
     assert!(first["result"]["writer"]["handle"].is_string());
     assert!(first["result"]["warning"].is_null());
@@ -2792,6 +2797,16 @@ fn result_record(response: &Value) -> &Value {
     &response["result"]["request"]
 }
 
+/// The ids `mux.request.list` reports as unfinished: what the stop gate counts.
+fn unfinished_ids(response: &Value) -> Vec<String> {
+    response["result"]["requests"]
+        .as_array()
+        .expect("a list of records")
+        .iter()
+        .filter_map(|record| record["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
 /// The daemon answers liveness with what it is, so a client can tell a daemon
 /// with no backend from a daemon of another version before asking it anything.
 #[test]
@@ -2813,7 +2828,10 @@ fn ping_answers_the_revision_and_backend_contracts_without_a_mux() {
             "registry.facts.v1",
             "events.v1",
             "topology.get.v1",
-            "topology.list.v1"
+            "topology.list.v1",
+            // Abandonment releases one of the daemon's own records, so a daemon
+            // with no backend still advertises and serves it.
+            "lifecycle.abandon.v1"
         ])
     );
     let unsupported = client.call(
@@ -3154,6 +3172,221 @@ fn a_request_id_is_at_most_once_across_methods() {
         json!({"name": "pi", "managed": false});
     let reordered = client.call_id(&id, "mux.close", changed_contents);
     assert_eq!(error_code(&reordered), "refused");
+    daemon.stop();
+}
+
+/// An operator can end an unresolved record's recovery obligation. The target it
+/// held becomes operable again, and the record still reports the uncertainty it
+/// always did: abandoning never establishes what the operation did.
+#[test]
+fn an_operator_abandonment_releases_the_target_and_keeps_the_record_unresolved() {
+    let sandbox = Sandbox::new("abandon");
+    let mut daemon = sandbox.daemon();
+    let state = Store::open(&sandbox.state()).expect("open the state");
+    let held = random_uuid();
+    let record = RequestRecord::new(
+        &held,
+        "mux.close",
+        Some("radar".into()),
+        Some("pane:9".into()),
+        now_ms(),
+    );
+    state.create(&record).expect("create the held request");
+    state
+        .write(&record.claim().start())
+        .expect("start the held request");
+
+    let mut client = Client::dial(daemon.path());
+    // While it is unresolved the target is held against a later mutation, and the
+    // stop gate counts it as unfinished work.
+    let refused = client.call_id(
+        &random_uuid(),
+        "mux.focus",
+        json!({"target": "pane:9", "target_kind": "pane"}),
+    );
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+    let gate = client.call("mux.request.list", json!({"unfinished": true}));
+    assert!(
+        unfinished_ids(&gate).contains(&held),
+        "the stop gate counts the unresolved record: {gate}"
+    );
+
+    let answer = client.call("lifecycle.abandon", json!({"request_id": held}));
+    assert_eq!(
+        result_record(&answer)["outcome"],
+        "completed",
+        "the abandonment itself is settled: {answer}"
+    );
+
+    // The record is still unresolved in every read, and says so with its own
+    // uncertainty plus the abandonment.
+    let after = client.call("mux.request.get", json!({"id": held}));
+    assert_eq!(result_record(&after)["outcome"], "unknown");
+    assert_eq!(result_record(&after)["state"], "completed");
+    assert!(result_record(&after)["abandoned_at"].is_string(), "{after}");
+    // The stop gate no longer counts it: its recovery obligation is over.
+    let gate = client.call("mux.request.list", json!({"unfinished": true}));
+    assert!(
+        !unfinished_ids(&gate).contains(&held),
+        "an abandoned record must not hold the stop gate: {gate}"
+    );
+
+    // And the target it held is operable again: the next request is no longer
+    // refused for an in-flight record, it is answered on its own merits.
+    let allowed = client.call_id(
+        &random_uuid(),
+        "mux.focus",
+        json!({"target": "pane:9", "target_kind": "pane"}),
+    );
+    assert_eq!(
+        result_record(&allowed)["category"],
+        Category::BACKEND_UNAVAILABLE,
+        "{allowed}"
+    );
+    daemon.stop();
+}
+
+/// Abandoning is for unresolved records only: a record nothing ran for, or one
+/// with a definite outcome, has no recovery obligation to end.
+#[test]
+fn abandoning_a_record_that_never_ran_or_already_settled_is_refused() {
+    let sandbox = Sandbox::new("abandon-refused");
+    let mut daemon = sandbox.daemon();
+    let state = Store::open(&sandbox.state()).expect("open the state");
+    let pending = random_uuid();
+    let record = RequestRecord::new(
+        &pending,
+        "mux.close",
+        Some("radar".into()),
+        Some("pane:9".into()),
+        now_ms(),
+    );
+    state.create(&record).expect("create the pending request");
+
+    let mut client = Client::dial(daemon.path());
+    // Nothing is dispatched, so this is a definite refusal about the record and
+    // the daemon answers with a settled record rather than an unresolved one.
+    let refused = client.call("lifecycle.abandon", json!({"request_id": pending}));
+    let record = result_record(&refused);
+    assert_eq!(record["outcome"], "refused", "{refused}");
+    assert_eq!(record["category"], Category::REFUSED, "{refused}");
+    assert!(
+        record["message"]
+            .as_str()
+            .expect("a message")
+            .contains("never claimed"),
+        "{refused}"
+    );
+    // The record it refused to abandon is untouched.
+    let after = client.call("mux.request.get", json!({"id": pending}));
+    assert_eq!(result_record(&after)["state"], "pending");
+    assert!(result_record(&after)["abandoned_at"].is_null(), "{after}");
+
+    // The same answer for a record with a definite outcome, and for one this
+    // daemon has never heard of.
+    let settled = random_uuid();
+    let done = RequestRecord::new(
+        &settled,
+        "mux.close",
+        Some("radar".into()),
+        Some("pane:8".into()),
+        now_ms(),
+    )
+    .complete(RequestOutcome::Completed, None, None, Vec::new(), now_ms());
+    state.create(&done).expect("create the settled request");
+    state.write(&done).expect("settle the request");
+    let refused = client.call("lifecycle.abandon", json!({"request_id": settled}));
+    assert_eq!(result_record(&refused)["outcome"], "refused", "{refused}");
+    assert!(
+        result_record(&refused)["message"]
+            .as_str()
+            .expect("a message")
+            .contains("definite outcome"),
+        "{refused}"
+    );
+
+    let missing = random_uuid();
+    let refused = client.call("lifecycle.abandon", json!({"request_id": missing}));
+    assert_eq!(result_record(&refused)["outcome"], "refused", "{refused}");
+    assert!(
+        result_record(&refused)["message"]
+            .as_str()
+            .expect("a message")
+            .contains("no request"),
+        "{refused}"
+    );
+    daemon.stop();
+}
+
+/// Reconciliation is an explicit pass over unresolved records. It settles only
+/// what independent evidence establishes, and reports the rest with a reason
+/// rather than guessing or replaying anything.
+#[test]
+fn reconciliation_reports_what_it_cannot_establish_and_settles_nothing_by_guesswork() {
+    let sandbox = Sandbox::new("reconcile");
+    let mut daemon = sandbox.daemon();
+    let state = Store::open(&sandbox.state()).expect("open the state");
+    // One record whose method has no independent evidence source.
+    let unprovable = random_uuid();
+    let record = RequestRecord::new(
+        &unprovable,
+        "mux.close",
+        Some("radar".into()),
+        Some("pane:9".into()),
+        now_ms(),
+    );
+    state.create(&record).expect("create");
+    state.write(&record.claim().start()).expect("start");
+    // One lifecycle record naming a subject that is not recorded at all.
+    let unknown_subject = random_uuid();
+    let lifecycle = RequestRecord::new(
+        &random_uuid(),
+        "lifecycle.stop",
+        Some("radar".into()),
+        Some(unknown_subject.clone()),
+        now_ms(),
+    );
+    state.create(&lifecycle).expect("create");
+    state.write(&lifecycle.claim().start()).expect("start");
+
+    let mut client = Client::dial(daemon.path());
+    let answer = client.call("lifecycle.reconcile", json!({}));
+    let outcome = &answer["result"]["reconciled"];
+    assert_eq!(outcome["trigger"], "operator_request", "{answer}");
+    assert_eq!(outcome["resolved"], 0, "{answer}");
+    let reported = outcome["unresolved"].as_array().expect("a report");
+    assert!(
+        reported
+            .iter()
+            .any(|entry| entry["request_id"] == unprovable
+                && entry["reason"]
+                    .as_str()
+                    .expect("a reason")
+                    .contains("no independent evidence source")),
+        "{answer}"
+    );
+    assert!(
+        reported
+            .iter()
+            .any(|entry| entry["request_id"] == lifecycle.id
+                && entry["reason"]
+                    .as_str()
+                    .expect("a reason")
+                    .contains("is not recorded")),
+        "{answer}"
+    );
+
+    // Neither record was settled, and neither target was released: a reason is
+    // not an outcome.
+    let after = client.call("mux.request.get", json!({"id": unprovable}));
+    assert_eq!(result_record(&after)["state"], "started");
+    assert!(result_record(&after)["outcome"].is_null(), "{after}");
+    let held = client.call_id(
+        &random_uuid(),
+        "mux.focus",
+        json!({"target": "pane:9", "target_kind": "pane"}),
+    );
+    assert_eq!(error_code(&held), "refused", "{held}");
     daemon.stop();
 }
 
@@ -5470,12 +5703,70 @@ fn launch_readiness_refuses_before_effect_dispatch_and_does_not_change_advertise
     daemon.stop();
 }
 
+#[test]
+fn spawn_refuses_durable_metadata_when_backend_cannot_track_lifecycle() {
+    let sandbox = Sandbox::new("spawn-metadata-untracked");
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let mut params = spawn_params(&parent, "/usr/bin/pi", &[]);
+    params["request"]["managed"] = json!({"owner":"herdr"});
+
+    let refused = client.call_id(&random_uuid(), "spawn.create", params);
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+    assert!(backend.creates().is_empty());
+    assert!(backend.launches().is_empty());
+    assert_eq!(edges_written(&sandbox.state()), 0);
+    daemon.stop();
+}
+
+#[test]
+fn spawn_refuses_caller_supplied_radar_identity_environment_before_any_effect() {
+    let sandbox = Sandbox::new("spawn-marker-env");
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let mut params = spawn_params(&parent, "/usr/bin/pi", &[]);
+    params["request"]["env"] = json!({
+        "PI_RADAR_MANAGED_SUBJECT_ID": "11111111-1111-4111-8111-111111111111"
+    });
+
+    let refused = client.call_id(&random_uuid(), "spawn.create", params);
+    assert_eq!(error_code(&refused), "bad_params", "{refused}");
+    assert!(backend.creates().is_empty());
+    assert!(backend.launches().is_empty());
+    assert_eq!(edges_written(&sandbox.state()), 0);
+    daemon.stop();
+}
+
+#[test]
+fn spawn_refuses_a_missing_managed_parent_subject_before_any_effect() {
+    let sandbox = Sandbox::new("spawn-parent-subject");
+    let backend = MuxBackend::new(TRACKED_SPAWN_PRIMITIVES);
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    let mut params = spawn_params(&parent, "/usr/bin/pi", &[]);
+    params["request"]["managed"] = json!({
+        "parent_subject_id": "01a10c77-8a6b-7035-8a0e-b1fa607bb507"
+    });
+
+    let refused = client.call_id(&random_uuid(), "spawn.create", params);
+    assert_eq!(error_code(&refused), "not_found", "{refused}");
+    assert!(backend.creates().is_empty());
+    assert!(backend.launches().is_empty());
+    assert_eq!(edges_written(&sandbox.state()), 0);
+    daemon.stop();
+}
+
 /// A spawn the backend can serve creates under the parent's own pane, launches
 /// the command the caller resolved, and answers with the two records it wrote.
 #[test]
 fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effects() {
     let sandbox = Sandbox::new("spawn-served");
-    let backend = MuxBackend::new(SPAWN_PRIMITIVES);
+    let backend = MuxBackend::new(TRACKED_SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
@@ -5484,11 +5775,33 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let mut params = spawn_params(&parent, "/usr/bin/pi", &["--child", "row one"]);
     params["request"]["cwd"] = json!("/work dir");
     params["request"]["env"] = json!({"SECRET": "PRIVATE_ENV_SENTINEL_8812"});
+    params["request"]["managed"] = json!({
+        "owner": "herdr",
+        "run": "run-17",
+        "label": "reviewer",
+        "role": "worker"
+    });
     let response = client.call_id(&id, "spawn.create", params.clone());
 
     let record = result_record(&response);
     assert_eq!(record["method"], "spawn.create");
     assert_eq!(record["outcome"], "completed");
+    let lifecycle = client.call("lifecycle.list", json!({"limit": 20}));
+    let subject = lifecycle["result"]["subjects"]
+        .as_array()
+        .expect("subjects")
+        .iter()
+        .find(|subject| subject["spawn_request_id"] == id)
+        .expect("the tracked launch is listed");
+    assert_eq!(
+        subject["managed"],
+        json!({
+            "owner": "herdr",
+            "run": "run-17",
+            "label": "reviewer",
+            "role": "worker"
+        })
+    );
     // The record's target is the location the request changed: the pane the child
     // was created beside, so a competing mutation of it cannot run alongside.
     assert_eq!(record["target"], "wA:p1");
@@ -5538,10 +5851,27 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let launches = backend.launches();
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].pane_id, "wA:p2");
-    assert_eq!(launches[0].executable, "/usr/bin/pi");
+    assert_ne!(
+        launches[0].executable, "/usr/bin/pi",
+        "tracked launches use Radar's bootstrap"
+    );
+    assert!(
+        launches[0]
+            .argv
+            .windows(3)
+            .any(|window| { window == ["--", "/usr/bin/pi", "--child"] })
+    );
     assert_eq!(
-        launches[0].argv,
-        vec!["--child".to_string(), "row one".into()]
+        launches[0].env[agent_radar::control_plane::lifecycle::MANAGED_SUBJECT_ENV],
+        subject["subject_id"]
+    );
+    assert_eq!(
+        launches[0].env[agent_radar::control_plane::lifecycle::MANAGED_LAUNCH_ENV],
+        id
+    );
+    assert_eq!(
+        launches[0].env[agent_radar::control_plane::lifecycle::MANAGED_GENERATION_ENV],
+        "1"
     );
     assert_eq!(launches[0].cwd.as_deref(), Some("/work dir"));
     assert_eq!(launches[0].env["SECRET"], "PRIVATE_ENV_SENTINEL_8812");
@@ -9522,6 +9852,23 @@ fn recipe_creation() -> Value {
 }
 
 #[test]
+fn a_topology_recipe_cannot_set_radar_identity_environment_variables() {
+    let sandbox = Sandbox::new("topology-recipe-marker-env");
+    let backend = recipe_backend();
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    let mut params = recipe_creation();
+    params["recipe"]["env"]["PI_RADAR_MANAGED_SUBJECT_ID"] =
+        json!("11111111-1111-4111-8111-111111111111");
+
+    let refused = client.call("topology.create", params);
+    assert_eq!(error_code(&refused), "bad_params", "{refused}");
+    assert!(backend.creates().is_empty());
+    assert!(backend.launches().is_empty());
+    daemon.stop();
+}
+
+#[test]
 fn a_recipe_creation_holds_the_command_privately_and_runs_it_in_its_pane() {
     let sandbox = Sandbox::new("topology-recipe");
     let backend = recipe_backend();
@@ -10264,6 +10611,29 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
 
     let launches = backend.launches();
     assert_eq!(launches.len(), 1, "one successor, got {launches:?}");
+    let current = client.call("lifecycle.get", json!({"subject_id": subject}));
+    assert_eq!(current["result"]["subject"]["subject_id"], subject);
+    assert_ne!(current["result"]["subject"]["execution_id"], subject);
+    assert_eq!(current["result"]["subject"]["execution_generation"], 2);
+    let successor_id = current["result"]["subject"]["execution_id"]
+        .as_str()
+        .expect("successor execution ID");
+    let events = client.call("events.read", json!({"after": 0, "limit": 256}));
+    let successor_events: Vec<_> = events["result"]["events"]
+        .as_array()
+        .expect("semantic events")
+        .iter()
+        .filter(|event| event["execution_id"] == successor_id)
+        .collect();
+    assert!(
+        !successor_events.is_empty(),
+        "successor lifecycle events: {events}"
+    );
+    assert!(
+        successor_events
+            .iter()
+            .all(|event| { event["subject_id"] == subject && event["execution_generation"] == 2 })
+    );
     assert!(
         launches[0]
             .argv
@@ -10273,8 +10643,8 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         launches[0].argv
     );
 
-    // A second restart of the same process generation names its successor and
-    // launches nothing more.
+    // Same request ID replays its first answer even though the public subject ID
+    // now resolves to the successor execution.
     let replay = selected
         .lifecycle
         .as_ref()
@@ -10297,8 +10667,10 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         "a replay launched a second successor"
     );
 
+    // A distinct restart request resolves to the latest generation. Its Pi
+    // process has not bound yet, so there is no recorded pane to restart from.
     let again = restart_lead_subject(&mut client, &subject);
-    assert_eq!(result_record(&again)["outcome"], "refused", "{again}");
+    assert_eq!(again["error"]["code"], "refused", "{again}");
     assert_eq!(
         backend.launches().len(),
         1,

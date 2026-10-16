@@ -27,10 +27,13 @@ a minimal one would give every pane that instead of the user's profiles. A pane
 started before this change keeps its old `PATH`; make a new workspace.
 
 The daemon records every session, window and pane of its own server as an
-`observed` container, with parent links, on its recovery pass (every two seconds),
+`observed` container, with parent links, on its observation pass (every two
+seconds),
 only when the server's places or its verified serving incarnation changed, and
 never for a place already recorded. It waits while a `topology.create` is
-unfinished so a created place is not recorded twice. Observed containers have no
+unfinished so a created place is not recorded twice. Recorded containers are then
+re-observed one bounded page per pass, resuming where the last pass stopped, so a
+record set larger than one page is reached in turn. Observed containers have no
 recipe, so `topology.reload` refuses them; `topology.delete` keeps its
 confirmation and its refusal to end a live worker. A tmux `mux.focus` with no
 attached client is refused (`no tmux client is attached to this server`) before
@@ -87,12 +90,25 @@ verifier leaves an unfenced edge instead of holding the worker answering a
 caller, and verification is deliberately not atomic with dispatch (a same-UID
 process could respawn the pane in the window between them). The daemon tracks the launches it makes: a captured
 process is stopped or cancelled through its own verified path, a lead can be
-enrolled as a restartable subject, and a recovery sweep re-observes every tracked
+enrolled as a restartable subject, and an observation pass re-observes every tracked
 launch by verified identity. Process stop, cancellation and restart are their own
 contracts (`lifecycle.*`) and claim nothing about assignments or registration. A
 created pane is not a bound child until that child registers with the private
 spawn token, and private launch/resume specifications stored on registrations
 remain inert unless explicitly used by a supported operation.
+
+A lead Radar launched from the dashboard's `L` shortcut is enrolled by the daemon,
+not by the dashboard: the pane must be one Radar created with a recipe, and the
+registration's own claimed process must be that pane's verified live occupant.
+Each place is offered once per daemon run, so a refusal is recorded rather than
+retried in a loop, and closing a dashboard cannot lose the work. A bound launch
+whose recorded pane stops being reported ends externally after a bounded
+confirmation window, with `pane_lost` evidence; that is not a verified process
+exit, which remains the only thing that sets `exited_at`. Recovery of unresolved
+operations runs at daemon start and on `radar lifecycle reconcile`, and
+`radar lifecycle abandon <request-id>` releases a record whose recovery obligation
+an operator chooses to end — preserving its recorded uncertainty and every
+independent process and pane safety check.
 
 ## Stopping and refusals
 

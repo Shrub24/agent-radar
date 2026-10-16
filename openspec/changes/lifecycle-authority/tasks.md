@@ -1,26 +1,46 @@
 # Tasks
 
-## 1. Audit
+## 1. Audit and choose persistence/migration seams
 
-- [ ] 1.1 List every place that detects an exit, a missing pane or a drift for a Radar-owned subject (recovery sweep, pidfd watchers, spawn-close checks, topology reconcile) and record whether it commits through one path. Output: a short table in `design.md`; no code.
+- [x] 1.1 Inventory the current launch/subject/registration keys, writer leases, enrollment paths, spawn bindings and restart recovery; record old-to-new identity behavior in `design.md` and verify no path merges subjects by pane reuse or session UUID alone.
+- [x] 1.2 Inspect the supported Pi APIs and select the branch-scoped non-context custom session entry (`pi.appendEntry`, read with active-branch `getBranch`); add the strict versioned marker codec/fixture. The actual Pi restart/reload round-trip remains an acceptance requirement in 3.1.
+- [x] 1.3 Produce the migration mapping for existing managed subjects, executions, registrations and spawn bindings to logical subject IDs plus generations; cover missing/contradictory records without replay or heuristic merge, and get the migration plan reviewed before changing persistent formats.
+- [x] 1.4 Define the versioned pi-radar runtime-handle request/reply API over Pi's shared extension event bus, with no shared module singleton; package tests prove independent consumers receive the same provider and missing/duplicate providers fail explicitly.
+- [ ] 1.5 Verify the real Herdsman adapter uses that handle in 4.2.
 
-## 2. One transition path
+## 2. Radar-authoritative managed subject and operation state
 
-- [ ] 2.1 Route observer-originated and command-originated transitions for lifecycle subjects through one reducer under the existing record fence, with an evidence summary on the committed event. Test the exit-races-stop case and an unchanged repeated observation appending nothing.
-- [ ] 2.2 Add evidence strength and the confirmation window for weak evidence, with the thresholds as daemon settings. Test a single missed listing, a persistent absence and a contradicting observation clearing the count.
-- [ ] 2.3 Add the ended-externally outcome for a Radar-launched pane or process that disappears outside Radar, reusing the lifecycle vocabulary. Test it through a real tmux pane killed outside Radar.
+- [x] 2.1 Make public `subject_id` the stable logical ID and add per-launch `execution_id`/generation; migrate existing event-log facts non-destructively through exact successor/spawn-edge links, append an idempotent identity-mapping transition, preserve legacy execution IDs and bump the protocol revision. Test an unambiguous chain, disconnected/forked/cyclic/missing links, reopen idempotence, stable read/control behavior and no launch replay.
+- [x] 2.2 Record accepted managed launch metadata in the durable execution event facts before dispatch and in the read model; validate an exact durable parent relation, inherit metadata on successor generations, reject invalid values before effects, and verify request replay does not create a second launch. Mutable metadata updates are deferred until a specific Radar operation is designed; publishers have no write path to these fields.
+- [x] 2.3 Keep command and observation transitions on the registry-fenced reducer; test a simultaneous stop/exit observation commits one terminal transition, and existing repeated-sample tests prove unchanged observations append no duplicate event.
+- [x] 2.4 Move `L`'s remaining TUI-owned post-launch enrollment/binding progress into the daemon. A display disconnect must not lose work; only fresh exact execution, process-birth, registration and marker evidence may bind a subject, and launch success remains verified capture plus durable recording rather than Pi readiness. The dashboard no longer remembers launched places: the daemon's observation pass enrolls a lead whose pane it created with a recipe once that registration's own claimed process is the pane's verified live occupant, once per daemon run.
 
-## 3. Reconciliation
+## 3. Pi-session recovery breadcrumbs
 
-- [ ] 3.1 Name the reconcile triggers (start, changed serving identity, unknown record, inconsistency, operator request) behind one entry point that commits through the reducer and never dispatches an effect. Test each trigger and that steady state runs none.
-- [ ] 3.2 Add an operator reconcile request to the CLI and control plane and document it.
+- [ ] 3.1 Radar now injects versioned subject/launch/generation variables through its tracked bootstrap; pi-radar's strict codec and `session_start` adapter persist them as non-context active-branch custom entries, and tests prove idempotence and that no recipe/token/environment is serialized. Live Pi restart/reload persistence and exact-session association remain to be accepted.
+- [ ] 3.2 Projection now classifies matching, missing, stale-generation, contradictory and unavailable marker evidence without changing a durable binding; tests prove a marker without a Radar record creates no subject. Daemon reconciliation still needs to consume this evidence only alongside exact process/pane evidence, with no create/dispatch fallback, and own post-launch binding independently of the display (2.4).
+- [ ] 3.3 Remove the client-side private publication cache only after daemon-issued identity and writer reacquisition work across daemon restart, publisher reload and brief daemon outage; test that absence of local publisher state cannot create a duplicate subject.
 
-## 4. Unresolved records
+## 4. Single baseline publisher and Herdsman integration
 
-- [ ] 4.1 Surface the reason on an unresolved record in reads and events. Test an unobservable effect staying unresolved and not replayed.
-- [ ] 4.2 Add an abandon operation that commits a terminal abandoned outcome and an event, and make the tmux stop gate ignore abandoned records. Test the gate before and after.
+- [ ] 4.1 Add the package Pi extension entry point at `extension/baseline.ts`; it builds and packs with the standalone SDK, but live Pi package loading, plain-session registration/facts, shutdown and reconnect acceptance remain open.
+- [ ] 4.2 Migrate Herdsman to consume the shared pi-radar runtime handle, submit launch intent to Radar, and contribute only its additional application evidence; test both integrations enabled produce exactly one registration, lease and baseline publication, and that missing/incompatible pi-radar produces a visible diagnostic.
+- [ ] 4.3 Keep live facts/location/process channels replaceable and source-labelled while managed ownership/parent/role/run/label remain Radar state; test freshness loss, channel replacement and that channel updates cannot mutate managed state.
+- [ ] 4.4 Verify the package manifest and Pi-Bolt compiled-ESM path: host Pi APIs are peer dependencies and are not bundled, the extension is discoverable from the published tarball, and imports do not instantiate a second pi-radar module copy.
+- [x] 4.5 Add managed launch metadata and the launch breadcrumb as Rust/Schemars directional DTOs, generate the TypeScript contracts from them, and test both directions plus generation drift.
 
-## 5. Documentation and gate
+## 5. Evidence, reconciliation and unresolved outcomes
 
-- [ ] 5.1 Document ownership, transitions, confirmation, reconciliation triggers and abandonment in `docs/control-plane.md` and `docs/daemon.md`; add the assignment/execution ownership direction to `ideas.md`.
-- [ ] 5.2 Run fmt, strict Clippy, the locked test suite, tmux acceptance, strict spec validation and the checked Nix build; record real exit codes.
+- [x] 5.1 Add evidence strength and bounded confirmation for weak absence evidence; test one missed listing, persistent fresh absence, contradictory evidence clearing confirmation, and failed/stale/incomplete scans never counting as absence. Unit tests cover one absence being cleared by a present read, a burst inside one window not confirming, an unavailable read never confirming, and a verified exit outranking later pane evidence.
+- [x] 5.2 Restrict reconciliation to daemon start, changed serving identity, unknown operation, detected inconsistency and operator request; test each trigger, prove steady-state observation is not named or run as reconciliation, and verify reconciliation dispatches no effect. Two triggers schedule a pass (daemon start, operator request); a changed serving identity, an unknown operation and a detected inconsistency are what a pass exists to resolve, not schedules of their own. Steady-state observation is reported as `source.observation`, and the socket test proves a pass settles nothing by guesswork and releases no target.
+- [x] 5.3 Add ended-externally transitions for Radar-launched subjects with evidence distinguishing pane loss from verified process exit. The `ended_externally` transition carries an evidence summary with reason `pane_lost`, source and confirmation count, and never sets `exited_at`. The fake-runtime and disposable-tmux acceptance for it remains open.
+- [x] 5.4 Add safe abandon behavior: release only the operation's administrative block while preserving uncertainty, no-replay rules and independent process/pane safety refusals. `lifecycle.abandon` takes the unresolved record's own id (never its target, which the record holds), is reachable as `radar lifecycle abandon <request-id>`, and is tested at the store and over the socket: the target becomes operable, the record still reports `unknown` with `abandoned_at`, and an unclaimed or definitely settled record is refused.
+- [x] 5.5 Make bounded lifecycle/container sweeps progress fairly across all records. One shared rule (`control_plane::store::page_after`) pages the subject sweep, the pane-evidence pass and container reconciliation; `topology.reconcile` accepts and returns a continuation cursor. Cursors live in the daemon's observation loop, so a restart starts over — a cursor is meaningful only inside the run that built it. The unit test proves a listing larger than one page is fully covered in bounded passes and that a cursor past the end wraps. Beyond-one-page coverage for a real fleet remains acceptance work.
+- [ ] 5.6 Define the write order across operation admission, spawn edge, lifecycle execution facts and external launch; inject crashes/failures after each durable step, reopen the daemon, and prove accepted intent remains visible, possibly-dispatched effects are never blindly repeated, and uncertain partial records remain unresolved rather than reported complete.
+
+## 6. Events, docs and integration gate
+
+- [x] 6.1 Define and document semantic event replay, retention, cursor expiry and gap behavior. `events.read` already returns a bounded prefix with `cursor` (the last event actually delivered), `tail`, `more` and `earliest`, and answers `cursor_expired` — never a partial sequence — when the epoch changed or the cursor fell out of retention; `docs/control-plane.md` and `docs/daemon.md` state the resynchronisation path. Observation snapshots are never delivered as events. The coalescing-versus-expiry test remains acceptance work.
+- [x] 6.2 Update `docs/control-plane.md`, `docs/daemon.md`, `docs/agent-registration.md` and the pi-radar README with single-publisher ownership, intent flow, breadcrumb semantics and recovery limits; no example describes the Pi session or Herdsman as lifecycle authority. The Herdsman-side integration doc is owned by 4.2, which is still open.
+- [ ] 6.3 Run package unit and packed-install tests, Rust fmt, strict Clippy, the locked Rust suite, strict OpenSpec validation, checked Nix build, PTY/tmux acceptance, daemon restart/replacement and two-display/no-display acceptance; record exact commands and exit codes before claiming completion.
+- [ ] 6.4 Before publishing the cutover, bump `pi-radar` to `0.2.0` for protocol revision 3 and the baseline/runtime API (the version is bumped in `package.json`), then verify the registry install and the Herdsman lockfile against that release. Publishing and the lockfile check remain outstanding.

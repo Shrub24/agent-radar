@@ -626,6 +626,20 @@ pub fn connect() -> Result<Selected, String> {
     connect_at(&socket_path())
 }
 
+/// One explicit reconciliation pass over the daemon's unresolved operations.
+///
+/// It dispatches nothing: it re-reads current evidence, settles only what that
+/// evidence establishes, and reports the rest with a reason. It is not the
+/// steady-state observation pass, which runs continuously whether or not anyone
+/// asks for one.
+pub fn reconcile(cancel: &AtomicBool) -> Result<Value, String> {
+    let socket = socket_path();
+    DaemonRuntime::handshake(&socket)?;
+    let answer = exchange_at(&socket, "lifecycle.reconcile", json!({}), cancel)
+        .map_err(|failure| failure.message)?;
+    Ok(answer.get("reconciled").cloned().unwrap_or(Value::Null))
+}
+
 /// The ids of the daemon's records that are not yet completed, however old.
 ///
 /// The caller must check that the socket unit is listening first: connecting to a
@@ -1136,6 +1150,21 @@ pub trait LifecycleControls: Send + Sync {
     ) -> Result<LifecycleAnswer, String> {
         Err("this run cannot enroll a lead".to_string())
     }
+
+    /// Ends an unresolved record's recovery obligation, releasing only the
+    /// administrative block it holds.
+    ///
+    /// The record is named rather than targeted: it is the one holding the target,
+    /// so it cannot be reached through the target. Nothing is dispatched, and no
+    /// outcome is established — the recorded uncertainty stands.
+    fn abandon_record(
+        &self,
+        _request_id: &str,
+        _held_request_id: &str,
+        _cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        Err("this run cannot abandon a record".to_string())
+    }
 }
 
 /// One subject-targeted request; pane ids are not lifecycle targets.
@@ -1441,6 +1470,31 @@ impl LifecycleControls for DaemonRuntime {
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
         self.enroll_registered(request_id, agent_id, session, cancel)
+    }
+
+    fn abandon_record(
+        &self,
+        request_id: &str,
+        held_request_id: &str,
+        cancel: &AtomicBool,
+    ) -> Result<LifecycleAnswer, String> {
+        if !self.serves(ops::Contract::LifecycleAbandon) {
+            return Err(self.describe(format!(
+                "does not provide `{}`",
+                ops::Contract::LifecycleAbandon.as_str()
+            )));
+        }
+        let result = exchange_with_id_at(
+            &self.socket,
+            request_id,
+            "lifecycle.abandon",
+            json!({"request_id": held_request_id, "requester": REQUESTER}),
+            cancel,
+        )
+        .map_err(|failure| failure.message)?;
+        Ok(LifecycleAnswer {
+            request: result.get("request").cloned().unwrap_or(Value::Null),
+        })
     }
 }
 

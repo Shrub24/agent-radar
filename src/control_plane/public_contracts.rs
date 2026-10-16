@@ -11,6 +11,35 @@ pub struct TaskLaneStatus {
     pub error: Option<String>,
 }
 
+/// Managed owner/parent metadata accepted with a spawn intent. Domain validation
+/// and parent-binding checks remain in the daemon handler.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedLaunchMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_subject_id: Option<String>,
+}
+
+/// A non-secret Pi-session breadcrumb issued by Radar. This is correlation
+/// evidence only and cannot establish lifecycle authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchIdentityMarker {
+    pub version: u32,
+    pub subject_id: String,
+    pub launch_id: String,
+    #[schemars(range(min = 1u32, max = 4294967295u32))]
+    pub execution_generation: u32,
+}
+
 /// `daemon.ping` result. Contract names remain strings so older clients can
 /// preserve and ignore names introduced by newer daemon builds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

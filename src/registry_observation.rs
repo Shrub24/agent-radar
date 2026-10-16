@@ -69,12 +69,24 @@ pub struct RegistryRead {
 /// part of the dashboard's registry read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleSubject {
+    /// Stable logical subject used by public control requests.
     pub subject_id: String,
+    /// Exact execution record ID used to match its spawn edge and process.
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub execution_generation: Option<u32>,
+    #[serde(default)]
+    pub spawn_request_id: Option<String>,
     #[serde(default)]
     pub bound_agent_id: Option<String>,
     #[serde(default)]
     pub process: Option<ProcessIdentity>,
     pub state: crate::control_plane::lifecycle::State,
+    #[serde(default)]
+    pub identity_unresolved: bool,
+    #[serde(default)]
+    pub managed: crate::control_plane::lifecycle::ManagedMetadata,
     #[serde(default)]
     pub session: Option<String>,
     #[serde(default)]
@@ -83,10 +95,24 @@ pub struct LifecycleSubject {
 
 /// A daemon-owned process lifecycle target, joined to one registration by exact
 /// agent id and process birth identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchIdentityEvidence {
+    #[default]
+    Missing,
+    Matching,
+    Stale,
+    Contradictory,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedSubject {
     pub subject_id: String,
     pub process: ProcessIdentity,
+    pub identity_unresolved: bool,
+    pub launch_identity: LaunchIdentityEvidence,
+    pub metadata: crate::control_plane::lifecycle::ManagedMetadata,
     pub child_close: Option<ChildCloseTarget>,
     pub state: crate::control_plane::lifecycle::State,
     pub session: Option<String>,
@@ -325,6 +351,34 @@ fn bind(
     }
 }
 
+/// Classifies the marker only as corroborating evidence; it never creates a
+/// managed join or changes the subject's authoritative binding.
+fn launch_identity_evidence(
+    agent: &RegistryAgent,
+    subject: &LifecycleSubject,
+) -> LaunchIdentityEvidence {
+    let Some(context) = agent.context.as_ref() else {
+        return LaunchIdentityEvidence::Missing;
+    };
+    if context.context.freshness != Freshness::Fresh {
+        return LaunchIdentityEvidence::Unavailable;
+    }
+    let Some(marker) = context.context.launch_identity.as_ref() else {
+        return LaunchIdentityEvidence::Missing;
+    };
+    let generation = subject.execution_generation.unwrap_or(1);
+    if marker.subject_id == subject.subject_id
+        && subject.spawn_request_id.as_deref() == Some(marker.launch_id.as_str())
+        && marker.execution_generation == generation
+    {
+        LaunchIdentityEvidence::Matching
+    } else if marker.subject_id == subject.subject_id && marker.execution_generation < generation {
+        LaunchIdentityEvidence::Stale
+    } else {
+        LaunchIdentityEvidence::Contradictory
+    }
+}
+
 /// The managed subject for a registration, if exactly one public subject names
 /// both its agent id and claimed process incarnation.
 fn managed_subject(
@@ -344,8 +398,19 @@ fn managed_subject(
     Some(ManagedSubject {
         subject_id: subject.subject_id.clone(),
         process: claim.clone(),
+        identity_unresolved: subject.identity_unresolved,
+        launch_identity: launch_identity_evidence(agent, subject),
+        metadata: subject.managed.clone(),
         child_close: spawn
-            .filter(|spawn| spawn.subject_id.as_deref() == Some(subject.subject_id.as_str()))
+            .filter(|spawn| {
+                spawn.subject_id.as_deref()
+                    == Some(
+                        subject
+                            .execution_id
+                            .as_deref()
+                            .unwrap_or(&subject.subject_id),
+                    )
+            })
             .and_then(|spawn| {
                 Some(ChildCloseTarget {
                     spawn_request_id: spawn.request_id.clone(),
@@ -863,15 +928,127 @@ mod tests {
     }
 
     #[test]
+    fn launch_marker_is_only_classified_as_fresh_corroborating_evidence() {
+        use crate::control_plane::public_contracts::LaunchIdentityMarker;
+        use crate::control_plane::registry::context::{PublicContext, PublicSession};
+        use crate::control_plane::registry::publication::{Freshness, PublicWriterFacts};
+
+        let claim = identity(10, 1);
+        let mut agent = registered("lead", at("p1"), Some(claim.clone()));
+        let subject = LifecycleSubject {
+            subject_id: "3d6f021b-4718-4a2e-a8c9-9920ff71af12".into(),
+            execution_id: Some("97403b5a-f470-4c80-bcb0-2bc84ad0e1c0".into()),
+            execution_generation: Some(2),
+            spawn_request_id: Some("97403b5a-f470-4c80-bcb0-2bc84ad0e1c0".into()),
+            bound_agent_id: Some("lead".into()),
+            process: Some(claim),
+            state: crate::control_plane::lifecycle::State::Bound,
+            identity_unresolved: false,
+            managed: Default::default(),
+            session: None,
+            successor: None,
+        };
+        let marker = LaunchIdentityMarker {
+            version: 1,
+            subject_id: subject.subject_id.clone(),
+            launch_id: subject.spawn_request_id.clone().unwrap(),
+            execution_generation: 2,
+        };
+        let set_context = |agent: &mut RegistryAgent,
+                           marker: Option<LaunchIdentityMarker>,
+                           freshness: Freshness| {
+            agent.context = Some(PublicContext {
+                version: 1,
+                agent_id: "lead".into(),
+                writer: PublicWriterFacts {
+                    source: "pi-radar".into(),
+                    incarnation: "11111111-1111-4111-8111-111111111111".into(),
+                    reporting_owner: None,
+                    generation: 1,
+                    sequence: 1,
+                    retired_at: None,
+                },
+                context: PublicSession {
+                    source: "pi-radar".into(),
+                    incarnation: "11111111-1111-4111-8111-111111111111".into(),
+                    reporting_owner: None,
+                    generation: 1,
+                    sequence: 1,
+                    lease_ms: 30_000,
+                    received_at: "2026-01-01T00:00:00.000Z".into(),
+                    expires_at: "2026-01-01T00:00:30.000Z".into(),
+                    observed_at: None,
+                    restored: false,
+                    freshness,
+                    session: Some("c1a2b3d4-e5f6-4a7b-8c9d-0e1a2b3c4d5e".into()),
+                    launch_identity: marker,
+                },
+            });
+        };
+
+        set_context(&mut agent, Some(marker.clone()), Freshness::Fresh);
+        assert_eq!(
+            launch_identity_evidence(&agent, &subject),
+            LaunchIdentityEvidence::Matching
+        );
+        set_context(&mut agent, None, Freshness::Fresh);
+        assert_eq!(
+            launch_identity_evidence(&agent, &subject),
+            LaunchIdentityEvidence::Missing
+        );
+        set_context(
+            &mut agent,
+            Some(LaunchIdentityMarker {
+                execution_generation: 1,
+                ..marker.clone()
+            }),
+            Freshness::Fresh,
+        );
+        assert_eq!(
+            launch_identity_evidence(&agent, &subject),
+            LaunchIdentityEvidence::Stale
+        );
+        set_context(
+            &mut agent,
+            Some(LaunchIdentityMarker {
+                subject_id: "11111111-1111-4111-8111-111111111111".into(),
+                ..marker
+            }),
+            Freshness::Fresh,
+        );
+        assert_eq!(
+            launch_identity_evidence(&agent, &subject),
+            LaunchIdentityEvidence::Contradictory
+        );
+        let marker = LaunchIdentityMarker {
+            version: 1,
+            subject_id: subject.subject_id.clone(),
+            launch_id: subject.spawn_request_id.clone().unwrap(),
+            execution_generation: 2,
+        };
+        set_context(&mut agent, Some(marker), Freshness::Stale);
+        assert_eq!(
+            launch_identity_evidence(&agent, &subject),
+            LaunchIdentityEvidence::Unavailable
+        );
+        assert!(managed_subject(&agent, &[], None).is_none());
+    }
+
+    #[test]
     fn lifecycle_subject_joins_only_on_agent_and_process_birth_identity() {
         let claim = identity(10, 1);
         let panes = inventory(vec![pane("p1", "t1")]);
         let agent = registered("lead", at("p1"), Some(claim.clone()));
         let subject = LifecycleSubject {
-            subject_id: "subject-1".into(),
+            subject_id: "logical-subject-1".into(),
+            execution_id: Some("subject-1".into()),
+            execution_generation: Some(1),
+            spawn_request_id: Some("subject-1".into()),
             bound_agent_id: Some("lead".into()),
             process: Some(claim.clone()),
             state: crate::control_plane::lifecycle::State::Bound,
+            identity_unresolved: false,
+            managed: crate::control_plane::lifecycle::ManagedMetadata::default(),
             session: Some("session".into()),
             successor: None,
         };
@@ -899,7 +1076,7 @@ mod tests {
                 .as_ref()
                 .and_then(|view| view.managed.as_ref())
                 .map(|managed| managed.subject_id.as_str()),
-            Some("subject-1")
+            Some("logical-subject-1")
         );
         assert_eq!(
             projected[0]

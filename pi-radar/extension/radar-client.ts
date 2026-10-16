@@ -4,7 +4,9 @@ import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import type {
 	DaemonPingSerialize,
+	LaunchIdentityMarkerSerialize,
 	FactsSnapshotDeserialize,
+	ManagedLaunchMetadataDeserialize,
 	SpawnExitObservationSerialize,
 } from "./generated-contracts.ts";
 
@@ -26,7 +28,7 @@ import type {
  */
 export const RADAR_PROTOCOL_VERSION = 2;
 /** The minimum daemon wire revision this client understands. */
-export const RADAR_MINIMUM_REVISION = 1;
+export const RADAR_MINIMUM_REVISION = 3;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
@@ -194,6 +196,7 @@ export type RadarWriterBinding = {
  */
 export type RadarContextValue = {
 	session: string | null;
+	launch_identity?: LaunchIdentityMarkerSerialize;
 };
 
 /**
@@ -296,6 +299,10 @@ export type RadarSpawnEdge = {
  * no exit was observed.
  */
 export type RadarSpawnExitObservation = SpawnExitObservationSerialize;
+export type RadarLaunchIdentityMarker = LaunchIdentityMarkerSerialize;
+
+/** Durable Radar-owned metadata accepted with a managed launch intent. */
+export type RadarManagedLaunchMetadata = ManagedLaunchMetadataDeserialize;
 
 /**
  * One edge with what *that read* learned about the location it recorded.
@@ -651,6 +658,11 @@ function unresolvedOperation(requestId: string, detail: string): RadarResult<nev
 }
 
 export const RADAR_SPAWN_TOKEN_ENV = "PI_RADAR_SPAWN_TOKEN";
+const RADAR_MANAGED_IDENTITY_ENV = new Set([
+	"PI_RADAR_MANAGED_SUBJECT_ID",
+	"PI_RADAR_MANAGED_LAUNCH_ID",
+	"PI_RADAR_MANAGED_EXECUTION_GENERATION",
+]);
 
 /**
  * A spawn this process may still have caused.
@@ -857,6 +869,7 @@ function spawnRequestShape(request: {
 	argv: string[];
 	cwd?: string;
 	env?: Record<string, string>;
+	managed?: RadarManagedLaunchMetadata;
 }): string | undefined {
 	if (!isUuid(request.request_id))
 		return "spawn requires a canonical request UUID";
@@ -875,8 +888,25 @@ function spawnRequestShape(request: {
 	for (const [name, value] of env) {
 		if (name === RADAR_SPAWN_TOKEN_ENV)
 			return `spawn env cannot set the reserved ${RADAR_SPAWN_TOKEN_ENV}`;
+		if (RADAR_MANAGED_IDENTITY_ENV.has(name))
+			return `spawn env cannot set Radar-issued identity variable ${name}`;
 		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || /\p{Cc}/u.test(value))
 			return `spawn env contains an invalid name or value: ${name}`;
+	}
+	if (request.managed !== undefined) {
+		if (typeof request.managed !== "object" || request.managed === null)
+			return "managed launch metadata must be an object";
+		for (const [name, value] of Object.entries(request.managed)) {
+			if (!["owner", "run", "label", "role", "parent_subject_id"].includes(name))
+				return `unknown managed launch metadata field: ${name}`;
+			if (value != null && (typeof value !== "string" || value.trim() === "" || new TextEncoder().encode(value).length > 256 || /\p{Cc}/u.test(value)))
+				return `managed launch ${name} must be non-empty, control-free, and at most 256 UTF-8 bytes`;
+		}
+		if (
+			request.managed.parent_subject_id != null &&
+			!isUuid(request.managed.parent_subject_id)
+		)
+			return "managed parent_subject_id must be a canonical UUID";
 	}
 	return undefined;
 }
@@ -978,6 +1008,7 @@ export type RadarClient = {
 		argv: string[];
 		cwd?: string;
 		env?: Record<string, string>;
+		managed?: RadarManagedLaunchMetadata;
 	}): Promise<RadarResult<RadarSpawnEdge>>;
 	spawnGet(request_id: string): Promise<RadarResult<RadarSpawnTopology>>;
 	/** The registered child's process verdict, read from its immutable claim. */
@@ -1512,6 +1543,9 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 								...(request.cwd !== undefined ? { cwd: request.cwd } : {}),
 								...(carriesContext && request.env !== undefined
 									? { env: request.env }
+									: {}),
+								...(request.managed !== undefined
+									? { managed: request.managed }
 									: {}),
 							},
 							requester,

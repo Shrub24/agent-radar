@@ -88,11 +88,18 @@ const rawReply = (request: any, result: unknown): string =>
 const reply = (request: any, result: unknown): string => {
 	if (request.method !== "daemon.ping" || typeof result !== "object" || result === null)
 		return rawReply(request, result);
+	const fields = result as Record<string, unknown>;
 	return rawReply(request, {
 		backend: "tmux",
 		instance: null,
 		tasks: { available: false, error: null },
-		...(result as Record<string, unknown>),
+		...fields,
+		// Most tests exercise ordinary current daemons; old-revision cases use
+		// rawReply so the handshake gate remains explicitly covered.
+		revision:
+			typeof fields.revision === "number" && fields.revision < 3
+				? 3
+				: fields.revision,
 	});
 };
 
@@ -745,6 +752,52 @@ test("a focus reply carrying no operation record is unresolved, never success", 
 	}
 });
 
+test("spawn carries validated Radar-owned launch metadata in the durable request", async () => {
+	const managed = {
+		owner: "herdr",
+		run: "run-17",
+		label: "reviewer",
+		role: "worker",
+		parent_subject_id: UUID_B,
+	};
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				revision: 3,
+				contracts: ["registry.v1", "spawn.v1"],
+			});
+		assert.equal(request.method, "spawn.create");
+		assert.deepEqual(request.params.request.managed, managed);
+		return refuse(request, "bad_params", "fixture refuses after checking request shape");
+	});
+	try {
+		await listen(fixture);
+		const result = await fixture.client().spawn({
+			request_id: UUID_A,
+			parent: UUID_B,
+			parent_session_id: UUID_A,
+			executable: "/nix/store/pi/bin/pi",
+			argv: [],
+			managed,
+		});
+		assert.equal(result.ok, false);
+		assert.equal(result.ok ? "" : result.code, "bad_params");
+		const spoof = await fixture.client().spawn({
+			request_id: UUID_A,
+			parent: UUID_B,
+			parent_session_id: UUID_A,
+			executable: "/nix/store/pi/bin/pi",
+			argv: [],
+			env: { PI_RADAR_MANAGED_SUBJECT_ID: UUID_A },
+		});
+		assert.equal(spoof.ok, false);
+		assert.equal(spoof.ok ? "" : spoof.code, "bad_params");
+	} finally {
+		cleanup(fixture);
+	}
+});
+
 test("child.close sends the exact spawn edge and accepts only confirmed pane closure", async () => {
 	const fixture = makeFixture((request) => {
 		if (request.method === "daemon.ping")
@@ -908,12 +961,16 @@ test("an untrusted control socket is refused without dialling", async () => {
 	}
 });
 
-test("daemon.ping requires protocol 2, revision 1, and registry.v1", async () => {
+test("daemon.ping requires protocol 2, revision 3, and registry.v1", async () => {
 	const answers = [
 		(request: any) =>
 			reply(request, { protocol: 1, revision: 1, contracts: ["registry.v1"] }),
 		(request: any) =>
-			reply(request, { protocol: 2, contracts: ["registry.v1"] }),
+			rawReply(request, {
+				protocol: 2,
+				revision: 2,
+				contracts: ["registry.v1"],
+			}),
 		(request: any) =>
 			reply(request, {
 				protocol: 2,
@@ -938,7 +995,7 @@ test("daemon.ping requires protocol 2, revision 1, and registry.v1", async () =>
 			value: {
 				protocol: 2,
 				backend: "sqlite",
-				revision: 1,
+				revision: 3,
 				instance: null,
 				contracts: ["registry.v1", "future.contract.v9"],
 				tasks: { available: false, error: null },

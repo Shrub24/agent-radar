@@ -4,3 +4,4 @@ export * as inspection from "./extension/radar-inspection.ts";
 export * as launch from "./extension/radar-launch.ts";
 export * as location from "./extension/radar-location.ts";
 export * as publication from "./extension/radar-publication.ts";
+export * as runtime from "./extension/radar-runtime.ts";

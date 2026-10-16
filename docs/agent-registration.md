@@ -322,6 +322,29 @@ advertises `spawn.close.v1`, so a consumer sees whether the method is servable.
 Existing managed
 lifecycle decisions remain with their owner.
 
+### Who owns what
+
+Three roles, kept apart so no participant keeps a second writable copy of
+another's state:
+
+- **Radar is the lifecycle authority** for a managed Pi process. It records the
+  logical subject, the execution generations, the accepted launch intent and its
+  outcome, and it alone decides a transition. Owner, run, label, role and parent
+  values supplied in an accepted launch are Radar state; a publisher has no write
+  path to them.
+- **pi-radar is the single baseline registrar and publisher.** One Pi process has
+  one registration, one writer lease and one baseline publication. Other
+  extensions consume that runtime through the versioned `pi.events` handoff
+  rather than creating a second publisher; a missing or incompatible one is a
+  visible diagnostic, not a silent duplicate.
+- **Herdsman supplies intent and application evidence**, not managed state. It
+  asks Radar for a launch and contributes its own observations through the same
+  subject; it does not maintain an independently writable copy of Radar's
+  lifecycle records.
+
+The Pi-session breadcrumb below is evidence in this split: it helps correlate a
+process during reconciliation and can never create authority.
+
 ### Public discovery and pagination
 
 `agent.get` takes `{"agent_id":"<registered UUID>"}`. `agent.list` takes
@@ -338,8 +361,13 @@ read explicitly. Retirement does not prune registrations.
 For owner/child correlation, pass the exact returned `agent_id`; session UUID or
 pane identity alone cannot identify a subject. If a live process changes session,
 do not register it as a new process: registration is immutable. Publish the
-current session through `agent.context` instead. Session context is a UUID-only
-association and does not carry paths or other launch/private data.
+current session through `agent.context` instead. Session context may also carry
+`launch_identity`: a versioned, non-secret Radar-issued `{version, subject_id,
+launch_id, execution_generation}` breadcrumb persisted in Pi's active session
+branch. It is correlation evidence only; it cannot create a subject, prove
+liveness, override the durable parent or authorize a retry. Invalid versions or
+non-canonical UUIDs are refused. The channel remains source-labelled, leased,
+replaceable evidence and carries no paths, recipes, spawn tokens or environment.
 
 ### One channel is one record
 
@@ -463,9 +491,13 @@ provenance, freshness and no fencing handle.
 
 ### Mutable current-session context
 
-`agent.context` publishes the current session UUID independently of registration
-and execution/assignment snapshots. Its params are
-`{"agent_id":"<registered UUID>","publisher":{"source":"…","incarnation":"<UUID>"},"sequence":1,"context":{"session":"<session UUID>"}}`;
+`agent.context` publishes the current session UUID and optional Radar-issued
+launch breadcrumb independently of registration and execution/assignment snapshots.
+The marker has version 1 and identifies the stable logical subject, the launch
+request UUID and the one-based execution generation. It must match the exact
+execution before Radar may use it as reconciliation evidence; a Pi session UUID
+alone never determines lifecycle identity. Its params are
+`{"agent_id":"<registered UUID>","publisher":{"source":"…","incarnation":"<UUID>"},"sequence":1,"context":{"session":"<session UUID>","launch_identity":{"version":1,"subject_id":"<logical subject UUID>","launch_id":"<launch UUID>","execution_generation":1}}}`;
 `lease_ms` (1–300 seconds, default 30 seconds) and `observed_at` are optional.
 On the first publish the daemon returns a generation-1 writer binding. Subsequent
 publishes include that binding's `writer_handle`; a session switch uses a newer

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Managed owner/parent metadata accepted with a spawn intent. Domain validation\nand parent-binding checks remain in the daemon handler.",
+  "properties": {
+    "label": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_subject_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "title": "managed-launch-metadata-deserialize",
+  "type": "object"
+}

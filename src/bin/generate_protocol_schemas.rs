@@ -7,7 +7,9 @@ use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
 use serde_json::{Value, json};
 
-use agent_radar::control_plane::public_contracts::PingResult;
+use agent_radar::control_plane::public_contracts::{
+    LaunchIdentityMarker, ManagedLaunchMetadata, PingResult,
+};
 use agent_radar::control_plane::registry::publication::FactsSnapshot;
 use agent_radar::control_plane::registry::spawn::PublicSpawnExitObservation;
 
@@ -149,6 +151,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     fs::create_dir_all(&output)?;
     write_pair::<PingResult>(&output, "daemon-ping")?;
+    write_pair::<ManagedLaunchMetadata>(&output, "managed-launch-metadata")?;
+    write_pair::<LaunchIdentityMarker>(&output, "launch-identity-marker")?;
     write_pair::<FactsSnapshot>(&output, "facts-snapshot")?;
     write_pair::<PublicSpawnExitObservation>(&output, "spawn-exit-observation")?;
     Ok(())

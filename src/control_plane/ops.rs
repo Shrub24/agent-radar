@@ -59,6 +59,8 @@ pub enum Contract {
     LifecycleEnroll,
     #[serde(rename = "lifecycle.restart.v1")]
     LifecycleRestart,
+    #[serde(rename = "lifecycle.abandon.v1")]
+    LifecycleAbandon,
     #[serde(rename = "observation.get.v1")]
     ObservationGet,
     #[serde(other)]
@@ -86,6 +88,7 @@ impl Contract {
         Self::LifecycleList,
         Self::LifecycleEnroll,
         Self::LifecycleRestart,
+        Self::LifecycleAbandon,
         Self::ObservationGet,
     ];
 
@@ -111,6 +114,7 @@ impl Contract {
             Self::LifecycleList => "lifecycle.list.v1",
             Self::LifecycleEnroll => "lifecycle.enroll.v1",
             Self::LifecycleRestart => "lifecycle.restart.v1",
+            Self::LifecycleAbandon => "lifecycle.abandon.v1",
             Self::ObservationGet => "observation.get.v1",
             Self::Unknown => "unknown",
         }
@@ -139,6 +143,9 @@ impl Contract {
             Self::TopologyReconcile => P::OBSERVE,
             Self::LifecycleEnroll => P::LIFECYCLE_TRACKING.union(P::OBSERVE),
             Self::LifecycleRestart => P::LIFECYCLE_TRACKING.union(P::CREATE).union(P::LAUNCH),
+            // Abandoning writes one durable record: it reads no backend and
+            // dispatches no effect, so it needs no primitive.
+            Self::LifecycleAbandon => P::NONE,
             // The snapshot is built from the same observation a `mux.observe`
             // read is, so a backend that cannot observe has nothing to publish.
             Self::ObservationGet => P::OBSERVE,
@@ -151,7 +158,7 @@ impl Contract {
 /// added to the protocol. A bundled client needs a daemon at least this new,
 /// because the two ship together and only a daemon that outlived an install can
 /// be older.
-pub const PROTOCOL_REVISION: u32 = 2;
+pub const PROTOCOL_REVISION: u32 = 3;
 
 /// What the handshake advertises: the daemon contracts the backend's primitive set
 /// can serve, which is the list an external consumer pins. The backend's own
@@ -202,6 +209,10 @@ pub enum Operation {
     Enroll,
     /// Operator restart of a restartable lead: stop, then a replacement in its own pane.
     Restart,
+    /// Operator abandonment of an unresolved record: its recovery obligation
+    /// ends and only its administrative block is released. The uncertainty is
+    /// preserved, no outcome is established, and no effect is dispatched.
+    Abandon,
 }
 
 impl Operation {
@@ -221,6 +232,7 @@ impl Operation {
             "lifecycle.stop" => Self::Stop,
             "lifecycle.enroll" => Self::Enroll,
             "lifecycle.restart" => Self::Restart,
+            "lifecycle.abandon" => Self::Abandon,
             _ => return None,
         })
     }
@@ -241,6 +253,7 @@ impl Operation {
             Self::Stop => "lifecycle.stop",
             Self::Enroll => "lifecycle.enroll",
             Self::Restart => "lifecycle.restart",
+            Self::Abandon => "lifecycle.abandon",
         }
     }
 
@@ -258,6 +271,7 @@ impl Operation {
             Self::Cancel | Self::Stop => P::LIFECYCLE_TRACKING,
             Self::Enroll => P::LIFECYCLE_TRACKING.union(P::OBSERVE),
             Self::Restart => P::LIFECYCLE_TRACKING.union(P::CREATE).union(P::LAUNCH),
+            Self::Abandon => P::NONE,
         }
     }
 
@@ -362,7 +376,7 @@ pub fn classify(method: &str) -> Option<Method> {
         // the read is served.
         "spawn.get" | "spawn.list" | "spawn.close" => Method::Registry,
         // A lifecycle read reports the daemon's own subject records.
-        "lifecycle.get" | "lifecycle.list" => Method::Registry,
+        "lifecycle.get" | "lifecycle.list" | "lifecycle.reconcile" => Method::Registry,
         "topology.get" | "topology.list" | "topology.reconcile" => Method::Registry,
         "mux.observe" | "mux.process_info" | "mux.output" => Method::Read,
         "spawn.bootstrap" => Method::Bootstrap,
@@ -524,6 +538,9 @@ mod tests {
                 Contract::Events,
                 Contract::TopologyGet,
                 Contract::TopologyList,
+                // Abandoning writes one durable record: it reads no backend and
+                // dispatches no effect, so a daemon with no backend still serves it.
+                Contract::LifecycleAbandon,
             ]
         );
     }

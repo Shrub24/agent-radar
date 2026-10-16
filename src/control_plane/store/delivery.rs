@@ -34,10 +34,13 @@ impl Store {
         let events = log.read_after(journal.source_seq, DELIVERY_BATCH)?;
         if !events.is_empty() {
             for source in &events {
-                let mut event = pointer(source, &log);
-                event.seq = journal.next_seq;
-                journal.next_seq += 1;
-                journal.events.push(event);
+                if let Some(mut event) = pointer(source, &log) {
+                    event.seq = journal.next_seq;
+                    journal.next_seq += 1;
+                    journal.events.push(event);
+                }
+                // Even private migration bookkeeping advances the source
+                // checkpoint, but it does not consume a public event sequence.
                 journal.source_seq = source.seq;
             }
             let mut bytes =
@@ -61,17 +64,20 @@ impl Store {
     }
 }
 
-fn pointer(event: &LifecycleEvent, log: &Log) -> Event {
+fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
     let kind = match &event.transition {
         Transition::Created(_) => "lifecycle.created",
         Transition::Enrolled(_) => "lifecycle.enrolled",
         Transition::Imported(_) => "lifecycle.imported",
+        Transition::IdentityMapped { .. } | Transition::IdentityUnresolved => return None,
         Transition::Captured(_) => "lifecycle.captured",
         Transition::Bound { .. } => "lifecycle.bound",
         Transition::Revoked => "lifecycle.revoked",
         Transition::SignalRequested => "lifecycle.signal_requested",
         Transition::ExitVerified => "lifecycle.exited",
         Transition::Observed(_) => "lifecycle.observed",
+        Transition::AbsencePending(_) => "lifecycle.absence_pending",
+        Transition::EndedExternally(_) => "lifecycle.ended_externally",
         Transition::PaneCleanup(_) => "lifecycle.pane_cleanup",
         Transition::SuccessorReserved { .. } => "lifecycle.successor_reserved",
         Transition::OperationAdmitted(_) => "lifecycle.operation.admitted",
@@ -88,10 +94,19 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Event {
         Transition::Enrolled(facts) | Transition::Imported(facts) => facts.bound_agent_id.clone(),
         _ => None,
     };
-    Event {
+    let lifecycle_execution = event.operation_id.is_none() && facts.is_some();
+    Some(Event {
         seq: 0,
         kind: kind.into(),
-        subject_id: event.subject_id.clone(),
+        subject_id: facts
+            .and_then(|facts| facts.logical_subject_id.clone())
+            .or_else(|| event.subject_id.clone()),
+        execution_id: lifecycle_execution
+            .then(|| event.subject_id.clone())
+            .flatten(),
+        execution_generation: lifecycle_execution
+            .then(|| facts.and_then(|facts| facts.execution_generation))
+            .flatten(),
         lifecycle_event_id: Some(event.event_id.clone()),
         agent_id,
         spawn: facts
@@ -108,5 +123,5 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Event {
                 _ => None,
             }),
         at: event.at.clone(),
-    }
+    })
 }
