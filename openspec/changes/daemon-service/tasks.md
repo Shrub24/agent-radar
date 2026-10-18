@@ -25,6 +25,7 @@
 - [ ] 4.2 Make bare `radar` start the socket unit, connect, and open the TUI; keep `radar daemon` as the foreground serve used by the unit.
 - [x] 4.3 Map a removed socket to "daemon stopped" and a failed unit to "daemon failed to start"; test both mappings.
 - [x] 4.4 Update `--help` and `--print-config` to show the `[daemon]` table.
+- [x] 4.5 Make a stop graceful: the transport waits up to `DRAIN_TIMEOUT` (3 s) for the requests already being served to answer before it cuts connections, so a write in flight reports its outcome instead of dying with the connection; a request that arrives while stopping is answered `busy` ("daemon is stopping") without being dispatched, so its caller may ask again; a waiting `events.read`/`observation.get` is woken and answered for the window that ended; and a request that cannot answer within the deadline is cut with its record standing, which is what makes an unresolved outcome readable instead of invisible. A switch restarts this service (`sd-switch` stop/start) and the socket unit is untouched, so connections queued during the gap are served by the new daemon; a clean stop keeps the journal epoch stable. Tested at the transport (`a_stop_lets_a_request_in_flight_answer_and_refuses_one_that_arrives_during_it`) and through a real daemon with a backend holding a request (`a_stop_answers_the_request_in_flight_and_refuses_one_that_arrives_during_it`); the daemon test fails when the pre-drain cut is restored. Three existing shutdown tests changed with the behaviour: a request blocked in a verifier and a long-polling read are now answered (`busy` / an ended window) rather than cut, and their bounded-shutdown assertions are unchanged.
 
 ## 5. TUI
 
@@ -36,6 +37,7 @@
 - [x] 6.1 Write `radar-control.socket` (`ListenStream=%t/agent-radar/control.sock`, `SocketMode=0600`, `DirectoryMode=0700`, `RemoveOnStop=yes`), `radar-daemon.service` (`KillMode=process`, `Restart=on-failure`) and `radar-tmux@.service` (`tmux -D -L %i -f /dev/null`, `KillMode=control-group`, no restart).
 - [x] 6.2 Declare the units in `nix/home-manager.nix` behind `programs.radar.enable`, with the package and tmux package and the daemon's `path`.
 - [ ] 6.3 Verify the units with `systemd-analyze verify` and add a checked evaluation of the module. Deferred to live acceptance (9.1): the flake adds no Home Manager input, so the module is not evaluated in checks.
+- [x] 6.4 Keep the tmux server across a package change: `radar-tmux@` carries `X-SwitchMethod = "keep-old"`. Without it `sd-switch`'s default for a changed unit stops and starts the template instance, which kills the server and every pane and agent in it. Verified with `sd-switch --dry-run` against the installed unit: the default plans `Stop/Start radar-tmux@radar.service (SwitchMethod(StopStart))`, and `keep-old` plans `Keep active radar-tmux@radar.service (SwitchMethod(KeepOld))`. The daemon unit deliberately keeps the default, so a switch that changes its `ExecStart` path does restart it.
 
 ## 7. Documentation
 

@@ -116,6 +116,28 @@ independent process and pane safety check.
 stopped a connection is refused and nothing restarts the daemon, so a publisher
 must treat a refused connection as the daemon being down.
 
+A stop is graceful about the requests it has already accepted. The transport
+waits up to three seconds for the requests being served to answer before it cuts
+the connections, so a write in flight finishes and reports its outcome instead of
+dying with the connection. A request that arrives while stopping is answered
+`busy` ("daemon is stopping") without being dispatched, so its caller knows it
+had no effect and may ask again. A waiting `events.read` or `observation.get` is
+woken and answered for the window that ended, which is an ordinary result, so a
+display loops and learns the daemon is going from its next call. Anything that
+cannot answer within the deadline is cut with its record standing, which is what
+makes an unresolved outcome readable through `mux.request.get` rather than
+invisible. An idle connection is dropped without waiting for it, because a
+client dials for each call rather than holding a session.
+
+A switch that changes the daemon's unit restarts it (`sd-switch` stop, then
+start), and the socket unit is untouched, so the listening socket and its queue
+survive the gap and a connection made during it is served by the new daemon. A
+clean stop keeps the journal epoch stable, so a reader resuming with `after` and
+`epoch` continues without skipping; only an unclean stop changes it. The tmux
+server unit carries `X-SwitchMethod = "keep-old"` for the opposite reason: a
+change to it must not stop the server, which would kill every pane and the agents
+in them.
+
 `radar server stop` and `radar server restart` are refused, with no signal sent, while the
 tmux server holds a pane (live or retained) or while a durable operation is
 unfinished. The refusal names the panes and operations.

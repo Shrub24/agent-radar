@@ -1515,7 +1515,17 @@ fn socket_verification_does_not_block_publication_and_shutdown_is_bounded() {
         "shutdown waited on verifier"
     );
     let answer = getter.join().unwrap();
-    assert_eq!(error_code(&answer), "connection_closed");
+    // An answer naming the reason beats a bare closed connection: the caller
+    // learns the request was not dispatched and may ask again. What matters
+    // here is that the stop did not wait for the blocked verification.
+    assert_eq!(error_code(&answer), "busy", "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stopping"),
+        "{answer}"
+    );
 }
 
 #[test]
@@ -1633,7 +1643,14 @@ fn socket_verifier_capacity_is_bounded_daemon_wide_and_released_by_completion() 
         "shutdown waited on a blocked verifier"
     );
     let answer = blocked.into_iter().next().unwrap().join().unwrap();
-    assert_eq!(error_code(&answer), "connection_closed");
+    assert_eq!(error_code(&answer), "busy", "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stopping"),
+        "{answer}"
+    );
 }
 
 #[test]
@@ -1714,10 +1731,22 @@ fn events_read_long_poll_expiry_validation_and_shutdown() {
     std::thread::sleep(Duration::from_millis(50));
     let started = Instant::now();
     daemon.stop();
-    assert!(started.elapsed() < Duration::from_millis(500));
     assert!(
-        waiter.join().is_err(),
-        "shutdown closes the waiting response stream"
+        started.elapsed() < Duration::from_millis(500),
+        "shutdown waited out the long poll"
+    );
+    // The stop ends the wait rather than letting it run to its own expiry, and
+    // the waiter is answered rather than cut: an empty read is a normal result
+    // (`more: false`), so a client loops and learns the daemon is stopping from
+    // its next call — which this daemon answers `busy`.
+    let (answer, elapsed) = waiter
+        .join()
+        .expect("the waiting read is answered, not left hanging");
+    assert!(answer["result"]["events"].is_array(), "{answer}");
+    assert_eq!(answer["result"]["more"], false, "{answer}");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the wait ran to its own expiry instead of ending with the stop: {elapsed:?}"
     );
 }
 
@@ -5233,6 +5262,74 @@ fn an_uncertain_focus_stays_unknown_and_never_holds_its_target() {
     );
     assert_eq!(backend.focused.lock().unwrap().len(), 2);
     daemon.stop();
+}
+
+/// A stop is graceful: the request already being served answers, and a request
+/// that arrives while stopping is refused instead of dropped. Without the drain
+/// the first is a connection the daemon ends, which the client cannot tell from
+/// a request that never arrived.
+#[test]
+fn a_stop_answers_the_request_in_flight_and_refuses_one_that_arrives_during_it() {
+    let sandbox = Sandbox::new("graceful-stop");
+    let (gate, rendezvous) = Rendezvous::new();
+    let backend = Arc::new(GatedBackend {
+        gate: Arc::clone(&gate),
+        released: true,
+        answer: FocusOutcome::Completed,
+    });
+    let mut daemon = sandbox.daemon_with(backend);
+    let path = daemon.path().to_path_buf();
+
+    let mut blocker = Client::dial(&path);
+    let id = random_uuid();
+    blocker.send(&request_line(
+        &id,
+        "mux.focus",
+        json!({"target":"wA:p1","target_kind":"pane"}),
+    ));
+    // Blocks until the request has reached the backend, so the stop below is
+    // asked to end a daemon that is genuinely mid-request.
+    rendezvous.entered();
+
+    // A connection dialled before the stop and left idle: what a client holds
+    // between calls, and where a request can arrive while stopping.
+    let mut later = Client::dial(&path);
+
+    let stopped = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&stopped);
+    let stop = thread::spawn(move || {
+        daemon.stop();
+        finished.store(true, Ordering::SeqCst);
+    });
+    // Waiting for the stop to have begun, not for a request to be mid-flight:
+    // the request above is held by the rendezvous, so the stop cannot finish
+    // however long this waits.
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the stop is waiting for the request the backend holds"
+    );
+
+    // A request arriving while stopping is answered before anything is
+    // dispatched — which is what makes asking again safe.
+    later.send(&request_line(&random_uuid(), "mux.observe", json!({})));
+    let refusal = later.read();
+    assert_eq!(refusal["error"]["code"], "busy", "{refusal}");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stopping"),
+        "{refusal}"
+    );
+
+    // Releasing the held request lets it answer. `Client::read` fails if the
+    // daemon ended the connection instead of answering, so this is the drain.
+    rendezvous.release();
+    let done = blocker.read();
+    assert_eq!(result_record(&done)["outcome"], "completed");
+    stop.join().expect("the stop thread");
+    assert!(stopped.load(Ordering::SeqCst));
 }
 
 /// The record is written before dispatch, and the daemon keeps answering other

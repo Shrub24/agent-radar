@@ -6,7 +6,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener as StdListener, UnixStream as StdStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -28,6 +28,17 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_RECHECK: Duration = Duration::from_millis(100);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a stop waits for requests already being served to answer.
+///
+/// Bounded below the client's own exchange budget and far below systemd's stop
+/// timeout. A request that has not answered by then is cut, and the record it
+/// was dispatched under — durable before dispatch — is what its caller reads
+/// afterwards.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How often a stop rechecks whether the last request in flight has answered.
+const DRAIN_POLL: Duration = Duration::from_millis(5);
 
 /// Create and verify the private directory used by a daemon-owned socket.
 pub(crate) fn prepare_socket_directory(directory: &Path, kind: &str) -> Result<(), String> {
@@ -254,7 +265,18 @@ pub(crate) struct Transport {
     runtime: Option<Arc<Runtime>>,
     accept: Option<JoinHandle<()>>,
     pub(crate) connections: Arc<ConnectionSet>,
+    /// Requests being served right now, so a stop can wait for them instead of
+    /// cutting the connections under them.
+    in_flight: Arc<AtomicUsize>,
     event_notification: Option<EventNotification>,
+}
+
+/// The process-wide signals a connection consults while it serves: whether the
+/// daemon is stopping, and how many requests are being served right now.
+#[derive(Clone)]
+struct Serving {
+    stopping: Arc<AtomicBool>,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl Transport {
@@ -274,9 +296,15 @@ impl Transport {
                 .build()?,
         );
         let connections = Arc::new(ConnectionSet::new());
+        let serving = Serving {
+            stopping,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        };
+        let in_flight = Arc::clone(&serving.in_flight);
         let admission = Arc::new(Admission::new());
         let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let accept_connections = Arc::clone(&connections);
+        let accept_serving = serving.clone();
         let thread_runtime = Arc::clone(&runtime);
         let accept = thread::Builder::new()
             .name("radar-transport".to_string())
@@ -287,10 +315,10 @@ impl Transport {
                         thread_runtime.spawn(accept_loop(
                             source.listener,
                             source.service,
-                            Arc::clone(&stopping),
                             Arc::clone(&accept_connections),
                             Arc::clone(&admission),
                             Arc::clone(&connection_slots),
+                            accept_serving.clone(),
                         ))
                     })
                     .collect();
@@ -304,6 +332,7 @@ impl Transport {
             runtime: Some(runtime),
             accept: Some(accept),
             connections,
+            in_flight,
             event_notification,
         })
     }
@@ -312,6 +341,10 @@ impl Transport {
         if let Some(notification) = &self.event_notification {
             notification.stop();
         }
+        // Requests already being served answer first; only then are the
+        // connections cut, which ends the idle ones and anything still running
+        // at the deadline.
+        self.drain();
         self.connections.close_all();
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
@@ -320,6 +353,20 @@ impl Transport {
             && let Ok(runtime) = Arc::try_unwrap(runtime)
         {
             runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+        }
+    }
+
+    /// Waits for the requests being served to answer, up to [`DRAIN_TIMEOUT`].
+    ///
+    /// Only work in flight is waited for: an idle connection is dropped without
+    /// consequence, because a client dials for each call rather than holding a
+    /// session. A request that cannot answer within the deadline is cut with its
+    /// record standing, which is what makes an unresolved outcome readable
+    /// instead of invisible.
+    fn drain(&self) {
+        let started = std::time::Instant::now();
+        while self.in_flight.load(Ordering::SeqCst) > 0 && started.elapsed() < DRAIN_TIMEOUT {
+            thread::sleep(DRAIN_POLL);
         }
     }
 }
@@ -392,17 +439,17 @@ fn lane(line: &[u8]) -> Lane {
 async fn accept_loop(
     listener: StdListener,
     service: Service,
-    stopping: Arc<AtomicBool>,
     connections: Arc<ConnectionSet>,
     admission: Arc<Admission>,
     connection_slots: Arc<Semaphore>,
+    serving: Serving,
 ) {
     let listener = match UnixListener::from_std(listener) {
         Ok(listener) => listener,
         Err(_) => return,
     };
     let mut tasks = JoinSet::new();
-    while !stopping.load(Ordering::SeqCst) {
+    while !serving.stopping.load(Ordering::SeqCst) {
         match tokio::time::timeout(ACCEPT_RECHECK, listener.accept()).await {
             Ok(Ok((stream, _))) => {
                 let slot = match Arc::clone(&connection_slots).try_acquire_owned() {
@@ -422,8 +469,9 @@ async fn accept_loop(
                 let service = service.clone();
                 let admission = Arc::clone(&admission);
                 let connections = Arc::clone(&connections);
+                let serving = serving.clone();
                 tasks.spawn(async move {
-                    serve(reader, writer, id, connections, service, admission).await;
+                    serve(reader, writer, id, connections, service, admission, serving).await;
                     drop(slot);
                 });
             }
@@ -434,7 +482,9 @@ async fn accept_loop(
             let _ = result;
         }
     }
-    connections.close_all();
+    // The connections are cut by `Transport::stop`, after it has waited for the
+    // requests in flight: closing them here would cut a request already being
+    // served, which is the thing a stop is meant not to do.
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, drain(&mut tasks)).await;
 }
 
@@ -449,6 +499,7 @@ async fn serve(
     connections: Arc<ConnectionSet>,
     service: Service,
     admission: Arc<Admission>,
+    serving: Serving,
 ) {
     let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
     let writer = Arc::new(Mutex::new(writer));
@@ -477,19 +528,29 @@ async fn serve(
                     Service::Control { .. } => lane(&line),
                     Service::Ingest { .. } => Lane::Ingest,
                 };
+                if serving.stopping.load(Ordering::SeqCst) {
+                    // Stopping. A waiting read's connection ends, so its client
+                    // reconnects rather than reading a wait that ended because
+                    // the daemon left: an empty result would be
+                    // indistinguishable from a normal expiry. Anything else is
+                    // answered, so its caller learns the request was not
+                    // dispatched and may ask again.
+                    if matches!(lane, Lane::Waiting) {
+                        break;
+                    }
+                    let request_id = request_id_of(&line);
+                    let response = Response::refused(
+                        &request_id,
+                        &Refusal::new(Code::Busy, "daemon is stopping".to_string()),
+                    );
+                    write_response(&writer, &response);
+                    break;
+                }
                 let Some(permit) = admission.acquire(lane) else {
                     if matches!(&service, Service::Ingest { .. }) {
                         break;
                     }
-                    let request_id = serde_json::from_slice::<serde_json::Value>(&line)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("id")
-                                .and_then(|id| id.as_str())
-                                .map(str::to_owned)
-                        })
-                        .unwrap_or_default();
+                    let request_id = request_id_of(&line);
                     let response = Response::refused(
                         &request_id,
                         &Refusal::new(Code::Busy, format!("the {lane:?} lane is at capacity")),
@@ -497,7 +558,8 @@ async fn serve(
                     write_response(&writer, &response);
                     continue;
                 };
-                match &service {
+                serving.in_flight.fetch_add(1, Ordering::SeqCst);
+                let keep = match &service {
                     Service::Control {
                         dispatch,
                         signal,
@@ -506,12 +568,9 @@ async fn serve(
                         let line = wait_for_event(&line, signal, Arc::clone(ready)).await;
                         let dispatch = Arc::clone(dispatch);
                         let writer = Arc::clone(&writer);
-                        if tokio::task::spawn_blocking(move || dispatch(line, id, writer))
+                        tokio::task::spawn_blocking(move || dispatch(line, id, writer))
                             .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                            .is_ok()
                     }
                     Service::Ingest { dispatch, .. } => {
                         let dispatch = Arc::clone(dispatch);
@@ -520,15 +579,17 @@ async fn serve(
                                 for connection_id in result.close_connections {
                                     connections.close(connection_id);
                                 }
-                                if !result.keep_connection {
-                                    break;
-                                }
+                                result.keep_connection
                             }
-                            Err(_) => break,
+                            Err(_) => false,
                         }
                     }
-                }
+                };
+                serving.in_flight.fetch_sub(1, Ordering::SeqCst);
                 drop(permit);
+                if !keep {
+                    break;
+                }
             }
         }
     }
@@ -536,6 +597,19 @@ async fn serve(
     if let Service::Ingest { disconnect, .. } = service {
         let _ = tokio::task::spawn_blocking(move || disconnect(id)).await;
     }
+}
+
+/// The id a line names, so a refusal can answer the request it will not serve.
+fn request_id_of(line: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 async fn wait_for_event(line: &[u8], signal: &EventSignal, ready: Arc<EventReady>) -> Vec<u8> {
@@ -679,6 +753,148 @@ mod tests {
         );
         assert_eq!(lane(&request("lifecycle.stop", json!({}))), Lane::Control);
         assert!(protocol::decode_request(b"bad").is_err());
+    }
+
+    /// What a stop owes a request it has already accepted: an answer, not a
+    /// dropped connection.
+    #[test]
+    fn a_stop_lets_a_request_in_flight_answer_and_refuses_one_that_arrives_during_it() {
+        use super::{
+            Dispatch, EventReady, ListenerSource, Transport, bind_socket, event_notifications,
+            request_id_of, write_response,
+        };
+        use crate::control_plane::protocol::{PROTOCOL_VERSION, Response};
+        use crate::control_plane::store::random_uuid;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream as StdStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let directory = std::env::temp_dir().join(format!(
+            "radar-transport-drain-{}-{}",
+            std::process::id(),
+            random_uuid()
+        ));
+        std::fs::create_dir_all(&directory).expect("state directory");
+        let path = directory.join("control.sock");
+        let listener = bind_socket(&path, "test", "already in use").expect("bind");
+        // The daemon makes its listener non-blocking before handing it to the
+        // transport, and an accepted socket inherits that.
+        listener.set_nonblocking(true).expect("non-blocking");
+        let (notification, signal) = event_notifications();
+        let ready: Arc<EventReady> = Arc::new(|_line: &[u8]| false);
+
+        // The request this test holds is the one the stop must wait for. It is
+        // chosen by id rather than by arrival, so the test does not depend on
+        // which connection the runtime dispatches first.
+        const BUSY: &str = "7f7f7f7f-7f7f-4f7f-8f7f-7f7f7f7f7f7f";
+        let held = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let (dispatch_held, dispatch_release) = (Arc::clone(&held), Arc::clone(&release));
+        let dispatch: Arc<Dispatch> = Arc::new(
+            move |line: Vec<u8>, _id: u64, writer: Arc<Mutex<StdStream>>| {
+                let id = request_id_of(&line);
+                if id == BUSY {
+                    dispatch_held.store(true, Ordering::SeqCst);
+                    while !dispatch_release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                write_response(
+                    &writer,
+                    &Response::ok(&id, serde_json::json!({"served": true})),
+                );
+            },
+        );
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let mut transport = Transport::start_services(
+            vec![ListenerSource::control(
+                listener,
+                dispatch,
+                signal,
+                notification,
+                ready,
+            )],
+            Arc::clone(&stopping),
+        )
+        .expect("transport starts");
+
+        fn ask(stream: &mut StdStream, id: &str) {
+            let line = serde_json::to_vec(&serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": id,
+                "method": "mux.focus",
+                "params": {},
+            }))
+            .expect("request serializes");
+            stream.write_all(&line).expect("write request");
+            stream.write_all(b"\n").expect("terminate request");
+            stream.flush().expect("flush request");
+        }
+        fn answer(stream: &mut StdStream) -> serde_json::Value {
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .expect("read answer");
+            serde_json::from_str(&line).expect("answer decodes")
+        }
+
+        // Both connections are accepted before the stop: the one carrying the
+        // request in flight, and the one that asks during the drain. An idle
+        // connection is exactly what a client holds between calls.
+        let mut busy = StdStream::connect(&path).expect("connect");
+        let mut later = StdStream::connect(&path).expect("connect");
+        ask(&mut busy, BUSY);
+        ask(&mut later, "8f8f8f8f-8f8f-4f8f-8f8f-8f8f8f8f8f8f");
+        assert_eq!(answer(&mut later)["result"]["served"], true);
+        let waiting = Instant::now();
+        while !held.load(Ordering::SeqCst) {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(5),
+                "the held request was never dispatched"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let (stop_finished, stop_stopping) = (Arc::clone(&finished), Arc::clone(&stopping));
+        let stop = std::thread::spawn(move || {
+            stop_stopping.store(true, Ordering::SeqCst);
+            transport.stop();
+            stop_finished.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the stop is still waiting for the request in flight"
+        );
+
+        // A request arriving while stopping is answered, and answered before
+        // anything is dispatched, so the caller learns it had no effect and may
+        // ask again. A dropped connection could not say that.
+        ask(&mut later, "9f9f9f9f-9f9f-4f9f-8f9f-9f9f9f9f9f9f");
+        let refusal = answer(&mut later);
+        assert_eq!(refusal["error"]["code"], "busy", "{refusal}");
+        assert!(
+            refusal["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("stopping"),
+            "{refusal}"
+        );
+
+        // Releasing the request in flight lets it answer, and only then does the
+        // stop end.
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(answer(&mut busy)["result"]["served"], true);
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the answer arrived before the stop ended"
+        );
+        stop.join().expect("stop thread");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

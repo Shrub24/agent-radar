@@ -42,7 +42,7 @@ use crate::control_plane::registry::{
 };
 use crate::control_plane::store::{self, Category, RequestOutcome, RequestRecord, Store};
 use crate::control_plane::transport::{
-    ConnectionSet, Dispatch, EventReady, IngestDispatch, ListenerSource, Transport,
+    Dispatch, EventReady, IngestDispatch, ListenerSource, Transport,
 };
 use crate::lifecycle::{self, CloseRequest, DirectClose};
 use crate::model::SessionUuid;
@@ -453,10 +453,6 @@ struct Core {
     hub: Option<Arc<crate::control_plane::observation::Hub>>,
 }
 
-fn stop_backend_for(connections: &ConnectionSet) {
-    connections.close_all();
-}
-
 /// The control-plane daemon.
 ///
 /// [`Daemon::bind_at`] binds the socket and starts accepting at once, so a caller
@@ -801,8 +797,9 @@ impl Daemon {
         Some(locked(&self.core).store.clone())
     }
 
-    /// Stops accepting, ends every connection, joins their threads, and removes
-    /// the socket file this daemon created. Idempotent.
+    /// Stops accepting, lets the requests already being served answer, ends
+    /// every connection, joins their threads, and removes the socket file this
+    /// daemon created. Idempotent.
     ///
     /// Records are left exactly where they are: they are the only account of what
     /// was asked for, and a daemon that removed them on the way out would make
@@ -812,7 +809,9 @@ impl Daemon {
             return;
         };
         self.stopping.store(true, Ordering::SeqCst);
-        stop_backend_for(&transport.connections);
+        // The transport drains first and cuts second: a request already being
+        // served answers, and a request that arrives while stopping is refused
+        // without being dispatched.
         transport.stop();
         if let Some(sweeper) = self.sweeper.take() {
             let _ = sweeper.join();

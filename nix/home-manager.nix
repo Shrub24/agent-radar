@@ -119,7 +119,14 @@ in
       };
 
       systemd.user.services."radar-tmux@" = {
-        Unit.Description = "Radar tmux server %i";
+        Unit = {
+          Description = "Radar tmux server %i";
+          # A switch that changes the tmux store path must not stop this unit:
+          # the server it runs holds every pane and every agent in them, so a
+          # restart here kills the fleet rather than updating anything. The new
+          # tmux is used by the next server, not this one.
+          X-SwitchMethod = "keep-old";
+        };
         Service = {
           Type = "simple";
           ExecStart = "${cfg.tmuxPackage}/bin/tmux -D -L %i -f /dev/null";
