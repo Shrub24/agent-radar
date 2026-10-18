@@ -1,9 +1,12 @@
 #![cfg(unix)]
 
-use agent_radar::{Collector, CollectorConfig, HerdrConfig, HerdrRuntime, ObservationState};
+use agent_radar::{
+    Collector, CollectorConfig, FleetObservation, HerdrConfig, HerdrRuntime, ObservationState,
+};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
+    sync::{Arc, atomic::AtomicBool},
     thread,
     time::{Duration, Instant},
 };
@@ -29,6 +32,9 @@ fn shutdown_does_not_wait_for_descendants_holding_output_pipes() {
             executable,
             command_timeout: Duration::from_secs(5),
         }),
+        // This test reads a backend, not a registry: the daemon's own read is
+        // what a collector is given in production.
+        Arc::new(|_fleet: &FleetObservation, _cancel: &AtomicBool| Ok(None)),
     );
     collector.tick(&mut ObservationState::new(), false);
     let deadline = Instant::now() + Duration::from_secs(1);

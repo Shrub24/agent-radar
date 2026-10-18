@@ -33,7 +33,7 @@ pub mod ui;
 pub use app::{
     Action, App, Confirmation, Confirmed, Geometry, Notice, Operation, PaneView, RowOrder,
 };
-pub use collector::{Collector, CollectorConfig};
+pub use collector::{Collector, CollectorConfig, RegistrySource};
 pub use config::{Config, Palette};
 pub use control::{
     ControlError, ControlRequest, ControlResult, NewRequest, Outcome, OwnerControl, RequestState,

@@ -141,7 +141,12 @@ the lifecycle sweep keeps its own coverage.
 The snapshot carries per-source freshness. The daemon reads the pane inventory
 from its backend and the registry in process, and reports the fleet, registry,
 process and task sources separately, so a registry that cannot be read is
-reported as the registry rather than as a fleet that vanished. The dashboard joins
+reported as the registry rather than as a fleet that vanished. That registry read
+is what puts the daemon's own records into the snapshot: every registration with
+its published channels and session context, every spawn edge, every container it
+records and every managed lifecycle subject, each paged to the end so a fleet
+larger than one page still arrives whole. A snapshot without them leaves the tree
+with no container to act on and no recorded label to show. The dashboard joins
 each registration to a pane by its backend-qualified location and the exact
 `process.claim` birth identity of that pane's own foreground process, and joins
 background tasks only by exact Pi session UUID; it does not bind publisher sockets

@@ -36,12 +36,10 @@ use serde_json::{Value, json};
 
 use super::containers::PublicContainer;
 use super::ops;
-use super::registry::PublicSpawnTopology;
 use super::{MAX_LINE_BYTES, PROTOCOL_VERSION, random_uuid, socket_path, trusted_socket};
 use crate::bus::{BusEvent, Task, TaskState};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::{FleetObservation, ForegroundEvidence};
-use crate::registry_observation::{LifecycleSubject, RegistryAgent, RegistryRead};
 use crate::runtime::{
     BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedIdentity,
     CreatedKind, CreatedLocation, FocusOutcome, InputOutcome, InputRequest, OutputOutcome,
@@ -57,39 +55,10 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_GRANULARITY: Duration = Duration::from_millis(10);
 
 /// Agents asked for per `agent.list` page: the daemon's own maximum.
-const REGISTRY_PAGE_LIMIT: usize = 100;
 const TASKS_PAGE_LIMIT: usize = 100;
 
-/// How long reading every registered agent may take in one refresh.
+/// How long reading every page of one registry or task read may take.
 const REGISTRY_READ_DEADLINE: Duration = Duration::from_secs(10);
-
-/// One `agent.list` answer.
-#[derive(Deserialize)]
-struct AgentPage {
-    agents: Vec<RegistryAgent>,
-    next: Option<String>,
-}
-
-/// One `spawn.list` answer.
-#[derive(Deserialize)]
-struct SpawnPage {
-    spawns: Vec<PublicSpawnTopology>,
-    next: Option<String>,
-}
-
-/// One `topology.list` answer.
-#[derive(Deserialize)]
-struct ContainerPage {
-    containers: Vec<PublicContainer>,
-    next: Option<String>,
-}
-
-/// One `lifecycle.list` answer.
-#[derive(Deserialize)]
-struct LifecyclePage {
-    subjects: Vec<LifecycleSubject>,
-    next_after: Option<String>,
-}
 
 #[derive(Deserialize)]
 pub struct TasksPage {
@@ -304,50 +273,7 @@ impl DaemonRuntime {
         self.task_diagnostic.as_deref()
     }
 
-    /// Every page of one cursor-paged read, to the end.
-    ///
-    /// A partial read is never returned as the whole: a page that fails, a
-    /// cursor that does not advance, or a read that outlives its deadline fails
-    /// the read, and so the refresh, which keeps the last inventory stale.
-    fn read_all<T>(
-        &self,
-        method: &str,
-        what: &str,
-        deadline: Instant,
-        cancel: &AtomicBool,
-        decode: impl Fn(Value) -> Result<(Vec<T>, Option<String>), serde_json::Error>,
-    ) -> Result<Vec<T>, String> {
-        let mut items = Vec::new();
-        let mut after: Option<String> = None;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(self.describe(format!(
-                    "did not finish reading {what} within {REGISTRY_READ_DEADLINE:?}"
-                )));
-            }
-            let mut params = json!({"limit": REGISTRY_PAGE_LIMIT});
-            if let Some(cursor) = &after {
-                params["after"] = json!(cursor);
-            }
-            let result = self
-                .call(method, params, cancel)
-                .map_err(|failure| failure.message)?;
-            let (page, next) = decode(result).map_err(|error| {
-                self.describe(format!("sent an unreadable {what} page: {error}"))
-            })?;
-            items.extend(page);
-            match next {
-                None => return Ok(items),
-                Some(next) if after.as_deref() == Some(next.as_str()) => {
-                    return Err(
-                        self.describe(format!("repeated a {what} page cursor without progress"))
-                    );
-                }
-                Some(next) => after = Some(next),
-            }
-        }
-    }
-
+    /// One exchange, with every failure naming the daemon it happened to.
     /// One exchange, with every failure naming the daemon it happened to.
     fn call(&self, method: &str, params: Value, cancel: &AtomicBool) -> Result<Value, Failure> {
         exchange_at(&self.socket, method, params, cancel)
@@ -451,63 +377,6 @@ impl RuntimeProvider for DaemonRuntime {
         let inventory = result.get("inventory").cloned().unwrap_or(Value::Null);
         serde_json::from_value(inventory)
             .map_err(|error| self.describe(format!("sent an unreadable inventory: {error}")))
-    }
-
-    fn registry(&self, cancel: &AtomicBool) -> Result<Option<RegistryRead>, String> {
-        // Without the registry there are no agent facts, and the inventory's own
-        // agent records are not a substitute. Refreshing fails visibly instead.
-        for contract in [ops::Contract::Registry, ops::Contract::Spawn] {
-            if !self.serves(contract) {
-                return Err(self.describe(format!("does not provide `{}`", contract.as_str())));
-            }
-        }
-        let deadline = Instant::now() + REGISTRY_READ_DEADLINE;
-        let agents = self.read_all(
-            "agent.list",
-            "registered agents",
-            deadline,
-            cancel,
-            |value| {
-                let page: AgentPage = serde_json::from_value(value)?;
-                Ok((page.agents, page.next))
-            },
-        )?;
-        let topology =
-            self.read_all("spawn.list", "spawn topology", deadline, cancel, |value| {
-                let page: SpawnPage = serde_json::from_value(value)?;
-                Ok((page.spawns, page.next))
-            })?;
-        // Containers are the daemon's own records, and a daemon that does not
-        // serve them has none: a missing contract reads as no containers rather
-        // than as a refresh that failed.
-        let containers = if self.serves(ops::Contract::TopologyList) {
-            self.read_all("topology.list", "containers", deadline, cancel, |value| {
-                let page: ContainerPage = serde_json::from_value(value)?;
-                Ok((page.containers, page.next))
-            })?
-        } else {
-            Vec::new()
-        };
-        let lifecycle = if self.serves(ops::Contract::LifecycleList) {
-            self.read_all(
-                "lifecycle.list",
-                "managed lifecycle subjects",
-                deadline,
-                cancel,
-                |value| {
-                    let page: LifecyclePage = serde_json::from_value(value)?;
-                    Ok((page.subjects, page.next_after))
-                },
-            )?
-        } else {
-            Vec::new()
-        };
-        Ok(Some(RegistryRead {
-            agents,
-            topology,
-            lifecycle,
-            containers,
-        }))
     }
 
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence {

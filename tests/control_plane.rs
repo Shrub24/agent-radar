@@ -2548,6 +2548,28 @@ impl Client {
         self.call_id(&id, method, params)
     }
 
+    /// The first snapshot this daemon publishes, asking until it has one.
+    ///
+    /// A first read is demand alone: the revision it is answered with is the one
+    /// that existed before it, so the snapshot its demand caused arrives on a
+    /// later read. Nothing here invents a fleet to answer with.
+    fn first_snapshot(&mut self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let answer = self.call(
+                "observation.get",
+                json!({"since_revision": 0, "wait_ms": 1000}),
+            );
+            if let Some(snapshot) = answer["result"].get("snapshot") {
+                return snapshot.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no snapshot was published: {answer}"
+            );
+        }
+    }
+
     fn call_id(&mut self, id: &str, method: &str, params: Value) -> Value {
         self.send(&request_line(id, method, params));
         self.read()
@@ -9548,7 +9570,7 @@ fn a_replayed_creation_answers_with_the_same_container_and_creates_nothing() {
 }
 
 #[test]
-fn the_client_reads_the_containers_the_daemon_records() {
+fn the_snapshot_carries_the_containers_the_daemon_records() {
     let sandbox = Sandbox::new("client-containers");
     // The capabilities the dashboard client's handshake requires, plus launch:
     // its registry read requires the spawn contract, which a backend can only
@@ -9574,24 +9596,16 @@ fn the_client_reads_the_containers_the_daemon_records() {
         "{created}"
     );
 
-    // The dashboard client reads the containers with the registry facts, in the
-    // normalized types the rest of Radar sees: the tree's own names for a fleet
-    // Radar created reach the client without a second protocol.
-    let client = DaemonRuntime::handshake(daemon.path()).expect("the daemon is usable");
-    let cancel = AtomicBool::new(false);
-    let read = client
-        .registry(&cancel)
-        .expect("a registry read")
-        .expect("a registry");
-    assert_eq!(read.containers.len(), 1, "{read:?}");
-    assert_eq!(read.containers[0].label.as_deref(), Some("work"));
-    assert_eq!(
-        read.containers[0]
-            .binding
-            .as_ref()
-            .map(|binding| binding.handle.as_str()),
-        Some("wA")
-    );
+    // The daemon's own observation carries the containers it recorded: a display
+    // reads them from the snapshot and from nowhere else, so a snapshot without
+    // them leaves every row unactionable and every created place unnamed.
+    let snapshot = raw.first_snapshot();
+    let containers = snapshot["observation"]["inventory"]["containers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("containers in the snapshot: {snapshot}"));
+    assert_eq!(containers.len(), 1, "{snapshot}");
+    assert_eq!(containers[0]["label"], "work", "{snapshot}");
+    assert_eq!(containers[0]["binding"]["handle"], "wA", "{snapshot}");
     daemon.stop();
 }
 
@@ -10465,17 +10479,17 @@ fn enrollment_binds_a_verified_lead_and_refuses_a_second_binding() {
     assert_eq!(view["result"]["subject"]["state"], "bound", "{view}");
     let selected =
         agent_radar::control_plane::client::connect_at(daemon.path()).expect("dashboard client");
-    let registry = selected
-        .provider
-        .registry(&AtomicBool::new(false))
-        .expect("registry read")
-        .expect("daemon registry");
+    // The snapshot carries the daemon's lifecycle subjects, which is what a
+    // display reads to offer a managed action on one.
+    let snapshot = client.first_snapshot();
+    let subjects = snapshot["observation"]["inventory"]["lifecycle_subjects"]
+        .as_array()
+        .unwrap_or_else(|| panic!("lifecycle subjects in the snapshot: {snapshot}"));
     assert!(
-        registry
-            .lifecycle
+        subjects
             .iter()
-            .any(|record| record.subject_id == subject),
-        "lifecycle.list was not included in the registry projection: {registry:?}"
+            .any(|record| record["subject_id"] == subject),
+        "the daemon's own lifecycle subjects were not in the snapshot: {snapshot}"
     );
     let public = view.to_string();
     assert!(!public.contains("/bin/sh"), "private launch leaked: {view}");

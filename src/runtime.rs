@@ -35,7 +35,6 @@ use std::sync::atomic::AtomicBool;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{FleetObservation, ForegroundEvidence};
-use crate::registry_observation::RegistryRead;
 
 /// What a tmux focus refuses with when nothing is attached to the server, so a
 /// caller can tell that case from any other refusal and attach a client.
@@ -1008,13 +1007,6 @@ pub trait RuntimeProvider: Send + Sync {
     /// The whole normalized inventory, or a user-facing diagnostic.
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String>;
 
-    /// The daemon registry's agents and spawn topology, read in full, when this
-    /// backend serves one. `None` means it has no registry, so it presents no
-    /// agent facts at all.
-    fn registry(&self, _cancel: &AtomicBool) -> Result<Option<RegistryRead>, String> {
-        Ok(None)
-    }
-
     /// Foreground evidence for one pane, inconclusive when unreadable.
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence;
 
@@ -1162,10 +1154,6 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {
         (**self).inventory(cancel)
-    }
-
-    fn registry(&self, cancel: &AtomicBool) -> Result<Option<RegistryRead>, String> {
-        (**self).registry(cancel)
     }
 
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence {

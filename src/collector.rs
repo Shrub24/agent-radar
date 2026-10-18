@@ -62,8 +62,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::observation::ObservationState;
 use crate::procfs::{self, Sampler};
-use crate::registry_observation;
+use crate::registry_observation::{self, RegistryRead};
 use crate::runtime::RuntimeProvider;
+
+/// Reads the registry a refresh joins its agents from.
+///
+/// The daemon owns its registry and reads it in process with the fleet it just
+/// collected, so the source is given that fleet: a spawn edge's location is
+/// confirmed against the observation of the same refresh rather than a second
+/// listing. `None` is a registry that could not be read, which fails the
+/// refresh's registry source and leaves the last-good projection standing.
+pub type RegistrySource = Arc<
+    dyn Fn(&FleetObservation, &AtomicBool) -> Result<Option<RegistryRead>, String> + Send + Sync,
+>;
 
 /// Interval between refreshes when [`CollectorConfig::poll_interval`] is left
 /// at its default.
@@ -144,6 +155,9 @@ pub struct Collector {
     /// The runtime this collector reads. Injected at assembly, so the same path
     /// serves the production adapter and a test fake.
     provider: Arc<dyn RuntimeProvider>,
+    /// The registry this collector joins agents from, read with the fleet of the
+    /// refresh it belongs to.
+    registry: RegistrySource,
     /// The resource sampling history, one for the run.
     ///
     /// It outlives a refresh — interval CPU is the difference between two
@@ -160,8 +174,12 @@ pub struct Collector {
 
 impl Collector {
     /// A collector that runs nothing until the first [`Self::tick`].
-    pub fn new(config: CollectorConfig, provider: impl RuntimeProvider + 'static) -> Self {
-        Self::sampling(config, provider, Sampler::new())
+    pub fn new(
+        config: CollectorConfig,
+        provider: impl RuntimeProvider + 'static,
+        registry: RegistrySource,
+    ) -> Self {
+        Self::sampling(config, provider, registry, Sampler::new())
     }
 
     /// A collector sampling with `sampler`, as tests and callers that must not
@@ -169,11 +187,13 @@ impl Collector {
     pub fn sampling(
         config: CollectorConfig,
         provider: impl RuntimeProvider + 'static,
+        registry: RegistrySource,
         sampler: Sampler,
     ) -> Self {
         Self {
             config,
             provider: Arc::new(provider),
+            registry,
             sampler: Arc::new(Mutex::new(sampler)),
             next_refresh: Instant::now(),
             in_flight: None,
@@ -304,6 +324,7 @@ impl Collector {
         let (sender, outcomes) = mpsc::channel();
         let worker = {
             let provider = Arc::clone(&self.provider);
+            let registry = Arc::clone(&self.registry);
             let cancel = Arc::clone(&cancel);
             let sampler = Arc::clone(&self.sampler);
             thread::Builder::new()
@@ -311,6 +332,7 @@ impl Collector {
                 .spawn(move || {
                     let _ = sender.send(collect(
                         provider.as_ref(),
+                        &registry,
                         &candidates,
                         &cancel,
                         &sampler,
@@ -343,6 +365,7 @@ impl Drop for Collector {
 /// is a failure, never a partial success.
 fn collect(
     provider: &dyn RuntimeProvider,
+    registry_source: &RegistrySource,
     candidates: &[String],
     cancel: &AtomicBool,
     sampler: &Mutex<Sampler>,
@@ -357,7 +380,7 @@ fn collect(
             };
         }
     };
-    let registry = match provider.registry(cancel) {
+    let registry = match registry_source(&observation, cancel) {
         Ok(registry) => registry,
         Err(diagnostic) => {
             return RefreshOutcome::Failure {
@@ -559,14 +582,25 @@ mod tests {
     fn a_refresh_that_finishes_at_its_deadline_is_refused_even_uncancelled() {
         let cancel = AtomicBool::new(false);
         let sampler = Mutex::new(Sampler::new());
+        // This daemon has no registry to read, which is not a failure of the
+        // fleet: the two sources fail independently.
+        let no_registry: RegistrySource =
+            Arc::new(|_fleet: &FleetObservation, _cancel: &AtomicBool| Ok(None));
         let ahead = Instant::now() + Duration::from_secs(60);
         assert!(matches!(
-            collect(&EmptyInventory, &[], &cancel, &sampler, ahead),
+            collect(&EmptyInventory, &no_registry, &[], &cancel, &sampler, ahead),
             RefreshOutcome::Success { .. }
         ));
         assert!(!cancel.load(Ordering::SeqCst));
         assert!(matches!(
-            collect(&EmptyInventory, &[], &cancel, &sampler, Instant::now()),
+            collect(
+                &EmptyInventory,
+                &no_registry,
+                &[],
+                &cancel,
+                &sampler,
+                Instant::now()
+            ),
             RefreshOutcome::Failure { .. }
         ));
     }

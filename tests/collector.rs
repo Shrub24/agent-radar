@@ -22,8 +22,8 @@ use agent_radar::procfs::{Procs, Sampler};
 use agent_radar::registry_observation::{self, Binding, RegistryAgent, RegistryRead, Unjoined};
 use agent_radar::runtime::BackendIdentity;
 use agent_radar::{
-    CloseTarget, Collector, CollectorConfig, ObservationState, RetentionBasis, RuntimeProvider,
-    SourceFreshness, Target,
+    CloseTarget, Collector, CollectorConfig, ObservationState, RegistrySource, RetentionBasis,
+    RuntimeProvider, SourceFreshness, Target,
 };
 use serde_json::json;
 
@@ -105,11 +105,6 @@ impl RuntimeProvider for FakeRuntime {
         BackendIdentity::named("fake")
     }
 
-    fn registry(&self, cancel: &AtomicBool) -> Result<Option<RegistryRead>, String> {
-        self.enter(cancel);
-        Ok(self.registered.lock().expect("registered").clone())
-    }
-
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {
         self.enter(cancel);
         self.refreshes.fetch_add(1, Ordering::SeqCst);
@@ -134,6 +129,16 @@ impl RuntimeProvider for FakeRuntime {
     }
 }
 
+/// The fake's registry, as the daemon reads its own: the same staged delay and
+/// cancellation bookkeeping every runtime call here makes.
+fn registry_source(runtime: &Arc<FakeRuntime>) -> RegistrySource {
+    let runtime = Arc::clone(runtime);
+    Arc::new(move |_fleet: &FleetObservation, cancel: &AtomicBool| {
+        runtime.enter(cancel);
+        Ok(runtime.registered.lock().expect("registered").clone())
+    })
+}
+
 /// A collector reading the fake runtime on a fast poll.
 fn collector_for(runtime: &Arc<FakeRuntime>) -> Collector {
     Collector::new(
@@ -141,6 +146,7 @@ fn collector_for(runtime: &Arc<FakeRuntime>) -> Collector {
             poll_interval: Duration::from_millis(10),
         },
         Arc::clone(runtime),
+        registry_source(runtime),
     )
 }
 
@@ -729,6 +735,7 @@ fn a_registration_joins_its_pane_only_on_the_exact_live_identity() {
             poll_interval: Duration::from_millis(10),
         },
         Arc::clone(&runtime),
+        registry_source(&runtime),
         Sampler::reading(procs.clone()),
     );
     let mut state = ObservationState::new();
@@ -794,6 +801,7 @@ fn live_agent_panes_receive_foreground_evidence_in_the_agents_view() {
             poll_interval: Duration::from_secs(30),
         },
         Arc::clone(&runtime),
+        registry_source(&runtime),
     );
     assert!(refresh_until(&mut collector, &mut state, |state| state
         .foreground("wA:p1")
@@ -922,6 +930,7 @@ fn a_live_pane_carries_a_root_sample_and_neither_stale_nor_retained_panes_do() {
             poll_interval: Duration::from_millis(10),
         },
         Arc::clone(&runtime),
+        registry_source(&runtime),
         Sampler::reading(procs.clone()),
     );
     let mut state = ObservationState::new();
@@ -1002,6 +1011,7 @@ fn a_build_beneath_a_pane_reaches_the_row_as_a_measured_sum() {
             poll_interval: Duration::from_millis(10),
         },
         Arc::clone(&runtime),
+        registry_source(&runtime),
         Sampler::reading(procs.clone()),
     );
     let mut state = ObservationState::new();

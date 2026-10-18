@@ -20,6 +20,7 @@ pub mod protocol;
 pub mod public_contracts;
 pub mod reconcile;
 pub mod registry;
+pub mod registry_read;
 pub mod server;
 pub mod store;
 pub mod transport;

@@ -179,6 +179,7 @@ impl Hub {
     /// reader asks.
     pub(crate) fn start(
         provider: Arc<dyn RuntimeProvider>,
+        registry: Arc<crate::control_plane::registry::Registry>,
         tasks: Option<Arc<TaskIngest>>,
         task_error: Option<String>,
         store: Store,
@@ -199,7 +200,7 @@ impl Hub {
             let shared = Arc::clone(&shared);
             thread::Builder::new()
                 .name("radar-observation".to_string())
-                .spawn(move || sample_loop(shared, provider, tasks, task_error, store))
+                .spawn(move || sample_loop(shared, provider, registry, tasks, task_error, store))
                 .ok()
         };
         Self { shared, worker }
@@ -293,11 +294,19 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn sample_loop(
     shared: Arc<Shared>,
     provider: Arc<dyn RuntimeProvider>,
+    registry: Arc<crate::control_plane::registry::Registry>,
     tasks: Option<Arc<TaskIngest>>,
     task_error: Option<String>,
     store: Store,
 ) {
-    let mut collector = Collector::new(CollectorConfig::default(), provider);
+    // The daemon's own registry, read in process with the fleet this refresh
+    // collected. Nothing here verifies a claimed process: a registration's claim
+    // is what a pane is matched against, and the verdict belongs to the request
+    // that asked for one.
+    let registry_source: crate::collector::RegistrySource = Arc::new(move |fleet, _cancel| {
+        crate::control_plane::registry_read::read(&registry, Some(fleet), unix_millis()).map(Some)
+    });
+    let mut collector = Collector::new(CollectorConfig::default(), provider, registry_source);
     let mut state = ObservationState::new();
     let mut last_success: BTreeMap<String, String> = BTreeMap::new();
     let mut last_generation = store.event_generation();

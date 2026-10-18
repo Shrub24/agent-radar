@@ -659,9 +659,10 @@ impl Daemon {
             workers: Mutex::new(Vec::new()),
         });
         let bootstrap = bootstrap_for(socket);
+        let registry = Arc::new(registry);
         let core = Arc::new(Mutex::new(Core {
             store,
-            registry: Arc::new(registry),
+            registry: Arc::clone(&registry),
             task_ingest: task_ingest.clone(),
             task_ingest_error,
             backend,
@@ -677,6 +678,7 @@ impl Daemon {
         if let Some(provider) = hub_backend {
             let hub = Arc::new(crate::control_plane::observation::Hub::start(
                 provider,
+                Arc::clone(&registry),
                 hub_tasks,
                 hub_task_error,
                 hub_store,
@@ -1180,19 +1182,6 @@ struct SpawnListParams {
     after: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
-}
-
-/// Process evidence as a client reads it: whether an identity was claimed, and,
-/// when it was checked, the labelled outcome of that check. Publication freshness
-/// is a separate field on each channel, and a claim is never a verification.
-#[derive(Clone, Debug, serde::Serialize)]
-struct ProcessEvidence {
-    claimed: bool,
-    /// The registered birth identity, present only when one was claimed. It is
-    /// same-UID process evidence for matching a pane, not a credential.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    claim: Option<crate::model::ProcessIdentity>,
-    verification: registry::ProcessVerification,
 }
 
 fn decode_params<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T, Response> {
@@ -1726,17 +1715,6 @@ fn verify_birth_identity(
     }
 }
 
-fn process_evidence(
-    registration: &registry::Registration,
-    verification: registry::ProcessVerification,
-) -> ProcessEvidence {
-    ProcessEvidence {
-        claimed: registration.request.process.is_some(),
-        claim: registration.request.process.clone(),
-        verification,
-    }
-}
-
 /// What the backend reports right now, or `None` when it could not be asked.
 ///
 /// A topology read is answered from the daemon's own records whether or not a
@@ -1821,20 +1799,6 @@ fn observe_spawn_exits(
             registry.record_spawn_exit(&edge.request_id, *code, *signal, store::now_ms())
         })
         .collect()
-}
-
-fn location_evidence(inventory: Option<&FleetObservation>, edge: &SpawnEdge) -> LocationEvidence {
-    let recorded = edge
-        .location
-        .as_ref()
-        .and_then(|location| location.pane.as_deref());
-    match (inventory, recorded) {
-        (Some(inventory), Some(pane)) if inventory.pane(pane).is_some() => {
-            LocationEvidence::Present
-        }
-        (Some(_), Some(_)) => LocationEvidence::Absent,
-        _ => LocationEvidence::Unavailable,
-    }
 }
 
 /// Revalidate the exact managed child against fresh pane and process evidence,
@@ -2228,7 +2192,10 @@ fn registry_request(
                 &request.id,
                 json!({"agent": {
                     "registration": registration.public(),
-                    "process": process_evidence(&registration, verified),
+                    "process": crate::control_plane::registry_read::process_evidence(
+                        &registration,
+                        verified,
+                    ),
                     "execution": execution, "assignment": assignment, "facts": facts,
                     "context": context,
                 }}),
@@ -2285,42 +2252,15 @@ fn registry_request(
                 let process = registration.request.process.clone();
                 let verified =
                     verify_bounded(process, &verifier, &stopping, verification, deadline);
-                let execution = match registry.published_facts(
-                    &registration.agent_id,
-                    Channel::Execution,
+                let entry = match crate::control_plane::registry_read::agent_entry(
+                    &registry,
+                    registration,
+                    verified,
                     now_ms,
                 ) {
-                    Ok(value) => value,
+                    Ok(entry) => entry,
                     Err(error) => return registry_error(request, error),
                 };
-                let assignment = match registry.published_facts(
-                    &registration.agent_id,
-                    Channel::Assignment,
-                    now_ms,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => return registry_error(request, error),
-                };
-                let facts = match registry.published_facts(
-                    &registration.agent_id,
-                    Channel::Facts,
-                    now_ms,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => return registry_error(request, error),
-                };
-                let context = match registry.context(&registration.agent_id, now_ms) {
-                    Ok(value) => value,
-                    Err(error) => return registry_error(request, error),
-                };
-                let entry = json!({
-                    "registration": registration.public(),
-                    "process": process_evidence(registration, verified),
-                    "execution": execution,
-                    "assignment": assignment,
-                    "facts": facts,
-                    "context": context,
-                });
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
                 if used + size > MAX_LIST_RESPONSE_BYTES {
                     if entries.is_empty() {
@@ -2374,7 +2314,8 @@ fn registry_request(
             // Location presence is separate from exit evidence: a missing pane
             // never becomes an exit observation.
             let inventory = observed_inventory(core);
-            let evidence = location_evidence(inventory.as_ref(), &stored);
+            let evidence =
+                crate::control_plane::registry_read::location_evidence(inventory.as_ref(), &stored);
             Response::ok(&request.id, json!({"spawn": stored.topology(evidence)}))
         }
         "lifecycle.get" => {
@@ -2752,7 +2693,12 @@ fn registry_request(
             let mut edges = Vec::new();
             let mut used = 0usize;
             for edge in &candidates {
-                let entry = json!(edge.topology(location_evidence(inventory.as_ref(), edge)));
+                let entry = json!(edge.topology(
+                    crate::control_plane::registry_read::location_evidence(
+                        inventory.as_ref(),
+                        edge
+                    )
+                ));
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
                 if used + size > MAX_LIST_RESPONSE_BYTES {
                     if edges.is_empty() {
@@ -6757,13 +6703,14 @@ fn observe_launch_panes(
         let Some(location) = edge.location.as_ref() else {
             continue;
         };
-        let evidence = match location_evidence(observation, &edge) {
-            LocationEvidence::Present => crate::control_plane::lifecycle::PaneEvidence::Present,
-            LocationEvidence::Absent => crate::control_plane::lifecycle::PaneEvidence::Absent,
-            LocationEvidence::Unavailable => {
-                crate::control_plane::lifecycle::PaneEvidence::Unavailable
-            }
-        };
+        let evidence =
+            match crate::control_plane::registry_read::location_evidence(observation, &edge) {
+                LocationEvidence::Present => crate::control_plane::lifecycle::PaneEvidence::Present,
+                LocationEvidence::Absent => crate::control_plane::lifecycle::PaneEvidence::Absent,
+                LocationEvidence::Unavailable => {
+                    crate::control_plane::lifecycle::PaneEvidence::Unavailable
+                }
+            };
         match crate::control_plane::lifecycle::observe_pane(
             registry, subject_id, location, evidence, now_ms,
         ) {
