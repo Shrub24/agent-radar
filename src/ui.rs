@@ -1859,10 +1859,12 @@ fn overview_lines(
                 "workspace",
                 location_text(label.as_deref(), workspace_id),
             ));
-            page.push(field(
-                "number",
-                number.map(|n| n.to_string()).unwrap_or_else(unavailable),
-            ));
+            // A backend that reports no number has none to show: tmux names a
+            // session and numbers nothing, so the field is left out rather than
+            // drawn as a fact nothing could read.
+            if let Some(number) = number {
+                page.push(field("number", number.to_string()));
+            }
             container_fields(container.as_ref(), page);
         }
         RowKind::Pane(pane) => {
@@ -5881,6 +5883,30 @@ mod tests {
             "{details}"
         );
         assert!(details.contains("running for: 5h14m"), "{details}");
+    }
+
+    #[test]
+    fn a_workspace_the_backend_numbers_shows_its_number_and_one_it_does_not_shows_none() {
+        // tmux names a session and numbers nothing: the row omits the number, and
+        // the details page must not draw an unreadable fact in its place.
+        let mut unnumbered = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        for workspace in &mut unnumbered.workspaces {
+            workspace.number = None;
+        }
+        let mut state = ObservationState::new();
+        state.apply_success(unnumbered);
+        let mut app = app_for(&state);
+        select_row(&mut app, crate::tree::RowId::Workspace("wA".into()));
+        let screen = render_text(&state, &app, 140, 30);
+        assert!(screen.contains("kind"), "the overview drew: {screen}");
+        assert!(!screen.contains("number"), "{screen}");
+
+        // The same row where the backend does report one keeps the field.
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        select_row(&mut app, crate::tree::RowId::Workspace("wA".into()));
+        let screen = render_text(&state, &app, 140, 30);
+        assert!(screen.contains("number"), "{screen}");
     }
 
     #[test]
