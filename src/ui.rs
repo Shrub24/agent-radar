@@ -226,6 +226,7 @@ pub fn render(
     }
 
     let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
+    draw_outcomes(frame, app);
 
     Geometry {
         tree_panel: tree_area,
@@ -360,6 +361,124 @@ fn tab_rows(width: u16) -> u16 {
 /// The lifecycle confirmation, drawn over everything else. Returns the two
 /// button rectangles so a pointer can be mapped back to the buttons actually
 /// drawn, and nothing else on screen is clickable while it is up.
+/// The outcomes panel: every retained outcome's whole text, wrapped and scrolled.
+///
+/// The footer shows one clipped line per outcome because a footer line is one row;
+/// a daemon's refusal names the method, the code and the reason, so the readable
+/// form of it lives here.
+fn draw_outcomes(frame: &mut Frame, app: &App) {
+    if !app.notices_open() {
+        return;
+    }
+    let palette = theme::palette();
+    let screen = frame.area();
+    let popup = centered(
+        screen,
+        screen.width.saturating_sub(4).min(100),
+        screen.height.saturating_sub(2),
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(palette.border))
+        .title("Outcomes")
+        .title_bottom(Line::from(Span::styled(
+            " j/k scroll  ·  c dismiss  ·  Esc close ",
+            Style::new().fg(palette.muted),
+        )));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let width = inner.width as usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(message) = app.focus_message() {
+        lines.push(Line::from(Span::styled(
+            "last message",
+            Style::new()
+                .fg(palette.heading)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for row in wrap(&sanitize(message), width) {
+            lines.push(Line::from(Span::styled(
+                row,
+                Style::new().fg(palette.failed),
+            )));
+        }
+        lines.push(Line::raw(""));
+    }
+    if app.lifecycle_notices().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no outcomes yet",
+            Style::new().fg(palette.subtle),
+        )));
+    }
+    for notice in app.lifecycle_notices().iter().rev() {
+        let style = if notice.failed {
+            Style::new().fg(palette.failed)
+        } else {
+            Style::new().fg(palette.done)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if notice.failed { "failed" } else { "completed" },
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(sanitize(&notice.id), Style::new().fg(palette.subtle)),
+        ]));
+        for row in wrap(&sanitize(&notice.text), width) {
+            lines.push(Line::from(Span::styled(row, style)));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // Scrolled in rows, clamped to what was drawn: an offset past the end shows
+    // the end rather than an empty panel.
+    let rows = lines.len();
+    let offset = app
+        .notice_scroll()
+        .min(rows.saturating_sub(inner.height as usize));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(PAGE_WRAP)
+            .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
+        inner,
+    );
+}
+
+/// `text` broken into rows of at most `width` columns, on spaces where it can be
+/// and mid-word where a single word is wider than the panel.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in text.split_whitespace() {
+        let word_width = Span::raw(word.to_string()).width();
+        if !row.is_empty() && Span::raw(row.clone()).width() + 1 + word_width > width {
+            rows.push(std::mem::take(&mut row));
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        if word_width <= width {
+            row.push_str(word);
+            continue;
+        }
+        // A word wider than the panel is broken across rows rather than cut: it
+        // is often the part that says why something failed.
+        for character in word.chars() {
+            let character_width = Span::raw(character.to_string()).width();
+            if Span::raw(row.clone()).width() + character_width > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            row.push(character);
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect>) {
     let Some(confirmation) = app.confirmation() else {
         return (None, None);
@@ -618,19 +737,27 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         )));
     }
     let notices = app.lifecycle_notices();
-    let shown = notices
+    let shown: Vec<&crate::app::Notice> = notices
         .iter()
         .rev()
-        .take(2usize.saturating_sub(action_lines.len()));
-    let count = 2usize.saturating_sub(action_lines.len()).min(notices.len());
-    for (index, notice) in shown.enumerate() {
+        .take(2usize.saturating_sub(action_lines.len()))
+        .collect();
+    let count = shown.len();
+    let any_failed = shown.iter().any(|notice| notice.failed);
+    for (index, notice) in shown.iter().enumerate() {
         let style = if notice.failed {
             Style::new().fg(palette.failed)
         } else {
             Style::new().fg(palette.done)
         };
         let dismiss = if index + 1 == count {
-            "  ·  c dismiss"
+            // A clipped line is all a footer can hold, so a failure advertises the
+            // panel that shows it whole alongside the key that clears it.
+            if any_failed {
+                "  ·  ! full  ·  c dismiss"
+            } else {
+                "  ·  c dismiss"
+            }
         } else {
             ""
         };
@@ -4942,6 +5069,79 @@ mod tests {
             }
         }
         panic!("`{needle}` is not on screen");
+    }
+
+    #[test]
+    fn the_outcomes_panel_shows_a_refusal_whole_where_the_footer_cannot() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        // A real refusal: the client names the daemon and the method, and the
+        // daemon names the code and the reason, which no footer line holds.
+        let refusal = "the control daemon at /run/user/1000/agent-radar/control.sock \
+             refused `topology.create` (bad_params): a recipe runs in a pane slot: \
+             a pane split or a tab creation carries one";
+        app.apply_container_outcome(crate::topology::Finished {
+            verb: "create",
+            request_id: "7b5a6cd8-a22a-44f6-9159-2bfce42a8499".to_string(),
+            result: Err(refusal.to_string()),
+        });
+
+        // Closed: the footer clips it, which is what the panel is for.
+        let footer = render_text(&state, &app, 120, 30);
+        assert!(footer.contains('…'), "the footer elides a long line");
+        assert!(
+            !footer.contains("a pane split or a tab creation carries one"),
+            "a footer line cannot hold the whole refusal: {footer}"
+        );
+        assert!(
+            footer.contains("! full"),
+            "a failure advertises the panel that shows it: {footer}"
+        );
+
+        // Open: every word of it is on screen, wrapped rather than cut.
+        app.toggle_notices();
+        let panel = render_text(&state, &app, 120, 30);
+        assert!(panel.contains("Outcomes"), "{panel}");
+        assert!(panel.contains("failed"), "{panel}");
+        assert!(panel.contains("bad_params"), "{panel}");
+        assert!(
+            panel.contains("a pane split or a tab creation carries one"),
+            "the panel shows the whole refusal: {panel}"
+        );
+    }
+
+    #[test]
+    fn the_outcomes_panel_scrolls_to_the_end_of_a_long_outcome() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        for index in 0..8 {
+            app.apply_container_outcome(crate::topology::Finished {
+                verb: "create",
+                request_id: format!("request-{index}"),
+                result: Err(format!("refusal number {index}")),
+            });
+        }
+        app.toggle_notices();
+        let top = render_text(&state, &app, 100, 20);
+        assert!(
+            top.contains("request-7"),
+            "the newest outcome is first: {top}"
+        );
+        assert!(
+            !top.contains("request-0"),
+            "the oldest is below the fold: {top}"
+        );
+
+        app.scroll_notices(60);
+        let bottom = render_text(&state, &app, 100, 20);
+        assert!(
+            bottom.contains("request-0"),
+            "scrolling reaches the oldest outcome: {bottom}"
+        );
+        // Past the end it stays at the end rather than showing nothing.
+        app.scroll_notices(60);
+        let past = render_text(&state, &app, 100, 20);
+        assert!(past.contains("request-0"), "{past}");
     }
 
     #[test]

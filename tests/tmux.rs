@@ -569,6 +569,9 @@ fn records_with_tmux_3_5as_escaped_separator_decode_the_same_way() {
     };
     assert_eq!(created.tab_id.as_deref(), Some(tab.as_str()));
     assert_eq!(created.workspace_id.as_deref(), Some(workspace.as_str()));
+    // A tab is made with a pane, and tmux names it: a launch into a new tab runs
+    // in the pane that tab opened.
+    assert_eq!(created.pane_id.as_deref(), Some(fake.handle("%4").as_str()));
 
     let split_pane = fake.handle("%3");
     let created = runtime.create(

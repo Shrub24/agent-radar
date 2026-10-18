@@ -13,7 +13,7 @@ case "$*" in
   *list-windows*) printf '%s\n' '@1\037$0\0372\037editor' ;;
   *list-panes*) printf '%s\n' '%1\037@1\037$0\037/tmp/herdr\037a title' ;;
   *display-message*) printf '%s\n' '4242\037pi' ;;
-  *new-window*) printf '%s\n' '@2\037$0' ;;
+  *new-window*) printf '%s\n' '@2\037$0\037%4' ;;
   *split-window*) printf '%s\n' '%3\037@2\037$0' ;;
   *) exit 1 ;;
 esac

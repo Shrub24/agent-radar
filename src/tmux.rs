@@ -80,7 +80,7 @@ const EXIT_FORMAT: &str = "#{pane_id}\u{1f}#{pane_dead}\u{1f}#{pane_dead_status}
 
 /// The identities each creation reports back, in the order they are read.
 const CREATED_SESSION_FORMAT: &str = "#{session_id}";
-const CREATED_WINDOW_FORMAT: &str = "#{window_id}\u{1f}#{session_id}";
+const CREATED_WINDOW_FORMAT: &str = "#{window_id}\u{1f}#{session_id}\u{1f}#{pane_id}";
 const CREATED_PANE_FORMAT: &str = "#{pane_id}\u{1f}#{window_id}\u{1f}#{session_id}";
 
 /// How often a running command is checked for exit, cancellation or its
@@ -784,14 +784,15 @@ impl TmuxRuntime {
                 }
                 args.extend(["-P", "-F", CREATED_WINDOW_FORMAT]);
                 let answer = self.run(&args, cancel).map_err(Failure::unknown)?;
-                let [tab, created_workspace] =
-                    self.created(&answer.text, &[Kind::Window, Kind::Session])?;
-                // tmux reported the session it put the window in, so the answer
-                // is its own and not this adapter's assumption.
+                let [tab, created_workspace, pane] =
+                    self.created(&answer.text, &[Kind::Window, Kind::Session, Kind::Pane])?;
+                // tmux reported the session it put the window in and the pane
+                // that window opened, so the answer is its own and not this
+                // adapter's assumption: a tab carries a pane a recipe can run in.
                 Ok(CreatedLocation {
                     workspace_id: Some(self.handle(&created_workspace)),
                     tab_id: Some(self.handle(&tab)),
-                    ..CreatedLocation::default()
+                    pane_id: Some(self.handle(&pane)),
                 })
             }
             CreateRequest::PaneSplit {

@@ -4961,8 +4961,10 @@ fn preflight_command(
 /// The recipe a creation carries: the command its pane slot runs.
 ///
 /// A recipe is held privately and reported only as held. It is refused on a
-/// creation that makes no pane, because a recipe runs in a pane slot, and only the
-/// hierarchy verb accepts one: the primitive create takes no Radar annotations.
+/// creation that makes no pane of its own, because a recipe runs in a pane slot:
+/// a pane split runs it in the pane it split from, and a tab runs it in the pane
+/// the tab opened. A workspace creation carries none: its pane is the session's
+/// own first slot, which this operation does not name.
 fn creation_recipe(
     request: &Request,
     create: &CreateRequest,
@@ -4970,12 +4972,15 @@ fn creation_recipe(
     let Some(recipe) = request.params.get("recipe") else {
         return Ok(None);
     };
-    if !matches!(create, CreateRequest::PaneSplit { .. }) {
+    if !matches!(
+        create,
+        CreateRequest::PaneSplit { .. } | CreateRequest::Tab { .. }
+    ) {
         return Err(Response::refused(
             &request.id,
             &Refusal::new(
                 Code::BadParams,
-                "a recipe runs in a pane slot: only a pane creation carries one",
+                "a recipe runs in a pane slot: a pane split or a tab creation carries one",
             ),
         ));
     }
@@ -4999,11 +5004,20 @@ fn preflight_recipe(
     create: &CreateRequest,
     recipe: &containers::Recipe,
 ) -> Result<(), Refusal> {
-    let CreateRequest::PaneSplit { pane_id, .. } = create else {
-        return Err(Refusal::new(
-            Code::BadParams,
-            "a recipe runs in a pane slot: only a pane creation carries one",
-        ));
+    // A pane split names the pane it splits from, so the command is checked
+    // against it. A tab's pane does not exist yet, so the probe names a synthetic
+    // one, exactly as a spawn's preflight does: what is checked here is the command
+    // and the context it needs, and both backends validate the address inside
+    // `launch`, against the pane the creation actually reported.
+    let pane_id = match create {
+        CreateRequest::PaneSplit { pane_id, .. } => pane_id.as_str(),
+        CreateRequest::Tab { .. } => "preflight",
+        _ => {
+            return Err(Refusal::new(
+                Code::BadParams,
+                "a recipe runs in a pane slot: a pane split or a tab creation carries one",
+            ));
+        }
     };
     preflight_command(
         core,

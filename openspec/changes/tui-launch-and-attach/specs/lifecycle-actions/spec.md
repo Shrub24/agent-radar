@@ -1,14 +1,18 @@
 ## ADDED Requirements
 
 ### Requirement: L launches the configured managed-agent command
-Radar SHALL expose `[tui].launch_command` as an argv vector defaulting to `["pi"]`. Pressing `L` on a recorded workspace or pane SHALL immediately create a tab or split pane running that command as a private recipe, without a command prompt or confirmation.
+Radar SHALL expose `[tui].launch_command` as an argv vector defaulting to `["pi"]`. Pressing `L` on a recorded workspace or pane SHALL immediately create a tab in that place's workspace running that command as a private recipe, without a command prompt or confirmation. A launch from a pane SHALL open its own tab rather than splitting the pane.
 
 #### Scenario: Launch the default agent
 - **WHEN** the user presses `L` on a recorded workspace or pane without a launch-command override
-- **THEN** Radar starts `pi` in the corresponding new tab or pane
+- **THEN** Radar starts `pi` in a new tab of that place's workspace
+
+#### Scenario: Launch from a pane
+- **WHEN** the user presses `L` on a pane
+- **THEN** the agent gets a window of its own in that pane's workspace, and the pane it was launched from is left as it was
 
 ### Requirement: L uses the selected place's shell context
-A launch SHALL use the workspace's recorded directory or the pane's current directory. It SHALL start through the user's login/interactive shell and apply direnv in that target directory. It SHALL NOT copy the TUI environment wholesale or persist environment values in public records, reads, or events.
+A launch SHALL use the pane's current directory, or the workspace's recorded directory when the selected place is the workspace itself. It SHALL start through the user's login/interactive shell and apply direnv in that target directory. It SHALL NOT copy the TUI environment wholesale or persist environment values in public records, reads, or events.
 
 #### Scenario: Launch from a workspace
 - **WHEN** the user presses `L` on a workspace
@@ -16,7 +20,7 @@ A launch SHALL use the workspace's recorded directory or the pane's current dire
 
 #### Scenario: Launch from a pane
 - **WHEN** the user presses `L` on a pane
-- **THEN** the split pane starts in that pane's current directory
+- **THEN** the new tab starts in that pane's current directory
 
 #### Scenario: The TUI uses another project's environment
 - **WHEN** the TUI runs with project-specific variables and `L` targets a different directory

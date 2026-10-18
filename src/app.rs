@@ -654,6 +654,12 @@ pub struct App {
     /// transient focus message and from the source diagnostics, so an owner's
     /// answer cannot be mistaken for the fleet's freshness.
     notices: Vec<Notice>,
+    /// Whether the outcomes panel is open, and how far it is scrolled. The footer
+    /// shows one clipped line per outcome; this is where the whole text of a
+    /// refusal is readable, since a daemon's answer names the method, the code and
+    /// the reason and is longer than any footer line.
+    notices_open: bool,
+    notice_scroll: usize,
 }
 
 /// The reader's place in one fleet row's process table.
@@ -1688,6 +1694,26 @@ impl App {
             return self.handle_confirmation_key(key);
         }
         self.focus_message = None;
+        // The outcomes panel is modal: it shows what was reported and acts on
+        // nothing, so while it is open no other key reaches the tree.
+        if self.notices_open {
+            match key.code {
+                KeyCode::Char('!') | KeyCode::Esc | KeyCode::Char('c') => {
+                    if key.code == KeyCode::Char('c') {
+                        self.dismiss_notices();
+                    }
+                    self.notices_open = false;
+                }
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_notices(1),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_notices(-1),
+                KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_notices(10),
+                KeyCode::PageUp => self.scroll_notices(-10),
+                KeyCode::Home => self.notice_scroll = 0,
+                KeyCode::End => self.scroll_notices(isize::MAX / 2),
+                _ => {}
+            }
+            return None;
+        }
         if self.filter_editing {
             self.handle_filter_key(key);
             return None;
@@ -1712,6 +1738,9 @@ impl App {
             KeyCode::Char('D') => return Some(Action::BeginAction(Operation::DeleteContainer)),
             KeyCode::Char('R') => return Some(Action::BeginAction(Operation::ReloadContainer)),
             KeyCode::Char('c') => self.dismiss_notices(),
+            // `!` opens the whole text of what was reported: the footer shows one
+            // clipped line, and a refusal is longer than that.
+            KeyCode::Char('!') => self.toggle_notices(),
             KeyCode::Tab | KeyCode::BackTab => self.toggle_detail_focus(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
@@ -2183,34 +2212,55 @@ impl App {
             self.set_focus_message(Some("the selected container is unresolved".into()));
             return None;
         };
-        let (kind, directory) = match recorded.kind {
+        // A launch always opens a new window: the agent gets its own tab in the
+        // workspace the selected place belongs to, rather than a pane beside
+        // whatever is already running there. The directory is the selected
+        // place's own, so a launch from a pane lands in that pane's project.
+        let (workspace_id, directory) = match recorded.kind {
             crate::control_plane::containers::Kind::Workspace => (
-                crate::control_plane::client::ContainerCreateKind::Tab {
-                    workspace_id: binding.handle.clone(),
-                },
+                binding.handle.clone(),
                 inventory
                     .workspaces
                     .iter()
                     .find(|workspace| workspace.workspace_id == binding.handle)
                     .and_then(|workspace| workspace.session_path.as_deref()),
             ),
-            crate::control_plane::containers::Kind::Pane => (
-                crate::control_plane::client::ContainerCreateKind::PaneSplit {
-                    pane_id: binding.handle.clone(),
-                },
-                inventory
+            crate::control_plane::containers::Kind::Pane => {
+                let Some(pane) = inventory
                     .panes
                     .iter()
                     .find(|pane| pane.location.pane_id == binding.handle)
-                    .and_then(|pane| pane.current_path.as_deref()),
-            ),
-            crate::control_plane::containers::Kind::Tab => {
+                else {
+                    self.set_focus_message(Some(
+                        "the selected pane is not in the current inventory".into(),
+                    ));
+                    return None;
+                };
+                (
+                    pane.location.workspace_id.clone(),
+                    pane.current_path.as_deref(),
+                )
+            }
+            // A tab is location detail rather than a row, so it is never the
+            // selected container; a place that is not one of the two above is
+            // refused rather than guessed at.
+            _ => {
                 self.set_focus_message(Some(
                     "select a workspace or pane to launch an agent".into(),
                 ));
                 return None;
             }
         };
+        // A tab names no directory of its own, so the launch starts in its
+        // workspace's, which is the project the reader selected.
+        let directory = directory.or_else(|| {
+            inventory
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .and_then(|workspace| workspace.session_path.as_deref())
+        });
+        let kind = crate::control_plane::client::ContainerCreateKind::Tab { workspace_id };
         let Some(directory) = directory else {
             self.set_focus_message(Some(
                 "the selected place has no current directory: nothing was sent".into(),
@@ -2660,6 +2710,31 @@ impl App {
     /// Dismisses every lifecycle outcome.
     pub fn dismiss_notices(&mut self) {
         self.notices.clear();
+        self.notice_scroll = 0;
+    }
+
+    /// Whether the outcomes panel is open, and where it is scrolled to.
+    pub fn notices_open(&self) -> bool {
+        self.notices_open
+    }
+
+    pub fn notice_scroll(&self) -> usize {
+        self.notice_scroll
+    }
+
+    /// Opens or closes the outcomes panel. Opening starts at the top, where the
+    /// newest outcome is.
+    pub fn toggle_notices(&mut self) {
+        self.notices_open = !self.notices_open;
+        if self.notices_open {
+            self.notice_scroll = 0;
+        }
+    }
+
+    /// Moves the outcomes panel by whole lines. The panel clamps the offset to the
+    /// text it has, so this may be called past either end.
+    pub fn scroll_notices(&mut self, lines: isize) {
+        self.notice_scroll = self.notice_scroll.saturating_add_signed(lines);
     }
 
     /// The open confirmation, if any.
@@ -4399,6 +4474,14 @@ mod tests {
             .unwrap_or_else(|| panic!("launch refused: {:?}", app.focus_message()));
         match confirmed {
             Confirmed::Container(crate::topology::Control::Create(request)) => {
+                // A launch from a pane opens its own window in that pane's
+                // workspace, rather than a pane beside what already runs there.
+                assert_eq!(
+                    request.kind,
+                    ContainerCreateKind::Tab {
+                        workspace_id: "wA".to_string()
+                    }
+                );
                 let recipe = request.recipe.expect("launch uses a private recipe");
                 assert_eq!(
                     recipe.cwd.as_deref(),
@@ -5163,6 +5246,37 @@ mod tests {
             app.confirm(&unknown),
             Some(Confirmed::Subject { .. })
         ));
+    }
+
+    #[test]
+    fn the_outcomes_panel_is_modal_and_shows_what_was_reported() {
+        let (state, mut app) = fixture_with_container(None);
+        app.record_notice("bad".into(), "delete refused: something long".into(), true);
+
+        assert_eq!(press(&mut app, KeyCode::Char('!')), None);
+        assert!(app.notices_open());
+
+        // While it is open nothing reaches the tree: `d` would toggle the details
+        // panel and `j` would move the selection, and neither happens.
+        let selected = app.selected_index();
+        let details = app.shows_details();
+        assert_eq!(press(&mut app, KeyCode::Char('d')), None);
+        assert_eq!(press(&mut app, KeyCode::Char('j')), None);
+        assert_eq!(app.shows_details(), details, "the tree kept its keys");
+        assert_eq!(app.selected_index(), selected);
+        assert_eq!(app.notice_scroll(), 1, "the panel took the key");
+
+        // Escape closes it and leaves the outcome to be read again.
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(!app.notices_open());
+        assert_eq!(app.lifecycle_notices().len(), 1);
+
+        // `c` in the panel clears the outcomes and closes it.
+        assert_eq!(press(&mut app, KeyCode::Char('!')), None);
+        assert_eq!(press(&mut app, KeyCode::Char('c')), None);
+        assert!(!app.notices_open());
+        assert!(app.lifecycle_notices().is_empty());
+        let _ = state;
     }
 
     #[test]

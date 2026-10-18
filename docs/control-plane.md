@@ -110,7 +110,7 @@ Daemon contracts are versioned promises that the daemon serves the methods its i
 | `spawn.close.v1` | `mux.observe` + `mux.close` | `spawn.close` |
 | `spawn.launch_context.v1` | `mux.create` + `mux.launch` + `mux.launch_context` | cwd/environment-bearing `spawn.create` |
 | `spawn.exit_observation.v1` | `mux.exit_observation` | typed `exit_observation` on current spawn edges |
-| `topology.create.v1` | `mux.create` | `topology.create`: a labelled container, optionally with a private recipe |
+| `topology.create.v1` | `mux.create` | `topology.create`: a labelled container, optionally with a private recipe. A recipe is carried by a pane split or a tab and runs in the pane that creation made; a workspace creation carries none |
 | `topology.delete.v1` | `mux.close` | `topology.delete`: the guarded close of a container's place and its removal records |
 | `topology.reload.v1` | `mux.launch` + `mux.exit_observation` | `topology.reload`: a pane container's recorded recipe, run again |
 | `topology.get.v1`, `topology.list.v1` | — | container reads |

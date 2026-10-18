@@ -10027,7 +10027,8 @@ fn a_recipe_creation_holds_the_command_privately_and_runs_it_in_its_pane() {
     assert!(!read.to_string().contains("sentinel-value"), "{read}");
     assert!(!read.to_string().contains("sentinel-argv"), "{read}");
 
-    // A create that makes no pane cannot carry a recipe, and one is never held.
+    // A create that makes no pane of its own cannot carry a recipe, and one is
+    // never held.
     let refused = client.call(
         "topology.create",
         json!({
@@ -10037,7 +10038,41 @@ fn a_recipe_creation_holds_the_command_privately_and_runs_it_in_its_pane() {
         }),
     );
     assert_eq!(error_code(&refused), "bad_params", "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("a pane split or a tab"),
+        "the refusal names what carries a recipe: {refused}"
+    );
     assert_eq!(backend.creates().len(), 1, "nothing was created for it");
+    daemon.stop();
+}
+
+/// A tab is made with a pane of its own, so a launch into a new window runs there:
+/// the create carries the recipe, the daemon holds it, and the command runs in the
+/// pane tmux reported for the tab. This is what `L` sends.
+#[test]
+fn a_tab_creation_runs_its_recipe_in_the_pane_the_tab_opened() {
+    let sandbox = Sandbox::new("topology-recipe-tab");
+    let backend = recipe_backend();
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let mut params = recipe_creation();
+    params["request"] = json!({
+        "kind": "tab",
+        "workspace_id": "wA",
+        "focus": false,
+    });
+    let created = client.call("topology.create", params);
+    assert_eq!(result_record(&created)["outcome"], "completed", "{created}");
+    assert_eq!(created["result"]["container"]["recipe"], json!(true));
+    let launches = backend.launches();
+    assert_eq!(launches.len(), 1, "{created}");
+    assert_eq!(launches[0].pane_id, "wA:p2", "{created}");
+    assert_eq!(launches[0].executable, "/bin/echo");
+    assert_eq!(launches[0].argv, vec!["sentinel-argv".to_string()]);
     daemon.stop();
 }
 
