@@ -56,7 +56,7 @@ pub const MAX_BACKGROUND_TASKS: usize = 64;
 pub const MAX_AWAITED: usize = 64;
 
 /// Independent publisher channels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
     /// Process execution evidence.
@@ -78,7 +78,7 @@ impl Channel {
 }
 
 /// A turn outcome kept distinct from current activity.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Outcome {
     /// Producer vocabulary is deliberately free-form.
@@ -89,7 +89,7 @@ pub struct Outcome {
 
 /// One complete snapshot for one channel. Vocabulary is free-form; shape is
 /// strict. Unknown state/reason/action words survive, unknown fields do not.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub activity: String,
@@ -141,7 +141,7 @@ fn validate_base(
 /// The owner's complete assignment snapshot: the shared base plus facts only an
 /// owner knows. It is authored by the owner's writer and is never derived from
 /// execution activity; the owner's identity is provenance, not authority.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentSnapshot {
     pub activity: String,
@@ -296,7 +296,7 @@ impl FactsSnapshot {
 /// One complete accepted snapshot, typed by the channel that carries it. Each
 /// variant is strict about its own fields, so a field from another channel is
 /// refused rather than silently dropped.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum Report {
     // Execution is tried first: its base shape is the one assignment shares, and
@@ -591,7 +591,7 @@ impl ChannelRecord {
 }
 
 /// Freshness is independent of process identity or completion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Freshness {
     /// Accepted in this serving epoch by the current writer and not expired.
@@ -694,7 +694,7 @@ pub struct PublicSnapshot {
 
 /// The current writer as an unrelated reader may see it: provenance and
 /// generation, without the opaque handle an update must present.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicWriterFacts {
     pub source: String,
@@ -709,7 +709,7 @@ pub struct PublicWriterFacts {
 
 /// The last accepted report as an unrelated reader may see it, leaving out the
 /// handle that fences further writes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicSnapshotFacts {
     pub source: String,
@@ -731,7 +731,7 @@ pub struct PublicSnapshotFacts {
 /// A channel read for a reader that is not its writer: the same identity,
 /// freshness and report facts as [`PublicChannel`], with the fencing handle
 /// dropped because it is a credential rather than a fact.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicChannelFacts {
     pub version: u32,

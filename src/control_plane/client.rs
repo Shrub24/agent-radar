@@ -114,6 +114,44 @@ pub enum ObservationRead {
     TooLarge,
 }
 
+fn decode_observation_result(result: Value) -> Result<ObservationRead, serde_json::Error> {
+    use crate::control_plane::public_contracts::observation::ObservationGetResponse;
+
+    Ok(
+        match serde_json::from_value::<ObservationGetResponse>(result)? {
+            ObservationGetResponse::Snapshot(response) => {
+                ObservationRead::Snapshot(Box::new(response.snapshot.into()))
+            }
+            ObservationGetResponse::NotModified(response) => ObservationRead::NotModified {
+                epoch: response.not_modified.epoch,
+                revision: response.not_modified.revision,
+            },
+            ObservationGetResponse::Expired(response) => ObservationRead::Expired {
+                epoch: response.snapshot_expired.epoch,
+                revision: response.snapshot_expired.revision,
+            },
+            ObservationGetResponse::TooLarge(_) => ObservationRead::TooLarge,
+        },
+    )
+}
+
+#[cfg(test)]
+mod observation_result_tests {
+    use super::*;
+
+    #[test]
+    fn not_modified_reads_the_nested_revision_from_the_public_response() {
+        let result = decode_observation_result(json!({
+            "not_modified": {"epoch": "epoch-1", "revision": 12}
+        }))
+        .expect("decode response");
+        assert!(matches!(
+            result,
+            ObservationRead::NotModified { epoch, revision: 12 } if epoch == "epoch-1"
+        ));
+    }
+}
+
 /// The daemon as a [`RuntimeProvider`].
 pub struct DaemonRuntime {
     socket: PathBuf,
@@ -329,30 +367,7 @@ impl DaemonRuntime {
         let result = self
             .call("observation.get", params, cancel)
             .map_err(|failure| failure.message)?;
-        if let Some(expired) = result.get("snapshot_expired") {
-            let epoch = expired
-                .get("epoch")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let revision = expired.get("revision").and_then(Value::as_u64).unwrap_or(0);
-            return Ok(ObservationRead::Expired { epoch, revision });
-        }
-        if result.get("not_modified").is_some() {
-            let epoch = result
-                .get("epoch")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let revision = result.get("revision").and_then(Value::as_u64).unwrap_or(0);
-            return Ok(ObservationRead::NotModified { epoch, revision });
-        }
-        if result.get("snapshot_too_large").is_some() {
-            return Ok(ObservationRead::TooLarge);
-        }
-        let snapshot = result.get("snapshot").cloned().unwrap_or(Value::Null);
-        serde_json::from_value(snapshot)
-            .map(|snapshot| ObservationRead::Snapshot(Box::new(snapshot)))
+        decode_observation_result(result)
             .map_err(|error| self.describe(format!("sent an unreadable observation: {error}")))
     }
 }

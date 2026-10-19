@@ -22,7 +22,7 @@ use crate::model::{FleetObservation, ProcessIdentity};
 use crate::runtime::{BackendIdentity, CloseTarget, CreateRequest, CreatedLocation};
 
 /// What a container is in the hierarchy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Workspace,
@@ -64,7 +64,7 @@ pub struct DeleteRequest {
 }
 
 /// Who made the container.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
     /// This daemon created it, so its recipe and its reload are ours.
@@ -75,7 +75,7 @@ pub enum Provenance {
 }
 
 /// Where a container's handle lives, and which incarnation answered for it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     pub backend: String,
@@ -254,7 +254,7 @@ impl Container {
 }
 
 /// One container as a consumer reads it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicContainer {
     pub container_id: String,

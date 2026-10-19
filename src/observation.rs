@@ -235,6 +235,29 @@ impl ObservationState {
         &self.registry
     }
 
+    /// Constructs internal continuity state from a decoded public observation.
+    pub(crate) fn from_public(
+        public: crate::control_plane::public_contracts::observation::ObservationProjection,
+    ) -> Self {
+        Self {
+            inventory: public.inventory,
+            source: public.source.into(),
+            registry: public.registry.into(),
+            retained: public
+                .retained
+                .into_iter()
+                .map(|(pane, retained)| (pane, retained.into()))
+                .collect(),
+            containment: public
+                .containment
+                .into_iter()
+                .map(|(pane, retained)| (pane, retained.into()))
+                .collect(),
+            awaiting_evidence: public.awaiting_evidence,
+            foreground: public.foreground,
+        }
+    }
+
     /// Retained presented agents keyed by pane id, for display (empty when
     /// nothing is retained). Herdr metadata never appears here.
     pub fn retained(&self) -> &BTreeMap<String, RetainedAgent> {

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Input accepted by `observation.get`.",
+  "properties": {
+    "classes": {
+      "default": null,
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "epoch": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "since_revision": {
+      "default": null,
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "wait_ms": {
+      "default": null,
+      "format": "uint64",
+      "maximum": 30000,
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "title": "observation-get-params-deserialize",
+  "type": "object"
+}

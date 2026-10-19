@@ -1,4 +1,9 @@
 import type {
+	ObservationGetParamsDeserialize,
+	ObservationGetResponseSerialize,
+	ObservationSnapshot,
+} from "./generated-contracts.js";
+import type {
 	RadarFactsSnapshot,
 	RadarHandoff,
 	RadarHandoffInbox,
@@ -27,6 +32,33 @@ const exited: RadarSpawnExitObservation = {
 	observed_at: "2026-01-01T00:00:00.000Z",
 };
 const unknown: RadarSpawnExitObservation = { state: "unknown" };
+const observationParams: ObservationGetParamsDeserialize = {
+	epoch: "epoch-1",
+	since_revision: 1,
+	wait_ms: 30_000,
+	classes: ["fleet"],
+};
+const observationSnapshot: ObservationSnapshot = {
+	epoch: "epoch-1",
+	revision: 1,
+	collected_at: null,
+	sources: [],
+	tasks: null,
+	observation: {
+		inventory: null,
+		source: "pending",
+		registry: "pending",
+		retained: {},
+		containment: {},
+		awaiting_evidence: [],
+		foreground: {},
+	},
+};
+const observationResponse: ObservationGetResponseSerialize = {
+	epoch: observationSnapshot.epoch,
+	revision: observationSnapshot.revision,
+	snapshot: observationSnapshot,
+};
 const handoff: RadarHandoff = {
 	version: 1,
 	id: "22222222-2222-4222-8222-222222222222",
@@ -50,4 +82,14 @@ const receipt: RadarHandoffReceipt = {
 	received_at_unix_ms: 1_800_000_000_100,
 };
 
-void [handshake, facts, exited, unknown, handoff, inbox, receipt];
+void [
+	handshake,
+	facts,
+	exited,
+	unknown,
+	observationParams,
+	observationResponse,
+	handoff,
+	inbox,
+	receipt,
+];

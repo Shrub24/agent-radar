@@ -239,7 +239,7 @@ impl SessionContext {
 ///
 /// There is no handle and no serving epoch here by construction, and no other
 /// field a private path or argument could be forgotten into.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicSession {
     pub source: String,
@@ -268,7 +268,7 @@ pub struct PublicSession {
 /// One agent record's context as a client reads it. A `None` read of this whole
 /// record means never published; a present record with a null session means no
 /// current session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicContext {
     pub version: u32,

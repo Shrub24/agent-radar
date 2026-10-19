@@ -60,6 +60,12 @@ try {
 		"facts-snapshot.deserialize.schema.json",
 		"spawn-exit-observation.serialize.schema.json",
 		"spawn-exit-observation.deserialize.schema.json",
+		"observation-get-params.serialize.schema.json",
+		"observation-get-params.deserialize.schema.json",
+		"observation-snapshot.serialize.schema.json",
+		"observation-snapshot.deserialize.schema.json",
+		"observation-get-response.serialize.schema.json",
+		"observation-get-response.deserialize.schema.json",
 	]) {
 		writeOrCheck(
 			join(schemaDirectory, file),
@@ -77,6 +83,8 @@ try {
 		["launch-identity-marker.serialize.schema.json", "LaunchIdentityMarker"],
 		["facts-snapshot.deserialize.schema.json", "FactsSnapshotInput"],
 		["spawn-exit-observation.serialize.schema.json", "SpawnExitObservation"],
+		["observation-get-params.deserialize.schema.json", "ObservationGetParamsDeserialize"],
+		["observation-get-response.serialize.schema.json", "ObservationGetResponseSerialize"],
 	];
 	let declarations = "// Generated from the checked-in Rust-derived JSON Schemas. Do not edit.\n\n";
 	for (const [file, typeName] of types) {

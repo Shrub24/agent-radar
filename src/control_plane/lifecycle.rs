@@ -75,7 +75,7 @@ const EXIT_DEADLINE: Duration = Duration::from_secs(2);
 /// the program.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     /// Launch recorded; no process has claimed it yet.
@@ -136,7 +136,7 @@ pub enum Origin {
 
 /// One durable launch subject. The correlation is a private credential and is
 /// spent at capture; no public read returns it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -29,7 +29,7 @@ The handoff API stores immutable bounded content separately from the recipient r
 
 ## Generated protocol contracts
 
-The selected Rust wire DTOs are the source for the draft 2020-12 schemas in `schema/public/v1/`, shipped and exported under `pi-radar/schema/`. Serialize and deserialize schemas are separate because Serde defaults, null handling and omission differ by direction. The SDK's ping, handoff inbox, publication-parameter, immutable handoff, receipt, managed-launch-metadata input, facts-input and spawn-exit types are generated into `extension/generated-contracts.ts`; do not edit that file by hand.
+The selected Rust wire DTOs are the source for the draft 2020-12 schemas in `schema/public/v1/`, shipped and exported under `pi-radar/schema/`. Serialize and deserialize schemas are separate because Serde defaults, null handling and omission differ by direction. The SDK's ping, handoff inbox, publication-parameter, immutable handoff, receipt, managed-launch-metadata input, facts-input, spawn-exit, and observation request/snapshot/response types are generated into `extension/generated-contracts.ts`; do not edit that file by hand.
 
 From the repository checkout, run `npm run generate:contracts` in this directory to regenerate schemas and TypeScript declarations. `npm test` checks the generated artifacts are current, typechecks the public SDK aliases, validates canonical wire fixtures and integer bounds against the schemas, and runs the package tests. Generation uses the locked Schemars crate plus pinned `json-schema-to-typescript` and TypeScript development dependencies; it adds no runtime package dependency.
 

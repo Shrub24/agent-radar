@@ -35,6 +35,9 @@ use crate::control_plane::containers;
 use crate::control_plane::lifecycle::{self as subjects, Bootstrap};
 use crate::control_plane::ops::{self, Method};
 use crate::control_plane::protocol::{self, Code, PROTOCOL_VERSION, Refusal, Request, Response};
+use crate::control_plane::public_contracts::observation::{
+    ObservationGetParams, ObservationGetResponse,
+};
 use crate::control_plane::public_contracts::{PingResult, TaskLaneStatus};
 use crate::control_plane::reconcile;
 use crate::control_plane::registry::{
@@ -934,23 +937,6 @@ fn handle_line(
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ObservationGetParams {
-    /// The epoch a caller believes it is reading, when it names one.
-    #[serde(default)]
-    epoch: Option<String>,
-    /// The revision the caller already holds, for a not-modified answer.
-    #[serde(default)]
-    since_revision: Option<u64>,
-    /// How long to hold the read open for a newer revision.
-    #[serde(default)]
-    wait_ms: Option<u64>,
-    /// The data classes the caller wants sampled.
-    #[serde(default)]
-    classes: Option<Vec<String>>,
-}
-
 /// Serves the daemon's shared observation snapshot.
 ///
 /// A read records nothing: it is a projection of what the sampler has already
@@ -1274,7 +1260,7 @@ fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         let (revision, _) = hub.current();
         return Response::ok(
             &request.id,
-            json!({"snapshot_expired": {"epoch": epoch, "revision": revision}}),
+            json!(ObservationGetResponse::expired(epoch, revision)),
         );
     }
     // Demand is recorded before the answer, so the class this read asked for is
@@ -1287,7 +1273,7 @@ fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         // snapshot is not a thing that can be invented for it.
         return Response::ok(
             &request.id,
-            json!({"not_modified": {"epoch": epoch, "revision": 0}}),
+            json!(ObservationGetResponse::not_modified(epoch, 0)),
         );
     }
     if let Some(since) = params.since_revision {
@@ -1295,7 +1281,7 @@ fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         if since > revision {
             return Response::ok(
                 &request.id,
-                json!({"snapshot_expired": {"epoch": epoch, "revision": revision}}),
+                json!(ObservationGetResponse::expired(epoch, revision)),
             );
         }
         if since == revision && wait > 0 {
@@ -1305,7 +1291,7 @@ fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         if since == revision {
             return Response::ok(
                 &request.id,
-                json!({"not_modified": {"epoch": epoch, "revision": revision}}),
+                json!(ObservationGetResponse::not_modified(epoch, revision)),
             );
         }
     }
@@ -1314,20 +1300,20 @@ fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
         // Nothing has been sampled yet: that is not a fleet, and not a failure.
         return Response::ok(
             &request.id,
-            json!({"not_modified": {"epoch": epoch, "revision": current}}),
+            json!(ObservationGetResponse::not_modified(epoch, current)),
         );
     };
     if !snapshot.fits() {
         return Response::ok(
             &request.id,
-            json!({"snapshot_too_large": {
-                "epoch": snapshot.epoch,
-                "revision": snapshot.revision,
-                "limit_bytes": crate::control_plane::observation::MAX_SNAPSHOT_BYTES,
-            }}),
+            json!(ObservationGetResponse::too_large(
+                snapshot.epoch.clone(),
+                snapshot.revision,
+                crate::control_plane::observation::MAX_SNAPSHOT_BYTES,
+            )),
         );
     }
-    let value = match serde_json::to_value(&*snapshot) {
+    let value = match serde_json::to_value(ObservationGetResponse::snapshot(&snapshot)) {
         Ok(value) => value,
         Err(error) => {
             return Response::refused(
@@ -1339,14 +1325,7 @@ fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
             );
         }
     };
-    Response::ok(
-        &request.id,
-        json!({
-            "epoch": snapshot.epoch,
-            "revision": snapshot.revision,
-            "snapshot": value,
-        }),
-    )
+    Response::ok(&request.id, value)
 }
 
 #[derive(serde::Deserialize)]

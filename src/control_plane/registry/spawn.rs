@@ -249,7 +249,7 @@ pub struct PublicSpawnEdge {
 /// The state of one edge in the recorded topology: the strongest statement a
 /// read can make about it, and nothing beyond the records and this read's own
 /// evidence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnState {
     /// No child has presented this edge's token. The edge may still be pending,

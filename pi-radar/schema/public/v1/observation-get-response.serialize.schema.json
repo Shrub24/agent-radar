@@ -1,0 +1,2896 @@
+{
+  "$defs": {
+    "AgentObservation": {
+      "additionalProperties": false,
+      "description": "A normalized observation of one agent, keyed in the inventory by its pane.",
+      "properties": {
+        "facts": {
+          "$ref": "#/$defs/HerdsmanFacts",
+          "description": "What Herdsman publishes about this agent. Empty unless the source\npublished metadata; never inferred from runtime facts."
+        },
+        "label": {
+          "description": "Reported display label (the stripped terminal title), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lineage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Lineage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit ownership lineage; `None` unless valid UUID tokens were supplied."
+        },
+        "location": {
+          "$ref": "#/$defs/Location"
+        },
+        "name": {
+          "description": "Reported agent name (for example `\"pi\"`), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "registry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistryView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The daemon's registration for this agent, with how it binds to a pane.\n`None` for an agent the registry does not know, and for every agent when\nno registry is read. A registration that names a pane protects that pane\neven when unjoined."
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reported session identity; `None` when the source reports none."
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Runtime lifecycle as reported; never a semantic control state."
+        }
+      },
+      "required": [
+        "location",
+        "name",
+        "label",
+        "status",
+        "session",
+        "lineage",
+        "facts",
+        "registry"
+      ],
+      "type": "object"
+    },
+    "AssignmentSnapshot": {
+      "additionalProperties": false,
+      "description": "The owner's complete assignment snapshot: the shared base plus facts only an\nowner knows. It is authored by the owner's writer and is never derived from\nexecution activity; the owner's identity is provenance, not authority.",
+      "properties": {
+        "actions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "activity": {
+          "type": "string"
+        },
+        "ask": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assigned_started_unix_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "assignment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "awaited": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "definition": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Outcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "waiting_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "activity"
+      ],
+      "type": "object"
+    },
+    "BackgroundTask": {
+      "additionalProperties": false,
+      "description": "One background task the agent process reports as unresolved.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "phase": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "BinaryFreshness": {
+      "description": "How a foreground process's running executable compares with the installed\nprogram it would run.",
+      "oneOf": [
+        {
+          "const": "current",
+          "description": "The running executable is the installed program, or another file inside\nthe same installation as the one installed now.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "The running executable's file was replaced or removed, or its\ninstallation differs from the one installed now.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Nothing could be compared: the process is gone, its executable or the\ninstalled program is unreadable, the running file is not the program the\ncounterpart belongs to, or this platform has no reader.",
+          "type": "string"
+        }
+      ]
+    },
+    "BinaryIdentity": {
+      "additionalProperties": false,
+      "description": "What was compared, and how it came out.\n\n`running` and `installed` are the installations the executables belong to —\nthe Nix store root, or the resolved path elsewhere — and they are what the\nfreshness compares. A bolt variant's payload is compared by package family,\nso its identities carry the package roots; every other program is compared\nby file name and keeps the earlier meaning. `executable` is the running file\nitself, which the kernel reports and nobody invokes, kept so a row can name\nwhat is running even when no verdict was reached.",
+      "properties": {
+        "executable": {
+          "description": "The running executable's own path, when it could be read.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "freshness": {
+          "$ref": "#/$defs/BinaryFreshness"
+        },
+        "installed": {
+          "description": "The installation the installed counterpart's payload belongs to. `None`\nwhen no counterpart was found or its payload could not be identified.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "running": {
+          "description": "The installation the running executable belongs to. `None` when its\nexecutable could not be read.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unknown": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BinaryUnknown"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why nothing was compared, when nothing was."
+        }
+      },
+      "required": [
+        "freshness",
+        "running",
+        "installed",
+        "executable",
+        "unknown"
+      ],
+      "type": "object"
+    },
+    "BinaryUnknown": {
+      "description": "Why a running executable could not be compared, when it could not.\n\nEach variant is something a reader can act on differently: a program that is\nnot installed, an installed entrypoint whose payload cannot be identified,\nan executable that cannot be read, or a running file that is not the program\nin question. The words a row uses are the row's, not this type's.",
+      "oneOf": [
+        {
+          "const": "no_counterpart",
+          "description": "No installed counterpart of that name is on the search path.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_launcher",
+          "description": "The counterpart exists, but the payload it runs could not be identified:\nits entrypoint is unreadable, or its shape is one this comparison\nrefuses rather than guesses at.",
+          "type": "string"
+        },
+        {
+          "const": "unreadable",
+          "description": "The running process's own executable could not be read.",
+          "type": "string"
+        },
+        {
+          "const": "not_compared",
+          "description": "The running file is not the program the runtime named, or the runtime\nnamed none: nothing about it is attributed to a program.",
+          "type": "string"
+        }
+      ]
+    },
+    "Binding": {
+      "description": "How a registration relates to the live panes.",
+      "oneOf": [
+        {
+          "enum": [
+            "joined"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "unjoined": {
+              "$ref": "#/$defs/Unjoined"
+            }
+          },
+          "required": [
+            "unjoined"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Binding2": {
+      "additionalProperties": false,
+      "description": "Where a container's handle lives, and which incarnation answered for it.",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "handle": {
+          "type": "string"
+        },
+        "incarnation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The verified process incarnation serving the handle, when one was\nestablished. A handle alone cannot be told apart from a later server\nreusing it, so a binding that names no incarnation is never verified."
+        }
+      },
+      "required": [
+        "backend",
+        "incarnation",
+        "handle"
+      ],
+      "type": "object"
+    },
+    "Channel": {
+      "description": "Independent publisher channels.",
+      "oneOf": [
+        {
+          "const": "execution",
+          "description": "Process execution evidence.",
+          "type": "string"
+        },
+        {
+          "const": "assignment",
+          "description": "Owner assignment projection.",
+          "type": "string"
+        },
+        {
+          "const": "facts",
+          "description": "Self-authored process facts, published with no owner.",
+          "type": "string"
+        }
+      ]
+    },
+    "ChildCloseTarget": {
+      "additionalProperties": false,
+      "description": "Exact spawn-edge child identity required by `spawn.close`.",
+      "properties": {
+        "incarnation": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "spawn_request_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "spawn_request_id",
+        "source",
+        "incarnation"
+      ],
+      "type": "object"
+    },
+    "ContextWindow": {
+      "additionalProperties": false,
+      "description": "How much of a model's context window a session has used, as counts.\n\n`window` is positive and `tokens` does not exceed it; the percentage a display\nshows is derived from these and never published. Wire counts stay exact in JS.",
+      "properties": {
+        "tokens": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tokens",
+        "window"
+      ],
+      "type": "object"
+    },
+    "CpuPercent": {
+      "description": "Interval CPU use of one process, as a percentage of one CPU.\n\nHeld in hundredths of a percent, as an integer: the value is a ratio of two\nkernel counter readings, and an exact integer is what a row can show and a\ntest can assert. `12.5%` of one CPU is `1_250`. It measures the process\nrather than the machine, so a process that used two CPUs for a whole\ninterval is `20_000`, not `100%`.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "DescendantResources": {
+      "additionalProperties": false,
+      "description": "What the processes beneath one root are using, as one scan observed them.\n\nThe members are the kernel's descendants — the ancestry its parent links\nreported when the scan read them — and never a claim of ownership: a build\nbeneath a pane belongs to no agent, session, assignment or background task\nthat Radar knows of, and none of these totals is a cgroup or workload total.\nA process beneath two roots contributes to each of their totals while being\nread once, and RSS is summed per process, so pages shared between two\ndescendants, or between a descendant and its ancestor, are counted once for\nevery process that maps them.",
+      "properties": {
+        "cpu": {
+          "$ref": "#/$defs/Total2",
+          "description": "Their interval CPU. Every one of them needs its own matching pair of\nreadings, so a descendant seen for the first time contributes nothing\nand leaves this partial."
+        },
+        "members": {
+          "description": "Those processes: one sample each, and exactly the ones `observed` counts\nand the totals cover. Empty when none could be enumerated, and the\ntotals below say why.",
+          "items": {
+            "$ref": "#/$defs/DescendantSample"
+          },
+          "type": "array"
+        },
+        "observed": {
+          "description": "How many processes the scan observed beneath the root. `None` when none\ncould be enumerated at all.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rss_bytes": {
+          "$ref": "#/$defs/Total",
+          "description": "The resident set of those of them whose size could be read."
+        }
+      },
+      "required": [
+        "observed",
+        "members",
+        "rss_bytes",
+        "cpu"
+      ],
+      "type": "object"
+    },
+    "DescendantSample": {
+      "additionalProperties": false,
+      "description": "One process beneath a root, as one refresh's scan confirmed it.\n\nThese are the members the totals of [`DescendantResources`] are made of, from\nthe same snapshot, the same reads and the same confirmation — never a second\nwalk and never a second reading of `/proc`. The parent is the identity of the\nprocess this one was read beneath: what a table can order and fold by is the\nincarnation, since a pid alone names a different process once the kernel\nreuses it. The name is the kernel's own short name for the process, which is\nneither the arguments it was started with nor a claim about what started it.",
+      "properties": {
+        "cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CpuPercent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Interval CPU since the previous sample of this same identity. `None` when\nno interval can be measured; a measured idle interval is `Some(0)`."
+        },
+        "identity": {
+          "$ref": "#/$defs/ProcessIdentity",
+          "description": "The incarnation this reading belongs to."
+        },
+        "name": {
+          "description": "The kernel's name for the process (`comm` in `/proc/<pid>/stat`), which\nis not argv and says nothing about who started it.",
+          "type": "string"
+        },
+        "parent": {
+          "$ref": "#/$defs/ProcessIdentity",
+          "description": "The incarnation of the process it was read beneath."
+        },
+        "rss_bytes": {
+          "description": "Resident set size in bytes. `None` when this machine cannot convert the\nkernel's page count.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/ProcessState",
+          "description": "The scheduler state the kernel reported for it."
+        }
+      },
+      "required": [
+        "identity",
+        "parent",
+        "name",
+        "state",
+        "cpu",
+        "rss_bytes"
+      ],
+      "type": "object"
+    },
+    "FactsSnapshot": {
+      "additionalProperties": false,
+      "description": "The agent's own process facts. Self-authored by any Pi session, with no owner\nor assignment, and kept separate from execution and assignment. Every field\nis optional and a published snapshot replaces the whole value, so omission\nwithdraws a fact. `context_window` is counts; a display derives the percentage.",
+      "properties": {
+        "background_started_unix_ms": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "background_tasks": {
+          "items": {
+            "$ref": "#/$defs/BackgroundTask"
+          },
+          "type": "array"
+        },
+        "context_window": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContextWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thinking": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "FleetObservation": {
+      "additionalProperties": false,
+      "description": "One successful inventory: workspaces, tabs, panes, reported agents and\ndaemon lifecycle subjects not represented by a joined agent row.",
+      "properties": {
+        "agents": {
+          "description": "The agents this observation presents as facts. The collector sets these\nfrom the registry; a backend's own metadata records never land here.",
+          "items": {
+            "$ref": "#/$defs/AgentObservation"
+          },
+          "type": "array"
+        },
+        "containers": {
+          "description": "The containers this daemon records, read beside the registry facts. A\nbackend's inventory never carries them, and an empty list means no\ncontainer was read — not that none exists.",
+          "items": {
+            "$ref": "#/$defs/PublicContainer"
+          },
+          "type": "array"
+        },
+        "lifecycle_subjects": {
+          "description": "Public lifecycle records from the same daemon read as agent facts. The\ntree suppresses subjects already represented by a joined agent row.",
+          "items": {
+            "$ref": "#/$defs/LifecycleObservation"
+          },
+          "type": "array"
+        },
+        "metadata_agents": {
+          "description": "Agent records a backend reads from pane metadata. They are physical\nevidence that protects a pane from unmanaged control, and are never\npresented as agent facts.",
+          "items": {
+            "$ref": "#/$defs/AgentObservation"
+          },
+          "type": "array"
+        },
+        "panes": {
+          "items": {
+            "$ref": "#/$defs/Pane"
+          },
+          "type": "array"
+        },
+        "tabs": {
+          "items": {
+            "$ref": "#/$defs/Tab"
+          },
+          "type": "array"
+        },
+        "workspaces": {
+          "items": {
+            "$ref": "#/$defs/Workspace"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "workspaces",
+        "tabs",
+        "panes",
+        "agents"
+      ],
+      "type": "object"
+    },
+    "ForegroundEvidence": {
+      "description": "Evidence about a pane's foreground, decoded inside the connector.\n\nThe reconciler treats only [`ForegroundEvidence::NonShell`] as positive\nsupersession evidence; absence or ambiguity retains the last observation.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The pane shell owns the foreground process group (shell PID evidence).",
+          "properties": {
+            "kind": {
+              "const": "shell",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A non-shell process group leader is in the foreground.",
+          "properties": {
+            "command": {
+              "description": "The leader's command line as the operating system reports it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "non_shell",
+              "type": "string"
+            },
+            "local": {
+              "$ref": "#/$defs/LocalFacts",
+              "description": "What this machine knows about that process. Filled by the collector\nfrom the operating system, never by the runtime's own report."
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pid": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "pid",
+            "name",
+            "command",
+            "local"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "PID fields are missing or inconsistent: foreground state is unknown.",
+          "properties": {
+            "kind": {
+              "const": "inconclusive",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Freshness": {
+      "description": "Freshness is independent of process identity or completion.",
+      "oneOf": [
+        {
+          "const": "fresh",
+          "description": "Accepted in this serving epoch by the current writer and not expired.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "Restored, reported by a replaced writer, retired, or expired.",
+          "type": "string"
+        }
+      ]
+    },
+    "HerdsmanFacts": {
+      "additionalProperties": false,
+      "properties": {
+        "ask": {
+          "description": "A lead's pending owner question.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assigned_for": {
+          "description": "How long the active assignment had been running when it was observed.\nMeasured at observation time from Herdsman's own start, because a\npresentation that had to interpret a timestamp would need a clock.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "assigned_started_unix_ms": {
+          "description": "The active assignment's start, Unix milliseconds as published.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "assignment": {
+          "description": "The active assignment's display text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "awaited": {
+          "description": "What this pane is waiting on: `agent:<label>` for each outstanding\nchild, and `owner` while its own question to its owner is outstanding.\nOutstanding work, not state: it is published while working and while\nstopped, and cleared when the last item resolves.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "background_running": {
+          "description": "How many of the pane's background tasks are running, as its own\nextension counts them. Another publisher owns this key, and the count\nspeaks only for the running ones: it is not the set of unresolved work.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "background_started": {
+          "description": "The oldest outstanding background task's start, ISO 8601 as published.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "background_tasks": {
+          "description": "The pane's unresolved background tasks as its own extension publishes\nthem, each an `<id>:<phase>` entry. The awaited facts are the union of\nthe owner's awaited items and these ids, because neither publisher can\nexpress the whole pane alone.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "context_usage": {
+          "description": "The percentage a Herdr token states, percent sign included. It carries no\ncounts, so it is never presented as a typed window.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContextWindow"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The context window a registry publisher reports as counts."
+        },
+        "definition": {
+          "description": "The agent definition a pane reports as its display agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "A managed worker's runtime label: the name its owner and its siblings\nuse for it, and the only faithful source for a worker's name. Herdr's\nown agent name truncates it and its title welds it to the task.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_outcome": {
+          "description": "The owner's last outcome for the assignment, as it published it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "managed_metadata": {
+          "description": "Whether this pane's tokens carried any `pi_herdsman_*` key.\n\nPresence, not readability: the owner's metadata is what makes a Pi pane\nmanaged, so a key whose value this build cannot read still counts. The\ndecoder sets this at the adapter boundary, where the raw token map is,\nbecause the named fields below discard keys this version does not know.",
+          "type": "boolean"
+        },
+        "model": {
+          "description": "The session's model identity as published, provider prefix included.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "A lead's published session name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request": {
+          "description": "The active assignment's request identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "description": "The role the agent runs as: a lead role, or a worker's agent definition.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run": {
+          "description": "A managed worker's run identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_name": {
+          "description": "The source's human session name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SemanticState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's projection of this agent's state, while it is published."
+        },
+        "thinking": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "waiting_reason": {
+          "description": "Why the owner says the assignment is waiting, as it published it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "role",
+        "name",
+        "definition",
+        "label",
+        "run",
+        "managed_metadata",
+        "request",
+        "ask",
+        "waiting_reason",
+        "last_outcome",
+        "assignment",
+        "assigned_started_unix_ms",
+        "assigned_for",
+        "state",
+        "model",
+        "provider",
+        "thinking",
+        "context_usage",
+        "context_window",
+        "session_name",
+        "awaited",
+        "background_running",
+        "background_tasks",
+        "background_started"
+      ],
+      "type": "object"
+    },
+    "Kind": {
+      "description": "What a container is in the hierarchy.",
+      "enum": [
+        "workspace",
+        "tab",
+        "pane"
+      ],
+      "type": "string"
+    },
+    "LaunchIdentityEvidence": {
+      "description": "A daemon-owned process lifecycle target, joined to one registration by exact\nagent id and process birth identity.",
+      "enum": [
+        "missing",
+        "matching",
+        "stale",
+        "contradictory",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "LaunchIdentityMarker": {
+      "additionalProperties": false,
+      "description": "A non-secret Pi-session breadcrumb issued by Radar. This is correlation\nevidence only and cannot establish lifecycle authority.",
+      "properties": {
+        "execution_generation": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "launch_id": {
+          "type": "string"
+        },
+        "subject_id": {
+          "type": "string"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version",
+        "subject_id",
+        "launch_id",
+        "execution_generation"
+      ],
+      "type": "object"
+    },
+    "LifecycleObservation": {
+      "additionalProperties": false,
+      "description": "Public lifecycle identity carried into the display projection.",
+      "properties": {
+        "bound_agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "process": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        },
+        "subject_id": {
+          "type": "string"
+        },
+        "successor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "subject_id",
+        "bound_agent_id",
+        "process",
+        "state",
+        "session",
+        "successor"
+      ],
+      "type": "object"
+    },
+    "Lineage": {
+      "additionalProperties": false,
+      "description": "Explicit ownership lineage from `pi_herdsman_session` /\n`pi_herdsman_parent_session` UUID metadata.\n\nUsed only for ownership joins (worker → owner). Lineage is never used as\nsession identity, and absent or malformed tokens yield no lineage at all.",
+      "properties": {
+        "parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionUuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionUuid"
+        }
+      },
+      "required": [
+        "session",
+        "parent"
+      ],
+      "type": "object"
+    },
+    "LocalFacts": {
+      "additionalProperties": false,
+      "description": "What this machine knows about the process holding a pane's foreground,\nbeyond what the runtime reports.",
+      "properties": {
+        "binary": {
+          "$ref": "#/$defs/BinaryIdentity",
+          "description": "How the foreground program's executable compares with the installed\nprogram of its own name or package family."
+        },
+        "resources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessResources"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the process is using, from the sample taken for it. `None` when no\nsample was taken: this machine has no reader for that process, the\nprocess could not be read, or the platform cannot sample at all. A\nreading from an earlier refresh is never carried here."
+        },
+        "running_for": {
+          "description": "How long the process has been alive, measured from its own start time\nrather than from when Radar first saw it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "terminal": {
+          "$ref": "#/$defs/TerminalMode",
+          "description": "What it has done to the terminal."
+        }
+      },
+      "required": [
+        "running_for",
+        "terminal",
+        "binary",
+        "resources"
+      ],
+      "type": "object"
+    },
+    "Location": {
+      "additionalProperties": false,
+      "description": "Connector-scoped runtime location: Herdr workspace, tab and pane identifiers.\n\nPane identity is a runtime location detail; it is never an agent identity.",
+      "properties": {
+        "pane_id": {
+          "type": "string"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "tab_id",
+        "pane_id"
+      ],
+      "type": "object"
+    },
+    "ManagedMetadata": {
+      "additionalProperties": false,
+      "description": "One durable launch subject. The correlation is a private credential and is\nspent at capture; no public read returns it.",
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_subject_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ManagedSubject": {
+      "additionalProperties": false,
+      "properties": {
+        "child_close": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChildCloseTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "identity_unresolved": {
+          "type": "boolean"
+        },
+        "launch_identity": {
+          "$ref": "#/$defs/LaunchIdentityEvidence"
+        },
+        "metadata": {
+          "$ref": "#/$defs/ManagedMetadata"
+        },
+        "process": {
+          "$ref": "#/$defs/ProcessIdentity"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        },
+        "subject_id": {
+          "type": "string"
+        },
+        "successor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "subject_id",
+        "process",
+        "identity_unresolved",
+        "launch_identity",
+        "metadata",
+        "child_close",
+        "state",
+        "session",
+        "successor"
+      ],
+      "type": "object"
+    },
+    "ObservationExpiredResult": {
+      "additionalProperties": false,
+      "properties": {
+        "snapshot_expired": {
+          "$ref": "#/$defs/ObservationRevision"
+        }
+      },
+      "required": [
+        "snapshot_expired"
+      ],
+      "type": "object"
+    },
+    "ObservationFreshness": {
+      "description": "Source freshness included in an observation response.",
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "current"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "stale": {
+              "additionalProperties": false,
+              "properties": {
+                "diagnostic": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "diagnostic"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "stale"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "unavailable": {
+              "additionalProperties": false,
+              "properties": {
+                "diagnostic": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "diagnostic"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "unavailable"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ObservationNotModifiedResult": {
+      "additionalProperties": false,
+      "properties": {
+        "not_modified": {
+          "$ref": "#/$defs/ObservationRevision"
+        }
+      },
+      "required": [
+        "not_modified"
+      ],
+      "type": "object"
+    },
+    "ObservationProjection": {
+      "additionalProperties": false,
+      "description": "Public observation projection. The sampler's mutable state remains private;\nthis DTO names the fields the daemon publishes without serializing that state\ntype directly.",
+      "properties": {
+        "awaiting_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "containment": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RetainedObservation"
+          },
+          "type": "object"
+        },
+        "foreground": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ForegroundEvidence"
+          },
+          "type": "object"
+        },
+        "inventory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FleetObservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registry": {
+          "$ref": "#/$defs/ObservationFreshness",
+          "default": "pending"
+        },
+        "retained": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RetainedObservation"
+          },
+          "type": "object"
+        },
+        "source": {
+          "$ref": "#/$defs/ObservationFreshness"
+        }
+      },
+      "required": [
+        "inventory",
+        "source",
+        "registry",
+        "retained",
+        "containment",
+        "awaiting_evidence",
+        "foreground"
+      ],
+      "type": "object"
+    },
+    "ObservationRevision": {
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "epoch",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "ObservationSnapshot": {
+      "additionalProperties": false,
+      "description": "One immutable observation revision on the public wire.",
+      "properties": {
+        "collected_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "epoch": {
+          "type": "string"
+        },
+        "observation": {
+          "$ref": "#/$defs/ObservationProjection"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/ObservationSource"
+          },
+          "type": "array"
+        },
+        "tasks": true
+      },
+      "required": [
+        "epoch",
+        "revision",
+        "collected_at",
+        "sources",
+        "tasks",
+        "observation"
+      ],
+      "type": "object"
+    },
+    "ObservationSnapshotResult": {
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/ObservationSnapshot"
+        }
+      },
+      "required": [
+        "epoch",
+        "revision",
+        "snapshot"
+      ],
+      "type": "object"
+    },
+    "ObservationSource": {
+      "additionalProperties": false,
+      "description": "One source's freshness in a snapshot revision.",
+      "properties": {
+        "last_success_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/ObservationFreshness"
+        }
+      },
+      "required": [
+        "name",
+        "state",
+        "last_success_at"
+      ],
+      "type": "object"
+    },
+    "ObservationTooLarge": {
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "type": "string"
+        },
+        "limit_bytes": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "epoch",
+        "revision",
+        "limit_bytes"
+      ],
+      "type": "object"
+    },
+    "ObservationTooLargeResult": {
+      "additionalProperties": false,
+      "properties": {
+        "snapshot_too_large": {
+          "$ref": "#/$defs/ObservationTooLarge"
+        }
+      },
+      "required": [
+        "snapshot_too_large"
+      ],
+      "type": "object"
+    },
+    "Outcome": {
+      "additionalProperties": false,
+      "description": "A turn outcome kept distinct from current activity.",
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "description": "Producer vocabulary is deliberately free-form.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    },
+    "Pane": {
+      "additionalProperties": false,
+      "description": "A runtime pane: location plus optional display text.\n\n`label` is the pane's declared label, `title` its stripped terminal title;\neither may be absent, and [`Pane::display_name`] defines the fallback used\nby presentation rows.",
+      "properties": {
+        "current_path": {
+          "description": "Current tmux pane directory, used as the target for a new launch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "$ref": "#/$defs/Location"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "location",
+        "label",
+        "title"
+      ],
+      "type": "object"
+    },
+    "ProcessEvidence": {
+      "additionalProperties": false,
+      "description": "The process evidence `agent.list` serves beside a registration. Only the\nclaimed birth identity is read here; the registry's own verdict is not used\nto join, because a join needs the claim to match the live foreground.",
+      "properties": {
+        "claim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "claim"
+      ],
+      "type": "object"
+    },
+    "ProcessIdentity": {
+      "additionalProperties": false,
+      "description": "Which process incarnation a sample belongs to.\n\nThe kernel reuses process ids, so a pid does not name a process: one\nincarnation is the boot it started in, its pid, and when it started. Those\nare what make two readings comparable — counters may only be subtracted\nfrom an earlier reading of the same identity, and a difference taken across\ntwo of them measures neither process.",
+      "properties": {
+        "boot_id": {
+          "description": "The boot this process started in, as the kernel reports it.",
+          "type": "string"
+        },
+        "pid": {
+          "description": "The process id, unique within one boot and one incarnation of it.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "start_ticks": {
+          "description": "Start time since boot, in clock ticks (`starttime` in\n`/proc/<pid>/stat`): the kernel's stamp for this incarnation.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "boot_id",
+        "pid",
+        "start_ticks"
+      ],
+      "type": "object"
+    },
+    "ProcessResources": {
+      "additionalProperties": false,
+      "description": "What one process is using, as the collector sampled it.\n\nThese are the resources of that process and of nothing larger: a build\nrunning beneath a pane is a descendant and is summed separately in\n[`Self::descendants`], and nothing here says who owns the process, what work\nit serves, or whether it is progressing. Every field comes from one read of\nthe process, so a sample never mixes two incarnations; RSS is that process's\nresident set, in which pages shared with another process are counted here as\nwell.",
+      "properties": {
+        "cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CpuPercent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Interval CPU since the previous sample of this same identity. `None`\nuntil such a sample exists, and whenever the interval cannot be\nmeasured."
+        },
+        "descendants": {
+          "$ref": "#/$defs/DescendantResources",
+          "description": "What the processes beneath this one are using, as the refresh's scan\nobserved them. Never merged with the fields above: a build's work is not\nits launcher's."
+        },
+        "identity": {
+          "$ref": "#/$defs/ProcessIdentity",
+          "description": "The incarnation these readings belong to."
+        },
+        "rss_bytes": {
+          "description": "Resident set size in bytes. `None` when this machine cannot convert the\nkernel's page count.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/ProcessState",
+          "description": "The kernel's scheduler state when the sample was taken."
+        }
+      },
+      "required": [
+        "identity",
+        "state",
+        "rss_bytes",
+        "cpu",
+        "descendants"
+      ],
+      "type": "object"
+    },
+    "ProcessState": {
+      "description": "The scheduler state the kernel reports for a process.\n\nA state letter travels with every process and is observable, but it says\nonly what the scheduler is doing with it: a sleeping process may be waiting\non a socket or on nothing, and a zombie has already exited. It is not\nactivity, not progress and not a verdict on the work underneath.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Running, or waiting its turn on a CPU.",
+          "properties": {
+            "kind": {
+              "const": "running",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Interruptible sleep: waiting, but wakeable.",
+          "properties": {
+            "kind": {
+              "const": "sleeping",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Uninterruptible sleep, usually blocked in the kernel on I/O.",
+          "properties": {
+            "kind": {
+              "const": "disk_sleep",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Stopped by a signal.",
+          "properties": {
+            "kind": {
+              "const": "stopped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Stopped because something is tracing it.",
+          "properties": {
+            "kind": {
+              "const": "tracing_stop",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Exited, not yet reaped by its parent.",
+          "properties": {
+            "kind": {
+              "const": "zombie",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Gone, or being torn down.",
+          "properties": {
+            "kind": {
+              "const": "dead",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Idle in the kernel, below the scheduler's oldest run queue.",
+          "properties": {
+            "kind": {
+              "const": "idle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A state this kernel wrote that Radar does not name.",
+          "properties": {
+            "kind": {
+              "const": "other",
+              "type": "string"
+            },
+            "value": {
+              "maxLength": 1,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Provenance": {
+      "description": "Who made the container.",
+      "oneOf": [
+        {
+          "const": "created",
+          "description": "This daemon created it, so its recipe and its reload are ours.",
+          "type": "string"
+        },
+        {
+          "const": "observed",
+          "description": "Only observed in the backend. Never recorded as ours, never reloaded\nfrom an invented recipe.",
+          "type": "string"
+        }
+      ]
+    },
+    "PublicChannelFacts": {
+      "additionalProperties": false,
+      "description": "A channel read for a reader that is not its writer: the same identity,\nfreshness and report facts as [`PublicChannel`], with the fencing handle\ndropped because it is a credential rather than a fact.",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "channel": {
+          "$ref": "#/$defs/Channel"
+        },
+        "snapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicSnapshotFacts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "writer": {
+          "$ref": "#/$defs/PublicWriterFacts"
+        }
+      },
+      "required": [
+        "version",
+        "agent_id",
+        "channel",
+        "writer"
+      ],
+      "type": "object"
+    },
+    "PublicContainer": {
+      "additionalProperties": false,
+      "description": "One container as a consumer reads it.",
+      "properties": {
+        "binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Binding2"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "container_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "created_by": {
+          "description": "The operation that created it, for a caller reconciling its own requests.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/Kind"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "recipe": {
+          "description": "Whether a recipe is held for this container's pane, so a caller knows the\nslot can be reloaded without reading private storage.",
+          "type": "boolean"
+        },
+        "removed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unresolved": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "container_id",
+        "kind",
+        "parent",
+        "label",
+        "created_by",
+        "recipe",
+        "provenance",
+        "binding",
+        "created_at",
+        "observed_at",
+        "unresolved",
+        "removed_at"
+      ],
+      "type": "object"
+    },
+    "PublicContext": {
+      "additionalProperties": false,
+      "description": "One agent record's context as a client reads it. A `None` read of this whole\nrecord means never published; a present record with a null session means no\ncurrent session.",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/$defs/PublicSession"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "writer": {
+          "$ref": "#/$defs/PublicWriterFacts"
+        }
+      },
+      "required": [
+        "version",
+        "agent_id",
+        "writer",
+        "context"
+      ],
+      "type": "object"
+    },
+    "PublicLaunch": {
+      "additionalProperties": false,
+      "description": "What a public read says about private launch information: that something is\nheld, and which revision of it.",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "available"
+      ],
+      "type": "object"
+    },
+    "PublicRegistration": {
+      "additionalProperties": false,
+      "description": "A registration as a client reads it. The private launch fields are absent by\nconstruction, not by redaction: there is no field here to forget to strip.",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "incarnation": {
+          "type": "string"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "launch": {
+          "$ref": "#/$defs/PublicLaunch"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistryLocation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "process_claimed": {
+          "description": "Whether a process identity was supplied. Its verification is a separate\nanswer and is never asserted by this record.",
+          "type": "boolean"
+        },
+        "registered_at": {
+          "type": "string"
+        },
+        "run": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version",
+        "agent_id",
+        "registered_at",
+        "source",
+        "incarnation",
+        "process_claimed",
+        "launch"
+      ],
+      "type": "object"
+    },
+    "PublicSession": {
+      "additionalProperties": false,
+      "description": "The last accepted context as a client reads it.\n\nThere is no handle and no serving epoch here by construction, and no other\nfield a private path or argument could be forgotten into.",
+      "properties": {
+        "expires_at": {
+          "type": "string"
+        },
+        "freshness": {
+          "$ref": "#/$defs/Freshness"
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "incarnation": {
+          "type": "string"
+        },
+        "launch_identity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchIdentityMarker"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lease_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "observed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "received_at": {
+          "type": "string"
+        },
+        "reporting_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "restored": {
+          "type": "boolean"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "description": "The current session, or an explicit null for \"no current session\".\n\nWritten even when null: a present record is what distinguishes \"no\ncurrent session\" from \"never published\", which is no context record at\nall.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "incarnation",
+        "generation",
+        "sequence",
+        "lease_ms",
+        "received_at",
+        "expires_at",
+        "restored",
+        "freshness",
+        "session"
+      ],
+      "type": "object"
+    },
+    "PublicSnapshotFacts": {
+      "additionalProperties": false,
+      "description": "The last accepted report as an unrelated reader may see it, leaving out the\nhandle that fences further writes.",
+      "properties": {
+        "expires_at": {
+          "type": "string"
+        },
+        "freshness": {
+          "$ref": "#/$defs/Freshness"
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "incarnation": {
+          "type": "string"
+        },
+        "lease_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "observed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "received_at": {
+          "type": "string"
+        },
+        "reporting_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "restored": {
+          "type": "boolean"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/Report"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "incarnation",
+        "generation",
+        "sequence",
+        "lease_ms",
+        "received_at",
+        "expires_at",
+        "restored",
+        "freshness",
+        "snapshot"
+      ],
+      "type": "object"
+    },
+    "PublicWriterFacts": {
+      "additionalProperties": false,
+      "description": "The current writer as an unrelated reader may see it: provenance and\ngeneration, without the opaque handle an update must present.",
+      "properties": {
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "incarnation": {
+          "type": "string"
+        },
+        "reporting_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retired_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "incarnation",
+        "generation",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    "RegistryAgent": {
+      "additionalProperties": false,
+      "description": "One registered agent as the daemon's `agent.list` serves it.",
+      "properties": {
+        "assignment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicChannelFacts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Mutable current-session context, kept separate from registration identity."
+        },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicChannelFacts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "facts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicChannelFacts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "process": {
+          "$ref": "#/$defs/ProcessEvidence"
+        },
+        "registration": {
+          "$ref": "#/$defs/PublicRegistration"
+        }
+      },
+      "required": [
+        "registration",
+        "process",
+        "context",
+        "execution",
+        "assignment",
+        "facts"
+      ],
+      "type": "object"
+    },
+    "RegistryLocation": {
+      "additionalProperties": false,
+      "description": "Where an agent's incarnation lives on one backend, in that backend's own\ncoordinates.\n\nThe backend name is free-form so a source Radar does not ship yet is\npreserved rather than rejected; the rest are the coordinates as reported, and\neach is optional because a backend need not name every level.",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "instance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tab": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "type": "object"
+    },
+    "RegistryView": {
+      "additionalProperties": false,
+      "description": "A registered agent with its binding, carried on the agent it projects to.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/RegistryAgent"
+        },
+        "binding": {
+          "$ref": "#/$defs/Binding"
+        },
+        "managed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedSubject"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "spawn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpawnBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "agent",
+        "binding",
+        "spawn",
+        "managed"
+      ],
+      "type": "object"
+    },
+    "Report": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Snapshot"
+        },
+        {
+          "$ref": "#/$defs/AssignmentSnapshot"
+        },
+        {
+          "$ref": "#/$defs/FactsSnapshot"
+        }
+      ],
+      "description": "One complete accepted snapshot, typed by the channel that carries it. Each\nvariant is strict about its own fields, so a field from another channel is\nrefused rather than silently dropped."
+    },
+    "RetainedBasis": {
+      "description": "Why a retained association is reported as not current.",
+      "enum": [
+        "shell_foreground",
+        "unverified"
+      ],
+      "type": "string"
+    },
+    "RetainedObservation": {
+      "additionalProperties": false,
+      "description": "Retained agent facts carried across an idle-shell gap.",
+      "properties": {
+        "basis": {
+          "$ref": "#/$defs/RetainedBasis"
+        },
+        "observation": {
+          "$ref": "#/$defs/AgentObservation"
+        }
+      },
+      "required": [
+        "observation",
+        "basis"
+      ],
+      "type": "object"
+    },
+    "RuntimeStatus": {
+      "description": "Runtime lifecycle exactly as the source reports it.\n\nThis is not a semantic control state: `Idle` says nothing about\navailability for new work, result delivery or safe lifecycle actions.\nUnrecognized values are preserved verbatim in [`RuntimeStatus::Other`] so a\nsource change never fails an otherwise valid inventory.",
+      "oneOf": [
+        {
+          "enum": [
+            "idle",
+            "working",
+            "done",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "other": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "other"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SemanticState": {
+      "description": "Herdsman's projection of an agent's state, as an owner publishes it.\n\nThis is a control projection, not a lifecycle: `Working` says a model turn\nor tool call is in flight, `Blocked` says the assignment waits on its owner,\nand `Waiting` says the turn has yielded while work it depends on is\nunresolved. Values are additive, so an unrecognised one is preserved.",
+      "oneOf": [
+        {
+          "enum": [
+            "idle",
+            "working",
+            "waiting",
+            "blocked",
+            "settling",
+            "unknown",
+            "lost"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "other": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "other"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SessionIdentity": {
+      "description": "Reported session identity for an agent observation.\n\nIdentity is separate from [`Location`]: the same session may move between\npanes, and a pane may host different sessions over time.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An explicit UUID identity, reported as `agent_session.kind == \"id\"`.",
+          "properties": {
+            "kind": {
+              "const": "uuid",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/SessionUuid"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A source-qualified reference (typically a session file path).\n\nKept exactly as reported: a path-like reference is never promoted to a\nUUID, however UUID-like the value looks.",
+          "properties": {
+            "kind": {
+              "const": "reported",
+              "type": "string"
+            },
+            "value": {
+              "additionalProperties": false,
+              "properties": {
+                "source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "value"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SessionUuid": {
+      "description": "A validated canonical UUID (lowercase `8-4-4-4-12` hex).\n\nOnly explicitly supplied UUID metadata is ever turned into this type —\nsession file paths are never scanned for embedded UUIDs.",
+      "type": "string"
+    },
+    "Snapshot": {
+      "additionalProperties": false,
+      "description": "One complete snapshot for one channel. Vocabulary is free-form; shape is\nstrict. Unknown state/reason/action words survive, unknown fields do not.",
+      "properties": {
+        "actions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "activity": {
+          "type": "string"
+        },
+        "last_outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Outcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "waiting_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "activity"
+      ],
+      "type": "object"
+    },
+    "SpawnBinding": {
+      "additionalProperties": false,
+      "description": "The spawn edge that binds this registration as a child, when one exists.\n\nParentage and the edge's own state come from the topology read. The edge's\nstate is never a process-exit claim: an unresolved child is shown as such.",
+      "properties": {
+        "child_incarnation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "child_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/SpawnState"
+        },
+        "subject_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "parent",
+        "request_id",
+        "subject_id",
+        "child_source",
+        "child_incarnation",
+        "state"
+      ],
+      "type": "object"
+    },
+    "SpawnState": {
+      "description": "The state of one edge in the recorded topology: the strongest statement a\nread can make about it, and nothing beyond the records and this read's own\nevidence.",
+      "oneOf": [
+        {
+          "const": "unbound",
+          "description": "No child has presented this edge's token. The edge may still be pending,\nor its launch may never have reached a shell.",
+          "type": "string"
+        },
+        {
+          "const": "bound",
+          "description": "A child registered with this edge's token, so the edge names its exact\nidentity. Observation does not revise this.",
+          "type": "string"
+        },
+        {
+          "const": "unresolved",
+          "description": "The recorded location is not in the backend's own report: the record and\nthe world disagree. This is never a statement that the child stopped — a\nread observes panes, and a pane's absence is not a process's death.",
+          "type": "string"
+        }
+      ]
+    },
+    "State": {
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Launch recorded; no process has claimed it yet.",
+          "type": "string"
+        },
+        {
+          "const": "captured",
+          "description": "The bootstrap's process is captured and released to exec.",
+          "type": "string"
+        },
+        {
+          "const": "bound",
+          "description": "A registration presented the token with the captured identity.",
+          "type": "string"
+        },
+        {
+          "const": "revoked",
+          "description": "Cancelled before binding: no registration may bind it.",
+          "type": "string"
+        }
+      ]
+    },
+    "Tab": {
+      "additionalProperties": false,
+      "description": "A Herdr tab within a workspace; shown as location detail, not a tree level.",
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "number": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "workspace_id",
+        "label",
+        "number"
+      ],
+      "type": "object"
+    },
+    "TerminalMode": {
+      "description": "Whether a foreground program has taken the terminal over.\n\nA terminal cannot see a program's intentions, but it does see the line\ndiscipline: a full-screen program turns canonical mode and echo off, and a\ncommand that prints and exits leaves them alone however long it runs. That\nis the difference between an editor someone is working in and a build in\nprogress, and it is the only signal of the kind the kernel offers.",
+      "oneOf": [
+        {
+          "const": "full_screen",
+          "description": "Raw mode, no echo: the program is drawing the screen itself.",
+          "type": "string"
+        },
+        {
+          "const": "line",
+          "description": "The shell's line discipline is intact: output scrolls, input is echoed.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Unreadable: a process with no terminal, one that is already gone, or a\nplatform whose terminal state Radar cannot read.",
+          "type": "string"
+        }
+      ]
+    },
+    "Total": {
+      "description": "A total over processes, and what it actually covers.\n\nA sum is not a measurement by itself: it can be small because its members\nwere idle, or because the scan could not read them. The variant keeps that\ndifference, so an incomplete total can never be read as a complete zero, and\nthe reason travels with it because the reader has to know which members are\nmissing to know what the number is worth.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Every member of the set contributed to it.",
+          "properties": {
+            "kind": {
+              "const": "complete",
+              "type": "string"
+            },
+            "value": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A lower bound: some members could not contribute, for the reason given.",
+          "properties": {
+            "kind": {
+              "const": "partial",
+              "type": "string"
+            },
+            "value": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Nothing could be totalled, for the reason given.",
+          "properties": {
+            "kind": {
+              "const": "unknown",
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Total2": {
+      "description": "A total over processes, and what it actually covers.\n\nA sum is not a measurement by itself: it can be small because its members\nwere idle, or because the scan could not read them. The variant keeps that\ndifference, so an incomplete total can never be read as a complete zero, and\nthe reason travels with it because the reader has to know which members are\nmissing to know what the number is worth.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Every member of the set contributed to it.",
+          "properties": {
+            "kind": {
+              "const": "complete",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/CpuPercent"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A lower bound: some members could not contribute, for the reason given.",
+          "properties": {
+            "kind": {
+              "const": "partial",
+              "type": "string"
+            },
+            "value": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "$ref": "#/$defs/CpuPercent"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Nothing could be totalled, for the reason given.",
+          "properties": {
+            "kind": {
+              "const": "unknown",
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Unjoined": {
+      "description": "Why a registration did not join a pane.",
+      "oneOf": [
+        {
+          "const": "no_location",
+          "description": "No pane is named, or the registration names no location at all.",
+          "type": "string"
+        },
+        {
+          "const": "no_claim",
+          "description": "The registration claimed no process identity to compare.",
+          "type": "string"
+        },
+        {
+          "const": "pane_absent",
+          "description": "The named pane is not in this inventory.",
+          "type": "string"
+        },
+        {
+          "const": "location_mismatch",
+          "description": "The backend, instance, tab or workspace differ from the pane's.",
+          "type": "string"
+        },
+        {
+          "const": "foreground_unreadable",
+          "description": "The pane's foreground identity was not sampled or could not be read.",
+          "type": "string"
+        },
+        {
+          "const": "identity_mismatch",
+          "description": "The pane's foreground is a different process incarnation.",
+          "type": "string"
+        },
+        {
+          "const": "ambiguous",
+          "description": "Two registrations claim the same pane's foreground identity.",
+          "type": "string"
+        }
+      ]
+    },
+    "Workspace": {
+      "additionalProperties": false,
+      "description": "A Herdr workspace: the first display grouping for the fleet tree.",
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "number": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_path": {
+          "description": "tmux's workspace directory, used as the default target for a new launch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "label",
+        "number"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/ObservationSnapshotResult"
+    },
+    {
+      "$ref": "#/$defs/ObservationNotModifiedResult"
+    },
+    {
+      "$ref": "#/$defs/ObservationExpiredResult"
+    },
+    {
+      "$ref": "#/$defs/ObservationTooLargeResult"
+    }
+  ],
+  "description": "The result forms returned by `observation.get`.",
+  "title": "observation-get-response-serialize"
+}

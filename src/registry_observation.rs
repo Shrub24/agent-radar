@@ -29,7 +29,7 @@ use crate::model::{
 use crate::runtime::BackendIdentity;
 
 /// One registered agent as the daemon's `agent.list` serves it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RegistryAgent {
     pub registration: PublicRegistration,
     pub process: ProcessEvidence,
@@ -67,7 +67,7 @@ pub struct RegistryRead {
 
 /// The safe identity fields from `lifecycle.list`; private launch data is never
 /// part of the dashboard's registry read.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LifecycleSubject {
     /// Stable logical subject used by public control requests.
     pub subject_id: String,
@@ -95,7 +95,9 @@ pub struct LifecycleSubject {
 
 /// A daemon-owned process lifecycle target, joined to one registration by exact
 /// agent id and process birth identity.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchIdentityEvidence {
     #[default]
@@ -106,7 +108,7 @@ pub enum LaunchIdentityEvidence {
     Unavailable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ManagedSubject {
     pub subject_id: String,
     pub process: ProcessIdentity,
@@ -122,14 +124,14 @@ pub struct ManagedSubject {
 /// The process evidence `agent.list` serves beside a registration. Only the
 /// claimed birth identity is read here; the registry's own verdict is not used
 /// to join, because a join needs the claim to match the live foreground.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProcessEvidence {
     #[serde(default)]
     pub claim: Option<ProcessIdentity>,
 }
 
 /// Why a registration did not join a pane.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Unjoined {
     /// No pane is named, or the registration names no location at all.
@@ -149,7 +151,7 @@ pub enum Unjoined {
 }
 
 /// How a registration relates to the live panes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Binding {
     Joined,
@@ -160,7 +162,7 @@ pub enum Binding {
 ///
 /// Parentage and the edge's own state come from the topology read. The edge's
 /// state is never a process-exit claim: an unresolved child is shown as such.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SpawnBinding {
     pub parent: String,
     pub request_id: String,
@@ -171,7 +173,7 @@ pub struct SpawnBinding {
 }
 
 /// Exact spawn-edge child identity required by `spawn.close`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ChildCloseTarget {
     pub spawn_request_id: String,
     pub source: String,
@@ -179,7 +181,7 @@ pub struct ChildCloseTarget {
 }
 
 /// A registered agent with its binding, carried on the agent it projects to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RegistryView {
     pub agent: RegistryAgent,
     pub binding: Binding,

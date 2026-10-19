@@ -72,7 +72,7 @@ const SUBJECTS: &str = "lifecycle";
 /// The backend name is free-form so a source Radar does not ship yet is
 /// preserved rather than rejected; the rest are the coordinates as reported, and
 /// each is optional because a backend need not name every level.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryLocation {
     pub backend: String,
@@ -340,7 +340,7 @@ impl Registration {
 
 /// A registration as a client reads it. The private launch fields are absent by
 /// construction, not by redaction: there is no field here to forget to strip.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicRegistration {
     pub version: u32,
@@ -366,7 +366,7 @@ pub struct PublicRegistration {
 
 /// What a public read says about private launch information: that something is
 /// held, and which revision of it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicLaunch {
     pub available: bool,

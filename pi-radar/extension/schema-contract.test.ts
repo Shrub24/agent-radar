@@ -187,3 +187,51 @@ test("spawn-exit schemas describe tagged output and optional input fields", () =
 	assert.equal(accepts(partialExitedInput), true, ajv.errorsText(accepts.errors));
 	assert.equal(validates(partialExitedInput), false);
 });
+
+test("observation.get schemas cover unchanged, expired, oversized, and snapshot responses", () => {
+	const params = ajv.compile(schema("observation-get-params.deserialize.schema.json"));
+	const snapshotInput = ajv.compile(schema("observation-snapshot.deserialize.schema.json"));
+	const snapshotOutput = ajv.compile(schema("observation-snapshot.serialize.schema.json"));
+	const response = ajv.compile(schema("observation-get-response.serialize.schema.json"));
+	assert.equal(params({ epoch: "epoch-1", since_revision: 1, wait_ms: 30_000, classes: ["fleet"] }), true);
+	assert.equal(params({ wait_ms: 30_001 }), false);
+	const outcomes = [
+		{ not_modified: { epoch: "epoch-1", revision: 1 } },
+		{ snapshot_expired: { epoch: "epoch-1", revision: 1 } },
+		{ snapshot_too_large: { epoch: "epoch-1", revision: 1, limit_bytes: 524_288 } },
+		{
+			epoch: "epoch-1",
+			revision: 1,
+			snapshot: {
+				epoch: "epoch-1",
+				revision: 1,
+				collected_at: null,
+				sources: [],
+				tasks: null,
+				observation: {
+					inventory: null,
+					source: "pending",
+					registry: "pending",
+					retained: {},
+					containment: {},
+					awaiting_evidence: [],
+					foreground: {},
+				},
+			},
+		},
+	];
+	for (const outcome of outcomes)
+		assert.equal(response(outcome), true, ajv.errorsText(response.errors));
+	const snapshot = outcomes[3].snapshot;
+	assert.equal(snapshotInput(snapshot), true, ajv.errorsText(snapshotInput.errors));
+	assert.equal(snapshotOutput(snapshot), true, ajv.errorsText(snapshotOutput.errors));
+	assert.equal(
+		response({ not_modified: { epoch: "epoch-1", revision: MAX_SAFE_INTEGER + 1 } }),
+		false,
+	);
+	const exported = import.meta.resolve("pi-radar/schema/observation-get-response.serialize.schema.json");
+	assert.deepEqual(
+		JSON.parse(readFileSync(new URL(exported), "utf8")),
+		schema("observation-get-response.serialize.schema.json"),
+	);
+});
