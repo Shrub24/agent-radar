@@ -18,7 +18,7 @@ use crate::bus::{BusSession, BusState, Task};
 use crate::control_plane::containers::Kind;
 use crate::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, LifecycleObservation,
-    Lineage, Pane, TerminalMode,
+    Pane, TerminalMode,
 };
 use crate::observation::{ObservationState, RetentionBasis};
 use crate::registry_observation::{Binding, RegistryView};
@@ -454,7 +454,7 @@ impl FleetTree {
                 .get(workspace_id.as_str())
                 .copied()
                 .or_else(|| workspace_id.is_empty().then_some("unplaced"));
-            let mut agents: Vec<(TreeNode, Option<Lineage>, String)> = Vec::new();
+            let mut agents: Vec<(Nestable, String)> = Vec::new();
 
             for agent in &inventory.agents {
                 if agent.location.workspace_id != *workspace_id {
@@ -477,8 +477,12 @@ impl FleetTree {
                     (None, None)
                 };
                 agents.push((
-                    agent_node(agent, None, pane, foreground, &places),
-                    agent.lineage.clone(),
+                    Nestable {
+                        node: agent_node(agent, None, pane, foreground, &places),
+                        parent: parent_claim(agent),
+                        agent_id: claimed_agent_id(agent),
+                        session: claimed_session(agent),
+                    },
                     agent.location.tab_id.clone(),
                 ));
             }
@@ -493,16 +497,20 @@ impl FleetTree {
                 }
                 let pane = inventory.pane(pane_id);
                 agents.push((
-                    agent_node(
-                        agent,
-                        Some(retained.basis.clone()),
-                        pane,
-                        // A retained row has no live process: it is not shown
-                        // staleness at all, whatever evidence the pane holds.
-                        None,
-                        &places,
-                    ),
-                    agent.lineage.clone(),
+                    Nestable {
+                        node: agent_node(
+                            agent,
+                            Some(retained.basis.clone()),
+                            pane,
+                            // A retained row has no live process: it is not shown
+                            // staleness at all, whatever evidence the pane holds.
+                            None,
+                            &places,
+                        ),
+                        parent: parent_claim(agent),
+                        agent_id: claimed_agent_id(agent),
+                        session: claimed_session(agent),
+                    },
                     agent.location.tab_id.clone(),
                 ));
             }
@@ -909,17 +917,15 @@ fn published_phase(entries: &[String], id: &str) -> Option<String> {
 /// its agents flat beneath the workspace, in original row order.
 ///
 /// Returns the workspace's children and, for each tab row, its tab id and position.
-fn nest_by_window(
-    agents: Vec<(TreeNode, Option<Lineage>, String)>,
-) -> (Vec<TreeNode>, Vec<(String, usize)>) {
-    let mut slots: Vec<Option<(TreeNode, Option<Lineage>)>> = Vec::with_capacity(agents.len());
+fn nest_by_window(agents: Vec<(Nestable, String)>) -> (Vec<TreeNode>, Vec<(String, usize)>) {
+    let mut slots: Vec<Option<Nestable>> = Vec::with_capacity(agents.len());
     let mut windows: Vec<(String, Vec<usize>)> = Vec::new();
-    for (index, (node, lineage, tab)) in agents.into_iter().enumerate() {
+    for (index, (nestable, tab)) in agents.into_iter().enumerate() {
         match windows.iter_mut().find(|(window, _)| *window == tab) {
             Some((_, members)) => members.push(index),
             None => windows.push((tab, vec![index])),
         }
-        slots.push(Some((node, lineage)));
+        slots.push(Some(nestable));
     }
 
     // Each entry: the position of the window's first agent, the tab id when the
@@ -927,7 +933,7 @@ fn nest_by_window(
     let mut placed: Vec<(usize, Option<String>, TreeNode)> = Vec::new();
     for (tab, members) in windows {
         let first = members[0];
-        let group: Vec<(TreeNode, Option<Lineage>)> = members
+        let group: Vec<Nestable> = members
             .iter()
             .map(|&index| slots[index].take().expect("each agent is grouped once"))
             .collect();
@@ -951,38 +957,109 @@ fn nest_by_window(
     (children, tabs)
 }
 
+/// One agent row as nesting needs it: the node itself, what it claims as its
+/// parent, and the identities a child can name it by.
+///
+/// The identities are the registration id Radar's spawn edges are written in and
+/// the session UUID a legacy lineage names. Both are carried because either may be
+/// what another row claims, and a row that is not the one claimed must not be
+/// linked by accident.
+struct Nestable {
+    node: TreeNode,
+    parent: Option<ParentClaim>,
+    agent_id: Option<String>,
+    session: Option<String>,
+}
+
+/// What a row claims as its parent.
+///
+/// A managed child's parent is the daemon's own spawn edge: Radar recorded which
+/// registration launched it, and that edge is the durable relationship. A
+/// registration that publishes a session lineage instead is the older path, used
+/// only when no edge exists — a worker whose parent is a Herdsman worker that
+/// never reported one has no edge and still nests by the session it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ParentClaim {
+    /// The registration this row's spawn edge names as its parent.
+    Edge(String),
+    /// The session UUID this row reports as its parent.
+    Session(String),
+}
+
+/// What a registration claims as its parent, preferring Radar's own edge.
+fn parent_claim(agent: &AgentObservation) -> Option<ParentClaim> {
+    if let Some(parent) = agent
+        .registry
+        .as_ref()
+        .and_then(|view| view.spawn.as_ref())
+        .map(|spawn| spawn.parent.clone())
+    {
+        return Some(ParentClaim::Edge(parent));
+    }
+    agent
+        .lineage
+        .as_ref()
+        .and_then(|lineage| lineage.parent.as_ref())
+        .map(|parent| ParentClaim::Session(parent.as_str().to_string()))
+}
+
+/// The registration id a row is addressed by, when it has one.
+fn claimed_agent_id(agent: &AgentObservation) -> Option<String> {
+    agent
+        .registry
+        .as_ref()
+        .map(|view| view.agent.registration.agent_id.clone())
+}
+
+/// The session UUID a row is addressed by, when it publishes a lineage.
+///
+/// A lineage carries both halves of the join: the session this row *is* and the
+/// parent session it names. A row that publishes no lineage cannot be the owner
+/// another row is looking for, because a session-named parent is only ever named
+/// by a lineage.
+fn claimed_session(agent: &AgentObservation) -> Option<String> {
+    agent
+        .lineage
+        .as_ref()
+        .map(|lineage| lineage.session.as_str().to_string())
+}
+
 /// Nests agent rows under unambiguous owners within the same group and returns the
 /// rest as roots, in original row order.
 ///
-/// A link is used only when exactly one agent in the workspace claims the
-/// parent session UUID and the link is not self-referential; cycles are then
-/// broken by dropping every edge inside the cycle (all members stay visible
-/// as roots, per the spec fallback).
-fn nest(mut agents: Vec<(TreeNode, Option<Lineage>)>) -> Vec<TreeNode> {
+/// A link is used only when exactly one agent in the group is the parent this row
+/// claims — by registration id where a spawn edge names one, otherwise by session
+/// UUID — and the link is not self-referential; cycles are then broken by dropping
+/// every edge inside the cycle (all members stay visible as roots, per the spec
+/// fallback).
+fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
     let count = agents.len();
     if count == 0 {
         return Vec::new();
     }
 
-    // Session UUIDs identify agents uniquely; the map is keyed by their
-    // canonical text so no ordering/hashing derive is needed on the id type.
-    let mut claims: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (index, (_, lineage)) in agents.iter().enumerate() {
-        if let Some(lineage) = lineage {
-            claims
-                .entry(lineage.session.as_str())
-                .or_default()
-                .push(index);
+    // Registration ids and session UUIDs identify agents uniquely; the maps are
+    // keyed by their canonical text so no ordering/hashing derive is needed on
+    // the id types.
+    let mut by_agent_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_session: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, nestable) in agents.iter().enumerate() {
+        if let Some(agent_id) = nestable.agent_id.as_deref() {
+            by_agent_id.entry(agent_id).or_default().push(index);
+        }
+        if let Some(session) = nestable.session.as_deref() {
+            by_session.entry(session).or_default().push(index);
         }
     }
 
     let mut parent: Vec<Option<usize>> = vec![None; count];
-    for (index, (_, lineage)) in agents.iter().enumerate() {
-        let Some(parent_session) = lineage.as_ref().and_then(|lineage| lineage.parent.as_ref())
-        else {
-            continue;
+    for (index, nestable) in agents.iter().enumerate() {
+        let owners = match nestable.parent.as_ref() {
+            Some(ParentClaim::Edge(agent_id)) => by_agent_id.get(agent_id.as_str()),
+            Some(ParentClaim::Session(session)) => by_session.get(session.as_str()),
+            None => None,
         };
-        if let Some(owners) = claims.get(parent_session.as_str())
+        if let Some(owners) = owners
             && owners.len() == 1
             && owners[0] != index
         {
@@ -1000,7 +1077,10 @@ fn nest(mut agents: Vec<(TreeNode, Option<Lineage>)>) -> Vec<TreeNode> {
         }
     }
 
-    let mut slots: Vec<Option<TreeNode>> = agents.drain(..).map(|(node, _)| Some(node)).collect();
+    let mut slots: Vec<Option<TreeNode>> = agents
+        .drain(..)
+        .map(|nestable| Some(nestable.node))
+        .collect();
     fn assemble(
         index: usize,
         slots: &mut [Option<TreeNode>],
@@ -1118,7 +1198,8 @@ mod tests {
     };
     use crate::herdr::decode_snapshot;
     use crate::model::{
-        FleetObservation, Location, RuntimeStatus, SessionIdentity, SessionUuid, Tab, Workspace,
+        FleetObservation, Lineage, Location, RuntimeStatus, SessionIdentity, SessionUuid, Tab,
+        Workspace,
     };
 
     const REAL_SHAPED: &str = include_str!("../tests/fixtures/snapshot_real_shaped.json");
@@ -1336,6 +1417,148 @@ mod tests {
             None
         }
         find(&tree.roots, id).expect("row present")
+    }
+
+    fn pane(pane_id: &str, tab_id: &str) -> Pane {
+        Pane {
+            location: Location {
+                workspace_id: "wA".into(),
+                tab_id: tab_id.into(),
+                pane_id: pane_id.into(),
+            },
+            label: None,
+            title: None,
+            current_path: None,
+        }
+    }
+
+    /// A projected registration: a row joined to `pane`, carrying Radar's spawn
+    /// edge when the daemon launched it as a child.
+    fn registered_agent(
+        agent_id: &str,
+        pane_id: &str,
+        tab_id: &str,
+        spawn_parent: Option<&str>,
+    ) -> AgentObservation {
+        let registry: RegistryView = serde_json::from_value(serde_json::json!({
+            "agent": {
+                "registration": {
+                    "version": 1,
+                    "agent_id": agent_id,
+                    "registered_at": "2026-01-01T00:00:00.000Z",
+                    "source": "herdsman",
+                    "incarnation": "11111111-1111-4111-8111-111111111111",
+                    "location": {
+                        "backend": "tmux",
+                        "instance": "radar",
+                        "workspace": "wA",
+                        "tab": tab_id,
+                        "pane": pane_id
+                    },
+                    "process_claimed": false,
+                    "launch": {"available": false}
+                },
+                "process": {"claimed": false, "verification": "unavailable"},
+                "execution": null,
+                "assignment": null,
+                "facts": null
+            },
+            "binding": "joined",
+            "spawn": spawn_parent.map(|parent| serde_json::json!({
+                "parent": parent,
+                "request_id": "r1",
+                "subject_id": null,
+                "child_source": null,
+                "child_incarnation": null,
+                "state": "bound"
+            })),
+            "managed": null
+        }))
+        .expect("a projected registration fixture");
+        AgentObservation {
+            location: Location {
+                workspace_id: "wA".into(),
+                tab_id: tab_id.into(),
+                pane_id: pane_id.into(),
+            },
+            name: None,
+            label: None,
+            status: Some(RuntimeStatus::Idle),
+            session: None,
+            lineage: None,
+            facts: HerdsmanFacts::default(),
+            registry: Some(registry),
+        }
+    }
+
+    /// One workspace and one window holding two panes, so the only thing that
+    /// decides nesting is what the two rows claim as a parent.
+    fn two_agent_window(agents: Vec<AgentObservation>) -> ObservationState {
+        let mut state = ObservationState::new();
+        state.apply_success(FleetObservation {
+            workspaces: vec![Workspace {
+                workspace_id: "wA".into(),
+                label: Some("work".into()),
+                number: Some(0),
+                session_path: None,
+            }],
+            tabs: vec![Tab {
+                tab_id: "wA:t1".into(),
+                workspace_id: "wA".into(),
+                label: None,
+                number: Some(0),
+            }],
+            panes: vec![pane("wA:p1", "wA:t1"), pane("wA:p2", "wA:t1")],
+            agents,
+            metadata_agents: Vec::new(),
+            containers: Vec::new(),
+            lifecycle_subjects: Vec::new(),
+        });
+        state
+    }
+
+    #[test]
+    fn a_managed_child_nests_under_the_registration_its_spawn_edge_names() {
+        // Neither row publishes a lineage, which is the shape a managed launch
+        // produces: the daemon's own spawn edge is the only parent relationship,
+        // and the child must still nest under the parent it names.
+        let state = two_agent_window(vec![
+            registered_agent("parent-1", "wA:p1", "wA:t1", None),
+            registered_agent("child-1", "wA:p2", "wA:t1", Some("parent-1")),
+        ]);
+        let tree = FleetTree::build(&state);
+
+        let parent = node(&tree, &RowId::Agent("wA:p1".into()));
+        assert_eq!(
+            parent
+                .children
+                .iter()
+                .map(|child| child.row.id.clone())
+                .collect::<Vec<_>>(),
+            vec![RowId::Agent("wA:p2".into())],
+            "the child nests under the parent its edge names"
+        );
+        // One root in the window: the parent's row is the window's tab.
+        assert_eq!(tree.roots[0].children.len(), 1);
+        assert_eq!(
+            tree.roots[0].children[0].row.id,
+            RowId::Agent("wA:p1".into())
+        );
+    }
+
+    #[test]
+    fn a_child_whose_parent_is_not_here_stays_flat() {
+        // The edge names a registration this window does not hold: the child is
+        // its own root rather than being hung on an unrelated row.
+        let state = two_agent_window(vec![
+            registered_agent("parent-1", "wA:p1", "wA:t1", None),
+            registered_agent("child-1", "wA:p2", "wA:t1", Some("parent-gone")),
+        ]);
+        let tree = FleetTree::build(&state);
+
+        let parent = node(&tree, &RowId::Agent("wA:p1".into()));
+        assert!(parent.children.is_empty(), "no invented parent link");
+        assert_eq!(tree.roots[0].children.len(), 2, "both rows stay visible");
     }
 
     #[test]
