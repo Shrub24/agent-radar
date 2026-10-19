@@ -6,6 +6,10 @@ import type {
 	DaemonPingSerialize,
 	LaunchIdentityMarkerSerialize,
 	FactsSnapshotDeserialize,
+	HandoffInboxSerialize,
+	HandoffReceiptSerialize,
+	HandoffPublishParamsDeserialize,
+	HandoffSerialize,
 	ManagedLaunchMetadataDeserialize,
 	SpawnExitObservationSerialize,
 } from "./generated-contracts.ts";
@@ -36,6 +40,7 @@ export const RADAR_SPAWN_CONTRACT = "spawn.v1";
 export const RADAR_SPAWN_CLOSE_CONTRACT = "spawn.close.v1";
 export const RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT = "spawn.launch_context.v1";
 export const RADAR_EVENTS_CONTRACT = "events.v1";
+export const RADAR_COMMUNICATION_CONTRACT = "communication.handoff.v1";
 /** The default audit identity; callers can supply their own requester. */
 export const RADAR_REQUESTER = "pi-radar";
 /** The daemon's own line bound; nothing longer is sent or accepted. */
@@ -162,6 +167,9 @@ export type RadarBackgroundTask = NonNullable<
 	FactsSnapshotDeserialize["background_tasks"]
 >[number];
 export type RadarFactsSnapshot = FactsSnapshotDeserialize;
+export type RadarHandoff = HandoffSerialize;
+export type RadarHandoffInbox = HandoffInboxSerialize;
+export type RadarHandoffReceipt = HandoffReceiptSerialize;
 
 /**
  * The assignment channel's interim fields. `request` is the owner's active
@@ -508,6 +516,46 @@ function numberAt(value: unknown, field: string): number | undefined {
 		: undefined;
 }
 
+function handoffAt(value: unknown): HandoffSerialize | undefined {
+	const version = numberAt(value, "version");
+	const id = stringAt(value, "id");
+	const sender = recordAt(value, "sender");
+	const senderGeneration = numberAt(sender, "execution_generation");
+	const target = stringAt(value, "recipient_subject_id");
+	const summary = stringAt(value, "summary");
+	const content = stringAt(value, "content");
+	const published = numberAt(value, "published_at_unix_ms");
+	const correlation = typeof value === "object" && value !== null
+		? (value as Record<string, unknown>).correlation_id
+		: undefined;
+	if (
+		version !== 1 || !isUuid(id) || !isUuid(stringAt(sender, "agent_id")) ||
+		!isUuid(stringAt(sender, "session_id")) || !isUuid(stringAt(sender, "subject_id")) ||
+		!isUuid(stringAt(sender, "execution_id")) || !Number.isSafeInteger(senderGeneration) ||
+		(senderGeneration ?? 0) < 1 || !isUuid(target) || summary === undefined || content === undefined ||
+		published === undefined || !Number.isSafeInteger(published) || published < 0 ||
+		(correlation !== undefined && correlation !== null &&
+			(typeof correlation !== "string" || correlation.length === 0 ||
+				Buffer.byteLength(correlation, "utf8") > 256 || /\p{Cc}/u.test(correlation)))
+	) return undefined;
+	return value as HandoffSerialize;
+}
+
+function handoffReceiptAt(value: unknown): HandoffReceiptSerialize | undefined {
+	const version = numberAt(value, "version");
+	const handoffId = stringAt(value, "handoff_id");
+	const recipient = recordAt(value, "recipient");
+	const generation = numberAt(recipient, "execution_generation");
+	const received = numberAt(value, "received_at_unix_ms");
+	if (
+		version !== 1 || !isUuid(handoffId) || !isUuid(stringAt(recipient, "agent_id")) ||
+		!isUuid(stringAt(recipient, "session_id")) || !isUuid(stringAt(recipient, "subject_id")) ||
+		!isUuid(stringAt(recipient, "execution_id")) || !Number.isSafeInteger(generation) ||
+		(generation ?? 0) < 1 || received === undefined || !Number.isSafeInteger(received) || received < 0
+	) return undefined;
+	return value as HandoffReceiptSerialize;
+}
+
 /** A writer binding a channel or context reply hands back to its publisher. */
 function writerBinding(value: unknown): RadarWriterBinding | undefined {
 	const handle = stringAt(value, "handle");
@@ -662,6 +710,7 @@ const RADAR_MANAGED_IDENTITY_ENV = new Set([
 	"PI_RADAR_MANAGED_SUBJECT_ID",
 	"PI_RADAR_MANAGED_LAUNCH_ID",
 	"PI_RADAR_MANAGED_EXECUTION_GENERATION",
+	"PI_RADAR_MANAGED_PARENT_SUBJECT_ID",
 ]);
 
 /**
@@ -1015,6 +1064,12 @@ export type RadarClient = {
 	agentGet(agent_id: string): Promise<RadarResult<RadarAgentProcess>>;
 	observe(): Promise<RadarResult<RadarInventory>>;
 	/** Read the durable event journal after `after`, waiting at most `wait_ms`. */
+	communicationPublish(request: HandoffPublishParamsDeserialize & {
+		request_id: string;
+	}): Promise<RadarResult<{ handoff: HandoffSerialize; created: boolean }>>;
+	communicationInbox(request: { agent_id: string }): Promise<RadarResult<HandoffInboxSerialize>>;
+	communicationGet(request: { agent_id: string; handoff_id: string }): Promise<RadarResult<{ handoff: HandoffSerialize; receipt: HandoffReceiptSerialize | null }>>;
+	communicationAck(request: { agent_id: string; handoff_id: string }): Promise<RadarResult<{ receipt: HandoffReceiptSerialize; created: boolean }>>;
 	events(request: {
 		after: number;
 		epoch?: string;
@@ -1664,6 +1719,56 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 						},
 					};
 				return protocol("spawn.close reply carries no close outcome");
+			});
+		},
+		async communicationPublish(request) {
+			return withContract(RADAR_COMMUNICATION_CONTRACT, async () => {
+				const answer = await call("communication.publish", {
+					sender_agent_id: request.sender_agent_id,
+					recipient_subject_id: request.recipient_subject_id,
+					...(request.correlation_id !== undefined ? { correlation_id: request.correlation_id } : {}),
+					summary: request.summary,
+					content: request.content,
+				}, request.request_id);
+				if (answer.ok === false) return answer;
+				const handoff = handoffAt(recordAt(answer.value, "handoff"));
+				const created = recordAt(answer.value, "created");
+				if (handoff === undefined || typeof created !== "boolean")
+					return protocol("communication.publish reply carries no handoff");
+				return { ok: true, value: { handoff, created } };
+			});
+		},
+		async communicationInbox(request) {
+			return withContract(RADAR_COMMUNICATION_CONTRACT, async () => {
+				const answer = await call("communication.inbox", request);
+				if (answer.ok === false) return answer;
+				const handoffIds = recordAt(answer.value, "handoff_ids");
+				if (!Array.isArray(handoffIds) || handoffIds.some((id) => !isUuid(id)))
+					return protocol("communication.inbox reply carries malformed handoff IDs");
+				return { ok: true, value: answer.value as HandoffInboxSerialize };
+			});
+		},
+		async communicationGet(request) {
+			return withContract(RADAR_COMMUNICATION_CONTRACT, async () => {
+				const answer = await call("communication.get", request);
+				if (answer.ok === false) return answer;
+				const handoff = handoffAt(recordAt(answer.value, "handoff"));
+				const receiptValue = recordAt(answer.value, "receipt");
+				const receipt = receiptValue === null ? null : handoffReceiptAt(receiptValue);
+				if (handoff === undefined || (receiptValue !== null && receipt === undefined))
+					return protocol("communication.get reply carries malformed content or receipt");
+				return { ok: true, value: { handoff, receipt: receipt ?? null } };
+			});
+		},
+		async communicationAck(request) {
+			return withContract(RADAR_COMMUNICATION_CONTRACT, async () => {
+				const answer = await call("communication.ack", request);
+				if (answer.ok === false) return answer;
+				const receipt = handoffReceiptAt(recordAt(answer.value, "receipt"));
+				const created = recordAt(answer.value, "created");
+				if (receipt === undefined || typeof created !== "boolean")
+					return protocol("communication.ack reply carries no receipt");
+				return { ok: true, value: { receipt, created } };
 			});
 		},
 		async events(request) {

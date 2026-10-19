@@ -10,6 +10,7 @@
 //! independent trusted-socket methods.
 
 pub mod client;
+pub mod communication;
 pub mod containers;
 pub mod events;
 pub mod ingest;

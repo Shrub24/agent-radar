@@ -135,6 +135,46 @@ test("facts input/output schemas match omitted optionals and exact integer limit
 	assert.equal(input({ context_window: { tokens: 2, window: 1 } }), true);
 });
 
+test("handoff schemas expose stable subject addressing and safe-range timestamps", () => {
+	const handoff = ajv.compile(schema("handoff.serialize.schema.json"));
+	const publishParams = ajv.compile(schema("handoff-publish-params.deserialize.schema.json"));
+	const receipt = ajv.compile(schema("handoff-receipt.serialize.schema.json"));
+	const value = {
+		version: 1,
+		id: "33333333-3333-4333-8333-333333333333",
+		sender: {
+			agent_id: "11111111-1111-4111-8111-111111111111",
+			session_id: "22222222-2222-4222-8222-222222222222",
+			subject_id: "44444444-4444-4444-8444-444444444444",
+			execution_id: "55555555-5555-4555-8555-555555555555",
+			execution_generation: 2,
+		},
+		recipient_subject_id: "66666666-6666-4666-8666-666666666666",
+		correlation_id: "77777777-7777-4777-8777-777777777777",
+		summary: "completed",
+		content: "full handoff payload",
+		published_at_unix_ms: MAX_SAFE_INTEGER,
+	};
+	assert.equal(handoff(value), true, ajv.errorsText(handoff.errors));
+	const params = {
+		sender_agent_id: value.sender.agent_id,
+		recipient_subject_id: value.recipient_subject_id,
+		correlation_id: value.correlation_id,
+		summary: value.summary,
+		content: value.content,
+	};
+	assert.equal(publishParams(params), true, ajv.errorsText(publishParams.errors));
+	assert.equal(publishParams({ ...params, unexpected: true }), false);
+	assert.equal(handoff({ ...value, published_at_unix_ms: MAX_SAFE_INTEGER + 1 }), false);
+	assert.equal(handoff({ ...value, unknown: true }), false);
+	assert.equal(receipt({
+		version: 1,
+		handoff_id: value.id,
+		recipient: value.sender,
+		received_at_unix_ms: MAX_SAFE_INTEGER,
+	}), true, ajv.errorsText(receipt.errors));
+});
+
 test("spawn-exit schemas describe tagged output and optional input fields", () => {
 	const validates = ajv.compile(schema("spawn-exit-observation.serialize.schema.json"));
 	const accepts = ajv.compile(schema("spawn-exit-observation.deserialize.schema.json"));

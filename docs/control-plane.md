@@ -75,7 +75,7 @@ The control socket and the temporary publisher-compatibility socket share one To
 `daemon.ping`, params `{}`:
 
 ```json
-{"protocol":2,"backend":"tmux","instance":"radar","revision":3,"contracts":["registry.v1","registry.facts.v1","events.v1","tasks.list.v1","spawn.v1","spawn.close.v1","spawn.launch_context.v1","spawn.exit_observation.v1","lifecycle.cancel.v1","lifecycle.stop.v1","topology.create.v1","topology.delete.v1","topology.reload.v1","topology.get.v1","topology.list.v1","topology.reconcile.v1","lifecycle.get.v1","lifecycle.list.v1","lifecycle.enroll.v1","lifecycle.restart.v1","lifecycle.abandon.v1","observation.get.v1"]}
+{"protocol":2,"backend":"tmux","instance":"radar","revision":4,"contracts":["registry.v1","registry.facts.v1","events.v1","tasks.list.v1","spawn.v1","spawn.close.v1","spawn.launch_context.v1","spawn.exit_observation.v1","lifecycle.cancel.v1","lifecycle.stop.v1","topology.create.v1","topology.delete.v1","topology.reload.v1","topology.get.v1","topology.list.v1","topology.reconcile.v1","lifecycle.get.v1","lifecycle.list.v1","lifecycle.enroll.v1","lifecycle.restart.v1","lifecycle.abandon.v1","observation.get.v1","communication.handoff.v1"]}
 ```
 
 `backend` is the wired physical backend: `herdr`, `tmux` or `none`, never a placeholder. `instance` names the tmux server for a tmux backend and is null otherwise. `revision` is the wire revision of the daemon's build, which increases whenever a method or field is added; Radar's own clients require at least their own revision and show a blocking diagnostic that names the restart when a daemon that outlived an install is older. `contracts` lists the daemon contracts the backend makes servable, which is what an external consumer pins. The backend's `mux.*` declaration stays inside the daemon and is not on the wire. A contract name your build does not know is tolerated; ignore it.
@@ -104,6 +104,7 @@ Daemon contracts are versioned promises that the daemon serves the methods its i
 | `registry.v1` | — | All `agent.*` methods |
 | `registry.facts.v1` | — | The `facts` channel and the assignment extension on `agent.acquire`/`agent.publish` |
 | `events.v1` | — | `events.read` |
+| `communication.handoff.v1` | — | `communication.publish`, `communication.inbox`, `communication.get`, `communication.ack` |
 | `observation.get.v1` | `mux.observe` | `observation.get`: the daemon's shared observation snapshot |
 | `tasks.list.v1` | task ingest configured | volatile publisher task snapshots via `tasks.list` |
 | `spawn.v1` | `mux.create` + `mux.launch` | `spawn.create` |
@@ -122,11 +123,21 @@ Daemon contracts are versioned promises that the daemon serves the methods its i
 | `lifecycle.abandon.v1` | — | `lifecycle.abandon`: ends one unresolved record's recovery obligation |
 | — | — | `lifecycle.reconcile`: one explicit reconciliation pass (no contract of its own, like the other daemon-owned reads) |
 
-`registry.v1`, `registry.facts.v1` and `events.v1` need no backend and are advertised even for backend `none`. A contract that the daemon cannot serve is never advertised. Bundled Radar clients require their minimum `revision` and show a blocking restart diagnostic when a daemon outlived an install; external consumers check the contracts they need. Unknown contract names are tolerated. An absent required contract or `unknown_method` is the compatibility signal for external consumers.
+`registry.v1`, `registry.facts.v1`, `events.v1` and `communication.handoff.v1` need no backend and are advertised even for backend `none`. A contract that the daemon cannot serve is never advertised. Bundled Radar clients require their minimum `revision` and show a blocking restart diagnostic when a daemon outlived an install; external consumers check the contracts they need. Unknown contract names are tolerated. An absent required contract or `unknown_method` is the compatibility signal for external consumers.
 
 ## Methods
 
 All method-specific parameter objects reject unknown keys unless noted; `daemon.ping`, `mux.request.get` and `mux.request.list` ignore unrecognized parameter keys. Identifiers are nonempty, at most 256 UTF-8 bytes, and contain no control characters. JSON serialization of normalized observation/evidence uses the Rust model's snake_case enums; unknown semantic/status values use `{"other":"value"}`. Durations are integer milliseconds; absent optional facts remain absent/null as defined by the normalized model.
+
+### Durable handoffs
+
+`communication.handoff.v1` is daemon-owned durable payload delivery. `communication.publish` uses the request UUID as the handoff ID and takes `sender_agent_id`, `recipient_subject_id`, optional `correlation_id`, a `summary`, and `content`. The first contract accepts only a managed sender targeting its exact resolved `parent_subject_id`; the daemon refuses root senders and any other target. `pi-radar` derives the sender from the current process registration and the recipient from Radar's injected parent context, so Herdsman callers do not choose either identity. The daemon resolves the sender from a fresh registry context and validates any Radar launch marker against the current durable execution. Retry an uncertain publication with the same request ID and identical content; a different payload under that ID is refused.
+
+`communication.inbox` takes the registered `agent_id` and returns pending `handoff_ids` for its current managed subject; it does not include payloads, keeping the list response small. An unmanaged or unresolved process is refused. Fetch each addressed payload with `communication.get` by ID, including after acknowledgement. `communication.ack` records that the recipient consumer durably captured the payload; it does not attest to understanding or settle the correlated domain work. Persist the retrieved content locally before acknowledging it.
+
+Content is capped at 384 KiB, summaries at 600 characters, pending obligations at 128 per recipient, aggregate storage at 512 records/64 MiB, and acknowledged records are retained for 30 days. Pending records are never age-pruned. Pointer events `communication.handoff_published` and `communication.handoff_acknowledged` carry IDs, not payloads; inbox scans remain the recovery source when a notification is missed.
+
+Radar owns the immutable message and receipt. Herdsman retains authority over completion validity, assignment state and worker lifecycle disposition. Publishing or acknowledging a handoff does not authorize worker closure or assignment settlement.
 
 ### Reads
 
@@ -238,6 +249,10 @@ Result keys: one object takes the method's own noun, a page takes its plural plu
 | `spawn.close` | `close` (`outcome`, `intent`, `pane`, `exit_observation` for `already_exited`) |
 | `events.read` | `epoch`, `events`, `cursor`, `tail`, `more`, `earliest`, or `cursor_expired` |
 | `observation.get` | `epoch`, `revision`, `snapshot`, or `not_modified`/`snapshot_expired`/`snapshot_too_large` |
+| `communication.publish` | `handoff`, `created` |
+| `communication.inbox` | `handoffs` |
+| `communication.get` | `handoff`, `receipt` |
+| `communication.ack` | `receipt`, `created` |
 
 Durable request state, and what each word means:
 

@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::Daemon;
+use agent_radar::control_plane::lifecycle as lifecycle_subjects;
 use agent_radar::control_plane::ops::Operation;
 use agent_radar::control_plane::registry::{MAX_LISTED, MAX_TEXT_BYTES, ProcessVerifier};
 use agent_radar::control_plane::{
@@ -1971,6 +1972,185 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
 }
 
 #[test]
+fn managed_parent_handoff_is_published_received_and_acknowledged() {
+    let sandbox = Sandbox::new("managed-parent-handoff");
+    let state = sandbox.state();
+    let registry = agent_radar::control_plane::registry::Registry::open(&state).expect("registry");
+    let parent_subject = random_uuid();
+    let parent_launch = random_uuid();
+    let parent_session = random_uuid();
+    lifecycle_subjects::create_with_intent(
+        &registry,
+        &parent_launch,
+        lifecycle_subjects::LaunchContext {
+            executable: "pi".into(),
+            argv: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        },
+        Some(parent_session.clone()),
+        Some((parent_subject.clone(), 1)),
+        lifecycle_subjects::ManagedMetadata::default(),
+        now_ms(),
+    )
+    .expect("parent subject");
+
+    let worker_subject = random_uuid();
+    let worker_launch = random_uuid();
+    let worker_session = random_uuid();
+    lifecycle_subjects::create_with_intent(
+        &registry,
+        &worker_launch,
+        lifecycle_subjects::LaunchContext {
+            executable: "pi".into(),
+            argv: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        },
+        Some(worker_session.clone()),
+        Some((worker_subject.clone(), 1)),
+        lifecycle_subjects::ManagedMetadata {
+            parent_subject_id: Some(parent_subject.clone()),
+            ..Default::default()
+        },
+        now_ms(),
+    )
+    .expect("worker subject");
+    drop(registry);
+
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let parent_registration = client.call(
+        "agent.register",
+        registration_body("a3a240cc-8950-4851-ae76-7bd9e0c1a010", None, None),
+    );
+    let parent_agent = agent_id(&parent_registration);
+    let worker_registration = client.call(
+        "agent.register",
+        registration_body("a3a240cc-8950-4851-ae76-7bd9e0c1a011", None, None),
+    );
+    let worker_agent = agent_id(&worker_registration);
+    for (agent, session, subject, launch) in [
+        (
+            parent_agent.as_str(),
+            parent_session.as_str(),
+            parent_subject.as_str(),
+            parent_launch.as_str(),
+        ),
+        (
+            worker_agent.as_str(),
+            worker_session.as_str(),
+            worker_subject.as_str(),
+            worker_launch.as_str(),
+        ),
+    ] {
+        let context = client.call("agent.context", json!({
+            "agent_id": agent,
+            "publisher": {"source":"test", "incarnation":"a3a240cc-8950-4851-ae76-7bd9e0c1a012"},
+            "sequence": 1,
+            "lease_ms": 60_000,
+            "context": {"session": session, "launch_identity": {
+                "version": 1, "subject_id": subject, "launch_id": launch, "execution_generation": 1
+            }},
+        }));
+        assert!(context["result"]["context"].is_object(), "{context}");
+    }
+
+    let handoff_id = random_uuid();
+    let publish = client.call_id(
+        &handoff_id,
+        "communication.publish",
+        json!({
+            "sender_agent_id": worker_agent,
+            "recipient_subject_id": parent_subject,
+            "correlation_id": "herdsman-run-17",
+            "summary": "worker completed",
+            "content": "full immutable handoff",
+        }),
+    );
+    assert_eq!(publish["result"]["created"], true, "{publish}");
+    assert_eq!(
+        publish["result"]["handoff"]["sender"]["execution_generation"],
+        1
+    );
+    let replay = client.call_id(
+        &handoff_id,
+        "communication.publish",
+        json!({
+            "sender_agent_id": worker_agent,
+            "recipient_subject_id": parent_subject,
+            "correlation_id": "herdsman-run-17",
+            "summary": "worker completed",
+            "content": "full immutable handoff",
+        }),
+    );
+    assert_eq!(replay["result"]["created"], false, "{replay}");
+    let wrong_target = client.call_id(
+        &random_uuid(),
+        "communication.publish",
+        json!({
+            "sender_agent_id": worker_agent,
+            "recipient_subject_id": worker_subject,
+            "summary": "worker completed",
+            "content": "must not be routed to self",
+        }),
+    );
+    assert_eq!(wrong_target["error"]["code"], "refused", "{wrong_target}");
+    let inbox = client.call("communication.inbox", json!({"agent_id":parent_agent}));
+    assert_eq!(
+        inbox["result"]["handoff_ids"].as_array().unwrap(),
+        &[json!(handoff_id)]
+    );
+    let retrieved = client.call(
+        "communication.get",
+        json!({"agent_id":parent_agent,"handoff_id":handoff_id}),
+    );
+    assert_eq!(
+        retrieved["result"]["handoff"]["content"],
+        "full immutable handoff"
+    );
+    let ack = client.call(
+        "communication.ack",
+        json!({"agent_id":parent_agent,"handoff_id":handoff_id}),
+    );
+    assert_eq!(ack["result"]["created"], true, "{ack}");
+    let read_after_ack = client.call(
+        "communication.get",
+        json!({"agent_id":parent_agent,"handoff_id":handoff_id}),
+    );
+    assert_eq!(
+        read_after_ack["result"]["handoff"]["content"],
+        "full immutable handoff"
+    );
+    assert!(
+        read_after_ack["result"]["receipt"].is_object(),
+        "{read_after_ack}"
+    );
+    let events = client.call("events.read", json!({"after":0,"limit":100}));
+    let pointers = events["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("communication."))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(pointers.len(), 2, "{events}");
+    assert!(
+        pointers
+            .iter()
+            .all(|event| event["request_id"] == handoff_id)
+    );
+    assert!(
+        !events.to_string().contains("full immutable handoff"),
+        "payload leaked into events: {events}"
+    );
+    daemon.stop();
+}
+
+#[test]
 fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     const SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     const NEXT_SESSION: &str = "e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b";
@@ -2880,9 +3060,10 @@ fn ping_answers_the_revision_and_backend_contracts_without_a_mux() {
             "events.v1",
             "topology.get.v1",
             "topology.list.v1",
-            // Abandonment releases one of the daemon's own records, so a daemon
-            // with no backend still advertises and serves it.
-            "lifecycle.abandon.v1"
+            // Abandonment and observation are daemon-owned and need no mux.
+            "lifecycle.abandon.v1",
+            "observation.get.v1",
+            "communication.handoff.v1"
         ])
     );
     let unsupported = client.call(
@@ -5849,7 +6030,8 @@ fn spawn_refuses_caller_supplied_radar_identity_environment_before_any_effect() 
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
     let mut params = spawn_params(&parent, "/usr/bin/pi", &[]);
     params["request"]["env"] = json!({
-        "PI_RADAR_MANAGED_SUBJECT_ID": "11111111-1111-4111-8111-111111111111"
+        "PI_RADAR_MANAGED_SUBJECT_ID": "11111111-1111-4111-8111-111111111111",
+        "PI_RADAR_MANAGED_PARENT_SUBJECT_ID": "22222222-2222-4222-8222-222222222222"
     });
 
     let refused = client.call_id(&random_uuid(), "spawn.create", params);

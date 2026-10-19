@@ -44,6 +44,14 @@ try {
 	for (const file of [
 		"daemon-ping.serialize.schema.json",
 		"daemon-ping.deserialize.schema.json",
+		"handoff-publish-params.serialize.schema.json",
+		"handoff-publish-params.deserialize.schema.json",
+		"handoff.serialize.schema.json",
+		"handoff.deserialize.schema.json",
+		"handoff-inbox.serialize.schema.json",
+		"handoff-inbox.deserialize.schema.json",
+		"handoff-receipt.serialize.schema.json",
+		"handoff-receipt.deserialize.schema.json",
 		"managed-launch-metadata.serialize.schema.json",
 		"managed-launch-metadata.deserialize.schema.json",
 		"launch-identity-marker.serialize.schema.json",
@@ -61,6 +69,10 @@ try {
 
 	const types = [
 		["daemon-ping.serialize.schema.json", "DaemonPingResult"],
+		["handoff-publish-params.deserialize.schema.json", "HandoffPublishParamsDeserialize"],
+		["handoff-inbox.serialize.schema.json", "HandoffInboxSerialize"],
+		["handoff.serialize.schema.json", "HandoffSerialize"],
+		["handoff-receipt.serialize.schema.json", "HandoffReceiptSerialize"],
 		["managed-launch-metadata.deserialize.schema.json", "ManagedLaunchMetadataDeserialize"],
 		["launch-identity-marker.serialize.schema.json", "LaunchIdentityMarker"],
 		["facts-snapshot.deserialize.schema.json", "FactsSnapshotInput"],

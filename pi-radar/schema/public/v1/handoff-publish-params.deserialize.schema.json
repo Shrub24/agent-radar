@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Inputs for publishing an immutable handoff. The wire request ID carries the\nstable communication identity; the daemon derives the sender execution.",
+  "properties": {
+    "content": {
+      "type": "string"
+    },
+    "correlation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recipient_subject_id": {
+      "type": "string"
+    },
+    "sender_agent_id": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "sender_agent_id",
+    "recipient_subject_id",
+    "summary",
+    "content"
+  ],
+  "title": "handoff-publish-params-deserialize",
+  "type": "object"
+}

@@ -1,0 +1,84 @@
+{
+  "$defs": {
+    "HandoffIdentity": {
+      "additionalProperties": false,
+      "description": "The current managed Pi execution that published or received a handoff.\n`subject_id` is stable across verified successors; `execution_id` and\ngeneration identify the exact execution that took the action.",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "execution_generation": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "execution_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "subject_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id",
+        "session_id",
+        "subject_id",
+        "execution_id",
+        "execution_generation"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Immutable handoff content. The request id is the stable communication id.",
+  "properties": {
+    "content": {
+      "type": "string"
+    },
+    "correlation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "published_at_unix_ms": {
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "recipient_subject_id": {
+      "type": "string"
+    },
+    "sender": {
+      "$ref": "#/$defs/HandoffIdentity"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "id",
+    "sender",
+    "recipient_subject_id",
+    "summary",
+    "content",
+    "published_at_unix_ms"
+  ],
+  "title": "handoff-serialize",
+  "type": "object"
+}

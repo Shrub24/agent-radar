@@ -20,6 +20,70 @@ export interface TaskLaneStatus {
   error: string | null;
 }
 /**
+ * Inputs for publishing an immutable handoff. The wire request ID carries the
+ * stable communication identity; the daemon derives the sender execution.
+ */
+export interface HandoffPublishParamsDeserialize {
+  content: string;
+  correlation_id?: string | null;
+  recipient_subject_id: string;
+  sender_agent_id: string;
+  summary: string;
+}
+/**
+ * A bounded inbox page by stable handoff ID. Payloads are fetched one at a
+ * time with `communication.get`, keeping each response within the wire bound.
+ */
+export interface HandoffInboxSerialize {
+  handoff_ids: string[];
+}
+/**
+ * Immutable handoff content. The request id is the stable communication id.
+ */
+export interface HandoffSerialize {
+  content: string;
+  correlation_id?: string | null;
+  id: string;
+  published_at_unix_ms: number;
+  recipient_subject_id: string;
+  sender: HandoffIdentity;
+  summary: string;
+  version: number;
+}
+/**
+ * The current managed Pi execution that published or received a handoff.
+ * `subject_id` is stable across verified successors; `execution_id` and
+ * generation identify the exact execution that took the action.
+ */
+export interface HandoffIdentity {
+  agent_id: string;
+  execution_generation: number;
+  execution_id: string;
+  session_id: string;
+  subject_id: string;
+}
+/**
+ * Durable recipient-consumer receipt, stored separately from immutable content.
+ */
+export interface HandoffReceiptSerialize {
+  handoff_id: string;
+  received_at_unix_ms: number;
+  recipient: HandoffIdentity;
+  version: number;
+}
+/**
+ * The current managed Pi execution that published or received a handoff.
+ * `subject_id` is stable across verified successors; `execution_id` and
+ * generation identify the exact execution that took the action.
+ */
+export interface HandoffIdentity {
+  agent_id: string;
+  execution_generation: number;
+  execution_id: string;
+  session_id: string;
+  subject_id: string;
+}
+/**
  * Managed owner/parent metadata accepted with a spawn intent. Domain validation
  * and parent-binding checks remain in the daemon handler.
  */

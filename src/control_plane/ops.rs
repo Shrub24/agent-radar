@@ -63,6 +63,8 @@ pub enum Contract {
     LifecycleAbandon,
     #[serde(rename = "observation.get.v1")]
     ObservationGet,
+    #[serde(rename = "communication.handoff.v1")]
+    CommunicationHandoff,
     #[serde(other)]
     Unknown,
 }
@@ -90,6 +92,7 @@ impl Contract {
         Self::LifecycleRestart,
         Self::LifecycleAbandon,
         Self::ObservationGet,
+        Self::CommunicationHandoff,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -116,6 +119,7 @@ impl Contract {
             Self::LifecycleRestart => "lifecycle.restart.v1",
             Self::LifecycleAbandon => "lifecycle.abandon.v1",
             Self::ObservationGet => "observation.get.v1",
+            Self::CommunicationHandoff => "communication.handoff.v1",
             Self::Unknown => "unknown",
         }
     }
@@ -148,7 +152,7 @@ impl Contract {
             Self::LifecycleAbandon => P::NONE,
             // The snapshot is built from the same observation a `mux.observe`
             // read is, so a backend that cannot observe has nothing to publish.
-            Self::ObservationGet => P::OBSERVE,
+            Self::ObservationGet | Self::CommunicationHandoff => P::NONE,
             Self::Unknown => P::NONE,
         }
     }
@@ -158,7 +162,7 @@ impl Contract {
 /// added to the protocol. A bundled client needs a daemon at least this new,
 /// because the two ship together and only a daemon that outlived an install can
 /// be older.
-pub const PROTOCOL_REVISION: u32 = 3;
+pub const PROTOCOL_REVISION: u32 = 4;
 
 /// What the handshake advertises: the daemon contracts the backend's primitive set
 /// can serve, which is the list an external consumer pins. The backend's own
@@ -343,6 +347,8 @@ pub enum Method {
     /// The daemon's shared observation snapshot: one sampler's output for every
     /// reader, revisioned and demand-driven. A read, never recorded.
     Observation,
+    /// Durable handoff publication, retrieval and recipient receipt.
+    Communication,
     /// Volatile task sessions received from extension publishers.
     Tasks,
     /// Registry reads and writes: the daemon's own durable records, answered
@@ -368,6 +374,10 @@ pub fn classify(method: &str) -> Option<Method> {
         "mux.request.list" => Method::Requests,
         "events.read" => Method::Events,
         "observation.get" => Method::Observation,
+        "communication.publish"
+        | "communication.inbox"
+        | "communication.get"
+        | "communication.ack" => Method::Communication,
         "tasks.list" => Method::Tasks,
         "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
         | "agent.get" | "agent.list" => Method::Registry,
@@ -541,6 +551,9 @@ mod tests {
                 // Abandoning writes one durable record: it reads no backend and
                 // dispatches no effect, so a daemon with no backend still serves it.
                 Contract::LifecycleAbandon,
+                Contract::ObservationGet,
+                // Communication records are daemon-owned and need no mux primitive.
+                Contract::CommunicationHandoff,
             ]
         );
     }

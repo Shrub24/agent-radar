@@ -64,9 +64,11 @@ export type LaunchMailbox<State extends LaunchState> = {
  * different leaves the launch unresolved rather than placed.
  */
 
-/** The exact parent this launch may use, and nothing inferred about it. */
+/** The exact managed parent this launch may use, and nothing inferred about it. */
 export type RadarLaunchParent = {
 	agent_id: string;
+	/** Stable subject from this process's current Radar registration. */
+	subject_id: string;
 	location?: RadarLocation;
 };
 
@@ -395,6 +397,10 @@ export async function launchRadarWorker<State extends LaunchState>(
 		return refusedLaunch(
 			"the launch has no exact parent registration to spawn under",
 		);
+	if (!isUuid(launch.parent.subject_id))
+		return refusedLaunch(
+			"the launch has no managed Radar subject for its parent",
+		);
 	// A spawn is created under the pane its parent registered, and this port
 	// registers no location it was not given: without one there is nothing to
 	// place the child beside, and a name or session lookup is not a substitute.
@@ -408,6 +414,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 		parent: launch.parent.agent_id,
 		parent_session_id: launch.parent_session_id,
 		executable: launch.executable,
+		managed: { parent_subject_id: launch.parent.subject_id },
 		argv: launch.argv,
 		...(launch.cwd !== "" ? { cwd: launch.cwd } : {}),
 		...(Object.keys(launch.env).length > 0 ? { env: launch.env } : {}),

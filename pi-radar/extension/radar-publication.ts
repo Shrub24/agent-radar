@@ -1318,6 +1318,8 @@ export type RadarPublication = {
 /** What a process's own registration resolved to, and where it says it is. */
 export type RadarSubject = {
 	agent_id: string;
+	/** Stable managed logical subject, present only for a Radar-issued launch. */
+	subject_id?: string;
 	location?: RadarLocation;
 };
 
@@ -1716,8 +1718,10 @@ function createRadarPublicationInner(
 			const record = await ensureRegistration();
 			if (record === undefined) return undefined;
 			const location = record.registration.location;
+			const subjectId = process.env.PI_RADAR_MANAGED_SUBJECT_ID;
 			return {
 				agent_id: agentId,
+				...(subjectId !== undefined ? { subject_id: subjectId } : {}),
 				...(location !== undefined ? { location } : {}),
 			};
 		},

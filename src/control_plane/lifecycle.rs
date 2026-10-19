@@ -47,6 +47,7 @@ pub const CORRELATION_ENV: &str = "PI_RADAR_LAUNCH_CORRELATION";
 pub const MANAGED_SUBJECT_ENV: &str = "PI_RADAR_MANAGED_SUBJECT_ID";
 pub const MANAGED_LAUNCH_ENV: &str = "PI_RADAR_MANAGED_LAUNCH_ID";
 pub const MANAGED_GENERATION_ENV: &str = "PI_RADAR_MANAGED_EXECUTION_GENERATION";
+pub const MANAGED_PARENT_SUBJECT_ENV: &str = "PI_RADAR_MANAGED_PARENT_SUBJECT_ID";
 
 /// The internal method a bootstrap calls to claim its process.
 pub const BOOTSTRAP_METHOD: &str = "spawn.bootstrap";
@@ -249,6 +250,7 @@ pub struct Ticket {
     /// The exact Radar launch operation that created this execution.
     pub launch_id: String,
     pub execution_generation: u32,
+    pub parent_subject_id: Option<String>,
     pub correlation: String,
 }
 
@@ -438,6 +440,7 @@ pub fn create_with_intent(
         logical_subject_id: subject.logical_subject_id.unwrap_or_default(),
         launch_id: subject.spawn_request_id,
         execution_generation: subject.execution_generation.unwrap_or(1),
+        parent_subject_id: subject.managed.parent_subject_id,
         correlation: subject.correlation.unwrap_or_default(),
     })
 }
@@ -966,6 +969,7 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
                 MANAGED_SUBJECT_ENV,
                 MANAGED_LAUNCH_ENV,
                 MANAGED_GENERATION_ENV,
+                MANAGED_PARENT_SUBJECT_ENV,
                 crate::runtime::LAUNCH_TOKEN_ENV,
             ]
             .contains(&name.as_str())
@@ -1453,6 +1457,12 @@ pub fn wrap(bootstrap: &Bootstrap, ticket: &Ticket, target: LaunchRequest) -> La
         MANAGED_GENERATION_ENV.to_string(),
         ticket.execution_generation.to_string(),
     );
+    if let Some(parent_subject_id) = &ticket.parent_subject_id {
+        env.insert(
+            MANAGED_PARENT_SUBJECT_ENV.to_string(),
+            parent_subject_id.clone(),
+        );
+    }
     LaunchRequest {
         pane_id,
         executable: bootstrap.executable.clone(),
@@ -2146,6 +2156,7 @@ mod tests {
         };
         let first = create_with_intent(&registry, SPAWN, launch(), None, None, metadata.clone(), 1)
             .expect("accepted launch intent");
+        assert_eq!(first.parent_subject_id, metadata.parent_subject_id);
         let persisted = read(&registry, &first.subject_id)
             .expect("read subject")
             .expect("subject");
@@ -2162,6 +2173,7 @@ mod tests {
             2,
         )
         .expect("successor intent");
+        assert_eq!(successor.parent_subject_id, metadata.parent_subject_id);
         assert_eq!(
             read(&registry, &successor.subject_id)
                 .expect("read successor")
@@ -2937,6 +2949,7 @@ mod resume_recipe_tests {
         env.insert(MANAGED_SUBJECT_ENV.to_string(), "logical".to_string());
         env.insert(MANAGED_LAUNCH_ENV.to_string(), "launch".to_string());
         env.insert(MANAGED_GENERATION_ENV.to_string(), "2".to_string());
+        env.insert(MANAGED_PARENT_SUBJECT_ENV.to_string(), "parent".to_string());
         env.insert(
             crate::runtime::LAUNCH_TOKEN_ENV.to_string(),
             "t".to_string(),

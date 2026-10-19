@@ -789,7 +789,10 @@ test("spawn carries validated Radar-owned launch metadata in the durable request
 			parent_session_id: UUID_A,
 			executable: "/nix/store/pi/bin/pi",
 			argv: [],
-			env: { PI_RADAR_MANAGED_SUBJECT_ID: UUID_A },
+			env: {
+				PI_RADAR_MANAGED_SUBJECT_ID: UUID_A,
+				PI_RADAR_MANAGED_PARENT_SUBJECT_ID: UUID_B,
+			},
 		});
 		assert.equal(spoof.ok, false);
 		assert.equal(spoof.ok ? "" : spoof.code, "bad_params");
@@ -1006,6 +1009,45 @@ test("daemon.ping requires protocol 2, revision 3, and registry.v1", async () =>
 	}
 });
 
+test("handoff inbox returns stable IDs and rejects malformed IDs", async () => {
+	let malformed = false;
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, { protocol: 2, revision: 4, contracts: ["communication.handoff.v1"] });
+		return reply(request, { handoff_ids: [malformed ? "not-a-uuid" : UUID_A] });
+	});
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		const valid = await client.communicationInbox({ agent_id: UUID_A });
+		assert.equal(valid.ok, true, JSON.stringify(valid));
+		assert.deepEqual(valid.ok ? valid.value.handoff_ids : undefined, [UUID_A]);
+		malformed = true;
+		const invalid = await client.communicationInbox({ agent_id: UUID_A });
+		assert.equal(invalid.ok, false);
+		assert.equal(invalid.ok ? "" : invalid.code, "protocol");
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("handoff contract absence disables only handoff calls on a revision-three daemon", async () => {
+	const fixture = makeFixture((request) =>
+		reply(request, { protocol: 2, revision: 3, contracts: ["registry.v1"] }),
+	);
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		assert.equal((await client.ping()).ok, true);
+		const result = await client.communicationInbox({ agent_id: UUID_A });
+		assert.equal(result.ok, false);
+		assert.equal(result.ok ? "" : result.code, "unsupported");
+		assert.ok(fixture.requests.every(({ method }) => method === "daemon.ping"));
+	} finally {
+		cleanup(fixture);
+	}
+});
+
 test("daemon.ping rejects malformed contract lists", async () => {
 	const fixture = makeFixture((request) =>
 		reply(request, { protocol: 2, revision: 1, contracts: ["registry.v1", 7] }),
@@ -1031,6 +1073,7 @@ test("every repository daemon.ping fixture is understood unchanged", async () =>
 		"spawn.v1",
 		"spawn.close.v1",
 		"spawn.launch_context.v1",
+		"communication.handoff.v1",
 	])
 		assert.ok(seen.has(contract), `the repository fixtures cover ${contract}`);
 	for (const expected of answers) {

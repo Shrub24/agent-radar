@@ -39,6 +39,7 @@ function runtime(_label: string): RadarRuntimeHandle {
 	} as unknown as RadarRuntimeServices["publication"];
 	const services: RadarRuntimeServices = {
 		publication,
+		communication: {} as RadarRuntimeServices["communication"],
 		execution: {
 			publication,
 			binding: () => undefined,
