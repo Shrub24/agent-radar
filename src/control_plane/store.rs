@@ -112,7 +112,8 @@ pub struct Event {
     pub lifecycle_event_id: Option<String>,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
+    #[serde(alias = "agent_id")]
+    pub registration_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -532,7 +533,7 @@ impl Store {
             return Err("event kind must be nonempty bounded text".into());
         }
         for identifier in [
-            &event.agent_id,
+            &event.registration_id,
             &event.spawn,
             &event.request_id,
             &event.subject_id,
@@ -1264,7 +1265,7 @@ mod tests {
                     lifecycle_event_id: None,
                     seq: 0,
                     kind: format!("k{n}"),
-                    agent_id: Some("agent".into()),
+                    registration_id: Some("agent".into()),
                     spawn: None,
                     request_id: None,
                     at: "now".into(),
@@ -1289,7 +1290,7 @@ mod tests {
                 lifecycle_event_id: None,
                 seq: 0,
                 kind: "publication".into(),
-                agent_id: Some("a".into()),
+                registration_id: Some("a".into()),
                 spawn: None,
                 request_id: None,
                 at: "later".into(),
@@ -1318,7 +1319,7 @@ mod tests {
                                 lifecycle_event_id: None,
                                 seq: 0,
                                 kind: "concurrent".into(),
-                                agent_id: Some(format!("{worker}-{item}")),
+                                registration_id: Some(format!("{worker}-{item}")),
                                 spawn: None,
                                 request_id: None,
                                 at: "now".into(),

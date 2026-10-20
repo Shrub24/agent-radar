@@ -42,6 +42,14 @@ function spawnExitObservations() {
 	});
 }
 
+test("presence answers expose only the public registration and claim receipt", () => {
+	const answer = schema("presence-answer.serialize.schema.json");
+	assert.deepEqual(answer.required, ["registration_id", "claim_id", "standing"]);
+	assert.deepEqual(Object.keys(answer.properties).sort(), [
+		"claim_id", "registration_id", "standing", "subject_id",
+	]);
+});
+
 test("the npm export exposes the portable daemon schema", () => {
 	const exported = import.meta.resolve("pi-radar/schema/daemon-ping.serialize.schema.json");
 	assert.deepEqual(JSON.parse(readFileSync(new URL(exported), "utf8")), schema("daemon-ping.serialize.schema.json"));
@@ -120,7 +128,7 @@ test("handoff schemas expose stable subject addressing and safe-range timestamps
 		version: 1,
 		id: "33333333-3333-4333-8333-333333333333",
 		sender: {
-			agent_id: "11111111-1111-4111-8111-111111111111",
+			registration_id: "11111111-1111-4111-8111-111111111111",
 			session_id: "22222222-2222-4222-8222-222222222222",
 			subject_id: "44444444-4444-4444-8444-444444444444",
 			execution_id: "55555555-5555-4555-8555-555555555555",
@@ -134,7 +142,7 @@ test("handoff schemas expose stable subject addressing and safe-range timestamps
 	};
 	assert.equal(handoff(value), true, ajv.errorsText(handoff.errors));
 	const params = {
-		sender_agent_id: value.sender.agent_id,
+		sender_registration_id: value.sender.registration_id,
 		recipient_subject_id: value.recipient_subject_id,
 		correlation_id: value.correlation_id,
 		summary: value.summary,

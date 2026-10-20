@@ -1028,7 +1028,7 @@ pub trait LifecycleControls: Send + Sync {
     fn enroll_agent(
         &self,
         _request_id: &str,
-        _agent_id: &str,
+        _registration_id: &str,
         _session: &str,
         _cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
@@ -1349,11 +1349,11 @@ impl LifecycleControls for DaemonRuntime {
     fn enroll_agent(
         &self,
         request_id: &str,
-        agent_id: &str,
+        registration_id: &str,
         session: &str,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
-        self.enroll_registered(request_id, agent_id, session, cancel)
+        self.enroll_registered(request_id, registration_id, session, cancel)
     }
 
     fn abandon_record(
@@ -1387,7 +1387,7 @@ impl DaemonRuntime {
     fn enroll_registered(
         &self,
         request_id: &str,
-        agent_id: &str,
+        registration_id: &str,
         session: &str,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String> {
@@ -1401,7 +1401,7 @@ impl DaemonRuntime {
             &self.socket,
             request_id,
             "lifecycle.enroll",
-            json!({"request": {"agent_id": agent_id, "session": session}, "requester": REQUESTER}),
+            json!({"request": {"registration_id": registration_id, "session": session}, "requester": REQUESTER}),
             cancel,
         )
         .map_err(|failure| failure.message)?;

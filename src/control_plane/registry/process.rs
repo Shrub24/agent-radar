@@ -105,12 +105,12 @@ impl Registry {
     /// runs independently of all registry transitions.
     pub fn verify_process(
         &self,
-        agent_id: &str,
+        registration_id: &str,
         verifier: &dyn ProcessVerifier,
     ) -> Result<ProcessVerification, String> {
         let registration = self
-            .get(agent_id)?
-            .ok_or_else(|| format!("agent {agent_id} is not registered"))?;
+            .get(registration_id)?
+            .ok_or_else(|| format!("agent {registration_id} is not registered"))?;
         Ok(verify_registration(&registration, verifier))
     }
 }

@@ -303,8 +303,9 @@ impl RegistrationRequest {
 #[serde(deny_unknown_fields)]
 pub struct Registration {
     pub version: u32,
-    /// The daemon-issued agent-record UUID and durable key.
-    pub agent_id: String,
+    /// The daemon-issued process-registration UUID and durable key.
+    #[serde(alias = "agent_id")]
+    pub registration_id: String,
     pub registered_at: String,
     pub request: RegistrationRequest,
 }
@@ -316,7 +317,7 @@ impl Registration {
     pub fn public(&self) -> PublicRegistration {
         PublicRegistration {
             version: self.version,
-            agent_id: self.agent_id.clone(),
+            registration_id: self.registration_id.clone(),
             registered_at: self.registered_at.clone(),
             source: self.request.source.clone(),
             incarnation: self.request.incarnation.clone(),
@@ -344,7 +345,7 @@ impl Registration {
 #[serde(deny_unknown_fields)]
 pub struct PublicRegistration {
     pub version: u32,
-    pub agent_id: String,
+    pub registration_id: String,
     pub registered_at: String,
     pub source: String,
     pub incarnation: String,
@@ -391,6 +392,7 @@ pub struct Registry {
     /// One local lock serializes all registry transitions; this is not a
     /// cross-process/distributed lock. The state root has one owning daemon.
     admission: Mutex<()>,
+    pub(crate) presence: Mutex<()>,
     journal: std::sync::Mutex<Option<crate::control_plane::store::Store>>,
     pub(crate) observing: Mutex<std::collections::HashSet<String>>,
     pub(crate) events: std::sync::Arc<Mutex<crate::control_plane::events::Log>>,
@@ -402,6 +404,8 @@ pub mod child_close;
 /// The mutable current-session context lives beside the channels; the details
 /// live in [`context`].
 pub mod context;
+/// Presence and durable session-load decisions.
+pub mod presence;
 /// Injectable local process birth-identity verification.
 pub mod process;
 /// Publication channels live alongside the registry; the details live in
@@ -476,6 +480,7 @@ impl Registry {
             served_since_ms: now_ms,
             serving_epoch: random_uuid(),
             admission: Mutex::new(()),
+            presence: Mutex::new(()),
             journal: std::sync::Mutex::new(None),
             observing: Mutex::new(std::collections::HashSet::new()),
             events: crate::control_plane::events::shared(&root.join("events"))?,
@@ -495,7 +500,7 @@ impl Registry {
     pub(crate) fn append_event(
         &self,
         kind: &str,
-        agent_id: Option<&str>,
+        registration_id: Option<&str>,
         spawn: Option<&str>,
         request_id: Option<&str>,
     ) {
@@ -512,7 +517,7 @@ impl Registry {
                 lifecycle_event_id: None,
                 seq: 0,
                 kind: kind.to_string(),
-                agent_id: agent_id.map(str::to_string),
+                registration_id: registration_id.map(str::to_string),
                 spawn: spawn.map(str::to_string),
                 request_id: request_id.map(str::to_string),
                 at: crate::control_plane::store::now(),
@@ -665,7 +670,7 @@ impl Registry {
         self.served_since_ms
     }
 
-    /// Explicitly acquire a writer on a target channel. The target's `agent_id`
+    /// Explicitly acquire a writer on a target channel. The target's `registration_id`
     /// remains unchanged across replacement; the opaque returned handle fences
     /// channel mutations. The publisher is an identity recorded as provenance,
     /// not a second agent registration: a publisher restart is a new incarnation
@@ -681,31 +686,31 @@ impl Registry {
     /// Read one channel record, if it exists.
     pub fn channel(
         &self,
-        agent_id: &str,
+        registration_id: &str,
         channel: Channel,
     ) -> Result<Option<ChannelRecord>, String> {
-        publication::channel(self, agent_id, channel)
+        publication::channel(self, registration_id, channel)
     }
 
     /// Read the source-labelled public channel projection.
     pub fn published(
         &self,
-        agent_id: &str,
+        registration_id: &str,
         channel: Channel,
         now_ms: i64,
     ) -> Result<Option<PublicChannel>, String> {
-        publication::published(self, agent_id, channel, now_ms)
+        publication::published(self, registration_id, channel, now_ms)
     }
 
     /// Read a channel for a reader that is not its writer: same facts, no
     /// fencing handle.
     pub fn published_facts(
         &self,
-        agent_id: &str,
+        registration_id: &str,
         channel: Channel,
         now_ms: i64,
     ) -> Result<Option<PublicChannelFacts>, String> {
-        publication::published_facts(self, agent_id, channel, now_ms)
+        publication::published_facts(self, registration_id, channel, now_ms)
     }
 
     /// Replace one channel's complete snapshot under its writer handle.
@@ -716,12 +721,12 @@ impl Registry {
     /// Retire one channel writer without deleting its last snapshot.
     pub fn retire(
         &self,
-        agent_id: &str,
+        registration_id: &str,
         channel: Channel,
         writer_handle: &str,
         now_ms: i64,
     ) -> Result<ChannelRecord, String> {
-        publication::retire(self, agent_id, channel, writer_handle, now_ms)
+        publication::retire(self, registration_id, channel, writer_handle, now_ms)
     }
 
     /// Publish one agent record's current session, binding a first writer or
@@ -737,17 +742,21 @@ impl Registry {
     /// Retire this agent's context writer without retracting its last report.
     pub fn retire_context(
         &self,
-        agent_id: &str,
+        registration_id: &str,
         writer_handle: &str,
         now_ms: i64,
     ) -> Result<SessionContext, String> {
-        context::retire(self, agent_id, writer_handle, now_ms)
+        context::retire(self, registration_id, writer_handle, now_ms)
     }
 
     /// Read one agent record's current session as a client sees it, or `None`
     /// when this agent has never published one.
-    pub fn context(&self, agent_id: &str, now_ms: i64) -> Result<Option<PublicContext>, String> {
-        context::published(self, agent_id, now_ms)
+    pub fn context(
+        &self,
+        registration_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<PublicContext>, String> {
+        context::published(self, registration_id, now_ms)
     }
 
     pub(crate) fn transition(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -757,19 +766,23 @@ impl Registry {
     }
 
     /// Reads one registration.
-    pub fn get(&self, agent_id: &str) -> Result<Option<Registration>, String> {
-        validate_agent_id(agent_id)?;
-        let path = self.path(agent_id);
+    pub fn get(&self, registration_id: &str) -> Result<Option<Registration>, String> {
+        validate_registration_id(registration_id)?;
+        let path = self.path(registration_id);
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("agent record {}: {error}", path.display())),
             Ok(_) => {}
         }
         let bytes = read_record_file(&path, MAX_REGISTRATION_BYTES)?;
-        let registration = decode(&bytes).map_err(|error| format!("agent {agent_id}: {error}"))?;
-        if registration.agent_id != agent_id {
+        let mut registration: Registration =
+            decode(&bytes).map_err(|error| format!("agent {registration_id}: {error}"))?;
+        if let Some(claim) = presence::current(self, registration_id)? {
+            registration.request.location = claim.location;
+        }
+        if registration.registration_id != registration_id {
             return Err(format!(
-                "agent {agent_id}: record id does not match its filename"
+                "agent {registration_id}: record id does not match its filename"
             ));
         }
         Ok(Some(registration))
@@ -805,12 +818,12 @@ impl Registry {
         limit: usize,
     ) -> Result<Vec<Registration>, String> {
         if let Some(after) = after {
-            validate_agent_id(after)?;
+            validate_registration_id(after)?;
         }
         let records = self.all()?;
         Ok(records
             .into_iter()
-            .filter(|record| after.is_none_or(|cursor| record.agent_id.as_str() > cursor))
+            .filter(|record| after.is_none_or(|cursor| record.registration_id.as_str() > cursor))
             .take(limit)
             .collect())
     }
@@ -854,18 +867,23 @@ impl Registry {
         }
         let registration = Registration {
             version: REGISTRATION_VERSION,
-            agent_id: random_uuid(),
+            registration_id: random_uuid(),
             registered_at: format_millis(now_ms),
             request: request.clone(),
         };
         self.create(&registration)?;
         if let Err(error) =
-            spawn::bind_presented_token(self, request, &registration.agent_id, now_ms)
+            spawn::bind_presented_token(self, request, &registration.registration_id, now_ms)
         {
-            let _ = fs::remove_file(self.path(&registration.agent_id));
+            let _ = fs::remove_file(self.path(&registration.registration_id));
             return Err(error);
         }
-        self.append_event("agent.registered", Some(&registration.agent_id), None, None);
+        self.append_event(
+            "agent.registered",
+            Some(&registration.registration_id),
+            None,
+            None,
+        );
         Ok(registration)
     }
 
@@ -887,7 +905,7 @@ impl Registry {
             let bytes = read_record_file(&path, MAX_REGISTRATION_BYTES)?;
             let registration =
                 decode(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
-            if registration.agent_id
+            if registration.registration_id
                 != entry
                     .file_name()
                     .to_string_lossy()
@@ -900,7 +918,7 @@ impl Registry {
             }
             registrations.push(registration);
         }
-        registrations.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        registrations.sort_by(|left, right| left.registration_id.cmp(&right.registration_id));
         Ok(registrations)
     }
 
@@ -918,12 +936,14 @@ impl Registry {
     /// Writes a new registration exactly once. An agent id is minted here, so a
     /// second write of the same id is a broken invariant rather than a retry.
     fn create(&self, registration: &Registration) -> Result<(), String> {
-        validate_agent_id(&registration.agent_id)?;
+        validate_registration_id(&registration.registration_id)?;
         let bytes = serialize(registration)?;
-        let temporary =
-            self.directory
-                .join(format!(".{}.tmp-{}", registration.agent_id, random_uuid()));
-        let final_path = self.path(&registration.agent_id);
+        let temporary = self.directory.join(format!(
+            ".{}.tmp-{}",
+            registration.registration_id,
+            random_uuid()
+        ));
+        let final_path = self.path(&registration.registration_id);
         let result = (|| -> std::io::Result<()> {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -938,22 +958,25 @@ impl Registry {
         if let Err(error) = result {
             let _ = fs::remove_file(&temporary);
             if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Err(format!("agent {} already exists", registration.agent_id));
+                return Err(format!(
+                    "agent {} already exists",
+                    registration.registration_id
+                ));
             }
-            return Err(format!("agent {}: {error}", registration.agent_id));
+            return Err(format!("agent {}: {error}", registration.registration_id));
         }
         Ok(())
     }
 
-    fn path(&self, agent_id: &str) -> PathBuf {
-        self.directory.join(format!("{agent_id}.json"))
+    fn path(&self, registration_id: &str) -> PathBuf {
+        self.directory.join(format!("{registration_id}.json"))
     }
 }
 
 /// An agent id is a file name, so it has to be canonical before it can name one.
 /// This rejects separators and traversal before any path is formed or read.
-fn validate_agent_id(agent_id: &str) -> Result<(), String> {
-    if SessionUuid::parse(agent_id).is_none() {
+pub(crate) fn validate_registration_id(registration_id: &str) -> Result<(), String> {
+    if SessionUuid::parse(registration_id).is_none() {
         return Err("agent id must be a canonical UUID".to_string());
     }
     Ok(())
@@ -998,11 +1021,11 @@ fn absolute_path(field: &str, value: &str) -> Result<(), String> {
 /// Encodes one registration, bounded.
 fn serialize(registration: &Registration) -> Result<Vec<u8>, String> {
     let bytes = serde_json::to_vec_pretty(registration)
-        .map_err(|error| format!("agent {}: {error}", registration.agent_id))?;
+        .map_err(|error| format!("agent {}: {error}", registration.registration_id))?;
     if bytes.len() > MAX_REGISTRATION_BYTES {
         return Err(format!(
             "agent {} exceeds {MAX_REGISTRATION_BYTES} bytes",
-            registration.agent_id
+            registration.registration_id
         ));
     }
     Ok(bytes)
@@ -1359,7 +1382,7 @@ mod tests {
     fn a_registration_of_another_version_is_not_read_as_this_one() {
         let registration = Registration {
             version: 2,
-            agent_id: random_uuid(),
+            registration_id: random_uuid(),
             registered_at: format_millis(1_000),
             request: request(),
         };

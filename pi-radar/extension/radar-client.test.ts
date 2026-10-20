@@ -843,7 +843,7 @@ test("agent.get decodes each process verdict exactly as the daemon names it", as
 				value: { claimed: true, verification },
 			});
 			const read = fixture.requests.find((request) => request.method === "agent.get");
-			assert.deepEqual(read.params, { agent_id: UUID_A });
+			assert.deepEqual(read.params, { registration_id: UUID_A });
 		} finally { cleanup(fixture); }
 	}
 });
@@ -889,7 +889,7 @@ test("agent.get reports the current session only while its context is fresh", as
 						agent: {
 							registration: {},
 							process: { claimed: true, verification: "verified" },
-							context: { version: 1, agent_id: UUID_A, context },
+							context: { version: 1, registration_id: UUID_A, context },
 						},
 					}),
 		);
@@ -1019,11 +1019,11 @@ test("handoff inbox returns stable IDs and rejects malformed IDs", async () => {
 	try {
 		await listen(fixture);
 		const client = fixture.client();
-		const valid = await client.communicationInbox({ agent_id: UUID_A });
+		const valid = await client.communicationInbox({ registration_id: UUID_A });
 		assert.equal(valid.ok, true, JSON.stringify(valid));
 		assert.deepEqual(valid.ok ? valid.value.handoff_ids : undefined, [UUID_A]);
 		malformed = true;
-		const invalid = await client.communicationInbox({ agent_id: UUID_A });
+		const invalid = await client.communicationInbox({ registration_id: UUID_A });
 		assert.equal(invalid.ok, false);
 		assert.equal(invalid.ok ? "" : invalid.code, "protocol");
 	} finally {
@@ -1039,7 +1039,7 @@ test("handoff contract absence disables only handoff calls on a revision-three d
 		await listen(fixture);
 		const client = fixture.client();
 		assert.equal((await client.ping()).ok, true);
-		const result = await client.communicationInbox({ agent_id: UUID_A });
+		const result = await client.communicationInbox({ registration_id: UUID_A });
 		assert.equal(result.ok, false);
 		assert.equal(result.ok ? "" : result.code, "unsupported");
 		assert.ok(fixture.requests.every(({ method }) => method === "daemon.ping"));
@@ -1125,7 +1125,7 @@ test("failed registry negotiation is retried on the same client", async () => {
 				? undefined
 				: reply(request, { protocol: 2, revision: 1, contracts: ["registry.v1"] });
 		}
-		return reply(request, { registration: { agent_id: UUID_A } });
+		return reply(request, { registration: { registration_id: UUID_A } });
 	});
 	try {
 		await listen(fixture);
@@ -1135,7 +1135,7 @@ test("failed registry negotiation is retried on the same client", async () => {
 		assert.equal(first.ok ? "" : first.code, "timeout");
 		assert.equal((await client.ping()).ok, true);
 		const recovered = await client.register({ source: "herdsman-pi", incarnation: UUID_A });
-		assert.deepEqual(recovered, { ok: true, value: { agent_id: UUID_A } });
+		assert.deepEqual(recovered, { ok: true, value: { registration_id: UUID_A } });
 		assert.equal(negotiations, 3);
 	} finally {
 		cleanup(fixture);
@@ -1150,14 +1150,14 @@ test("facts and assignment writes require the facts contract before dispatch", a
 		await listen(fixture);
 		const client = fixture.client();
 		const facts = await client.publish({
-			agent_id: UUID_A,
+			registration_id: UUID_A,
 			channel: "facts",
 			writer_handle: FIXTURE_WRITER,
 			sequence: 1,
 			snapshot: { model: "model" },
 		});
 		const assignment = await client.acquire({
-			agent_id: UUID_A,
+			registration_id: UUID_A,
 			channel: "assignment",
 			publisher: { source: "pi-radar", incarnation: UUID_A },
 		});
@@ -1187,7 +1187,7 @@ test("facts publication requires registry.facts.v1 and preserves typed fields", 
 	try {
 		await listen(fixture);
 		const result = await fixture.client().publish({
-			agent_id: UUID_A,
+			registration_id: UUID_A,
 			channel: "facts",
 			writer_handle: FIXTURE_WRITER,
 			sequence: 1,
@@ -1212,7 +1212,7 @@ test("facts publication rejects legacy text and invalid token ranges before dial
 			{ context_window: { tokens: 201, window: 200 } },
 		]) {
 			const result = await client.publish({
-				agent_id: UUID_A,
+				registration_id: UUID_A,
 				channel: "facts",
 				writer_handle: FIXTURE_WRITER,
 				sequence: 1,
@@ -1339,13 +1339,55 @@ test("unsupported daemons are never sent registry methods", async () => {
 	}
 });
 
+test("presence and exact release use the flat claim contract and require a release acknowledgement", async () => {
+	const fixture = makeFixture((request) => {
+		switch (request.method) {
+			case "daemon.ping":
+				return reply(request, { protocol: 2, revision: 1, contracts: ["registry.v1"] });
+			case "agent.presence":
+				return reply(request, {
+					registration_id: UUID_A, claim_id: UUID_B,
+					standing: "granted", subject_id: UUID_A,
+				});
+			case "agent.release":
+				return reply(request, {
+					registration_id: UUID_A, claim_id: UUID_B, standing: "released",
+				});
+			default:
+				return reply(request, {});
+		}
+	});
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		const process = { boot_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", pid: 42, start_ticks: 99 };
+		const presence = await client.presence({
+			source: "herdsman-pi", incarnation: UUID_B, process,
+			session_id: UUID_A, claim_id: UUID_B,
+		});
+		assert.deepEqual(presence, {
+			ok: true,
+			value: { registration_id: UUID_A, claim_id: UUID_B, standing: "granted", subject_id: UUID_A },
+		});
+		const released = await client.releasePresence({
+			registration_id: UUID_A, claim_id: UUID_B, process,
+		});
+		assert.equal(released.ok && released.value.standing, "released");
+		assert.deepEqual(fixture.requests.map(({ method }) => method), [
+			"daemon.ping", "agent.presence", "agent.release",
+		]);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
 test("registry calls put only the contract's own fields on the wire", async () => {
 	const fixture = makeFixture((request) => {
 		switch (request.method) {
 			case "daemon.ping":
 				return reply(request, { protocol: 2, revision: 1, contracts: ["registry.v1"] });
 			case "agent.register":
-				return reply(request, { registration: { agent_id: UUID_A } });
+				return reply(request, { registration: { registration_id: UUID_A } });
 			case "agent.acquire":
 				return reply(request, {
 					writer: {
@@ -1375,10 +1417,10 @@ test("registry calls put only the contract's own fields on the wire", async () =
 			location: { backend: "tmux", pane: "%1" },
 			process: { boot_id: "boot", pid: 42, start_ticks: 99 },
 		});
-		assert.deepEqual(registered, { ok: true, value: { agent_id: UUID_A } });
+		assert.deepEqual(registered, { ok: true, value: { registration_id: UUID_A } });
 
 		const acquired = await client.acquire({
-			agent_id: UUID_A,
+			registration_id: UUID_A,
 			channel: "execution",
 			publisher: {
 				source: "herdsman-pi",
@@ -1390,7 +1432,7 @@ test("registry calls put only the contract's own fields on the wire", async () =
 		assert.equal(acquired.ok ? acquired.value.handle : "", UUID_B);
 
 		const published = await client.publish({
-			agent_id: UUID_A,
+			registration_id: UUID_A,
 			channel: "execution",
 			writer_handle: UUID_B,
 			sequence: 0,
@@ -1398,7 +1440,7 @@ test("registry calls put only the contract's own fields on the wire", async () =
 		});
 		assert.deepEqual(published, { ok: true, value: { sequence: 7 } });
 		await client.retire({
-			agent_id: UUID_A,
+			registration_id: UUID_A,
 			channel: "execution",
 			writer_handle: UUID_B,
 		});
@@ -1435,7 +1477,7 @@ test("registry calls put only the contract's own fields on the wire", async () =
 				[
 					"agent.acquire",
 					{
-						agent_id: UUID_A,
+						registration_id: UUID_A,
 						channel: "execution",
 						publisher: {
 							source: "herdsman-pi",
@@ -1447,7 +1489,7 @@ test("registry calls put only the contract's own fields on the wire", async () =
 				[
 					"agent.publish",
 					{
-						agent_id: UUID_A,
+						registration_id: UUID_A,
 						channel: "execution",
 						writer_handle: UUID_B,
 						sequence: 0,
@@ -1457,7 +1499,7 @@ test("registry calls put only the contract's own fields on the wire", async () =
 				[
 					"agent.retire",
 					{
-						agent_id: UUID_A,
+						registration_id: UUID_A,
 						channel: "execution",
 						writer_handle: UUID_B,
 					},
@@ -1473,7 +1515,7 @@ test("an ambivalent registration reply is not a registration", async () => {
 	const fixture = makeFixture((request) =>
 		request.method === "daemon.ping"
 			? reply(request, { protocol: 2, revision: 1, contracts: ["registry.v1"] })
-			: reply(request, { registration: { agent_id: "not-a-uuid" } }),
+			: reply(request, { registration: { registration_id: "not-a-uuid" } }),
 	);
 	try {
 		await listen(fixture);
@@ -1508,7 +1550,7 @@ test("the context answer reports Radar's standing on the session when it names o
 				generation: 1,
 				sequence: request.params.sequence,
 			},
-			context: { version: 1, agent_id: UUID_A },
+			context: { version: 1, registration_id: UUID_A },
 			warning: null,
 			management,
 		});
@@ -1518,7 +1560,7 @@ test("the context answer reports Radar's standing on the session when it names o
 		const client = fixture.client();
 		const publish = (sequence: number, session: string) =>
 			client.context({
-				agent_id: UUID_A,
+				registration_id: UUID_A,
 				publisher: { source: "herdsman-pi", incarnation: UUID_A },
 				sequence,
 				context: { session },
@@ -1551,7 +1593,7 @@ test("the context channel carries only the session and keeps the returned bindin
 						generation: 1,
 						sequence: request.params.sequence,
 					},
-					context: { version: 1, agent_id: UUID_A },
+					context: { version: 1, registration_id: UUID_A },
 					warning: null,
 				}),
 	);
@@ -1559,7 +1601,7 @@ test("the context channel carries only the session and keeps the returned bindin
 		await listen(fixture);
 		const client = fixture.client();
 		const first = await client.context({
-			agent_id: UUID_A,
+			registration_id: UUID_A,
 			publisher: { source: "herdsman-pi", incarnation: UUID_A },
 			sequence: 1,
 			lease_ms: 30_000,
@@ -1588,7 +1630,7 @@ test("the context channel carries only the session and keeps the returned bindin
 		// Once issued, the writer is presented again: a session switch is a newer
 		// sequence under the same binding, never another subject.
 		const second = await client.context({
-			agent_id: UUID_A,
+			registration_id: UUID_A,
 			publisher: { source: "herdsman-pi", incarnation: UUID_A },
 			writer_handle: FIXTURE_WRITER,
 			sequence: 2,
@@ -1661,7 +1703,7 @@ test("the canonical daemon contract fixture round-trips through this client", as
 		);
 		assert.deepEqual(await client.register(registration), {
 			ok: true,
-			value: { agent_id: "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22" },
+			value: { registration_id: "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22" },
 		});
 
 		const acquire = byMethod("agent.acquire");

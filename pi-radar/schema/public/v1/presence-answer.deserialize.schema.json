@@ -1,0 +1,40 @@
+{
+  "$defs": {
+    "Standing": {
+      "enum": [
+        "pending",
+        "granted",
+        "duplicate",
+        "released"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The small public receipt; session/location context stays inside Radar.",
+  "properties": {
+    "claim_id": {
+      "type": "string"
+    },
+    "registration_id": {
+      "type": "string"
+    },
+    "standing": {
+      "$ref": "#/$defs/Standing"
+    },
+    "subject_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "registration_id",
+    "claim_id",
+    "standing"
+  ],
+  "title": "presence-answer-deserialize",
+  "type": "object"
+}

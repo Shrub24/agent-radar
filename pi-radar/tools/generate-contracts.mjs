@@ -42,6 +42,12 @@ try {
 	);
 
 	for (const file of [
+	"presence-report.serialize.schema.json",
+	"presence-report.deserialize.schema.json",
+	"presence-answer.serialize.schema.json",
+	"presence-answer.deserialize.schema.json",
+	"presence-release.serialize.schema.json",
+	"presence-release.deserialize.schema.json",
 		"daemon-ping.serialize.schema.json",
 		"daemon-ping.deserialize.schema.json",
 		"handoff-publish-params.serialize.schema.json",
@@ -72,6 +78,9 @@ try {
 	}
 
 	const types = [
+	["presence-report.deserialize.schema.json", "PresenceReport"],
+	["presence-answer.serialize.schema.json", "PresenceAnswer"],
+	["presence-release.deserialize.schema.json", "PresenceRelease"],
 		["daemon-ping.serialize.schema.json", "DaemonPingResult"],
 		["handoff-publish-params.deserialize.schema.json", "HandoffPublishParamsDeserialize"],
 		["handoff-inbox.serialize.schema.json", "HandoffInboxSerialize"],
@@ -85,7 +94,18 @@ try {
 	];
 	let declarations = "// Generated from the checked-in Rust-derived JSON Schemas. Do not edit.\n\n";
 	for (const [file, typeName] of types) {
-		const schema = JSON.parse(readFileSync(join(temporarySchemas, file), "utf8"));
+		let schema = JSON.parse(readFileSync(join(temporarySchemas, file), "utf8"));
+		// Presence DTOs share internal definition names with observation; namespace
+		// their generated declarations rather than accidentally merging interfaces.
+		if (file.startsWith("presence-")) {
+			for (const name of Object.keys(schema.$defs ?? {})) {
+				const qualified = `${typeName}${name}`;
+				schema.$defs[qualified] = schema.$defs[name];
+				delete schema.$defs[name];
+				if (schema.$defs[qualified].title) schema.$defs[qualified].title = qualified;
+				schema = JSON.parse(JSON.stringify(schema).replaceAll(`\"#/$defs/${name}\"`, `\"#/$defs/${qualified}\"`));
+			}
+		}
 		declarations += await compile(schema, typeName, {
 			bannerComment: "",
 			style: { singleQuote: false, bracketSpacing: false },

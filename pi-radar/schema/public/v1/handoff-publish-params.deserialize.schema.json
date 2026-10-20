@@ -15,7 +15,7 @@
     "recipient_subject_id": {
       "type": "string"
     },
-    "sender_agent_id": {
+    "sender_registration_id": {
       "type": "string"
     },
     "summary": {
@@ -23,7 +23,7 @@
     }
   },
   "required": [
-    "sender_agent_id",
+    "sender_registration_id",
     "recipient_subject_id",
     "summary",
     "content"

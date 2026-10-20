@@ -57,12 +57,15 @@ function harness(
 			contracts: ["registry.v1", "registry.facts.v1"],
 			tasks: { available: false, error: null },
 		}),
-		register: async (params) => {
-			calls.push({ method: "agent.register", params });
-			minted += 1;
-			return ok({
-				agent_id: `00000000-0000-4000-8000-${String(minted).padStart(12, "0")}`,
-			});
+		presence: async (params) => {
+			calls.push({ method: "agent.presence", params });
+			return ok({ registration_id: "00000000-0000-4000-8000-000000000001",
+				claim_id: params.claim_id, session_id: params.session_id, standing: "granted",
+				subject_id: params.session_id });
+		},
+		releasePresence: async (params) => {
+			calls.push({ method: "agent.release", params });
+			return ok({ ...params, standing: "released" });
 		},
 		acquire: async (params) => {
 			calls.push({ method: "agent.acquire", params });
@@ -120,9 +123,7 @@ function harness(
 			slot: options.slot ?? createRadarProcessSlot(),
 			incarnation: INCARNATION,
 			questionnaireEvent: "rpiv:ask-user:blocked",
-			// Present and undefined: this platform reports no process claim, and
-			// absence is never inferred from a later successful read.
-			birth: undefined,
+			birth: { boot_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", pid: 123, start_ticks: 42 },
 			scheduler: options.scheduler ?? frozenScheduler,
 			...(options.managed
 				? {
@@ -142,14 +143,17 @@ function harness(
 			.map((call) => call.params.snapshot);
 	const contexts = () =>
 		calls
-			.filter((call) => call.method === "agent.context")
+			.filter((call) => call.method === "agent.presence")
 			.map((call) => call.params);
-	const emit = (
+	const emit = async (
 		name: string,
 		event: unknown = {},
 		context: unknown = {},
-	): void => {
-		for (const handler of [...(handlers.get(name) ?? [])]) handler(event, context);
+	): Promise<void> => {
+		if (name === "session_start" && !(context as any).sessionManager) {
+			context = { ...(context as object), sessionManager: { getSessionId: () => "11111111-2222-4333-8444-555555555555" } };
+		}
+		await Promise.all([...(handlers.get(name) ?? [])].map(handler => handler(event, context)));
 	};
 	return {
 		adapter,
@@ -175,12 +179,11 @@ test("a subject is registered before anything is published about it", async () =
 		h.emit("session_start", {}, { isIdle: () => true });
 		await h.settled();
 		assert.deepEqual(h.snapshots(), [{ activity: "idle" }]);
-		// The immutable registration carries the subject and nothing else: no Pi
-		// session, no pane, no task text, and no claim this platform cannot make.
-		assert.deepEqual(h.calls[0], {
-			method: "agent.register",
-			params: { source: "herdsman-pi", incarnation: INCARNATION },
-		});
+		assert.equal(h.calls[0].method, "agent.presence");
+		assert.equal(h.calls[0].params.incarnation, INCARNATION);
+		assert.equal(h.calls[0].params.process.pid, 123);
+		assert.equal(h.calls[0].params.session_id, "11111111-2222-4333-8444-555555555555");
+		assert.match(h.calls[0].params.claim_id, /^[0-9a-f-]{36}$/);
 		assert.equal(h.calls.findIndex((call) => call.method === "agent.acquire"), 1);
 	} finally {
 		h.stop();
@@ -359,19 +362,14 @@ test("a managed child registers its binding and hands the subject to its owner",
 		assert.equal(h.adapter.binding(), undefined);
 		h.emit("session_start", {}, { isIdle: () => true });
 		await h.settled();
-		assert.deepEqual(h.calls[0], {
-			method: "agent.register",
-			params: {
-				source: "herdsman-pi",
-				incarnation: INCARNATION,
-				owner: "owner-1",
-				run: "run-1",
-				label: "worker",
-			},
-		});
+		const report = h.calls[0];
+		assert.equal(report.method, "agent.presence");
+		assert.equal(report.params.owner, "owner-1");
+		assert.equal(report.params.run, "run-1");
+		assert.equal(report.params.label, "worker");
 		assert.deepEqual(h.adapter.binding(), {
 			version: 1,
-			agent_id: "00000000-0000-4000-8000-000000000001",
+			registration_id: "00000000-0000-4000-8000-000000000001",
 			incarnation: INCARNATION,
 			run: "run-1",
 			owner: "owner-1",
@@ -423,49 +421,7 @@ test("session facts are one complete snapshot, republished only when they change
 	}
 });
 
-test("the current session is published as a mutable fact of the same subject", async () => {
-	const h = harness();
-	const session = (id: string, idle: boolean) => ({
-		isIdle: () => idle,
-		sessionManager: { getSessionId: () => id },
-	});
-	const SESSION_A = "11111111-2222-4333-8444-555555555555";
-	const SESSION_B = "66666666-7777-4888-8999-aaaaaaaaaaaa";
-	try {
-		h.emit("session_start", {}, session(SESSION_A, true));
-		await h.settled();
-		const [first] = h.contexts();
-		// A first publish binds the writer and carries the session alone.
-		assert.equal("writer_handle" in first, false);
-		assert.deepEqual(first.context, { session: SESSION_A });
-		assert.equal(first.sequence, 1);
-		assert.deepEqual(first.publisher, {
-			source: "herdsman-pi",
-			incarnation: INCARNATION,
-		});
-		assert.equal(
-			first.agent_id,
-			h.calls.find((call) => call.method === "agent.publish")!.params.agent_id,
-		);
-
-		// A replaced session is a newer sequence under the same subject, never a
-		// second registration.
-		h.emit("session_shutdown");
-		h.emit("session_start", {}, session(SESSION_B, false));
-		await h.settled();
-		assert.equal(
-			h.calls.filter((call) => call.method === "agent.register").length,
-			1,
-		);
-		const [, switched] = h.contexts();
-		assert.match(switched.writer_handle, /^[0-9a-f]{8}-[0-9a-f]{4}-/);
-		assert.equal(switched.sequence, 2);
-		assert.deepEqual(switched.context, { session: SESSION_B });
-		assert.equal(switched.agent_id, first.agent_id);
-	} finally {
-		h.stop();
-	}
-});
+;
 
 test("a session Pi cannot name is left unreported", async () => {
 	const h = harness();
@@ -479,7 +435,7 @@ test("a session Pi cannot name is left unreported", async () => {
 		);
 		await h.settled();
 		assert.deepEqual(h.contexts(), []);
-		assert.equal(h.snapshots().length, 1);
+		assert.equal(h.snapshots().length, 0);
 	} finally {
 		h.stop();
 	}
@@ -507,13 +463,18 @@ test("a replaced session is never renewed as the one it replaced", async () => {
 	try {
 		h.emit("session_start", {}, session(FIRST));
 		await h.settled();
-		h.emit("session_shutdown");
+		await h.emit("session_shutdown");
+		assert.equal(
+			h.calls.find(call => call.method === "agent.release")?.params.claim_id,
+			h.contexts()[0].claim_id,
+		);
 		now += 60_000;
 		h.emit("session_start", {}, session(SECOND));
 		await h.settled();
 		const contexts = h.contexts();
 		assert.equal(contexts.length, 2);
-		assert.deepEqual(contexts[1].context, { session: SECOND });
+		assert.equal(contexts[1].session_id, SECOND);
+		assert.notEqual(contexts[1].claim_id, contexts[0].claim_id);
 	} finally {
 		h.stop();
 	}
@@ -527,7 +488,7 @@ test("a session can be replaced or ended without ending this process", async () 
 		assert.deepEqual(h.snapshots(), [{ activity: "idle" }]);
 
 		// The session ends: this session's facts stop advancing with its timers.
-		h.emit("session_shutdown");
+		await h.emit("session_shutdown");
 		h.emit("agent_start");
 		await h.settled();
 		assert.equal(h.snapshots().length, 1);
@@ -537,10 +498,7 @@ test("a session can be replaced or ended without ending this process", async () 
 		h.emit("session_start", {}, { isIdle: () => false });
 		await h.settled();
 		assert.deepEqual(h.snapshots().slice(1), [{ activity: "working" }]);
-		assert.equal(
-			h.calls.filter((call) => call.method === "agent.register").length,
-			1,
-		);
+		assert.equal(new Set(h.calls.filter(call => call.method === "agent.publish").map(call => call.params.registration_id)).size, 1);
 
 		// Explicit disposal silences the adapter for good.
 		h.adapter.stop();
@@ -572,15 +530,8 @@ test("a reloaded adapter reuses the process's one publisher", async () => {
 			// binding: the reload neither re-registers nor re-acquires the channel,
 			// and the sequence continues where the process left it.
 			assert.deepEqual(second.calls, []);
-			assert.deepEqual(
-				first.calls.map((call) => [call.method, call.params.sequence]),
-				[
-					["agent.register", undefined],
-					["agent.acquire", undefined],
-					["agent.publish", 1],
-					["agent.publish", 2],
-				],
-			);
+			assert.deepEqual(first.calls.filter(call => call.method === "agent.publish").map(call => call.params.sequence), [1, 2]);
+			assert.notEqual(first.contexts()[0].claim_id, first.contexts().at(-1).claim_id);
 			assert.deepEqual(first.snapshots(), [
 				{ activity: "idle" },
 				{ activity: "working" },

@@ -183,7 +183,7 @@ pub fn observe_pane(
     now_ms: i64,
 ) -> Result<bool, String> {
     let subject = read_recorded(registry, subject_id)?;
-    if terminal(&subject) || subject.bound_agent_id.is_none() {
+    if terminal(&subject) || subject.bound_registration_id.is_none() {
         return Ok(terminal(&subject));
     }
     let at = crate::control_plane::store::format_millis(now_ms);
@@ -197,7 +197,7 @@ pub fn observe_pane(
     if terminal(&current) {
         return Ok(true);
     }
-    if current.bound_agent_id.is_none() {
+    if current.bound_registration_id.is_none() {
         return Ok(false);
     }
     match evidence {

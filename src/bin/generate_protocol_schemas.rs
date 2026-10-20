@@ -154,6 +154,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     fs::create_dir_all(&output)?;
     write_pair::<PingResult>(&output, "daemon-ping")?;
+    write_pair::<agent_radar::control_plane::registry::presence::Report>(
+        &output,
+        "presence-report",
+    )?;
+    write_pair::<agent_radar::control_plane::registry::presence::Answer>(
+        &output,
+        "presence-answer",
+    )?;
+    write_pair::<agent_radar::control_plane::registry::presence::Release>(
+        &output,
+        "presence-release",
+    )?;
     write_pair::<HandoffPublishParams>(&output, "handoff-publish-params")?;
     write_pair::<HandoffInbox>(&output, "handoff-inbox")?;
     write_pair::<Handoff>(&output, "handoff")?;

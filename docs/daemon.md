@@ -62,7 +62,7 @@ Spawn accepts optional absolute cwd and an environment overlay, requiring the
 unrepresentable values before creation. Public operation readbacks omit
 environment values. The child captures/removes the private
 `PI_RADAR_SPAWN_TOKEN` and registers with it; new bindings persist the returned
-`agent_id`. Read `result.spawn.bound.agent_id` from flat `spawn.get` and use that
+`registration_id`. Read `result.spawn.bound.registration_id` from flat `spawn.get` and use that
 exact ID with `agent.get`, not aliases or a nonexistent `spawn.edge` object.
 Legacy bindings may omit the ID. New v2 edges retain process and session parent
 identities; v1 edges have no inferred session parent. Current v2 topology also
@@ -97,13 +97,7 @@ created pane is not a bound child until that child registers with the private
 spawn token, and private launch/resume specifications stored on registrations
 remain inert unless explicitly used by a supported operation.
 
-A managed Pi session is enrolled by the daemon, not by an operator or the dashboard.
-An eligible registration is one published by the Pi session baseline (`herdsman-pi`),
-carrying no spawn token, whose claimed process is the verified live occupant of a
-pane it reports, with a fresh session. The daemon adopts it as a lead; `lifecycle.enroll`
-repeats the same answer for the same session and refuses a session another live process
-holds. Each registration is attempted once per daemon run after its context is fresh,
-so a refusal is recorded rather than retried in a loop; a daemon restart reconsiders it. A bound launch
+A Pi session's managed subject is resolved through `agent.presence`, not an operator enrollment. The report carries the process birth identity, current session, fresh-load `claim_id`, and current location; Radar verifies the process and pane, then returns `granted`, `duplicate` or `pending`, plus `subject_id` only on a grant. Reconnect and heartbeat reuse the claim; only a fresh `session_start` creates a new claim. Duplicate decisions stay rejected across incumbent exit and daemon restart. Graceful `session_shutdown` releases that exact claim without deleting its process registration or session subject. The TUI's `E` action reports claim standing and cannot create another identity path. A bound launch
 whose recorded pane stops being reported ends externally after a bounded
 confirmation window, with `pane_lost` evidence; that is not a verified process
 exit, which remains the only thing that sets `exited_at`. Recovery of unresolved
@@ -213,7 +207,9 @@ processes running as the same user. Do not expose this socket remotely.
 | Durable lifecycle events | `events.read` | `events.v1` |
 | Volatile task snapshot | `tasks.list` | `tasks.list.v1` |
 | Shared observation snapshot | `observation.get` | `observation.get.v1` |
-| Register a subject | `agent.register` | `registry.v1` |
+| Report Pi process/session presence | `agent.presence` | `registry.v1` |
+| Release a Pi session claim | `agent.release` | `registry.v1` |
+| Register a generic publisher | `agent.register` | `registry.v1` |
 | Acquire or explicitly replace a channel writer | `agent.acquire` | `registry.v1` |
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `registry.v1` |
 | Session facts and assignment extension | `agent.acquire`, `agent.publish` on channel `facts`, or extended assignment fields | `registry.v1`; negotiate `registry.facts.v1` |
@@ -239,7 +235,7 @@ synthesize an equivalent operation with terminal input.
 1. **Register the subject.** Supply immutable identity/configuration, optional
    location and process birth identity, and optional private launch information.
    Preserve the registration content for identical reconnect retries. The
-   returned `agent_id` identifies this record, not a session or pane.
+   returned `registration_id` identifies this record, not a session or pane.
 2. **Acquire a writer.** Choose `execution` or `assignment` and provide the
    publisher's source/incarnation and, for an owner projection, reporting owner.
    Preserve the returned binding and sequence. The publisher is separate from
@@ -389,7 +385,7 @@ The first port can be small:
   protocol 2 and the `spawn.v1` contract, plus `spawn.launch_context.v1` when
   supplying cwd/environment. The backend's `mux.*` primitives are internal to
   the daemon and are not part of client preflight. Capture/remove the token in
-  the child and use the returned bound `agent_id` for subsequent registry reads.
+  the child and use the returned bound `registration_id` for subsequent registry reads.
   Binding is not application or assignment readiness. The server states which contracts it serves; the method
   names themselves are not advertised, so attempt `spawn.create` once after
   those checks. An `unknown_method` response means this daemon does not implement

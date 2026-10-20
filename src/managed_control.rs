@@ -45,7 +45,7 @@ pub struct Control {
 /// What the operator saw and confirmed for an enrollment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Enrollment {
-    pub agent_id: String,
+    pub registration_id: String,
     pub session: String,
 }
 
@@ -92,7 +92,7 @@ fn execute(
     let primary = match (dispatched.operation, dispatched.enrollment.as_ref()) {
         (Operation::Enroll, Some(enrollment)) => controls.enroll_agent(
             &dispatched.request_id,
-            &enrollment.agent_id,
+            &enrollment.registration_id,
             &enrollment.session,
             cancel,
         ),
@@ -299,14 +299,14 @@ mod tests {
         fn enroll_agent(
             &self,
             request_id: &str,
-            agent_id: &str,
+            registration_id: &str,
             session: &str,
             _: &AtomicBool,
         ) -> Result<LifecycleAnswer, String> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("enroll:{request_id}:{agent_id}:{session}"));
+                .push(format!("enroll:{request_id}:{registration_id}:{session}"));
             Ok(Self::answer("completed"))
         }
     }
@@ -326,7 +326,7 @@ mod tests {
             child_close: None,
             close_request_id: None,
             enrollment: Some(Enrollment {
-                agent_id: "agent-1".into(),
+                registration_id: "agent-1".into(),
                 session: "11111111-1111-4111-8111-111111111111".into(),
             }),
         };

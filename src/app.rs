@@ -394,9 +394,8 @@ pub enum Operation {
     DeleteContainer,
     /// Run the selected pane container’s recorded recipe again in its own slot.
     ReloadContainer,
-    /// Make the selected registered lead a lifecycle subject, so it can be
-    /// stopped and restarted.
-    EnrollAgent,
+    /// Show Radar's current Pi session-presence standing.
+    PresenceStatus,
 }
 
 impl Operation {
@@ -707,8 +706,6 @@ pub struct Confirmation {
     /// The container this confirmation acts on, when it is a container control:
     /// the daemon revalidates that exact record before it changes anything.
     pub container_id: Option<String>,
-    /// The registration and session an enrollment confirmed.
-    pub enrollment: Option<crate::managed_control::Enrollment>,
 }
 
 /// A confirmed action ready to run: direct unmanaged close, daemon lifecycle
@@ -726,12 +723,6 @@ pub enum Confirmed {
     },
     /// A container control, dispatched to the daemon under its own request id.
     Container(crate::topology::Control),
-    /// An enrollment of a registered lead, under its own request id.
-    Enroll {
-        request_id: String,
-        agent_id: String,
-        session: String,
-    },
 }
 
 /// One lifecycle outcome, kept visible until it is dismissed.
@@ -1732,8 +1723,8 @@ impl App {
             // confirmed, because an addition cannot take anything away.
             KeyCode::Char('A') => return Some(Action::NewWorkspace),
             // `L` launches the configured managed agent in a new tab or pane.
-            // `E` makes a registered lead restartable and stoppable.
-            KeyCode::Char('E') => return Some(Action::BeginAction(Operation::EnrollAgent)),
+            // `E` reports Radar's automatic Pi presence standing.
+            KeyCode::Char('E') => return Some(Action::BeginAction(Operation::PresenceStatus)),
             KeyCode::Char('L') => return Some(Action::LaunchConfigured),
             KeyCode::Char('D') => return Some(Action::BeginAction(Operation::DeleteContainer)),
             KeyCode::Char('R') => return Some(Action::BeginAction(Operation::ReloadContainer)),
@@ -1904,7 +1895,9 @@ impl App {
                 let described = match &target_id {
                     RowId::Workspace(workspace_id) => format!("workspace {workspace_id}"),
                     RowId::Agent(pane_id) | RowId::Pane(pane_id) => format!("pane {pane_id}"),
-                    RowId::Registered(agent_id) => format!("unresolved agent {agent_id}"),
+                    RowId::Registered(registration_id) => {
+                        format!("unresolved agent {registration_id}")
+                    }
                     RowId::Task(_) => unreachable!("a task is looked up through its owner row"),
                     RowId::Lifecycle(subject_id) => format!("lifecycle subject {subject_id}"),
                 };
@@ -1927,8 +1920,8 @@ impl App {
             self.begin_container(operation, state);
             return;
         }
-        if operation == Operation::EnrollAgent {
-            self.begin_enrollment(state);
+        if operation == Operation::PresenceStatus {
+            self.show_presence_status(state);
             return;
         }
         let Some(selected) = self.selected_action() else {
@@ -2004,7 +1997,7 @@ impl App {
             | Operation::ReloadContainer => {
                 unreachable!("a container control returned above")
             }
-            Operation::EnrollAgent => unreachable!("an enrollment returned above"),
+            Operation::PresenceStatus => unreachable!("presence status returned above"),
         };
         match containment_of(inventory, state, &target) {
             Containment::Managed if !matches!(operation, Operation::ClosePane) => {
@@ -2040,61 +2033,35 @@ impl App {
     /// The lead must be joined to its pane, have a fresh session identity from its
     /// registration, and not already be a lifecycle subject. The daemon verifies
     /// the live process again before it records anything.
-    fn begin_enrollment(&mut self, state: &ObservationState) {
+    fn show_presence_status(&mut self, _state: &ObservationState) {
         let Some(row) = self.selected_row() else {
             self.set_focus_message(Some("nothing selected: no action target".to_string()));
             return;
         };
         let RowKind::Agent(agent) = &row.node.row.kind else {
-            self.set_focus_message(Some("only a registered lead can be enrolled".to_string()));
+            self.set_focus_message(Some("only a Pi session can be managed".to_string()));
             return;
         };
-        let Some(view) = agent.registry.as_ref().filter(|_| agent.joined()) else {
-            self.set_focus_message(Some(
-                "this agent is not registered and joined to its pane".to_string(),
-            ));
-            return;
+        let standing = agent
+            .registry
+            .as_ref()
+            .and_then(|view| view.agent.claim_standing.as_ref());
+        let message = match standing {
+            Some(crate::control_plane::registry::presence::Standing::Granted) => {
+                "this Pi session already has a Radar subject"
+            }
+            Some(crate::control_plane::registry::presence::Standing::Duplicate) => {
+                "this session claim was rejected; reload or resume from its last live state"
+            }
+            Some(crate::control_plane::registry::presence::Standing::Pending) => {
+                "Radar is still verifying this session claim"
+            }
+            Some(crate::control_plane::registry::presence::Standing::Released) => {
+                "this session claim was released; reload or resume to claim it again"
+            }
+            None => "Radar adopts Pi sessions through presence; waiting for the next report",
         };
-        if view.managed.is_some() {
-            self.set_focus_message(Some(
-                "this agent is already a lifecycle subject".to_string(),
-            ));
-            return;
-        }
-        let Some(session) = agent.session_uuid.clone() else {
-            self.set_focus_message(Some(
-                "this agent publishes no fresh session: nothing to enroll".to_string(),
-            ));
-            return;
-        };
-        if !matches!(state.source_freshness(), SourceFreshness::Current) {
-            self.set_focus_message(Some("the fleet is stale: not acting".to_string()));
-            return;
-        }
-        let Some(inventory) = state.inventory() else {
-            self.set_focus_message(Some("no current inventory: not acting".to_string()));
-            return;
-        };
-        let target = CloseTarget::Pane(agent.pane_id.clone());
-        let identity = lifecycle::identity(inventory, &target);
-        let mut losses = agent_losses(agent);
-        losses.push(format!(
-            "session {session} becomes restartable and stoppable by Radar"
-        ));
-        losses.push("nothing is signalled or relaunched now".to_string());
-        self.confirmation = Some(Confirmation {
-            operation: Operation::EnrollAgent,
-            target,
-            identity,
-            losses,
-            confirm_selected: false,
-            subject: None,
-            container_id: None,
-            enrollment: Some(crate::managed_control::Enrollment {
-                agent_id: view.agent.registration.agent_id.clone(),
-                session,
-            }),
-        });
+        self.set_focus_message(Some(message.to_string()));
     }
 
     fn open_subject(
@@ -2113,7 +2080,6 @@ impl App {
             confirm_selected: false,
             subject: Some(subject),
             container_id: None,
-            enrollment: None,
         });
     }
 
@@ -2137,7 +2103,6 @@ impl App {
             confirm_selected: false,
             subject: None,
             container_id: None,
-            enrollment: None,
         });
     }
 
@@ -2386,7 +2351,6 @@ impl App {
             confirm_selected: false,
             subject: None,
             container_id: Some(container.container_id),
-            enrollment: None,
         });
     }
 
@@ -2481,42 +2445,6 @@ impl App {
         Some(Confirmed::Container(control))
     }
 
-    /// Revalidates an enrollment: the same registration must still be joined to the
-    /// same pane with the same fresh session, and still not be a subject.
-    fn confirm_enrollment(
-        &mut self,
-        confirmation: &Confirmation,
-        enrollment: crate::managed_control::Enrollment,
-        state: &ObservationState,
-    ) -> Option<Confirmed> {
-        let described = confirmation.target.description();
-        if !matches!(state.source_freshness(), SourceFreshness::Current) {
-            self.set_focus_message(Some("the fleet is stale: nothing was sent".to_string()));
-            return None;
-        }
-        let inventory = state.inventory()?;
-        let still = inventory.agents.iter().any(|agent| {
-            agent.registry.as_ref().is_some_and(|view| {
-                view.agent.registration.agent_id == enrollment.agent_id
-                    && view.managed.is_none()
-                    && view
-                        .agent
-                        .current_session_uuid()
-                        .map(|uuid| uuid.as_str().to_owned())
-                        == Some(enrollment.session.clone())
-            })
-        });
-        if !still || !lifecycle::matches(inventory, &confirmation.identity) {
-            self.set_focus_message(Some(format!("{described} changed: nothing was sent")));
-            return None;
-        }
-        Some(Confirmed::Enroll {
-            request_id: crate::control_plane::random_uuid(),
-            agent_id: enrollment.agent_id,
-            session: enrollment.session,
-        })
-    }
-
     /// Revalidates an open confirmation against the latest current observation
     /// and hands back the frozen action when it still holds. A stale source,
     /// disappeared target or changed containment cancels it with a reason.
@@ -2524,9 +2452,6 @@ impl App {
         let confirmation = self.confirmation.take()?;
         if confirmation.operation.is_container() {
             return self.confirm_container(confirmation, state);
-        }
-        if let Some(enrollment) = confirmation.enrollment.clone() {
-            return self.confirm_enrollment(&confirmation, enrollment, state);
         }
         let described = confirmation.target.description();
         if !matches!(state.source_freshness(), SourceFreshness::Current) {
@@ -3466,12 +3391,12 @@ mod tests {
             .to_string();
         // Publisher task snapshots join by fresh registry context, not by the
         // legacy lineage fact in this Herdr-shaped fixture.
-        let agent_id = "task-owner";
+        let registration_id = "task-owner";
         let mut registry_agent: crate::registry_observation::RegistryAgent =
             serde_json::from_value(serde_json::json!({
                 "registration": {
                     "version": 1,
-                    "agent_id": agent_id,
+                    "registration_id": registration_id,
                     "registered_at": "2026-01-01T00:00:00Z",
                     "source": "herdsman",
                     "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -3490,7 +3415,7 @@ mod tests {
         registry_agent.context = Some(
             serde_json::from_value(serde_json::json!({
                 "version": 1,
-                "agent_id": agent_id,
+                "registration_id": registration_id,
                 "writer": {
                     "source":"herdsman",
                     "incarnation":"22222222-2222-4222-8222-222222222222",
@@ -4109,7 +4034,7 @@ mod tests {
     fn direct(confirmed: Confirmed) -> CloseRequest {
         match confirmed {
             Confirmed::Direct(request) => request,
-            Confirmed::Subject { .. } | Confirmed::Container(_) | Confirmed::Enroll { .. } => {
+            Confirmed::Subject { .. } | Confirmed::Container(_) => {
                 panic!("expected a direct close")
             }
         }
@@ -4553,23 +4478,21 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_refuses_what_is_not_a_registered_lead() {
-        // A pane with no registration is not a lead: the key opens nothing. A
-        // lead launched from the tree needs no remembering here, because the
-        // daemon enrolls it from its own records whether or not a display is
-        // connected.
+    fn presence_status_action_does_not_dispatch_enrollment() {
+        // The key reports the daemon's current standing; the presence reporter owns
+        // admission and session changes.
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         assert_eq!(
             press(&mut app, KeyCode::Char('E')),
-            Some(Action::BeginAction(Operation::EnrollAgent))
+            Some(Action::BeginAction(Operation::PresenceStatus))
         );
-        app.begin_action(Operation::EnrollAgent, &state);
+        app.begin_action(Operation::PresenceStatus, &state);
         assert!(app.confirmation().is_none());
         assert!(
             app.focus_message()
-                .is_some_and(|message| message.contains("only a registered lead")),
+                .is_some_and(|message| message.contains("only a Pi session can be managed")),
             "{:?}",
             app.focus_message()
         );
@@ -5021,7 +4944,7 @@ mod tests {
                     agent: serde_json::from_value(serde_json::json!({
                         "registration": {
                             "version": 1,
-                            "agent_id": "managed-agent",
+                            "registration_id": "managed-agent",
                             "registered_at": "2026-01-01T00:00:00Z",
                             "source": "test",
                             "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -5099,10 +5022,7 @@ mod tests {
                 );
                 assert!(close_request_id.is_some(), "pane cleanup has its own id");
             }
-            Confirmed::Direct(_)
-            | Confirmed::Container(_)
-            | Confirmed::Enroll { .. }
-            | Confirmed::Subject { .. } => {
+            Confirmed::Direct(_) | Confirmed::Container(_) | Confirmed::Subject { .. } => {
                 panic!("managed control must target its daemon subject")
             }
         }

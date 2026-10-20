@@ -1,5 +1,100 @@
 // Generated from the checked-in Rust-derived JSON Schemas. Do not edit.
 
+export interface PresenceReportDeserialize {
+  claim_id: string;
+  incarnation: string;
+  label?: string | null;
+  location?: PresenceReportRegistryLocation | null;
+  owner?: string | null;
+  process: PresenceReportProcessIdentity;
+  registration_id?: string | null;
+  run?: string | null;
+  session_id: string;
+  source: string;
+  spawn_token?: string | null;
+  subject_id?: string | null;
+}
+/**
+ * Where an agent's incarnation lives on one backend, in that backend's own
+ * coordinates.
+ *
+ * The backend name is free-form so a source Radar does not ship yet is
+ * preserved rather than rejected; the rest are the coordinates as reported, and
+ * each is optional because a backend need not name every level.
+ */
+export interface PresenceReportRegistryLocation {
+  backend: string;
+  instance?: string | null;
+  pane?: string | null;
+  tab?: string | null;
+  workspace?: string | null;
+}
+/**
+ * Which process incarnation a sample belongs to.
+ *
+ * The kernel reuses process ids, so a pid does not name a process: one
+ * incarnation is the boot it started in, its pid, and when it started. Those
+ * are what make two readings comparable — counters may only be subtracted
+ * from an earlier reading of the same identity, and a difference taken across
+ * two of them measures neither process.
+ */
+export interface PresenceReportProcessIdentity {
+  /**
+   * The boot this process started in, as the kernel reports it.
+   */
+  boot_id: string;
+  /**
+   * The process id, unique within one boot and one incarnation of it.
+   */
+  pid: number;
+  /**
+   * Start time since boot, in clock ticks (`starttime` in
+   * `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
+   */
+  start_ticks: number;
+  [k: string]: unknown;
+}
+export type PresenceAnswerStanding = "pending" | "granted" | "duplicate" | "released";
+
+/**
+ * The small public receipt; session/location context stays inside Radar.
+ */
+export interface PresenceAnswerSerialize {
+  claim_id: string;
+  registration_id: string;
+  standing: PresenceAnswerStanding;
+  subject_id?: string | null;
+}
+export interface PresenceReleaseDeserialize {
+  claim_id: string;
+  process: PresenceReleaseProcessIdentity;
+  registration_id: string;
+}
+/**
+ * Which process incarnation a sample belongs to.
+ *
+ * The kernel reuses process ids, so a pid does not name a process: one
+ * incarnation is the boot it started in, its pid, and when it started. Those
+ * are what make two readings comparable — counters may only be subtracted
+ * from an earlier reading of the same identity, and a difference taken across
+ * two of them measures neither process.
+ */
+export interface PresenceReleaseProcessIdentity {
+  /**
+   * The boot this process started in, as the kernel reports it.
+   */
+  boot_id: string;
+  /**
+   * The process id, unique within one boot and one incarnation of it.
+   */
+  pid: number;
+  /**
+   * Start time since boot, in clock ticks (`starttime` in
+   * `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
+   */
+  start_ticks: number;
+  [k: string]: unknown;
+}
 /**
  * `daemon.ping` result. Contract names remain strings so older clients can
  * preserve and ignore names introduced by newer daemon builds.
@@ -27,7 +122,7 @@ export interface HandoffPublishParamsDeserialize {
   content: string;
   correlation_id?: string | null;
   recipient_subject_id: string;
-  sender_agent_id: string;
+  sender_registration_id: string;
   summary: string;
 }
 /**
@@ -56,9 +151,9 @@ export interface HandoffSerialize {
  * generation identify the exact execution that took the action.
  */
 export interface HandoffIdentity {
-  agent_id: string;
   execution_generation: number;
   execution_id: string;
+  registration_id: string;
   session_id: string;
   subject_id: string;
 }
@@ -77,9 +172,9 @@ export interface HandoffReceiptSerialize {
  * generation identify the exact execution that took the action.
  */
 export interface HandoffIdentity {
-  agent_id: string;
   execution_generation: number;
   execution_id: string;
+  registration_id: string;
   session_id: string;
   subject_id: string;
 }
@@ -191,6 +286,7 @@ export type Freshness = "fresh" | "stale";
  * refused rather than silently dropped.
  */
 export type Report = Snapshot | AssignmentSnapshot | FactsSnapshot;
+export type Standing = "pending" | "granted" | "duplicate" | "released";
 /**
  * How a registration relates to the live panes.
  */
@@ -570,6 +666,10 @@ export interface RegistryView {
 export interface RegistryAgent {
   assignment: PublicChannelFacts | null;
   /**
+   * Durable claim decision, if this registration has claimed a session.
+   */
+  claim_standing?: Standing | null;
+  /**
    * Mutable current-session context, kept separate from registration identity.
    */
   context: PublicContext | null;
@@ -584,8 +684,8 @@ export interface RegistryAgent {
  * dropped because it is a credential rather than a fact.
  */
 export interface PublicChannelFacts {
-  agent_id: string;
   channel: Channel;
+  registration_id: string;
   snapshot?: PublicSnapshotFacts | null;
   version: number;
   writer: PublicWriterFacts;
@@ -687,8 +787,8 @@ export interface PublicWriterFacts {
  * current session.
  */
 export interface PublicContext {
-  agent_id: string;
   context: PublicSession;
+  registration_id: string;
   version: number;
   writer: PublicWriterFacts;
 }
@@ -756,7 +856,6 @@ export interface ProcessIdentity {
  * construction, not by redaction: there is no field here to forget to strip.
  */
 export interface PublicRegistration {
-  agent_id: string;
   incarnation: string;
   label?: string | null;
   launch: PublicLaunch;
@@ -768,6 +867,7 @@ export interface PublicRegistration {
    */
   process_claimed: boolean;
   registered_at: string;
+  registration_id: string;
   run?: string | null;
   session?: string | null;
   source: string;
@@ -1215,7 +1315,7 @@ export interface Binding2 {
  * Public lifecycle identity carried into the display projection.
  */
 export interface LifecycleObservation {
-  bound_agent_id: string | null;
+  bound_registration_id: string | null;
   process: ProcessIdentity | null;
   session: string | null;
   state: State;

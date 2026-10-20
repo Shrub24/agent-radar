@@ -91,7 +91,8 @@ pub struct BoundChild {
     pub incarnation: String,
     /// Exact registry identity returned to the registering child. Absent in legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
+    #[serde(alias = "agent_id")]
+    pub registration_id: Option<String>,
     /// When the edge bound to this incarnation.
     pub bound_at: String,
 }
@@ -537,7 +538,7 @@ pub fn bind(
 pub(super) fn bind_presented_token(
     registry: &Registry,
     request: &super::RegistrationRequest,
-    agent_id: &str,
+    registration_id: &str,
     now_ms: i64,
 ) -> Result<(), String> {
     let Some(token) = request.spawn_token.as_deref() else {
@@ -547,7 +548,7 @@ pub(super) fn bind_presented_token(
         registry,
         &registration_bind(token, request),
         now_ms,
-        Some(agent_id),
+        Some(registration_id),
         request.process.as_ref(),
     )?;
     Ok(())
@@ -575,7 +576,7 @@ pub(super) fn heal_binding(
         registry,
         &bind,
         now_ms,
-        Some(&registration.agent_id),
+        Some(&registration.registration_id),
         request.process.as_ref(),
     )
     .map(|_| ())
@@ -594,7 +595,7 @@ fn bind_locked(
     registry: &Registry,
     request: &SpawnBindRequest,
     now_ms: i64,
-    agent_id: Option<&str>,
+    registration_id: Option<&str>,
     process: Option<&ProcessIdentity>,
 ) -> Result<SpawnEdge, String> {
     let mut matches = edges(registry)?
@@ -612,30 +613,35 @@ fn bind_locked(
     // while its subject is still live. The subject is written first: an edge that
     // could not be written leaves the subject bound, which a same-content retry heals.
     if let Some(subject_id) = &stored.subject_id {
-        lifecycle::fence_registration(registry, subject_id, process, agent_id, now_ms)?;
+        lifecycle::fence_registration(registry, subject_id, process, registration_id, now_ms)?;
     }
     if let Some(bound) = &stored.bound {
         if bound.source == request.source
             && bound.incarnation == request.incarnation
-            && let Some(agent_id) = agent_id
+            && let Some(registration_id) = registration_id
         {
             if bound
-                .agent_id
+                .registration_id
                 .as_deref()
-                .is_some_and(|existing| existing != agent_id)
+                .is_some_and(|existing| existing != registration_id)
             {
                 return Err("spawn binding names a different registry identity".into());
             }
-            if bound.agent_id.is_none() {
+            if bound.registration_id.is_none() {
                 let edge = SpawnEdge {
                     bound: Some(BoundChild {
-                        agent_id: Some(agent_id.to_string()),
+                        registration_id: Some(registration_id.to_string()),
                         ..bound.clone()
                     }),
                     ..stored
                 };
                 write_edge(registry, &edge)?;
-                registry.append_event("spawn.bound", Some(agent_id), None, Some(&edge.request_id));
+                registry.append_event(
+                    "spawn.bound",
+                    Some(registration_id),
+                    None,
+                    Some(&edge.request_id),
+                );
                 return Ok(edge);
             }
             return Ok(stored);
@@ -646,13 +652,13 @@ fn bind_locked(
         bound: Some(BoundChild {
             source: request.source.clone(),
             incarnation: request.incarnation.clone(),
-            agent_id: agent_id.map(str::to_owned),
+            registration_id: registration_id.map(str::to_owned),
             bound_at: format_millis(now_ms),
         }),
         ..stored
     };
     write_edge(registry, &edge)?;
-    registry.append_event("spawn.bound", agent_id, None, Some(&edge.request_id));
+    registry.append_event("spawn.bound", registration_id, None, Some(&edge.request_id));
     Ok(edge)
 }
 
@@ -736,8 +742,8 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
         if timestamp_millis(&bound.bound_at).is_none() {
             return Err("spawn edge bound_at is not a timestamp".into());
         }
-        if let Some(agent_id) = &bound.agent_id {
-            canonical_uuid("bound.agent_id", agent_id)?;
+        if let Some(registration_id) = &bound.registration_id {
+            canonical_uuid("bound.registration_id", registration_id)?;
         }
     }
     if let Some(exit) = &edge.exit {

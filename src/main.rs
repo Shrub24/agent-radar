@@ -626,22 +626,6 @@ fn dispatch(
 ) {
     match confirmed {
         Some(Confirmed::Direct(request)) => closer.start(request),
-        Some(Confirmed::Enroll {
-            request_id,
-            agent_id,
-            session,
-        }) => {
-            if let Err(message) = managed.start(radar::Control {
-                operation: radar::Operation::Enroll,
-                request_id,
-                subject_id: agent_id.clone(),
-                child_close: None,
-                close_request_id: None,
-                enrollment: Some(radar::Enrollment { agent_id, session }),
-            }) {
-                app.set_focus_message(Some(message));
-            }
-        }
         Some(Confirmed::Subject {
             operation,
             request_id,

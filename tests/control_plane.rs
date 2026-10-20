@@ -1399,13 +1399,13 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 
 /// One `agent.get` on its own connection, with a daemon-ended connection
 /// reported as an error rather than failing the read.
-fn socket_agent_get(path: &Path, agent_id: &str) -> Value {
+fn socket_agent_get(path: &Path, registration_id: &str) -> Value {
     let mut client = Client::dial(path);
     let id = random_uuid();
     client.send(&request_line(
         &id,
         "agent.get",
-        json!({"agent_id":agent_id}),
+        json!({"registration_id":registration_id}),
     ));
     let mut line = String::new();
     let bytes = client.reader.read_line(&mut line).unwrap_or(0);
@@ -1436,20 +1436,20 @@ fn agent_get_serves_the_claimed_birth_identity_only_when_claimed() {
             None,
         ),
     );
-    let claimed_id = agent_id(&claimed);
+    let claimed_id = registration_id(&claimed);
     let unclaimed = client.call(
         "agent.register",
         registration_body("7b3f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
     );
-    let unclaimed_id = agent_id(&unclaimed);
+    let unclaimed_id = registration_id(&unclaimed);
 
-    let served = client.call("agent.get", json!({"agent_id": claimed_id}));
+    let served = client.call("agent.get", json!({"registration_id": claimed_id}));
     assert_eq!(
         served["result"]["agent"]["process"]["claim"],
         json!({"boot_id": "boot-claim", "pid": 5151, "start_ticks": 77}),
         "{served}"
     );
-    let absent = client.call("agent.get", json!({"agent_id": unclaimed_id}));
+    let absent = client.call("agent.get", json!({"registration_id": unclaimed_id}));
     assert!(
         absent["result"]["agent"]["process"].get("claim").is_none(),
         "{absent}"
@@ -1479,7 +1479,7 @@ fn socket_verification_does_not_block_publication_and_shutdown_is_bounded() {
         "agent.register",
         registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", Some(process), None),
     );
-    let target_id = agent_id(&registered);
+    let target_id = registration_id(&registered);
     let verifier_path = daemon.path().to_path_buf();
     drop(setup);
     let getter = thread::spawn(move || {
@@ -1488,7 +1488,7 @@ fn socket_verification_does_not_block_publication_and_shutdown_is_bounded() {
         client.send(&request_line(
             &id,
             "agent.get",
-            json!({"agent_id":target_id}),
+            json!({"registration_id":target_id}),
         ));
         let mut line = String::new();
         let bytes = client.reader.read_line(&mut line).unwrap_or(0);
@@ -1505,7 +1505,7 @@ fn socket_verification_does_not_block_publication_and_shutdown_is_bounded() {
         registration_body("1c2d3e4f-5678-4abc-9def-0123456789ab", None, None),
     );
     assert!(
-        written["result"]["registration"]["agent_id"].is_string(),
+        written["result"]["registration"]["registration_id"].is_string(),
         "{written}"
     );
     let started = Instant::now();
@@ -1549,7 +1549,7 @@ fn socket_verifier_capacity_is_bounded_daemon_wide_and_released_by_completion() 
         "agent.register",
         registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", Some(process), None),
     );
-    let target = agent_id(&registered);
+    let target = registration_id(&registered);
     let path = daemon.path().to_path_buf();
     drop(setup);
 
@@ -1591,7 +1591,7 @@ fn socket_verifier_capacity_is_bounded_daemon_wide_and_released_by_completion() 
         registration_body("1c2d3e4f-5678-4abc-9def-0123456789ab", None, None),
     );
     assert!(
-        written["result"]["registration"]["agent_id"].is_string(),
+        written["result"]["registration"]["registration_id"].is_string(),
         "{written}"
     );
 
@@ -1692,7 +1692,7 @@ fn events_read_long_poll_expiry_validation_and_shutdown() {
         "agent.register",
         registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
     );
-    assert!(registered["result"]["registration"]["agent_id"].is_string());
+    assert!(registered["result"]["registration"]["registration_id"].is_string());
     let answer = answer_rx
         .recv_timeout(Duration::from_millis(500))
         .expect("event wakes reader");
@@ -1767,7 +1767,7 @@ fn a_bounded_event_read_resumes_without_skipping_events() {
     ];
     for incarnation in incarnations {
         let registered = client.call("agent.register", registration_body(incarnation, None, None));
-        assert!(registered["result"]["registration"]["agent_id"].is_string());
+        assert!(registered["result"]["registration"]["registration_id"].is_string());
     }
 
     let mut seen: Vec<u64> = Vec::new();
@@ -1829,7 +1829,7 @@ fn daemon_journals_committed_registration_once_without_private_launch_data() {
         "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None,
         Some(json!({"executable":"/usr/bin/pi","argv":[secret],"cwd":"/tmp","session":{"path":secret},"provenance":"test","revision":"r1"})),
     ));
-    assert!(registered["result"]["registration"]["agent_id"].is_string());
+    assert!(registered["result"]["registration"]["registration_id"].is_string());
     let journal: serde_json::Value = serde_json::from_slice(
         &fs::read(sandbox.state().join("events.json")).expect("journal file"),
     )
@@ -1837,11 +1837,11 @@ fn daemon_journals_committed_registration_once_without_private_launch_data() {
     let events = journal["events"].as_array().expect("events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["kind"], "agent.registered");
-    assert_eq!(events[0]["agent_id"], agent_id(&registered));
+    assert_eq!(events[0]["registration_id"], registration_id(&registered));
     let handle = client.call(
         "agent.acquire",
         json!({
-            "agent_id": agent_id(&registered), "channel": "execution",
+            "registration_id": registration_id(&registered), "channel": "execution",
             "publisher": {"source":"child", "incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"}
         }),
     )["result"]["writer"]["handle"]
@@ -1849,7 +1849,7 @@ fn daemon_journals_committed_registration_once_without_private_launch_data() {
         .unwrap()
         .to_string();
     let publish = json!({
-        "agent_id": agent_id(&registered), "channel":"execution", "writer_handle":handle,
+        "registration_id": registration_id(&registered), "channel":"execution", "writer_handle":handle,
         "sequence":1, "snapshot":channel_snapshot("idle")
     });
     assert!(client.call("agent.publish", publish.clone())["result"].is_object());
@@ -1869,8 +1869,8 @@ fn daemon_journals_committed_registration_once_without_private_launch_data() {
         Some(json!({"executable":"/usr/bin/pi","argv":[secret],"cwd":"/tmp","session":{"path":secret},"provenance":"test","revision":"r1"})),
     ));
     assert_eq!(
-        replay["result"]["registration"]["agent_id"],
-        events[0]["agent_id"]
+        replay["result"]["registration"]["registration_id"],
+        events[0]["registration_id"]
     );
     let after_replay: serde_json::Value = serde_json::from_slice(
         &fs::read(sandbox.state().join("events.json")).expect("journal file"),
@@ -1895,15 +1895,15 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
     );
     let registered = client.call("agent.register", registration);
     assert!(
-        registered["result"]["registration"]["agent_id"].is_string(),
+        registered["result"]["registration"]["registration_id"].is_string(),
         "{registered}"
     );
     no_secret(&registered, launch_secret);
-    let agent_id = agent_id(&registered);
+    let registration_id = registration_id(&registered);
     let acquired = client.call(
         "agent.acquire",
         json!({
-            "agent_id":agent_id,"channel":"execution",
+            "registration_id":registration_id,"channel":"execution",
             "publisher":{"source":"child","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"}
         }),
     );
@@ -1918,7 +1918,7 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
     let published = client.call(
         "agent.publish",
         json!({
-            "agent_id":agent_id,"channel":"execution","writer_handle":handle,"sequence":1,
+            "registration_id":registration_id,"channel":"execution","writer_handle":handle,"sequence":1,
             "snapshot":channel_snapshot("idle")
         }),
     );
@@ -1930,14 +1930,14 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
     let replay = client.call(
         "agent.publish",
         json!({
-            "agent_id":agent_id,"channel":"execution","writer_handle":handle,"sequence":1,
+            "registration_id":registration_id,"channel":"execution","writer_handle":handle,"sequence":1,
             "snapshot":channel_snapshot("idle")
         }),
     );
     assert!(replay["result"].is_object(), "equal replay: {replay}");
     assert_eq!(replay["result"]["channel"]["writer"]["handle"], handle);
     assert_eq!(replay["result"]["channel"]["snapshot"]["sequence"], 1);
-    let get = client.call("agent.get", json!({"agent_id":agent_id}));
+    let get = client.call("agent.get", json!({"registration_id":registration_id}));
     assert_eq!(
         get["result"]["agent"]["registration"]["launch"]["available"],
         true
@@ -1956,13 +1956,13 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
     assert!(list["result"]["agents"][0]["context"].is_null());
     let retired = client.call(
         "agent.retire",
-        json!({"agent_id":agent_id,"channel":"execution","writer_handle":handle}),
+        json!({"registration_id":registration_id,"channel":"execution","writer_handle":handle}),
     );
     assert!(retired["result"].is_object(), "{retired}");
     let fenced = client.call(
         "agent.publish",
         json!({
-            "agent_id":agent_id,"channel":"execution","writer_handle":handle,"sequence":2,
+            "registration_id":registration_id,"channel":"execution","writer_handle":handle,"sequence":2,
             "snapshot":channel_snapshot("working")
         }),
     );
@@ -1996,7 +1996,7 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         .to_string();
     let mut body = registration_body(PARENT_INCARNATION, None, None);
     body["location"] = json!({"backend":"tmux", "pane":root_pane});
-    let root = agent_id(&client.call("agent.register", body));
+    let root = registration_id(&client.call("agent.register", body));
     let root_session = random_uuid();
     publish_session_context(&mut client, &root, PARENT_INCARNATION, &root_session);
 
@@ -2045,7 +2045,7 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         &handoff_id,
         "communication.publish",
         json!({
-            "sender_agent_id": worker_agent,
+            "sender_registration_id": worker_agent,
             "recipient_subject_id": parent_subject,
             "correlation_id": "herdsman-run-17",
             "summary": "worker completed",
@@ -2061,7 +2061,7 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         &handoff_id,
         "communication.publish",
         json!({
-            "sender_agent_id": worker_agent,
+            "sender_registration_id": worker_agent,
             "recipient_subject_id": parent_subject,
             "correlation_id": "herdsman-run-17",
             "summary": "worker completed",
@@ -2073,21 +2073,24 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         &random_uuid(),
         "communication.publish",
         json!({
-            "sender_agent_id": worker_agent,
+            "sender_registration_id": worker_agent,
             "recipient_subject_id": worker_subject,
             "summary": "worker completed",
             "content": "must not be routed to self",
         }),
     );
     assert_eq!(wrong_target["error"]["code"], "refused", "{wrong_target}");
-    let inbox = client.call("communication.inbox", json!({"agent_id":parent_agent}));
+    let inbox = client.call(
+        "communication.inbox",
+        json!({"registration_id":parent_agent}),
+    );
     assert_eq!(
         inbox["result"]["handoff_ids"].as_array().unwrap(),
         &[json!(handoff_id)]
     );
     let retrieved = client.call(
         "communication.get",
-        json!({"agent_id":parent_agent,"handoff_id":handoff_id}),
+        json!({"registration_id":parent_agent,"handoff_id":handoff_id}),
     );
     assert_eq!(
         retrieved["result"]["handoff"]["content"],
@@ -2095,12 +2098,12 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
     );
     let ack = client.call(
         "communication.ack",
-        json!({"agent_id":parent_agent,"handoff_id":handoff_id}),
+        json!({"registration_id":parent_agent,"handoff_id":handoff_id}),
     );
     assert_eq!(ack["result"]["created"], true, "{ack}");
     let read_after_ack = client.call(
         "communication.get",
-        json!({"agent_id":parent_agent,"handoff_id":handoff_id}),
+        json!({"registration_id":parent_agent,"handoff_id":handoff_id}),
     );
     assert_eq!(
         read_after_ack["result"]["handoff"]["content"],
@@ -2151,8 +2154,8 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
             Some(json!({"executable":"/usr/bin/pi","argv":[launch_secret],"cwd":"/tmp","session":{"path":launch_secret},"provenance":"test","revision":"r1"})),
         ),
     );
-    let id = agent_id(&registered);
-    let absent = client.call("agent.get", json!({"agent_id":id}));
+    let id = registration_id(&registered);
+    let absent = client.call("agent.get", json!({"registration_id":id}));
     assert!(absent["result"]["agent"]["context"].is_null(), "{absent}");
     let list_absent = client.call("agent.list", json!({"limit":1}));
     assert!(
@@ -2165,7 +2168,7 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     // never-published read absence.
     let first = client.call(
         "agent.context",
-        json!({"agent_id":id,"publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},"sequence":1,"lease_ms":10000,"context":{"session":SESSION}}),
+        json!({"registration_id":id,"publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},"sequence":1,"lease_ms":10000,"context":{"session":SESSION}}),
     );
     assert!(first["result"]["context"].is_object(), "{first}");
     assert_eq!(first["result"]["context"]["context"]["session"], SESSION);
@@ -2187,7 +2190,7 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     let switched = client.call(
         "agent.context",
         json!({
-            "agent_id":id,
+            "registration_id":id,
             "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
             "writer_handle":writer,
             "sequence":2,
@@ -2203,7 +2206,7 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     let replay = client.call(
         "agent.context",
         json!({
-            "agent_id":id,
+            "registration_id":id,
             "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
             "writer_handle":writer,
             "sequence":2,
@@ -2223,7 +2226,7 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     let cleared = client.call(
         "agent.context",
         json!({
-            "agent_id":id,
+            "registration_id":id,
             "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
             "writer_handle":writer,
             "sequence":3,
@@ -2234,7 +2237,7 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
         cleared["result"]["context"]["context"]["session"].is_null(),
         "{cleared}"
     );
-    let get = client.call("agent.get", json!({"agent_id":id}));
+    let get = client.call("agent.get", json!({"registration_id":id}));
     assert!(get["result"]["agent"]["context"].is_object(), "{get}");
     assert!(get["result"]["agent"]["context"]["context"]["session"].is_null());
     assert!(get["result"]["agent"]["context"]["context"]["freshness"] == "fresh");
@@ -2263,7 +2266,7 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     let mut daemon =
         Daemon::bind_without_backend(&sandbox.socket(), &sandbox.state()).expect("restart daemon");
     let mut client = Client::dial(daemon.path());
-    let stale = client.call("agent.get", json!({"agent_id":id}));
+    let stale = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(
         stale["result"]["agent"]["context"]["context"]["freshness"],
         "stale"
@@ -2287,11 +2290,11 @@ fn agent_context_socket_expiry_and_replacement_keep_writer_fenced() {
         "agent.register",
         registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
     );
-    let id = agent_id(&registered);
+    let id = registration_id(&registered);
     let first = client.call(
         "agent.context",
         json!({
-            "agent_id":id,
+            "registration_id":id,
             "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
             "sequence":1,
             "lease_ms":1000,
@@ -2308,7 +2311,7 @@ fn agent_context_socket_expiry_and_replacement_keep_writer_fenced() {
         list_stale["result"]["agents"][0]["context"]["context"]["freshness"],
         "stale"
     );
-    let stale = client.call("agent.get", json!({"agent_id":id}));
+    let stale = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(
         stale["result"]["agent"]["context"]["context"]["freshness"],
         "stale"
@@ -2317,7 +2320,7 @@ fn agent_context_socket_expiry_and_replacement_keep_writer_fenced() {
     let replacement = client.call(
         "agent.context",
         json!({
-            "agent_id":id,
+            "registration_id":id,
             "publisher":{"source":"herdsman","incarnation":"4c2d3e4f-5678-4abc-9def-0123456789ab"},
             "replace":{"generation":old["generation"],"handle":old["handle"]},
             "sequence":1,
@@ -2329,7 +2332,7 @@ fn agent_context_socket_expiry_and_replacement_keep_writer_fenced() {
     let fenced = client.call(
         "agent.context",
         json!({
-            "agent_id":id,
+            "registration_id":id,
             "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
             "writer_handle":old["handle"],
             "sequence":2,
@@ -2337,7 +2340,7 @@ fn agent_context_socket_expiry_and_replacement_keep_writer_fenced() {
         }),
     );
     assert_eq!(error_code(&fenced), "refused");
-    let accepted = client.call("agent.get", json!({"agent_id":id}));
+    let accepted = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(
         accepted["result"]["agent"]["context"]["writer"]["generation"],
         2
@@ -2358,18 +2361,18 @@ fn socket_registry_replace_restart_and_reconnect_keep_writer_provenance() {
         "agent.register",
         registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
     );
-    let id = agent_id(&registered);
-    let first = client.call("agent.acquire", json!({"agent_id":id,"channel":"assignment","publisher":{"source":"owner","incarnation":"3c2d3e4f-5678-4abc-9def-0123456789ab","reporting_owner":"owner-A"}}));
+    let id = registration_id(&registered);
+    let first = client.call("agent.acquire", json!({"registration_id":id,"channel":"assignment","publisher":{"source":"owner","incarnation":"3c2d3e4f-5678-4abc-9def-0123456789ab","reporting_owner":"owner-A"}}));
     let old = first["result"]["writer"]["handle"]
         .as_str()
         .unwrap()
         .to_owned();
-    let report = client.call("agent.publish", json!({"agent_id":id,"channel":"assignment","writer_handle":old,"sequence":1,"snapshot":channel_snapshot("unsettled")}));
+    let report = client.call("agent.publish", json!({"registration_id":id,"channel":"assignment","writer_handle":old,"sequence":1,"snapshot":channel_snapshot("unsettled")}));
     assert!(report["result"].is_object(), "{report}");
     let old_generation = first["result"]["writer"]["generation"].as_u64().unwrap();
     let retired = client.call(
         "agent.retire",
-        json!({"agent_id":id,"channel":"assignment","writer_handle":old}),
+        json!({"registration_id":id,"channel":"assignment","writer_handle":old}),
     );
     assert!(retired["result"].is_object(), "{retired}");
     daemon.stop();
@@ -2377,13 +2380,13 @@ fn socket_registry_replace_restart_and_reconnect_keep_writer_provenance() {
     let mut daemon =
         Daemon::bind_without_backend(&sandbox.socket(), &sandbox.state()).expect("restart daemon");
     let mut client = Client::dial(daemon.path());
-    let restored = client.call("agent.get", json!({"agent_id":id}));
+    let restored = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(
         restored["result"]["agent"]["assignment"]["snapshot"]["freshness"],
         "stale"
     );
     let replacement = client.call("agent.acquire", json!({
-        "agent_id":id,"channel":"assignment",
+        "registration_id":id,"channel":"assignment",
         "publisher":{"source":"owner","incarnation":"4c2d3e4f-5678-4abc-9def-0123456789ab","reporting_owner":"owner-A"},
         "replace":{"generation":old_generation,"handle":old}
     }));
@@ -2396,11 +2399,11 @@ fn socket_registry_replace_restart_and_reconnect_keep_writer_provenance() {
         replacement["result"]["writer"]["generation"],
         old_generation + 1
     );
-    let stale = client.call("agent.publish", json!({"agent_id":id,"channel":"assignment","writer_handle":old,"sequence":2,"snapshot":channel_snapshot("stale-writer")}));
+    let stale = client.call("agent.publish", json!({"registration_id":id,"channel":"assignment","writer_handle":old,"sequence":2,"snapshot":channel_snapshot("stale-writer")}));
     assert_eq!(error_code(&stale), "refused");
-    let reconnect = client.call("agent.publish", json!({"agent_id":id,"channel":"assignment","writer_handle":new_handle,"sequence":1,"snapshot":channel_snapshot("owner-reconnected")}));
+    let reconnect = client.call("agent.publish", json!({"registration_id":id,"channel":"assignment","writer_handle":new_handle,"sequence":1,"snapshot":channel_snapshot("owner-reconnected")}));
     assert!(reconnect["result"].is_object(), "{reconnect}");
-    let accepted = client.call("agent.get", json!({"agent_id":id}));
+    let accepted = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(
         accepted["result"]["agent"]["assignment"]["snapshot"]["snapshot"]["activity"],
         "owner-reconnected"
@@ -2419,7 +2422,7 @@ fn registry_socket_rejects_unknown_fields_and_surfaces_corrupt_records() {
         "agent.register",
         registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
     );
-    let id = agent_id(&registered);
+    let id = registration_id(&registered);
     daemon.stop();
     fs::write(
         sandbox.state().join("agents").join(format!("{id}.json")),
@@ -2429,7 +2432,7 @@ fn registry_socket_rejects_unknown_fields_and_surfaces_corrupt_records() {
     let mut daemon = Daemon::bind_without_backend(&sandbox.socket(), &sandbox.state())
         .expect("bind corrupt store for explicit read failure");
     let mut client = Client::dial(daemon.path());
-    let get = client.call("agent.get", json!({"agent_id":id}));
+    let get = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(error_code(&get), "refused");
     let list = client.call("agent.list", json!({}));
     assert_eq!(error_code(&list), "refused");
@@ -2449,7 +2452,7 @@ fn registry_list_pages_are_cursor_stable_and_response_byte_bounded() {
         request["label"] = json!("\\\"".repeat(MAX_TEXT_BYTES / 2));
         let response = client.call("agent.register", request);
         assert!(
-            response["result"]["registration"]["agent_id"].is_string(),
+            response["result"]["registration"]["registration_id"].is_string(),
             "{response}"
         );
     }
@@ -2467,7 +2470,7 @@ fn registry_list_pages_are_cursor_stable_and_response_byte_bounded() {
         assert!(response["result"]["agents"].as_array().unwrap().len() <= 3);
         for entry in response["result"]["agents"].as_array().unwrap() {
             observed.push(
-                entry["registration"]["agent_id"]
+                entry["registration"]["registration_id"]
                     .as_str()
                     .unwrap()
                     .to_owned(),
@@ -2858,8 +2861,8 @@ fn registered_parent(client: &mut Client, incarnation: &str, pane: &str) -> Stri
         "pane": pane,
     });
     let response = client.call("agent.register", body);
-    let id = agent_id(&response);
-    let context = client.call("agent.context", json!({"agent_id":id,"publisher":{"source":"test-publisher","incarnation":incarnation},"sequence":1,"lease_ms":10000,"context":{"session":SESSION}}));
+    let id = registration_id(&response);
+    let context = client.call("agent.context", json!({"registration_id":id,"publisher":{"source":"test-publisher","incarnation":incarnation},"sequence":1,"lease_ms":10000,"context":{"session":SESSION}}));
     assert!(
         context.get("result").is_some(),
         "context publish failed: {context}"
@@ -3003,8 +3006,8 @@ fn channel_snapshot(activity: &str) -> Value {
     json!({"activity":activity,"waiting_reason":"waiting-for-owner","last_outcome":{"result":"failed-tool-timeout"},"actions":["retry"]})
 }
 
-fn agent_id(response: &Value) -> String {
-    response["result"]["registration"]["agent_id"]
+fn registration_id(response: &Value) -> String {
+    response["result"]["registration"]["registration_id"]
         .as_str()
         .expect("public agent id")
         .to_owned()
@@ -4323,12 +4326,12 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .to_string();
     let mut body = registration_body(PARENT_INCARNATION, None, None);
     body["location"] = json!({"backend":"tmux", "pane":parent_pane});
-    let parent = agent_id(&client.call("agent.register", body));
+    let parent = registration_id(&client.call("agent.register", body));
     let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     client.call(
         "agent.context",
         json!({
-            "agent_id": parent,
+            "registration_id": parent,
             "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
             "sequence": 1,
             "lease_ms": 10_000,
@@ -4409,7 +4412,6 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
 
 /// The logical session a tracked parent publishes; tracked children launch under it.
 const TRACKED_SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
-const MOVED_SESSION: &str = "d2b3c4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e";
 
 /// Starts the daemon on a disposable tmux server and waits for its greeting.
 fn tmux_daemon(socket: &Path, state: &Path, server: &TmuxServer) -> DaemonChild {
@@ -4434,11 +4436,11 @@ fn tracked_parent(client: &mut Client) -> String {
         .to_string();
     let mut body = registration_body(PARENT_INCARNATION, None, None);
     body["location"] = json!({"backend":"tmux", "pane":pane});
-    let parent = agent_id(&client.call("agent.register", body));
+    let parent = registration_id(&client.call("agent.register", body));
     let context = client.call(
         "agent.context",
         json!({
-            "agent_id": parent,
+            "registration_id": parent,
             "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
             "sequence": 1,
             "lease_ms": 10_000,
@@ -4539,7 +4541,7 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         "agent.register",
         child_registration_for(&state, &spawn_id, &subject),
     );
-    let child = agent_id(&registered);
+    let child = registration_id(&registered);
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
         result_record(&cancelled)["outcome"],
@@ -4555,7 +4557,7 @@ fn a_cancel_after_binding_stops_the_bound_process() {
     assert_eq!(subject_record(&state, &subject)["state"], "bound");
     let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
     assert_eq!(
-        spawn["result"]["spawn"]["bound"]["agent_id"],
+        spawn["result"]["spawn"]["bound"]["registration_id"],
         json!(child),
         "{spawn}"
     );
@@ -4983,11 +4985,11 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
     let mut body = registration_body(incarnation, None, None);
     body["location"] = json!({"backend":"tmux", "pane":parent_pane});
     let registration = client.call("agent.register", body);
-    let parent = agent_id(&registration);
+    let parent = registration_id(&registration);
     let context = client.call(
         "agent.context",
         json!({
-            "agent_id": parent,
+            "registration_id": parent,
             "publisher": {"source":"test-publisher", "incarnation":incarnation},
             "sequence": 1,
             "lease_ms": 10_000,
@@ -4995,7 +4997,7 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
         }),
     );
     assert!(context["result"].is_object(), "{context}");
-    let facts_before = client.call("agent.get", json!({"agent_id":parent}));
+    let facts_before = client.call("agent.get", json!({"registration_id":parent}));
 
     let (spawn_id, raw_pane, child_agent) = spawned_exiting_tmux_child(
         &mut client,
@@ -5014,7 +5016,7 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
         .as_str()
         .expect("spawned pane")
         .to_string();
-    let child_facts_before = client.call("agent.get", json!({"agent_id":child_agent}));
+    let child_facts_before = client.call("agent.get", json!({"registration_id":child_agent}));
     let listed = client.call("spawn.list", json!({"limit":10}));
     assert_eq!(
         listed["result"]["spawns"][0]["exit_observation"]["code"],
@@ -5031,7 +5033,7 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
             .is_some_and(|text| text.contains("Pane is dead (status 23")),
         "{output}"
     );
-    let facts_after = client.call("agent.get", json!({"agent_id":parent}));
+    let facts_after = client.call("agent.get", json!({"registration_id":parent}));
     assert_eq!(
         facts_after["result"]["agent"]["execution"],
         facts_before["result"]["agent"]["execution"]
@@ -5093,7 +5095,7 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
         "the retained pane is gone: {:?}",
         pane_ids(&server)
     );
-    let child_facts_after = client.call("agent.get", json!({"agent_id":child_agent}));
+    let child_facts_after = client.call("agent.get", json!({"registration_id":child_agent}));
     assert_eq!(
         child_facts_after["result"]["agent"]["execution"],
         child_facts_before["result"]["agent"]["execution"],
@@ -5161,11 +5163,11 @@ fn a_tmux_pane_from_another_server_generation_is_never_closed() {
     let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let mut body = registration_body(PARENT_INCARNATION, None, None);
     body["location"] = json!({"backend":"tmux", "pane":parent_pane});
-    let parent = agent_id(&client.call("agent.register", body));
+    let parent = registration_id(&client.call("agent.register", body));
     let context = client.call(
         "agent.context",
         json!({
-            "agent_id": parent,
+            "registration_id": parent,
             "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
             "sequence": 1,
             "lease_ms": 10_000,
@@ -5291,7 +5293,7 @@ fn publish_session_context(client: &mut Client, agent: &str, incarnation: &str, 
     let context = client.call(
         "agent.context",
         json!({
-            "agent_id": agent,
+            "registration_id": agent,
             "publisher": {"source":"test-publisher", "incarnation": incarnation},
             "sequence": 1,
             "lease_ms": 60_000,
@@ -5350,10 +5352,10 @@ fn spawned_live_tmux_child(
     child_registration["spawn_token"] = json!(token);
     // The child's own pane is where its own children are spawned.
     child_registration["location"] = json!({"backend":"tmux", "pane": edge["location"]["pane"]});
-    let child_agent = agent_id(&client.call("agent.register", child_registration));
+    let child_agent = registration_id(&client.call("agent.register", child_registration));
     let bound = client.call("spawn.get", json!({"request_id": spawn_id}));
     assert_eq!(
-        bound["result"]["spawn"]["bound"]["agent_id"],
+        bound["result"]["spawn"]["bound"]["registration_id"],
         json!(child_agent),
         "{bound}"
     );
@@ -5402,10 +5404,10 @@ fn spawned_exiting_tmux_child(
     let mut child_registration =
         registration_body(incarnation, Some(process_identity_from_proc(pid)), None);
     child_registration["spawn_token"] = json!(token);
-    let child_agent = agent_id(&client.call("agent.register", child_registration));
+    let child_agent = registration_id(&client.call("agent.register", child_registration));
     let bound = client.call("spawn.get", json!({"request_id":spawn_id}));
     assert_eq!(
-        bound["result"]["spawn"]["bound"]["agent_id"],
+        bound["result"]["spawn"]["bound"]["registration_id"],
         json!(child_agent),
         "{bound}"
     );
@@ -6517,8 +6519,8 @@ fn a_spawn_without_a_parent_pane_is_refused_before_any_effect() {
         "agent.register",
         registration_body(OTHER_INCARNATION, None, None),
     );
-    let unlocatable = agent_id(&unlocatable);
-    let context = client.call("agent.context", json!({"agent_id":unlocatable,"publisher":{"source":"test-publisher","incarnation":OTHER_INCARNATION},"sequence":1,"lease_ms":10000,"context":{"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}}));
+    let unlocatable = registration_id(&unlocatable);
+    let context = client.call("agent.context", json!({"registration_id":unlocatable,"publisher":{"source":"test-publisher","incarnation":OTHER_INCARNATION},"sequence":1,"lease_ms":10000,"context":{"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}}));
     assert!(context.get("result").is_some());
     let no_pane = client.call(
         "spawn.create",
@@ -6551,7 +6553,7 @@ fn spawn_refuses_missing_stale_null_and_mismatched_exact_parent_context_before_c
         "agent.register",
         registration_body(PARENT_INCARNATION, None, None),
     );
-    let parent = agent_id(&parent);
+    let parent = registration_id(&parent);
 
     let missing = client.call("spawn.create", spawn_params(&parent, "/usr/bin/pi", &[]));
     assert_eq!(error_code(&missing), "refused");
@@ -6559,7 +6561,7 @@ fn spawn_refuses_missing_stale_null_and_mismatched_exact_parent_context_before_c
 
     let mut writer_handle: Option<String> = None;
     let mut publish = |client: &mut Client, sequence, session: Value| {
-        let mut params = json!({"agent_id":parent,"publisher":{"source":"test-publisher","incarnation":PARENT_INCARNATION},"sequence":sequence,"lease_ms":1000,"context":{"session":session}});
+        let mut params = json!({"registration_id":parent,"publisher":{"source":"test-publisher","incarnation":PARENT_INCARNATION},"sequence":sequence,"lease_ms":1000,"context":{"session":session}});
         if let Some(handle) = &writer_handle {
             params["writer_handle"] = json!(handle);
         }
@@ -6716,14 +6718,14 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
         .to_owned();
     let registered = register_close_child(&mut client, &token, process);
     assert!(
-        registered["result"]["registration"]["agent_id"].is_string(),
+        registered["result"]["registration"]["registration_id"].is_string(),
         "{registered}"
     );
-    let agent_id = registered["result"]["registration"]["agent_id"]
+    let registration_id = registered["result"]["registration"]["registration_id"]
         .as_str()
         .expect("the child's registration")
         .to_owned();
-    let registration = client.call("agent.get", json!({"agent_id": &agent_id}));
+    let registration = client.call("agent.get", json!({"registration_id": &registration_id}));
     let close_id = random_uuid();
     let selected =
         agent_radar::control_plane::client::connect_at(daemon.path()).expect("dashboard client");
@@ -6790,7 +6792,7 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
     assert_eq!(topology["result"]["spawn"]["created"], "completed");
     assert_eq!(topology["result"]["spawn"]["launched"], "completed");
     assert_eq!(
-        client.call("agent.get", json!({"agent_id": &agent_id}))["result"]["agent"],
+        client.call("agent.get", json!({"registration_id": &registration_id}))["result"]["agent"],
         registration["result"]["agent"],
         "a close rewrites no registration of the child it closed"
     );
@@ -9038,23 +9040,23 @@ fn socket_facts_and_owner_assignment_are_read_separately_with_identifier_only_po
         "agent.register",
         registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
     );
-    let id = agent_id(&registered);
+    let id = registration_id(&registered);
     let model = "private-model-name";
     let handle = client.call(
         "agent.acquire",
-        json!({"agent_id":id,"channel":"facts","publisher":{"source":"pi","incarnation":"3c2d3e4f-5678-4abc-9def-0123456789ab"}}),
+        json!({"registration_id":id,"channel":"facts","publisher":{"source":"pi","incarnation":"3c2d3e4f-5678-4abc-9def-0123456789ab"}}),
     )["result"]["writer"]["handle"]
         .as_str()
         .expect("facts writer handle")
         .to_owned();
     let published = client.call(
         "agent.publish",
-        json!({"agent_id":id,"channel":"facts","writer_handle":handle,"sequence":1,
+        json!({"registration_id":id,"channel":"facts","writer_handle":handle,"sequence":1,
                "snapshot":{"model":model,"background_tasks":[{"id":"t1","phase":"running"}]}}),
     );
     assert!(published["result"].is_object(), "{published}");
 
-    let got = client.call("agent.get", json!({"agent_id":id}));
+    let got = client.call("agent.get", json!({"registration_id":id}));
     let facts = &got["result"]["agent"]["facts"];
     assert_eq!(facts["snapshot"]["freshness"], "fresh");
     assert_eq!(facts["snapshot"]["source"], "pi");
@@ -9068,7 +9070,7 @@ fn socket_facts_and_owner_assignment_are_read_separately_with_identifier_only_po
         .as_array()
         .expect("agents")
         .iter()
-        .find(|agent| agent["registration"]["agent_id"] == id)
+        .find(|agent| agent["registration"]["registration_id"] == id)
         .expect("the registered agent in the list");
     assert_eq!(entry["facts"]["snapshot"]["snapshot"]["model"], model);
     daemon.stop();
@@ -9083,7 +9085,7 @@ fn socket_facts_and_owner_assignment_are_read_separately_with_identifier_only_po
         .last()
         .expect("an event");
     assert_eq!(event["kind"], "facts.published");
-    assert_eq!(event["agent_id"], id);
+    assert_eq!(event["registration_id"], id);
     assert!(!serde_json::to_string(event).unwrap().contains(model));
 }
 
@@ -10086,7 +10088,7 @@ fn a_deletion_that_would_end_a_live_worker_names_it_and_dispatches_nothing() {
     let mut body = registration_body("3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b22", None, None);
     body["location"] = json!({"backend": "fake", "workspace": "wA"});
     let registered = client.call("agent.register", body);
-    let worker = agent_id(&registered).to_string();
+    let worker = registration_id(&registered).to_string();
     assert!(!worker.is_empty(), "{registered}");
 
     let deletion = client.call("topology.delete", request);
@@ -10773,11 +10775,11 @@ fn registered_lead(
 ) -> (String, String) {
     let mut body = registration_body(PARENT_INCARNATION, Some(lead.identity.clone()), None);
     body["location"] = json!({"backend":"tmux", "pane":pane});
-    let agent = agent_id(&client.call("agent.register", body));
+    let agent = registration_id(&client.call("agent.register", body));
     let context = client.call(
         "agent.context",
         json!({
-            "agent_id": agent,
+            "registration_id": agent,
             "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
             "sequence": 1,
             "lease_ms": 10_000,
@@ -10792,186 +10794,119 @@ fn registered_lead(
     (agent, writer)
 }
 
-fn enroll_lead(client: &mut Client, agent: &str, session: &str) -> Value {
-    client.call_id(
-        &random_uuid(),
-        "lifecycle.enroll",
-        json!({"request": {"agent_id": agent, "session": session}}),
-    )
-}
-
-/// The subject id an enrollment recorded, read from its settled effects.
-#[test]
-fn a_manual_pi_session_is_adopted_by_the_daemon_without_an_operator_enrollment() {
-    let sandbox = Sandbox::new("lead-adopt");
-    let lead = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_PRIMITIVES)
-        .observing(&["wA:p1"])
-        .with_foreground(ForegroundEvidence::command(
-            lead.pid,
-            Some("sh".into()),
-            None,
-        ));
-    let mut daemon =
-        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
-            .expect("daemon");
-    let mut client = Client::dial(daemon.path());
-    // A manually started Pi session publishes through the baseline publisher with
-    // no launch token; nothing asks the daemon to enroll it.
-    let mut body = registration_body(PARENT_INCARNATION, Some(lead.identity.clone()), None);
-    body["source"] = json!("herdsman-pi");
-    body["location"] = json!({"backend": "tmux", "pane": "wA:p1"});
-    let agent = agent_id(&client.call("agent.register", body));
-    let context = client.call(
-        "agent.context",
-        json!({
-            "agent_id": agent,
-            "publisher": {"source": "herdsman-pi", "incarnation": PARENT_INCARNATION},
-            "sequence": 1,
-            "lease_ms": 10_000,
-            "context": {"session": TRACKED_SESSION}
-        }),
-    );
-    assert!(context["result"].is_object(), "{context}");
-
-    let mut subject = None;
-    wait_for("the sweep to adopt the Pi lead", || {
-        let snapshot = client.first_snapshot();
-        subject = snapshot["observation"]["inventory"]["lifecycle_subjects"]
-            .as_array()
-            .and_then(|subjects| subjects.first())
-            .and_then(|record| record["subject_id"].as_str())
-            .map(str::to_owned);
-        subject.is_some()
-    });
-    let subject = subject.expect("an adopted subject");
-    let view = client.call("lifecycle.get", json!({"subject_id": subject}));
-    assert_eq!(view["result"]["subject"]["state"], "bound", "{view}");
-
-    // A later explicit report for the same session finds the adopted binding.
-    let again = enroll_lead(&mut client, &agent, TRACKED_SESSION);
-    assert_eq!(enrolled_subject(&again), subject, "{again}");
-
-    daemon.stop();
-    lead.kill();
-}
-
-#[test]
-fn a_session_held_by_a_live_registration_is_refused_for_a_second_one() {
-    let sandbox = Sandbox::new("lead-duplicate");
-    let lead = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_PRIMITIVES)
-        .observing(&["wA:p1", "wB:p1"])
-        .with_foreground(ForegroundEvidence::command(
-            lead.pid,
-            Some("sh".into()),
-            None,
-        ));
-    let mut daemon =
-        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
-            .expect("daemon");
-    let mut client = Client::dial(daemon.path());
-    let (first, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
-    let enrolled = enroll_lead(&mut client, &first, TRACKED_SESSION);
-    assert_eq!(
-        result_record(&enrolled)["outcome"],
-        "completed",
-        "{enrolled}"
-    );
-
-    // A second registration reporting the same session stays unbound while the
-    // incumbent holds it.
-    let incarnation = random_uuid();
-    let mut body = registration_body(&incarnation, Some(lead.identity.clone()), None);
-    body["location"] = json!({"backend": "tmux", "pane": "wB:p1"});
-    let second = agent_id(&client.call("agent.register", body));
-    let context = client.call(
-        "agent.context",
-        json!({
-            "agent_id": second,
-            "publisher": {"source": "test-publisher", "incarnation": incarnation},
-            "sequence": 1,
-            "lease_ms": 10_000,
-            "context": {"session": TRACKED_SESSION}
-        }),
-    );
-    assert!(context["result"].is_object(), "{context}");
-    let duplicate = enroll_lead(&mut client, &second, TRACKED_SESSION);
-    assert_eq!(
-        result_record(&duplicate)["outcome"],
-        "refused",
-        "{duplicate}"
-    );
-    assert!(
-        result_record(&duplicate)["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("another live process")),
-        "{duplicate}"
-    );
-
-    daemon.stop();
-    lead.kill();
-}
-
-/// A Pi session registration as the baseline publisher makes it: `herdsman-pi`,
-/// in `pane`, reporting `session` first. Returns its agent ID and writer handle.
-fn pi_lead(
+fn presence_lead(
     client: &mut Client,
     lead: &LeadProcess,
     pane: &str,
-    incarnation: &str,
     session: &str,
 ) -> (String, String) {
-    let mut body = registration_body(incarnation, Some(lead.identity.clone()), None);
-    body["source"] = json!("herdsman-pi");
-    body["location"] = json!({"backend": "tmux", "pane": pane});
-    let agent = agent_id(&client.call("agent.register", body));
-    let handle = publish_session(client, &agent, incarnation, None, 1, session);
-    (agent, handle)
-}
-
-/// Publishes the registration's current session at `sequence`, as a Pi session
-/// start or `/resume` does, presenting the writer handle once it has one. Returns
-/// the handle the daemon issued.
-fn publish_session(
-    client: &mut Client,
-    agent: &str,
-    incarnation: &str,
-    handle: Option<&str>,
-    sequence: u64,
-    session: &str,
-) -> String {
-    let mut params = json!({
-        "agent_id": agent,
-        "publisher": {"source": "herdsman-pi", "incarnation": incarnation},
-        "sequence": sequence,
-        "lease_ms": 10_000,
-        "context": {"session": session}
-    });
-    if let Some(handle) = handle {
-        params["writer_handle"] = json!(handle);
-    }
-    let context = client.call("agent.context", params);
-    assert!(context["result"].is_object(), "{context}");
-    context["result"]["writer"]["handle"]
-        .as_str()
-        .expect("context writer handle")
-        .to_owned()
-}
-
-/// The lifecycle subject the snapshot holds for `agent` on `session`, if any.
-fn subject_on(client: &mut Client, agent: &str, session: &str) -> Option<Value> {
-    client.first_snapshot()["observation"]["inventory"]["lifecycle_subjects"]
-        .as_array()?
-        .iter()
-        .find(|record| record["bound_agent_id"] == agent && record["session"] == session)
-        .cloned()
+    let answer = client.call(
+        "agent.presence",
+        json!({
+            "source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
+            "process":lead.identity.clone(), "session_id":session,
+            "claim_id":random_uuid(),
+            "location":{"backend":"tmux", "pane":pane}
+        }),
+    );
+    assert_eq!(answer["result"]["standing"], "granted", "{answer}");
+    (
+        answer["result"]["registration_id"]
+            .as_str()
+            .expect("registration ID")
+            .to_owned(),
+        answer["result"]["subject_id"]
+            .as_str()
+            .expect("subject ID")
+            .to_owned(),
+    )
 }
 
 #[test]
-fn a_session_switch_releases_the_prior_subject_and_restarting_it_is_refused() {
-    let sandbox = Sandbox::new("lead-switch");
+fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant() {
+    let sandbox = Sandbox::new("presence-claims");
     let lead = LeadProcess::start();
+    let duplicate = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1", "wA:p2"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon = Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend))
+        .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let claim = random_uuid();
+    let report = json!({"source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
+        "process":lead.identity,"session_id":TRACKED_SESSION,"claim_id":claim,
+        "location":{"backend":"tmux","pane":"wA:p1"}});
+    let first = client.call("agent.presence", report.clone());
+    assert_eq!(first["result"]["standing"], "granted", "{first}");
+    let registration = first["result"]["registration_id"].clone();
+    let subject = first["result"]["subject_id"].clone();
+    let mut reassert = report.clone();
+    reassert["registration_id"] = registration.clone();
+    reassert["subject_id"] = subject.clone();
+    let replay = client.call("agent.presence", reassert.clone());
+    assert_eq!(replay["result"]["subject_id"], subject, "{replay}");
+    reassert["location"]["pane"] = json!("wA:p2");
+    let moved = client.call("agent.presence", reassert.clone());
+    assert_eq!(moved["result"]["subject_id"], subject, "{moved}");
+    let record = client.call("agent.get", json!({"registration_id": registration}));
+    assert_eq!(
+        record["result"]["agent"]["registration"]["location"]["pane"],
+        "wA:p2"
+    );
+    let mut forged = reassert.clone();
+    forged["subject_id"] = json!(random_uuid());
+    assert!(client.call("agent.presence", forged)["error"].is_object());
+    let duplicate_claim = random_uuid();
+    let rejected_report = json!({"source":"herdsman-pi","incarnation":CHILD_INCARNATION,
+        "process":duplicate.identity,"session_id":TRACKED_SESSION,"claim_id":duplicate_claim,
+        "location":{"backend":"tmux","pane":"wA:p1"}});
+    let rejected = client.call("agent.presence", rejected_report.clone());
+    assert_eq!(rejected["result"]["standing"], "duplicate", "{rejected}");
+    let release = json!({"registration_id":registration,"claim_id":claim,"process":lead.identity});
+    let released = client.call("agent.release", release.clone());
+    assert_eq!(released["result"]["standing"], "released", "{released}");
+    let stopped = client.call_id(
+        &random_uuid(),
+        "lifecycle.stop",
+        json!({"request": {"subject_id": subject}}),
+    );
+    assert_eq!(result_record(&stopped)["outcome"], "refused", "{stopped}");
+    assert!(
+        process_exists(lead.pid),
+        "a released claim authorized a signal"
+    );
+    let inbox = client.call(
+        "communication.inbox",
+        json!({"registration_id": registration}),
+    );
+    assert!(
+        inbox["error"].is_object(),
+        "released claim retained inbox access: {inbox}"
+    );
+    assert_eq!(
+        client.call("agent.presence", report.clone())["result"]["standing"],
+        "released"
+    );
+    assert_eq!(
+        client.call("agent.presence", rejected_report.clone())["result"]["standing"],
+        "duplicate"
+    );
+    let mut fresh = report.clone();
+    fresh["claim_id"] = json!(random_uuid());
+    let granted = client.call("agent.presence", fresh.clone());
+    assert_eq!(granted["result"]["standing"], "granted", "{granted}");
+    assert_eq!(granted["result"]["subject_id"], subject);
+    client.call("agent.release", release);
+    assert_eq!(
+        client.call("agent.presence", fresh.clone())["result"]["standing"],
+        "granted"
+    );
+    daemon.stop();
     let backend = MuxBackend::new(LEAD_PRIMITIVES)
         .observing(&["wA:p1"])
         .with_foreground(ForegroundEvidence::command(
@@ -10979,127 +10914,82 @@ fn a_session_switch_releases_the_prior_subject_and_restarting_it_is_refused() {
             Some("sh".into()),
             None,
         ));
-    let mut daemon =
-        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
-            .expect("daemon");
+    let mut daemon = Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend))
+        .expect("reopen");
     let mut client = Client::dial(daemon.path());
-    let (agent, handle) = pi_lead(
-        &mut client,
-        &lead,
-        "wA:p1",
-        PARENT_INCARNATION,
-        TRACKED_SESSION,
-    );
-    wait_for("the sweep to bind the first session", || {
-        subject_on(&mut client, &agent, TRACKED_SESSION).is_some()
-    });
-    let first =
-        subject_on(&mut client, &agent, TRACKED_SESSION).expect("first subject")["subject_id"]
-            .as_str()
-            .expect("subject id")
-            .to_owned();
-
-    // `/resume` in the same process: the prior subject is released.
-    publish_session(
-        &mut client,
-        &agent,
-        PARENT_INCARNATION,
-        Some(&handle),
-        2,
-        MOVED_SESSION,
-    );
-    wait_for("the sweep to bind the moved session", || {
-        subject_on(&mut client, &agent, MOVED_SESSION).is_some()
-    });
-
-    // The released subject's recipe no longer names the process's session, so a
-    // restart refuses before it stops anything.
-    let restart = restart_lead_subject(&mut client, &first);
-    assert_eq!(result_record(&restart)["outcome"], "refused", "{restart}");
-    assert!(
-        result_record(&restart)["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("no longer matches")),
-        "{restart}"
+    let restored = client.call("agent.presence", fresh);
+    assert_eq!(restored["result"]["subject_id"], subject, "{restored}");
+    assert_eq!(
+        client.call("agent.presence", rejected_report)["result"]["standing"],
+        "duplicate"
     );
     daemon.stop();
+    duplicate.kill();
     lead.kill();
 }
 
 #[test]
-fn a_released_session_rebinds_its_logical_subject_for_the_next_process() {
-    let sandbox = Sandbox::new("lead-rebind");
-    let lead = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_PRIMITIVES)
-        .observing(&["wA:p1", "wB:p1"])
+fn a_fresh_process_reclaims_the_existing_session_subject_after_release_and_restart() {
+    let sandbox = Sandbox::new("presence-resume");
+    let previous = LeadProcess::start();
+    let first_backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1"])
         .with_foreground(ForegroundEvidence::command(
-            lead.pid,
+            previous.pid,
             Some("sh".into()),
             None,
         ));
     let mut daemon =
-        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(first_backend))
             .expect("daemon");
     let mut client = Client::dial(daemon.path());
-    let (agent, handle) = pi_lead(
-        &mut client,
-        &lead,
-        "wA:p1",
-        PARENT_INCARNATION,
-        TRACKED_SESSION,
+    let old_claim = random_uuid();
+    let first = client.call(
+        "agent.presence",
+        json!({
+            "source":"herdsman-pi", "incarnation":random_uuid(), "process":previous.identity,
+            "session_id":TRACKED_SESSION, "claim_id":old_claim,
+            "location":{"backend":"tmux","pane":"wA:p1"}
+        }),
     );
-    wait_for("the sweep to bind the first session", || {
-        subject_on(&mut client, &agent, TRACKED_SESSION).is_some()
-    });
-    let logical =
-        subject_on(&mut client, &agent, TRACKED_SESSION).expect("first subject")["subject_id"]
-            .clone();
-    publish_session(
-        &mut client,
-        &agent,
-        PARENT_INCARNATION,
-        Some(&handle),
-        2,
-        MOVED_SESSION,
+    assert_eq!(first["result"]["standing"], "granted", "{first}");
+    let subject = first["result"]["subject_id"].clone();
+    let old_registration = first["result"]["registration_id"].clone();
+    let released = client.call(
+        "agent.release",
+        json!({
+            "registration_id":old_registration, "claim_id":old_claim, "process":previous.identity
+        }),
     );
-    wait_for("the sweep to bind the moved session", || {
-        subject_on(&mut client, &agent, MOVED_SESSION).is_some()
-    });
-
-    // The session is free: another process reporting it continues the same
-    // logical subject as its next execution.
-    let (next, _) = pi_lead(&mut client, &lead, "wB:p1", &random_uuid(), TRACKED_SESSION);
-    wait_for("the next process to rebind the session", || {
-        subject_on(&mut client, &next, TRACKED_SESSION).is_some()
-    });
-    let rebound = subject_on(&mut client, &next, TRACKED_SESSION).expect("rebound subject");
-    assert_eq!(rebound["subject_id"], logical, "{rebound}");
-    // The logical subject now resolves to the new process's execution.
-    let current = client.call("lifecycle.get", json!({"subject_id": logical}));
-    assert_eq!(
-        current["result"]["subject"]["execution_generation"], 2,
-        "{current}"
-    );
-    assert_eq!(
-        current["result"]["subject"]["bound_agent_id"],
-        next.as_str(),
-        "{current}"
-    );
+    assert_eq!(released["result"]["standing"], "released", "{released}");
     daemon.stop();
-    lead.kill();
-}
 
-fn enrolled_subject(enrolled: &Value) -> String {
-    result_record(enrolled)["effects"]
-        .as_array()
-        .and_then(|effects| {
-            effects
-                .iter()
-                .filter_map(Value::as_str)
-                .find_map(|effect| effect.strip_prefix("enrolled subject "))
-        })
-        .expect("an enrolled subject effect")
-        .to_string()
+    let resumed = LeadProcess::start();
+    let resumed_backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            resumed.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(resumed_backend))
+            .expect("reopened daemon");
+    let mut client = Client::dial(daemon.path());
+    let attached = client.call(
+        "agent.presence",
+        json!({
+            "source":"herdsman-pi", "incarnation":random_uuid(), "process":resumed.identity,
+            "session_id":TRACKED_SESSION, "claim_id":random_uuid(),
+            "location":{"backend":"tmux","pane":"wA:p1"}
+        }),
+    );
+    assert_eq!(attached["result"]["standing"], "granted", "{attached}");
+    assert_eq!(attached["result"]["subject_id"], subject);
+    assert_ne!(attached["result"]["registration_id"], old_registration);
+    daemon.stop();
+    resumed.kill();
+    previous.kill();
 }
 
 fn restart_lead_subject_with_id(client: &mut Client, request_id: &str, subject: &str) -> Value {
@@ -11115,8 +11005,8 @@ fn restart_lead_subject(client: &mut Client, subject: &str) -> Value {
 }
 
 #[test]
-fn enrollment_binds_a_verified_lead_idempotently() {
-    let sandbox = Sandbox::new("lead-enroll");
+fn lifecycle_enrollment_without_a_presence_claim_is_refused() {
+    let sandbox = Sandbox::new("lead-enroll-refusals");
     let lead = LeadProcess::start();
     let backend = MuxBackend::new(LEAD_PRIMITIVES)
         .observing(&["wA:p1"])
@@ -11131,102 +11021,26 @@ fn enrollment_binds_a_verified_lead_idempotently() {
     let mut client = Client::dial(daemon.path());
     let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
 
-    let enrolled = enroll_lead(&mut client, &agent, TRACKED_SESSION);
+    let unclaimed = client.call_id(
+        &random_uuid(),
+        "lifecycle.enroll",
+        json!({"request": {"registration_id": agent, "session": TRACKED_SESSION}}),
+    );
     assert_eq!(
-        result_record(&enrolled)["outcome"],
-        "completed",
-        "{enrolled}"
+        result_record(&unclaimed)["outcome"],
+        "refused",
+        "{unclaimed}"
     );
-    let subject = enrolled_subject(&enrolled);
-    let view = client.call("lifecycle.get", json!({"subject_id": subject}));
-    assert_eq!(view["result"]["subject"]["state"], "bound", "{view}");
-    let selected =
-        agent_radar::control_plane::client::connect_at(daemon.path()).expect("dashboard client");
-    // The snapshot carries the daemon's lifecycle subjects, which is what a
-    // display reads to offer a managed action on one.
-    let snapshot = client.first_snapshot();
-    let subjects = snapshot["observation"]["inventory"]["lifecycle_subjects"]
-        .as_array()
-        .unwrap_or_else(|| panic!("lifecycle subjects in the snapshot: {snapshot}"));
     assert!(
-        subjects
-            .iter()
-            .any(|record| record["subject_id"] == subject),
-        "the daemon's own lifecycle subjects were not in the snapshot: {snapshot}"
+        result_record(&unclaimed)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("presence claim")),
+        "{unclaimed}"
     );
-    let public = view.to_string();
-    assert!(!public.contains("/bin/sh"), "private launch leaked: {view}");
-    assert!(
-        !public.contains("PATH"),
-        "private environment leaked: {view}"
-    );
-
-    // Enrollment is idempotent: a repeated report for the same session answers
-    // with the established subject rather than a second binding.
-    let again = enroll_lead(&mut client, &agent, TRACKED_SESSION);
-    assert_eq!(result_record(&again)["outcome"], "completed", "{again}");
-    assert_eq!(enrolled_subject(&again), subject, "{again}");
-    let stop_id = random_uuid();
-    let stopped = selected
-        .lifecycle
-        .as_ref()
-        .expect("daemon lifecycle controls")
-        .stop_subject(
-            &agent_radar::control_plane::client::LifecycleControlRequest {
-                request_id: stop_id.clone(),
-                subject_id: subject.clone(),
-            },
-            &AtomicBool::new(false),
-        )
-        .expect("lifecycle.stop socket control");
-    assert_eq!(stopped.outcome(), "completed", "{stopped:?}");
-    let second_client = agent_radar::control_plane::client::connect_at(daemon.path())
-        .expect("second dashboard client");
-    let readback = second_client
-        .lifecycle
-        .as_ref()
-        .expect("second lifecycle controls")
-        .read_operation(&stop_id, &AtomicBool::new(false))
-        .expect("operation readback")
-        .expect("durable stop record");
-    assert_eq!(readback.outcome(), "completed", "{readback:?}");
-    assert!(
-        !process_exists(lead.pid),
-        "lifecycle.stop left the lead alive"
-    );
-
-    daemon.stop();
-    lead.kill();
-}
-
-#[test]
-fn enrollment_refuses_a_session_mismatch_and_a_foreign_foreground_without_binding() {
-    let sandbox = Sandbox::new("lead-enroll-refusals");
-    let lead = LeadProcess::start();
-    let other = LeadProcess::start();
-    let backend = MuxBackend::new(LEAD_PRIMITIVES)
-        .observing(&["wA:p1"])
-        .with_foreground(ForegroundEvidence::command(
-            other.pid,
-            Some("sh".into()),
-            None,
-        ));
-    let mut daemon =
-        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
-            .expect("daemon");
-    let mut client = Client::dial(daemon.path());
-    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
-
-    let wrong_session = enroll_lead(&mut client, &agent, &random_uuid());
-    assert_eq!(error_code(&wrong_session), "refused", "{wrong_session}");
-
-    // The pane's foreground is another process, not the one the registration claims.
-    let foreign = enroll_lead(&mut client, &agent, TRACKED_SESSION);
-    assert_eq!(result_record(&foreign)["outcome"], "refused", "{foreign}");
 
     let malformed = client.call(
         "lifecycle.enroll",
-        json!({"request": {"agent_id": agent, "session": "not-a-uuid"}}),
+        json!({"request": {"registration_id": agent, "session": "not-a-uuid"}}),
     );
     assert_eq!(error_code(&malformed), "bad_params", "{malformed}");
 
@@ -11239,7 +11053,6 @@ fn enrollment_refuses_a_session_mismatch_and_a_foreign_foreground_without_bindin
 
     daemon.stop();
     lead.kill();
-    other.kill();
 }
 
 #[test]
@@ -11257,9 +11070,7 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
             .expect("daemon");
     let mut client = Client::dial(daemon.path());
-    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
-    let enrolled = enroll_lead(&mut client, &agent, TRACKED_SESSION);
-    let subject = enrolled_subject(&enrolled);
+    let (_agent, subject) = presence_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
 
     let restart_id = random_uuid();
     let selected =
@@ -11370,8 +11181,7 @@ fn restart_refuses_before_any_signal_when_the_session_context_changes() {
         Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
             .expect("daemon");
     let mut client = Client::dial(daemon.path());
-    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
-    let subject = enrolled_subject(&enroll_lead(&mut client, &agent, TRACKED_SESSION));
+    let (agent, subject) = presence_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
 
     let unknown = restart_lead_subject(&mut client, &random_uuid());
     assert_eq!(error_code(&unknown), "not_found", "{unknown}");
@@ -11381,28 +11191,19 @@ fn restart_refuses_before_any_signal_when_the_session_context_changes() {
     );
     assert_eq!(error_code(&malformed), "bad_params", "{malformed}");
 
-    // The lead's session changes after enrollment, so its resume recipe no longer
-    // names the live session.
+    // A fresh presence claim switches the same process to a different session.
     let moved = client.call(
-        "agent.context",
+        "agent.presence",
         json!({
-            "agent_id": agent,
-            "publisher": {"source":"test-publisher", "incarnation":PARENT_INCARNATION},
-            "writer_handle": _writer,
-            "sequence": 2,
-            "lease_ms": 10_000,
-            "context": {"session": random_uuid()}
+            "source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
+            "registration_id":agent, "process":lead.identity.clone(),
+            "session_id":random_uuid(), "claim_id":random_uuid(),
+            "location":{"backend":"tmux", "pane":"wA:p1"}
         }),
     );
-    assert!(moved["result"].is_object(), "{moved}");
+    assert_eq!(moved["result"]["standing"], "granted", "{moved}");
     let stale = restart_lead_subject(&mut client, &subject);
     assert_eq!(result_record(&stale)["outcome"], "refused", "{stale}");
-    assert!(
-        result_record(&stale)["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("no longer matches")),
-        "{stale}"
-    );
     assert!(
         process_exists(lead.pid),
         "a session refusal signalled the lead"
@@ -11414,8 +11215,8 @@ fn restart_refuses_before_any_signal_when_the_session_context_changes() {
 }
 
 #[test]
-fn restart_refuses_when_the_lead_pane_is_no_longer_present() {
-    let sandbox = Sandbox::new("lead-restart-anchor");
+fn presence_waits_without_a_current_pane_location() {
+    let sandbox = Sandbox::new("presence-pane-pending");
     let lead = LeadProcess::start();
     let backend = MuxBackend::new(LEAD_PRIMITIVES)
         .observing(&["wA:p9"])
@@ -11424,31 +11225,20 @@ fn restart_refuses_when_the_lead_pane_is_no_longer_present() {
             Some("sh".into()),
             None,
         ));
-    let mut daemon =
-        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
-            .expect("daemon");
+    let mut daemon = Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend))
+        .expect("daemon");
     let mut client = Client::dial(daemon.path());
-    let (agent, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
-    let subject = enrolled_subject(&enroll_lead(&mut client, &agent, TRACKED_SESSION));
-
-    let anchorless = restart_lead_subject(&mut client, &subject);
-    assert_eq!(
-        result_record(&anchorless)["outcome"],
-        "refused",
-        "{anchorless}"
+    let answer = client.call(
+        "agent.presence",
+        json!({
+            "source":"herdsman-pi", "incarnation":PARENT_INCARNATION,
+            "process":lead.identity.clone(), "session_id":TRACKED_SESSION,
+            "claim_id":random_uuid()
+        }),
     );
-    assert!(
-        result_record(&anchorless)["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("no longer present")),
-        "{anchorless}"
-    );
-    assert!(
-        process_exists(lead.pid),
-        "an anchor refusal signalled the lead"
-    );
-    assert!(backend.launches().is_empty());
-
+    assert_eq!(answer["result"]["standing"], "pending", "{answer}");
+    let subjects = client.call("lifecycle.list", json!({}));
+    assert_eq!(subjects["result"]["subjects"].as_array().unwrap().len(), 0);
     daemon.stop();
     lead.kill();
 }

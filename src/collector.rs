@@ -453,7 +453,7 @@ fn collect(
                 .iter()
                 .map(|subject| crate::model::LifecycleObservation {
                     subject_id: subject.subject_id.clone(),
-                    bound_agent_id: subject.bound_agent_id.clone(),
+                    bound_registration_id: subject.bound_registration_id.clone(),
                     process: subject.process.clone(),
                     state: subject.state,
                     session: subject.session.clone(),

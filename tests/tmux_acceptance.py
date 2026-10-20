@@ -255,25 +255,25 @@ class Fleet:
             registration["label"] = label
         if claim is not None:
             registration["process"] = claim
-        return call(self.socket, "agent.register", registration)["registration"]["agent_id"]
+        return call(self.socket, "agent.register", registration)["registration"]["registration_id"]
 
-    def publish_execution(self, agent_id, activity):
+    def publish_execution(self, registration_id, activity):
         writer = call(self.socket, "agent.acquire", {
-            "agent_id": agent_id, "channel": "execution",
+            "registration_id": registration_id, "channel": "execution",
             "publisher": {"source": "pi", "incarnation": str(uuid.uuid4())}})["writer"]
         channel = call(self.socket, "agent.publish", {
-            "agent_id": agent_id, "channel": "execution", "writer_handle": writer["handle"],
+            "registration_id": registration_id, "channel": "execution", "writer_handle": writer["handle"],
             "sequence": 1, "snapshot": {"activity": activity},
             "lease_ms": MAX_LEASE_MS})["channel"]
         check(channel["snapshot"]["freshness"] == "fresh", str(channel))
 
-    def publish_assignment(self, agent_id):
+    def publish_assignment(self, registration_id):
         writer = call(self.socket, "agent.acquire", {
-            "agent_id": agent_id, "channel": "assignment",
+            "registration_id": registration_id, "channel": "assignment",
             "publisher": {"source": "herdsman", "incarnation": str(uuid.uuid4()),
                           "reporting_owner": OWNER}})["writer"]
         channel = call(self.socket, "agent.publish", {
-            "agent_id": agent_id, "channel": "assignment", "writer_handle": writer["handle"],
+            "registration_id": registration_id, "channel": "assignment", "writer_handle": writer["handle"],
             "sequence": 1, "lease_ms": MAX_LEASE_MS,
             "snapshot": {"activity": "working", "role": "worker",
                          "definition": "acceptance-worker", "run": "run-1",
@@ -283,9 +283,9 @@ class Fleet:
                          "last_outcome": {"result": "partial", "detail": "pending"}}})["channel"]
         check(channel["snapshot"]["freshness"] == "fresh", str(channel))
 
-    def publish_facts(self, agent_id, lease_ms, snapshot):
+    def publish_facts(self, registration_id, lease_ms, snapshot):
         return publisher.publish_facts(
-            self.socket, agent_id, {"source": "pi", "incarnation": str(uuid.uuid4())},
+            self.socket, registration_id, {"source": "pi", "incarnation": str(uuid.uuid4())},
             snapshot, 1, lease_ms=lease_ms)
 
     # -- the dashboard -----------------------------------------------------

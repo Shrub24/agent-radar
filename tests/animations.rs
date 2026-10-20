@@ -48,7 +48,7 @@ unknown = "diamond"
     let mut observation = FleetObservation::default();
     observation.lifecycle_subjects.push(LifecycleObservation {
         subject_id: "pending-subject".into(),
-        bound_agent_id: None,
+        bound_registration_id: None,
         process: None,
         state: LifecycleState::Pending,
         session: None,

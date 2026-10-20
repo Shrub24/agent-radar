@@ -944,13 +944,13 @@ fn handle_line(
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HandoffInboxParams {
-    agent_id: String,
+    registration_id: String,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HandoffReadParams {
-    agent_id: String,
+    registration_id: String,
     handoff_id: String,
 }
 
@@ -970,7 +970,7 @@ fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) -> Response
                     Ok(value) => value,
                     Err(response) => return response,
                 };
-            let sender = match communication_identity(&registry, &params.sender_agent_id) {
+            let sender = match communication_identity(&registry, &params.sender_registration_id) {
                 Ok(identity) => identity,
                 Err(error) => return communication_error(request, error),
             };
@@ -998,7 +998,7 @@ fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) -> Response
                             "communication.handoff_published",
                             &handoff.id,
                             subject_id,
-                            &handoff.sender.agent_id,
+                            &handoff.sender.registration_id,
                         );
                     }
                     Response::ok(
@@ -1014,7 +1014,7 @@ fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) -> Response
                 Ok(value) => value,
                 Err(response) => return response,
             };
-            let identity = match communication_identity(&registry, &params.agent_id) {
+            let identity = match communication_identity(&registry, &params.registration_id) {
                 Ok(identity) => identity,
                 Err(error) => return communication_error(request, error),
             };
@@ -1037,7 +1037,7 @@ fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) -> Response
                 Ok(value) => value,
                 Err(response) => return response,
             };
-            let identity = match communication_identity(&registry, &params.agent_id) {
+            let identity = match communication_identity(&registry, &params.registration_id) {
                 Ok(identity) => identity,
                 Err(error) => return communication_error(request, error),
             };
@@ -1054,7 +1054,7 @@ fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) -> Response
                 Ok(value) => value,
                 Err(response) => return response,
             };
-            let identity = match communication_identity(&registry, &params.agent_id) {
+            let identity = match communication_identity(&registry, &params.registration_id) {
                 Ok(identity) => identity,
                 Err(error) => return communication_error(request, error),
             };
@@ -1067,7 +1067,7 @@ fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) -> Response
                             "communication.handoff_acknowledged",
                             &receipt.handoff_id,
                             Some(identity.subject_id.clone()),
-                            &identity.agent_id,
+                            &identity.registration_id,
                         );
                     }
                     Response::ok(
@@ -1087,13 +1087,15 @@ fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) -> Response
 
 fn communication_identity(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
 ) -> Result<crate::control_plane::public_contracts::HandoffIdentity, communication::Error> {
-    if !valid_identifier(agent_id) {
-        return Err(communication::Error::Invalid("agent_id is invalid".into()));
+    if !valid_identifier(registration_id) {
+        return Err(communication::Error::Invalid(
+            "registration_id is invalid".into(),
+        ));
     }
     let context = registry
-        .context(agent_id, unix_millis())
+        .context(registration_id, unix_millis())
         .map_err(communication::Error::Internal)?
         .ok_or(communication::Error::NotFound)?;
     if context.context.freshness != crate::control_plane::registry::publication::Freshness::Fresh {
@@ -1106,7 +1108,7 @@ fn communication_identity(
         .session
         .ok_or_else(|| communication::Error::Invalid("sender has no current Pi session".into()))?;
     let now_ms = unix_millis();
-    let subject = match subjects::attachment(registry, agent_id, &session_id, now_ms)
+    let subject = match subjects::attachment(registry, registration_id, &session_id, now_ms)
         .map_err(communication::Error::Internal)?
     {
         subjects::Attachment::Own(subject) => *subject,
@@ -1123,7 +1125,7 @@ fn communication_identity(
         ));
     }
     Ok(crate::control_plane::public_contracts::HandoffIdentity {
-        agent_id: agent_id.to_owned(),
+        registration_id: registration_id.to_owned(),
         session_id,
         subject_id: subject
             .logical_subject_id
@@ -1171,7 +1173,7 @@ fn append_communication_event(
     kind: &str,
     handoff_id: &str,
     subject_id: Option<String>,
-    agent_id: &str,
+    registration_id: &str,
 ) {
     let event = store::Event {
         subject_id,
@@ -1180,7 +1182,7 @@ fn append_communication_event(
         lifecycle_event_id: None,
         seq: 0,
         kind: kind.to_owned(),
-        agent_id: Some(agent_id.to_owned()),
+        registration_id: Some(registration_id.to_owned()),
         spawn: None,
         request_id: Some(handoff_id.to_owned()),
         at: store::now(),
@@ -1333,7 +1335,7 @@ fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentGetParams {
-    agent_id: String,
+    registration_id: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1357,7 +1359,7 @@ struct AgentListParams {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentRetireParams {
-    agent_id: String,
+    registration_id: String,
     channel: Channel,
     writer_handle: String,
 }
@@ -2317,12 +2319,191 @@ fn close_response(request: &Request, close: &registry::ChildClose) -> Response {
     }
 }
 
+fn presence_request(
+    core: &Arc<Mutex<Core>>,
+    request: &Request,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    use registry::presence::{self, Standing};
+    let (registry, verifier, backend, stopping) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            Arc::clone(&core.verifier),
+            core.backend.clone(),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let _presence = registry.presence.lock().unwrap_or_else(|e| e.into_inner());
+    let now = store::now_ms();
+    let result = (|| -> Result<presence::Claim, String> {
+        if request.method == "agent.release" {
+            let release: presence::Release =
+                serde_json::from_value(request.params.clone()).map_err(|e| e.to_string())?;
+            let registration = registry
+                .get(&release.registration_id)?
+                .ok_or("registration is not recorded")?;
+            if registration.request.process.as_ref() != Some(&release.process)
+                || !matches!(verifier.inspect(release.process.pid), Ok(Some(p)) if p == release.process)
+            {
+                return Err("release does not identify the registered live process".into());
+            }
+            return presence::release(&registry, &release.registration_id, &release.claim_id);
+        }
+        let report: presence::Report =
+            serde_json::from_value(request.params.clone()).map_err(|e| e.to_string())?;
+        for id in [&report.claim_id, &report.session_id, &report.incarnation] {
+            registry::validate_registration_id(id)?;
+        }
+        if let Some(subject_id) = &report.subject_id {
+            registry::validate_registration_id(subject_id)?;
+        }
+        let process_observation = verifier.inspect(report.process.pid);
+        match &process_observation {
+            Ok(Some(process)) if process == &report.process => {}
+            Err(_) => {}
+            Ok(_) => return Err("process birth identity is absent or mismatched".into()),
+        }
+        let registration = presence::registration(&registry, &report, now)?;
+        if report.spawn_token.is_some() && report.spawn_token != registration.request.spawn_token {
+            return Err("launch correlation does not match the recorded registration".into());
+        }
+        let mut claim = presence::begin(
+            &registry,
+            &registration.registration_id,
+            &report.claim_id,
+            &report.session_id,
+            None,
+        )?;
+        if matches!(claim.standing, Standing::Released | Standing::Duplicate) {
+            return Ok(claim);
+        }
+        if process_observation.is_err() {
+            return Ok(claim);
+        }
+        let mut attachment = subjects::attachment(
+            &registry,
+            &registration.registration_id,
+            &report.session_id,
+            now,
+        )?;
+        if let subjects::Attachment::Other(holder) = &attachment
+            && subjects::release_if_gone(&registry, holder, verifier.as_ref(), now)?
+        {
+            attachment = subjects::attachment(
+                &registry,
+                &registration.registration_id,
+                &report.session_id,
+                now,
+            )?;
+        }
+        if matches!(attachment, subjects::Attachment::Other(_)) {
+            claim.standing = Standing::Duplicate;
+            claim.subject_id = None;
+            presence::save(&registry, &claim)?;
+            return Ok(claim);
+        }
+        let Some(backend) = backend else {
+            return Ok(claim);
+        };
+        let Some(pane) = report
+            .location
+            .as_ref()
+            .and_then(|location| location.pane.as_deref())
+        else {
+            return Ok(claim);
+        };
+        if verify_live_occupant(
+            &backend,
+            &verifier,
+            pane,
+            &report.process,
+            &stopping,
+            verification,
+        )
+        .is_err()
+        {
+            return Ok(claim);
+        }
+        claim = presence::begin(
+            &registry,
+            &registration.registration_id,
+            &report.claim_id,
+            &report.session_id,
+            report.location.clone(),
+        )?;
+        registry::context::report_presence(
+            &registry,
+            &registration.registration_id,
+            registry::PublisherIdentity {
+                source: registration.request.source.clone(),
+                incarnation: registration.request.incarnation.clone(),
+                reporting_owner: None,
+            },
+            Some(report.session_id.clone()),
+            now,
+        )?;
+        subjects::record_launch_session(
+            &registry,
+            &registration.registration_id,
+            &report.session_id,
+            now,
+        )?;
+        attachment = subjects::attachment(
+            &registry,
+            &registration.registration_id,
+            &report.session_id,
+            now,
+        )?;
+        let subject = match attachment {
+            subjects::Attachment::Other(_) => {
+                claim.standing = Standing::Duplicate;
+                claim.subject_id = None;
+                presence::save(&registry, &claim)?;
+                return Ok(claim);
+            }
+            subjects::Attachment::Own(subject) => *subject,
+            subjects::Attachment::Free => {
+                let id = record_enrollment(
+                    &registry,
+                    &verifier,
+                    &EnrollParams {
+                        registration_id: registration.registration_id.clone(),
+                        session: report.session_id,
+                    },
+                    &report.process,
+                    &report.claim_id,
+                    now,
+                )?;
+                subjects::read(&registry, &id)?.ok_or("enrolled subject is missing")?
+            }
+        };
+        let subject_id = subject.logical_subject_id.unwrap_or(subject.subject_id);
+        if report
+            .subject_id
+            .as_deref()
+            .is_some_and(|known| known != subject_id)
+        {
+            return Err("reported subject does not match Radar's stored claim".into());
+        }
+        claim.subject_id = Some(subject_id);
+        claim.standing = Standing::Granted;
+        presence::save(&registry, &claim)?;
+        Ok(claim)
+    })();
+    match result {
+        Ok(claim) => Response::ok(&request.id, json!(presence::Answer::from(&claim))),
+        Err(error) => registry_error(request, error),
+    }
+}
+
 fn registry_request(
     core: &Arc<Mutex<Core>>,
     request: &Request,
     verification: &Arc<VerificationBudget>,
 ) -> Response {
     match request.method.as_str() {
+        "agent.presence" | "agent.release" => presence_request(core, request, verification),
         "agent.register" => {
             let registration: RegistrationRequest = match decode_params(request) {
                 Ok(value) => value,
@@ -2374,7 +2555,7 @@ fn registry_request(
                     if let Some(session) = publish.context.session.as_deref()
                         && let Err(error) = subjects::record_launch_session(
                             &core.registry,
-                            &publish.agent_id,
+                            &publish.registration_id,
                             session,
                             now_ms,
                         )
@@ -2389,7 +2570,7 @@ fn registry_request(
                             "writer": result.record.writer,
                             "context": result.record.public(now_ms, core.registry.serving_epoch()),
                             "warning": result.warning,
-                            "management": management_view(&core.registry, &publish.agent_id, now_ms),
+                            "management": management_view(&core.registry, &publish.registration_id, now_ms),
                         }),
                     )
                 }
@@ -2403,7 +2584,7 @@ fn registry_request(
             };
             let core = locked(core);
             match core.registry.retire(
-                &params.agent_id,
+                &params.registration_id,
                 params.channel,
                 &params.writer_handle,
                 store::now_ms(),
@@ -2428,7 +2609,7 @@ fn registry_request(
                     Arc::clone(&core.stopping),
                 )
             };
-            let registration = match registry.get(&params.agent_id) {
+            let registration = match registry.get(&params.registration_id) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     return Response::refused(
@@ -2452,20 +2633,25 @@ fn registry_request(
             }
             let now_ms = store::now_ms();
             let execution =
-                match registry.published_facts(&params.agent_id, Channel::Execution, now_ms) {
+                match registry.published_facts(&params.registration_id, Channel::Execution, now_ms)
+                {
                     Ok(value) => value,
                     Err(error) => return registry_error(request, error),
                 };
-            let assignment =
-                match registry.published_facts(&params.agent_id, Channel::Assignment, now_ms) {
-                    Ok(value) => value,
-                    Err(error) => return registry_error(request, error),
-                };
-            let facts = match registry.published_facts(&params.agent_id, Channel::Facts, now_ms) {
+            let assignment = match registry.published_facts(
+                &params.registration_id,
+                Channel::Assignment,
+                now_ms,
+            ) {
                 Ok(value) => value,
                 Err(error) => return registry_error(request, error),
             };
-            let context = match registry.context(&params.agent_id, now_ms) {
+            let facts =
+                match registry.published_facts(&params.registration_id, Channel::Facts, now_ms) {
+                    Ok(value) => value,
+                    Err(error) => return registry_error(request, error),
+                };
+            let context = match registry.context(&params.registration_id, now_ms) {
                 Ok(value) => value,
                 Err(error) => return registry_error(request, error),
             };
@@ -2563,7 +2749,7 @@ fn registry_request(
             let next = (entries.len() < candidates.len() || has_more).then(|| {
                 entries
                     .last()
-                    .expect("a continuation has a returned record")["registration"]["agent_id"]
+                    .expect("a continuation has a returned record")["registration"]["registration_id"]
                     .as_str()
                     .expect("public registration id")
                     .to_owned()
@@ -4623,8 +4809,8 @@ fn execute_container_delete(
         let named: Vec<String> = occupied
             .iter()
             .map(|registration| match registration.label.as_deref() {
-                Some(label) => format!("{label} ({})", registration.agent_id),
-                None => registration.agent_id.clone(),
+                Some(label) => format!("{label} ({})", registration.registration_id),
+                None => registration.registration_id.clone(),
             })
             .collect();
         return write_refused(
@@ -5496,7 +5682,8 @@ fn spawn_child(
         let registry = Arc::clone(&locked(core).registry);
         match subjects::read_logical(&registry, parent_subject_id) {
             Ok(Some(parent_subject))
-                if parent_subject.bound_agent_id.as_deref() == Some(params.parent.as_str()) => {}
+                if parent_subject.bound_registration_id.as_deref()
+                    == Some(params.parent.as_str()) => {}
             Ok(Some(_)) => {
                 return Response::refused(
                     &request.id,
@@ -6042,6 +6229,31 @@ fn execute_subject_control(
         }
         Admission::Dispatch(..) => {}
     }
+    let current_subject = match subjects::read(&registry, &subject_id) {
+        Ok(subject) => subject,
+        Err(error) => return registry_error(request, error),
+    };
+    if current_subject
+        .as_ref()
+        .is_some_and(|subject| !current_presence_grant(&registry, subject).unwrap_or(false))
+    {
+        let record = RequestRecord::new(
+            &request.id,
+            operation.as_str(),
+            requester,
+            Some(target.clone()),
+            now,
+        )
+        .with_params(request.params.clone())
+        .complete(
+            RequestOutcome::Refused,
+            Some(Category::BACKEND_REFUSED),
+            Some("the Pi session has no current granted presence claim"),
+            Vec::new(),
+            store::now_ms(),
+        );
+        return write_settled(request, record, core);
+    }
     let (verifier, backend, stopping) = {
         let core = locked(core);
         (
@@ -6099,7 +6311,7 @@ fn execute_subject_control(
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnrollParams {
-    agent_id: String,
+    registration_id: String,
     session: String,
 }
 
@@ -6168,7 +6380,7 @@ fn execute_enroll(
         )
     };
     let now = store::now_ms();
-    let registration = match registry.get(&params.agent_id) {
+    let registration = match registry.get(&params.registration_id) {
         Ok(Some(registration)) => registration,
         Ok(None) => {
             return Response::refused(
@@ -6201,7 +6413,7 @@ fn execute_enroll(
             ),
         );
     };
-    match registry.context(&params.agent_id, now) {
+    match registry.context(&params.registration_id, now) {
         Ok(Some(context))
             if context.context.freshness == registry::Freshness::Fresh
                 && context.context.session.as_deref() == Some(params.session.as_str()) => {}
@@ -6281,6 +6493,16 @@ fn record_enrollment(
     enrollment_id: &str,
     now: i64,
 ) -> Result<String, String> {
+    let presence = registry::presence::current(registry, &params.registration_id)?
+        .ok_or("lifecycle enrollment requires a current presence claim")?;
+    if presence.session_id != params.session
+        || !matches!(
+            presence.standing,
+            registry::presence::Standing::Pending | registry::presence::Standing::Granted
+        )
+    {
+        return Err("lifecycle enrollment does not match an accepted presence claim".into());
+    }
     let effective = process_control::effective(claim.pid)
         .map_err(|_| "launch context is unavailable".to_string())?;
     if !matches!(verifier.inspect(claim.pid), Ok(Some(observed)) if observed == *claim) {
@@ -6290,7 +6512,7 @@ fn record_enrollment(
     subjects::enroll_subject(
         registry,
         enrollment_id,
-        &params.agent_id,
+        &params.registration_id,
         claim,
         &params.session,
         launch,
@@ -6363,7 +6585,7 @@ fn execute_restart(
     };
     // The anchor is the lead's own pane: a dead lead's pane stays addressable under
     // remain-on-exit, and a replacement is split from it rather than from a parent.
-    let anchor = match subject.bound_agent_id.as_deref() {
+    let anchor = match subject.bound_registration_id.as_deref() {
         Some(agent) => match registry.get(agent) {
             Ok(Some(registration)) => registration
                 .request
@@ -6462,8 +6684,11 @@ fn restart_lead(
     if subject.state != subjects::State::Bound {
         return refusal_settlement("the subject is not bound to a live process");
     }
+    if !current_presence_grant(&registry, subject).unwrap_or(false) {
+        return refusal_settlement("the Pi session has no current granted presence claim");
+    }
     let (Some(agent), Some(session)) = (
-        subject.bound_agent_id.as_deref(),
+        subject.bound_registration_id.as_deref(),
         subject.session.as_deref(),
     ) else {
         return refusal_settlement("the subject has no session to resume; enroll it first");
@@ -6650,6 +6875,34 @@ fn restart_lead(
 }
 
 /// The subject a cancel or stop names and the target it is admitted under.
+fn current_presence_grant(
+    registry: &Registry,
+    subject: &subjects::Subject,
+) -> Result<bool, String> {
+    let (Some(registration_id), Some(session)) = (
+        subject.bound_registration_id.as_deref(),
+        subject.session.as_deref(),
+    ) else {
+        return Ok(true);
+    };
+    let Some(registration) = registry.get(registration_id)? else {
+        return Ok(false);
+    };
+    if registration.request.source != "herdsman-pi" {
+        return Ok(true);
+    }
+    let Some(claim) = registry::presence::current(registry, registration_id)? else {
+        return Ok(false);
+    };
+    let expected_subject = subject
+        .logical_subject_id
+        .as_deref()
+        .unwrap_or(&subject.subject_id);
+    Ok(claim.standing == registry::presence::Standing::Granted
+        && claim.session_id == session
+        && claim.subject_id.as_deref() == Some(expected_subject))
+}
+
 fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String, String), Refusal> {
     let internal = |error: String| Refusal::new(Code::Internal, error);
     let subject = match (&params.subject_id, &params.spawn_request_id) {
@@ -6795,11 +7048,7 @@ fn spawn_sweeper(
                 {
                     tracing::error!(%error, "launch pane observation failed");
                 }
-                if let Err(error) =
-                    bind_launched_leads(&core, &registry, observation.as_ref(), &verification)
-                {
-                    tracing::error!(%error, "launch enrollment pass failed");
-                }
+
                 if let Err(error) = adopt_topology(
                     &core,
                     &registry,
@@ -6822,153 +7071,29 @@ fn spawn_sweeper(
 /// How many recorded spawn edges one pane-evidence pass may examine.
 const MAX_PANE_OBSERVATIONS: usize = 64;
 
-/// Most launched places one binding pass attempts, so a fleet larger than one
-/// page is still covered over successive passes.
-const MAX_LEAD_BINDINGS: usize = 16;
-
-/// How many registrations one page of the enrollment pass reads.
-const REGISTRY_SCAN: usize = 128;
-
-/// The publisher label of the Pi session baseline. Its registrations are the Pi
-/// sessions Radar adopts; a managed child carries a spawn token and is bound by
-/// its launch instead.
-// HACK: the baseline's label predates adoption and is shared with Herdsman's Pi
-// integration; renaming it is a wire migration owned by the pi-radar release.
-const PI_PUBLISHER_SOURCE: &str = "herdsman-pi";
-
 /// The management standing of a publisher's current session, so a publisher can
 /// tell managed, unmanaged and duplicate sessions apart after each publication.
 /// Read errors answer `unmanaged` rather than failing the publication, which
 /// already succeeded.
 fn management_view(
     registry: &registry::Registry,
-    agent_id: &str,
+    registration_id: &str,
     now_ms: i64,
 ) -> serde_json::Value {
-    let session = match registry.context(agent_id, now_ms) {
+    let session = match registry.context(registration_id, now_ms) {
         Ok(Some(context)) => context.context.session,
         _ => None,
     };
     let Some(session) = session else {
         return json!({"state": "unmanaged"});
     };
-    match subjects::attachment(registry, agent_id, &session, now_ms) {
+    match subjects::attachment(registry, registration_id, &session, now_ms) {
         Ok(subjects::Attachment::Own(subject_id)) => {
             json!({"state": "managed", "subject_id": subject_id})
         }
-        Ok(subjects::Attachment::Other) => json!({"state": "duplicate"}),
+        Ok(subjects::Attachment::Other(_)) => json!({"state": "duplicate"}),
         Ok(subjects::Attachment::Free) | Err(_) => json!({"state": "unmanaged"}),
     }
-}
-
-/// Adopts eligible Pi registrations as managed leads: the registration is verified
-/// in the pane it reports and reports a fresh session. The display does not own
-/// this, so adoption does not depend on a dashboard being connected.
-///
-/// Re-checked on every pass while a registration's session is unattached, so a
-/// session that a live process holds is refused cheaply, and the first pass after
-/// the incumbent releases it binds it. A session switch in the same process is
-/// picked up the same way.
-fn bind_launched_leads(
-    core: &Arc<Mutex<Core>>,
-    registry: &Arc<Registry>,
-    observation: Option<&FleetObservation>,
-    verification: &Arc<VerificationBudget>,
-) -> Result<usize, String> {
-    let Some(inventory) = observation else {
-        return Ok(0);
-    };
-    let (backend, verifier, stopping) = {
-        let core = locked(core);
-        (
-            core.backend.clone(),
-            Arc::clone(&core.verifier),
-            Arc::clone(&core.stopping),
-        )
-    };
-    let Some(backend) = backend else {
-        return Ok(0);
-    };
-    let candidates: Vec<(String, String, crate::model::ProcessIdentity)> = {
-        let mut after: Option<String> = None;
-        let mut found = Vec::new();
-        loop {
-            let page = registry.list_after(after.as_deref(), REGISTRY_SCAN)?;
-            for registration in &page {
-                let Some(pane) = registration
-                    .request
-                    .location
-                    .as_ref()
-                    .and_then(|location| location.pane.clone())
-                else {
-                    continue;
-                };
-                let Some(claim) = registration.request.process.clone() else {
-                    continue;
-                };
-                if registration.request.source != PI_PUBLISHER_SOURCE
-                    || registration.request.spawn_token.is_some()
-                    || inventory.pane(&pane).is_none()
-                {
-                    continue;
-                }
-                found.push((registration.agent_id.clone(), pane, claim));
-            }
-            match page.last() {
-                Some(last) if page.len() == REGISTRY_SCAN => after = Some(last.agent_id.clone()),
-                _ => break,
-            }
-        }
-        found
-    };
-    let mut bound = 0;
-    let mut attempts = 0;
-    for (agent_id, pane, claim) in candidates {
-        if attempts == MAX_LEAD_BINDINGS {
-            break;
-        }
-        let now = store::now_ms();
-        let Some(context) = registry.context(&agent_id, now)? else {
-            continue;
-        };
-        if context.context.freshness != registry::Freshness::Fresh {
-            continue;
-        }
-        let Some(session) = context.context.session.clone() else {
-            continue;
-        };
-        // An attached session needs nothing, and a session another live process
-        // holds is refused without inspecting any process.
-        if !matches!(
-            subjects::attachment(registry, &agent_id, &session, now)?,
-            subjects::Attachment::Free
-        ) {
-            continue;
-        }
-        attempts += 1;
-        // The registration's own claimed process must be this pane's verified
-        // occupant, so a registration cannot claim a pane that is not its own.
-        if verify_live_occupant(&backend, &verifier, &pane, &claim, &stopping, verification)
-            .is_err()
-        {
-            continue;
-        }
-        let params = EnrollParams {
-            agent_id: agent_id.clone(),
-            session,
-        };
-        let enrollment_id = store::random_uuid();
-        match record_enrollment(registry, &verifier, &params, &claim, &enrollment_id, now) {
-            Ok(_) => {
-                bound += 1;
-                tracing::info!(%agent_id, %pane, "bound a managed Pi session");
-            }
-            Err(error) => {
-                tracing::debug!(%error, %agent_id, %pane, "lead binding not yet possible")
-            }
-        }
-    }
-    Ok(bound)
 }
 
 /// Records what one inventory read said about each bound launch's pane.
@@ -7398,7 +7523,7 @@ mod tests {
             lifecycle_event_id: None,
             seq,
             kind: "agent.registered".to_string(),
-            agent_id: Some(format!("agent-{seq}")),
+            registration_id: Some(format!("agent-{seq}")),
             spawn: None,
             request_id: None,
             at: "2026-01-01T00:00:00.000Z".to_string(),

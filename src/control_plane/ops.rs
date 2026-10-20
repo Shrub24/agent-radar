@@ -379,8 +379,10 @@ pub fn classify(method: &str) -> Option<Method> {
         | "communication.get"
         | "communication.ack" => Method::Communication,
         "tasks.list" => Method::Tasks,
-        "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
-        | "agent.get" | "agent.list" => Method::Registry,
+        "agent.presence" | "agent.release" | "agent.acquire" | "agent.register"
+        | "agent.publish" | "agent.retire" | "agent.context" | "agent.get" | "agent.list" => {
+            Method::Registry
+        }
         // A spawn read reports the daemon's own edge records; whether the backend
         // still reports a recorded location changes its freshness, never whether
         // the read is served.

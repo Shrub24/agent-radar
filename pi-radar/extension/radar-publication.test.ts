@@ -74,11 +74,13 @@ function fakeDaemon(script: Script = {}) {
 			contracts: ["registry.v1", "registry.facts.v1"],
 			tasks: { available: false, error: null },
 		}),
-		register: async (params) => answer("agent.register", params, () => {
-			const agentId = mint();
-			agentIds.push(agentId);
-			return ok({ agent_id: agentId });
+		presence: async (params) => answer("agent.presence", params, () => {
+			const agentId = params.registration_id ?? agentIds[0] ?? mint();
+			if (!agentIds.includes(agentId)) agentIds.push(agentId);
+			return ok({ registration_id: agentId, claim_id: params.claim_id,
+				session_id: params.session_id, standing: "granted", subject_id: SESSION_A });
 		}),
+		releasePresence: async (params) => answer("agent.release", params, () => ok({ ...params, standing: "released" })),
 		acquire: async (params) => answer("agent.acquire", params, () => {
 			const handle = mint();
 			handles.push(handle);
@@ -181,12 +183,15 @@ function publicationFor(
 	daemon: ReturnType<typeof fakeDaemon>,
 	overrides: Record<string, unknown> = {},
 ): RadarPublication {
-	return createRadarPublication({
+	const publication = createRadarPublication({
 		client: daemon.client,
 		registration: { source: "herdsman-pi" },
+		birth: { boot_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", pid: 123, start_ticks: 42 },
 		heartbeatMs: HEARTBEAT_MS,
 		...overrides,
 	} as Parameters<typeof createRadarPublication>[0]);
+	publication.presence.report(SESSION_A);
+	return publication;
 }
 
 test("radar records are private, atomic and bounded", () => {
@@ -194,6 +199,8 @@ test("radar records are private, atomic and bounded", () => {
 	try {
 		assert.throws(() => store.path("../escape.json"), /invalid radar record name/);
 		store.write("subjects/one.json", { version: 1 });
+		store.write("registrations/one.json", { version: 1 });
+		store.write("presence/one.json", { version: 1 });
 		assert.equal(statSync(store.path("subjects/one.json")).mode & 0o777, 0o600);
 		assert.equal(statSync(join(root, "subjects")).mode & 0o777, 0o700);
 		assert.deepEqual(store.read("subjects/one.json"), { version: 1 });
@@ -375,7 +382,7 @@ test("a reload reuses the process incarnation and its one publisher", async () =
 		const first = publicationFor(daemon, common);
 		first.execution.update({ activity: "working" });
 		await settle();
-		assert.equal(daemon.count("agent.register"), 1);
+		assert.equal(daemon.count("agent.presence"), 1);
 		assert.equal(daemon.count("agent.acquire"), 1);
 		assert.equal(daemon.params("agent.publish").sequence, 1);
 
@@ -387,9 +394,8 @@ test("a reload reuses the process incarnation and its one publisher", async () =
 		assert.equal(radarProcessIncarnation(slot), incarnation);
 		reloaded.execution.update({ activity: "idle" });
 		await settle();
-		// The same writer binding and sequence continue: no second subject and no
-		// competing publisher of the same channel.
-		assert.equal(daemon.count("agent.register"), 1);
+		// Reload creates a fresh session claim, not another process registration.
+		assert.notEqual(daemon.params("agent.presence", 0).claim_id, daemon.params("agent.presence", 1).claim_id);
 		assert.equal(daemon.count("agent.acquire"), 1);
 		assert.equal(daemon.params("agent.publish", 1).sequence, 2);
 		assert.equal(daemon.params("agent.publish", 1).snapshot.activity, "idle");
@@ -411,14 +417,14 @@ test("a fresh process is a distinct subject of the same data root", async () => 
 			publication.execution.update({ activity: "working" });
 			await settle();
 		}
-		const registrations = daemon.all("agent.register");
+		const registrations = daemon.all("agent.presence");
 		assert.equal(registrations.length, 2);
 		assert.notEqual(
 			registrations[0].incarnation,
 			registrations[1].incarnation,
 		);
 		assert.notEqual(daemon.agentIds[0], daemon.agentIds[1]);
-		assert.equal(readdirSync(join(root, "subjects")).length, 2);
+		assert.equal(readdirSync(join(root, "registrations")).length, 2);
 	} finally {
 		cleanup();
 	}
@@ -450,11 +456,11 @@ test("the persisted registration outlives a later process claim", async () => {
 		});
 		first.execution.update({ activity: "working" });
 		await settle();
-		assert.deepEqual(daemon.params("agent.register").process, claim(11));
+		assert.deepEqual(daemon.params("agent.presence").process, claim(11));
 		// The registration is durable before it is ever sent.
-		const [record] = readdirSync(join(root, "subjects"));
+		const [record] = readdirSync(join(root, "registrations"));
 		assert.deepEqual(
-			(store.read(`subjects/${record}`) as { registration: { process: unknown } })
+			(store.read(`registrations/${record}`) as { registration: { process: unknown } })
 				.registration.process,
 			claim(11),
 		);
@@ -471,11 +477,10 @@ test("the persisted registration outlives a later process claim", async () => {
 		restarted.execution.update({ activity: "idle" });
 		await settle();
 		await advance(HEARTBEAT_MS);
-		assert.equal(daemon.count("agent.register"), 2);
-		assert.deepEqual(daemon.params("agent.register", 1).process, claim(11));
-		// The recovered subject starts its own channel sequence.
+		assert.ok(daemon.all("agent.presence").every(report => report.process.pid === 11));
+		// Reassertion retains the registration and its accepted channel sequence.
 		assert.equal(daemon.count("agent.publish"), 3);
-		assert.equal(daemon.params("agent.publish", 2).sequence, 1);
+		assert.equal(daemon.params("agent.publish", 2).sequence, 2);
 		assert.equal(daemon.params("agent.publish", 2).snapshot.activity, "idle");
 	} finally {
 		cleanup();
@@ -531,13 +536,11 @@ test("a lost subject is registered again from the identical content", async () =
 		publication.execution.update({ activity: "working" });
 		await settle();
 		// A lost subject is not retried in a loop; the heartbeat holds the cadence.
-		assert.equal(daemon.count("agent.register"), 1);
+		assert.equal(daemon.count("agent.presence"), 1);
 		await advance(HEARTBEAT_MS);
-		assert.equal(daemon.count("agent.register"), 2);
-		assert.deepEqual(
-			daemon.params("agent.register", 0),
-			daemon.params("agent.register", 1),
-		);
+		assert.equal(daemon.count("agent.presence"), 2);
+		assert.equal(daemon.params("agent.presence", 0).claim_id, daemon.params("agent.presence", 1).claim_id);
+		assert.deepEqual(daemon.params("agent.presence", 0).process, daemon.params("agent.presence", 1).process);
 		// A new subject cannot carry the old subject's channel state.
 		assert.equal(daemon.params("agent.publish").sequence, 1);
 		assert.equal(daemon.params("agent.publish").snapshot.activity, "working");
@@ -613,7 +616,7 @@ test("an absent daemon is silent rather than an incident", async () => {
 	const { root, store, cleanup } = makeRoot();
 	try {
 		const daemon = fakeDaemon({
-			"agent.register": () =>
+			"agent.presence": () =>
 				refused("absent", "/run/user/1000/agent-radar/control.sock is unavailable"),
 		});
 		const { scheduler, advance } = fakeScheduler();
@@ -631,7 +634,7 @@ test("an absent daemon is silent rather than an incident", async () => {
 		assert.equal(daemon.count("agent.acquire"), 0);
 		assert.equal(daemon.count("agent.publish"), 0);
 		assert.equal(publication.diagnostic(), undefined);
-		assert.equal(readdirSync(join(root, "subjects")).length, 1);
+		assert.equal(readdirSync(join(root, "registrations")).length, 1);
 	} finally {
 		cleanup();
 	}
@@ -660,7 +663,7 @@ test("the owner publishes about a child's subject and retires only its own write
 		child.execution.update({ activity: "working" });
 		await settle();
 		// Only the child registers, and only the child writes its own sidecar.
-		assert.equal(daemon.count("agent.register"), 1);
+		assert.equal(daemon.count("agent.presence"), 1);
 
 		const owner = publicationFor(daemon, {
 			dataRoot: root,
@@ -670,14 +673,14 @@ test("the owner publishes about a child's subject and retires only its own write
 			incarnation: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
 		});
 		const bound = owner.binding(key);
-		assert.equal(bound?.agent_id, daemon.agentIds[0]);
+		assert.equal(bound?.registration_id, daemon.agentIds[0]);
 		assert.equal(bound?.label, "worker");
 
-		const writer = owner.assignment(bound!.agent_id, "owner-1");
+		const writer = owner.assignment(bound!.registration_id, "owner-1");
 		writer.update({ activity: "waiting", waiting_reason: "background-work" });
 		await settle();
 		const published = daemon.params("agent.publish", 1);
-		assert.equal(published.agent_id, daemon.agentIds[0]);
+		assert.equal(published.registration_id, daemon.agentIds[0]);
 		assert.equal(published.channel, "assignment");
 		// The owner acquires it in its own name, reporting whose assignment it is.
 		assert.deepEqual(daemon.params("agent.acquire", 1).publisher, {
@@ -691,10 +694,10 @@ test("the owner publishes about a child's subject and retires only its own write
 		await settle();
 		assert.equal(daemon.count("agent.retire"), 0);
 
-		owner.retireAssignment(bound!.agent_id);
+		owner.retireAssignment(bound!.registration_id);
 		await settle();
 		assert.equal(daemon.count("agent.retire"), 1);
-		assert.equal(daemon.params("agent.retire").agent_id, daemon.agentIds[0]);
+		assert.equal(daemon.params("agent.retire").registration_id, daemon.agentIds[0]);
 		assert.equal(daemon.params("agent.retire").writer_handle, daemon.handles[1]);
 	} finally {
 		cleanup();
@@ -704,262 +707,61 @@ test("the owner publishes about a child's subject and retires only its own write
 const SESSION_A = "11111111-2222-4333-8444-555555555555";
 const SESSION_B = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 
-test("a session Radar adopts names its managed subject, and a duplicate warns without one", async () => {
-	const { root, store, cleanup } = makeRoot();
-	const ADOPTED = "9d1e2f3a-4b5c-4d6e-8f70-123456789abc";
-	let standing: unknown = { state: "managed", subject_id: ADOPTED };
-	try {
-		const daemon = fakeDaemon({
-			"agent.context": (params) =>
-				ok({
-					writer: {
-						handle: "5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a",
-						source: params.publisher.source,
-						incarnation: params.publisher.incarnation,
-						generation: 1,
-						sequence: params.sequence,
-					},
-					management: standing,
-				}),
-		});
-		const { scheduler } = fakeScheduler();
-		const publication = publicationFor(daemon, {
-			dataRoot: root,
-			store,
-			scheduler,
-			slot: createRadarProcessSlot(),
-		});
-		publication.context.update(SESSION_A);
-		await settle();
-		assert.equal((await publication.subject())?.subject_id, ADOPTED);
-		assert.equal(publication.context.diagnostic(), undefined);
+;
 
-		// The session is held by another live process: Radar answers duplicate, the
-		// identity is withdrawn, and the process gets one warning.
-		standing = { state: "duplicate" };
-		publication.context.update(SESSION_B);
+;
+
+;
+
+;
+
+;
+
+;
+
+test("presence retries preserve the claim, fresh session loads replace it, and shutdown releases exactly it", async () => {
+	const { root, store, cleanup } = makeRoot();
+	const registration = "00000000-0000-4000-8000-000000000123";
+	let mode: "offline" | "granted" | "duplicate" = "offline";
+	const daemon = fakeDaemon({
+		"agent.presence": params => mode === "offline"
+			? refused("transport", "connection lost")
+			: ok({ registration_id: registration, claim_id: params.claim_id,
+				session_id: params.session_id, standing: mode,
+				...(mode === "granted" ? { subject_id: SESSION_A } : {}) }),
+	});
+	const { scheduler, advance } = fakeScheduler();
+	let pane = "%1";
+	try {
+		const publication = publicationFor(daemon, {
+			dataRoot: root, store, scheduler, slot: createRadarProcessSlot(),
+			location: async () => ({ state: "resolved", location: { backend: "tmux", pane } }),
+		});
 		await settle();
+		const firstClaim = daemon.params("agent.presence").claim_id;
+		mode = "granted";
+		await advance(HEARTBEAT_MS);
+		assert.equal(daemon.params("agent.presence", 1).claim_id, firstClaim);
+		assert.equal((await publication.subject())?.subject_id, SESSION_A);
+		assert.equal((await publication.subject())?.location?.pane, "%1");
+		pane = "%2";
+		assert.equal((await publication.subject())?.location?.pane, "%2");
+		mode = "duplicate";
+		publication.presence.report(SESSION_B);
+		await settle();
+		const duplicateClaim = daemon.all("agent.presence").at(-1).claim_id;
+		assert.notEqual(duplicateClaim, firstClaim);
 		assert.equal((await publication.subject())?.subject_id, undefined);
-		assert.match(publication.context.diagnostic() ?? "", /another live Radar process/);
-	} finally {
-		cleanup();
-	}
-});
-
-test("a current session is published once and renewed from the same cadence", async () => {
-	const { root, store, cleanup } = makeRoot();
-	try {
-		const daemon = fakeDaemon();
-		const { scheduler, advance } = fakeScheduler();
-		const publication = publicationFor(daemon, {
-			dataRoot: root,
-			store,
-			scheduler,
-			slot: createRadarProcessSlot(),
-		});
-		publication.context.update(SESSION_A);
-		await settle();
-		const first = daemon.params("agent.context");
-		// A first publish presents no credential: the daemon binds the writer this
-		// publisher already is, and the payload is the session alone.
-		assert.equal("writer_handle" in first, false);
-		assert.deepEqual(first.context, { session: SESSION_A });
-		assert.equal(first.sequence, 1);
-		assert.equal(first.lease_ms, RADAR_LEASE_MS);
-
+		assert.match(publication.presence.diagnostic() ?? "", /reload or resume/);
 		await advance(HEARTBEAT_MS);
-		// Renewal is a newer sequence under the issued binding, on the cadence that
-		// already carries this process's facts: no second heartbeat, no longer lease.
-		const renewed = daemon.params("agent.context", 1);
-		assert.equal(renewed.writer_handle, daemon.handles[0]);
-		assert.equal(renewed.sequence, 2);
-		assert.deepEqual(renewed.context, { session: SESSION_A });
-		assert.equal(renewed.lease_ms, RADAR_LEASE_MS);
-	} finally {
-		cleanup();
-	}
-});
-
-test("a session switch is a newer sequence under the same subject", async () => {
-	const { root, store, cleanup } = makeRoot();
-	try {
-		const daemon = fakeDaemon();
-		const { scheduler } = fakeScheduler();
-		const publication = publicationFor(daemon, {
-			dataRoot: root,
-			store,
-			scheduler,
-			slot: createRadarProcessSlot(),
-		});
-		publication.context.update(SESSION_A);
-		await settle();
-		publication.context.update(SESSION_B);
-		await settle();
-		// Switching or forking a session is not becoming another subject: no second
-		// registration, no second writer binding and no regressed sequence.
-		assert.equal(daemon.count("agent.register"), 1);
-		assert.equal(daemon.count("agent.context"), 2);
-		assert.equal(
-			daemon.params("agent.context", 0).agent_id,
-			daemon.params("agent.context", 1).agent_id,
-		);
-		assert.equal(daemon.params("agent.context", 1).writer_handle, daemon.handles[0]);
-		assert.equal(daemon.params("agent.context", 1).sequence, 2);
-		assert.deepEqual(daemon.params("agent.context", 1).context, {
-			session: SESSION_B,
-		});
-
-		// An unchanged session is not re-sent between heartbeats.
-		publication.context.update(SESSION_B);
-		await settle();
-		assert.equal(daemon.count("agent.context"), 2);
-
-		// An explicit null is the record's own value for "no current session": it
-		// is published as that fact, not as a missing one.
-		publication.context.update(null);
-		await settle();
-		assert.equal(daemon.params("agent.context", 2).sequence, 3);
-		assert.equal("session" in daemon.params("agent.context", 2).context, true);
-		assert.equal(daemon.params("agent.context", 2).context.session, null);
-	} finally {
-		cleanup();
-	}
-});
-
-test("a warned replay renews on the original lease origin, not on the replay", async () => {
-	const { root, store, cleanup } = makeRoot();
-	try {
-		// The daemon's answer to an identical replay: the stored record, with a
-		// warning that the lease was not renewed.
-		const replayWarning = (params: any) =>
-			ok({
-				writer: {
-					handle: params.writer_handle,
-					source: params.publisher.source,
-					incarnation: params.publisher.incarnation,
-					generation: 1,
-					sequence: params.sequence,
-				},
-				warning: "answered replay: the lease was not renewed",
-			});
-		const daemon = fakeDaemon({
-			"agent.context": (params, nth) => {
-				if (nth === 1) return refused("timeout", "lost ack");
-				return nth === 2 ? replayWarning(params) : undefined;
-			},
-		});
-		const { scheduler, advance } = fakeScheduler();
-		const publication = publicationFor(daemon, {
-			dataRoot: root,
-			store,
-			scheduler,
-			slot: createRadarProcessSlot(),
-		});
-		publication.context.update(SESSION_A);
-		await settle();
-
-		// One heartbeat in, the renewal goes out and its reply is lost.
-		await advance(HEARTBEAT_MS + HEARTBEAT_MS / 2);
-		assert.equal(daemon.count("agent.context"), 2);
-
-		// An extension reload between heartbeats replays the unresolved request, and
-		// the daemon answers that identical replay with the warning.
-		publication.context.reopen();
-		await settle();
-		assert.equal(daemon.count("agent.context"), 3);
-		assert.deepEqual(
-			daemon.params("agent.context", 2),
-			daemon.params("agent.context", 1),
-		);
-
-		// The lease the warning did not renew still started at the original
-		// acceptance, so the next heartbeat tick renews instead of waiting another
-		// full heartbeat after the replay.
-		await advance(HEARTBEAT_MS / 2);
-		assert.equal(daemon.count("agent.context"), 4);
-		const renewed = daemon.params("agent.context", 3);
-		assert.equal(renewed.sequence, 3);
-		assert.equal(renewed.writer_handle, daemon.handles[0]);
-		assert.deepEqual(renewed.context, { session: SESSION_A });
-
-		// An ordinary acceptance does draw the clock forward to its own time: this
-		// reload is half a heartbeat after it and stages nothing.
-		await advance(HEARTBEAT_MS / 2);
-		publication.context.reopen();
-		await settle();
-		assert.equal(daemon.count("agent.context"), 4);
-	} finally {
-		cleanup();
-	}
-});
-
-test("a context for a lost subject is bound again from a fresh sequence", async () => {
-	const { root, store, cleanup } = makeRoot();
-	try {
-		const daemon = fakeDaemon({
-			"agent.context": (_params, nth) =>
-				nth === 0 ? refused("not_found", "unknown agent") : undefined,
-		});
-		const { scheduler, advance } = fakeScheduler();
-		const publication = publicationFor(daemon, {
-			dataRoot: root,
-			store,
-			scheduler,
-			slot: createRadarProcessSlot(),
-		});
-		publication.context.update(SESSION_A);
-		await settle();
-		// A lost subject is registered again on the heartbeat, not in a hot loop.
-		assert.equal(daemon.count("agent.register"), 1);
-		await advance(HEARTBEAT_MS);
-		assert.equal(daemon.count("agent.register"), 2);
-		const rebound = daemon.params("agent.context", 1);
-		assert.equal("writer_handle" in rebound, false);
-		assert.equal(rebound.sequence, 1);
-		assert.deepEqual(rebound.context, { session: SESSION_A });
-	} finally {
-		cleanup();
-	}
-});
-
-test("a refused context stops with one diagnostic and no takeover", async () => {
-	// A refusal and a method this daemon does not serve are both permanent for the
-	// record's lifetime: neither is retried, and neither provokes a takeover.
-	for (const [code, message] of [
-		["refused", "context has a writer this publisher did not present"],
-		["unknown_method", "unknown method agent.context"],
-	] as const) {
-		const { root, store, cleanup } = makeRoot();
-		try {
-			const daemon = fakeDaemon({
-				"agent.context": (_params, nth) =>
-					nth === 0 ? refused(code, message) : undefined,
-			});
-			const { scheduler, advance } = fakeScheduler();
-			const publication = publicationFor(daemon, {
-				dataRoot: root,
-				store,
-				scheduler,
-				slot: createRadarProcessSlot(),
-			});
-			publication.context.update(SESSION_A);
-			await settle();
-			const diagnostic = `context stopped: ${message}`;
-			assert.equal(publication.context.diagnostic(), diagnostic);
-			assert.equal(publication.diagnostic(), diagnostic);
-			await advance(HEARTBEAT_MS * 4);
-			assert.equal(daemon.count("agent.context"), 1);
-			// Replacement stays explicit: a fenced writer never asks to take over.
-			assert.ok(
-				daemon
-					.all("agent.context")
-					.every((params) => params.replace === undefined),
-			);
-			assert.equal(publication.context.diagnostic(), diagnostic);
-		} finally {
-			cleanup();
-		}
-	}
+		assert.equal(daemon.all("agent.presence").at(-1).claim_id, duplicateClaim);
+		await publication.presence.release();
+		assert.equal(daemon.all("agent.release").at(-1).claim_id, duplicateClaim);
+		const calls = daemon.count("agent.presence");
+		await advance(HEARTBEAT_MS * 2);
+		assert.equal(daemon.count("agent.presence"), calls);
+		publication.stop();
+	} finally { cleanup(); }
 });
 
 test("process start ticks parse around a command name with spaces", () => {

@@ -10,7 +10,7 @@ function launch(parentSubject: string): RadarWorkerLaunch {
 		request_id: randomUUID(),
 		generation: randomUUID(),
 		parent: {
-			agent_id: randomUUID(),
+			registration_id: randomUUID(),
 			subject_id: parentSubject,
 			location: { backend: "herdr", pane: "parent-pane" },
 		},

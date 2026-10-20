@@ -492,7 +492,7 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
         Operation::CreateContainer => "Add to container",
         Operation::DeleteContainer => "Delete container",
         Operation::ReloadContainer => "Reload pane",
-        Operation::EnrollAgent => "Enroll lead",
+        Operation::PresenceStatus => "Pi presence",
     };
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
@@ -1033,6 +1033,16 @@ fn row_item(
                     format!("{} ", theme::stale_mark()),
                     Style::new().fg(palette.stale),
                 ));
+            }
+            if agent.registry.as_ref().is_some_and(|view| {
+                view.agent.claim_standing
+                    == Some(crate::control_plane::registry::presence::Standing::Duplicate)
+            }) {
+                spans.push(Span::styled(
+                    theme::duplicate_mark(),
+                    Style::new().fg(palette.failed),
+                ));
+                spans.push(Span::raw(" "));
             }
             // The row's own text carries the state too, with weight spent on
             // the lifecycle that is moving: colour is what a glance reads, and
@@ -2051,7 +2061,7 @@ fn overview_lines(
             {
                 page.push(line);
             }
-            page.push(field("agent", agent_identifier(agent)));
+            page.push(field("agent", registration_identifier(agent)));
             container_fields(agent.container.as_ref(), page);
             match &agent.registry {
                 Some(view) => registry_lines(state, agent, view, page),
@@ -2086,7 +2096,7 @@ fn overview_lines(
             page.push(field(
                 "binding",
                 subject
-                    .bound_agent_id
+                    .bound_registration_id
                     .as_deref()
                     .map(|agent| format!("unresolved registration {agent}"))
                     .unwrap_or_else(|| "awaiting registration".to_string()),
@@ -2129,14 +2139,14 @@ fn overview_lines(
 /// has none, and that absence says nothing about the agent: the registration's
 /// label, else the agent id it was registered under, names it instead. Reporting
 /// both as `unavailable` would hide a registration the row is drawn from.
-fn agent_identifier(agent: &AgentRow) -> String {
+fn registration_identifier(agent: &AgentRow) -> String {
     if let Some(name) = agent.name.as_deref() {
         return sanitize(name);
     }
     if let Some(view) = agent.registry.as_ref() {
         return match view.agent.registration.label.as_deref() {
             Some(label) => sanitize(label),
-            None => sanitize(&view.agent.registration.agent_id),
+            None => sanitize(&view.agent.registration.registration_id),
         };
     }
     unavailable()
@@ -2296,7 +2306,7 @@ fn spawn_text(state: &ObservationState, spawn: &SpawnBinding) -> String {
         .into_iter()
         .flat_map(|inventory| inventory.agents.iter())
         .filter_map(|agent| agent.registry.as_ref())
-        .find(|view| view.agent.registration.agent_id == spawn.parent);
+        .find(|view| view.agent.registration.registration_id == spawn.parent);
     let parent = match parent.and_then(|view| view.agent.registration.label.as_deref()) {
         Some(label) => format!("{} ({})", sanitize(label), sanitize(&spawn.parent)),
         None if parent.is_some() => sanitize(&spawn.parent),
@@ -7998,6 +8008,35 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_session_has_a_distinct_inline_mark() {
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let row = &mut observation.agents[0];
+        row.registry = Some(
+            serde_json::from_value(serde_json::json!({
+                "agent": {
+                    "registration": {
+                        "version": 1, "registration_id": "process-registration",
+                        "registered_at": "2026-01-01T00:00:00Z", "source": "herdsman-pi",
+                        "incarnation": "11111111-1111-4111-8111-111111111111",
+                        "process_claimed": true, "launch": {"available": false}
+                    },
+                    "claim_standing": "duplicate",
+                    "process": {"claim": {"boot_id":"boot", "pid":1234, "start_ticks":55}},
+                    "context": null, "execution": null, "assignment": null, "facts": null
+                },
+                "binding": "joined", "spawn": null, "managed": null
+            }))
+            .expect("duplicate registration"),
+        );
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let mut app = app_for(&state);
+        let screen = render_pages(&state, &mut app, 180, 30);
+        assert!(screen.contains(theme::duplicate_mark()), "{screen}");
+        assert_ne!(theme::duplicate_mark(), theme::stale_mark());
+    }
+
+    #[test]
     fn a_live_stale_agent_is_marked_and_names_both_installations() {
         let mut state = fixture_state();
         state.apply_evidence("wA:p2", binary_evidence(stale_identity()));
@@ -8948,7 +8987,7 @@ mod tests {
                     agent: serde_json::from_value(serde_json::json!({
                         "registration": {
                             "version": 1,
-                            "agent_id": "managed-agent",
+                            "registration_id": "managed-agent",
                             "registered_at": "2026-01-01T00:00:00Z",
                             "source": "test",
                             "incarnation": "11111111-1111-4111-8111-111111111111",

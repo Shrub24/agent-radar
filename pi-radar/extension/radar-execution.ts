@@ -129,11 +129,13 @@ function unavailablePublication(): RadarPublication {
 	return {
 		execution: writer,
 		facts: { ...writer, update: () => undefined },
-		context: {
-			update: () => undefined,
+		presence: {
+			report: () => undefined,
 			stop: () => undefined,
 			reopen: () => undefined,
 			management: () => undefined,
+			ensure: async () => undefined,
+			release: async () => undefined,
 			diagnostic: () => "Radar private storage is unavailable",
 		},
 		assignment: () => writer,
@@ -265,7 +267,7 @@ export function createRadarExecutionAdapter(
 		const session = context?.sessionManager?.getSessionId?.();
 		if (!isUuid(session)) return;
 		try {
-			publication.context.update(session);
+			publication.presence.report(session);
 		} catch {
 			// Optional publication must not interfere with Pi's lifecycle handler.
 		}
@@ -400,12 +402,13 @@ export function createRadarExecutionAdapter(
 		emit();
 	});
 
-	on("session_shutdown", () => {
+	on("session_shutdown", async () => {
 		// A session can end or be replaced without ending this process, and Pi keeps
 		// the same extension instance across that: the listeners stay registered so
 		// the next session_start re-arms the same process publication. Only the
 		// timers and this session's facts are released.
 		suspend();
+		await publication.presence.release();
 	});
 
 	function suspend(): void {

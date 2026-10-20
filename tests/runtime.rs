@@ -1753,13 +1753,13 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
             "location": {"backend": "herdr", "pane": parent_pane},
         }),
     );
-    let parent_id = parent["result"]["registration"]["agent_id"]
+    let parent_id = parent["result"]["registration"]["registration_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the parent was not registered: {parent}"))
         .to_owned();
     let parent_incarnation = parent["result"]["registration"]["incarnation"].clone();
     eprintln!(
-        "sanitized parent registration: agent_id={parent_id}, pane_id={parent_pane}, incarnation={parent_incarnation}"
+        "sanitized parent registration: registration_id={parent_id}, pane_id={parent_pane}, incarnation={parent_incarnation}"
     );
     let parent_session = random_uuid();
     let context = control_call(
@@ -1767,7 +1767,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         &random_uuid(),
         "agent.context",
         serde_json::json!({
-            "agent_id": parent_id,
+            "registration_id": parent_id,
             "publisher": {"source": "radar-live-close-smoke-parent", "incarnation": parent_incarnation},
             "sequence": 1,
             "context": {"session": parent_session},
@@ -1877,12 +1877,15 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
     let topology = &topology_response["result"]["spawn"];
     assert_eq!(topology["request_id"], spawn_id);
     assert_eq!(topology["parent"], parent_id);
-    assert_eq!(topology["bound"]["agent_id"], child["agent_id"]);
+    assert_eq!(
+        topology["bound"]["registration_id"],
+        child["registration_id"]
+    );
     assert_eq!(topology["bound"]["source"], child["source"]);
     assert_eq!(topology["bound"]["incarnation"], child["incarnation"]);
     eprintln!(
-        "sanitized child registration: agent_id={}, source={}, incarnation={}, pid={}, cwd={}",
-        child["agent_id"], child["source"], child["incarnation"], child["pid"], child["cwd"]
+        "sanitized child registration: registration_id={}, source={}, incarnation={}, pid={}, cwd={}",
+        child["registration_id"], child["source"], child["incarnation"], child["pid"], child["cwd"]
     );
     eprintln!(
         "sanitized topology: {}",
@@ -1892,7 +1895,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         &socket,
         &random_uuid(),
         "agent.get",
-        serde_json::json!({"agent_id": child["agent_id"]}),
+        serde_json::json!({"registration_id": child["registration_id"]}),
     )["result"]["agent"]
         .clone();
     assert!(
@@ -1912,7 +1915,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
             &random_uuid(),
             "agent.acquire",
             serde_json::json!({
-                "agent_id": child["agent_id"],
+                "registration_id": child["registration_id"],
                 "channel": channel,
                 "publisher": {"source": format!("live-smoke-{channel}"), "incarnation": random_uuid()},
             }),
@@ -1926,7 +1929,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
             &random_uuid(),
             "agent.publish",
             serde_json::json!({
-                "agent_id": child["agent_id"],
+                "registration_id": child["registration_id"],
                 "channel": channel,
                 "writer_handle": handle,
                 "sequence": 1,
@@ -1939,7 +1942,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         );
     }
 
-    let child_id = child["agent_id"].clone();
+    let child_id = child["registration_id"].clone();
     // The recorded edge, not the read's own state and freshness: those are
     // evidence about the pane, and closing it changes the evidence.
     disposable.pane_closed(&child_pane);
@@ -1954,7 +1957,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         &socket,
         &random_uuid(),
         "agent.get",
-        serde_json::json!({"agent_id": child_id}),
+        serde_json::json!({"registration_id": child_id}),
     )["result"]["agent"]
         .clone();
     assert!(
@@ -2043,7 +2046,7 @@ fn a_real_herdr_managed_child_close_is_durable_and_idempotent() {
         &socket,
         &random_uuid(),
         "agent.get",
-        serde_json::json!({"agent_id": child_id}),
+        serde_json::json!({"registration_id": child_id}),
     )["result"]["agent"]
         .clone();
     // The stored reports, not the whole read: `process.verification` is fresh

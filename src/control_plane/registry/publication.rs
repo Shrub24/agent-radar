@@ -34,7 +34,7 @@ use crate::control::timestamp_millis;
 use crate::control_plane::store::{format_millis, random_uuid};
 use crate::model::{ContextWindow, SessionUuid};
 
-use super::{Registry, bounded_text, read_record_file, validate_agent_id};
+use super::{Registry, bounded_text, read_record_file, validate_registration_id};
 
 /// Publication record directory under the private registry root.
 pub const PUBLICATIONS: &str = "publications";
@@ -380,7 +380,7 @@ impl ExpectedWriter {
         if self.generation == 0 {
             return Err("`replace.generation` must be at least 1".into());
         }
-        validate_agent_id(&self.handle)
+        validate_registration_id(&self.handle)
     }
 }
 
@@ -389,7 +389,7 @@ impl ExpectedWriter {
 #[serde(deny_unknown_fields)]
 pub struct AcquireRequest {
     /// The target agent incarnation the channel reports about.
-    pub agent_id: String,
+    pub registration_id: String,
     pub channel: Channel,
     pub publisher: PublisherIdentity,
     /// Absent acquires only a channel with no writer. Present replaces exactly
@@ -400,7 +400,7 @@ pub struct AcquireRequest {
 
 impl AcquireRequest {
     pub fn validate(&self) -> Result<(), String> {
-        validate_agent_id(&self.agent_id)?;
+        validate_registration_id(&self.registration_id)?;
         self.publisher.validate()?;
         if let Some(expected) = &self.replace {
             expected.validate()?;
@@ -496,7 +496,8 @@ impl AcceptedSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct ChannelRecord {
     pub version: u32,
-    pub agent_id: String,
+    #[serde(alias = "agent_id")]
+    pub registration_id: String,
     pub channel: Channel,
     pub writer: WriterBinding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -530,7 +531,7 @@ impl ChannelRecord {
         let view = self.view(now_ms, serving_epoch);
         PublicChannelFacts {
             version: view.version,
-            agent_id: view.agent_id,
+            registration_id: view.registration_id,
             channel: view.channel,
             writer: PublicWriterFacts {
                 source: view.writer.source,
@@ -560,7 +561,7 @@ impl ChannelRecord {
     pub fn view(&self, now_ms: i64, serving_epoch: &str) -> PublicChannel {
         PublicChannel {
             version: self.version,
-            agent_id: self.agent_id.clone(),
+            registration_id: self.registration_id.clone(),
             channel: self.channel,
             writer: PublicWriter {
                 handle: self.writer.handle.clone(),
@@ -735,7 +736,7 @@ pub struct PublicSnapshotFacts {
 #[serde(deny_unknown_fields)]
 pub struct PublicChannelFacts {
     pub version: u32,
-    pub agent_id: String,
+    pub registration_id: String,
     pub channel: Channel,
     pub writer: PublicWriterFacts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -747,7 +748,7 @@ pub struct PublicChannelFacts {
 #[serde(deny_unknown_fields)]
 pub struct PublicChannel {
     pub version: u32,
-    pub agent_id: String,
+    pub registration_id: String,
     pub channel: Channel,
     pub writer: PublicWriter,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -758,7 +759,7 @@ pub struct PublicChannel {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishRequest {
-    pub agent_id: String,
+    pub registration_id: String,
     pub channel: Channel,
     pub writer_handle: String,
     pub sequence: u64,
@@ -773,8 +774,8 @@ impl PublishRequest {
     /// Checks the envelope and the snapshot against this request's channel, and
     /// returns the snapshot as that channel's schema.
     pub fn validate(&self) -> Result<Report, String> {
-        validate_agent_id(&self.agent_id)?;
-        validate_agent_id(&self.writer_handle)?;
+        validate_registration_id(&self.registration_id)?;
+        validate_registration_id(&self.writer_handle)?;
         if self.sequence == 0 {
             return Err("`sequence` must be at least 1".into());
         }
@@ -819,14 +820,14 @@ pub fn acquire_writer(
     // registration, and its identity is recorded as provenance rather than
     // admitted against an agent record.
     registry
-        .get(&request.agent_id)?
-        .ok_or_else(|| format!("agent {} is not registered", request.agent_id))?;
-    let existing = read_record(registry, &request.agent_id, request.channel)?;
+        .get(&request.registration_id)?
+        .ok_or_else(|| format!("agent {} is not registered", request.registration_id))?;
+    let existing = read_record(registry, &request.registration_id, request.channel)?;
     let is_new = existing.is_none();
     let record = match (existing, &request.replace) {
         (None, None) => ChannelRecord {
             version: PUBLICATION_VERSION,
-            agent_id: request.agent_id.clone(),
+            registration_id: request.registration_id.clone(),
             channel: request.channel,
             writer: new_binding(&request.publisher, 1),
             snapshot: None,
@@ -862,7 +863,7 @@ pub fn acquire_writer(
         } else {
             "publication.writer_replaced"
         },
-        Some(&request.agent_id),
+        Some(&request.registration_id),
         None,
         None,
     );
@@ -872,31 +873,31 @@ pub fn acquire_writer(
 /// Read the current durable channel record.
 pub fn channel(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     channel: Channel,
 ) -> Result<Option<ChannelRecord>, String> {
-    read_record(registry, agent_id, channel)
+    read_record(registry, registration_id, channel)
 }
 
 /// Read the source-labelled public channel projection.
 pub fn published(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     channel: Channel,
     now_ms: i64,
 ) -> Result<Option<PublicChannel>, String> {
-    Ok(read_record(registry, agent_id, channel)?
+    Ok(read_record(registry, registration_id, channel)?
         .map(|record| record.view(now_ms, registry.serving_epoch())))
 }
 
 /// Read the channel as an unrelated reader sees it: same facts, no handle.
 pub fn published_facts(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     channel: Channel,
     now_ms: i64,
 ) -> Result<Option<PublicChannelFacts>, String> {
-    Ok(read_record(registry, agent_id, channel)?
+    Ok(read_record(registry, registration_id, channel)?
         .map(|record| record.facts(now_ms, registry.serving_epoch())))
 }
 
@@ -914,7 +915,7 @@ pub fn publish(
 ) -> Result<ChannelRecord, String> {
     let report = request.validate()?;
     let _transition = registry.transition();
-    let record = read_record(registry, &request.agent_id, request.channel)?
+    let record = read_record(registry, &request.registration_id, request.channel)?
         .ok_or_else(|| "channel has no writer".to_string())?;
     if record.writer.handle != request.writer_handle {
         return Err("writer handle is stale or belongs to another channel generation".into());
@@ -939,7 +940,7 @@ pub fn publish(
     let writer = &record.writer;
     let updated = ChannelRecord {
         version: record.version,
-        agent_id: record.agent_id.clone(),
+        registration_id: record.registration_id.clone(),
         channel: record.channel,
         writer: WriterBinding {
             sequence: request.sequence,
@@ -967,7 +968,7 @@ pub fn publish(
             Channel::Assignment => "assignment.published",
             Channel::Facts => "facts.published",
         },
-        Some(&request.agent_id),
+        Some(&request.registration_id),
         None,
         None,
     );
@@ -977,14 +978,14 @@ pub fn publish(
 /// Retire this channel's current writer without retracting its last facts.
 pub fn retire(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     channel: Channel,
     writer_handle: &str,
     now_ms: i64,
 ) -> Result<ChannelRecord, String> {
-    validate_agent_id(writer_handle)?;
+    validate_registration_id(writer_handle)?;
     let _transition = registry.transition();
-    let record = read_record(registry, agent_id, channel)?
+    let record = read_record(registry, registration_id, channel)?
         .ok_or_else(|| "channel has no writer".to_string())?;
     if record.writer.handle != writer_handle {
         return Err("writer handle is stale or belongs to another channel generation".into());
@@ -1006,7 +1007,7 @@ pub fn retire(
             Channel::Assignment => "assignment.retired",
             Channel::Facts => "facts.retired",
         },
-        Some(agent_id),
+        Some(registration_id),
         None,
         None,
     );
@@ -1027,11 +1028,11 @@ pub(crate) fn new_binding(publisher: &PublisherIdentity, generation: u64) -> Wri
 
 fn read_record(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     channel: Channel,
 ) -> Result<Option<ChannelRecord>, String> {
-    validate_agent_id(agent_id)?;
-    let path = record_path(registry, agent_id, channel);
+    validate_registration_id(registration_id)?;
+    let path = record_path(registry, registration_id, channel);
     let bytes = match read_record_file(&path, MAX_PUBLICATION_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.contains("No such file or directory") => return Ok(None),
@@ -1040,7 +1041,7 @@ fn read_record(
     let mut record: ChannelRecord =
         serde_json::from_slice(&bytes).map_err(|error| format!("not a channel record: {error}"))?;
     if record.version != PUBLICATION_VERSION
-        || record.agent_id != agent_id
+        || record.registration_id != registration_id
         || record.channel != channel
     {
         return Err("channel record has invalid version, target or channel".into());
@@ -1048,23 +1049,23 @@ fn read_record(
     if record.writer.generation == 0 {
         return Err("channel writer generation is zero".into());
     }
-    validate_agent_id(&record.writer.handle)?;
-    validate_agent_id(&record.writer.incarnation)?;
+    validate_registration_id(&record.writer.handle)?;
+    validate_registration_id(&record.writer.incarnation)?;
     if let Some(accepted) = &mut record.snapshot {
         if accepted.generation == 0 || accepted.generation > record.writer.generation {
             return Err("channel snapshot generation is out of range".into());
         }
-        validate_agent_id(&accepted.handle)?;
-        validate_agent_id(&accepted.incarnation)?;
+        validate_registration_id(&accepted.handle)?;
+        validate_registration_id(&accepted.incarnation)?;
         accepted.snapshot = accepted.snapshot.for_channel(channel)?;
     }
     Ok(Some(record))
 }
 
-fn record_path(registry: &Registry, agent_id: &str, channel: Channel) -> std::path::PathBuf {
+fn record_path(registry: &Registry, registration_id: &str, channel: Channel) -> std::path::PathBuf {
     registry
         .publications()
-        .join(format!("{agent_id}.{}.json", channel.name()))
+        .join(format!("{registration_id}.{}.json", channel.name()))
 }
 
 /// Writes the whole channel record atomically: a mode-`0600` temporary sibling,
@@ -1074,7 +1075,7 @@ fn write_record(registry: &Registry, record: &ChannelRecord) -> Result<(), Strin
     write_record_at(
         registry,
         record,
-        &record_path(registry, &record.agent_id, record.channel),
+        &record_path(registry, &record.registration_id, record.channel),
     )
 }
 
@@ -1084,7 +1085,7 @@ fn write_record_with_failure(
     record: &ChannelRecord,
     fail_before_rename: bool,
 ) -> Result<(), String> {
-    let path = record_path(registry, &record.agent_id, record.channel);
+    let path = record_path(registry, &record.registration_id, record.channel);
     write_record_at_inner(registry, record, &path, fail_before_rename)
 }
 
@@ -1246,7 +1247,7 @@ mod tests {
         let writer = registry
             .acquire_writer(
                 &AcquireRequest {
-                    agent_id: agent.agent_id.clone(),
+                    registration_id: agent.registration_id.clone(),
                     channel: Channel::Execution,
                     publisher,
                     replace: None,
@@ -1255,7 +1256,7 @@ mod tests {
             )
             .expect("acquire");
         let make_request = |sequence| PublishRequest {
-            agent_id: agent.agent_id.clone(),
+            registration_id: agent.registration_id.clone(),
             channel: Channel::Execution,
             writer_handle: writer.handle.clone(),
             sequence,
@@ -1271,10 +1272,10 @@ mod tests {
         registry
             .publish(&make_request(1), 1_000)
             .expect("first publish");
-        let path = record_path(&registry, &agent.agent_id, Channel::Execution);
+        let path = record_path(&registry, &agent.registration_id, Channel::Execution);
         let before = fs::read(&path).expect("old record bytes");
         let old_record = registry
-            .channel(&agent.agent_id, Channel::Execution)
+            .channel(&agent.registration_id, Channel::Execution)
             .expect("read")
             .expect("record");
         let failed = ChannelRecord {
@@ -1302,7 +1303,7 @@ mod tests {
         assert_eq!(fs::read(&path).expect("old record still present"), before);
         assert_eq!(
             registry
-                .channel(&agent.agent_id, Channel::Execution)
+                .channel(&agent.registration_id, Channel::Execution)
                 .unwrap()
                 .unwrap()
                 .writer
@@ -1316,7 +1317,7 @@ mod tests {
         drop(registry);
         let reopened = Registry::open_at(&root, 2_000).expect("reopen");
         let restored = reopened
-            .channel(&agent.agent_id, Channel::Execution)
+            .channel(&agent.registration_id, Channel::Execution)
             .unwrap()
             .unwrap();
         assert_eq!(restored.writer.sequence, 2);

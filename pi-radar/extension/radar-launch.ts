@@ -46,7 +46,7 @@ export type LaunchMailbox<State extends LaunchState> = {
  *    the child's exact command into it, and still reports that pane in its own
  *    inventory;
  * 2. a child registered with the launch's private token, so the edge names the
- *    exact `agent_id` that child obtained — never a label, pane or session;
+ *    exact `registration_id` that child obtained — never a label, pane or session;
  * 3. that child wrote a fresh startup acknowledgment for this launch generation
  *    after Herdsman startup finished, naming the pane the daemon created as its
  *    own location.
@@ -66,7 +66,7 @@ export type LaunchMailbox<State extends LaunchState> = {
 
 /** The exact managed parent this launch may use, and nothing inferred about it. */
 export type RadarLaunchParent = {
-	agent_id: string;
+	registration_id: string;
 	/** Stable subject from this process's current Radar registration. */
 	subject_id: string;
 	location?: RadarLocation;
@@ -109,12 +109,12 @@ export type RadarWorkerLaunch = {
 	 * because a binding that was not persisted is one no later reader can hold the
 	 * child by.
 	 */
-	onBound?: (bound: { agent_id: string; pane_id: string }) => void;
+	onBound?: (bound: { registration_id: string; pane_id: string }) => void;
 };
 
 export type RadarWorkerLaunched<State = unknown> = {
 	request_id: string;
-	agent_id: string;
+	registration_id: string;
 	pane_id: string;
 	/**
 	 * The process the daemon bound this launch's edge to, taken from that same
@@ -143,7 +143,7 @@ export type RadarLaunchOutcome<State = unknown> =
  */
 export type RadarChildEvidence = {
 	request_id: string;
-	agent_id: string;
+	registration_id: string;
 	source: string;
 	incarnation: string;
 	pane_id: string;
@@ -192,12 +192,12 @@ export async function observeRadarChild(
 	provenance: {
 		request_id: string;
 		pane_id: string | undefined;
-		agent_id: string | undefined;
+		registration_id: string | undefined;
 		/** The session this launch's mailbox records for the child. */
 		session_id: string | undefined;
 	},
 ): Promise<RadarChildObservation> {
-	if (provenance.agent_id === undefined)
+	if (provenance.registration_id === undefined)
 		return unknownChild("not bound to a child by this launch");
 	// A launch that recorded no pane has nothing to compare the daemon's read
 	// against: the child's own claim about where it runs is not where the launch
@@ -211,11 +211,11 @@ export async function observeRadarChild(
 		);
 	const topology = read.value;
 	const edge = topology.edge;
-	if (edge.bound === undefined || edge.bound.agent_id === undefined)
+	if (edge.bound === undefined || edge.bound.registration_id === undefined)
 		return unknownChild("not bound to a child by the daemon");
-	if (edge.bound.agent_id !== provenance.agent_id)
+	if (edge.bound.registration_id !== provenance.registration_id)
 		return unknownChild(
-			`bound to another subject (${edge.bound.agent_id}), not to ${provenance.agent_id}`,
+			`bound to another subject (${edge.bound.registration_id}), not to ${provenance.registration_id}`,
 		);
 	if (edge.location?.pane === undefined)
 		return unknownChild("recorded without a pane");
@@ -241,7 +241,7 @@ export async function observeRadarChild(
 	// The edge says where the child was bound, not that its process still runs.
 	// The registry's verdict on the bound subject, and the location it registered
 	// with, are what prove the child live.
-	const reply = await client.agentGet(edge.bound.agent_id);
+	const reply = await client.agentGet(edge.bound.registration_id);
 	if (reply.ok === false)
 		return unknownChild(
 			`process verdict not readable (${reply.code}: ${reply.message})`,
@@ -271,7 +271,7 @@ export async function observeRadarChild(
 		kind: "live",
 		evidence: {
 			request_id: provenance.request_id,
-			agent_id: edge.bound.agent_id,
+			registration_id: edge.bound.registration_id,
 			source: edge.bound.source,
 			incarnation: edge.bound.incarnation,
 			pane_id: edge.location.pane,
@@ -393,7 +393,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 	const deadline = Date.now() + options.timeoutMs;
 	const remaining = (): number => Math.max(0, deadline - Date.now());
 	const pane = launch.parent.location?.pane;
-	if (!isUuid(launch.parent.agent_id))
+	if (!isUuid(launch.parent.registration_id))
 		return refusedLaunch(
 			"the launch has no exact parent registration to spawn under",
 		);
@@ -411,7 +411,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 
 	const spawned = await client.spawn({
 		request_id: launch.request_id,
-		parent: launch.parent.agent_id,
+		parent: launch.parent.registration_id,
 		parent_session_id: launch.parent_session_id,
 		executable: launch.executable,
 		managed: { parent_subject_id: launch.parent.subject_id },
@@ -437,13 +437,13 @@ export async function launchRadarWorker<State extends LaunchState>(
 		...(signal !== undefined ? { signal } : {}),
 	});
 	if (bound.kind !== "bound") return bound;
-	const agentId = bound.agent_id;
+	const agentId = bound.registration_id;
 	// The binding is recorded before the readiness wait, not after it: the child
 	// may never acknowledge, and the subject and pane the daemon named are still
 	// what a reload has to prove this child by.
 	if (launch.onBound !== undefined) {
 		try {
-			launch.onBound({ agent_id: agentId, pane_id: bound.pane_id });
+			launch.onBound({ registration_id: agentId, pane_id: bound.pane_id });
 		} catch (error) {
 			return unresolvedLaunch(
 				launch.request_id,
@@ -475,7 +475,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 			kind: "ready",
 			value: {
 				request_id: launch.request_id,
-				agent_id: agentId,
+				registration_id: agentId,
 				pane_id: bound.pane_id,
 				bound_process: {
 					source: bound.source,
@@ -498,7 +498,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 type BoundChild =
 	| {
 			kind: "bound";
-			agent_id: string;
+			registration_id: string;
 			pane_id: string;
 			source: string;
 			incarnation: string;
@@ -509,7 +509,7 @@ type BoundChild =
  * Poll the edge this request id authored until a child presents its token.
  *
  * The daemon binds the edge once, to the exact registration the token produced,
- * so `bound.agent_id` is the child identity. A refusal or an unknown launch
+ * so `bound.registration_id` is the child identity. A refusal or an unknown launch
  * effect ends the wait at once: neither becomes a child by waiting longer. An
  * edge whose recorded pane the daemon no longer reports ends it too: waiting
  * cannot create the pane a launch claims, and a location read afterwards would
@@ -559,7 +559,7 @@ async function waitForChild(
 					requestId,
 					"the daemon observed the launched child's process exit",
 				);
-			const agentId = edge.bound?.agent_id;
+			const agentId = edge.bound?.registration_id;
 			if (agentId !== undefined && isUuid(agentId)) {
 				// A child the daemon bound without the process it registered as is a
 				// child no assignment can be addressed to, and an unaddressed Radar
@@ -579,7 +579,7 @@ async function waitForChild(
 					);
 				return {
 					kind: "bound",
-					agent_id: agentId,
+					registration_id: agentId,
 					pane_id: pane,
 					source,
 					incarnation,

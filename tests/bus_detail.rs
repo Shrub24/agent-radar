@@ -39,11 +39,11 @@ fn location(pane_id: &str) -> Location {
 /// — the running count beside it is not a task set — so the count publishes
 /// that many ids.
 fn task_session_view(pane_id: &str, session: &str) -> RegistryView {
-    let agent_id = format!("test-{pane_id}");
+    let registration_id = format!("test-{pane_id}");
     let mut agent: RegistryAgent = serde_json::from_value(serde_json::json!({
         "registration": {
             "version": 1,
-            "agent_id": agent_id,
+            "registration_id": registration_id,
             "registered_at": "2026-01-01T00:00:00.000Z",
             "source": "herdsman",
             "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -62,7 +62,7 @@ fn task_session_view(pane_id: &str, session: &str) -> RegistryView {
     agent.context = Some(
         serde_json::from_value(serde_json::json!({
             "version": 1,
-            "agent_id": agent_id,
+            "registration_id": registration_id,
             "writer": {
                 "source":"herdsman",
                 "incarnation":"22222222-2222-4222-8222-222222222222",

@@ -341,7 +341,7 @@ fn validate_handoff(handoff: &Handoff) -> Result<(), Error> {
 }
 
 fn validate_identity(identity: &HandoffIdentity) -> Result<(), Error> {
-    if !is_id(&identity.agent_id) || !is_id(&identity.session_id) {
+    if !is_id(&identity.registration_id) || !is_id(&identity.session_id) {
         return Err(Error::Invalid("identity is incomplete".into()));
     }
     if is_id(&identity.subject_id)
@@ -386,7 +386,7 @@ mod tests {
 
     fn identity(subject_id: Option<String>) -> HandoffIdentity {
         HandoffIdentity {
-            agent_id: random_uuid(),
+            registration_id: random_uuid(),
             session_id: random_uuid(),
             subject_id: subject_id.unwrap_or_else(random_uuid),
             execution_id: random_uuid(),
@@ -499,7 +499,7 @@ mod tests {
         let message = sample(&sender, &recipient);
         store.publish(&message).unwrap();
         let successor = HandoffIdentity {
-            agent_id: random_uuid(),
+            registration_id: random_uuid(),
             session_id: random_uuid(),
             execution_id: random_uuid(),
             execution_generation: 2,

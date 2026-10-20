@@ -58,13 +58,13 @@ capabilities, while topology reads are registry reads.
 
 ## Registration record
 
-One registration is one JSON file, `<state root>/agents/<agent_id>.json`, mode
+One registration is one JSON file, `<state root>/agents/<registration_id>.json`, mode
 `0600`:
 
 ```json
 {
   "version": 1,
-  "agent_id": "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
+  "registration_id": "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
   "registered_at": "2026-01-01T00:00:00.000Z",
   "request": {
     "source": "herdsman",
@@ -94,26 +94,11 @@ One registration is one JSON file, `<state root>/agents/<agent_id>.json`, mode
 }
 ```
 
-The daemon-issued UUID is the durable identity key. Source plus publisher
-incarnation define an idempotent registration; session is context, not identity,
-so duplicate attaches stay distinct. `owner`, `run`, `label`, backend-qualified
-location, claimed process identity and explicit private launch specification
-are optional facts. The public registration projection has no fields for launch
-executable, argv, cwd, session path, or `spawn_token`; it exposes launch
-availability and revision only. Process identity is a strict registry-wire
-shape but a claim, not verification. For a daemon-spawned child only, the child
-passes the exact `PI_RADAR_SPAWN_TOKEN` value as `spawn_token` in its own
-`agent.register` request. It is a private correlation credential: never place it
-in labels, aliases, publication facts, logs, or public read projections. A
-successful registration binds the edge once; a repeated presentation after
-binding is refused, except an identical retry of the same registration is
-answered as that earlier registration.
+Radar exposes one `agent.presence` operation. A report presents the process birth identity (boot ID, PID, start ticks), source/incarnation, current session UUID, session-load `claim_id`, mutable location and optional launch correlation/managed metadata. Radar resolves the process's `registration_id`, current context and durable session subject internally. The response is `granted`, `duplicate` or `pending`, with a `subject_id` only for a grant. A retry of one claim returns its stored decision; only a fresh Pi `session_start` creates another claim opportunity.
 
-Registration holds **identity and configuration only**. Mutable activity,
-waiting reason, last outcome and actions belong to publication, not to this
-record. A `state` field is refused as unknown; unknown vocabulary is preserved
-where the publication channel accepts it. Registration retry with identical
-source/incarnation/content returns the same handle; conflicting content refuses.
+The process birth tuple and `registration_id` identify the process registration. Session/location are mutable context; the subject ID follows the session and survives release. A duplicate claim is sticky across incumbent release and daemon restart. Procfs or storage uncertainty remains pending, never duplicate. Supplied launch correlation must match the recorded launch; it never falls back to manual adoption. The daemon validates process identity before recording a registration. Launch secrets and `spawn_token` are private and never appear in public projections.
+
+`agent.release` names the exact registration and claim. It releases the current attachment but retains the process registration and durable session subject. It is idempotent; a delayed release cannot revoke a later claim. The process-exit sweep releases only when birth identity is verifiably absent or reused, never from pane loss or heartbeat expiry.
 
 Records are bounded (64 KiB, 1 KiB text fields, max 256 argv entries), private
 (mode 0600), written atomically and read only as bounded regular non-symlink
@@ -124,10 +109,11 @@ root are unsupported for concurrent writes.
 
 ## Socket methods
 
-The trusted control socket serves `agent.register`, `agent.acquire`,
-`agent.publish`, `agent.retire`, `agent.context`, `agent.get`, `agent.list`,
-`spawn.create`, `spawn.get`, `spawn.list` and `spawn.close`, plus the journal read
-`events.read`. `daemon.ping` advertises `registry.v1`, `registry.facts.v1` and `events.v1`
+The Pi baseline uses `agent.presence` and `agent.release` for identity; generic
+publisher clients may still use `agent.register` and `agent.context`. The trusted
+control socket also serves `agent.acquire`, `agent.publish`, `agent.retire`,
+`agent.get`, `agent.list`, `spawn.create`, `spawn.get`, `spawn.list` and
+`spawn.close`, plus the journal read `events.read`. `daemon.ping` advertises `registry.v1`, `registry.facts.v1` and `events.v1`
 regardless of mux backend. `registry.facts.v1` is served whenever `registry.v1`
 is, and names the facts channel and the assignment extension below; an older
 daemon rejects both as `bad_params`. The `agent.*` methods are
@@ -166,11 +152,11 @@ assignment, or alter process lifecycle. The command is passed to the backend
 unchanged, alongside a daemon-minted, single-use token exported to the child as
 `PI_RADAR_SPAWN_TOKEN`. The child captures that value, removes it from its
 process environment, and includes it privately as `spawn_token` in its own
-`agent.register` request. Keep the captured value only in bootstrap memory while
+`agent.presence` request. Keep the captured value only in bootstrap memory while
 an acknowledgement is uncertain; retry with identical source, incarnation,
-process claim and token. The returned `registration.agent_id` is the exact child
+process claim and token. The returned `registration.registration_id` is the exact child
 identity. A parent obtains the same identity from `spawn.get`/`spawn.list` at
-`spawn.bound.agent_id`, then calls `agent.get` with that value. The token is
+`spawn.bound.registration_id`, then calls `agent.get` with that value. The token is
 private, stored
 only with the durable edge and consumed on binding; never return or publish it.
 
@@ -218,7 +204,7 @@ Both topology methods require `registry.v1`, regardless of backend. For
 location verification, one `mux.observe` inventory is consulted per response/page
 when a backend advertises `mux.observe`; otherwise the durable topology is still
 returned with unconfirmed freshness. Edges persist across daemon restarts. The
-public topology contains parent, optional bound child `(source, incarnation, agent_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains created/launched outcomes, optional created location, `state`,
+public topology contains parent, optional bound child `(source, incarnation, registration_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains created/launched outcomes, optional created location, `state`,
 `freshness`, and `exit_observation`; it never contains the token, and it never
 returns the private creating instance the dead-pane fence compares.
 
@@ -347,8 +333,8 @@ are evidence-based and never create authority from a session entry alone.
 
 ### Public discovery and pagination
 
-`agent.get` takes `{"agent_id":"<registered UUID>"}`. `agent.list` takes
-`{"limit":50,"after":"<last returned agent_id>"}`; both fields are optional.
+`agent.get` takes `{"registration_id":"<registered UUID>"}`. `agent.list` takes
+`{"limit":50,"after":"<last returned registration_id>"}`; both fields are optional.
 The default limit is 50; accepted limits are 1–100. Listing returns
 `{"agents":[...],"next":"<continuation UUID>"}` or `"next": null` when complete.
 Pass `next` as `after` for the next page. Responses are also byte-bounded and may
@@ -358,24 +344,15 @@ time. Pages are current reads, not a frozen fleet snapshot; concurrent insertion
 before a cursor can be seen on a subsequent full scan. Corrupt records fail the
 read explicitly. Retirement does not prune registrations.
 
-For owner/child correlation, pass the exact returned `agent_id`; session UUID or
-pane identity alone cannot identify a subject. If a live process changes session,
-do not register it as a new process: registration is immutable. Publish the
-current session through `agent.context` instead. Session context carries only the
-session. The response's `management` states Radar's standing on it: `managed`
-with the subject ID the session is attached to, `duplicate` when another live
-process holds the session, or `unmanaged`. No session entry or marker is written
-or read for identity; a pi-radar 0.3.0 `launch_identity` field is accepted and
-ignored. The channel remains source-labelled, leased, replaceable evidence and
-carries no paths, recipes, spawn tokens or environment.
+For process-owned channels, use the exact `registration_id`; durable lifecycle and handoff identity use `subject_id`, not a session lookup or pane. If a process changes sessions, it keeps the same registration and sends a fresh `claim_id` through `agent.presence`. The receipt reports `granted`, `duplicate` or `pending`, and includes `subject_id` only on a grant. A duplicate stays rejected until a fresh session load; reconnecting the same claim does not promote it. No session entry or marker is written or read for identity. Process channels remain source-labelled, leased, replaceable evidence and carry no paths, recipes, spawn tokens or environment.
 
 ### One channel is one record
 
-A channel is one file, `<state root>/publications/<agent_id>.<channel>.json`,
+A channel is one file, `<state root>/publications/<registration_id>.<channel>.json`,
 holding the current `writer` binding and an optional `snapshot`. Execution,
 assignment and facts are three such files, each with its own writer, sequence
 and lease. Current session
-context is a separate file, `<state root>/publications/<agent_id>.context.json`.
+context is a separate file, `<state root>/publications/<registration_id>.context.json`.
 **Acquire,
 publish and retire each rewrite that single record atomically**: a mode-`0600`
 temporary sibling is flushed, renamed into place, and the containing directory is
@@ -383,7 +360,7 @@ synced before the call returns. There is no separate writer file a partial write
 could leave behind, so a failed write leaves the previous binding, sequence and
 snapshot byte-identical and an identical retry still succeeds.
 
-`AcquireRequest` names a target `agent_id`, a `channel`, a `PublisherIdentity`
+`AcquireRequest` names a target `registration_id`, a `channel`, a `PublisherIdentity`
 (`source`, publisher `incarnation` UUID, optional `reporting_owner`) and an
 optional expected incumbent:
 
@@ -395,7 +372,7 @@ optional expected incumbent:
   (`incumbent writer changed`), so a replayed or delayed replacement cannot
   overwrite a newer writer.
 
-A `registration` `agent_id` is a target identity, **not** a writer credential. A
+A `registration` `registration_id` is a target identity, **not** a writer credential. A
 channel writer is a separately issued opaque UUID bound to actual publisher
 source, publisher incarnation, reporting owner, target agent ID, channel,
 generation, sequence and retirement state. The **publisher is not looked up**: a
@@ -443,7 +420,7 @@ at a newer sequence, so omitting a field withdraws it on read.
 Facts (`channel: "facts"`) are self-authored by the session, with no owner:
 
 - `model`, `provider`, `thinking` and `session_name`: optional bounded text.
-  `session_name` is a display label; the session UUID stays in `agent.context`.
+  `session_name` is a display label; the session UUID is reported through `agent.presence`.
 - `context_window`: optional `{"tokens","window"}` of two non-negative integers
   no greater than `9,007,199,254,740,991` (JavaScript's safe-integer maximum),
   the tokens in context and the window size. `window` is above zero and `tokens`
@@ -482,60 +459,20 @@ does not touch assignment or execution.
 
 Each accepted facts publish appends a `facts.published` pointer, and each retire
 appends `facts.retired`. Execution and assignment append their own
-`execution.*` and `assignment.*` pointers. Pointers carry `agent_id` and time
+`execution.*` and `assignment.*` pointers. Pointers carry `registration_id` and time
 only, never snapshot values.
 
 `agent.get` and every `agent.list` entry carry a `facts` key: `null` when no
 facts writer was ever acquired, otherwise the public channel projection with its
 provenance, freshness and no fencing handle.
 
-### Mutable current-session context
+### Presence, claims and release
 
-`agent.context` publishes the current session UUID independently of registration
-and execution/assignment snapshots.
-A session is bound to a registration only through Radar's attachment rules: the
-registration's published session must equal the subject's session, and the subject
-must be live. Its params are
-`{"agent_id":"<registered UUID>","publisher":{"source":"…","incarnation":"<UUID>"},"sequence":1,"context":{"session":"<session UUID>"}}`;
-`lease_ms` (1–300 seconds, default 30 seconds) and `observed_at` are optional.
-On the first publish the daemon returns a generation-1 writer binding. Subsequent
-publishes include that binding's `writer_handle`; a session switch uses a newer
-sequence under the same writer and leaves `agent_id`, registration and generation
-unchanged. To replace a retired or expired writer, include `replace` with the
-observed incumbent `generation` and `handle`, and publish as the successor
-publisher. For example:
+`agent.presence` combines the Pi process identity, current location, loaded session UUID and session-load claim. pi-radar calls it on `session_start`, renewal/reconnect reuses the same claim ID, and the response supplies the process `registration_id` plus claim standing. A fresh session load creates a new claim. Radar records duplicate outcomes durably so renewal, incumbent exit or daemon restart cannot promote a rejected duplicate. Pending verification/recovery is retried with the same claim.
 
-```json
-{"agent_id":"<agent-id>","publisher":{"source":"herdsman","incarnation":"<new-incarnation>"},"replace":{"generation":1,"handle":"<observed-incumbent-handle>"},"sequence":1,"context":{"session":"<session-uuid>"}}
-```
+On graceful `session_shutdown`, pi-radar calls `agent.release` with the exact `registration_id`, `claim_id` and process birth identity. The daemon acknowledges release of that attachment; the process registration and session subject persist. A late release is fenced to its old claim. If the shutdown reply is lost, a new claim from the same verified process can supersede its previous attachment. Process death is independently established from birth identity; missing pane, expired heartbeat and silence are not proof of death.
 
-This is the same `ExpectedWriter` shape used by `agent.acquire`. Fresh takeover
-is refused; a successful replacement advances the generation and fences the old
-handle. The fixture includes a complete replacement exchange. A stale handshake refusal names the reason
-and the incumbent generation/handle.
-
-The request's `context` object has exactly one field, `session`: a canonical UUID
-or explicit `null` meaning "no current session". Do not send a session-file path,
-launch arguments, environment or provider error text. A lost response may be
-retried at the same sequence with identical content; the daemon returns the
-stored context with a warning and does not renew the lease. Conflicting content
-at an already-stored sequence and older sequences are refused.
-
-`agent.context` returns `{ "writer": <binding>, "context": <public context>,
-"warning": null-or-string }`; the binding is returned only to the publishing
-caller so it can retain its credential. A non-null `warning` is human-readable
-prose explaining an answered replay; do not parse it. `agent.get` and every `agent.list` entry
-contain a `context` key: it is `null` when never published, and otherwise the
-credential-free public projection with source/incarnation, generation/sequence,
-lease timestamps, `restored`, `freshness` and `session`. A present record with
-`session: null` means explicitly unassociated, distinct from a null context key
-meaning never reported. Get/list never expose a writer handle or serving epoch.
-
-Long leases are allowed up to the same 300-second bound, but are discouraged:
-when a publisher disappears, context may remain `fresh` until that lease expires.
-Freshness is only daemon receipt time plus the serving epoch, not process
-liveness. Stale or absent context is unknown, never evidence of process exit,
-idleness or completion.
+The daemon stores the grant/decision and projects its current standing through `agent.get`/`agent.list` and observation snapshots. Clients do not persist subject authority in Pi transcript entries or infer it from pane/session contents. Mutable location changes update process context without creating another registration.
 
 ### Sequences, leases and freshness
 
@@ -600,7 +537,7 @@ accumulate blocked verifier threads, and a request arriving with no slot starts
 no work at all. A verifier that blocks forever therefore holds its slot, and up
 to that many uncancellable verifier threads can outlive a stop request; shutdown
 does not join them, and each worker holds only the claimed process identity and
-the verifier seam. The `Registry::verify_process(agent_id, verifier)` local API
+the verifier seam. The `Registry::verify_process(registration_id, verifier)` local API
 remains available for
 deterministic tests. No registry lock is held across procfs or an injected verifier. The result is
 `verified` only when the full boot ID, PID and `/proc/<pid>/stat` start-tick tuple
@@ -630,7 +567,7 @@ The endpoint contract exposes explicit writer acquire and replace (with expected
 generation/handle), channel publish/retire under the opaque handle, mutable context
 publish/replace, plus bounded public channel/context reads/listing and separately
 labelled process verification. Do
-not overload immutable `agent.register` with succession. Automatic replacement
+not overload immutable `agent.presence` with succession. Automatic replacement
 policy, process-death inference from a stale lease, launch/stop/resume,
 task-completion certification and physical mux controls remain out of scope.
 
@@ -644,10 +581,10 @@ python3 examples/agent-publisher/publisher.py /run/user/1000/agent-radar/control
 ```
 
 The script is dependency-free Python 3.10+ and demonstrates owner assignment
-projection plus current-session context publication when its session changes. A production publisher stores its immutable registration and
-publisher-incarnation identity outside the process, repeats identical
-`agent.register` content after reconnect, and calls `agent.acquire` without
-`replace` to recover the same current writer. The example process generates an
+projection plus current-session context publication when its session changes. A production publisher stores its process registration and current session claim
+outside the process, reuses the same `claim_id` after reconnect, reports the
+current location, and calls `agent.acquire` without `replace` to recover the same
+current writer. The example process generates an
 incarnation once for its lifetime; it is illustrative, not durable publisher
 state. It publishes a complete snapshot and uses a newer sequence for every
 heartbeat. A lost response may be retried with exactly the same sequence,
@@ -690,7 +627,7 @@ independent facts replacement, assignment replay/heartbeat, context session swit
 context privacy, channel lease-expiry replacement, old-writer fencing and restart
 epoch freshness/reconnect, then stops the child in `finally`. It is not live
 publisher or fleet integration. The pi-extensions port is a separate follow-up:
-Herdsman must adopt `agent.context` on session start/switch/fork under its existing
+Herdsman must adopt `agent.presence` on session start/switch/fork under its existing
 publisher/writer handling. Map its current owner projection to assignment and
 its child execution facts to their separate channel, retain optional legacy
 metadata reporting only as an intentional compatibility bridge, and do not add

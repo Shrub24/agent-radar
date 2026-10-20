@@ -109,17 +109,17 @@ generic operation, spawn-edge and managed-close record shapes.
 
 A context-bearing `spawn.create` requires compatible protocol plus the `spawn.v1`
 and `spawn.launch_context.v1` contracts (`mux.create`, `mux.launch` and
-`mux.launch_context`). It names the exact parent `agent_id` and a fresh,
+`mux.launch_context`). It names the exact parent `registration_id` and a fresh,
 matching `parent_session_id`; duplicate attaches are not selected by UUID alone.
 
 The request supplies a resolved executable and literal argv, optional absolute
 cwd and an environment **overlay**, not replacement of the inherited environment.
 Radar reserves `PI_RADAR_SPAWN_TOKEN`, passes its private one-use token to the
 child, and consumes it when that exact child registers. New bindings expose the
-actual registration `agent_id`; old bindings may lack that field.
+actual registration `registration_id`; old bindings may lack that field.
 
-Use flat `spawn.get` readback: `result.spawn.bound.agent_id`, not
-`result.spawn.edge.bound.agent_id`. Then read `agent.get` for that exact ID.
+Use flat `spawn.get` readback: `result.spawn.bound.registration_id`, not
+`result.spawn.edge.bound.registration_id`. Then read `agent.get` for that exact ID.
 Binding says which registered child belongs to this creation; it does not say
 that the application is ready to receive an assignment. Execution freshness,
 process verification and owner-assignment facts are separate evidence.

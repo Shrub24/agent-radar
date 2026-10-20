@@ -480,7 +480,7 @@ impl FleetTree {
                     Nestable {
                         node: agent_node(agent, None, pane, foreground, &places),
                         parent: parent_claim(agent),
-                        agent_id: claimed_agent_id(agent),
+                        registration_id: claimed_registration_id(agent),
                         session: claimed_session(agent),
                     },
                     agent.location.tab_id.clone(),
@@ -508,7 +508,7 @@ impl FleetTree {
                             &places,
                         ),
                         parent: parent_claim(agent),
-                        agent_id: claimed_agent_id(agent),
+                        registration_id: claimed_registration_id(agent),
                         session: claimed_session(agent),
                     },
                     agent.location.tab_id.clone(),
@@ -696,7 +696,7 @@ fn agent_node(
     let registry = agent.registry.clone();
     let id = match &registry {
         Some(view) if view.binding != Binding::Joined => {
-            RowId::Registered(view.agent.registration.agent_id.clone())
+            RowId::Registered(view.agent.registration.registration_id.clone())
         }
         _ => RowId::Agent(location.pane_id.clone()),
     };
@@ -705,7 +705,7 @@ fn agent_node(
     // the reported title. A known vendor prefix supplies the identity when
     // the report has none; the prefix itself is stripped from the words.
     let fallback = match &id {
-        RowId::Registered(agent_id) => agent_id.clone(),
+        RowId::Registered(registration_id) => registration_id.clone(),
         _ => location.pane_id.clone(),
     };
     let raw = agent
@@ -974,7 +974,7 @@ fn nest_by_window(agents: Vec<(Nestable, String)>) -> (Vec<TreeNode>, Vec<(Strin
 struct Nestable {
     node: TreeNode,
     parent: Option<ParentClaim>,
-    agent_id: Option<String>,
+    registration_id: Option<String>,
     session: Option<String>,
 }
 
@@ -1011,11 +1011,11 @@ fn parent_claim(agent: &AgentObservation) -> Option<ParentClaim> {
 }
 
 /// The registration id a row is addressed by, when it has one.
-fn claimed_agent_id(agent: &AgentObservation) -> Option<String> {
+fn claimed_registration_id(agent: &AgentObservation) -> Option<String> {
     agent
         .registry
         .as_ref()
-        .map(|view| view.agent.registration.agent_id.clone())
+        .map(|view| view.agent.registration.registration_id.clone())
 }
 
 /// The session UUID a row is addressed by, when it publishes a lineage.
@@ -1048,11 +1048,14 @@ fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
     // Registration ids and session UUIDs identify agents uniquely; the maps are
     // keyed by their canonical text so no ordering/hashing derive is needed on
     // the id types.
-    let mut by_agent_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_registration_id: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut by_session: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, nestable) in agents.iter().enumerate() {
-        if let Some(agent_id) = nestable.agent_id.as_deref() {
-            by_agent_id.entry(agent_id).or_default().push(index);
+        if let Some(registration_id) = nestable.registration_id.as_deref() {
+            by_registration_id
+                .entry(registration_id)
+                .or_default()
+                .push(index);
         }
         if let Some(session) = nestable.session.as_deref() {
             by_session.entry(session).or_default().push(index);
@@ -1062,7 +1065,9 @@ fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
     let mut parent: Vec<Option<usize>> = vec![None; count];
     for (index, nestable) in agents.iter().enumerate() {
         let owners = match nestable.parent.as_ref() {
-            Some(ParentClaim::Edge(agent_id)) => by_agent_id.get(agent_id.as_str()),
+            Some(ParentClaim::Edge(registration_id)) => {
+                by_registration_id.get(registration_id.as_str())
+            }
             Some(ParentClaim::Session(session)) => by_session.get(session.as_str()),
             None => None,
         };
@@ -1442,7 +1447,7 @@ mod tests {
     /// A projected registration: a row joined to `pane`, carrying Radar's spawn
     /// edge when the daemon launched it as a child.
     fn registered_agent(
-        agent_id: &str,
+        registration_id: &str,
         pane_id: &str,
         tab_id: &str,
         spawn_parent: Option<&str>,
@@ -1451,7 +1456,7 @@ mod tests {
             "agent": {
                 "registration": {
                     "version": 1,
-                    "agent_id": agent_id,
+                    "registration_id": registration_id,
                     "registered_at": "2026-01-01T00:00:00.000Z",
                     "source": "herdsman",
                     "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -1964,7 +1969,7 @@ mod tests {
             lifecycle_subjects: vec![
                 LifecycleObservation {
                     subject_id: "subject-pending".into(),
-                    bound_agent_id: None,
+                    bound_registration_id: None,
                     process: None,
                     state: crate::control_plane::lifecycle::State::Pending,
                     session: None,
@@ -1972,7 +1977,7 @@ mod tests {
                 },
                 LifecycleObservation {
                     subject_id: "subject-bound-unjoined".into(),
-                    bound_agent_id: Some("agent-old".into()),
+                    bound_registration_id: Some("agent-old".into()),
                     process: Some(crate::model::ProcessIdentity {
                         boot_id: "boot".into(),
                         pid: 42,
@@ -1984,7 +1989,7 @@ mod tests {
                 },
                 LifecycleObservation {
                     subject_id: "subject-revoked".into(),
-                    bound_agent_id: None,
+                    bound_registration_id: None,
                     process: None,
                     state: crate::control_plane::lifecycle::State::Revoked,
                     session: None,

@@ -36,7 +36,7 @@ pub struct ManagedLaunchMetadata {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffIdentity {
-    pub agent_id: String,
+    pub registration_id: String,
     pub session_id: String,
     pub subject_id: String,
     pub execution_id: String,
@@ -49,7 +49,7 @@ pub struct HandoffIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffPublishParams {
-    pub sender_agent_id: String,
+    pub sender_registration_id: String,
     pub recipient_subject_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,

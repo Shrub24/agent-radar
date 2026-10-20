@@ -36,20 +36,20 @@ import {
 	systemScheduler,
 } from "./radar-client.ts";
 
-/** Shown while another live Radar process holds this Pi session. */
+/** A rejected session claim requires a fresh Pi session load before reconsideration. */
 const DUPLICATE_SESSION_DIAGNOSTIC =
-	"this Pi session is held by another live Radar process; it stays unmanaged until that process releases it";
+	"Radar rejected this session claim as a duplicate; reload or resume the session before retrying";
 
 /** The client members publication calls; consumers narrow to this rather than the whole client. */
 export type RadarPublicationClient = Pick<
 	RadarClient,
-	"ping" | "register" | "acquire" | "publish" | "context" | "retire"
+	"ping" | "presence" | "releasePresence" | "acquire" | "publish" | "retire"
 >;
 
 /**
  * Durable publication state for Radar's registry (`agent-radar`
  * `docs/agent-registration.md`, contract version 1): this process's immutable
- * subject registration, the acquired writer binding per channel, the accepted
+ * registration record, the acquired writer binding per channel, the accepted
  * sequence and the exact unresolved request.
  *
  * Everything here is best-effort and asynchronous. An absent daemon, a lost
@@ -103,7 +103,7 @@ export function readProcessBirth(): ProcessBirth | undefined {
 	}
 }
 
-const RECORD_NAME = /^(?:subjects|channels|context|bindings)\/[a-z0-9-]{1,64}\.json$/;
+const RECORD_NAME = /^(?:registrations|presence|subjects|channels|context|bindings)\/[a-z0-9-]{1,64}\.json$/;
 const MAX_RECORD_BYTES = 64 * 1024;
 const PRIVATE_MODE = 0o700;
 const RECORD_MODE = 0o600;
@@ -311,7 +311,7 @@ type PendingPublish = {
 
 type ChannelRecord = {
 	version: typeof RADAR_PUBLICATION_VERSION;
-	agent_id: string;
+	registration_id: string;
 	channel: RadarChannel;
 	publisher: RadarPublisherIdentity;
 	writer?: { handle: string; generation: number };
@@ -337,7 +337,7 @@ type ContextReport = {
  */
 type ContextRecord = {
 	version: typeof RADAR_PUBLICATION_VERSION;
-	agent_id: string;
+	registration_id: string;
 	publisher: RadarPublisherIdentity;
 	writer?: { handle: string; generation: number };
 	sequence: number;
@@ -349,7 +349,7 @@ type ContextRecord = {
 /** What a managed child tells its owner: which exact subject to publish about. */
 export type RadarChildBinding = {
 	version: typeof RADAR_PUBLICATION_VERSION;
-	agent_id: string;
+	registration_id: string;
 	incarnation: string;
 	run: string;
 	owner: string;
@@ -645,7 +645,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 	function blank(agentId: string): ChannelRecord {
 		return {
 			version: RADAR_PUBLICATION_VERSION,
-			agent_id: agentId,
+			registration_id: agentId,
 			channel,
 			publisher,
 			sequence: 0,
@@ -654,7 +654,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 
 	function loadRecord(): ChannelRecord {
 		const value = store.read(recordName);
-		const agentId = textAt(value, "agent_id");
+		const agentId = textAt(value, "registration_id");
 		const storedPublisher = recordAt(value, "publisher");
 		// A record written for another channel or publisher is not this writer's
 		// binding: adopting it would publish under someone else's identity.
@@ -682,7 +682,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 		const sentAt = numberAt(acceptedValue, "sent_at");
 		return {
 			version: RADAR_PUBLICATION_VERSION,
-			agent_id: agentId,
+			registration_id: agentId,
 			channel,
 			publisher,
 			...(handle !== undefined && generation !== undefined
@@ -750,7 +750,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 		// identical immutable content that was persisted with it.
 		const agentId = await input.subject(recovering);
 		if (agentId === undefined) return false;
-		if (record.agent_id !== agentId) {
+		if (record.registration_id !== agentId) {
 			// A different subject incarnation is a different channel: the previous
 			// binding, sequence and unresolved request do not apply to it, so the
 			// next drain publishes a complete snapshot instead of replaying one.
@@ -758,7 +758,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 			save();
 		}
 		const answer = await client.acquire({
-			agent_id: agentId,
+			registration_id: agentId,
 			channel,
 			publisher,
 		});
@@ -799,7 +799,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 		const writer = record.writer;
 		if (writer === undefined) return;
 		const answer = await client.publish({
-			agent_id: record.agent_id,
+			registration_id: record.registration_id,
 			channel,
 			writer_handle: writer.handle,
 			sequence: pending.sequence,
@@ -912,10 +912,10 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 			stopPump();
 			const writer = record.writer;
 			if (writer === undefined) return;
-			const agentId = record.agent_id;
+			const agentId = record.registration_id;
 			try {
 				void client
-					.retire({ agent_id: agentId, channel, writer_handle: writer.handle })
+					.retire({ registration_id: agentId, channel, writer_handle: writer.handle })
 					.then((answer) => {
 				if (answer.ok === true) {
 						try {
@@ -943,327 +943,166 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 	};
 }
 
-export type RadarContextWriter = {
-	/**
-	 * Report this process's current session. `null` is the explicit "no current
-	 * session" the daemon serves; `undefined` never is, because a process that
-	 * does not know its session has nothing to assert.
-	 */
-	update(session: string | null): void;
-	/** Release this writer's timers. The accepted report stays until it goes stale. */
+export type RadarPresenceReporter = {
+	/** Start a fresh session-load claim. Retries and heartbeats keep its claim ID. */
+	report(session: string): void;
+	/** Release this exact session claim on graceful shutdown. */
 	stop(): void;
 	/** Re-arm a stopped writer after an extension reload. */
 	reopen(): void;
 	/** Radar's standing on the session last published, once the daemon answered. */
 	management(): RadarManagement | undefined;
+	ensure(): Promise<string | undefined>;
+	release(): Promise<void>;
 	diagnostic(): string | undefined;
 };
 
-type ContextWriterInput = {
+type PresenceReporterInput = {
 	store: PublicationStore;
 	client: RadarPublicationClient;
 	scheduler: RadarScheduler;
 	recordName: string;
-	publisher: RadarPublisherIdentity;
-	/**
-	 * The exact subject this process registered. `recheck` forgets a cached
-	 * subject so the identical immutable content is registered again, which is
-	 * what a daemon that lost its state root needs.
-	 */
-	subject(recheck: boolean): Promise<string | undefined>;
-	leaseMs: number;
+	registration(): Promise<RadarRegistration | undefined>;
 	heartbeatMs: number;
 };
 
 /**
- * This process's own current session, under the channel discipline: one writer,
- * a strictly forward sequence and a lease. The first publish binds the writer
- * the daemon issues; a later session is a newer sequence under that same
- * binding, and the lease is renewed from the same cadence as the process's
- * facts rather than from a second heartbeat.
- *
- * A refusal is a real disagreement about ownership, so it stops this writer
- * with one diagnostic instead of taking over a binding it did not observe.
+ * Owns this process's durable claim retry state; Radar owns the subject grant.
+ * Session-load boundaries create claim IDs; heartbeats/reconnects reuse them.
  */
-function createContextWriter(input: ContextWriterInput): RadarContextWriter {
-	const { store, client, scheduler, recordName, publisher } = input;
-	let record = loadRecord();
-	let desired: string | null | undefined;
-	let running = false;
-	let again = false;
-	let recovering = false;
-	let stopped = false;
-	let fenced = false;
+function createPresenceReporter(input: PresenceReporterInput): RadarPresenceReporter {
+	const { store, client, scheduler, recordName } = input;
+	type State = {
+		version: 2;
+		claim_id: string;
+		session: string;
+		registration_id?: string;
+		subject_id?: string;
+		releases: Array<{ registration_id: string; claim_id: string }>;
+	};
+	let state: State | undefined;
 	let standing: RadarManagement | undefined;
-	let pump: RadarTimer | undefined;
-
-	function blank(agentId: string): ContextRecord {
-		return {
-			version: RADAR_PUBLICATION_VERSION,
-			agent_id: agentId,
-			publisher,
-			sequence: 0,
-		};
-	}
-
-	function loadRecord(): ContextRecord {
-		const value = store.read(recordName);
-		const agentId = textAt(value, "agent_id");
-		const storedPublisher = recordAt(value, "publisher");
-		// A record written for another publisher is not this writer's binding:
-		// adopting it would publish under someone else's identity.
+	let diagnostic: string | undefined;
+	try {
+		const saved = store.read(recordName) as State | undefined;
 		if (
-			numberAt(value, "version") !== RADAR_PUBLICATION_VERSION ||
-			agentId === undefined ||
-			(!isUuid(agentId) && agentId !== "") ||
-			textAt(storedPublisher, "source") !== publisher.source ||
-			textAt(storedPublisher, "incarnation") !== publisher.incarnation ||
-			textAt(storedPublisher, "reporting_owner") !== publisher.reporting_owner
+			saved?.version === 2 &&
+			isUuid(saved.claim_id) &&
+			isUuid(saved.session) &&
+			Array.isArray(saved.releases)
 		)
-			return blank("");
-		const writer = recordAt(value, "writer");
-		const handle = textAt(writer, "handle");
-		const generation = numberAt(writer, "generation");
-		if (
-			writer !== undefined &&
-			(!exactKeys(writer, WRITER_KEYS) || !isUuid(handle) || generation === undefined)
-		)
-			return blank(agentId);
-		const pending = contextReportAt(
-			recordAt(value, "pending"),
-			CONTEXT_PENDING_KEYS,
-			CONTEXT_PENDING_LEGACY_KEYS,
-		);
-		const acceptedValue = recordAt(value, "accepted");
-		const accepted = contextReportAt(
-			acceptedValue,
-			CONTEXT_ACCEPTED_KEYS,
-			CONTEXT_ACCEPTED_LEGACY_KEYS,
-		);
-		const sentAt = numberAt(acceptedValue, "sent_at");
-		return {
-			version: RADAR_PUBLICATION_VERSION,
-			agent_id: agentId,
-			publisher,
-			...(handle !== undefined && generation !== undefined
-				? { writer: { handle, generation } }
-				: {}),
-			sequence: numberAt(value, "sequence") ?? 0,
-			...(pending !== undefined ? { pending } : {}),
-			...(accepted !== undefined && sentAt !== undefined
-				? { accepted: { ...accepted, sent_at: sentAt } }
-				: {}),
-			...(textAt(value, "diagnostic") !== undefined
-				? { diagnostic: textAt(value, "diagnostic") }
-				: {}),
-		};
+			state = saved;
+	} catch (error) {
+		diagnostic = `presence storage unavailable: ${String(error)}`;
 	}
-
-	/** One bounded diagnostic: the first cause is the one a reader reconciles. */
-	function note(message: string): void {
-		if (record.diagnostic !== undefined) return;
-		record.diagnostic = message.slice(0, 256);
-		save();
-	}
-
-	function save(): void {
-		store.write(recordName, record);
-	}
-
-	function fence(message: string): void {
-		fenced = true;
-		stopPump();
-		note(`context stopped: ${message}`);
-	}
-
-	function startPump(): void {
-		if (pump !== undefined || stopped || fenced) return;
-		pump = scheduler.setInterval(() => kick(), input.heartbeatMs);
-		pump.unref?.();
-	}
-
-	function stopPump(): void {
-		if (pump === undefined) return;
-		scheduler.clearInterval(pump);
-		pump = undefined;
-	}
-
-	async function ensureSubject(): Promise<boolean> {
-		if (record.writer !== undefined) return true;
-		// A subject the daemon no longer holds is registered again from the
-		// identical immutable content that was persisted with it.
-		const agentId = await input.subject(recovering);
-		if (agentId === undefined) return false;
-		if (record.agent_id !== agentId) {
-			// A different subject incarnation is a different context record: the
-			// previous binding, sequence and unresolved report do not apply to it.
-			record = blank(agentId);
-			save();
-		}
-		return true;
-	}
-
-	function heartbeatDue(): boolean {
-		return (
-			record.accepted !== undefined &&
-			scheduler.now() - record.accepted.sent_at >= input.heartbeatMs
-		);
-	}
-
-	async function send(pending: ContextReport): Promise<void> {
-		const writer = record.writer;
-		const answer = await client.context({
-			agent_id: record.agent_id,
-			publisher,
-			// A first publish presents no handle: the daemon binds the writer the
-			// publisher already is, which is the binding this writer then keeps.
-			...(writer !== undefined ? { writer_handle: writer.handle } : {}),
-			sequence: pending.sequence,
-			lease_ms: pending.lease_ms,
-			observed_at: pending.observed_at,
-			context: {
-			session: pending.session,
-		},
-		});
-		if (answer.ok === true) {
-			recovering = false;
-			standing = answer.value.management;
-			record.writer = {
-				handle: answer.value.writer.handle,
-				generation: answer.value.writer.generation,
-			};
-			record.sequence = Math.max(record.sequence, answer.value.writer.sequence);
-			record.accepted = {
-				...pending,
-				sent_at: answer.value.warning === undefined
-					? scheduler.now()
-					: record.accepted?.sent_at ?? scheduler.now(),
-			};
-			record.pending = undefined;
-			save();
-			return;
-		}
-		if (
-			answer.code === "refused" ||
-			answer.code === "bad_params" ||
-			// A daemon that speaks the registry but does not serve this record would
-			// refuse every retry the same way; one diagnostic beats a silent retry
-			// loop once per heartbeat.
-			answer.code === "unknown_method"
-		) {
-			fence(answer.message);
-			return;
-		}
-		if (answer.code === "not_found") {
-			// The subject is gone. Nothing of the old subject can be republished
-			// against, so the whole record is dropped: the next heartbeat registers
-			// the identical content again and binds a fresh writer to it.
-			record = blank("");
-			recovering = true;
-			save();
-			return;
-		}
-		// A timeout, a closed connection or a lost reply leaves the exact request
-		// pending, so the retry replays it byte for byte and the lease does not
-		// silently advance.
-	}
-
-	async function stage(session: string | null): Promise<void> {
-		const pending: ContextReport = {
-			sequence: record.sequence + 1,
-			session,
-			lease_ms: input.leaseMs,
-			observed_at: new Date(scheduler.now()).toISOString(),
-		};
-		// Persisted before it is sent, so a lost reply replays this exact request.
-		record.pending = pending;
-		save();
-		await send(pending);
-	}
-
-	async function drainOnce(): Promise<void> {
-		if (fenced) return;
-		if (record.pending !== undefined) {
-			// An unresolved request is never overwritten by newer content.
-			await send(record.pending);
-			return;
-		}
-		if (desired === undefined) return;
-		if (!(await ensureSubject())) return;
-		if (fenced) return;
-		if (
-			record.writer === undefined ||
-			record.accepted === undefined ||
-			record.accepted.session !== desired
-		) {
-			await stage(desired);
-			return;
-		}
-		if (heartbeatDue()) await stage(record.accepted.session);
-	}
-
-	async function drain(): Promise<void> {
-		if (running || stopped || fenced) return;
-		running = true;
+	let timer: RadarTimer | undefined;
+	let stopped = false;
+	let running: Promise<string | undefined> | undefined;
+	function save(): boolean {
 		try {
-			await drainOnce();
+			if (state) store.write(recordName, state);
+			return true;
 		} catch (error) {
-			fenced = true;
-			stopPump();
-			try {
-				note(`context storage failure: ${String(error).slice(0, 180)}`);
-			} catch {
-				// Persistence failure is diagnostic-only; never escape into the host.
-			}
-		} finally {
-			running = false;
-			if (again && !stopped && !fenced) {
-				again = false;
-				kick();
-			}
+			diagnostic = `presence storage unavailable: ${String(error)}`;
+			return false;
 		}
 	}
-
-	function kick(): void {
-		if (stopped || fenced) return;
-		startPump();
-		if (running) {
-			again = true;
-			return;
+	async function releasePending() {
+		if (!state) return;
+		const registration = await input.registration();
+		if (!registration?.process) return;
+		for (const release of [...state.releases]) {
+			const answer = await client.releasePresence({ ...release, process: registration.process });
+			if (!answer.ok) return;
+			state.releases = state.releases.filter(r => r.claim_id !== release.claim_id);
+			save();
 		}
-		void drain().catch(() => undefined);
 	}
-
+	function schedule() {
+		if (stopped || timer) return;
+		timer = scheduler.setTimeout(() => { timer = undefined; void ensure(); }, input.heartbeatMs);
+		timer.unref?.();
+	}
+	async function ensure(): Promise<string | undefined> {
+		if (running) return running;
+		if (stopped || !state) return undefined;
+		const claim = state;
+		if (!save()) return undefined;
+		running = (async () => {
+			await releasePending();
+			const registration = await input.registration();
+			if (!registration?.process || state !== claim || stopped) return undefined;
+			const answer = await client.presence({
+				...registration, process: registration.process,
+				session_id: claim.session, claim_id: claim.claim_id,
+				...(claim.registration_id ? { registration_id: claim.registration_id } : {}),
+				...(claim.subject_id ? { subject_id: claim.subject_id } : {}),
+			});
+			if (state !== claim) return undefined;
+			if (!answer.ok) {
+				if (!["absent", "timeout", "transport"].includes(answer.code)) diagnostic = answer.message;
+				return undefined;
+			}
+			claim.registration_id = answer.value.registration_id;
+			claim.subject_id = answer.value.standing === "granted" ? answer.value.subject_id ?? undefined : undefined;
+			standing = answer.value.standing === "granted"
+				? { state: "managed", subject_id: claim.subject_id! }
+				: answer.value.standing === "duplicate"
+					? { state: "duplicate" }
+					: answer.value.standing === "pending"
+						? { state: "pending" }
+						: { state: "unmanaged" };
+			diagnostic = answer.value.standing === "duplicate" ? DUPLICATE_SESSION_DIAGNOSTIC : undefined;
+			save();
+			return claim.registration_id;
+		})();
+		try { return await running; }
+		catch (error) { diagnostic = `presence unavailable: ${String(error)}`; return undefined; }
+		finally {
+			running = undefined;
+			if (!stopped && state !== claim) void ensure();
+			else schedule();
+		}
+	}
 	return {
-		update(session) {
-			if (fenced || session === desired) return;
-			// A session reported while this writer is stopped is remembered, not
-			// published: only `reopen` restarts the timers, and it must see the
-			// session the process is in now rather than the one it left.
-			desired = session;
-			if (stopped) return;
-			kick();
+		report(session) {
+			const releases = [...(state?.releases ?? [])];
+			if (state?.registration_id && !releases.some(release => release.claim_id === state!.claim_id)) {
+				releases.push({ registration_id: state.registration_id, claim_id: state.claim_id });
+			}
+			standing = undefined;
+			state = { version: 2, session, claim_id: randomUUID(), releases };
+			save(); stopped = false;
+			void ensure();
 		},
-		stop() {
+		ensure,
+		async release() {
+			const releasing = state;
+			standing = undefined;
 			stopped = true;
-			stopPump();
+			if (timer) scheduler.clearTimeout(timer);
+			timer = undefined;
+			if (running) await running;
+			if (state === releasing) standing = undefined;
+			if (releasing?.registration_id && !releasing.releases.some(r => r.claim_id === releasing.claim_id)) {
+				releasing.releases.push({ registration_id: releasing.registration_id, claim_id: releasing.claim_id });
+				if (!save()) return;
+			}
+			await releasePending();
 		},
-		reopen() {
-			stopped = false;
-			if (desired !== undefined || record.pending !== undefined) kick();
-		},
+		stop() { stopped = true; if (timer) scheduler.clearTimeout(timer); timer = undefined; },
+		reopen() { stopped = false; void ensure(); },
 		management: () => standing,
-		diagnostic: () =>
-			record.diagnostic ??
-			(standing?.state === "duplicate" ? DUPLICATE_SESSION_DIAGNOSTIC : undefined),
+		diagnostic: () => diagnostic,
 	};
 }
+
 
 export type RadarPublication = {
 	/** This process's own execution channel. */
 	execution: RadarChannelWriter;
 	/** This process's own current session. */
-	context: RadarContextWriter;
+	presence: RadarPresenceReporter;
 	/** This process's own facts, a complete replacement on every update. */
 	facts: RadarFactsWriter;
 	/** The assignment channel of one owned child subject. */
@@ -1287,7 +1126,7 @@ export type RadarPublication = {
 
 /** What a process's own registration resolved to, and where it says it is. */
 export type RadarSubject = {
-	agent_id: string;
+	registration_id: string;
 	/** Stable managed logical subject: a Radar-issued launch, or an adopted Pi session. */
 	subject_id?: string;
 	location?: RadarLocation;
@@ -1305,32 +1144,23 @@ export type RadarPublicationOptions = {
 	scheduler?: RadarScheduler;
 	/** `undefined` omits the process claim rather than guessing one. */
 	birth?: ProcessBirth;
-	/**
-	 * The pane this process may publish for itself, resolved when the registration
-	 * record is first built. It is awaited rather than required up front, because
-	 * the daemon may not have answered yet - and a gap in that evidence is not a
-	 * fact to freeze: only a settled answer writes the immutable record, and a
-	 * record that already exists is never rebuilt and never acquires a location
-	 * later.
+	/** Current pane observation, refreshed for every presence report. Missing location
+	 * leaves process identity reportable but pending subject grant; no pane is guessed.
 	 */
 	location?: () => Promise<RadarLocationResolution>;
 	/** Set on a managed child: the sidecar its owner correlates the subject with. */
 	binding?: { key: string; run: string; owner: string; label: string };
-	/**
-	 * A daemon-spawned child's one-use launch token. It is sent with this
-	 * registration only, and never written to the subject record: a private
-	 * credential is not part of the identity that record holds.
-	 */
+	/** A daemon-spawned child's one-use launch token; sent privately, never stored in the process record. */
 	spawnToken?: string;
 	leaseMs?: number;
 	heartbeatMs?: number;
 };
 
-/** The persisted subject plus the daemon-issued identity it resolved to. */
-type SubjectRecord = {
+/** The process registration and its daemon-issued registration ID. */
+type RegistrationRecord = {
 	version: typeof RADAR_PUBLICATION_VERSION;
 	registration: RadarRegistration;
-	agent_id?: string;
+	registration_id?: string;
 };
 
 /**
@@ -1369,8 +1199,10 @@ function unavailablePublication(error?: unknown): RadarPublication {
 	};
 	return {
 		execution: writer,
-		context: {
-			update: () => undefined,
+		presence: {
+			report: () => undefined,
+			ensure: async () => undefined,
+			release: async () => undefined,
 			stop: () => undefined,
 			reopen: () => undefined,
 			management: () => undefined,
@@ -1409,7 +1241,7 @@ function createRadarPublicationInner(
 		return cached;
 	}
 
-	const subjectName = `subjects/${createHash("sha256")
+	const registrationName = `registrations/${createHash("sha256")
 		.update(`${options.registration.source}\0${incarnation}`)
 		.digest("hex")
 		.slice(0, 32)}.json`;
@@ -1427,8 +1259,8 @@ function createRadarPublicationInner(
 			.slice(0, 32)}.json`;
 
 	/** One current-session record per publisher, for the same reason as channels. */
-	const contextRecord = `context/${createHash("sha256")
-		.update(`context\0${incarnation}`)
+	const presenceRecord = `presence/${createHash("sha256")
+		.update(`presence\0${incarnation}`)
 		.digest("hex")
 		.slice(0, 32)}.json`;
 
@@ -1437,8 +1269,8 @@ function createRadarPublicationInner(
 	 * stored content wins over a later attempt to build it again: a claim read
 	 * successfully once may not change what this incarnation is registered as.
 	 */
-	function readSubject(): SubjectRecord | undefined {
-		const value = store.read(subjectName);
+	function readRegistration(): RegistrationRecord | undefined {
+		const value = store.read(registrationName);
 		const registration = recordAt(value, "registration");
 		if (
 			numberAt(value, "version") !== RADAR_PUBLICATION_VERSION ||
@@ -1446,20 +1278,20 @@ function createRadarPublicationInner(
 			textAt(registration, "incarnation") !== incarnation
 		)
 			return undefined;
-		const storedAgentId = textAt(value, "agent_id");
+		const storedAgentId = textAt(value, "registration_id");
 		return {
 			version: RADAR_PUBLICATION_VERSION,
 			registration: registration as RadarRegistration,
 			...(storedAgentId !== undefined && isUuid(storedAgentId)
-				? { agent_id: storedAgentId }
+				? { registration_id: storedAgentId }
 				: {}),
 		};
 	}
 
-	const stored = readSubject();
-	let subject: SubjectRecord | undefined = stored;
+	const stored = readRegistration();
+	let processRecord: RegistrationRecord | undefined = stored;
 	let registrationDiagnostic: string | undefined;
-	let registrationRecord: Promise<SubjectRecord | undefined> | undefined;
+	let registrationRecord: Promise<RegistrationRecord | undefined> | undefined;
 	/**
 	 * The immutable registration is written before it is ever sent, and the stored
 	 * content wins over a later attempt to build it again: a claim read
@@ -1474,18 +1306,13 @@ function createRadarPublicationInner(
 	 * never be repaired without replacing the identity it belongs to; the next
 	 * attempt asks the daemon again instead.
 	 */
-	async function ensureRegistration(): Promise<SubjectRecord | undefined> {
-		if (subject !== undefined) return subject;
+	async function ensureRegistration(): Promise<RegistrationRecord | undefined> {
+		if (processRecord !== undefined) return processRecord;
 		registrationRecord ??= (async () => {
 			const resolution = options.location
 				? await options.location()
 				: ({ state: "absent", reason: "this process publishes no location" } as const);
-			if (resolution.state === "pending") {
-				registrationDiagnostic =
-					`location bootstrap pending: ${resolution.reason}`.slice(0, 256);
-				return undefined;
-			}
-			const built: SubjectRecord = {
+			const built: RegistrationRecord = {
 				version: RADAR_PUBLICATION_VERSION,
 				registration: {
 					...options.registration,
@@ -1497,14 +1324,14 @@ function createRadarPublicationInner(
 				},
 			};
 			try {
-				store.write(subjectName, built);
+				store.write(registrationName, built);
 			} catch (error) {
 				registrationDiagnostic ??=
 					`private storage unavailable: ${String(error)}`.slice(0, 256);
 				return undefined;
 			}
 			registrationDiagnostic = undefined;
-			subject = built;
+			processRecord = built;
 			return built;
 		})();
 		try {
@@ -1513,11 +1340,10 @@ function createRadarPublicationInner(
 			registrationRecord = undefined;
 		}
 	}
-	let agentId = stored?.agent_id;
+	let agentId = stored?.registration_id;
 	let subjectReady: Promise<string | undefined> | undefined;
 	async function ensureSubject(recheck: boolean): Promise<string | undefined> {
-		if (recheck) agentId = undefined;
-		if (agentId !== undefined) return agentId;
+		if (!recheck && agentId !== undefined) return agentId;
 		subjectReady ??= (async () => {
 			const ready = await client.ping();
 			if (ready.ok === false) {
@@ -1527,18 +1353,11 @@ function createRadarPublicationInner(
 			}
 			const record = await ensureRegistration();
 			if (record === undefined) return undefined;
-			const answer = await client.register({
-				...record.registration,
-				...(spawnToken !== undefined ? { spawn_token: spawnToken } : {}),
-			});
-			if (answer.ok === false) {
-				if (answer.code !== "absent" && answer.code !== "timeout" && answer.code !== "transport")
-					registrationDiagnostic ??= `subject registration refused: ${answer.message}`.slice(0, 256);
-				return undefined;
-			}
-			agentId = answer.value.agent_id;
-			subject = { ...record, agent_id: agentId };
-			store.write(subjectName, subject);
+			const registered = await presence.ensure();
+			if (registered === undefined) return undefined;
+			agentId = registered;
+			processRecord = { ...record, registration_id: agentId };
+			store.write(registrationName, processRecord);
 			if (options.binding !== undefined) writeBinding(options.binding);
 			return agentId;
 		})();
@@ -1558,7 +1377,7 @@ function createRadarPublicationInner(
 		if (agentId === undefined) return;
 		store.write(`bindings/${binding.key}.json`, {
 			version: RADAR_PUBLICATION_VERSION,
-			agent_id: agentId,
+			registration_id: agentId,
 			incarnation,
 			run: binding.run,
 			owner: binding.owner,
@@ -1588,14 +1407,18 @@ function createRadarPublicationInner(
 		heartbeatMs: options.heartbeatMs ?? RADAR_HEARTBEAT_MS,
 	});
 
-	const context = createContextWriter({
-		store,
-		client,
-		scheduler,
-		recordName: contextRecord,
-		publisher: publisher("herdsman-pi"),
-		subject: ensureSubject,
-		leaseMs: options.leaseMs ?? RADAR_LEASE_MS,
+	const presence = createPresenceReporter({
+		store, client, scheduler, recordName: presenceRecord,
+		registration: async () => {
+			const record = await ensureRegistration();
+			if (!record) return undefined;
+			const location = await options.location?.();
+			const { location: _initialLocation, ...identity } = record.registration;
+			return { ...identity,
+				...(location?.state === "resolved" ? { location: location.location } : {}),
+				...(spawnToken ? { spawn_token: spawnToken } : {}),
+			};
+		},
 		heartbeatMs: options.heartbeatMs ?? RADAR_HEARTBEAT_MS,
 	});
 
@@ -1616,7 +1439,7 @@ function createRadarPublicationInner(
 
 	const publication: RadarPublication = {
 		execution,
-		context,
+		presence,
 		facts,
 		assignment(target, reportingOwner: string) {
 			const existing = assignmentWriters.get(target);
@@ -1631,7 +1454,7 @@ function createRadarPublicationInner(
 					publisher: publisher("herdsman-owner", reportingOwner),
 					codec: assignmentCodec,
 					// The owner publishes about a subject it did not register: the exact
-					// agent_id from the child's sidecar is the whole correlation.
+					// registration_id from the child's sidecar is the whole correlation.
 					subject: async () => target,
 					leaseMs: options.leaseMs ?? RADAR_LEASE_MS,
 					heartbeatMs: options.heartbeatMs ?? RADAR_HEARTBEAT_MS,
@@ -1651,7 +1474,7 @@ function createRadarPublicationInner(
 				registrationDiagnostic ??= `Radar binding unavailable: ${String(error).slice(0, 180)}`;
 				return undefined;
 			}
-			const bound = textAt(value, "agent_id");
+			const bound = textAt(value, "registration_id");
 			const boundIncarnation = textAt(value, "incarnation");
 			const run = textAt(value, "run");
 			const owner = textAt(value, "owner");
@@ -1670,7 +1493,7 @@ function createRadarPublicationInner(
 				return undefined;
 			return {
 				version: RADAR_PUBLICATION_VERSION,
-				agent_id: bound,
+				registration_id: bound,
 				incarnation: boundIncarnation,
 				run,
 				owner,
@@ -1688,12 +1511,13 @@ function createRadarPublicationInner(
 			if (agentId === undefined) return undefined;
 			const record = await ensureRegistration();
 			if (record === undefined) return undefined;
-			const location = record.registration.location;
+			const currentLocation = await options.location?.();
+			const location = currentLocation?.state === "resolved" ? currentLocation.location : undefined;
 			// Radar's answer to this process's current session names its subject.
-			const standing = context.management();
+			const standing = presence.management();
 			const subjectId = standing?.state === "managed" ? standing.subject_id : undefined;
 			return {
-				agent_id: agentId,
+				registration_id: agentId,
 				...(subjectId !== undefined ? { subject_id: subjectId } : {}),
 				...(location !== undefined ? { location } : {}),
 			};
@@ -1701,18 +1525,18 @@ function createRadarPublicationInner(
 		diagnostic: () =>
 			registrationDiagnostic ??
 			execution.diagnostic() ??
-			context.diagnostic() ??
+			presence.diagnostic() ??
 			facts.diagnostic(),
 		stop() {
 			for (const writer of assignmentWriters.values()) writer.stop();
 			execution.stop();
-			context.stop();
+			presence.stop();
 			facts.stop();
 		},
 		reopen() {
 			for (const writer of assignmentWriters.values()) writer.reopen();
 			execution.reopen();
-			context.reopen();
+			presence.reopen();
 			facts.reopen();
 		},
 	};

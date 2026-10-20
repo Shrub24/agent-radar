@@ -32,6 +32,9 @@ use crate::runtime::BackendIdentity;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RegistryAgent {
     pub registration: PublicRegistration,
+    /// Durable claim decision, if this registration has claimed a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_standing: Option<crate::control_plane::registry::presence::Standing>,
     pub process: ProcessEvidence,
     /// Mutable current-session context, kept separate from registration identity.
     pub context: Option<PublicContext>,
@@ -79,7 +82,7 @@ pub struct LifecycleSubject {
     #[serde(default)]
     pub spawn_request_id: Option<String>,
     #[serde(default)]
-    pub bound_agent_id: Option<String>,
+    pub bound_registration_id: Option<String>,
     #[serde(default)]
     pub process: Option<ProcessIdentity>,
     pub state: crate::control_plane::lifecycle::State,
@@ -348,7 +351,8 @@ fn managed_subject(
 ) -> Option<ManagedSubject> {
     let claim = agent.process.claim.as_ref()?;
     let mut matches = subjects.iter().filter(|subject| {
-        subject.bound_agent_id.as_deref() == Some(agent.registration.agent_id.as_str())
+        subject.bound_registration_id.as_deref()
+            == Some(agent.registration.registration_id.as_str())
             && subject.process.as_ref() == Some(claim)
     });
     let subject = matches.next()?;
@@ -385,14 +389,14 @@ fn managed_subject(
 
 /// The spawn edge a registration's exact identity is bound by, when one exists.
 fn spawn_binding(agent: &RegistryAgent, topology: &[PublicSpawnTopology]) -> Option<SpawnBinding> {
-    let id = agent.registration.agent_id.as_str();
+    let id = agent.registration.registration_id.as_str();
     topology
         .iter()
         .find(|edge| {
             edge.edge
                 .bound
                 .as_ref()
-                .is_some_and(|bound| bound.agent_id.as_deref() == Some(id))
+                .is_some_and(|bound| bound.registration_id.as_deref() == Some(id))
         })
         .map(|edge| SpawnBinding {
             parent: edge.edge.parent.clone(),
@@ -591,14 +595,14 @@ mod tests {
 
     /// A registration as `agent.list` serves it, claiming `claim` at `location`.
     fn registered(
-        agent_id: &str,
+        registration_id: &str,
         location: Value,
         claim: Option<ProcessIdentity>,
     ) -> RegistryAgent {
         serde_json::from_value(json!({
             "registration": {
                 "version": 1,
-                "agent_id": agent_id,
+                "registration_id": registration_id,
                 "registered_at": "2026-01-01T00:00:00.000Z",
                 "source": "herdsman",
                 "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -618,15 +622,15 @@ mod tests {
         BackendIdentity::named("herdr")
     }
 
-    /// The daemon's spawn edge for a child already bound to `agent_id`.
-    fn spawn_edge(agent_id: &str) -> PublicSpawnTopology {
+    /// The daemon's spawn edge for a child already bound to `registration_id`.
+    fn spawn_edge(registration_id: &str) -> PublicSpawnTopology {
         serde_json::from_value(json!({
             "version": 1,
             "request_id": "r1",
             "parent": "parent-1",
             "created": "completed",
             "launched": "completed",
-            "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "agent_id": agent_id, "bound_at": "2026-01-01T00:00:00.000Z"},
+            "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "registration_id": registration_id, "bound_at": "2026-01-01T00:00:00.000Z"},
             "recorded_at": "2026-01-01T00:00:00.000Z",
             "state": "bound"
         }))
@@ -638,7 +642,7 @@ mod tests {
         agent.context = Some(
             serde_json::from_value(json!({
                 "version": 1,
-                "agent_id": agent.registration.agent_id,
+                "registration_id": agent.registration.registration_id,
                 "writer": {
                     "source": "herdsman",
                     "incarnation": "22222222-2222-4222-8222-222222222222",
@@ -694,7 +698,7 @@ mod tests {
             };
             project(&panes, &herdr(), read, &[])
                 .into_iter()
-                .filter_map(|agent| Some(agent.registry?.agent.registration.agent_id))
+                .filter_map(|agent| Some(agent.registry?.agent.registration.registration_id))
                 .collect()
         };
         // Radar reaches only what is inside its own server: a pane it does not
@@ -861,7 +865,7 @@ mod tests {
             "parent": "parent-1",
             "created": "completed",
             "launched": "completed",
-            "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "agent_id": "child", "bound_at": "2026-01-01T00:00:00.000Z"},
+            "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "registration_id": "child", "bound_at": "2026-01-01T00:00:00.000Z"},
             "recorded_at": "2026-01-01T00:00:00.000Z",
             "state": "bound"
         }))
@@ -896,7 +900,7 @@ mod tests {
             execution_id: Some("subject-1".into()),
             execution_generation: Some(1),
             spawn_request_id: Some("subject-1".into()),
-            bound_agent_id: Some("lead".into()),
+            bound_registration_id: Some("lead".into()),
             process: Some(claim.clone()),
             state: crate::control_plane::lifecycle::State::Bound,
             identity_unresolved: false,
@@ -911,7 +915,7 @@ mod tests {
             "subject_id": "subject-1",
             "created": "completed",
             "launched": "completed",
-            "bound": {"source":"lead", "incarnation":"11111111-1111-4111-8111-111111111111", "agent_id":"lead", "bound_at":"2026-01-01T00:00:00.000Z"},
+            "bound": {"source":"lead", "incarnation":"11111111-1111-4111-8111-111111111111", "registration_id":"lead", "bound_at":"2026-01-01T00:00:00.000Z"},
             "recorded_at": "2026-01-01T00:00:00.000Z",
             "state": "bound"
         })).expect("spawn edge");
@@ -1025,7 +1029,7 @@ mod tests {
         let mut agent = registered("a", at("p1"), None);
         agent.execution = serde_json::from_value(json!({
             "version": 1,
-            "agent_id": "a",
+            "registration_id": "a",
             "channel": "execution",
             "writer": {"source": "herdsman", "incarnation": "11111111-1111-4111-8111-111111111111",
                        "generation": 1, "sequence": 3},

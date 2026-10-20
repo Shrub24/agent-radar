@@ -20,28 +20,35 @@ Radar SHALL retain a private executable, argv, cwd and environment restart recip
 - **THEN** restart refuses before terminating the process
 
 ### Requirement: Current session context is mutable and fenced
-The daemon SHALL accept current session context separately from registration, with one writer at a time, strictly forward sequence, bounded lease and daemon-time freshness. A session change SHALL NOT change the process registration identity, but SHALL resolve its active managed association to the selected session's subject. Context replay SHALL NOT extend its lease. Effects SHALL validate the current subject attachment, not only the unchanged process identity.
+pi-radar SHALL report process birth identity, current location, session UUID and a session-load claim ID through one presence operation, with acknowledged `registration_id` and `subject_id` when known. Radar SHALL resolve internal process registration, mutable context and durable session subject separately. It SHALL return `registration_id`, claim ID and `granted`, `duplicate`, `pending` or `released` standing; only a grant includes `subject_id`. Retries SHALL reuse the claim ID. The public process identifier SHALL be `registration_id`, without an `agent_id` compatibility alias. Generic publisher registration/context operations SHALL NOT be pi-radar's session-management path.
+
+#### Scenario: Reconnect reasserts a claim
+- **WHEN** pi-radar renews or reconnects for the same loaded session
+- **THEN** Radar returns the stored decision without allocating another subject or creating a fresh admission opportunity
 
 #### Scenario: A process switches or forks its session
-- **WHEN** a registered publisher reports a newly selected session
-- **THEN** its registration is unchanged and its active subject becomes the subject for that session
-
-#### Scenario: Another handle tries to take the record
-- **WHEN** a handle that is not the current writer reports context before retirement or lease expiry
-- **THEN** the daemon refuses it and the incumbent's record is unchanged
-
-#### Scenario: One process changes session
-- **WHEN** a registered publisher reports a newly selected session
-- **THEN** its process registration remains unchanged and its active subject becomes the subject for that session
-- **AND** the previous subject retains its own children, inbox and history
+- **WHEN** the same process reports a new session-load claim
+- **THEN** its process registration remains unchanged, the new session is resolved to its own subject, and the previous subject retains its children, inbox and history
 
 #### Scenario: An equal sequence repeats identical content
-- **WHEN** a publisher replays the same sequence and content after an uncertain acknowledgment
-- **THEN** the daemon returns the stored context without extending its lease or duplicating an established binding
+- **WHEN** a publisher replays the same sequence and content after an uncertain acknowledgment on a separately fenced context channel
+- **THEN** the daemon returns the stored context without extending its lease
 
-#### Scenario: Another writer tries to take the record
-- **WHEN** a noncurrent writer reports context before retirement or lease expiry
-- **THEN** the daemon refuses it and the incumbent's context is unchanged
+#### Scenario: Another handle tries to take the record
+- **WHEN** a handle that is not the current context writer reports before retirement or lease expiry
+- **THEN** the daemon refuses it and leaves the incumbent record unchanged
+
+#### Scenario: Process location changes
+- **WHEN** the same verified process reports a new pane
+- **THEN** Radar updates mutable location without changing process registration or subject identity solely because of placement
+
+#### Scenario: Another process presents an acknowledged registration
+- **WHEN** the report's registration ID belongs to another process birth identity
+- **THEN** Radar refuses the report and preserves the current attachment
+
+#### Scenario: Verification is temporarily unavailable
+- **WHEN** process or pane evidence cannot be established
+- **THEN** Radar retains `pending` standing, publishes no subject authority, and permits retry with the same claim
 
 #### Scenario: Session changes while a control is pending
 - **WHEN** a process switches away from the subject named by a pending effect before dispatch
@@ -61,7 +68,7 @@ A Pi subject SHALL be Radar's durable identity for one canonical Pi session UUID
 - **THEN** Radar creates a new subject rather than recovering authority from conversation contents
 
 ### Requirement: Pi enrollment uses one verified binding path
-pi-radar SHALL request automatic management by default through its process-local registration/context reporting. Radar SHALL apply the same binding rules to adoption, correlated launch registration, explicit enrollment and reconciliation. Binding SHALL require verified process birth identity, verified pane occupancy and fresh canonical current-session evidence. Herdsman SHALL consume pi-radar's current association rather than run another registrar.
+pi-radar SHALL request automatic management for each eligible Pi session through `agent.presence`. Radar SHALL require verified process birth identity, pane occupancy and fresh session evidence. Manual adoption, managed launch and reconnect SHALL use this same report path. Herdsman SHALL consume the returned association and SHALL NOT run enrollment or register with the daemon.
 
 #### Scenario: Manual Pi becomes managed
 - **WHEN** pi-radar reports an eligible manually started Pi session
@@ -87,15 +94,15 @@ Radar SHALL validate supplied launch correlation against its admitted launch and
 - **THEN** Radar refuses binding without inferring launch success or creating an alternative subject
 
 ### Requirement: Duplicate live sessions remain preliminary
-A process reporting a session with another accepted live attachment SHALL remain baseline-visible with a duplicate-session warning and without that subject's management or inbox authority. The conflict SHALL NOT auto-promote the duplicate: reconsideration requires a fresh resume from persisted session state or a process restart, then ordinary verification. Heartbeats, daemon restart and extension reload SHALL NOT clear it, and unavailable observations SHALL NOT establish incumbent release.
+Radar SHALL durably record duplicate claim decisions, keep those registrations baseline-visible with a distinct inline warning, and grant no subject or inbox authority. Renewal, incumbent release and daemon restart SHALL NOT promote the rejected claim. Only a fresh Pi session-load claim SHALL permit reconsideration.
 
 #### Scenario: Incumbent exits after duplicate opens
 - **WHEN** a duplicate remains running after the incumbent exits
 - **THEN** it remains unmanaged until a fresh session load or restart makes it eligible for verification again
 
-#### Scenario: Host cannot distinguish fresh session loading
-- **WHEN** the Pi adapter cannot reliably distinguish a fresh load from reconnect or extension reload
-- **THEN** the duplicate must restart its process rather than receive a guessed promotion
+#### Scenario: Verification is temporarily unavailable
+- **WHEN** process verification or daemon recovery cannot establish whether a claim can be granted
+- **THEN** its standing is pending and the same claim may retry without a fresh session load
 
 ### Requirement: Relationships and receipt authority follow the session subject
 Logical parent relationships SHALL remain Radar-owned durable subject relationships rather than depend on the original parent registration. Execution-specific spawn and communication provenance SHALL remain historical records. Handoff access SHALL resolve through the caller's current accepted subject binding. Receipt SHALL NOT imply application settlement or permission to close a worker.

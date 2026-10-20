@@ -37,7 +37,7 @@ use super::publication::{
     PublicWriterFacts, PublisherIdentity, WriterBinding, freshness_of, incumbent_live, new_binding,
     write_atomic,
 };
-use super::{Registry, bounded_text, read_record_file, validate_agent_id};
+use super::{Registry, bounded_text, read_record_file, validate_registration_id};
 
 /// Record schema version.
 pub const CONTEXT_VERSION: u32 = 1;
@@ -66,7 +66,7 @@ pub struct ContextValue {
 #[serde(deny_unknown_fields)]
 pub struct ContextRequest {
     /// The agent record whose current session this is.
-    pub agent_id: String,
+    pub registration_id: String,
     /// The publisher presenting itself: the writer a first publish binds, and
     /// the successor a replacement binds. Recorded as provenance, never looked
     /// up — a publisher restart is a new incarnation UUID, not a second agent.
@@ -88,10 +88,10 @@ pub struct ContextRequest {
 
 impl ContextRequest {
     pub fn validate(&self) -> Result<(), String> {
-        validate_agent_id(&self.agent_id)?;
+        validate_registration_id(&self.registration_id)?;
         self.publisher.validate()?;
         if let Some(handle) = &self.writer_handle {
-            validate_agent_id(handle)?;
+            validate_registration_id(handle)?;
         }
         if let Some(expected) = &self.replace {
             expected.validate()?;
@@ -177,7 +177,8 @@ impl AcceptedContext {
 #[serde(deny_unknown_fields)]
 pub struct SessionContext {
     pub version: u32,
-    pub agent_id: String,
+    #[serde(alias = "agent_id")]
+    pub registration_id: String,
     pub writer: WriterBinding,
     pub context: AcceptedContext,
 }
@@ -204,7 +205,7 @@ impl SessionContext {
     pub fn public(&self, now_ms: i64, serving_epoch: &str) -> PublicContext {
         PublicContext {
             version: self.version,
-            agent_id: self.agent_id.clone(),
+            registration_id: self.registration_id.clone(),
             writer: PublicWriterFacts {
                 source: self.writer.source.clone(),
                 incarnation: self.writer.incarnation.clone(),
@@ -272,7 +273,7 @@ pub struct PublicSession {
 #[serde(deny_unknown_fields)]
 pub struct PublicContext {
     pub version: u32,
-    pub agent_id: String,
+    pub registration_id: String,
     pub writer: PublicWriterFacts,
     pub context: PublicSession,
 }
@@ -285,6 +286,31 @@ pub struct ContextWrite {
     /// Set when an identical replay was answered from the stored record. A
     /// replay is never a refusal, and never a lease refresh.
     pub warning: Option<String>,
+}
+
+/// Internal projection of the unified presence report for existing snapshot readers.
+pub(crate) fn report_presence(
+    registry: &Registry,
+    registration_id: &str,
+    publisher: PublisherIdentity,
+    session: Option<String>,
+    now_ms: i64,
+) -> Result<(), String> {
+    let prior = read_record(registry, registration_id)?;
+    let request = ContextRequest {
+        registration_id: registration_id.into(),
+        publisher,
+        writer_handle: prior.as_ref().map(|p| p.writer.handle.clone()),
+        replace: None,
+        sequence: prior.as_ref().map_or(1, |p| p.writer.sequence + 1),
+        lease_ms: None,
+        observed_at: None,
+        context: ContextValue {
+            session,
+            launch_identity: None,
+        },
+    };
+    publish(registry, &request, now_ms).map(|_| ())
 }
 
 /// Publish one agent record's current session.
@@ -305,9 +331,9 @@ pub fn publish(
     let _transition = registry.transition();
     // The context is a fact about an agent record, so the subject must exist.
     registry
-        .get(&request.agent_id)?
-        .ok_or_else(|| format!("agent {} is not registered", request.agent_id))?;
-    let existing = read_record(registry, &request.agent_id)?;
+        .get(&request.registration_id)?
+        .ok_or_else(|| format!("agent {} is not registered", request.registration_id))?;
+    let existing = read_record(registry, &request.registration_id)?;
 
     let (writer, sequence) = match existing {
         None => {
@@ -398,12 +424,17 @@ pub fn publish(
     };
     let record = SessionContext {
         version: CONTEXT_VERSION,
-        agent_id: request.agent_id.clone(),
+        registration_id: request.registration_id.clone(),
         writer: WriterBinding { sequence, ..writer },
         context: accepted,
     };
     write_record(registry, &record)?;
-    registry.append_event("context.updated", Some(&request.agent_id), None, None);
+    registry.append_event(
+        "context.updated",
+        Some(&request.registration_id),
+        None,
+        None,
+    );
     Ok(ContextWrite {
         record,
         warning: None,
@@ -413,14 +444,14 @@ pub fn publish(
 /// Retire this agent's context writer without retracting its last report.
 pub fn retire(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     writer_handle: &str,
     now_ms: i64,
 ) -> Result<SessionContext, String> {
-    validate_agent_id(writer_handle)?;
+    validate_registration_id(writer_handle)?;
     let _transition = registry.transition();
-    let record =
-        read_record(registry, agent_id)?.ok_or_else(|| "context has no writer".to_string())?;
+    let record = read_record(registry, registration_id)?
+        .ok_or_else(|| "context has no writer".to_string())?;
     if record.writer.handle != writer_handle {
         return Err(refusal(
             "context writer handle is stale or belongs to another generation",
@@ -438,7 +469,7 @@ pub fn retire(
         ..record
     };
     write_record(registry, &updated)?;
-    registry.append_event("context.retired", Some(agent_id), None, None);
+    registry.append_event("context.retired", Some(registration_id), None, None);
     Ok(updated)
 }
 
@@ -446,10 +477,10 @@ pub fn retire(
 /// when this agent has never published one.
 pub fn published(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     now_ms: i64,
 ) -> Result<Option<PublicContext>, String> {
-    Ok(read_record(registry, agent_id)?
+    Ok(read_record(registry, registration_id)?
         .map(|record| record.public(now_ms, registry.serving_epoch())))
 }
 
@@ -466,9 +497,12 @@ fn refusal(reason: &str, incumbent: &WriterBinding) -> String {
     )
 }
 
-fn read_record(registry: &Registry, agent_id: &str) -> Result<Option<SessionContext>, String> {
-    validate_agent_id(agent_id)?;
-    let path = record_path(registry, agent_id);
+fn read_record(
+    registry: &Registry,
+    registration_id: &str,
+) -> Result<Option<SessionContext>, String> {
+    validate_registration_id(registration_id)?;
+    let path = record_path(registry, registration_id);
     let bytes = match read_record_file(&path, MAX_CONTEXT_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.contains("No such file or directory") => return Ok(None),
@@ -482,7 +516,7 @@ fn read_record(registry: &Registry, agent_id: &str) -> Result<Option<SessionCont
             record.version
         ));
     }
-    if record.agent_id != agent_id {
+    if record.registration_id != registration_id {
         return Err(format!(
             "context record id does not match its filename: {}",
             path.display()
@@ -491,13 +525,13 @@ fn read_record(registry: &Registry, agent_id: &str) -> Result<Option<SessionCont
     if record.writer.generation == 0 {
         return Err("context writer generation is zero".into());
     }
-    validate_agent_id(&record.writer.handle)?;
-    validate_agent_id(&record.writer.incarnation)?;
+    validate_registration_id(&record.writer.handle)?;
+    validate_registration_id(&record.writer.incarnation)?;
     if record.context.generation != record.writer.generation {
         return Err("context report generation is not the current writer generation".into());
     }
-    validate_agent_id(&record.context.handle)?;
-    validate_agent_id(&record.context.incarnation)?;
+    validate_registration_id(&record.context.handle)?;
+    validate_registration_id(&record.context.incarnation)?;
     if let Some(session) = &record.context.session
         && SessionUuid::parse(session).is_none()
     {
@@ -506,17 +540,17 @@ fn read_record(registry: &Registry, agent_id: &str) -> Result<Option<SessionCont
     Ok(Some(record))
 }
 
-fn record_path(registry: &Registry, agent_id: &str) -> PathBuf {
+fn record_path(registry: &Registry, registration_id: &str) -> PathBuf {
     registry
         .publications()
-        .join(format!("{agent_id}.context.json"))
+        .join(format!("{registration_id}.context.json"))
 }
 
 fn write_record(registry: &Registry, record: &SessionContext) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?;
     write_atomic(
         &registry.publications(),
-        &record_path(registry, &record.agent_id),
+        &record_path(registry, &record.registration_id),
         &bytes,
         MAX_CONTEXT_BYTES,
     )

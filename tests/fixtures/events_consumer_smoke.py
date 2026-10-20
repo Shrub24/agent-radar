@@ -69,7 +69,7 @@ def main():
             try:
                 registered = call(sock, "agent.register", {
                     "source": "consumer-smoke", "incarnation": "1c2d3e4f-5678-4abc-9def-0123456789ab",
-                })["registration"]["agent_id"]
+                })["registration"]["registration_id"]
                 observed = pointer_line(run, 5)
                 assert run.poll() is None, "consumer exited instead of following the journal"
                 run.send_signal(signal.SIGTERM)
@@ -80,8 +80,8 @@ def main():
                     raise
                 assert observed is not None, f"consumer printed no event; stderr: {run.stderr.read()}"
                 assert observed["event"]["kind"] == "agent.registered", observed
-                assert observed["event"]["agent_id"] == registered, observed
-                assert observed["agent"]["registration"]["agent_id"] == registered, observed
+                assert observed["event"]["registration_id"] == registered, observed
+                assert observed["agent"]["registration"]["registration_id"] == registered, observed
             finally:
                 if run.poll() is None:
                     run.kill()

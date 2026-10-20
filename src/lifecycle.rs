@@ -263,11 +263,11 @@ fn pane_identity(inventory: &FleetObservation, pane_id: &str) -> PaneIdentity {
         occupant: inventory
             .all_agents()
             .find(|agent| agent.location.pane_id == pane_id)
-            .map(agent_identity),
+            .map(registration_identity),
     }
 }
 
-fn agent_identity(agent: &AgentObservation) -> AgentIdentity {
+fn registration_identity(agent: &AgentObservation) -> AgentIdentity {
     AgentIdentity {
         name: agent.name.clone(),
         session: agent.session.clone(),
@@ -1219,7 +1219,7 @@ mod tests {
         let agent: crate::registry_observation::RegistryAgent = serde_json::from_value(json!({
             "registration": {
                 "version": 1,
-                "agent_id": "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
+                "registration_id": "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
                 "registered_at": "2026-01-01T00:00:00.000Z",
                 "source": "herdsman",
                 "incarnation": "11111111-1111-4111-8111-111111111111",

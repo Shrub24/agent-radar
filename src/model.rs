@@ -614,7 +614,7 @@ impl AgentObservation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LifecycleObservation {
     pub subject_id: String,
-    pub bound_agent_id: Option<String>,
+    pub bound_registration_id: Option<String>,
     pub process: Option<ProcessIdentity>,
     pub state: LifecycleState,
     pub session: Option<String>,

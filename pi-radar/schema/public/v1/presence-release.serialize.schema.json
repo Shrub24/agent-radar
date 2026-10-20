@@ -1,0 +1,52 @@
+{
+  "$defs": {
+    "ProcessIdentity": {
+      "additionalProperties": false,
+      "description": "Which process incarnation a sample belongs to.\n\nThe kernel reuses process ids, so a pid does not name a process: one\nincarnation is the boot it started in, its pid, and when it started. Those\nare what make two readings comparable — counters may only be subtracted\nfrom an earlier reading of the same identity, and a difference taken across\ntwo of them measures neither process.",
+      "properties": {
+        "boot_id": {
+          "description": "The boot this process started in, as the kernel reports it.",
+          "type": "string"
+        },
+        "pid": {
+          "description": "The process id, unique within one boot and one incarnation of it.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "start_ticks": {
+          "description": "Start time since boot, in clock ticks (`starttime` in\n`/proc/<pid>/stat`): the kernel's stamp for this incarnation.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "boot_id",
+        "pid",
+        "start_ticks"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "claim_id": {
+      "type": "string"
+    },
+    "process": {
+      "$ref": "#/$defs/ProcessIdentity"
+    },
+    "registration_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "registration_id",
+    "claim_id",
+    "process"
+  ],
+  "title": "presence-release-serialize",
+  "type": "object"
+}

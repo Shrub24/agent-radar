@@ -90,9 +90,11 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::ContainerRemoved => "container.removed",
     };
     let facts = event.subject_id.as_deref().and_then(|id| log.facts(id));
-    let agent_id = match &event.transition {
-        Transition::Bound { agent_id } => Some(agent_id.clone()),
-        Transition::Enrolled(facts) | Transition::Imported(facts) => facts.bound_agent_id.clone(),
+    let registration_id = match &event.transition {
+        Transition::Bound { registration_id } => Some(registration_id.clone()),
+        Transition::Enrolled(facts) | Transition::Imported(facts) => {
+            facts.bound_registration_id.clone()
+        }
         _ => None,
     };
     let lifecycle_execution = event.operation_id.is_none() && facts.is_some();
@@ -109,7 +111,7 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
             .then(|| facts.and_then(|facts| facts.execution_generation))
             .flatten(),
         lifecycle_event_id: Some(event.event_id.clone()),
-        agent_id,
+        registration_id,
         spawn: facts
             .filter(|facts| facts.origin == Origin::Spawned)
             .map(|facts| facts.spawn_request_id.clone()),

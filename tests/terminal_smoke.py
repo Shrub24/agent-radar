@@ -88,21 +88,21 @@ def register_worker(control_path, pid):
         "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
         "process": birth_identity(pid),
     })["registration"]
-    agent_id = registered["agent_id"]
+    registration_id = registered["registration_id"]
     publisher.publish_context(
-        control_path, agent_id,
+        control_path, registration_id,
         {"source": "herdsman", "incarnation": CONTEXT_INCARNATION},
         None, 1, SESSION, lease_ms=MAX_LEASE_MS)
     publisher.publish_facts(
-        control_path, agent_id, {"source": "pi", "incarnation": FACTS_INCARNATION},
+        control_path, registration_id, {"source": "pi", "incarnation": FACTS_INCARNATION},
         {"background_tasks": [{"id": "bg-7", "phase": "running"},
                               {"id": "bg-8", "phase": "running"}]},
         1, lease_ms=MAX_LEASE_MS)
     writer = publisher.call(control_path, "agent.acquire", {
-        "agent_id": agent_id, "channel": "execution",
+        "registration_id": registration_id, "channel": "execution",
         "publisher": {"source": "pi", "incarnation": EXECUTION_INCARNATION}})["writer"]
     publisher.call(control_path, "agent.publish", {
-        "agent_id": agent_id, "channel": "execution", "writer_handle": writer["handle"],
+        "registration_id": registration_id, "channel": "execution", "writer_handle": writer["handle"],
         "sequence": 1, "snapshot": {"activity": "working"}, "lease_ms": MAX_LEASE_MS})
 
 

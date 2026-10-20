@@ -50,13 +50,15 @@ pub(crate) fn agent_entry(
     verification: crate::control_plane::registry::ProcessVerification,
     now_ms: i64,
 ) -> Result<Value, String> {
-    let execution = registry.published_facts(&registration.agent_id, Channel::Execution, now_ms)?;
+    let execution =
+        registry.published_facts(&registration.registration_id, Channel::Execution, now_ms)?;
     let assignment =
-        registry.published_facts(&registration.agent_id, Channel::Assignment, now_ms)?;
-    let facts = registry.published_facts(&registration.agent_id, Channel::Facts, now_ms)?;
-    let context = registry.context(&registration.agent_id, now_ms)?;
+        registry.published_facts(&registration.registration_id, Channel::Assignment, now_ms)?;
+    let facts = registry.published_facts(&registration.registration_id, Channel::Facts, now_ms)?;
+    let context = registry.context(&registration.registration_id, now_ms)?;
     Ok(json!({
         "registration": registration.public(),
+        "claim_standing": crate::control_plane::registry::presence::current(registry, &registration.registration_id)?.map(|claim| claim.standing),
         "process": process_evidence(registration, verification),
         "execution": execution,
         "assignment": assignment,
@@ -120,7 +122,7 @@ fn agents(registry: &Registry, now_ms: i64) -> Result<Vec<RegistryAgent>, String
         let page = registry.list_after(after.as_deref(), PAGE)?;
         let last = page
             .last()
-            .map(|registration| registration.agent_id.clone());
+            .map(|registration| registration.registration_id.clone());
         for registration in &page {
             let entry = agent_entry(
                 registry,

@@ -866,7 +866,7 @@
     "LifecycleObservation": {
       "description": "Public lifecycle identity carried into the display projection.",
       "properties": {
-        "bound_agent_id": {
+        "bound_registration_id": {
           "type": [
             "string",
             "null"
@@ -1624,11 +1624,11 @@
       "additionalProperties": false,
       "description": "A channel read for a reader that is not its writer: the same identity,\nfreshness and report facts as [`PublicChannel`], with the fencing handle\ndropped because it is a credential rather than a fact.",
       "properties": {
-        "agent_id": {
-          "type": "string"
-        },
         "channel": {
           "$ref": "#/$defs/Channel"
+        },
+        "registration_id": {
+          "type": "string"
         },
         "snapshot": {
           "anyOf": [
@@ -1651,7 +1651,7 @@
       },
       "required": [
         "version",
-        "agent_id",
+        "registration_id",
         "channel",
         "writer"
       ],
@@ -1738,11 +1738,11 @@
       "additionalProperties": false,
       "description": "One agent record's context as a client reads it. A `None` read of this whole\nrecord means never published; a present record with a null session means no\ncurrent session.",
       "properties": {
-        "agent_id": {
-          "type": "string"
-        },
         "context": {
           "$ref": "#/$defs/PublicSession"
+        },
+        "registration_id": {
+          "type": "string"
         },
         "version": {
           "format": "uint32",
@@ -1755,7 +1755,7 @@
       },
       "required": [
         "version",
-        "agent_id",
+        "registration_id",
         "writer",
         "context"
       ],
@@ -1784,9 +1784,6 @@
       "additionalProperties": false,
       "description": "A registration as a client reads it. The private launch fields are absent by\nconstruction, not by redaction: there is no field here to forget to strip.",
       "properties": {
-        "agent_id": {
-          "type": "string"
-        },
         "incarnation": {
           "type": "string"
         },
@@ -1822,6 +1819,9 @@
         "registered_at": {
           "type": "string"
         },
+        "registration_id": {
+          "type": "string"
+        },
         "run": {
           "type": [
             "string",
@@ -1845,7 +1845,7 @@
       },
       "required": [
         "version",
-        "agent_id",
+        "registration_id",
         "registered_at",
         "source",
         "incarnation",
@@ -2046,6 +2046,17 @@
               "type": "null"
             }
           ]
+        },
+        "claim_standing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Standing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Durable claim decision, if this registration has claimed a session."
         },
         "context": {
           "anyOf": [
@@ -2406,6 +2417,15 @@
           "type": "string"
         }
       ]
+    },
+    "Standing": {
+      "enum": [
+        "pending",
+        "granted",
+        "duplicate",
+        "released"
+      ],
+      "type": "string"
     },
     "State": {
       "oneOf": [

@@ -5,11 +5,12 @@ Manual Pi sessions require explicit enrollment despite reporting the process evi
 ## What Changes
 
 - Define a managed Pi subject as the durable Radar identity of one tracked Pi session UUID. Registrations/executions are its current process attachments; pane and tab are placement.
-- Use one daemon-owned binding path for default Pi adoption, correlated launch registration, explicit enrollment and reconciliation. pi-radar reports through its existing driver; Herdsman adds no registrar.
+- Replace register/context/sweep adoption with one flat presence report used for session start, renewal and reconnect. Radar internally separates immutable process registration, mutable location/context and durable session-load claims. Herdsman adds no registrar.
+- Rename the process-record identity to `registration_id` with a breaking alpha contract update, not compatibility aliases. Persist granted/duplicate claim decisions; graceful shutdown releases the exact grant, while verified process death is the crash backstop.
 - Reattach a fresh uncontested process to an existing session subject. `/resume` in the same process changes the active subject, not the process registration. Children, inbox and history remain with their session subjects.
 - Keep duplicate live sessions baseline-visible but unmanaged, with a warning. An incumbent's exit does not promote a duplicate: require fresh session loading or process restart before reconsideration.
 - Validate supplied launch correlation; a mismatch cannot fall back to adoption. Retain daemon-side effect fencing and logical parent authority without requiring Pi-persisted execution identity.
-- Remove active session-marker reads/writes, marker-only checks and separate enrollment policy paths. Retain released compatibility fields only where needed, not as active authority.
+- Remove active session-marker reads/writes, marker-only checks and separate enrollment policy paths. No transcript breadcrumbs, dummy subject IDs, cryptographic receipts or legacy alpha wire compatibility.
 - Standardize private restart recipes on verified observed process context; resume the current subject's session without replaying initial prompts or one-use credentials.
 - Retain subject/child links when a lead manually resumes elsewhere. No automatic pane movement or cross-tab tree redesign; explicit gathering is deferred in `ideas.md`.
 

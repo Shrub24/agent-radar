@@ -284,7 +284,10 @@ fn agent(pane_id: &str, assigned_started_unix_ms: Option<u64>) -> AgentObservati
 
 /// A registration whose fresh assignment publishes `assigned_started_unix_ms`,
 /// as `agent.list` serves it: unjoined, since the age does not need a pane.
-fn registered_assignment(agent_id: &str, assigned_started_unix_ms: Option<u64>) -> RegistryAgent {
+fn registered_assignment(
+    registration_id: &str,
+    assigned_started_unix_ms: Option<u64>,
+) -> RegistryAgent {
     let snapshot = json!({
         "activity": "owner-waiting-new-state",
         "role": "worker",
@@ -294,7 +297,7 @@ fn registered_assignment(agent_id: &str, assigned_started_unix_ms: Option<u64>) 
     serde_json::from_value(json!({
         "registration": {
             "version": 1,
-            "agent_id": agent_id,
+            "registration_id": registration_id,
             "registered_at": "2026-01-01T00:00:00.000Z",
             "source": "herdsman",
             "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -307,7 +310,7 @@ fn registered_assignment(agent_id: &str, assigned_started_unix_ms: Option<u64>) 
         "facts": null,
         "assignment": {
             "version": 1,
-            "agent_id": agent_id,
+            "registration_id": registration_id,
             "channel": "assignment",
             "writer": {
                 "source": "herdsman-owner",
@@ -432,7 +435,7 @@ fn assignment_age_is_measured_from_the_published_start() {
         .source_freshness()
         == &SourceFreshness::Current));
     let inventory = state.inventory().expect("inventory");
-    let aged_for = |agent_id: &str| {
+    let aged_for = |registration_id: &str| {
         inventory
             .agents
             .iter()
@@ -440,7 +443,7 @@ fn assignment_age_is_measured_from_the_published_start() {
                 agent
                     .registry
                     .as_ref()
-                    .is_some_and(|view| view.agent.registration.agent_id == agent_id)
+                    .is_some_and(|view| view.agent.registration.registration_id == registration_id)
             })
             .expect("registered agent")
             .facts
@@ -649,11 +652,11 @@ fn inconclusive_evidence_leaves_the_association_unverified_and_the_inventory_cur
 }
 
 /// A registration as the daemon's `agent.list` serves it, at a pane's location.
-fn registered_at(agent_id: &str, pane_id: &str, claim: Option<(u64, i32)>) -> RegistryAgent {
+fn registered_at(registration_id: &str, pane_id: &str, claim: Option<(u64, i32)>) -> RegistryAgent {
     serde_json::from_value(serde_json::json!({
         "registration": {
             "version": 1,
-            "agent_id": agent_id,
+            "registration_id": registration_id,
             "registered_at": "2026-01-01T00:00:00.000Z",
             "source": "herdsman",
             "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -682,7 +685,7 @@ fn only_fresh_registry_context_is_projected_as_the_task_session() {
     agent.context = Some(
         serde_json::from_value(json!({
             "version": 1,
-            "agent_id": "a1",
+            "registration_id": "a1",
             "writer": {
                 "source": "herdsman",
                 "incarnation": "11111111-1111-4111-8111-111111111111",

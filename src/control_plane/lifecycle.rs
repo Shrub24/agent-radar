@@ -229,7 +229,8 @@ pub struct Subject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_evidence: Option<EndedEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bound_agent_id: Option<String>,
+    #[serde(alias = "bound_agent_id")]
+    pub bound_registration_id: Option<String>,
     /// Recorded before a SIGTERM is sent, so a signal is never sent twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signalled_at: Option<String>,
@@ -348,7 +349,7 @@ fn draft(
         launch,
         correlation: Some(random_uuid()),
         process: None,
-        bound_agent_id: None,
+        bound_registration_id: None,
         signalled_at: None,
         exited_at: None,
         pane_cleanup: None,
@@ -685,13 +686,13 @@ pub(crate) fn fence_registration(
     registry: &Registry,
     subject_id: &str,
     process: Option<&ProcessIdentity>,
-    agent_id: Option<&str>,
+    registration_id: Option<&str>,
     now_ms: i64,
 ) -> Result<(), String> {
     let mut subject = read_recorded(registry, subject_id)?;
-    match (subject.state, agent_id) {
+    match (subject.state, registration_id) {
         (State::Bound, Some(agent))
-            if subject.bound_agent_id.as_deref() == Some(agent)
+            if subject.bound_registration_id.as_deref() == Some(agent)
                 && subject.process.as_ref() == process =>
         {
             Ok(())
@@ -701,7 +702,7 @@ pub(crate) fn fence_registration(
             if process.is_some() && subject.process.as_ref() == process =>
         {
             subject.state = State::Bound;
-            subject.bound_agent_id = Some(agent.to_string());
+            subject.bound_registration_id = Some(agent.to_string());
             subject.recorded_at = format_millis(now_ms);
             write(registry, &subject)
         }
@@ -751,27 +752,32 @@ pub fn observe_exit(
 pub enum Attachment {
     /// This registration already holds the session's live subject.
     Own(Box<Subject>),
-    /// Another live registration holds the session.
-    Other,
+    /// Another registration's live subject holds the session.
+    Other(Box<Subject>),
     /// No live registration holds the session; this one may bind it.
     Free,
 }
 
-/// Whether a tracked subject is attached to a live process: bound, not ended, and
-/// its registration still publishes the subject's session. A registration that
-/// moved to another session has released the subject; a stale heartbeat has not.
+/// Whether a tracked subject is attached to a live process: bound, not verifiably
+/// exited, and its registration still publishes the subject's session.
+///
+/// Only two things release a session: a verified process exit, or the same
+/// registration publishing a different session. A lost pane does not release it,
+/// because absence of a pane is not proof that the process is gone; a stale
+/// heartbeat does not release it either.
 pub fn is_attached(registry: &Registry, subject: &Subject, now_ms: i64) -> Result<bool, String> {
     let (Some(agent), Some(session)) = (
-        subject.bound_agent_id.as_deref(),
+        subject.bound_registration_id.as_deref(),
         subject.session.as_deref(),
     ) else {
         return Ok(false);
     };
-    if subject.state != State::Bound
-        || subject.exited_at.is_some()
-        || subject.ended_externally_at.is_some()
-    {
+    if subject.state != State::Bound || subject.exited_at.is_some() {
         return Ok(false);
+    }
+    if let Some(claim) = crate::control_plane::registry::presence::current(registry, agent)? {
+        return Ok(claim.session_id == session
+            && claim.standing == crate::control_plane::registry::presence::Standing::Granted);
     }
     Ok(registry
         .context(agent, now_ms)?
@@ -786,7 +792,7 @@ pub fn is_attached(registry: &Registry, subject: &Subject, now_ms: i64) -> Resul
 /// not recorded, so the launch stays unattached rather than duplicating it.
 pub fn record_launch_session(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     session: &str,
     now_ms: i64,
 ) -> Result<(), String> {
@@ -795,15 +801,15 @@ pub fn record_launch_session(
     loop {
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
         if let Some(found) = page.iter().find(|subject| {
-            subject.bound_agent_id.as_deref() == Some(agent_id)
+            subject.bound_registration_id.as_deref() == Some(registration_id)
                 && subject.session.is_none()
                 && subject.state == State::Bound
                 && subject.exited_at.is_none()
                 && subject.ended_externally_at.is_none()
         }) {
             if !matches!(
-                attachment(registry, agent_id, session, now_ms)?,
-                Attachment::Other
+                attachment(registry, registration_id, session, now_ms)?,
+                Attachment::Other(_)
             ) {
                 // The stored record is the one the transition is checked against.
                 let mut subject = read_recorded(registry, &found.subject_id)?;
@@ -820,11 +826,38 @@ pub fn record_launch_session(
     }
 }
 
-/// How `agent_id` stands against `session`, read before any verification so a
+/// Releases a session whose holding process is verifiably gone.
+///
+/// A holder is judged by its own process identity, never by its pane: a live
+/// process holds its session wherever it runs, including a pane it was moved to
+/// or a pane that was closed while the process kept running. Only a process the
+/// process table confirms absent, or whose PID now belongs to another process,
+/// has exited. Procfs that cannot be read is not evidence of absence, so the
+/// holder keeps the session.
+///
+/// Returns whether the holder was released. Reads procfs, so callers run it
+/// outside the registry transition.
+pub fn release_if_gone(
+    registry: &Registry,
+    holder: &Subject,
+    verifier: &dyn crate::control_plane::registry::process::ProcessVerifier,
+    now_ms: i64,
+) -> Result<bool, String> {
+    use crate::control_plane::registry::process::{ProcessVerification, verify_identity};
+    match verify_identity(holder.process.as_ref(), verifier) {
+        ProcessVerification::Absent | ProcessVerification::Mismatched => {
+            record_exit(registry, &holder.subject_id, now_ms)?;
+            Ok(true)
+        }
+        ProcessVerification::Verified | ProcessVerification::Unavailable => Ok(false),
+    }
+}
+
+/// How `registration_id` stands against `session`, read before any verification so a
 /// registration that cannot bind costs no process inspection.
 pub fn attachment(
     registry: &Registry,
-    agent_id: &str,
+    registration_id: &str,
     session: &str,
     now_ms: i64,
 ) -> Result<Attachment, String> {
@@ -838,10 +871,10 @@ pub fn attachment(
             {
                 continue;
             }
-            if subject.bound_agent_id.as_deref() == Some(agent_id) {
+            if subject.bound_registration_id.as_deref() == Some(registration_id) {
                 return Ok(Attachment::Own(Box::new(subject.clone())));
             }
-            found = Attachment::Other;
+            found = Attachment::Other(Box::new(subject.clone()));
         }
         match page.last() {
             Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
@@ -865,7 +898,7 @@ pub fn attachment(
 pub fn enroll_subject(
     registry: &Registry,
     enrollment_id: &str,
-    agent_id: &str,
+    registration_id: &str,
     process: &ProcessIdentity,
     session: &str,
     launch: LaunchContext,
@@ -881,7 +914,7 @@ pub fn enroll_subject(
                 continue;
             }
             if is_attached(registry, subject, now_ms)? {
-                return if subject.bound_agent_id.as_deref() == Some(agent_id) {
+                return if subject.bound_registration_id.as_deref() == Some(registration_id) {
                     Ok(subject.subject_id.clone())
                 } else {
                     Err("the session is already attached to another live process".into())
@@ -944,7 +977,7 @@ pub fn enroll_subject(
         successor: None,
         correlation: None,
         process: Some(process.clone()),
-        bound_agent_id: Some(agent_id.to_string()),
+        bound_registration_id: Some(registration_id.to_string()),
         signalled_at: None,
         exited_at: None,
         pane_cleanup: None,
@@ -1116,7 +1149,7 @@ pub fn public_view(subject: &Subject) -> Value {
         "ended_externally_at": subject.ended_externally_at,
         "ended_evidence": subject.ended_evidence,
         "pane_cleanup": subject.pane_cleanup,
-        "bound_agent_id": subject.bound_agent_id,
+        "bound_registration_id": subject.bound_registration_id,
         "signalled_at": subject.signalled_at,
         "exited_at": subject.exited_at,
         "recorded_at": subject.recorded_at,
@@ -1799,8 +1832,8 @@ fn write(registry: &Registry, subject: &Subject) -> Result<(), String> {
             State::Bound => (
                 Source::Registration,
                 Transition::Bound {
-                    agent_id: target
-                        .bound_agent_id
+                    registration_id: target
+                        .bound_registration_id
                         .clone()
                         .ok_or("binding has no agent")?,
                 },
@@ -2062,7 +2095,7 @@ mod tests {
             ended_externally_at: None,
             ended_evidence: None,
             pane_cleanup: None,
-            bound_agent_id: None,
+            bound_registration_id: None,
             signalled_at: None,
             exited_at: None,
             recorded_at: "2026-01-01T00:00:00.000Z".into(),
@@ -2101,7 +2134,7 @@ mod tests {
             .record_spawn(
                 &crate::control_plane::registry::SpawnRequest {
                     request_id: request_id.into(),
-                    parent: parent.agent_id.clone(),
+                    parent: parent.registration_id.clone(),
                     parent_session_id: "2a4c6e80-1357-4b9d-8f01-23456789abcd".into(),
                 },
                 1,
@@ -2146,7 +2179,7 @@ mod tests {
         registry
             .publish_context(
                 &crate::control_plane::registry::ContextRequest {
-                    agent_id: parent.agent_id.clone(),
+                    registration_id: parent.registration_id.clone(),
                     publisher: crate::control_plane::registry::PublisherIdentity {
                         source: parent.request.source.clone(),
                         incarnation: parent.request.incarnation.clone(),
@@ -2692,6 +2725,77 @@ mod tests {
         )
         .expect("capture");
         (ticket.subject_id, child, process)
+    }
+
+    /// Reports every PID as absent, as a process table that no longer lists it does.
+    struct Gone;
+
+    impl ProcessVerifier for Gone {
+        fn inspect(&self, _pid: i32) -> Result<Option<ProcessIdentity>, String> {
+            Ok(None)
+        }
+    }
+
+    /// Reports every PID as owned by another process, as a reused PID is.
+    struct Reused;
+
+    impl ProcessVerifier for Reused {
+        fn inspect(&self, pid: i32) -> Result<Option<ProcessIdentity>, String> {
+            Ok(Some(ProcessIdentity {
+                boot_id: "boot".into(),
+                pid,
+                start_ticks: 7,
+            }))
+        }
+    }
+
+    #[test]
+    fn a_holder_whose_process_is_alive_or_unreadable_keeps_its_session() {
+        // The holder's pane is irrelevant: only its process decides. A live process
+        // holds the session, and an unreadable one is not evidence it is gone.
+        let scratch = Scratch::new("holder-alive");
+        let registry = scratch.registry();
+        let (subject_id, _child, _process) = captured_child(&registry);
+        let holder = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject");
+
+        assert!(!release_if_gone(&registry, &holder, &LocalProcfsVerifier, 3).expect("verify"));
+        assert!(!release_if_gone(&registry, &holder, &Unreadable, 3).expect("verify"));
+        let held = read(&registry, &subject_id)
+            .expect("read")
+            .expect("subject");
+        assert!(
+            held.exited_at.is_none(),
+            "a live or unreadable holder is not an exit"
+        );
+    }
+
+    #[test]
+    fn a_holder_whose_process_is_gone_or_reused_releases_its_session_as_a_verified_exit() {
+        let scratch = Scratch::new("holder-gone");
+        let registry = scratch.registry();
+
+        let (gone_id, _gone, _) = captured_child(&registry);
+        let holder = read(&registry, &gone_id).expect("read").expect("subject");
+        assert!(release_if_gone(&registry, &holder, &Gone, 3).expect("verify"));
+        let exited = read(&registry, &gone_id).expect("read").expect("subject");
+        assert!(exited.exited_at.is_some());
+        assert!(
+            exited.ended_externally_at.is_none(),
+            "a confirmed exit is not a pane loss"
+        );
+
+        let (reused_id, _reused, _) = captured_child(&registry);
+        let holder = read(&registry, &reused_id).expect("read").expect("subject");
+        assert!(release_if_gone(&registry, &holder, &Reused, 4).expect("verify"));
+        assert!(
+            read(&registry, &reused_id)
+                .expect("read")
+                .expect("subject")
+                .exited_at
+                .is_some()
+        );
     }
 
     #[test]

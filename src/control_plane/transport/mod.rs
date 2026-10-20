@@ -428,7 +428,13 @@ fn lane(line: &[u8]) -> Lane {
         Lane::Waiting
     } else if matches!(
         request.method.as_str(),
-        "agent.acquire" | "agent.register" | "agent.publish" | "agent.retire" | "agent.context"
+        "agent.acquire"
+            | "agent.register"
+            | "agent.presence"
+            | "agent.release"
+            | "agent.publish"
+            | "agent.retire"
+            | "agent.context"
     ) {
         Lane::Ingest
     } else {
@@ -732,6 +738,8 @@ mod tests {
     #[test]
     fn request_lanes_are_isolated_and_waiting_reads_are_separate() {
         assert_eq!(lane(&request("agent.register", json!({}))), Lane::Ingest);
+        assert_eq!(lane(&request("agent.presence", json!({}))), Lane::Ingest);
+        assert_eq!(lane(&request("agent.release", json!({}))), Lane::Ingest);
         assert_eq!(lane(&request("agent.get", json!({}))), Lane::Control);
         assert_eq!(
             lane(&request("events.read", json!({"wait_ms":1}))),

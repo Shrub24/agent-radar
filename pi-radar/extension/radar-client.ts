@@ -113,6 +113,10 @@ export type RadarLocation = {
 	pane?: string;
 };
 
+export type RadarPresenceReport = import("./generated-contracts.ts").PresenceReportDeserialize;
+export type RadarPresenceAnswer = import("./generated-contracts.ts").PresenceAnswerSerialize;
+export type RadarPresenceRelease = import("./generated-contracts.ts").PresenceReleaseDeserialize;
+
 export type RadarProcessClaim = {
 	boot_id: string;
 	pid: number;
@@ -284,7 +288,7 @@ export type RadarEffectOutcome = "completed" | "refused" | "unknown";
 /**
  * One durable spawn edge as the daemon publishes it (`spawn.get`).
  *
- * `bound.agent_id` is the exact registry identity the child obtained with the
+ * `bound.registration_id` is the exact registry identity the child obtained with the
  * launch's private token, which is the only thing that says *this* child belongs
  * to *this* spawn: a label, a pane or a session UUID would each be a guess.
  */
@@ -294,7 +298,7 @@ export type RadarSpawnEdge = {
 	created: RadarEffectOutcome;
 	launched: RadarEffectOutcome;
 	location?: RadarLocation;
-	bound?: { source: string; incarnation: string; agent_id?: string };
+	bound?: { source: string; incarnation: string; registration_id?: string };
 	exit_observation?: RadarSpawnExitObservation;
 };
 
@@ -499,13 +503,30 @@ export function isUuid(value: unknown): value is string {
 	return typeof value === "string" && UUID.test(value);
 }
 
+function decodePresenceAnswer(value: unknown): RadarResult<RadarPresenceAnswer> {
+	const registrationId = recordAt(value, "registration_id");
+	const claimId = recordAt(value, "claim_id");
+	const standing = recordAt(value, "standing");
+	const subjectId = recordAt(value, "subject_id");
+	if (
+		!isUuid(registrationId) ||
+		!isUuid(claimId) ||
+		!["pending", "granted", "duplicate", "released"].includes(String(standing)) ||
+		(subjectId !== undefined && !isUuid(subjectId)) ||
+		(standing === "granted" && !isUuid(subjectId))
+	)
+		return protocol("presence reply carries no valid claim standing");
+	return { ok: true, value: value as RadarPresenceAnswer };
+}
+
 /**
  * How Radar stands on a publisher's current session: adopted as a managed Pi
- * session, held by another live process (a duplicate), or not managed (yet).
+ * session, rejected as a duplicate, still pending evidence/recovery, or not managed (yet).
  */
 export type RadarManagement =
 	| { state: "managed"; subject_id: string }
 	| { state: "duplicate" }
+	| { state: "pending" }
 	| { state: "unmanaged" };
 
 function managementAt(value: unknown): RadarManagement | undefined {
@@ -515,7 +536,7 @@ function managementAt(value: unknown): RadarManagement | undefined {
 		const subjectId = stringAt(field, "subject_id");
 		return subjectId === undefined ? undefined : { state, subject_id: subjectId };
 	}
-	if (state === "duplicate" || state === "unmanaged") return { state };
+	if (state === "duplicate" || state === "pending" || state === "unmanaged") return { state };
 	return undefined;
 }
 
@@ -546,7 +567,7 @@ function handoffAt(value: unknown): HandoffSerialize | undefined {
 		? (value as Record<string, unknown>).correlation_id
 		: undefined;
 	if (
-		version !== 1 || !isUuid(id) || !isUuid(stringAt(sender, "agent_id")) ||
+		version !== 1 || !isUuid(id) || !isUuid(stringAt(sender, "registration_id")) ||
 		!isUuid(stringAt(sender, "session_id")) || !isUuid(stringAt(sender, "subject_id")) ||
 		!isUuid(stringAt(sender, "execution_id")) || !Number.isSafeInteger(senderGeneration) ||
 		(senderGeneration ?? 0) < 1 || !isUuid(target) || summary === undefined || content === undefined ||
@@ -565,7 +586,7 @@ function handoffReceiptAt(value: unknown): HandoffReceiptSerialize | undefined {
 	const generation = numberAt(recipient, "execution_generation");
 	const received = numberAt(value, "received_at_unix_ms");
 	if (
-		version !== 1 || !isUuid(handoffId) || !isUuid(stringAt(recipient, "agent_id")) ||
+		version !== 1 || !isUuid(handoffId) || !isUuid(stringAt(recipient, "registration_id")) ||
 		!isUuid(stringAt(recipient, "session_id")) || !isUuid(stringAt(recipient, "subject_id")) ||
 		!isUuid(stringAt(recipient, "execution_id")) || !Number.isSafeInteger(generation) ||
 		(generation ?? 0) < 1 || received === undefined || !Number.isSafeInteger(received) || received < 0
@@ -781,7 +802,7 @@ function locationAt(value: unknown): RadarLocation | undefined {
 }
 
 /**
- * One durable edge, decoded strictly. The bound child's `agent_id` is kept only
+ * One durable edge, decoded strictly. The bound child's `registration_id` is kept only
  * when it is a canonical UUID: a legacy binding has none, and an unreadable one
  * is not an identity to correlate with.
  */
@@ -801,7 +822,7 @@ function spawnEdge(value: unknown): RadarResult<RadarSpawnEdge> {
 	const bound = recordAt(value, "bound");
 	const source = stringAt(bound, "source");
 	const incarnation = stringAt(bound, "incarnation");
-	const agentId = stringAt(bound, "agent_id");
+	const agentId = stringAt(bound, "registration_id");
 	const exit = exitAt(recordAt(value, "exit_observation"));
 	return {
 		ok: true,
@@ -816,7 +837,7 @@ function spawnEdge(value: unknown): RadarResult<RadarSpawnEdge> {
 						bound: {
 							source,
 							incarnation,
-							...(isUuid(agentId) ? { agent_id: agentId } : {}),
+							...(isUuid(agentId) ? { registration_id: agentId } : {}),
 						},
 					}
 				: {}),
@@ -1018,15 +1039,15 @@ export type RadarClient = {
 	ping(): Promise<RadarResult<RadarHandshake>>;
 	register(
 		registration: RadarRegistration,
-	): Promise<RadarResult<{ agent_id: string }>>;
+	): Promise<RadarResult<{ registration_id: string }>>;
 	acquire(request: {
-		agent_id: string;
+		registration_id: string;
 		channel: RadarChannel;
 		publisher: RadarPublisherIdentity;
 		replace?: { generation: number; handle: string };
 	}): Promise<RadarResult<RadarWriterBinding>>;
 	publish(request: {
-		agent_id: string;
+		registration_id: string;
 		channel: RadarChannel;
 		writer_handle: string;
 		sequence: number;
@@ -1034,8 +1055,10 @@ export type RadarClient = {
 		observed_at?: string;
 		snapshot: RadarChannelSnapshot;
 	}): Promise<RadarResult<{ sequence: number }>>;
+	presence(request: RadarPresenceReport): Promise<RadarResult<RadarPresenceAnswer>>;
+	releasePresence(request: RadarPresenceRelease): Promise<RadarResult<RadarPresenceAnswer>>;
 	context(request: {
-		agent_id: string;
+		registration_id: string;
 		publisher: RadarPublisherIdentity;
 		writer_handle?: string;
 		replace?: { generation: number; handle: string };
@@ -1045,7 +1068,7 @@ export type RadarClient = {
 		context: RadarContextValue;
 	}): Promise<RadarResult<{ writer: RadarWriterBinding; warning?: string; management?: RadarManagement }>>;
 	retire(request: {
-		agent_id: string;
+		registration_id: string;
 		channel: RadarChannel;
 		writer_handle: string;
 	}): Promise<RadarResult<void>>;
@@ -1078,15 +1101,15 @@ export type RadarClient = {
 	}): Promise<RadarResult<RadarSpawnEdge>>;
 	spawnGet(request_id: string): Promise<RadarResult<RadarSpawnTopology>>;
 	/** The registered child's process verdict, read from its immutable claim. */
-	agentGet(agent_id: string): Promise<RadarResult<RadarAgentProcess>>;
+	agentGet(registration_id: string): Promise<RadarResult<RadarAgentProcess>>;
 	observe(): Promise<RadarResult<RadarInventory>>;
 	/** Read the durable event journal after `after`, waiting at most `wait_ms`. */
 	communicationPublish(request: HandoffPublishParamsDeserialize & {
 		request_id: string;
 	}): Promise<RadarResult<{ handoff: HandoffSerialize; created: boolean }>>;
-	communicationInbox(request: { agent_id: string }): Promise<RadarResult<HandoffInboxSerialize>>;
-	communicationGet(request: { agent_id: string; handoff_id: string }): Promise<RadarResult<{ handoff: HandoffSerialize; receipt: HandoffReceiptSerialize | null }>>;
-	communicationAck(request: { agent_id: string; handoff_id: string }): Promise<RadarResult<{ receipt: HandoffReceiptSerialize; created: boolean }>>;
+	communicationInbox(request: { registration_id: string }): Promise<RadarResult<HandoffInboxSerialize>>;
+	communicationGet(request: { registration_id: string; handoff_id: string }): Promise<RadarResult<{ handoff: HandoffSerialize; receipt: HandoffReceiptSerialize | null }>>;
+	communicationAck(request: { registration_id: string; handoff_id: string }): Promise<RadarResult<{ receipt: HandoffReceiptSerialize; created: boolean }>>;
 	events(request: {
 		after: number;
 		epoch?: string;
@@ -1485,6 +1508,24 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 	return {
 		socketPath,
 		ping,
+		async presence(request) {
+			return withRegistry(async () => {
+				const answer = await call("agent.presence", { ...request });
+				if (!answer.ok) return answer;
+				return decodePresenceAnswer(answer.value);
+			});
+		},
+		async releasePresence(request) {
+			return withRegistry(async () => {
+				const answer = await call("agent.release", { ...request });
+				if (!answer.ok) return answer;
+				const decoded = decodePresenceAnswer(answer.value);
+				if (!decoded.ok) return decoded;
+				return decoded.value.standing === "released"
+					? decoded
+					: protocol("release reply did not confirm the claim release");
+			});
+		},
 		async register(registration) {
 			return withRegistry(async () => {
 				const answer = await call("agent.register", {
@@ -1504,15 +1545,15 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				});
 				if (answer.ok === false) return answer;
 				const record = (answer.value as { registration?: unknown }).registration;
-				const agentId = stringAt(record, "agent_id");
-				if (!isUuid(agentId)) return protocol("registration reply carries no agent_id");
-				return { ok: true, value: { agent_id: agentId } };
+				const agentId = stringAt(record, "registration_id");
+				if (!isUuid(agentId)) return protocol("registration reply carries no registration_id");
+				return { ok: true, value: { registration_id: agentId } };
 			});
 		},
 		async acquire(request) {
 			return withRegistryChannel(request.channel, async () => {
 				const answer = await call("agent.acquire", {
-					agent_id: request.agent_id,
+					registration_id: request.registration_id,
 					channel: request.channel,
 					publisher: request.publisher,
 					...(request.replace !== undefined ? { replace: request.replace } : {}),
@@ -1541,7 +1582,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 			}
 			return withRegistryChannel(request.channel, async () => {
 				const answer = await call("agent.publish", {
-					agent_id: request.agent_id,
+					registration_id: request.registration_id,
 					channel: request.channel,
 					writer_handle: request.writer_handle,
 					sequence: request.sequence,
@@ -1560,7 +1601,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 		async context(request) {
 			return withRegistry(async () => {
 				const answer = await call("agent.context", {
-					agent_id: request.agent_id,
+					registration_id: request.registration_id,
 					publisher: request.publisher,
 					...(request.writer_handle !== undefined
 						? { writer_handle: request.writer_handle }
@@ -1680,7 +1721,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					message: "agent.get requires a canonical agent UUID",
 				};
 			return withRegistry(async () => {
-				const answer = await call("agent.get", { agent_id: agentId });
+				const answer = await call("agent.get", { registration_id: agentId });
 				if (answer.ok === false) return answer;
 				return agentProcessAt(recordAt(answer.value, "agent"));
 			});
@@ -1746,7 +1787,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 		async communicationPublish(request) {
 			return withContract(RADAR_COMMUNICATION_CONTRACT, async () => {
 				const answer = await call("communication.publish", {
-					sender_agent_id: request.sender_agent_id,
+					sender_registration_id: request.sender_registration_id,
 					recipient_subject_id: request.recipient_subject_id,
 					...(request.correlation_id !== undefined ? { correlation_id: request.correlation_id } : {}),
 					summary: request.summary,

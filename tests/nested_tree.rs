@@ -141,9 +141,9 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                     ..HerdsmanFacts::default()
                 },
                 registry: agent.session.map(|session| {
-                    let agent_id = format!("test-{}", agent.pane_id);
+                    let registration_id = format!("test-{}", agent.pane_id);
                     let mut registered = registration(
-                        &agent_id,
+                        &registration_id,
                         json!({
                             "backend": "test",
                             "workspace": "wH",
@@ -156,7 +156,7 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                     registered.context = Some(
                         serde_json::from_value(json!({
                             "version": 1,
-                            "agent_id": agent_id,
+                            "registration_id": registration_id,
                             "writer": {
                                 "source": "herdsman",
                                 "incarnation": REGISTRY_INCARNATION,
@@ -1786,7 +1786,7 @@ const REGISTRY_SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
 /// A registration as `agent.list` serves it, with the reports it holds. A
 /// claimed registration names the birth identity the registry verifies.
 fn registration(
-    agent_id: &str,
+    registration_id: &str,
     location: Value,
     claimed: bool,
     reports: Vec<Value>,
@@ -1803,12 +1803,12 @@ fn registration(
     serde_json::from_value(json!({
         "registration": {
             "version": 1,
-            "agent_id": agent_id,
+            "registration_id": registration_id,
             "registered_at": "2026-01-01T00:00:00.000Z",
             "source": "herdsman",
             "incarnation": REGISTRY_INCARNATION,
             "session": REGISTRY_SESSION,
-            "label": format!("{agent_id} label"),
+            "label": format!("{registration_id} label"),
             "location": location,
             "process_claimed": claimed,
             "launch": {"available": false}
@@ -1823,7 +1823,7 @@ fn registration(
 
 /// One channel's report at `freshness`. The owner publishes the assignment for
 /// its own owner; a session publishes its execution and facts itself.
-fn report(agent_id: &str, channel: &str, freshness: &str, snapshot: Value) -> Value {
+fn report(registration_id: &str, channel: &str, freshness: &str, snapshot: Value) -> Value {
     let (source, owner) = if channel == "assignment" {
         ("herdsman", Some("herdsman-owner"))
     } else {
@@ -1831,7 +1831,7 @@ fn report(agent_id: &str, channel: &str, freshness: &str, snapshot: Value) -> Va
     };
     json!({
         "version": 1,
-        "agent_id": agent_id,
+        "registration_id": registration_id,
         "channel": channel,
         "writer": {"source": source, "incarnation": REGISTRY_INCARNATION, "generation": 1, "sequence": 3},
         "snapshot": {
@@ -1851,7 +1851,7 @@ fn bound_edge(parent: &str, child: &str) -> PublicSpawnTopology {
         "parent": parent,
         "created": "completed",
         "launched": "completed",
-        "bound": {"source": "test", "incarnation": REGISTRY_INCARNATION, "agent_id": child,
+        "bound": {"source": "test", "incarnation": REGISTRY_INCARNATION, "registration_id": child,
                   "bound_at": "2026-01-01T00:00:00.000Z"},
         "recorded_at": "2026-01-01T00:00:00.000Z",
         "state": "bound"

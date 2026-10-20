@@ -78,7 +78,8 @@ pub struct Facts {
     pub ended_evidence: Option<EndedEvidence>,
     #[serde(default)]
     pub pane_cleanup: Option<PaneCleanup>,
-    pub bound_agent_id: Option<String>,
+    #[serde(alias = "bound_agent_id")]
+    pub bound_registration_id: Option<String>,
     pub signalled_at: Option<String>,
     pub exited_at: Option<String>,
     pub recorded_at: String,
@@ -102,7 +103,7 @@ impl Facts {
             ended_externally_at: subject.ended_externally_at.clone(),
             ended_evidence: subject.ended_evidence.clone(),
             pane_cleanup: subject.pane_cleanup.clone(),
-            bound_agent_id: subject.bound_agent_id.clone(),
+            bound_registration_id: subject.bound_registration_id.clone(),
             signalled_at: subject.signalled_at.clone(),
             exited_at: subject.exited_at.clone(),
             recorded_at: subject.recorded_at.clone(),
@@ -123,7 +124,7 @@ impl Facts {
         subject.ended_externally_at = self.ended_externally_at.clone();
         subject.ended_evidence = self.ended_evidence.clone();
         subject.pane_cleanup = self.pane_cleanup.clone();
-        subject.bound_agent_id = self.bound_agent_id.clone();
+        subject.bound_registration_id = self.bound_registration_id.clone();
         subject.signalled_at = self.signalled_at.clone();
         subject.exited_at = self.exited_at.clone();
         subject.recorded_at = self.recorded_at.clone();
@@ -155,7 +156,8 @@ pub enum Transition {
     IdentityUnresolved,
     Captured(ProcessIdentity),
     Bound {
-        agent_id: String,
+        #[serde(alias = "agent_id")]
+        registration_id: String,
     },
     Revoked,
     SignalRequested,
@@ -518,9 +520,9 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
             facts.state = State::Captured;
             facts.process = Some(process.clone());
         }
-        Transition::Bound { agent_id } if facts.state == State::Captured => {
+        Transition::Bound { registration_id } if facts.state == State::Captured => {
             facts.state = State::Bound;
-            facts.bound_agent_id = Some(agent_id.clone());
+            facts.bound_registration_id = Some(registration_id.clone());
         }
         Transition::Revoked if matches!(facts.state, State::Pending | State::Captured) => {
             facts.state = State::Revoked

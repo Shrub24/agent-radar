@@ -1,39 +1,28 @@
 # Tasks
 
-Implement against `scope.md` and the aligned design/spec delta. Prefer existing production seams and tests; no parallel enrollment controller, session-marker replacement or pane-move feature. Each group includes the behavior checks and documentation it needs. Items are unchecked: this is a plan, not an implementation report.
+The implementation already contains partial session continuity and marker removal. Checkboxes below track the corrected presence/claim contract, not the superseded sweep-adoption implementation. Retain useful existing code, remove competing paths, and do not mark partial behavior complete.
 
-## 1. First-class adoption through the real Pi reporter
+## 1. Durable daemon recognition
 
-- [ ] 1.1 Converge manual adoption, explicit enrollment, launch binding and recorded-execution reconciliation on one daemon-owned binding routine, resolving subject by canonical session UUID and validating optional launch correlation before adoption; extend an existing daemon integration flow to verify manual adoption, identical retry, correlated child binding and correlation refusal without duplicate subjects or effects. — Partial: duplicate, reattach and sweep share one routine; launch-correlation binding still runs its own path (refactor, not behaviour).
-- [x] 1.2 Adapt the existing durable subject/execution records for session association and active attachment without replacing storage or rewriting history; verify reopen restores one binding and that ambiguous legacy session mappings remain unresolved rather than merge IDs, parentage or inboxes; document actual format/rollback constraints.
-- [x] 1.3 Wire automatic management into pi-radar's baseline registration/context driver and expose accepted/pending/refused association through the shared runtime, with additive capability negotiation and generated DTOs only for consumed changes; exercise the real reporter to verify manual Pi becomes managed without E/Herdsman, missing verification preserves baseline publication, and an older daemon gets no simulated identity; update `pi-radar/README.md` and registration docs alongside the slice.
+- [x] 1.1 Add the flat presence report and typed standing/release DTOs; resolve immutable process identity to `registration_id`, retain mutable location/session context separately, and validate optional launch correlation without adoption fallback. Generate consumed protocol artifacts and rename public `agent_id` references without alpha compatibility aliases.
+- [x] 1.2 Persist session-load claim identity and granted/duplicate/released decisions using existing storage and transition serialization. Retry interrupted work without another subject; preserve existing session subjects, inboxes, relationships and history. Document storage/rollback limits and ambiguous legacy handling.
+- [x] 1.3 Bind through the recognition request, not a later adoption sweep. Reassertions replay the same claim; a duplicate stays rejected after incumbent exit and daemon restart. Pending verification failures remain retryable. A fresh same-process claim supersedes the old attachment safely.
+- [x] 1.4 Implement exact idempotent release. A delayed release cannot revoke a replacement, a released claim cannot reacquire, and graceful release leaves process registration intact. Verify process birth identity for crash recovery, never infer death from pane loss or heartbeat expiry; remove sweep promotion.
 
-## 2. Session switching and safe reattachment
+## 2. pi-radar production path
 
-- [x] 2.1 Change current-session reporting so `/resume` retains process registration but changes active subject, releasing the prior session attachment and keeping its relationships/history; use one composed session-switch/reattach test to verify a fresh uncontested process resumes the original subject and repeated reports/daemon restart do not create another identity.
-- [ ] 2.2 Fence effect dispatch and subject-bound publication/communication against the current attachment, including same-PID session changes; extend existing control/communication checks so stale work for session A cannot act on or acknowledge as session B, while the correct current association still works. — Partial: handoff sender and restart use attachment; other effect fences unchanged.
-- [x] 2.3 Update pi-radar runtime consumers to invalidate previous subject/parent/communication handles on session selection and deliver the new association; verify through the actual session event/runtime boundary that switches do not leak cached identity, and document the consumer contract for Herdsman's owner without implementing a second registrar.
+- [x] 2.1 Use one report function on `session_start`, renewal and reconnect; create claim IDs only at session-load boundaries, reuse them after failures, and retain private retry/acknowledgment state. Replace separate registration/context management choreography while keeping facts/channel publication working.
+- [x] 2.2 Send bounded awaited exact release on `session_shutdown`; preserve unresolved release for retry when the process survives. Invalidate subject/parent/communication handles on the session boundary and expose current granted/duplicate/pending standing through the shared runtime.
+- [x] 2.3 Finish the `registration_id` SDK rename, remove obsolete marker/registration-context scaffolding, update public schemas and package docs, and ensure no transcript or managed-identity environment machinery is reintroduced.
 
-## 3. Unsupported duplicate-session handling
+## 3. Consumers and display
 
-- [x] 3.1 Make pi-radar's `session_start` the reconsideration boundary: re-attempt registration and re-read the subject on every session start (`/reload`, `/resume`, new process). No host session-load signal is instrumented; no session-history comparison or merge.
-- [x] 3.2 Keep a duplicate process baseline-visible but unbound, retain sufficient conflict state across daemon restart, and allow reconsideration only after fresh loading/restart plus incumbent release verification; extend one duplicate flow through incumbent exit and daemon restart to prove no automatic promotion, then prove the supported fresh-load/restart path can bind.
-- [ ] 3.3 Expose a concise duplicate/pending warning in observation and the TUI without displacing the incumbent or granting inbox authority; add a focused existing-view rendering assertion and update operator guidance with how to resolve the duplicate safely. — Open: duplicate warning reaches the publisher diagnostic only; TUI/observation presentation not built.
+- [x] 3.1 Fence effects and handoff identity to the current granted attachment, including same-PID session switches. Preserve logical parent/child/inbox continuity on resume and existing-pane restart using verified observed context.
+- [x] 3.2 Carry duplicate standing into observation and show a compact inline TUI warning distinct from stale process/binary marks. Preserve minimal logical parent references across tabs without pane movement or tree redesign.
+- [x] 3.3 Update the existing Herdsman companion brief with the flat report/release and breaking registration-ID contract; leave cross-repository consumer changes to its owner and report adoption status explicitly.
 
-## 4. Session-owned relationships, inbox and restart
+## 4. Verification and adoption
 
-- [ ] 4.1 Resolve logical parent/child identity using subject relationships while preserving original spawn history; extend the reattachment flow to verify child identity and pending inbox survive parent process replacement, and render a minimal out-of-tab parent reference without moving panes or building cross-tab nesting; document the supported placement limitation. — Partial: logical parent and children continue through reattachment; no out-of-tab parent reference in the TUI.
-- [x] 4.2 Use verified observed process context as the private restart recipe for either origin, freeze/revalidate the selected subject's current session and preserve existing restart placement; adapt existing restart coverage for current-session selection, initial-prompt/credential exclusion and refusal before termination on ambiguous arguments; update restart docs with observed-environment limits.
-- [x] 4.3 Remove active session-marker reads/writes, marker-only environment injection, host API requirements and marker projections/tests with no remaining consumer; retain necessary released compatibility exports but ignore old entries; verify baseline/runtime behavior without custom-entry support and run contract drift/type checks after regeneration, then align the superseded lifecycle-authority breadcrumb guidance.
-
-## 5. Integration and adoption handoff
-
-- [x] 5.1 Run formatting, strict Clippy, locked Rust targets, pi-radar contract/type/package checks, strict OpenSpec validation and the checked Nix build; record actual exits and any unavailable check, using the existing gate rather than adding a validation framework.
-- [ ] 5.2 Operator-run smokes: the operator runs the live Pi/tmux smokes (manual auto-adoption, `/resume` subject change, reattachment, duplicate repair at `session_start`). The agent may run one minimal disposable check only; record the operator's observed identities and links, and do not infer acceptance from unit tests. — Operator-run smokes.
-- [ ] 5.3 Deliver the Herdsman adoption brief with the current-association/cache contract and verified local SDK artifact; record the consumer owner's validation or explicitly pending cutover, including a handoff recovered by the same session subject after reattachment. Keep assignment restoration and settlement policy outside Radar.
-
-## Workflow follow-up
-
-- Ship daemon capability support before the pi-radar npm release and consumer pin updates; publication, switching and live consumer acceptance remain explicit release/operator work, not implicit results of passing tests.
-- Review the completed change, sync requirements and archive when implementation and required acceptance are recorded.
-- Keep `/radar gather-children`, first-class resume, layout migration, richer cross-tab views, fork investigation and legacy repair tooling deferred as listed in `scope.md`/`ideas.md`; do not add placeholders.
+- [ ] 4.1 Exercise a composed acquisition/switch/release/resume flow, including mutable pane location and retained child/inbox identity; prove duplicate stickiness across incumbent exit and daemon restart, then fresh-load acceptance; prove lost-response replay and delayed release fencing. Prefer existing integration seams over fixture matrices.
+- [x] 4.2 Run fmt, strict Clippy, locked Rust tests, pi-radar generated-contract/type/package checks, strict OpenSpec validation and checked Nix build. Record actual exits and unavailable checks; no new validation framework.
+- [x] 4.3 Operator-run live Pi/tmux smokes and Herdsman cutover remain explicit pending acceptance. No automatic pane movement, general incoming request transport, signing or assignment recovery in this change.

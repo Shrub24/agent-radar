@@ -69,7 +69,7 @@ def fixture_pairs():
 def validate_fixture(path):
     """Run registry exchanges and compare stable response schema/content live."""
     pairs = fixture_pairs()
-    handles, agent_id = {}, None  # handles are keyed by writer channel, or "context"
+    handles, registration_id = {}, None  # handles are keyed by writer channel, or "context"
     previous_context = None
     event_epoch = None
     get_template = next(response["result"]["agent"] for request, response in pairs
@@ -98,7 +98,7 @@ def validate_fixture(path):
                 expected["epoch"] = actual["epoch"]
                 expected["cursor"]["epoch"] = actual["epoch"]
                 for event, served in zip(expected["events"], actual["events"]):
-                    event["agent_id"] = agent_id
+                    event["registration_id"] = registration_id
                     event["at"] = served["at"]
             check(actual == expected, f"fixture events.read differs:\nactual={actual}\nexpected={expected}")
             continue
@@ -106,7 +106,7 @@ def validate_fixture(path):
         if method == "agent.register" and "spawn_token" in params:
             continue
         if method in ("agent.acquire", "agent.publish", "agent.context", "agent.get", "agent.retire"):
-            params["agent_id"] = agent_id
+            params["registration_id"] = registration_id
         if method == "agent.publish":
             params["writer_handle"] = handles[params["channel"]]
         if method == "agent.retire":
@@ -124,14 +124,14 @@ def validate_fixture(path):
             # channel, with a longer lease, stays fresh meanwhile.
             time.sleep(1.05)
             params["replace"]["handle"] = handles[params["channel"]]
-            before = get_agent(path, agent_id)
+            before = get_agent(path, registration_id)
             check(before["facts"]["snapshot"]["freshness"] == "stale", str(before))
             check(before["assignment"]["snapshot"]["freshness"] == "fresh", str(before))
         actual = call(path, method, params)
         expected = json.loads(json.dumps(response["result"]))
         if method == "agent.register":
-            agent_id = actual["registration"]["agent_id"]
-            expected["registration"]["agent_id"] = agent_id
+            registration_id = actual["registration"]["registration_id"]
+            expected["registration"]["registration_id"] = registration_id
             expected["registration"]["registered_at"] = actual["registration"]["registered_at"]
             expected["registration"]["session"] = actual["registration"]["session"]
         elif method == "agent.acquire":
@@ -140,7 +140,7 @@ def validate_fixture(path):
         elif method == "agent.publish":
             channel = actual["channel"]
             handle = handles[params["channel"]]
-            expected["channel"]["agent_id"] = agent_id
+            expected["channel"]["registration_id"] = registration_id
             expected["channel"]["writer"]["handle"] = handle
             expected["channel"]["snapshot"]["handle"] = handle
             expected["channel"]["snapshot"]["received_at"] = channel["snapshot"]["received_at"]
@@ -153,7 +153,7 @@ def validate_fixture(path):
             if "context" not in handles or "replace" in params:
                 handles["context"] = actual["writer"]["handle"]
             expected["writer"]["handle"] = handles["context"]
-            expected["context"]["agent_id"] = agent_id
+            expected["context"]["registration_id"] = registration_id
             expected["context"]["context"]["received_at"] = context["context"]["received_at"]
             expected["context"]["context"]["expires_at"] = context["context"]["expires_at"]
             check(context["context"]["session"] == params["context"]["session"], str(context))
@@ -173,53 +173,53 @@ def validate_fixture(path):
                   f"fixture context projection differs:\nactual={actual['context']}\nexpected={expected['context']}")
             continue
         elif method == "agent.get":
-            expected["agent"]["registration"]["agent_id"] = agent_id
+            expected["agent"]["registration"]["registration_id"] = registration_id
             expected["agent"]["registration"]["registered_at"] = actual["agent"]["registration"]["registered_at"]
-            expected["agent"]["assignment"]["agent_id"] = agent_id
+            expected["agent"]["assignment"]["registration_id"] = registration_id
             # get/list facts intentionally omit the private fencing handle.
             expected["agent"]["assignment"]["snapshot"].pop("handle", None)
             expected["agent"]["assignment"]["snapshot"]["received_at"] = actual["agent"]["assignment"]["snapshot"]["received_at"]
             expected["agent"]["assignment"]["snapshot"]["expires_at"] = actual["agent"]["assignment"]["snapshot"]["expires_at"]
-            expected["agent"]["facts"]["agent_id"] = agent_id
+            expected["agent"]["facts"]["registration_id"] = registration_id
             expected["agent"]["facts"]["snapshot"]["received_at"] = actual["agent"]["facts"]["snapshot"]["received_at"]
             expected["agent"]["facts"]["snapshot"]["expires_at"] = actual["agent"]["facts"]["snapshot"]["expires_at"]
             expected["agent"]["context"]["context"]["received_at"] = actual["agent"]["context"]["context"]["received_at"]
             expected["agent"]["context"]["context"]["expires_at"] = actual["agent"]["context"]["context"]["expires_at"]
             expected["agent"]["context"]["context"]["freshness"] = actual["agent"]["context"]["context"]["freshness"]
-            expected["agent"]["context"]["agent_id"] = agent_id
+            expected["agent"]["context"]["registration_id"] = registration_id
         elif method == "agent.list":
             expected_agent = json.loads(json.dumps(get_template))
-            expected_agent["registration"]["agent_id"] = agent_id
+            expected_agent["registration"]["registration_id"] = registration_id
             expected_agent["registration"]["registered_at"] = actual["agents"][0]["registration"]["registered_at"]
-            expected_agent["assignment"]["agent_id"] = agent_id
+            expected_agent["assignment"]["registration_id"] = registration_id
             expected_agent["assignment"]["snapshot"].pop("handle", None)
             expected_agent["assignment"]["snapshot"]["received_at"] = actual["agents"][0]["assignment"]["snapshot"]["received_at"]
             expected_agent["assignment"]["snapshot"]["expires_at"] = actual["agents"][0]["assignment"]["snapshot"]["expires_at"]
             expected_agent["context"]["context"]["received_at"] = actual["agents"][0]["context"]["context"]["received_at"]
             expected_agent["context"]["context"]["expires_at"] = actual["agents"][0]["context"]["context"]["expires_at"]
             expected_agent["context"]["context"]["freshness"] = actual["agents"][0]["context"]["context"]["freshness"]
-            expected_agent["facts"]["agent_id"] = agent_id
+            expected_agent["facts"]["registration_id"] = registration_id
             expected_agent["facts"]["snapshot"]["received_at"] = actual["agents"][0]["facts"]["snapshot"]["received_at"]
             expected_agent["facts"]["snapshot"]["expires_at"] = actual["agents"][0]["facts"]["snapshot"]["expires_at"]
-            expected_agent["context"]["agent_id"] = agent_id
+            expected_agent["context"]["registration_id"] = registration_id
             check(actual["agents"] == [expected_agent], f"fixture agent.list mismatch: {actual}")
             check(actual["next"] is None, str(actual))
             continue
         elif method == "agent.retire":
-            check(set(actual["channel"]) == {"version", "agent_id", "channel", "writer", "snapshot"},
+            check(set(actual["channel"]) == {"version", "registration_id", "channel", "writer", "snapshot"},
                   f"retire response schema mismatch: {actual}")
-            check(actual["channel"]["agent_id"] == agent_id, str(actual))
+            check(actual["channel"]["registration_id"] == registration_id, str(actual))
             check(actual["channel"]["writer"]["handle"] == handles["assignment"], str(actual))
             check(actual["channel"]["writer"]["retired_at"] is not None, str(actual))
             continue
         check(actual == expected,
               f"fixture {method} differs from served response:\nactual={actual}\nexpected={expected}")
-    check(agent_id is not None, "fixture did not register an agent")
+    check(registration_id is not None, "fixture did not register an agent")
     # Facts publication appends identifier-only pointers, never the values it carries.
     events = call(path, "events.read", {"after": 1, "limit": 500})["events"]
     pointers = [event for event in events if event["kind"] == "facts.published"]
     check(len(pointers) == 2, f"expected one pointer per accepted facts report: {events}")
-    check(all(set(event) == {"seq", "kind", "agent_id", "at"} and event["agent_id"] == agent_id
+    check(all(set(event) == {"seq", "kind", "registration_id", "at"} and event["registration_id"] == registration_id
               for event in pointers), f"facts pointer carries more than identifiers: {pointers}")
     check("claude-opus-example" not in json.dumps(events), "facts value leaked into the journal")
     # The scripted-backend sequence below validates spawn wire shapes end to end.
@@ -265,8 +265,8 @@ def stop_daemon(child):
         raise RuntimeError(f"daemon exit {child.returncode}: {out}\n{err}")
 
 
-def get_agent(path, agent_id):
-    return call(path, "agent.get", {"agent_id": agent_id})["agent"]
+def get_agent(path, registration_id):
+    return call(path, "agent.get", {"registration_id": registration_id})["agent"]
 
 
 def process_birth_identity(pid):
@@ -311,9 +311,9 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
         parent = call(socket_path, "agent.register", {
             "source": "fixture-parent", "incarnation": "11111111-1111-4111-8111-111111111111",
             "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
-        })["registration"]["agent_id"]
+        })["registration"]["registration_id"]
         parent_session_id = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
-        call(socket_path, "agent.context", {"agent_id": parent,
+        call(socket_path, "agent.context", {"registration_id": parent,
              "publisher": {"source": "fixture-parent", "incarnation": "1c2d3e4f-5678-4abc-9def-0123456789ab"},
              "sequence": 1, "lease_ms": 30000, "context": {"session": parent_session_id}})
         launch_env = {"PI_HERDSMAN_MAILBOX": "mailbox-smoke", "PI_HERDSMAN_OWNER": "owner-smoke"}
@@ -349,27 +349,27 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
         check("spawn_token" not in json.dumps(child), "registration response leaked token")
         get = call(socket_path, "spawn.get", {"request_id": edge["request_id"]})["spawn"]
         check(get["state"] == "bound" and get["bound"]["incarnation"] == child["incarnation"], str(get))
-        check(get["bound"]["agent_id"] == child["agent_id"], str(get))
+        check(get["bound"]["registration_id"] == child["registration_id"], str(get))
         check(get["freshness"] == "fresh" and "token" not in json.dumps(get), str(get))
         listed = call(socket_path, "spawn.list", {"limit": 10})
         check(listed["spawns"] == [get] and listed["next"] is None, str(listed))
-        bound_child = get_agent(socket_path, get["bound"]["agent_id"])
+        bound_child = get_agent(socket_path, get["bound"]["registration_id"])
         check(bound_child["execution"] is None, "binding must not imply execution readiness")
         check(bound_child["facts"] is None, "a child that published no facts reads them as null")
-        check(bound_child["registration"]["agent_id"] == child["agent_id"], str(bound_child))
+        check(bound_child["registration"]["registration_id"] == child["registration_id"], str(bound_child))
         for channel, publisher_identity in (
             ("assignment", {"source": "fixture-owner", "incarnation": "9f8e7d6c-4321-4def-8abc-0123456789ab", "reporting_owner": "owner-smoke"}),
             ("execution", {"source": "fixture-pi", "incarnation": "2f8e7d6c-4321-4def-8abc-0123456789ab"}),
         ):
             binding = call(socket_path, "agent.acquire", {
-                "agent_id": child["agent_id"], "channel": channel, "publisher": publisher_identity,
+                "registration_id": child["registration_id"], "channel": channel, "publisher": publisher_identity,
             })["writer"]
             call(socket_path, "agent.publish", {
-                "agent_id": child["agent_id"], "channel": channel,
+                "registration_id": child["registration_id"], "channel": channel,
                 "writer_handle": binding["handle"], "sequence": 1,
                 "snapshot": {"activity": f"{channel}-before-close", "actions": ["inspect"]},
             })
-        before_agent = get_agent(socket_path, child["agent_id"])
+        before_agent = get_agent(socket_path, child["registration_id"])
         before_topology = call(socket_path, "spawn.get", {"request_id": edge["request_id"]})["spawn"]
         public = json.dumps([response, child, get, listed])
         check(private_token not in public, "token leaked through a public spawn projection")
@@ -386,7 +386,7 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
             check(actual == {"close": expected_close}, f"spawn.close fixture differs: {actual}")
         check((fake_state / "close-count").read_text() == "1",
               "same-ID close replay dispatched more than once")
-        after_agent = get_agent(socket_path, child["agent_id"])
+        after_agent = get_agent(socket_path, child["registration_id"])
         after_topology = call(socket_path, "spawn.get", {"request_id": edge["request_id"]})["spawn"]
         for channel in ("assignment", "execution"):
             check(after_agent[channel] == before_agent[channel],
@@ -441,19 +441,19 @@ def main():
             registered, channel = publisher.publish_assignment(
                 socket_path, registration, identity, snapshot, 1, lease_ms=1000)
             event_read = call(socket_path, "events.read", {"after": 0, "limit": 100})
-            check(any(event.get("agent_id") == registered["agent_id"] for event in event_read["events"]),
+            check(any(event.get("registration_id") == registered["registration_id"] for event in event_read["events"]),
                   "events consumer fixture did not observe the registered agent")
-            agent_id, old_writer = registered["agent_id"], channel["writer"]
+            registration_id, old_writer = registered["registration_id"], channel["writer"]
             check(channel["snapshot"]["freshness"] == "fresh", str(channel))
             check(channel["snapshot"]["lease_ms"] == 1000, str(channel))
             check(channel["snapshot"]["snapshot"] == snapshot, str(channel))
             initial_context = call(socket_path, "agent.context", {
-                "agent_id": agent_id, "publisher": identity, "sequence": 1,
+                "registration_id": registration_id, "publisher": identity, "sequence": 1,
                 "lease_ms": 1000, "context": {"session": "c1a2b3d4-e5f6-4a7b-8c9d-0e1a2b3c4d5e"},
             })
             context_writer = initial_context["writer"]
             context_sequence = 1
-            get = get_agent(socket_path, agent_id)
+            get = get_agent(socket_path, registration_id)
             listed = call(socket_path, "agent.list", {"limit": 10})["agents"]
             public = json.dumps([get, listed], sort_keys=True)
             check(sentinel not in public, "private launch sentinel leaked in public get/list")
@@ -464,10 +464,10 @@ def main():
             check(get["execution"] is None, "assignment merged into execution")
             # Self facts need no owner and never reach execution or assignment.
             facts = publisher.publish_facts(
-                socket_path, agent_id, {"source": "pi", "incarnation": "2d3e4f50-6789-4abc-8def-0123456789ab"},
+                socket_path, registration_id, {"source": "pi", "incarnation": "2d3e4f50-6789-4abc-8def-0123456789ab"},
                 {"model": "live-model", "session_name": "live"}, 1)
             check(facts["snapshot"]["freshness"] == "fresh", str(facts))
-            live = get_agent(socket_path, agent_id)
+            live = get_agent(socket_path, registration_id)
             check(live["facts"]["snapshot"]["snapshot"]["model"] == "live-model", str(live))
             check(live["assignment"]["snapshot"]["snapshot"] == snapshot, "facts changed assignment")
 
@@ -475,31 +475,31 @@ def main():
             # never republishes the immutable registration or private launch path.
             switched_session = "e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b"
             switched = call(socket_path, "agent.context", {
-                "agent_id": agent_id, "publisher": identity,
+                "registration_id": registration_id, "publisher": identity,
                 "writer_handle": context_writer["handle"], "sequence": 2,
                 "lease_ms": 1000, "context": {"session": switched_session},
             })
             check(switched["writer"]["generation"] == context_writer["generation"], str(switched))
-            check(get_agent(socket_path, agent_id)["context"]["context"]["session"] == switched_session,
+            check(get_agent(socket_path, registration_id)["context"]["context"]["session"] == switched_session,
                   "session switch was not visible in agent.get")
             cleared = call(socket_path, "agent.context", {
-                "agent_id": agent_id, "publisher": identity,
+                "registration_id": registration_id, "publisher": identity,
                 "writer_handle": context_writer["handle"], "sequence": 3,
                 "lease_ms": 1000, "context": {"session": None},
             })
             check(cleared["context"]["context"]["session"] is None, str(cleared))
-            public_clear = get_agent(socket_path, agent_id)
+            public_clear = get_agent(socket_path, registration_id)
             check(public_clear["context"]["context"]["session"] is None, str(public_clear))
             check(context_writer["handle"] not in json.dumps(public_clear), "context writer handle leaked")
             check(sentinel not in json.dumps(public_clear), "launch data leaked after context update")
 
             registered2, heartbeat = publisher.publish_assignment(
                 socket_path, registration, identity, snapshot, 2, lease_ms=1000)
-            check(registered2["agent_id"] == agent_id, "registration retry changed identity")
+            check(registered2["registration_id"] == registration_id, "registration retry changed identity")
             check(heartbeat["writer"]["handle"] == old_writer["handle"] and
                   heartbeat["writer"]["generation"] == old_writer["generation"],
                   "reconnect did not reacquire the same writer")
-            replay = {"agent_id": agent_id, "channel": "assignment",
+            replay = {"registration_id": registration_id, "channel": "assignment",
                       "writer_handle": old_writer["handle"], "sequence": 2,
                       "lease_ms": 1000, "snapshot": snapshot}
             one = call(socket_path, "agent.publish", replay)["channel"]
@@ -513,12 +513,12 @@ def main():
                          "9f8e7d6c-4321-4def-8abc-0123456789ab",
                          "reporting_owner": "owner-smoke"}
             replacement = call(socket_path, "agent.acquire", {
-                "agent_id": agent_id, "channel": "assignment", "publisher": successor,
+                "registration_id": registration_id, "channel": "assignment", "publisher": successor,
                 "replace": {"generation": old_writer["generation"],
                             "handle": old_writer["handle"]},
             })["writer"]
             check(replacement["generation"] == old_writer["generation"] + 1, str(replacement))
-            check(get_agent(socket_path, agent_id)["assignment"]["snapshot"]["freshness"] == "stale",
+            check(get_agent(socket_path, registration_id)["assignment"]["snapshot"]["freshness"] == "stale",
                   "replacement did not stale previous publication")
             try:
                 call(socket_path, "agent.publish", replay)
@@ -527,7 +527,7 @@ def main():
                 check(error.code == "refused", str(error))
             try:
                 call(socket_path, "agent.acquire", {
-                    "agent_id": agent_id, "channel": "assignment", "publisher": identity,
+                    "registration_id": registration_id, "channel": "assignment", "publisher": identity,
                 })
                 raise AssertionError("implicit takeover unexpectedly succeeded")
             except publisher.RegistryError as error:
@@ -535,27 +535,27 @@ def main():
 
             stop_daemon(daemon)
             daemon = spawn_daemon(binary, socket_path, state_path)
-            restored = get_agent(socket_path, agent_id)["assignment"]["snapshot"]
+            restored = get_agent(socket_path, registration_id)["assignment"]["snapshot"]
             check(restored["restored"] is True and restored["freshness"] == "stale", str(restored))
-            restored_facts = get_agent(socket_path, agent_id)["facts"]["snapshot"]
+            restored_facts = get_agent(socket_path, registration_id)["facts"]["snapshot"]
             check(restored_facts["restored"] is True and restored_facts["freshness"] == "stale",
                   str(restored_facts))
             check(restored_facts["snapshot"]["model"] == "live-model", str(restored_facts))
             registered3 = call(socket_path, "agent.register", registration)["registration"]
-            check(registered3["agent_id"] == agent_id, "restart changed registration identity")
+            check(registered3["registration_id"] == registration_id, "restart changed registration identity")
             binding = call(socket_path, "agent.acquire", {
-                "agent_id": agent_id, "channel": "assignment", "publisher": successor,
+                "registration_id": registration_id, "channel": "assignment", "publisher": successor,
             })["writer"]
             check(binding["handle"] == replacement["handle"], "restart changed current writer")
             refreshed = call(socket_path, "agent.publish", {
-                "agent_id": agent_id, "channel": "assignment",
+                "registration_id": registration_id, "channel": "assignment",
                 "writer_handle": binding["handle"], "sequence": 1, "snapshot": snapshot,
             })["channel"]
             check(refreshed["snapshot"]["freshness"] == "fresh", str(refreshed))
-            check(sentinel not in json.dumps(get_agent(socket_path, agent_id)),
+            check(sentinel not in json.dumps(get_agent(socket_path, registration_id)),
                   "private launch sentinel leaked after restart")
             retired = call(socket_path, "agent.retire", {
-                "agent_id": agent_id, "channel": "assignment", "writer_handle": binding["handle"],
+                "registration_id": registration_id, "channel": "assignment", "writer_handle": binding["handle"],
             })["channel"]
             check(retired["writer"]["retired_at"] is not None, str(retired))
             print("PASS: live registry and event fixtures; trusted disposable daemon; register/acquire/publish/context/get/list/retire/events.read; "

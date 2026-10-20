@@ -1,6 +1,6 @@
 {
   "name": "pi-radar",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "Radar daemon client, communication, publication, execution, location, launch and inspection surface for Pi extensions.",
   "license": "Apache-2.0",
@@ -14,7 +14,9 @@
   },
   "types": "./index.ts",
   "pi": {
-    "extensions": ["./extension/baseline.ts"]
+    "extensions": [
+      "./extension/baseline.ts"
+    ]
   },
   "exports": {
     ".": {

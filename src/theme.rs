@@ -218,6 +218,11 @@ pub fn stale_mark() -> &'static str {
     stale_mark_for(nerd_font())
 }
 
+/// A conflicting Pi session registration, distinct from process staleness.
+pub fn duplicate_mark() -> &'static str {
+    if nerd_font() { "⊘" } else { "=" }
+}
+
 /// The stale mark for a terminal with or without the Nerd Font, so the choice
 /// is testable without controlling the process-wide font detection.
 fn stale_mark_for(nerd_font: bool) -> &'static str {

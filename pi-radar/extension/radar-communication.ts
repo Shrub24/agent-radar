@@ -31,7 +31,7 @@ export function createRadarHandoffPort(
 		const subject = await publication.subject();
 		return subject === undefined
 			? { ok: false, code: "absent", message: "this process has no current Radar registration" }
-			: { ok: true, value: subject.agent_id };
+			: { ok: true, value: subject.registration_id };
 	}
 
 	return {
@@ -43,24 +43,24 @@ export function createRadarHandoffPort(
 				return { ok: false, code: "absent", message: "this managed execution has no Radar parent subject" };
 			return client.communicationPublish({
 				...request,
-				sender_agent_id: identity.value,
+				sender_registration_id: identity.value,
 				recipient_subject_id: parent,
 			});
 		},
 		async inbox() {
 			const identity = await agentId();
 			if (identity.ok === false) return identity;
-			return client.communicationInbox({ agent_id: identity.value });
+			return client.communicationInbox({ registration_id: identity.value });
 		},
 		async get(handoff_id) {
 			const identity = await agentId();
 			if (identity.ok === false) return identity;
-			return client.communicationGet({ agent_id: identity.value, handoff_id });
+			return client.communicationGet({ registration_id: identity.value, handoff_id });
 		},
 		async ack(handoff_id) {
 			const identity = await agentId();
 			if (identity.ok === false) return identity;
-			return client.communicationAck({ agent_id: identity.value, handoff_id });
+			return client.communicationAck({ registration_id: identity.value, handoff_id });
 		},
 	};
 }

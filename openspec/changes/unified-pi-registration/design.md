@@ -1,84 +1,55 @@
 ## Context
 
-The agreed product scope is in `scope.md`. Existing seams include `agent.register`, the sequenced `agent.context` publisher, `execute_enroll`/`record_enrollment`, `enroll_subject`, launch `fence_registration`, daemon post-launch binding and reconciliation, and pi-radar's `publication.subject()` shared runtime.
-
-Today these seams distinguish launch and adoption too strongly, carry Pi-session markers, and retain execution-centric assumptions in restart and parent projection. Handoff recipients already use subject IDs; changing attachment semantics must preserve that durable communication identity rather than copy messages into a new inbox.
+Pi subjects follow canonical session UUIDs, while process registrations identify verified OS process incarnations. The partial implementation still sequences `agent.register`, `agent.context` and sweep adoption, freezes pane location in registration, and automatically promotes previously rejected duplicates. Replace that choreography rather than add another enrollment controller.
 
 ## Goals / Non-Goals
 
-**Goals:** one verified binding implementation; first-class manual adoption; session-bound child/inbox/history continuity; removal of active breadcrumb machinery.
-
-**Non-goals:** duplicate-history merging or takeover, fork investigation, general recovery controllers, assignment recovery, new resume commands, pane movement, richer cross-tab nesting, and a database or execution-ID migration.
+Deliver one presence report, durable claim decisions, explicit graceful release, automatic reconnect recovery, mutable location, and session-owned subject continuity. No transcript breadcrumbs, signing, workflow framework, storage replacement, pane movement, general incoming command transport or compatibility aliases. This is an alpha contract change; daemon, pi-radar and consumers update together.
 
 ## Decisions
 
-### 1. Resolve subjects by session, attach processes separately
+### 1. One public report, three internal responsibilities
 
-Retain daemon-issued subject IDs and associate them durably with canonical session UUIDs. A process registration retains its incarnation/birth identity and reports its current session. Its active managed association resolves through that session, not through an old session entry or pane.
+pi-radar sends a flat presence report: source/incarnation and process birth identity, session UUID, session-load claim ID, current location, optional launch correlation/managed metadata, and acknowledged registration/subject IDs when known. Radar resolves immutable process registration, mutable process context and session claim internally. Rename process-record `agent_id` to `registration_id` throughout the public contract and its consumers. The immutable identity is the process birth tuple (boot ID, PID, start ticks); changing location does not create another registration.
 
-On session switch, detach the previous subject and resolve/bind the selected one. Preserve the old subject's child relationships, inbox and history. Controls and publication must be fenced to the active subject attachment as well as process birth identity: unchanged PID does not mean unchanged agent authority.
+Return registration ID, claim ID and standing (`granted`, `duplicate`, `pending`), with subject ID only when granted. IDs returned earlier are correlation, not proof sufficient to overwrite durable grants. Validate supplied launch correlation; invalid correlation never falls back to adoption. Reuse the same binding implementation for manual sessions, launches and recovery.
 
-Reuse existing execution records, generations and writer fencing where consumed. Record actual binding changes, not every heartbeat. No Pi-persisted subject/execution markers or new independent identity store.
+### 2. Claims distinguish fresh session loads from retries
 
-### 2. Converge at the current report and binding seams
+Create one claim ID at each Pi `session_start` (startup, reload, new, resume or fork). All renewals, transport retries and daemon reconnects for that loaded session reuse it. Persist its decision in Radar. A duplicate decision is sticky even after incumbent release or daemon restart; only a new session-load claim can be considered again. Transient observation/transport failures are pending, not duplicate decisions and not consumed opportunities.
 
-pi-radar requests management by default through its existing registration/context driver. Add only consumed typed report/result fields and additive capability negotiation. Generic baseline publishers remain baseline-only unless requesting management. Old daemons continue baseline service without simulated management success.
+pi-radar uses one report function and existing retry scheduling, retaining acknowledged protocol state privately, never in the transcript. A reconnect must not generate a new claim or resurrect a released one. The same claim ID cannot name different process/session identity. Periodic reassertion is contact, not fresh-load evidence.
 
-A shared daemon routine resolves an existing durable binding or validates supplied launch correlation before considering new adoption. It verifies process birth identity, pane occupant and fresh canonical session context, captures private execution context when binding, and commits under existing transition serialization. External reads occur outside the transition lock; revalidate the relevant association before commit.
+### 3. Explicit release, persistent subjects
 
-Existing launch binding, explicit enrollment and reconciliation call this same implementation. Invalid correlation refuses rather than selecting the adoption branch. A new untracked session becomes an enrolled lead with null parent; a tracked session retains its recorded parent. Correlation is consumed for the admitted launch, not reapplied on every later session selection.
+`session_shutdown` sends a bounded awaited release naming registration ID and exact claim ID (subject ID may be checked for consistency). Release is idempotent and only affects that grant. A delayed release cannot revoke a newer claim. Release removes session authority, not process registration or the durable subject, children, inbox or history. Retain unresolved release for retry where the process survives.
 
-Repeated reports, lost replies and daemon restart resolve existing records before creating another subject or attachment. Accepted baseline context and unresolved management remain distinguishable. Reuse existing retry/heartbeat scheduling; do not add an enrollment pump. Context replay must not renew its lease merely to retry a pending binding.
+A new claim from the same verified registration may supersede its previous attachment, so loss of a shutdown response cannot strand a session switch. A released claim cannot be reacquired by reasserting it. A live process with no grant is unattached, not presumed exited.
 
-### 3. Treat duplicates as unsupported, not as standby executions
+### 4. Recovery ordering and crash backstop
 
-The accepted attachment remains the incumbent. A second process reporting that session is baseline-visible, warns as duplicate and gets no managed identity or inbox access. Persist enough conflict state that daemon restart, heartbeat or extension reload cannot accidentally promote the stale duplicate after the incumbent disappears.
+Recover durable grants before admitting competing claims. Verify holder birth identity directly: absent or reused PID releases the attachment as verified exit; unreadable identity, expired heartbeat and missing pane do not. The sweep detects process exit, not new claim opportunities. When durable authority is missing or ambiguous, report pending rather than reconstructing history from receipts or session contents.
 
-Reconsider at the `session_start` boundary (any `/reload`, `/resume`, or new process re-attempts registration), and only when the incumbent is released or verified no longer attached. Failed scans and expired leases do not prove release. No Pi host signal distinguishing fresh load from reload is required. No history comparison, merge or forced takeover mechanism.
+Persist claim decisions before acknowledgment. Use existing private atomic-file and transition facilities, with recoverable ordering: the claim record tracks pending work and the resolved subject, so retries can finish an interrupted binding without allocating another subject. Record binding changes, not every contact renewal, in lifecycle history. One RPC does not imply cross-file atomicity. No SQLite, genesis replay or cryptographic receipts.
 
-The behavioral contract is settled. Verifying the host signal selects between these defined implementation paths; it is not permission to invent a weaker admission rule.
+### 5. Mutable placement and effect fences
 
-### 4. Resolve parents and inbox rights through current session subjects
+Location belongs to process context; validate it before physical controls. Session selection changes the active subject while process registration remains stable. Fence control dispatch and handoff identity to the current granted claim and execution, not merely PID. Preserve logical parent/child relationships and inboxes through reattachment; execution-specific provenance remains immutable. Keep rows in physical tabs, with a minimal parent reference when needed; never move panes automatically.
 
-Logical parentage remains durable Radar state; execution-specific spawn edges remain immutable history. Restore basic parent display/selection from logical subject relationships rather than requiring the original parent registration to survive. Keep physical rows in their own tabs; an out-of-tab parent reference is sufficient.
+### 6. Presentation and consumer boundary
 
-Communication reads/acknowledgments resolve the caller's current accepted subject. Reattachment to the same session preserves inbox access; switching to another session revokes the prior association. Old sender/recipient fields and acknowledgments are not rewritten. Duplicates have no subject authority.
+Baseline-visible duplicate registrations have no subject authority and show a compact inline warning distinct from stale process/binary warnings. pi-radar's shared runtime exposes current standing and invalidates cached subject/communication identity at session boundaries. Herdsman consumes this SDK and owns assignment/settlement policy, not registration or socket transport.
 
-Herdsman must invalidate cached subject/parent/communication handles on session change. The SDK supplies current identity; it does not restore assignments, declare handoffs valid or authorize worker closure.
+No session launch markers or injected execution identity remain. Observed private restart recipes retain executable/argv/cwd/env and strip initial prompts and one-use credentials; restart resumes the selected session in its existing placement. Generated schemas describe consumed public DTOs.
 
-### 5. Restart the subject's session using observed execution context
+### 7. Existing state and rollout
 
-Capture the verified executable/argv/cwd/environment once when establishing the execution binding for either origin. Keep original launch intent as operation history, not as a separate privilege requirement. Freeze fresh current subject/session/attachment before destructive restart and revalidate at the effect boundary.
+Preserve unambiguous existing subject/session associations, inboxes, parentage and history. Conflicting legacy mappings remain pending; do not merge. Process-record renaming may require a bounded storage adapter separate from the breaking public rename; document actual rollback limits. Do not preserve obsolete alpha wire aliases. Publish daemon/SDK together, hand off the changed contract to Herdsman, and leave live operator smokes explicitly pending.
 
-Reuse `resume_launch` argument reconstruction. Remove stale session selectors and one-use credentials; refuse ambiguous initial prompts before termination. Restart stays anchored to the old lead pane/tab where available. It does not refresh direnv, credentials or the original shell launcher. A manually resumed lead elsewhere retains identity and relationships with no automatic movement.
+## Validation
 
-### 6. Delete the competing marker path
+Use a few composed flows: acquire/switch/release/resume with stable process registration and subject continuity; duplicate/incumbent exit/restart/still rejected/fresh load accepted; lost replies and daemon restart with exact replay and delayed release unable to revoke a new grant. Exercise mutable pane context and one inline duplicate rendering assertion. Use existing gates; no speculative transport matrix.
 
-Stop appending/reading session launch markers and deriving routine matching/stale/contradictory marker projections. Remove marker-only environment plumbing, host API requirements, tests and documentation. Ignore historical custom entries. Retain released optional fields/schema exports where needed for compatibility, but no active branch exists solely to populate them.
+## Deferred
 
-Retain initial private launch correlation, process birth verification, writer leases and daemon-side effect fencing. These protect real boundaries; removing breadcrumbs does not remove them.
-
-### 7. Adapt existing records without merging authority
-
-Reuse an unambiguous existing session-to-subject association; preserve history, subject IDs, inboxes and parentage. Subjects missing session evidence remain unresolved until verified context supplies it. Multiple existing subjects naming the same session are an explicit legacy conflict, not an automatic merge or a reason to delete history. Duplicate records are not the supported concurrent-session case.
-
-Use existing records and storage facilities for the mapping/attachment changes. No genesis replay, new database or broad backfill/discovery service. Record the rollback limit: an old daemon cannot be assumed to understand new attachment semantics or persisted fields. Verify format readability and document supported rollback before deployment rather than promise automatic downgrade safety.
-
-## Risks / Trade-offs
-
-- Session changes can invalidate pending controls with the same PID: current attachment is a required fence.
-- Mutable application caches can publish for the wrong session: update/invalidate at the real pi-radar and Herdsman boundaries, not only the daemon DTO.
-- Duplicate repair relies on the `session_start` boundary and incumbent release, not on detecting fresh session loads. Heartbeat expiry is a stale warning only, not a release signal; surfacing it is deferred.
-- Existing ambiguous subjects cannot safely be merged: surface them without introducing repair tooling until real data warrants it.
-- Observed context can contain secrets or expired values: keep recipes private and document the reproduction promise.
-- Cross-tab children remain an edge case: basic links survive, topology stays untouched, gathering remains in `ideas.md`.
-
-## Migration Plan
-
-Deliver in small vertical slices with their own behavior checks and docs: manual adoption through the real reporter; session switching/reattachment and effect fencing; duplicate admission; relationship/inbox continuity and minimal projection; observed restart and marker deletion. Extend existing tests rather than build a separate conformance framework.
-
-Ship daemon capability support before publishing the SDK that requests it. Coordinate Herdsman's current-subject/cache handling, update consumers, and run focused real Pi acceptance. Do not call that cutover complete on Rust tests alone. Rollback is subject to the actual persisted-format checks above.
-
-## Open Questions
-
-No unresolved product choices block the task list. The Pi fresh-load event and legacy stored mappings require bounded implementation checks with defined conservative outcomes; fork internals, legacy repair tooling and pane migration remain deferred.
+Scoped incoming event feeds and targeted requests, signed receipts, history merging, assignment recovery, pane gathering/migration and richer cross-tab trees. The existing bounded event journal remains notification transport, not a per-process reliable command queue.
