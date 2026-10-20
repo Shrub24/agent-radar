@@ -160,11 +160,23 @@ The daemon SHALL append one event with a monotonic sequence immediately after ea
 - **THEN** its event contains no environment value or token
 
 ### Requirement: Events are read by resumable long poll
-The daemon SHALL provide `events.read` taking a sequence `after`, optional last-seen `epoch`, bounded `limit` (1..=500, default 100) and bounded `wait_ms` (0..=1000, default 0). It returns ordered events after the cursor, or an empty list when the wait ends. The result carries current epoch, events, object cursor `{epoch, sequence}` and earliest retained sequence. It SHALL preserve JSON-lines framing and worker bounds, and advertise `events_v1`.
+The daemon SHALL provide `events.read` returning ordered events after `after`, or an empty list when a bounded wait ends. Following the returned `cursor` SHALL never skip an undelivered event. It SHALL keep JSON-lines framing and worker bounds and advertise `events.v1`.
+
+#### Scenario: Read result shape
+- **WHEN** a read answers
+- **THEN** the result carries the epoch, the events, a `cursor` `{epoch, sequence}` for the position after the last delivered event (the request's `after` when none were delivered), the journal `tail`, `more` for whether events exist beyond `cursor`, and the earliest retained sequence
+
+#### Scenario: Bounded read parameters
+- **WHEN** a client reads events
+- **THEN** it supplies `after`, an optional last-seen `epoch`, a bounded `limit` (1..=500, default 100) and a bounded `wait_ms` (0..=1000, default 0)
 
 #### Scenario: Waiting reader
 - **WHEN** a reader waits and a fact commits within the wait
 - **THEN** the reader receives that event before the wait ends
+
+#### Scenario: Bounded prefix
+- **WHEN** more events exist than `limit` or the response byte bound allows
+- **THEN** the result delivers a prefix, `cursor` names the last delivered event, `tail` names the journal head and `more` is true
 
 #### Scenario: Shutdown during wait
 - **WHEN** the daemon stops while a reader waits
@@ -193,10 +205,10 @@ Events SHALL NOT report process exit, readiness or assignment outcome that the d
 - **THEN** no exit event is appended
 
 ### Requirement: Launch context support is negotiated
-The daemon SHALL advertise child_launch_context_v1 only when its spawn handler and selected backend support the cwd/environment contract. Consumers SHALL require compatible protocol, creation, launch and this feature before using extended spawn fields. A backend without support SHALL refuse supplied launch context before effects; no fallback is allowed after uncertain dispatch.
+The daemon SHALL advertise the `spawn.launch_context.v1` contract only when its spawn handler and selected backend support the cwd/environment contract. Consumers SHALL require a compatible protocol and that contract before using extended spawn fields. A backend without support SHALL refuse supplied launch context before effects; no fallback is allowed after uncertain dispatch.
 
 #### Scenario: Older daemon
-- **WHEN** a consumer observes a compatible daemon without child_launch_context_v1
+- **WHEN** a consumer observes a compatible daemon without `spawn.launch_context.v1`
 - **THEN** it does not attempt the extended launch request and treats launch migration as unsupported
 
 #### Scenario: Backend lacks launch context
@@ -268,3 +280,47 @@ An exit observation SHALL NOT change execution or assignment publications and SH
 #### Scenario: Dead pane does not bypass close verification
 - **WHEN** `child.close` is requested for a dead pane with an exit observation but no current foreground-process identity
 - **THEN** the daemon refuses before durable close admission or dispatch, and leaves execution and assignment publications unchanged
+
+### Requirement: The wire contract is one namespaced version-2 scheme
+The daemon SHALL serve protocol version 2 through one namespaced method scheme. A request naming protocol version 1 or a removed method name SHALL be refused with a typed error naming the supported version, and no alias SHALL be served.
+
+#### Scenario: Version 2 method names
+- **WHEN** a client addresses protocol version 2
+- **THEN** it uses `daemon.ping`; `mux.observe`, `mux.process_info`, `mux.output`, `mux.focus`, `mux.close`, `mux.create`, `mux.input` and `mux.report`; `mux.request.get` and `mux.request.list`; the `agent.*` methods; `spawn.create`, `spawn.get`, `spawn.list` and `spawn.close`; and `events.read`
+
+#### Scenario: Old method name
+- **WHEN** a client calls `child.close` or the flat `observe`
+- **THEN** the daemon answers `unknown_method` and performs no effect
+
+#### Scenario: Old protocol version
+- **WHEN** a client sends version 1
+- **THEN** the daemon refuses with the version it serves
+
+### Requirement: Capabilities share one naming scheme
+The handshake SHALL list capabilities as `<namespace>.<name>`, with a `.v<N>` suffix on every versioned contract. Backend capabilities SHALL be `mux.*` and SHALL be the backend's own declaration. Daemon contracts SHALL be `registry.v1`, `events.v1`, `spawn.v1`, `spawn.close.v1`, `spawn.launch_context.v1` and `spawn.exit_observation.v1`, each advertised only when every capability it needs is present. A capability SHALL NOT be advertised that the daemon would refuse to serve.
+
+#### Scenario: Close needs the backend's close
+- **WHEN** the wired backend does not declare `mux.close`
+- **THEN** `spawn.close.v1` is not advertised and `spawn.close` is refused with no record
+
+### Requirement: The handshake names the real backend
+`daemon.ping` SHALL report the protocol version, the wired backend identity (`herdr`, `tmux` or `none`) and, for tmux, the server instance. It SHALL NOT report a generic placeholder.
+
+#### Scenario: tmux daemon
+- **WHEN** the daemon runs against tmux server `radar`
+- **THEN** the handshake reports backend `tmux` and instance `radar`
+
+### Requirement: The handshake advertises a revision and contracts
+The daemon's handshake SHALL report a protocol revision, an integer increased whenever a method or field is added, and the daemon contracts it serves, each only when every backend need of its methods is met. It SHALL NOT advertise backend primitives. Clients bundled with the daemon SHALL require a minimum revision and SHALL NOT probe individual contracts. External consumers SHALL check contract names, and names a client does not know SHALL be ignored.
+
+#### Scenario: Newer client, older daemon
+- **WHEN** a bundled client requires a revision above the running daemon's
+- **THEN** it shows a blocking diagnostic naming the revision gap and the daemon restart command, and sends no request that the daemon may mishandle
+
+#### Scenario: Contract not served
+- **WHEN** the backend lacks a need of a contract's methods
+- **THEN** the handshake omits that contract and a request for its methods refuses before any effect
+
+#### Scenario: Unknown contract name
+- **WHEN** a daemon advertises a contract a client was not built with
+- **THEN** the client ignores it and its own contract checks are unaffected

@@ -20,7 +20,7 @@
 - [x] 3.1 Add the observation read to the dashboard client and replace the TUI collector with a snapshot fetcher; build the tree from the snapshot. Remove local `/proc` sampling, reconciliation and inventory reads from the TUI.
 - [x] 3.2 Keep one task path: the dashboard reads task sessions from the snapshot's task source instead of a second `tasks.list` read.
 - [x] 3.3 Refuse with the existing blocking diagnostic when the daemon lacks `observation.get.v1`; there is no local fallback. A failed or expired read leaves the previous view standing with the reason on the footer.
-- [ ] 3.4 Two-display live acceptance: two clients reading one revision, and a display restart receiving the retained associations the daemon kept.
+- [x] 3.4 Two-display live acceptance: two clients reading one revision, and a display restart receiving the retained associations the daemon kept.
 
 ## 4. Tracing
 

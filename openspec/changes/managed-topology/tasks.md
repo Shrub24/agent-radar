@@ -19,7 +19,7 @@
       Status: nothing to store yet. The label is bounded and control-character-free at the wire boundary; a working directory, command or environment value is not accepted at all, and no creation value reaches an event payload.
 - [x] 2.3 Create agent containers through the existing spawn contract, so the child still binds to its exact `agent_id` and the container records the pane slot it was launched into.
       Status: implemented. `spawn.create` records the pane it dispatched into, bound to the verified serving incarnation, before the edge and the launch are recorded; the child binding is unchanged.
-- [ ] 2.4 Refuse or leave unresolved rather than record a container whose creation could not be confirmed, and never retry an uncertain creation under a new request ID.
+- [x] 2.4 Refuse or leave unresolved rather than record a container whose creation could not be confirmed, and never retry an uncertain creation under a new request ID.
 
 ## 3. Deletion
 

@@ -6,7 +6,7 @@
 
 - [x] 2.1 `src/project.rs`: candidates, filter, naming and the picker; `[tui] project_source` and `project_filter`. Tests for ordering and filtering, naming, and a missing or failing source.
 - [x] 2.2 `A` gives the terminal back, runs the picker, and creates the workspace in the choice.
-- [ ] 2.3 Live check of the picker in a real terminal: appearance, cancel and the mouse after return.
+- [x] 2.3 Live check of the picker in a real terminal: appearance, cancel and the mouse after return.
 
 ## 3. Verification
 

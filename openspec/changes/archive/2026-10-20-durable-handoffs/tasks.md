@@ -1,15 +1,15 @@
 ## 1. Daemon contract and persistence
 
-- [ ] 1.1 Add the negotiated `communication.handoff.v1` contract and typed publish/inbox/get/ack methods.
-- [ ] 1.2 Persist immutable bounded handoff records and separate receipts atomically; enforce idempotency, recipient identity, retention, and hard capacity bounds.
-- [ ] 1.3 Append payload-free publication/receipt pointer events and recover pending work by inbox scan.
-- [ ] 1.4 Add focused durability, replay, successor identity, acknowledgement, retention, and capacity tests.
+- [x] 1.1 Add the negotiated `communication.handoff.v1` contract and typed publish/inbox/get/ack methods.
+- [x] 1.2 Persist immutable bounded handoff records and separate receipts atomically; enforce idempotency, recipient identity, retention, and hard capacity bounds.
+- [x] 1.3 Append payload-free publication/receipt pointer events and recover pending work by inbox scan.
+- [x] 1.4 Add focused durability, replay, successor identity, acknowledgement, retention, and capacity tests.
 
 ## 2. pi-radar SDK and generated contracts
 
-- [ ] 2.1 Add explicit Schemars DTOs for publication params, handoff and receipt; regenerate directional schemas and TypeScript types.
-- [ ] 2.2 Add a process-bound pi-radar communication helper for publish, inbox, get, and ack; do not expose caller-selected sender identity in its API.
-- [ ] 2.3 Test generated artifact drift, SDK reply validation, and identity binding.
+- [x] 2.1 Add explicit Schemars DTOs for publication params, handoff and receipt; regenerate directional schemas and TypeScript types.
+- [x] 2.2 Add a process-bound pi-radar communication helper for publish, inbox, get, and ack; do not expose caller-selected sender identity in its API.
+- [x] 2.3 Test generated artifact drift, SDK reply validation, and identity binding.
 
 ## 3. Herdsman end-to-end integration
 
@@ -20,7 +20,7 @@
 
 ## 4. Documentation and gates
 
-- [ ] 4.1 Document the public protocol, authority boundary, bounds, retention and recovery semantics.
+- [x] 4.1 Document the public protocol, authority boundary, bounds, retention and recovery semantics.
 - [x] 4.2 Run focused tests, package tests, generated-artifact checks, Rust formatting/Clippy/full tests, strict OpenSpec validation, and Nix build.
 - [x] 4.3 Keep interactive live Pi/Herdsman/tmux acceptance explicitly deferred if the user has not requested it.
 

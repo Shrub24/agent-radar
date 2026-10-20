@@ -20,6 +20,16 @@ Radar SHALL provide a standalone full-screen tree grouped by the daemon's logica
 - **THEN** the row shows the title with that prefix removed, because the row already carries the provider's mark
 - **AND** a title that would be emptied by the removal is shown unchanged
 
+#### Scenario: Window with one root agent
+
+- **WHEN** a tab holds a root agent and other agents or panes
+- **THEN** the root agent's row is the tab and the others appear beneath it, with the tab name shown as its tab label
+
+#### Scenario: Window with several root agents
+
+- **WHEN** a tab holds more than one agent with no owner in that tab
+- **THEN** the tab has no single identity, and its agents and panes remain flat beneath its container
+
 #### Scenario: A container's binding is unresolved
 
 - **WHEN** a container's backend binding cannot be verified, or its handle now exists under a different serving instance

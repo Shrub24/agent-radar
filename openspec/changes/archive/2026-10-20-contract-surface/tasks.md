@@ -14,7 +14,7 @@
 ## 3. Documentation and gate
 
 - [x] 3.1 Update `docs/control-plane.md` and `docs/daemon.md` for the revision and contract list, and record in `ideas.md` that the primitive layer is deleted with the Herdr backend.
-- [ ] 3.2 Run fmt, strict Clippy, the locked tests, tmux acceptance, strict spec validation and the checked Nix build; record real exit codes.
+- [x] 3.2 Run fmt, strict Clippy, the locked tests, tmux acceptance, strict spec validation and the checked Nix build; record real exit codes.
 
 ## Gate record
 

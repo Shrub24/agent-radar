@@ -8,10 +8,10 @@ Show an agent's background tasks in the detail the owning extension publishes, j
 
 ### Requirement: Joining tasks to an agent
 
-Radar SHALL attach a session's bus tasks to the agent row whose `pi_herdsman_session` equals the `hello` session UUID. Where a row publishes no `pi_herdsman_session`, Radar SHALL attach them to the row whose Herdr pane id equals the `hello` pane. Radar SHALL attach them to no other row.
+Radar SHALL attach a session's tasks to the agent row whose registry-published current session UUID equals the `hello` session UUID. Radar SHALL NOT use a pane identifier, pane token, session name, tab or working directory to attach tasks, and SHALL attach them to no other row.
 
 #### Scenario: A matching agent
-- **WHEN** a connected session's UUID equals an agent's `pi_herdsman_session`
+- **WHEN** a connected session's UUID equals an agent's registry-published current session
 - **THEN** that agent's details show the session's tasks
 
 #### Scenario: No matching agent
@@ -19,12 +19,16 @@ Radar SHALL attach a session's bus tasks to the agent row whose `pi_herdsman_ses
 - **THEN** its tasks are held and shown on no row
 
 #### Scenario: The pane as a fallback
-- **WHEN** an agent publishes no `pi_herdsman_session` and a connected session's `hello` names that agent's pane
-- **THEN** the session's tasks are attached to that agent
+- **WHEN** an agent publishes no session and a connected session's `hello` names that agent's pane
+- **THEN** no tasks are attached to that agent
 
 #### Scenario: Something other than the UUID or the fallback pane
-- **WHEN** an agent publishes a different `pi_herdsman_session` than a connected session, or shares only a session name, tab or working directory with it
+- **WHEN** an agent publishes a different session than a connected session, or shares only a name, tab, pane or working directory with it
 - **THEN** no tasks are attached to it
+
+#### Scenario: Session changes
+- **WHEN** an agent publishes a new current session
+- **THEN** tasks of its previous session no longer attach to it
 
 ### Requirement: Task detail in the selected row's details
 

@@ -104,7 +104,7 @@ Radar SHALL expose, per pane, what the runtime reports about the command in the 
 
 ### Requirement: Failed collection preserves stale observations
 
-Radar SHALL preserve the last successful inventory during collection failure, visibly mark it stale and report the failure. Failure SHALL NOT prove that panes or agents disappeared. Collection SHALL NOT block keyboard input or quitting, and successful recovery SHALL restore current observations.
+The daemon SHALL preserve the last successful inventory during collection failure, visibly mark it stale and report the failure. Failure SHALL NOT prove that panes or agents disappeared. A display's reading of a snapshot SHALL NOT block keyboard input or quitting, and successful recovery SHALL restore current observations.
 
 #### Scenario: Herdr unavailable after a successful refresh
 - **WHEN** the next collection fails or times out
@@ -112,11 +112,11 @@ Radar SHALL preserve the last successful inventory during collection failure, vi
 
 #### Scenario: Failure before the first inventory
 - **WHEN** the initial collection fails
-- **THEN** Radar shows an unavailable-source diagnostic rather than a successful empty fleet
+- **THEN** the snapshot reports an unavailable-source diagnostic rather than a successful empty fleet
 
 #### Scenario: Recovery
 - **WHEN** a collection succeeds after a failure
-- **THEN** Radar replaces the stale inventory with the successful observation and clears the source-failure indicator
+- **THEN** the next snapshot replaces the stale inventory with the successful observation and clears the source-failure indicator
 
 ### Requirement: Idle-shell continuity
 
@@ -136,7 +136,7 @@ Radar SHALL retain the last observed agent association in memory when its pane r
 
 ### Requirement: Positive supersession clears continuity
 
-Radar SHALL discard a retained agent association when successful inventory proves its pane absent, a different reported agent session replaces it, or positive foreground evidence shows a non-shell replacement command without a current agent observation. Radar SHALL NOT persist retained associations across its own restarts.
+The daemon SHALL discard a retained agent association when successful inventory proves its pane absent, a different reported agent session replaces it, or positive foreground evidence shows a non-shell replacement command without a current agent observation. The daemon SHALL NOT persist retained associations across its own restarts, and a display restart SHALL NOT clear them.
 
 #### Scenario: Pane closes
 - **WHEN** a successful inventory no longer contains the retained pane
@@ -151,8 +151,12 @@ Radar SHALL discard a retained agent association when successful inventory prove
 - **THEN** the old association is replaced by the newly observed session without carrying forward its old ownership or assignment
 
 #### Scenario: Radar restarts
-- **WHEN** Radar starts a new process
+- **WHEN** the daemon starts a new process
 - **THEN** no retained associations from its previous process are restored
+
+#### Scenario: Display restarts
+- **WHEN** a display starts while the daemon keeps running
+- **THEN** it receives the retained associations the daemon holds
 
 ### Requirement: Agent state comes from the registry
 When observing through the daemon, Radar SHALL source every displayed agent fact from the registry. Herdr agent records, display metadata and native agent status SHALL NOT supply display state or fill missing facts. Backend metadata MAY be retained solely for destructive-control protection, outside display continuity. Missing registry facts SHALL remain unavailable without source fallback.

@@ -17,6 +17,14 @@ Radar SHALL provide a standalone full-screen tree grouped by workspace. It SHALL
 - **THEN** the row shows the title with that prefix removed, because the row already carries the provider's mark
 - **AND** a title that would be emptied by the removal is shown unchanged
 
+#### Scenario: Window with one root agent
+- **WHEN** a tab holds a root agent and other agents or panes
+- **THEN** the root agent's row is the tab and the others appear beneath it, with the tab name shown as its tab label
+
+#### Scenario: Window with several root agents
+- **WHEN** a tab holds more than one agent with no owner in that tab
+- **THEN** the tab has no single identity, and its agents and panes remain flat beneath its workspace
+
 #### Scenario: A session of another server
 - **WHEN** a session registered a pane of a different tmux server
 - **THEN** it is not shown
