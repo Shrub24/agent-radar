@@ -6818,16 +6818,18 @@ const MAX_LEAD_BINDINGS: usize = 16;
 /// How many registrations one page of the enrollment pass reads.
 const REGISTRY_SCAN: usize = 128;
 
-/// Enrolls a lead Radar launched from a container recipe once its registration
-/// joins that pane.
-///
-/// The display does not own this. A launch is Radar's durable intent, so the
-/// subject is recorded whether or not a dashboard is connected, and closing one
-/// cannot lose the work. The pane must be one Radar created with a recipe — the
-/// `L` shortcut, not an empty shell — and the registration's claimed process must
-/// be that pane's verified live occupant, so a registration cannot be attached to
-/// a pane it does not own. Each place is attempted once per daemon run: a refusal
-/// is recorded as a refusal, not retried in a loop.
+/// The publisher label of the Pi session baseline. Its registrations are the Pi
+/// sessions Radar adopts; a managed child carries a spawn token and is bound by
+/// its launch instead.
+// HACK: the baseline's label predates adoption and is shared with Herdsman's Pi
+// integration; renaming it is a wire migration owned by the pi-radar release.
+const PI_PUBLISHER_SOURCE: &str = "herdsman-pi";
+
+/// Adopts eligible Pi registrations as managed leads: the registration is verified
+/// in the pane it reports and reports a fresh session. The display does not own
+/// this, so adoption does not depend on a dashboard being connected. Each
+/// registration is attempted once per daemon run, so a refusal is recorded rather
+/// than retried in a loop; a restart reconsiders it.
 fn bind_launched_leads(
     core: &Arc<Mutex<Core>>,
     registry: &Arc<Registry>,
@@ -6849,35 +6851,6 @@ fn bind_launched_leads(
     let Some(backend) = backend else {
         return Ok(0);
     };
-    // Places Radar created with a recipe, still reported by the backend, that no
-    // pass has attempted yet. In the steady state this is empty, so the registry
-    // is not scanned at all.
-    let pending: Vec<String> = {
-        let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-        let mut panes: Vec<String> = log
-            .container_ids()
-            .filter_map(|id| log.container(id))
-            .filter(|container| {
-                container.provenance == containers::Provenance::Created
-                    && container.recipe
-                    && container.removed_at.is_none()
-            })
-            .filter_map(|container| {
-                container
-                    .binding
-                    .as_ref()
-                    .map(|binding| binding.handle.clone())
-            })
-            .filter(|handle| !attempted.contains(handle))
-            .filter(|handle| inventory.pane(handle).is_some())
-            .collect();
-        panes.sort();
-        panes.dedup();
-        panes
-    };
-    if pending.is_empty() {
-        return Ok(0);
-    }
     let candidates: Vec<(String, String, crate::model::ProcessIdentity)> = {
         let mut after: Option<String> = None;
         let mut found = Vec::new();
@@ -6892,13 +6865,17 @@ fn bind_launched_leads(
                 else {
                     continue;
                 };
-                if !pending.contains(&pane) {
-                    continue;
-                }
                 let Some(claim) = registration.request.process.clone() else {
                     continue;
                 };
-                found.push((pane, registration.agent_id.clone(), claim));
+                if registration.request.source != PI_PUBLISHER_SOURCE
+                    || registration.request.spawn_token.is_some()
+                    || inventory.pane(&pane).is_none()
+                    || attempted.contains(&registration.agent_id)
+                {
+                    continue;
+                }
+                found.push((registration.agent_id.clone(), pane, claim));
             }
             match page.last() {
                 Some(last) if page.len() == REGISTRY_SCAN => after = Some(last.agent_id.clone()),
@@ -6908,14 +6885,10 @@ fn bind_launched_leads(
         found
     };
     let mut bound = 0;
-    for (pane, agent_id, claim) in candidates.into_iter().take(MAX_LEAD_BINDINGS) {
-        if !attempted.insert(pane.clone()) {
-            continue;
-        }
-        // A subject that already names this agent needs nothing: enrollment is a
-        // one-time association, not a repeated observation.
-        if subjects::bound_subject(registry, &agent_id)?.is_some() {
-            continue;
+    let mut attempts = 0;
+    for (agent_id, pane, claim) in candidates {
+        if attempts == MAX_LEAD_BINDINGS {
+            break;
         }
         let now = store::now_ms();
         let Some(context) = registry.context(&agent_id, now)? else {
@@ -6927,6 +6900,8 @@ fn bind_launched_leads(
         let Some(session) = context.context.session.clone() else {
             continue;
         };
+        attempts += 1;
+        attempted.insert(agent_id.clone());
         // The registration's own claimed process must be this pane's verified
         // occupant, so a registration cannot claim a pane that is not its own.
         if verify_live_occupant(&backend, &verifier, &pane, &claim, &stopping, verification)
@@ -6942,9 +6917,9 @@ fn bind_launched_leads(
         match record_enrollment(registry, &verifier, &params, &claim, &enrollment_id, now) {
             Ok(_) => {
                 bound += 1;
-                tracing::info!(%agent_id, %pane, "enrolled a lead Radar launched");
+                tracing::info!(%agent_id, %pane, "enrolled a managed Pi lead");
             }
-            Err(error) => tracing::warn!(%error, %agent_id, %pane, "launch enrollment refused"),
+            Err(error) => tracing::warn!(%error, %agent_id, %pane, "lead enrollment refused"),
         }
     }
     Ok(bound)

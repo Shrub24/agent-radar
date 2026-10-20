@@ -97,11 +97,13 @@ created pane is not a bound child until that child registers with the private
 spawn token, and private launch/resume specifications stored on registrations
 remain inert unless explicitly used by a supported operation.
 
-A lead Radar launched from the dashboard's `L` shortcut is enrolled by the daemon,
-not by the dashboard: the pane must be one Radar created with a recipe, and the
-registration's own claimed process must be that pane's verified live occupant.
-Each place is offered once per daemon run, so a refusal is recorded rather than
-retried in a loop, and closing a dashboard cannot lose the work. A bound launch
+A managed Pi session is enrolled by the daemon, not by an operator or the dashboard.
+An eligible registration is one published by the Pi session baseline (`herdsman-pi`),
+carrying no spawn token, whose claimed process is the verified live occupant of a
+pane it reports, with a fresh session. The daemon adopts it as a lead; `lifecycle.enroll`
+repeats the same answer for the same session and refuses a session another live process
+holds. Each registration is attempted once per daemon run after its context is fresh,
+so a refusal is recorded rather than retried in a loop; a daemon restart reconsiders it. A bound launch
 whose recorded pane stops being reported ends externally after a bounded
 confirmation window, with `pane_lost` evidence; that is not a verified process
 exit, which remains the only thing that sets `exited_at`. Recovery of unresolved

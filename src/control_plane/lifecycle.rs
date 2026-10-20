@@ -744,18 +744,38 @@ pub fn observe_exit(
 }
 
 /// Records an enrolled subject for a running registration the daemon did not
-/// launch. Its process is already verified, so it is bound at once. Refused when
-/// another tracked subject names the same registration, so binding stays unique.
-pub fn enroll(registry: &Registry, subject: &Subject) -> Result<(), String> {
+/// launch. Its process is already verified, so it is bound at once.
+///
+/// Idempotent: a registration already bound to this session answers with its
+/// established subject. A registration tracked for another session, or a session
+/// another live process holds, is refused, so binding stays unique.
+pub fn enroll(registry: &Registry, subject: &Subject) -> Result<String, String> {
     let _transition = registry.transition();
     let agent = subject
         .bound_agent_id
         .as_deref()
         .ok_or("an enrolled subject must name its registration")?;
-    if bound_elsewhere(registry, agent, &subject.subject_id)? {
-        return Err("the registration is already tracked by a launch subject".into());
+    let session = subject
+        .session
+        .as_deref()
+        .ok_or("an enrolled subject must name its session")?;
+    if let Some(tracked) = bound_subject(registry, agent)? {
+        return match tracked.state {
+            State::Bound if tracked.session.as_deref() == Some(session) => Ok(tracked.subject_id),
+            State::Bound => Err("the registration is already tracked for another session".into()),
+            _ => Err("the registration is already tracked by a subject that has ended".into()),
+        };
     }
-    write(registry, subject)
+    let held = find_subject(registry, |other| {
+        matches!(other.state, State::Bound)
+            && other.session.as_deref() == Some(session)
+            && other.bound_agent_id.as_deref() != Some(agent)
+    })?;
+    if held.is_some() {
+        return Err("the session is already attached to another live process".into());
+    }
+    write(registry, subject)?;
+    Ok(subject.subject_id.clone())
 }
 
 /// Records an enrolled subject for a registration whose process the caller has
@@ -796,45 +816,31 @@ pub fn enroll_subject(
         pane_cleanup: None,
         recorded_at: format_millis(now_ms),
     };
-    enroll(registry, &subject)?;
-    Ok(subject.subject_id)
+    enroll(registry, &subject)
 }
 
 /// The tracked subject that names `agent_id`, if one does.
-///
-/// Public so a daemon-owned pass can ask whether a registration already has a
-/// managed subject before it enrolls one. Paging is the same bounded, fair walk
-/// `bound_elsewhere` uses.
-pub fn bound_subject(registry: &Registry, agent_id: &str) -> Result<Option<String>, String> {
+pub fn bound_subject(registry: &Registry, agent_id: &str) -> Result<Option<Subject>, String> {
+    find_subject(registry, |subject| {
+        subject.bound_agent_id.as_deref() == Some(agent_id)
+    })
+}
+
+/// The first tracked subject that satisfies `matches`, over the same bounded, fair
+/// walk every subject sweep uses.
+fn find_subject(
+    registry: &Registry,
+    matches: impl Fn(&Subject) -> bool,
+) -> Result<Option<Subject>, String> {
     let mut after: Option<String> = None;
     loop {
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
-        if let Some(subject) = page
-            .iter()
-            .find(|subject| subject.bound_agent_id.as_deref() == Some(agent_id))
-        {
-            return Ok(Some(subject.subject_id.clone()));
+        if let Some(found) = page.iter().find(|subject| matches(subject)) {
+            return Ok(Some(found.clone()));
         }
         match page.last() {
             Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
             _ => return Ok(None),
-        }
-    }
-}
-
-/// Whether a tracked subject other than `except` names `agent_id`.
-fn bound_elsewhere(registry: &Registry, agent_id: &str, except: &str) -> Result<bool, String> {
-    let mut after: Option<String> = None;
-    loop {
-        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
-        if page.iter().any(|subject| {
-            subject.subject_id != except && subject.bound_agent_id.as_deref() == Some(agent_id)
-        }) {
-            return Ok(true);
-        }
-        match page.last() {
-            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
-            _ => return Ok(false),
         }
     }
 }
@@ -2326,7 +2332,10 @@ mod tests {
             }
         );
         let status = child.0.wait().expect("reaped");
-        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert_eq!(
+            status.signal(),
+            Some(rustix::process::Signal::TERM.as_raw())
+        );
         assert_eq!(
             read(&registry, subject)
                 .expect("read")

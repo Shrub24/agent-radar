@@ -10740,6 +10740,118 @@ fn enroll_lead(client: &mut Client, agent: &str, session: &str) -> Value {
 }
 
 /// The subject id an enrollment recorded, read from its settled effects.
+#[test]
+fn a_manual_pi_session_is_adopted_by_the_daemon_without_an_operator_enrollment() {
+    let sandbox = Sandbox::new("lead-adopt");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    // A manually started Pi session publishes through the baseline publisher with
+    // no launch token; nothing asks the daemon to enroll it.
+    let mut body = registration_body(PARENT_INCARNATION, Some(lead.identity.clone()), None);
+    body["source"] = json!("herdsman-pi");
+    body["location"] = json!({"backend": "tmux", "pane": "wA:p1"});
+    let agent = agent_id(&client.call("agent.register", body));
+    let context = client.call(
+        "agent.context",
+        json!({
+            "agent_id": agent,
+            "publisher": {"source": "herdsman-pi", "incarnation": PARENT_INCARNATION},
+            "sequence": 1,
+            "lease_ms": 10_000,
+            "context": {"session": TRACKED_SESSION}
+        }),
+    );
+    assert!(context["result"].is_object(), "{context}");
+
+    let mut subject = None;
+    wait_for("the sweep to adopt the Pi lead", || {
+        let snapshot = client.first_snapshot();
+        subject = snapshot["observation"]["inventory"]["lifecycle_subjects"]
+            .as_array()
+            .and_then(|subjects| subjects.first())
+            .and_then(|record| record["subject_id"].as_str())
+            .map(str::to_owned);
+        subject.is_some()
+    });
+    let subject = subject.expect("an adopted subject");
+    let view = client.call("lifecycle.get", json!({"subject_id": subject}));
+    assert_eq!(view["result"]["subject"]["state"], "bound", "{view}");
+
+    // A later explicit report for the same session finds the adopted binding.
+    let again = enroll_lead(&mut client, &agent, TRACKED_SESSION);
+    assert_eq!(enrolled_subject(&again), subject, "{again}");
+
+    daemon.stop();
+    lead.kill();
+}
+
+#[test]
+fn a_session_held_by_a_live_registration_is_refused_for_a_second_one() {
+    let sandbox = Sandbox::new("lead-duplicate");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1", "wB:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let (first, _writer) = registered_lead(&mut client, &lead, "wA:p1", TRACKED_SESSION);
+    let enrolled = enroll_lead(&mut client, &first, TRACKED_SESSION);
+    assert_eq!(
+        result_record(&enrolled)["outcome"],
+        "completed",
+        "{enrolled}"
+    );
+
+    // A second registration reporting the same session stays unbound while the
+    // incumbent holds it.
+    let incarnation = random_uuid();
+    let mut body = registration_body(&incarnation, Some(lead.identity.clone()), None);
+    body["location"] = json!({"backend": "tmux", "pane": "wB:p1"});
+    let second = agent_id(&client.call("agent.register", body));
+    let context = client.call(
+        "agent.context",
+        json!({
+            "agent_id": second,
+            "publisher": {"source": "test-publisher", "incarnation": incarnation},
+            "sequence": 1,
+            "lease_ms": 10_000,
+            "context": {"session": TRACKED_SESSION}
+        }),
+    );
+    assert!(context["result"].is_object(), "{context}");
+    let duplicate = enroll_lead(&mut client, &second, TRACKED_SESSION);
+    assert_eq!(
+        result_record(&duplicate)["outcome"],
+        "refused",
+        "{duplicate}"
+    );
+    assert!(
+        result_record(&duplicate)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("another live process")),
+        "{duplicate}"
+    );
+
+    daemon.stop();
+    lead.kill();
+}
+
 fn enrolled_subject(enrolled: &Value) -> String {
     result_record(enrolled)["effects"]
         .as_array()
@@ -10766,7 +10878,7 @@ fn restart_lead_subject(client: &mut Client, subject: &str) -> Value {
 }
 
 #[test]
-fn enrollment_binds_a_verified_lead_and_refuses_a_second_binding() {
+fn enrollment_binds_a_verified_lead_idempotently() {
     let sandbox = Sandbox::new("lead-enroll");
     let lead = LeadProcess::start();
     let backend = MuxBackend::new(LEAD_PRIMITIVES)
@@ -10812,14 +10924,11 @@ fn enrollment_binds_a_verified_lead_and_refuses_a_second_binding() {
         "private environment leaked: {view}"
     );
 
+    // Enrollment is idempotent: a repeated report for the same session answers
+    // with the established subject rather than a second binding.
     let again = enroll_lead(&mut client, &agent, TRACKED_SESSION);
-    assert_eq!(result_record(&again)["outcome"], "refused", "{again}");
-    assert!(
-        result_record(&again)["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("already tracked")),
-        "{again}"
-    );
+    assert_eq!(result_record(&again)["outcome"], "completed", "{again}");
+    assert_eq!(enrolled_subject(&again), subject, "{again}");
     let stop_id = random_uuid();
     let stopped = selected
         .lifecycle
