@@ -37,6 +37,25 @@ of the detail.
 | Generic query layer for daemon reads | (a) typed named predicates per read with one shared scan helper (current direction); (b) embed the `cel` crate (cel-rust, 0.15.0 per docs.rs) | P3 | medium | A second consumer needs structured predicates |
 | Structured TUI filters | (a) keep text-only substring match with ancestors kept (current); (b) typed fields such as state or assignment; (c) fuzzy matching (nucleo or fuzzy-matcher, not verified) | P2 | medium | Operators need to filter by state or assignment, not just text |
 
+## Explicit child-pane gathering
+
+Deferred: `/radar gather-children` could move live child panes into the lead's
+current tab using tmux `join-pane`/`move-pane`, without respawning them. Radar
+would own selection and movement; pi-radar would expose the operator command.
+These commands preserved pane ID, PID, process birth identity and PTY in an
+isolated tmux 3.7c experiment.
+
+Do not implement this in `unified-pi-registration`. Default behavior is no
+movement: a lead manually resumed elsewhere retains its session subject,
+child links and inbox identity. Keep cross-tab presentation minimal; no new
+layout manager, cross-tab nesting redesign or command stub. Radar-controlled
+restart stays anchored to its existing pane/tab where available; a future
+resume action should preserve placement too.
+
+Priority: **P2**. Trigger: operators actually need to gather a resumed lead's
+children. A future implementation must report partial moves honestly rather
+than imply that gathering several panes is atomic.
+
 ## TUI and navigation
 
 | Item | Options | Priority | Confidence | Trigger |
