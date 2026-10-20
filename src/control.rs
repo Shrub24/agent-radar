@@ -23,6 +23,7 @@
 use std::fs::{self, File, OpenOptions, symlink_metadata};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -417,13 +418,9 @@ impl OwnerControl {
         }
         // O_NOFOLLOW refuses a symlink even if one replaced the file after the
         // check above; O_NONBLOCK keeps a FIFO or device from blocking the open.
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-            .map_err(|error| {
-                ControlError::InvalidEvidence(format!("the result is not readable: {error}"))
-            })?;
+        let file = File::from(open_result(&path).map_err(|error| {
+            ControlError::InvalidEvidence(format!("the result is not readable: {error}"))
+        })?);
         let metadata = file
             .metadata()
             .map_err(|error| ControlError::Io(format!("cannot read the result: {error}")))?;
@@ -519,8 +516,17 @@ fn trusted_directory(path: &Path) -> Result<(), ControlError> {
 }
 
 fn current_uid() -> u32 {
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    unsafe { libc::geteuid() }
+    rustix::process::geteuid().as_raw()
+}
+
+/// Opens a result for reading without following a symlink and without blocking on
+/// a FIFO or device that replaced the file between the check and the open.
+fn open_result(path: &Path) -> Result<OwnedFd, rustix::io::Errno> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
 }
 
 /// Validates a canonical UUID, which is what makes an identifier safe to join.
