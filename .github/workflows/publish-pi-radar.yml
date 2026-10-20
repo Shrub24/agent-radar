@@ -1,0 +1,46 @@
+name: Publish pi-radar
+
+on:
+  push:
+    tags:
+      - 'pi-radar-v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: pi-radar
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Verify release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          git merge-base --is-ancestor "$RELEASE_COMMIT" origin/main
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const match = /^pi-radar-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(process.env.RELEASE_TAG);
+          if (!match) throw new Error(`Expected stable pi-radar-vX.Y.Z tag; got ${process.env.RELEASE_TAG}`);
+          const expected = match.slice(1).join(".");
+          const actual = JSON.parse(readFileSync("package.json", "utf8")).version;
+          if (actual !== expected) throw new Error(`Tag version ${expected} does not match package.json version ${actual}`);
+          NODE
+
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --access public
