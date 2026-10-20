@@ -4,7 +4,6 @@ import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import type {
 	DaemonPingSerialize,
-	LaunchIdentityMarkerSerialize,
 	FactsSnapshotDeserialize,
 	HandoffInboxSerialize,
 	HandoffReceiptSerialize,
@@ -204,7 +203,6 @@ export type RadarWriterBinding = {
  */
 export type RadarContextValue = {
 	session: string | null;
-	launch_identity?: LaunchIdentityMarkerSerialize;
 };
 
 /**
@@ -307,7 +305,6 @@ export type RadarSpawnEdge = {
  * no exit was observed.
  */
 export type RadarSpawnExitObservation = SpawnExitObservationSerialize;
-export type RadarLaunchIdentityMarker = LaunchIdentityMarkerSerialize;
 
 /** Durable Radar-owned metadata accepted with a managed launch intent. */
 export type RadarManagedLaunchMetadata = ManagedLaunchMetadataDeserialize;
@@ -500,6 +497,26 @@ function recordAt(value: unknown, field: string): unknown {
 
 export function isUuid(value: unknown): value is string {
 	return typeof value === "string" && UUID.test(value);
+}
+
+/**
+ * How Radar stands on a publisher's current session: adopted as a managed Pi
+ * session, held by another live process (a duplicate), or not managed (yet).
+ */
+export type RadarManagement =
+	| { state: "managed"; subject_id: string }
+	| { state: "duplicate" }
+	| { state: "unmanaged" };
+
+function managementAt(value: unknown): RadarManagement | undefined {
+	const field = recordAt(value, "management");
+	const state = stringAt(field, "state");
+	if (state === "managed") {
+		const subjectId = stringAt(field, "subject_id");
+		return subjectId === undefined ? undefined : { state, subject_id: subjectId };
+	}
+	if (state === "duplicate" || state === "unmanaged") return { state };
+	return undefined;
 }
 
 function stringAt(value: unknown, field: string): string | undefined {
@@ -1026,7 +1043,7 @@ export type RadarClient = {
 		lease_ms?: number;
 		observed_at?: string;
 		context: RadarContextValue;
-	}): Promise<RadarResult<{ writer: RadarWriterBinding; warning?: string }>>;
+	}): Promise<RadarResult<{ writer: RadarWriterBinding; warning?: string; management?: RadarManagement }>>;
 	retire(request: {
 		agent_id: string;
 		channel: RadarChannel;
@@ -1563,9 +1580,14 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				if (writer === undefined)
 					return protocol("context reply carries no writer binding");
 				const warning = stringAt(answer.value, "warning");
+				const management = managementAt(answer.value);
 				return {
 					ok: true,
-					value: { writer, ...(warning !== undefined ? { warning } : {}) },
+					value: {
+						writer,
+						...(warning !== undefined ? { warning } : {}),
+						...(management !== undefined ? { management } : {}),
+					},
 				};
 			});
 		},

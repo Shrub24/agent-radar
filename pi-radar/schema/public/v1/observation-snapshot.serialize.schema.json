@@ -910,47 +910,6 @@
       ],
       "type": "string"
     },
-    "LaunchIdentityEvidence": {
-      "description": "A daemon-owned process lifecycle target, joined to one registration by exact\nagent id and process birth identity.",
-      "enum": [
-        "missing",
-        "matching",
-        "stale",
-        "contradictory",
-        "unavailable"
-      ],
-      "type": "string"
-    },
-    "LaunchIdentityMarker": {
-      "additionalProperties": false,
-      "description": "A non-secret Pi-session breadcrumb issued by Radar. This is correlation\nevidence only and cannot establish lifecycle authority.",
-      "properties": {
-        "execution_generation": {
-          "format": "uint32",
-          "maximum": 4294967295,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "launch_id": {
-          "type": "string"
-        },
-        "subject_id": {
-          "type": "string"
-        },
-        "version": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "version",
-        "subject_id",
-        "launch_id",
-        "execution_generation"
-      ],
-      "type": "object"
-    },
     "LifecycleObservation": {
       "additionalProperties": false,
       "description": "Public lifecycle identity carried into the display projection.",
@@ -1125,6 +1084,7 @@
     },
     "ManagedSubject": {
       "additionalProperties": false,
+      "description": "A daemon-owned process lifecycle target, joined to one registration by exact\nagent id and process birth identity.",
       "properties": {
         "child_close": {
           "anyOf": [
@@ -1138,9 +1098,6 @@
         },
         "identity_unresolved": {
           "type": "boolean"
-        },
-        "launch_identity": {
-          "$ref": "#/$defs/LaunchIdentityEvidence"
         },
         "metadata": {
           "$ref": "#/$defs/ManagedMetadata"
@@ -1171,7 +1128,6 @@
         "subject_id",
         "process",
         "identity_unresolved",
-        "launch_identity",
         "metadata",
         "child_close",
         "state",
@@ -1876,16 +1832,6 @@
         },
         "incarnation": {
           "type": "string"
-        },
-        "launch_identity": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LaunchIdentityMarker"
-            },
-            {
-              "type": "null"
-            }
-          ]
         },
         "lease_ms": {
           "format": "int64",

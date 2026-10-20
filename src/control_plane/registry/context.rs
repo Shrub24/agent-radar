@@ -54,8 +54,11 @@ pub const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 pub struct ContextValue {
     #[serde(default)]
     pub session: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_identity: Option<crate::control_plane::public_contracts::LaunchIdentityMarker>,
+    /// Read from records and requests that predate session-bound management, and
+    /// never written or served: the execution a session belongs to is its
+    /// attached subject, not a marker a process presents.
+    #[serde(default, skip_serializing)]
+    pub launch_identity: Option<serde_json::Value>,
 }
 
 /// A publish of one agent record's current session.
@@ -114,14 +117,6 @@ impl ContextRequest {
         {
             return Err("`context.session` must be a canonical UUID".into());
         }
-        if let Some(marker) = &self.context.launch_identity
-            && (marker.version != 1
-                || SessionUuid::parse(&marker.subject_id).is_none()
-                || SessionUuid::parse(&marker.launch_id).is_none()
-                || marker.execution_generation == 0)
-        {
-            return Err("`context.launch_identity` is not a valid Radar-issued marker".into());
-        }
         Ok(())
     }
 
@@ -155,8 +150,11 @@ pub struct AcceptedContext {
     /// The current session, or `None` for an explicit "no current session".
     #[serde(default)]
     pub session: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_identity: Option<crate::control_plane::public_contracts::LaunchIdentityMarker>,
+    /// Read from records and requests that predate session-bound management, and
+    /// never written or served: the execution a session belongs to is its
+    /// attached subject, not a marker a process presents.
+    #[serde(default, skip_serializing)]
+    pub launch_identity: Option<serde_json::Value>,
 }
 
 impl AcceptedContext {
@@ -164,7 +162,6 @@ impl AcceptedContext {
         self.lease_ms == request.lease_ms()
             && self.observed_at == request.observed_at
             && self.session == request.context.session
-            && self.launch_identity == request.context.launch_identity
     }
 }
 
@@ -261,8 +258,11 @@ pub struct PublicSession {
     /// current session" from "never published", which is no context record at
     /// all.
     pub session: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_identity: Option<crate::control_plane::public_contracts::LaunchIdentityMarker>,
+    /// Read from records and requests that predate session-bound management, and
+    /// never written or served: the execution a session belongs to is its
+    /// attached subject, not a marker a process presents.
+    #[serde(default, skip_serializing)]
+    pub launch_identity: Option<serde_json::Value>,
 }
 
 /// One agent record's context as a client reads it. A `None` read of this whole

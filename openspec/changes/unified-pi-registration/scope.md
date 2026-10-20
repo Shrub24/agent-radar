@@ -69,9 +69,8 @@ If another process opens a session with an accepted live attachment:
 - Keep the incumbent's subject binding.
 - Continue baseline tracking of the duplicate, with a visible duplicate-session warning and no managed subject/inbox authority.
 - Do not terminate either process, choose between histories, merge them or promote the duplicate when the incumbent later exits.
-- Require the duplicate to perform a fresh resume/reload of persisted session state, or restart, before it can be reconsidered after the conflict is resolved. Ordinary reports and heartbeats do not clear the conflict.
-
-The adapter must distinguish a real fresh session load from a heartbeat/reconnect. This is a duplicate-admission condition, not a new session-history validator. If the host cannot signal the needed reload reliably, require a process restart rather than guess.
+- The conflict is a warning state. It repairs automatically at the next `session_start` boundary once the incumbent is released: pi-radar's `session_start` re-attempts registration, so `/reload`, `/resume`, a process restart, or the TUI restart action all reconsider it. No Pi host signal distinguishing fresh load from reload is required, and none is instrumented.
+- Ordinary reports, heartbeats and expired leases do not clear the conflict or prove release.
 
 No fork investigation or additional branch model is included. A genuinely new session UUID is a new subject; copied conversation entries confer no existing parent or inbox rights.
 
@@ -105,7 +104,7 @@ Keep recipes private. Never expose environment values or launch credentials in p
 - Publish fresh current-session changes and update the shared runtime's subject association accordingly.
 - Expose the daemon-issued subject to consumers such as Herdsman without a caller-selected identity or recipient override.
 - Present pending/conflicting management state without breaking ordinary facts publication.
-- Keep process-local registration continuity across extension reloads, but do not treat reload alone as proof that a conflicting session was freshly loaded.
+- Treat `session_start` as the registration boundary: every `/reload`, `/resume` or new process re-attempts registration and re-reads the subject. Process-local continuity across reloads does not by itself carry a binding; the daemon's record does.
 - Remove active session-marker reads/writes and marker-only environment plumbing. Opening an old session must not reinstall an old execution identity.
 
 Use the existing typed DTO/schema workflow only for wire shapes actually changed and consumed. Negotiate additive behavior for older daemons instead of raising unrelated clients' global minimum revision. Do not silently emulate management when the daemon lacks the capability.

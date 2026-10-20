@@ -14,7 +14,6 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import type { RadarLocationResolution } from "./radar-location.ts";
-import { decodeRadarLaunchMarker } from "./radar-session-marker.ts";
 import {
 	boundedRadarAssignment,
 	boundedRadarFacts,
@@ -28,7 +27,7 @@ import {
 	type RadarFactsSnapshot,
 	type RadarClient,
 	type RadarLocation,
-	type RadarLaunchIdentityMarker,
+	type RadarManagement,
 	type RadarPublisherIdentity,
 	type RadarRegistration,
 	type RadarScheduler,
@@ -36,6 +35,10 @@ import {
 	type RadarTimer,
 	systemScheduler,
 } from "./radar-client.ts";
+
+/** Shown while another live Radar process holds this Pi session. */
+const DUPLICATE_SESSION_DIAGNOSTIC =
+	"this Pi session is held by another live Radar process; it stays unmanaged until that process releases it";
 
 /** The client members publication calls; consumers narrow to this rather than the whole client. */
 export type RadarPublicationClient = Pick<
@@ -325,7 +328,6 @@ type ContextReport = {
 	session: string | null;
 	lease_ms: number;
 	observed_at: string;
-	launch_identity?: RadarLaunchIdentityMarker;
 };
 
 /**
@@ -563,9 +565,11 @@ function pendingAt(
 }
 
 const CONTEXT_PENDING_KEYS = "lease_ms,observed_at,sequence,session";
-const CONTEXT_PENDING_MARKED_KEYS = "launch_identity,lease_ms,observed_at,sequence,session";
 const CONTEXT_ACCEPTED_KEYS = "lease_ms,observed_at,sent_at,sequence,session";
-const CONTEXT_ACCEPTED_MARKED_KEYS = "launch_identity,lease_ms,observed_at,sent_at,sequence,session";
+// Records written before session-bound management also carry a launch-identity
+// marker. It is read past and never used: the attached subject is the identity.
+const CONTEXT_PENDING_LEGACY_KEYS = "launch_identity,lease_ms,observed_at,sequence,session";
+const CONTEXT_ACCEPTED_LEGACY_KEYS = "launch_identity,lease_ms,observed_at,sent_at,sequence,session";
 
 /** The reported session, or `undefined` when the field is not one of the two. */
 function sessionAt(value: unknown): string | null | undefined {
@@ -575,28 +579,12 @@ function sessionAt(value: unknown): string | null | undefined {
 	return typeof found === "string" ? found : undefined;
 }
 
-function sameLaunchIdentity(
-	a: RadarLaunchIdentityMarker | undefined,
-	b: RadarLaunchIdentityMarker | undefined,
-): boolean {
-	return (
-		a === b ||
-		(a !== undefined &&
-			b !== undefined &&
-			a.version === b.version &&
-			a.subject_id === b.subject_id &&
-			a.launch_id === b.launch_id &&
-			a.execution_generation === b.execution_generation)
-	);
-}
-
 function contextReportAt(
 	value: unknown,
 	keys: string,
-	markedKeys: string,
+	legacyKeys: string,
 ): ContextReport | undefined {
-	const marked = exactKeys(value, markedKeys);
-	if (!exactKeys(value, keys) && !marked) return undefined;
+	if (!exactKeys(value, keys) && !exactKeys(value, legacyKeys)) return undefined;
 	const sequence = numberAt(value, "sequence");
 	const lease = numberAt(value, "lease_ms");
 	const observed = textAt(value, "observed_at");
@@ -604,17 +592,7 @@ function contextReportAt(
 	if (sequence === undefined || sequence < 1) return undefined;
 	if (lease === undefined || observed === undefined || session === undefined)
 		return undefined;
-	const marker = marked
-		? decodeRadarLaunchMarker((value as Record<string, unknown>).launch_identity)
-		: undefined;
-	if (marked && marker === undefined) return undefined;
-	return {
-		sequence,
-		session,
-		lease_ms: lease,
-		observed_at: observed,
-		...(marker !== undefined ? { launch_identity: marker } : {}),
-	};
+	return { sequence, session, lease_ms: lease, observed_at: observed };
 }
 
 export type RadarFactsWriter = Omit<RadarChannelWriter, "update"> & {
@@ -971,11 +949,13 @@ export type RadarContextWriter = {
 	 * session" the daemon serves; `undefined` never is, because a process that
 	 * does not know its session has nothing to assert.
 	 */
-	update(session: string | null, launchIdentity?: RadarLaunchIdentityMarker): void;
+	update(session: string | null): void;
 	/** Release this writer's timers. The accepted report stays until it goes stale. */
 	stop(): void;
 	/** Re-arm a stopped writer after an extension reload. */
 	reopen(): void;
+	/** Radar's standing on the session last published, once the daemon answered. */
+	management(): RadarManagement | undefined;
 	diagnostic(): string | undefined;
 };
 
@@ -1009,12 +989,12 @@ function createContextWriter(input: ContextWriterInput): RadarContextWriter {
 	const { store, client, scheduler, recordName, publisher } = input;
 	let record = loadRecord();
 	let desired: string | null | undefined;
-	let desiredMarker: RadarLaunchIdentityMarker | undefined;
 	let running = false;
 	let again = false;
 	let recovering = false;
 	let stopped = false;
 	let fenced = false;
+	let standing: RadarManagement | undefined;
 	let pump: RadarTimer | undefined;
 
 	function blank(agentId: string): ContextRecord {
@@ -1052,13 +1032,13 @@ function createContextWriter(input: ContextWriterInput): RadarContextWriter {
 		const pending = contextReportAt(
 			recordAt(value, "pending"),
 			CONTEXT_PENDING_KEYS,
-			CONTEXT_PENDING_MARKED_KEYS,
+			CONTEXT_PENDING_LEGACY_KEYS,
 		);
 		const acceptedValue = recordAt(value, "accepted");
 		const accepted = contextReportAt(
 			acceptedValue,
 			CONTEXT_ACCEPTED_KEYS,
-			CONTEXT_ACCEPTED_MARKED_KEYS,
+			CONTEXT_ACCEPTED_LEGACY_KEYS,
 		);
 		const sentAt = numberAt(acceptedValue, "sent_at");
 		return {
@@ -1143,13 +1123,11 @@ function createContextWriter(input: ContextWriterInput): RadarContextWriter {
 			observed_at: pending.observed_at,
 			context: {
 			session: pending.session,
-			...(pending.launch_identity !== undefined
-				? { launch_identity: pending.launch_identity }
-				: {}),
 		},
 		});
 		if (answer.ok === true) {
 			recovering = false;
+			standing = answer.value.management;
 			record.writer = {
 				handle: answer.value.writer.handle,
 				generation: answer.value.writer.generation,
@@ -1190,16 +1168,12 @@ function createContextWriter(input: ContextWriterInput): RadarContextWriter {
 		// silently advance.
 	}
 
-	async function stage(
-		session: string | null,
-		launchIdentity?: RadarLaunchIdentityMarker,
-	): Promise<void> {
+	async function stage(session: string | null): Promise<void> {
 		const pending: ContextReport = {
 			sequence: record.sequence + 1,
 			session,
 			lease_ms: input.leaseMs,
 			observed_at: new Date(scheduler.now()).toISOString(),
-			...(launchIdentity !== undefined ? { launch_identity: launchIdentity } : {}),
 		};
 		// Persisted before it is sent, so a lost reply replays this exact request.
 		record.pending = pending;
@@ -1220,13 +1194,12 @@ function createContextWriter(input: ContextWriterInput): RadarContextWriter {
 		if (
 			record.writer === undefined ||
 			record.accepted === undefined ||
-			record.accepted.session !== desired ||
-			!sameLaunchIdentity(record.accepted.launch_identity, desiredMarker)
+			record.accepted.session !== desired
 		) {
-			await stage(desired, desiredMarker);
+			await stage(desired);
 			return;
 		}
-		if (heartbeatDue()) await stage(record.accepted.session, desiredMarker);
+		if (heartbeatDue()) await stage(record.accepted.session);
 	}
 
 	async function drain(): Promise<void> {
@@ -1262,18 +1235,12 @@ function createContextWriter(input: ContextWriterInput): RadarContextWriter {
 	}
 
 	return {
-		update(session, launchIdentity) {
-			if (
-				fenced ||
-				(session === desired &&
-					sameLaunchIdentity(desiredMarker, launchIdentity))
-			)
-				return;
+		update(session) {
+			if (fenced || session === desired) return;
 			// A session reported while this writer is stopped is remembered, not
 			// published: only `reopen` restarts the timers, and it must see the
 			// session the process is in now rather than the one it left.
 			desired = session;
-			desiredMarker = launchIdentity;
 			if (stopped) return;
 			kick();
 		},
@@ -1285,7 +1252,10 @@ function createContextWriter(input: ContextWriterInput): RadarContextWriter {
 			stopped = false;
 			if (desired !== undefined || record.pending !== undefined) kick();
 		},
-		diagnostic: () => record.diagnostic,
+		management: () => standing,
+		diagnostic: () =>
+			record.diagnostic ??
+			(standing?.state === "duplicate" ? DUPLICATE_SESSION_DIAGNOSTIC : undefined),
 	};
 }
 
@@ -1318,7 +1288,7 @@ export type RadarPublication = {
 /** What a process's own registration resolved to, and where it says it is. */
 export type RadarSubject = {
 	agent_id: string;
-	/** Stable managed logical subject, present only for a Radar-issued launch. */
+	/** Stable managed logical subject: a Radar-issued launch, or an adopted Pi session. */
 	subject_id?: string;
 	location?: RadarLocation;
 };
@@ -1403,6 +1373,7 @@ function unavailablePublication(error?: unknown): RadarPublication {
 			update: () => undefined,
 			stop: () => undefined,
 			reopen: () => undefined,
+			management: () => undefined,
 			diagnostic: () => diagnostic,
 		},
 		facts: { ...writer, update: () => undefined },
@@ -1718,7 +1689,9 @@ function createRadarPublicationInner(
 			const record = await ensureRegistration();
 			if (record === undefined) return undefined;
 			const location = record.registration.location;
-			const subjectId = process.env.PI_RADAR_MANAGED_SUBJECT_ID;
+			// Radar's answer to this process's current session names its subject.
+			const standing = context.management();
+			const subjectId = standing?.state === "managed" ? standing.subject_id : undefined;
 			return {
 				agent_id: agentId,
 				...(subjectId !== undefined ? { subject_id: subjectId } : {}),

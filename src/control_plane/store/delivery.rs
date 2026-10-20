@@ -80,6 +80,7 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::EndedExternally(_) => "lifecycle.ended_externally",
         Transition::PaneCleanup(_) => "lifecycle.pane_cleanup",
         Transition::SuccessorReserved { .. } => "lifecycle.successor_reserved",
+        Transition::SessionRecorded { .. } => "lifecycle.session_recorded",
         Transition::OperationAdmitted(_) => "lifecycle.operation.admitted",
         Transition::OperationStarted(_) => "lifecycle.operation.started",
         Transition::OperationSettled(_) => "lifecycle.settled",

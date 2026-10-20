@@ -95,16 +95,6 @@ export interface ManagedLaunchMetadataDeserialize {
   run?: string | null;
 }
 /**
- * A non-secret Pi-session breadcrumb issued by Radar. This is correlation
- * evidence only and cannot establish lifecycle authority.
- */
-export interface LaunchIdentityMarkerSerialize {
-  execution_generation: number;
-  launch_id: string;
-  subject_id: string;
-  version: number;
-}
-/**
  * The agent's own process facts. Self-authored by any Pi session, with no owner
  * or assignment, and kept separate from execution and assignment. Every field
  * is optional and a published snapshot replaces the whole value, so omission
@@ -220,11 +210,6 @@ export type Unjoined =
   | "foreground_unreadable"
   | "identity_mismatch"
   | "ambiguous";
-/**
- * A daemon-owned process lifecycle target, joined to one registration by exact
- * agent id and process birth identity.
- */
-export type LaunchIdentityEvidence = "missing" | "matching" | "stale" | "contradictory" | "unavailable";
 export type State = "pending" | "captured" | "bound" | "revoked";
 /**
  * The state of one edge in the recorded topology: the strongest statement a
@@ -718,7 +703,6 @@ export interface PublicSession {
   freshness: Freshness;
   generation: number;
   incarnation: string;
-  launch_identity?: LaunchIdentityMarker | null;
   lease_ms: number;
   observed_at?: string | null;
   received_at: string;
@@ -734,16 +718,6 @@ export interface PublicSession {
    */
   session: string | null;
   source: string;
-}
-/**
- * A non-secret Pi-session breadcrumb issued by Radar. This is correlation
- * evidence only and cannot establish lifecycle authority.
- */
-export interface LaunchIdentityMarker {
-  execution_generation: number;
-  launch_id: string;
-  subject_id: string;
-  version: number;
 }
 /**
  * The process evidence `agent.list` serves beside a registration. Only the
@@ -822,10 +796,13 @@ export interface RegistryLocation {
   tab?: string | null;
   workspace?: string | null;
 }
+/**
+ * A daemon-owned process lifecycle target, joined to one registration by exact
+ * agent id and process birth identity.
+ */
 export interface ManagedSubject {
   child_close: ChildCloseTarget | null;
   identity_unresolved: boolean;
-  launch_identity: LaunchIdentityEvidence;
   metadata: ManagedMetadata;
   process: ProcessIdentity;
   session: string | null;

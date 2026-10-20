@@ -5040,7 +5040,6 @@ mod tests {
                         subject_id: "subject-managed".into(),
                         process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
                         identity_unresolved: false,
-                        launch_identity: crate::registry_observation::LaunchIdentityEvidence::Missing,
                         metadata: crate::control_plane::lifecycle::ManagedMetadata::default(),
                         child_close: None,
                         state: crate::control_plane::lifecycle::State::Bound,

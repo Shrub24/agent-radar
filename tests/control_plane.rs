@@ -28,7 +28,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_radar::Daemon;
-use agent_radar::control_plane::lifecycle as lifecycle_subjects;
 use agent_radar::control_plane::ops::Operation;
 use agent_radar::control_plane::registry::{MAX_LISTED, MAX_TEXT_BYTES, ProcessVerifier};
 use agent_radar::control_plane::{
@@ -1973,88 +1972,73 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
 
 #[test]
 fn managed_parent_handoff_is_published_received_and_acknowledged() {
+    // The handoff parties are real managed children: each is bound by the token its
+    // launch carried, and its own Pi session is recorded when it first reports it.
+    let Some(server) = TmuxServer::start("managed-parent-handoff") else {
+        return;
+    };
     let sandbox = Sandbox::new("managed-parent-handoff");
+    let socket = sandbox.socket();
     let state = sandbox.state();
-    let registry = agent_radar::control_plane::registry::Registry::open(&state).expect("registry");
-    let parent_subject = random_uuid();
-    let parent_launch = random_uuid();
+    let backend = [
+        ("RADAR_CONTROL_BACKEND", "tmux"),
+        ("RADAR_TMUX_SERVER", server.name.as_str()),
+    ];
+    let mut daemon = DaemonChild::spawn_with(&socket, &state, &backend);
+    let mut lines = BufReader::new(daemon.process.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting line").expect("greeting");
+    let mut client = Client::dial(&socket);
+
+    let observed = client.call("mux.observe", json!({}));
+    let root_pane = observed["result"]["inventory"]["panes"][0]["location"]["pane_id"]
+        .as_str()
+        .expect("root pane")
+        .to_string();
+    let mut body = registration_body(PARENT_INCARNATION, None, None);
+    body["location"] = json!({"backend":"tmux", "pane":root_pane});
+    let root = agent_id(&client.call("agent.register", body));
+    let root_session = random_uuid();
+    publish_session_context(&mut client, &root, PARENT_INCARNATION, &root_session);
+
+    let (parent_subject, parent_agent, _parent_pane) = spawned_live_tmux_child(
+        &mut client,
+        &server,
+        &state,
+        &root,
+        &root_session,
+        Value::Null,
+        OTHER_INCARNATION,
+    );
     let parent_session = random_uuid();
-    lifecycle_subjects::create_with_intent(
-        &registry,
-        &parent_launch,
-        lifecycle_subjects::LaunchContext {
-            executable: "pi".into(),
-            argv: Vec::new(),
-            cwd: None,
-            env: BTreeMap::new(),
-        },
-        Some(parent_session.clone()),
-        Some((parent_subject.clone(), 1)),
-        lifecycle_subjects::ManagedMetadata::default(),
-        now_ms(),
-    )
-    .expect("parent subject");
+    publish_session_context(
+        &mut client,
+        &parent_agent,
+        OTHER_INCARNATION,
+        &parent_session,
+    );
 
-    let worker_subject = random_uuid();
-    let worker_launch = random_uuid();
+    let (worker_subject, worker_agent, _worker_pane) = spawned_live_tmux_child(
+        &mut client,
+        &server,
+        &state,
+        &parent_agent,
+        &parent_session,
+        json!({"parent_subject_id": parent_subject}),
+        CHILD_INCARNATION,
+    );
     let worker_session = random_uuid();
-    lifecycle_subjects::create_with_intent(
-        &registry,
-        &worker_launch,
-        lifecycle_subjects::LaunchContext {
-            executable: "pi".into(),
-            argv: Vec::new(),
-            cwd: None,
-            env: BTreeMap::new(),
-        },
-        Some(worker_session.clone()),
-        Some((worker_subject.clone(), 1)),
-        lifecycle_subjects::ManagedMetadata {
-            parent_subject_id: Some(parent_subject.clone()),
-            ..Default::default()
-        },
-        now_ms(),
-    )
-    .expect("worker subject");
-    drop(registry);
-
-    let mut daemon = sandbox.daemon();
-    let mut client = Client::dial(daemon.path());
-    let parent_registration = client.call(
-        "agent.register",
-        registration_body("a3a240cc-8950-4851-ae76-7bd9e0c1a010", None, None),
+    publish_session_context(
+        &mut client,
+        &worker_agent,
+        CHILD_INCARNATION,
+        &worker_session,
     );
-    let parent_agent = agent_id(&parent_registration);
-    let worker_registration = client.call(
-        "agent.register",
-        registration_body("a3a240cc-8950-4851-ae76-7bd9e0c1a011", None, None),
+    let attached = client.call("lifecycle.get", json!({"subject_id": worker_subject}));
+    assert_eq!(
+        attached["result"]["subject"]["session"],
+        json!(worker_session),
+        "{attached}"
     );
-    let worker_agent = agent_id(&worker_registration);
-    for (agent, session, subject, launch) in [
-        (
-            parent_agent.as_str(),
-            parent_session.as_str(),
-            parent_subject.as_str(),
-            parent_launch.as_str(),
-        ),
-        (
-            worker_agent.as_str(),
-            worker_session.as_str(),
-            worker_subject.as_str(),
-            worker_launch.as_str(),
-        ),
-    ] {
-        let context = client.call("agent.context", json!({
-            "agent_id": agent,
-            "publisher": {"source":"test", "incarnation":"a3a240cc-8950-4851-ae76-7bd9e0c1a012"},
-            "sequence": 1,
-            "lease_ms": 60_000,
-            "context": {"session": session, "launch_identity": {
-                "version": 1, "subject_id": subject, "launch_id": launch, "execution_generation": 1
-            }},
-        }));
-        assert!(context["result"]["context"].is_object(), "{context}");
-    }
 
     let handoff_id = random_uuid();
     let publish = client.call_id(
@@ -2147,7 +2131,8 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         !events.to_string().contains("full immutable handoff"),
         "payload leaked into events: {events}"
     );
-    daemon.stop();
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
 #[test]
@@ -2180,13 +2165,14 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     // never-published read absence.
     let first = client.call(
         "agent.context",
-        json!({"agent_id":id,"publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},"sequence":1,"lease_ms":10000,"context":{"session":SESSION,"launch_identity":{"version":1,"subject_id":"3d6f021b-4718-4a2e-a8c9-9920ff71af12","launch_id":"97403b5a-f470-4c80-bcb0-2bc84ad0e1c0","execution_generation":2}}}),
+        json!({"agent_id":id,"publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},"sequence":1,"lease_ms":10000,"context":{"session":SESSION}}),
     );
     assert!(first["result"]["context"].is_object(), "{first}");
     assert_eq!(first["result"]["context"]["context"]["session"], SESSION);
+    // No subject is attached to this registration, so Radar names none.
     assert_eq!(
-        first["result"]["context"]["context"]["launch_identity"]["subject_id"],
-        "3d6f021b-4718-4a2e-a8c9-9920ff71af12"
+        first["result"]["management"]["state"], "unmanaged",
+        "{first}"
     );
     assert_eq!(first["result"]["context"]["writer"]["generation"], 1);
     assert!(first["result"]["writer"]["handle"].is_string());
@@ -4423,6 +4409,7 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
 
 /// The logical session a tracked parent publishes; tracked children launch under it.
 const TRACKED_SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+const MOVED_SESSION: &str = "d2b3c4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e";
 
 /// Starts the daemon on a disposable tmux server and waits for its greeting.
 fn tmux_daemon(socket: &Path, state: &Path, server: &TmuxServer) -> DaemonChild {
@@ -5298,6 +5285,81 @@ fn pane_ids(server: &TmuxServer) -> Vec<String> {
         .collect()
 }
 
+/// Publishes `session` as the current session of a registration, as the baseline
+/// publisher does at session start.
+fn publish_session_context(client: &mut Client, agent: &str, incarnation: &str, session: &str) {
+    let context = client.call(
+        "agent.context",
+        json!({
+            "agent_id": agent,
+            "publisher": {"source":"test-publisher", "incarnation": incarnation},
+            "sequence": 1,
+            "lease_ms": 60_000,
+            "context": {"session": session}
+        }),
+    );
+    assert!(context["result"].is_object(), "{context}");
+}
+
+/// Spawns one managed child of `parent` under `managed` metadata in this daemon's
+/// tmux server, binds the child's process with the token its launch carried, and
+/// leaves it waiting, so it stays live. Returns the child's lifecycle subject, its
+/// agent, and its raw tmux pane.
+fn spawned_live_tmux_child(
+    client: &mut Client,
+    server: &TmuxServer,
+    state: &Path,
+    parent: &str,
+    session: &str,
+    managed: Value,
+    incarnation: &str,
+) -> (String, String, String) {
+    let spawn_id = random_uuid();
+    let mut request = json!({
+        "parent": parent,
+        "parent_session_id": session,
+        "executable": "/bin/sh",
+        "argv": ["-c", "read -r _; exit 23"],
+    });
+    if !managed.is_null() {
+        request["managed"] = managed;
+    }
+    let spawned = client.call_id(&spawn_id, "spawn.create", json!({"request": request}));
+    assert!(spawned["result"].is_object(), "{spawned}");
+    await_captured_launch(state, &spawn_id);
+    let edge = recorded_edge(state, &spawn_id);
+    let token = edge["token"].as_str().expect("spawn token").to_string();
+    let subject = edge["subject_id"]
+        .as_str()
+        .expect("child subject")
+        .to_string();
+    let raw_pane = edge["location"]["pane"]
+        .as_str()
+        .expect("spawned pane")
+        .rsplit(':')
+        .next()
+        .expect("raw tmux pane")
+        .to_string();
+    let pid = server
+        .tmux(&["display-message", "-p", "-t", &raw_pane, "#{pane_pid}"])
+        .trim()
+        .parse::<i32>()
+        .expect("child process pid");
+    let mut child_registration =
+        registration_body(incarnation, Some(process_identity_from_proc(pid)), None);
+    child_registration["spawn_token"] = json!(token);
+    // The child's own pane is where its own children are spawned.
+    child_registration["location"] = json!({"backend":"tmux", "pane": edge["location"]["pane"]});
+    let child_agent = agent_id(&client.call("agent.register", child_registration));
+    let bound = client.call("spawn.get", json!({"request_id": spawn_id}));
+    assert_eq!(
+        bound["result"]["spawn"]["bound"]["agent_id"],
+        json!(child_agent),
+        "{bound}"
+    );
+    (subject, child_agent, raw_pane)
+}
+
 /// Spawns one managed child of `parent` in this daemon's tmux server, binds the
 /// child's own process identity with the token its launch carried, releases the
 /// child's waiting shell, and waits until its exit is a recorded fact of its
@@ -6162,18 +6224,17 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
             .windows(3)
             .any(|window| { window == ["--", "/usr/bin/pi", "--child"] })
     );
-    assert_eq!(
-        launches[0].env[agent_radar::control_plane::lifecycle::MANAGED_SUBJECT_ENV],
-        subject["subject_id"]
-    );
-    assert_eq!(
-        launches[0].env[agent_radar::control_plane::lifecycle::MANAGED_LAUNCH_ENV],
-        id
-    );
-    assert_eq!(
-        launches[0].env[agent_radar::control_plane::lifecycle::MANAGED_GENERATION_ENV],
-        "1"
-    );
+    // Identity is the attached execution, never an injected variable.
+    for retired in [
+        agent_radar::control_plane::lifecycle::MANAGED_SUBJECT_ENV,
+        agent_radar::control_plane::lifecycle::MANAGED_LAUNCH_ENV,
+        agent_radar::control_plane::lifecycle::MANAGED_GENERATION_ENV,
+    ] {
+        assert!(
+            !launches[0].env.contains_key(retired),
+            "{retired} is injected"
+        );
+    }
     assert_eq!(launches[0].cwd.as_deref(), Some("/work dir"));
     assert_eq!(launches[0].env["SECRET"], "PRIVATE_ENV_SENTINEL_8812");
     let token = recorded_edge(&sandbox.state(), &id)["token"]
@@ -10848,6 +10909,182 @@ fn a_session_held_by_a_live_registration_is_refused_for_a_second_one() {
         "{duplicate}"
     );
 
+    daemon.stop();
+    lead.kill();
+}
+
+/// A Pi session registration as the baseline publisher makes it: `herdsman-pi`,
+/// in `pane`, reporting `session` first. Returns its agent ID and writer handle.
+fn pi_lead(
+    client: &mut Client,
+    lead: &LeadProcess,
+    pane: &str,
+    incarnation: &str,
+    session: &str,
+) -> (String, String) {
+    let mut body = registration_body(incarnation, Some(lead.identity.clone()), None);
+    body["source"] = json!("herdsman-pi");
+    body["location"] = json!({"backend": "tmux", "pane": pane});
+    let agent = agent_id(&client.call("agent.register", body));
+    let handle = publish_session(client, &agent, incarnation, None, 1, session);
+    (agent, handle)
+}
+
+/// Publishes the registration's current session at `sequence`, as a Pi session
+/// start or `/resume` does, presenting the writer handle once it has one. Returns
+/// the handle the daemon issued.
+fn publish_session(
+    client: &mut Client,
+    agent: &str,
+    incarnation: &str,
+    handle: Option<&str>,
+    sequence: u64,
+    session: &str,
+) -> String {
+    let mut params = json!({
+        "agent_id": agent,
+        "publisher": {"source": "herdsman-pi", "incarnation": incarnation},
+        "sequence": sequence,
+        "lease_ms": 10_000,
+        "context": {"session": session}
+    });
+    if let Some(handle) = handle {
+        params["writer_handle"] = json!(handle);
+    }
+    let context = client.call("agent.context", params);
+    assert!(context["result"].is_object(), "{context}");
+    context["result"]["writer"]["handle"]
+        .as_str()
+        .expect("context writer handle")
+        .to_owned()
+}
+
+/// The lifecycle subject the snapshot holds for `agent` on `session`, if any.
+fn subject_on(client: &mut Client, agent: &str, session: &str) -> Option<Value> {
+    client.first_snapshot()["observation"]["inventory"]["lifecycle_subjects"]
+        .as_array()?
+        .iter()
+        .find(|record| record["bound_agent_id"] == agent && record["session"] == session)
+        .cloned()
+}
+
+#[test]
+fn a_session_switch_releases_the_prior_subject_and_restarting_it_is_refused() {
+    let sandbox = Sandbox::new("lead-switch");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let (agent, handle) = pi_lead(
+        &mut client,
+        &lead,
+        "wA:p1",
+        PARENT_INCARNATION,
+        TRACKED_SESSION,
+    );
+    wait_for("the sweep to bind the first session", || {
+        subject_on(&mut client, &agent, TRACKED_SESSION).is_some()
+    });
+    let first =
+        subject_on(&mut client, &agent, TRACKED_SESSION).expect("first subject")["subject_id"]
+            .as_str()
+            .expect("subject id")
+            .to_owned();
+
+    // `/resume` in the same process: the prior subject is released.
+    publish_session(
+        &mut client,
+        &agent,
+        PARENT_INCARNATION,
+        Some(&handle),
+        2,
+        MOVED_SESSION,
+    );
+    wait_for("the sweep to bind the moved session", || {
+        subject_on(&mut client, &agent, MOVED_SESSION).is_some()
+    });
+
+    // The released subject's recipe no longer names the process's session, so a
+    // restart refuses before it stops anything.
+    let restart = restart_lead_subject(&mut client, &first);
+    assert_eq!(result_record(&restart)["outcome"], "refused", "{restart}");
+    assert!(
+        result_record(&restart)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no longer matches")),
+        "{restart}"
+    );
+    daemon.stop();
+    lead.kill();
+}
+
+#[test]
+fn a_released_session_rebinds_its_logical_subject_for_the_next_process() {
+    let sandbox = Sandbox::new("lead-rebind");
+    let lead = LeadProcess::start();
+    let backend = MuxBackend::new(LEAD_PRIMITIVES)
+        .observing(&["wA:p1", "wB:p1"])
+        .with_foreground(ForegroundEvidence::command(
+            lead.pid,
+            Some("sh".into()),
+            None,
+        ));
+    let mut daemon =
+        Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend.clone()))
+            .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let (agent, handle) = pi_lead(
+        &mut client,
+        &lead,
+        "wA:p1",
+        PARENT_INCARNATION,
+        TRACKED_SESSION,
+    );
+    wait_for("the sweep to bind the first session", || {
+        subject_on(&mut client, &agent, TRACKED_SESSION).is_some()
+    });
+    let logical =
+        subject_on(&mut client, &agent, TRACKED_SESSION).expect("first subject")["subject_id"]
+            .clone();
+    publish_session(
+        &mut client,
+        &agent,
+        PARENT_INCARNATION,
+        Some(&handle),
+        2,
+        MOVED_SESSION,
+    );
+    wait_for("the sweep to bind the moved session", || {
+        subject_on(&mut client, &agent, MOVED_SESSION).is_some()
+    });
+
+    // The session is free: another process reporting it continues the same
+    // logical subject as its next execution.
+    let (next, _) = pi_lead(&mut client, &lead, "wB:p1", &random_uuid(), TRACKED_SESSION);
+    wait_for("the next process to rebind the session", || {
+        subject_on(&mut client, &next, TRACKED_SESSION).is_some()
+    });
+    let rebound = subject_on(&mut client, &next, TRACKED_SESSION).expect("rebound subject");
+    assert_eq!(rebound["subject_id"], logical, "{rebound}");
+    // The logical subject now resolves to the new process's execution.
+    let current = client.call("lifecycle.get", json!({"subject_id": logical}));
+    assert_eq!(
+        current["result"]["subject"]["execution_generation"], 2,
+        "{current}"
+    );
+    assert_eq!(
+        current["result"]["subject"]["bound_agent_id"],
+        next.as_str(),
+        "{current}"
+    );
     daemon.stop();
     lead.kill();
 }

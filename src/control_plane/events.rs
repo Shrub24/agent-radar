@@ -114,6 +114,7 @@ impl Facts {
         subject.execution_generation = self.execution_generation;
         subject.identity_unresolved = self.identity_unresolved;
         subject.managed = self.managed.clone();
+        subject.session = self.session.clone();
         subject.state = self.state;
         subject.successor = self.successor.clone();
         subject.process = self.process.clone();
@@ -169,6 +170,11 @@ pub enum Transition {
     PaneCleanup(PaneCleanup),
     SuccessorReserved {
         spawn_request_id: String,
+    },
+    /// Records the Pi session a launched process reported, once, on a bound subject
+    /// that was launched without one.
+    SessionRecorded {
+        session: String,
     },
     OperationAdmitted(RequestRecord),
     OperationStarted(RequestRecord),
@@ -559,6 +565,14 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
             if facts.exited_at.is_some() && facts.successor.is_none() =>
         {
             facts.successor = Some(spawn_request_id.clone())
+        }
+        Transition::SessionRecorded { session }
+            if facts.state == State::Bound
+                && facts.session.is_none()
+                && facts.exited_at.is_none()
+                && facts.ended_externally_at.is_none() =>
+        {
+            facts.session = Some(session.clone())
         }
         _ => return Err("invalid lifecycle transition".into()),
     }

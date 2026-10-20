@@ -11,8 +11,7 @@ use agent_radar::control_plane::public_contracts::observation::{
     ObservationGetParams, ObservationGetResponse, ObservationSnapshot,
 };
 use agent_radar::control_plane::public_contracts::{
-    Handoff, HandoffInbox, HandoffPublishParams, HandoffReceipt, LaunchIdentityMarker,
-    ManagedLaunchMetadata, PingResult,
+    Handoff, HandoffInbox, HandoffPublishParams, HandoffReceipt, ManagedLaunchMetadata, PingResult,
 };
 use agent_radar::control_plane::registry::publication::FactsSnapshot;
 use agent_radar::control_plane::registry::spawn::PublicSpawnExitObservation;
@@ -160,7 +159,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_pair::<Handoff>(&output, "handoff")?;
     write_pair::<HandoffReceipt>(&output, "handoff-receipt")?;
     write_pair::<ManagedLaunchMetadata>(&output, "managed-launch-metadata")?;
-    write_pair::<LaunchIdentityMarker>(&output, "launch-identity-marker")?;
     write_pair::<FactsSnapshot>(&output, "facts-snapshot")?;
     write_pair::<PublicSpawnExitObservation>(&output, "spawn-exit-observation")?;
     write_pair::<ObservationGetParams>(&output, "observation-get-params")?;

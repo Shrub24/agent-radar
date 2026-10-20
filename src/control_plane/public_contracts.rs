@@ -30,18 +30,6 @@ pub struct ManagedLaunchMetadata {
     pub parent_subject_id: Option<String>,
 }
 
-/// A non-secret Pi-session breadcrumb issued by Radar. This is correlation
-/// evidence only and cannot establish lifecycle authority.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LaunchIdentityMarker {
-    pub version: u32,
-    pub subject_id: String,
-    pub launch_id: String,
-    #[schemars(range(min = 1u32, max = 4294967295u32))]
-    pub execution_generation: u32,
-}
-
 /// The current managed Pi execution that published or received a handoff.
 /// `subject_id` is stable across verified successors; `execution_id` and
 /// generation identify the exact execution that took the action.

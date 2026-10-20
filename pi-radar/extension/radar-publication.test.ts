@@ -704,6 +704,48 @@ test("the owner publishes about a child's subject and retires only its own write
 const SESSION_A = "11111111-2222-4333-8444-555555555555";
 const SESSION_B = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 
+test("a session Radar adopts names its managed subject, and a duplicate warns without one", async () => {
+	const { root, store, cleanup } = makeRoot();
+	const ADOPTED = "9d1e2f3a-4b5c-4d6e-8f70-123456789abc";
+	let standing: unknown = { state: "managed", subject_id: ADOPTED };
+	try {
+		const daemon = fakeDaemon({
+			"agent.context": (params) =>
+				ok({
+					writer: {
+						handle: "5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a",
+						source: params.publisher.source,
+						incarnation: params.publisher.incarnation,
+						generation: 1,
+						sequence: params.sequence,
+					},
+					management: standing,
+				}),
+		});
+		const { scheduler } = fakeScheduler();
+		const publication = publicationFor(daemon, {
+			dataRoot: root,
+			store,
+			scheduler,
+			slot: createRadarProcessSlot(),
+		});
+		publication.context.update(SESSION_A);
+		await settle();
+		assert.equal((await publication.subject())?.subject_id, ADOPTED);
+		assert.equal(publication.context.diagnostic(), undefined);
+
+		// The session is held by another live process: Radar answers duplicate, the
+		// identity is withdrawn, and the process gets one warning.
+		standing = { state: "duplicate" };
+		publication.context.update(SESSION_B);
+		await settle();
+		assert.equal((await publication.subject())?.subject_id, undefined);
+		assert.match(publication.context.diagnostic() ?? "", /another live Radar process/);
+	} finally {
+		cleanup();
+	}
+});
+
 test("a current session is published once and renewed from the same cadence", async () => {
 	const { root, store, cleanup } = makeRoot();
 	try {

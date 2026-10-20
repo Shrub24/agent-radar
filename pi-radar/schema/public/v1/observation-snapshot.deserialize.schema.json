@@ -863,47 +863,6 @@
       ],
       "type": "string"
     },
-    "LaunchIdentityEvidence": {
-      "description": "A daemon-owned process lifecycle target, joined to one registration by exact\nagent id and process birth identity.",
-      "enum": [
-        "missing",
-        "matching",
-        "stale",
-        "contradictory",
-        "unavailable"
-      ],
-      "type": "string"
-    },
-    "LaunchIdentityMarker": {
-      "additionalProperties": false,
-      "description": "A non-secret Pi-session breadcrumb issued by Radar. This is correlation\nevidence only and cannot establish lifecycle authority.",
-      "properties": {
-        "execution_generation": {
-          "format": "uint32",
-          "maximum": 4294967295,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "launch_id": {
-          "type": "string"
-        },
-        "subject_id": {
-          "type": "string"
-        },
-        "version": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "version",
-        "subject_id",
-        "launch_id",
-        "execution_generation"
-      ],
-      "type": "object"
-    },
     "LifecycleObservation": {
       "description": "Public lifecycle identity carried into the display projection.",
       "properties": {
@@ -1066,6 +1025,7 @@
       "type": "object"
     },
     "ManagedSubject": {
+      "description": "A daemon-owned process lifecycle target, joined to one registration by exact\nagent id and process birth identity.",
       "properties": {
         "child_close": {
           "anyOf": [
@@ -1079,9 +1039,6 @@
         },
         "identity_unresolved": {
           "type": "boolean"
-        },
-        "launch_identity": {
-          "$ref": "#/$defs/LaunchIdentityEvidence"
         },
         "metadata": {
           "$ref": "#/$defs/ManagedMetadata"
@@ -1112,7 +1069,6 @@
         "subject_id",
         "process",
         "identity_unresolved",
-        "launch_identity",
         "metadata",
         "state"
       ],
@@ -1782,14 +1738,8 @@
           "type": "string"
         },
         "launch_identity": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LaunchIdentityMarker"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "description": "Read from records and requests that predate session-bound management, and\nnever written or served: the execution a session belongs to is its\nattached subject, not a marker a process presents.",
+          "writeOnly": true
         },
         "lease_ms": {
           "format": "int64",

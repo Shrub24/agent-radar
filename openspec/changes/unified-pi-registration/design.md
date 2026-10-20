@@ -34,7 +34,7 @@ Repeated reports, lost replies and daemon restart resolve existing records befor
 
 The accepted attachment remains the incumbent. A second process reporting that session is baseline-visible, warns as duplicate and gets no managed identity or inbox access. Persist enough conflict state that daemon restart, heartbeat or extension reload cannot accidentally promote the stale duplicate after the incumbent disappears.
 
-Reconsider only after a real session reload/resume from persisted state or a new process, and only when the incumbent is released or verified no longer attached. Failed scans and expired leases do not prove release. Use the Pi host's session-load signal if it distinguishes a fresh load from reconnect/reload; otherwise require process restart. No history comparison, merge or forced takeover mechanism.
+Reconsider at the `session_start` boundary (any `/reload`, `/resume`, or new process re-attempts registration), and only when the incumbent is released or verified no longer attached. Failed scans and expired leases do not prove release. No Pi host signal distinguishing fresh load from reload is required. No history comparison, merge or forced takeover mechanism.
 
 The behavioral contract is settled. Verifying the host signal selects between these defined implementation paths; it is not permission to invent a weaker admission rule.
 
@@ -68,7 +68,7 @@ Use existing records and storage facilities for the mapping/attachment changes. 
 
 - Session changes can invalidate pending controls with the same PID: current attachment is a required fence.
 - Mutable application caches can publish for the wrong session: update/invalidate at the real pi-radar and Herdsman boundaries, not only the daemon DTO.
-- Duplicate admission requires evidence of fresh loading: process restart is the conservative fallback if the host cannot supply it.
+- Duplicate repair relies on the `session_start` boundary and incumbent release, not on detecting fresh session loads. Heartbeat expiry is a stale warning only, not a release signal; surfacing it is deferred.
 - Existing ambiguous subjects cannot safely be merged: surface them without introducing repair tooling until real data warrants it.
 - Observed context can contain secrets or expired values: keep recipes private and document the reproduction promise.
 - Cross-tab children remain an edge case: basic links survive, topology stays untouched, gathering remains in `ideas.md`.

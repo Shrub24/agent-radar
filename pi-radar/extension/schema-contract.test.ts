@@ -70,29 +70,6 @@ test("daemon ping schemas distinguish tolerated input defaults from emitted outp
 	assert.equal(validates(defaultedInput), false);
 });
 
-test("launch identity marker schema is versioned and JSON-safe", () => {
-	const validate = ajv.compile(schema("launch-identity-marker.deserialize.schema.json"));
-	assert.equal(
-		validate({
-			version: 1,
-			subject_id: "11111111-1111-4111-8111-111111111111",
-			launch_id: "22222222-2222-4222-8222-222222222222",
-			execution_generation: 0xffff_ffff,
-		}),
-		true,
-		ajv.errorsText(validate.errors),
-	);
-	assert.equal(
-		validate({
-			version: 1,
-			subject_id: "11111111-1111-4111-8111-111111111111",
-			launch_id: "22222222-2222-4222-8222-222222222222",
-			execution_generation: 0x1_0000_0000,
-		}),
-		false,
-	);
-});
-
 test("managed launch metadata schemas cover the typed spawn intent shape", () => {
 	const input = ajv.compile(schema("managed-launch-metadata.deserialize.schema.json"));
 	const output = ajv.compile(schema("managed-launch-metadata.serialize.schema.json"));

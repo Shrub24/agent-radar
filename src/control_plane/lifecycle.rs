@@ -44,6 +44,8 @@ use crate::runtime::LaunchRequest;
 /// Environment variables the bootstrap reads and removes before the program runs.
 pub const SUBJECT_ENV: &str = "PI_RADAR_LAUNCH_SUBJECT";
 pub const CORRELATION_ENV: &str = "PI_RADAR_LAUNCH_CORRELATION";
+// Retired: the managed subject is the attached execution, not an injected identity.
+// These names are still dropped from recipes captured before that change.
 pub const MANAGED_SUBJECT_ENV: &str = "PI_RADAR_MANAGED_SUBJECT_ID";
 pub const MANAGED_LAUNCH_ENV: &str = "PI_RADAR_MANAGED_LAUNCH_ID";
 pub const MANAGED_GENERATION_ENV: &str = "PI_RADAR_MANAGED_EXECUTION_GENERATION";
@@ -743,44 +745,123 @@ pub fn observe_exit(
     observe_exit_from(registry, subject_id, verifier, now_ms, Observer::Read)
 }
 
-/// Records an enrolled subject for a running registration the daemon did not
-/// launch. Its process is already verified, so it is bound at once.
-///
-/// Idempotent: a registration already bound to this session answers with its
-/// established subject. A registration tracked for another session, or a session
-/// another live process holds, is refused, so binding stays unique.
-pub fn enroll(registry: &Registry, subject: &Subject) -> Result<String, String> {
-    let _transition = registry.transition();
-    let agent = subject
-        .bound_agent_id
-        .as_deref()
-        .ok_or("an enrolled subject must name its registration")?;
-    let session = subject
-        .session
-        .as_deref()
-        .ok_or("an enrolled subject must name its session")?;
-    if let Some(tracked) = bound_subject(registry, agent)? {
-        return match tracked.state {
-            State::Bound if tracked.session.as_deref() == Some(session) => Ok(tracked.subject_id),
-            State::Bound => Err("the registration is already tracked for another session".into()),
-            _ => Err("the registration is already tracked by a subject that has ended".into()),
-        };
-    }
-    let held = find_subject(registry, |other| {
-        matches!(other.state, State::Bound)
-            && other.session.as_deref() == Some(session)
-            && other.bound_agent_id.as_deref() != Some(agent)
-    })?;
-    if held.is_some() {
-        return Err("the session is already attached to another live process".into());
-    }
-    write(registry, subject)?;
-    Ok(subject.subject_id.clone())
+/// How a registration stands against one Pi session. A session has at most one
+/// attachment: the live registration whose published session is that session.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Attachment {
+    /// This registration already holds the session's live subject.
+    Own(Box<Subject>),
+    /// Another live registration holds the session.
+    Other,
+    /// No live registration holds the session; this one may bind it.
+    Free,
 }
 
-/// Records an enrolled subject for a registration whose process the caller has
-/// verified live on its pane. The enrollment request is its origin, so it names no
-/// spawn edge, and it is bound at once. Returns the new subject id.
+/// Whether a tracked subject is attached to a live process: bound, not ended, and
+/// its registration still publishes the subject's session. A registration that
+/// moved to another session has released the subject; a stale heartbeat has not.
+pub fn is_attached(registry: &Registry, subject: &Subject, now_ms: i64) -> Result<bool, String> {
+    let (Some(agent), Some(session)) = (
+        subject.bound_agent_id.as_deref(),
+        subject.session.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    if subject.state != State::Bound
+        || subject.exited_at.is_some()
+        || subject.ended_externally_at.is_some()
+    {
+        return Ok(false);
+    }
+    Ok(registry
+        .context(agent, now_ms)?
+        .and_then(|context| context.context.session)
+        .as_deref()
+        == Some(session))
+}
+
+/// Records the session a launched process reports, once, when its bound subject
+/// was launched without one: a daemon-spawned child does not know its session
+/// until the process publishes it. A session another live registration holds is
+/// not recorded, so the launch stays unattached rather than duplicating it.
+pub fn record_launch_session(
+    registry: &Registry,
+    agent_id: &str,
+    session: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let _transition = registry.transition();
+    let mut after: Option<String> = None;
+    loop {
+        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
+        if let Some(found) = page.iter().find(|subject| {
+            subject.bound_agent_id.as_deref() == Some(agent_id)
+                && subject.session.is_none()
+                && subject.state == State::Bound
+                && subject.exited_at.is_none()
+                && subject.ended_externally_at.is_none()
+        }) {
+            if !matches!(
+                attachment(registry, agent_id, session, now_ms)?,
+                Attachment::Other
+            ) {
+                // The stored record is the one the transition is checked against.
+                let mut subject = read_recorded(registry, &found.subject_id)?;
+                subject.session = Some(session.to_string());
+                subject.recorded_at = format_millis(now_ms);
+                write(registry, &subject)?;
+            }
+            return Ok(());
+        }
+        match page.last() {
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// How `agent_id` stands against `session`, read before any verification so a
+/// registration that cannot bind costs no process inspection.
+pub fn attachment(
+    registry: &Registry,
+    agent_id: &str,
+    session: &str,
+    now_ms: i64,
+) -> Result<Attachment, String> {
+    let mut after: Option<String> = None;
+    let mut found = Attachment::Free;
+    loop {
+        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
+        for subject in &page {
+            if subject.session.as_deref() != Some(session)
+                || !is_attached(registry, subject, now_ms)?
+            {
+                continue;
+            }
+            if subject.bound_agent_id.as_deref() == Some(agent_id) {
+                return Ok(Attachment::Own(Box::new(subject.clone())));
+            }
+            found = Attachment::Other;
+        }
+        match page.last() {
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
+            _ => return Ok(found),
+        }
+    }
+}
+
+/// Binds a verified, unlaunched process to its registration's current Pi session.
+/// Returns the subject that holds the session.
+///
+/// - The registration already holds the session: its subject, unchanged.
+/// - Another live registration holds it: refused; the session has one attachment.
+/// - A prior execution of the session is no longer attached (its process exited,
+///   or the process moved on): a new execution of that same logical subject, so
+///   its children, inbox and managed metadata continue with the session.
+/// - Otherwise a new logical subject for the session.
+///
+/// The decision is made inside the transition, so a lost reply or a concurrent
+/// report cannot create a second binding.
 pub fn enroll_subject(
     registry: &Registry,
     enrollment_id: &str,
@@ -790,7 +871,60 @@ pub fn enroll_subject(
     launch: LaunchContext,
     now_ms: i64,
 ) -> Result<String, String> {
+    let _transition = registry.transition();
+    let mut prior: Option<Subject> = None;
+    let mut after: Option<String> = None;
+    loop {
+        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
+        for subject in &page {
+            if subject.session.as_deref() != Some(session) || subject.state != State::Bound {
+                continue;
+            }
+            if is_attached(registry, subject, now_ms)? {
+                return if subject.bound_agent_id.as_deref() == Some(agent_id) {
+                    Ok(subject.subject_id.clone())
+                } else {
+                    Err("the session is already attached to another live process".into())
+                };
+            }
+            if prior
+                .as_ref()
+                .is_none_or(|p| p.recorded_at < subject.recorded_at)
+            {
+                prior = Some(subject.clone());
+            }
+        }
+        match page.last() {
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
+            _ => break,
+        }
+    }
+    // A reattachment continues the prior logical subject; a new session starts one.
+    let (logical, generation, managed) = match &prior {
+        Some(prior) if prior.identity_unresolved => {
+            return Err(
+                "the session's prior subject has unresolved identity; resolve it before reattaching"
+                    .into(),
+            );
+        }
+        Some(prior) => (
+            Some(
+                prior
+                    .logical_subject_id
+                    .clone()
+                    .unwrap_or_else(|| prior.subject_id.clone()),
+            ),
+            prior
+                .execution_generation
+                .unwrap_or(1)
+                .checked_add(1)
+                .ok_or("execution generation is exhausted")?,
+            prior.managed.clone(),
+        ),
+        None => (None, 1, ManagedMetadata::default()),
+    };
     let subject_id = random_uuid();
+    let logical = logical.unwrap_or_else(|| subject_id.clone());
     let subject = Subject {
         observation: None,
         pane_absence: None,
@@ -798,13 +932,13 @@ pub fn enroll_subject(
         ended_evidence: None,
         version: SUBJECT_VERSION,
         subject_id: subject_id.clone(),
-        logical_subject_id: Some(subject_id),
-        execution_generation: Some(1),
+        logical_subject_id: Some(logical),
+        execution_generation: Some(generation),
         identity_unresolved: false,
         spawn_request_id: enrollment_id.to_string(),
         origin: Origin::Enrolled,
         state: State::Bound,
-        managed: ManagedMetadata::default(),
+        managed,
         launch,
         session: Some(session.to_string()),
         successor: None,
@@ -816,33 +950,8 @@ pub fn enroll_subject(
         pane_cleanup: None,
         recorded_at: format_millis(now_ms),
     };
-    enroll(registry, &subject)
-}
-
-/// The tracked subject that names `agent_id`, if one does.
-pub fn bound_subject(registry: &Registry, agent_id: &str) -> Result<Option<Subject>, String> {
-    find_subject(registry, |subject| {
-        subject.bound_agent_id.as_deref() == Some(agent_id)
-    })
-}
-
-/// The first tracked subject that satisfies `matches`, over the same bounded, fair
-/// walk every subject sweep uses.
-fn find_subject(
-    registry: &Registry,
-    matches: impl Fn(&Subject) -> bool,
-) -> Result<Option<Subject>, String> {
-    let mut after: Option<String> = None;
-    loop {
-        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
-        if let Some(found) = page.iter().find(|subject| matches(subject)) {
-            return Ok(Some(found.clone()));
-        }
-        match page.last() {
-            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
-            _ => return Ok(None),
-        }
-    }
+    write(registry, &subject)?;
+    Ok(subject_id)
 }
 
 /// Records the replacement dispatched for this process generation, before the
@@ -1454,15 +1563,6 @@ pub fn wrap(bootstrap: &Bootstrap, ticket: &Ticket, target: LaunchRequest) -> La
     wrapped.extend(argv);
     env.insert(SUBJECT_ENV.to_string(), ticket.subject_id.clone());
     env.insert(CORRELATION_ENV.to_string(), ticket.correlation.clone());
-    env.insert(
-        MANAGED_SUBJECT_ENV.to_string(),
-        ticket.logical_subject_id.clone(),
-    );
-    env.insert(MANAGED_LAUNCH_ENV.to_string(), ticket.launch_id.clone());
-    env.insert(
-        MANAGED_GENERATION_ENV.to_string(),
-        ticket.execution_generation.to_string(),
-    );
     if let Some(parent_subject_id) = &ticket.parent_subject_id {
         env.insert(
             MANAGED_PARENT_SUBJECT_ENV.to_string(),
@@ -1756,6 +1856,16 @@ fn write(registry: &Registry, subject: &Subject) -> Result<(), String> {
         (
             Source::ProcessObservation,
             Transition::AbsencePending(target.pane_absence.clone()),
+        )
+    } else if previous.session.is_none() && target.session.is_some() {
+        (
+            Source::Registration,
+            Transition::SessionRecorded {
+                session: target
+                    .session
+                    .clone()
+                    .ok_or("a recorded session is named")?,
+            },
         )
     } else {
         return Err("unsupported lifecycle transition".into());

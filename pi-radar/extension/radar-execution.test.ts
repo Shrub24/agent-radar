@@ -37,7 +37,6 @@ function harness(
 		slot?: RadarProcessSlot;
 		root?: string;
 		scheduler?: RadarScheduler;
-		markerEnvironment?: Record<string, string | undefined>;
 	} = {},
 ) {
 	const handlers = new Map<
@@ -48,7 +47,6 @@ function harness(
 	const root =
 		options.root ?? mkdtempSync(join(tmpdir(), "radar-execution-test-"));
 	const calls: Array<{ method: string; params: any }> = [];
-	const markerBranch: Array<{ type: string; customType: string; data: unknown }> = [];
 	let minted = 0;
 	const client: RadarPublicationClient = {
 		ping: async () => ok({
@@ -115,14 +113,10 @@ function harness(
 				};
 			},
 			events,
-			appendEntry(customType: string, data?: unknown) {
-				markerBranch.push({ type: "custom", customType, data });
-			},
 		},
 		{
 			client,
 			dataRoot: root,
-			markerEnvironment: options.markerEnvironment,
 			slot: options.slot ?? createRadarProcessSlot(),
 			incarnation: INCARNATION,
 			questionnaireEvent: "rpiv:ask-user:blocked",
@@ -162,7 +156,6 @@ function harness(
 		calls,
 		emit,
 		events,
-		markerBranch,
 		snapshots,
 		contexts,
 		async settled(): Promise<void> {
@@ -175,38 +168,6 @@ function harness(
 		},
 	};
 }
-
-test("session_start stores the daemon-issued marker in the active Pi branch", async () => {
-	const h = harness({
-		markerEnvironment: {
-			PI_RADAR_MANAGED_SUBJECT_ID: "3d6f021b-4718-4a2e-a8c9-9920ff71af12",
-			PI_RADAR_MANAGED_LAUNCH_ID: "97403b5a-f470-4c80-bcb0-2bc84ad0e1c0",
-			PI_RADAR_MANAGED_EXECUTION_GENERATION: "2",
-		},
-	});
-	try {
-		// Pi's host writes appendEntry into the active branch.
-		const sessionManager = {
-			getBranch: () => h.markerBranch,
-			getSessionId: () => "c1a2b3d4-e5f6-4a7b-8c9d-0e1a2b3c4d5e",
-		};
-		h.emit("session_start", {}, { sessionManager });
-		h.emit("session_start", {}, { sessionManager });
-		await h.settled();
-		assert.equal(h.markerBranch.length, 1);
-		assert.equal(h.markerBranch[0].customType, "pi-radar.launch-identity");
-		const marker = {
-			version: 1,
-			subject_id: "3d6f021b-4718-4a2e-a8c9-9920ff71af12",
-			launch_id: "97403b5a-f470-4c80-bcb0-2bc84ad0e1c0",
-			execution_generation: 2,
-		};
-		assert.deepEqual(h.markerBranch[0].data, marker);
-		assert.deepEqual(h.contexts()[0].context.launch_identity, marker);
-	} finally {
-		h.stop();
-	}
-});
 
 test("a subject is registered before anything is published about it", async () => {
 	const h = harness();

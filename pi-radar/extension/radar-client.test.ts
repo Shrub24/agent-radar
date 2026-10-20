@@ -1487,6 +1487,58 @@ test("an ambivalent registration reply is not a registration", async () => {
 	}
 });
 
+test("the context answer reports Radar's standing on the session when it names one", async () => {
+	const subjectId = "9d1e2f3a-4b5c-4d6e-8f70-123456789abc";
+	const DUPLICATE_SESSION = "c3d4e5f6-a7b8-4c9d-8e0f-1a2b3c4d5e6f";
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, { protocol: 2, revision: 1, contracts: ["registry.v1"] });
+		const session = request.params.context.session;
+		const management =
+			session === UUID_B
+				? { state: "managed", subject_id: subjectId }
+				: session === DUPLICATE_SESSION
+					? { state: "duplicate" }
+					: undefined;
+		return reply(request, {
+			writer: {
+				handle: FIXTURE_WRITER,
+				source: "herdsman-pi",
+				incarnation: UUID_A,
+				generation: 1,
+				sequence: request.params.sequence,
+			},
+			context: { version: 1, agent_id: UUID_A },
+			warning: null,
+			management,
+		});
+	});
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		const publish = (sequence: number, session: string) =>
+			client.context({
+				agent_id: UUID_A,
+				publisher: { source: "herdsman-pi", incarnation: UUID_A },
+				sequence,
+				context: { session },
+			});
+		const managed = await publish(1, UUID_B);
+		assert.equal(managed.ok && managed.value.management?.state, "managed");
+		assert.deepEqual(managed.ok && managed.value.management, {
+			state: "managed",
+			subject_id: subjectId,
+		});
+		const duplicate = await publish(2, DUPLICATE_SESSION);
+		assert.deepEqual(duplicate.ok && duplicate.value.management, { state: "duplicate" });
+		// An answer that names no standing (an older daemon) stays undecided.
+		const older = await publish(3, "d2b3c4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e");
+		assert.equal(older.ok && "management" in older.value, false);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
 test("the context channel carries only the session and keeps the returned binding", async () => {
 	const fixture = makeFixture((request) =>
 		request.method === "daemon.ping"
@@ -1660,6 +1712,7 @@ test("the canonical daemon contract fixture round-trips through this client", as
 					generation: 1,
 					sequence: 1,
 				},
+				management: { state: "unmanaged" },
 			},
 		});
 		assert.deepEqual(await client.context(switchedContext), {

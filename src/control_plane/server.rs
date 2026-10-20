@@ -28,8 +28,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
-use std::collections::BTreeSet;
-
 use crate::control_plane::communication::{self, CommunicationStore};
 use crate::control_plane::containers;
 use crate::control_plane::lifecycle::{self as subjects, Bootstrap};
@@ -1107,28 +1105,32 @@ fn communication_identity(
         .context
         .session
         .ok_or_else(|| communication::Error::Invalid("sender has no current Pi session".into()))?;
-    let marker = context.context.launch_identity.ok_or_else(|| {
-        communication::Error::Invalid("handoff operations require a Radar-managed execution".into())
-    })?;
-    let subject = subjects::read_logical(registry, &marker.subject_id)
+    let now_ms = unix_millis();
+    let subject = match subjects::attachment(registry, agent_id, &session_id, now_ms)
         .map_err(communication::Error::Internal)?
-        .ok_or(communication::Error::NotFound)?;
-    if subject.identity_unresolved
-        || subject.logical_subject_id.as_deref() != Some(marker.subject_id.as_str())
-        || subject.spawn_request_id != marker.launch_id
-        || subject.execution_generation != Some(marker.execution_generation)
-        || subject.session.as_deref() != Some(session_id.as_str())
     {
+        subjects::Attachment::Own(subject) => *subject,
+        _ => {
+            return Err(communication::Error::Invalid(
+                "handoff operations require a Radar-managed execution attached to the current session"
+                    .into(),
+            ));
+        }
+    };
+    if subject.identity_unresolved {
         return Err(communication::Error::Invalid(
-            "Radar launch identity is stale or does not match the current execution".into(),
+            "Radar launch identity is unresolved".into(),
         ));
     }
     Ok(crate::control_plane::public_contracts::HandoffIdentity {
         agent_id: agent_id.to_owned(),
         session_id,
-        subject_id: marker.subject_id,
+        subject_id: subject
+            .logical_subject_id
+            .clone()
+            .unwrap_or_else(|| subject.subject_id.clone()),
         execution_id: subject.subject_id,
-        execution_generation: marker.execution_generation,
+        execution_generation: subject.execution_generation.unwrap_or(1),
     })
 }
 
@@ -2365,16 +2367,32 @@ fn registry_request(
             let core = locked(core);
             let now_ms = store::now_ms();
             match core.registry.publish_context(&publish, now_ms) {
-                Ok(result) => Response::ok(
-                    &request.id,
-                    json!({
-                        // The write response returns the credential only to its
-                        // publisher; agent.get/list use the credential-free projection.
-                        "writer": result.record.writer,
-                        "context": result.record.public(now_ms, core.registry.serving_epoch()),
-                        "warning": result.warning,
-                    }),
-                ),
+                Ok(result) => {
+                    // A launched process learns its session by reporting it; record it
+                    // on its bound subject, so that subject can be attached. A failure
+                    // leaves the subject unattached, which is reported, not retried here.
+                    if let Some(session) = publish.context.session.as_deref()
+                        && let Err(error) = subjects::record_launch_session(
+                            &core.registry,
+                            &publish.agent_id,
+                            session,
+                            now_ms,
+                        )
+                    {
+                        tracing::warn!(%error, "could not record a launched session");
+                    }
+                    Response::ok(
+                        &request.id,
+                        json!({
+                            // The write response returns the credential only to its
+                            // publisher; agent.get/list use the credential-free projection.
+                            "writer": result.record.writer,
+                            "context": result.record.public(now_ms, core.registry.serving_epoch()),
+                            "warning": result.warning,
+                            "management": management_view(&core.registry, &publish.agent_id, now_ms),
+                        }),
+                    )
+                }
                 Err(error) => registry_error(request, error),
             }
         }
@@ -6758,9 +6776,6 @@ fn spawn_sweeper(
             // And for container observation, so a record set larger than one page
             // is reached over successive passes.
             let mut reconcile_after: Option<String> = None;
-            // The launched places this run already offered for enrollment, so a
-            // refusal is attempted once rather than every pass.
-            let mut lead_attempts: BTreeSet<String> = BTreeSet::new();
             while !stopping.load(Ordering::SeqCst) {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -6780,13 +6795,9 @@ fn spawn_sweeper(
                 {
                     tracing::error!(%error, "launch pane observation failed");
                 }
-                if let Err(error) = bind_launched_leads(
-                    &core,
-                    &registry,
-                    observation.as_ref(),
-                    &mut lead_attempts,
-                    &verification,
-                ) {
+                if let Err(error) =
+                    bind_launched_leads(&core, &registry, observation.as_ref(), &verification)
+                {
                     tracing::error!(%error, "launch enrollment pass failed");
                 }
                 if let Err(error) = adopt_topology(
@@ -6825,16 +6836,43 @@ const REGISTRY_SCAN: usize = 128;
 // integration; renaming it is a wire migration owned by the pi-radar release.
 const PI_PUBLISHER_SOURCE: &str = "herdsman-pi";
 
+/// The management standing of a publisher's current session, so a publisher can
+/// tell managed, unmanaged and duplicate sessions apart after each publication.
+/// Read errors answer `unmanaged` rather than failing the publication, which
+/// already succeeded.
+fn management_view(
+    registry: &registry::Registry,
+    agent_id: &str,
+    now_ms: i64,
+) -> serde_json::Value {
+    let session = match registry.context(agent_id, now_ms) {
+        Ok(Some(context)) => context.context.session,
+        _ => None,
+    };
+    let Some(session) = session else {
+        return json!({"state": "unmanaged"});
+    };
+    match subjects::attachment(registry, agent_id, &session, now_ms) {
+        Ok(subjects::Attachment::Own(subject_id)) => {
+            json!({"state": "managed", "subject_id": subject_id})
+        }
+        Ok(subjects::Attachment::Other) => json!({"state": "duplicate"}),
+        Ok(subjects::Attachment::Free) | Err(_) => json!({"state": "unmanaged"}),
+    }
+}
+
 /// Adopts eligible Pi registrations as managed leads: the registration is verified
 /// in the pane it reports and reports a fresh session. The display does not own
-/// this, so adoption does not depend on a dashboard being connected. Each
-/// registration is attempted once per daemon run, so a refusal is recorded rather
-/// than retried in a loop; a restart reconsiders it.
+/// this, so adoption does not depend on a dashboard being connected.
+///
+/// Re-checked on every pass while a registration's session is unattached, so a
+/// session that a live process holds is refused cheaply, and the first pass after
+/// the incumbent releases it binds it. A session switch in the same process is
+/// picked up the same way.
 fn bind_launched_leads(
     core: &Arc<Mutex<Core>>,
     registry: &Arc<Registry>,
     observation: Option<&FleetObservation>,
-    attempted: &mut BTreeSet<String>,
     verification: &Arc<VerificationBudget>,
 ) -> Result<usize, String> {
     let Some(inventory) = observation else {
@@ -6871,7 +6909,6 @@ fn bind_launched_leads(
                 if registration.request.source != PI_PUBLISHER_SOURCE
                     || registration.request.spawn_token.is_some()
                     || inventory.pane(&pane).is_none()
-                    || attempted.contains(&registration.agent_id)
                 {
                     continue;
                 }
@@ -6900,8 +6937,15 @@ fn bind_launched_leads(
         let Some(session) = context.context.session.clone() else {
             continue;
         };
+        // An attached session needs nothing, and a session another live process
+        // holds is refused without inspecting any process.
+        if !matches!(
+            subjects::attachment(registry, &agent_id, &session, now)?,
+            subjects::Attachment::Free
+        ) {
+            continue;
+        }
         attempts += 1;
-        attempted.insert(agent_id.clone());
         // The registration's own claimed process must be this pane's verified
         // occupant, so a registration cannot claim a pane that is not its own.
         if verify_live_occupant(&backend, &verifier, &pane, &claim, &stopping, verification)
@@ -6917,9 +6961,11 @@ fn bind_launched_leads(
         match record_enrollment(registry, &verifier, &params, &claim, &enrollment_id, now) {
             Ok(_) => {
                 bound += 1;
-                tracing::info!(%agent_id, %pane, "enrolled a managed Pi lead");
+                tracing::info!(%agent_id, %pane, "bound a managed Pi session");
             }
-            Err(error) => tracing::warn!(%error, %agent_id, %pane, "lead enrollment refused"),
+            Err(error) => {
+                tracing::debug!(%error, %agent_id, %pane, "lead binding not yet possible")
+            }
         }
     }
     Ok(bound)

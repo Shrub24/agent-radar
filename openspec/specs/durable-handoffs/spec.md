@@ -23,9 +23,9 @@ A managed recipient SHALL recover pending handoffs by inbox scan without relying
 - **AND** recovery does not depend on replaying a pointer event
 
 #### Scenario: Verified successor reads the subject inbox
-- **WHEN** a current execution presents a fresh Radar marker matching the latest verified execution and generation of the managed subject
+- **WHEN** a registration is attached to the managed subject of its current Pi session, with a verified process and a resolved identity
 - **THEN** the daemon allows that execution to recover the same subject inbox
-- **AND** a stale marker or unresolved identity is refused
+- **AND** a detached registration, a session it no longer publishes, or an unresolved identity is refused
 
 #### Scenario: Managed sender targets its recorded parent only
 - **WHEN** a managed sender publishes a handoff to its recorded `parent_subject_id`
