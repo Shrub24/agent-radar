@@ -4505,7 +4505,7 @@ mod tests {
         // A live agent title, and a pane keeping a finished session's label.
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
-                agent.label = Some("π - Inspect Bifrost - nix-homelab".into());
+                agent.label = Some("Bolt - Inspect Bifrost - nix-homelab".into());
             }
         }
         for pane in &mut observation.panes {
@@ -4542,7 +4542,7 @@ mod tests {
             logo.map_or_else(|| "  ".to_string(), |mark| format!("{mark} "))
         );
         assert!(screen.contains(&row), "{screen}");
-        assert!(!screen.contains("π - Inspect"), "{screen}");
+        assert!(!screen.contains("Bolt - Inspect"), "{screen}");
     }
 
     fn spans_text(spans: &[Span<'_>]) -> String {

@@ -130,6 +130,7 @@ pub type Brands = BTreeMap<String, Color>;
 /// cannot follow the terminal's theme the way a palette slot can.
 pub const BRAND_DEFAULTS: &[(&str, &str)] = &[
     ("pi", "#d67079"),
+    ("pi-bolt", "#8b77d5"),
     ("claude", "#d97757"),
     ("gemini", "#4285f4"),
     ("kimi", "#1783ff"),
@@ -957,6 +958,10 @@ htop = "none"
         assert_eq!(config.brand("claude"), Some(Color::Indexed(208)));
         assert_eq!(config.brand("my-agent"), Some(Color::Rgb(0, 255, 0)));
         assert_eq!(config.brand("pi"), Some(Color::LightBlue));
+        assert_ne!(
+            Config::default().brand("pi"),
+            Config::default().brand("pi-bolt")
+        );
         // An untouched vendor keeps its shipped colour.
         assert_eq!(config.brand("gemini"), Config::default().brand("gemini"));
     }

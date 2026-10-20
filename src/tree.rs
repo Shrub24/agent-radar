@@ -702,9 +702,8 @@ fn agent_node(
     };
     // The name a row shows is what Herdsman publishes for this agent — a
     // managed worker's runtime label, a lead's session name — and only then
-    // the reported title. Herdr writes the vendor's own mark and name into
-    // that title and the row already draws the mark beside it, so only the
-    // words are kept.
+    // the reported title. A known vendor prefix supplies the identity when
+    // the report has none; the prefix itself is stripped from the words.
     let fallback = match &id {
         RowId::Registered(agent_id) => agent_id.clone(),
         _ => location.pane_id.clone(),
@@ -717,7 +716,15 @@ fn agent_node(
         .or_else(|| agent.name.clone())
         .or_else(|| pane.and_then(|pane| pane.display_name().map(str::to_string)))
         .unwrap_or(fallback);
-    let displayed = crate::title::display(&raw, agent.name.as_deref());
+    let title_provider = crate::title::session_provider(&raw);
+    let name = match (agent.name.as_deref(), title_provider) {
+        (None, Some(provider)) => Some(provider.to_string()),
+        (Some(name), Some("pi-bolt")) if name.eq_ignore_ascii_case("pi") => {
+            Some("pi-bolt".to_string())
+        }
+        _ => agent.name.clone(),
+    };
+    let displayed = crate::title::display(&raw, name.as_deref());
     let title = crate::title::strip_workspace_suffix(
         &displayed,
         places
@@ -743,7 +750,7 @@ fn agent_node(
                     .map(|label| (*label).to_string()),
                 container: places.panes.get(location.pane_id.as_str()).cloned(),
                 title,
-                name: agent.name.clone(),
+                name,
                 status: agent.status.clone(),
                 state: agent.state(),
                 retained,
@@ -1515,6 +1522,21 @@ mod tests {
             lifecycle_subjects: Vec::new(),
         });
         state
+    }
+
+    #[test]
+    fn a_bolt_title_selects_the_pi_bolt_row_identity() {
+        let mut agent = registered_agent("lead", "wA:p1", "wA:t1", None);
+        agent.name = Some("pi".into());
+        agent.label = Some("Bolt - Inspect Bifrost".into());
+
+        let tree = FleetTree::build(&two_agent_window(vec![agent]));
+        let row = node(&tree, &RowId::Agent("wA:p1".into()));
+        let RowKind::Agent(agent) = &row.row.kind else {
+            panic!("expected agent row")
+        };
+        assert_eq!(agent.name.as_deref(), Some("pi-bolt"));
+        assert_eq!(agent.title, "Inspect Bifrost");
     }
 
     #[test]

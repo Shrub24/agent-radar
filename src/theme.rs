@@ -31,6 +31,8 @@ pub const TEXT: &[(&str, &str)] = &[
     ("kilo", "♟"),
     ("maki", "✳"),
     ("pi", "π"),
+    // Pi-Bolt shares Pi's mark but keeps its own brand colour.
+    ("pi-bolt", "π"),
     ("hermes", "☪"),
     ("cursor", "◆"),
     ("copilot", "⊙"),
@@ -65,6 +67,7 @@ pub const PUA: &[(&str, &str)] = &[
     ("kilo", "\u{e1a7}"),
     ("maki", "\u{e1a8}"),
     ("pi", "\u{e1a9}"),
+    ("pi-bolt", "\u{e1a9}"),
     ("hermes", "\u{e1aa}"),
     ("cursor", "\u{e1ab}"),
     ("copilot", "\u{e1ac}"),
@@ -368,21 +371,25 @@ pub fn logo(agent: Option<&str>) -> Option<&'static str> {
 ///
 /// A latched session title opens with the provider's own mark or name; this
 /// turns either form into the mark a row would draw for that vendor.
-pub fn vendor_mark(token: &str) -> Option<&'static str> {
-    let name = TEXT
-        .iter()
+pub fn provider_name(token: &str) -> Option<&'static str> {
+    if token.eq_ignore_ascii_case("bolt") {
+        return Some("pi-bolt");
+    }
+    TEXT.iter()
         .chain(PUA.iter())
         .find(|(name, mark)| *mark == token || name.eq_ignore_ascii_case(token))
-        .map(|(name, _)| *name)?;
+        .map(|(name, _)| *name)
+}
+
+/// The mark for the vendor a title prefix names or marks, when Radar knows it.
+pub fn vendor_mark(token: &str) -> Option<&'static str> {
+    let name = provider_name(token)?;
     logo(Some(name))
 }
 
 /// Whether `token` names a known agent, by id.
 pub fn is_agent(token: &str) -> bool {
-    config().brand(token).is_some()
-        || TEXT
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case(token))
+    config().brand(token).is_some() || provider_name(token).is_some()
 }
 
 /// Whether Radar ships a mark for this agent kind: the vendors it knows.
@@ -493,6 +500,13 @@ pub fn agent_ink(agent: Option<&str>, retained: bool) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_bolt_uses_the_pi_logo_and_has_its_own_vendor_identity() {
+        assert_eq!(logo(Some("pi-bolt")), logo(Some("pi")));
+        assert_eq!(provider_name("Bolt"), Some("pi-bolt"));
+        assert_eq!(vendor_mark("Bolt"), logo(Some("pi-bolt")));
+    }
 
     #[test]
     fn a_plain_mark_needs_no_nerd_font_and_a_private_use_one_does() {

@@ -90,18 +90,23 @@ pub fn has_provider_prefix(text: &str) -> bool {
 ///
 /// A finished session leaves its title — mark and all — on the pane's label,
 /// and that mark is the only thing on the pane saying which agent it was.
-pub fn session_vendor(text: &str) -> Option<&'static str> {
+pub fn session_provider(text: &str) -> Option<&'static str> {
     let title = strip_pulse(text);
     let head = title.chars().next()?;
     if theme::is_mark(head) {
-        return theme::vendor_mark(&head.to_string());
+        return theme::provider_name(&head.to_string());
     }
     let token = leading_token(title);
     if after_prefix(title, token).is_some() {
-        theme::vendor_mark(token)
+        theme::provider_name(token)
     } else {
         None
     }
+}
+
+/// The vendor mark a latched session title opens with, when Radar knows it.
+pub fn session_vendor(text: &str) -> Option<&'static str> {
+    theme::logo(session_provider(text))
 }
 
 /// What a pane row should show.
@@ -189,7 +194,15 @@ pub fn display(title: &str, agent: Option<&str>) -> String {
     let title = strip_pulse(title);
     let title = after_mark(title).unwrap_or(title);
     let named = match agent {
-        Some(agent) => after_prefix(title, agent),
+        Some(agent) => after_prefix(title, agent).or_else(|| {
+            let token = leading_token(title);
+            let provider = theme::provider_name(token)?;
+            let matches_agent = theme::provider_name(agent)
+                .is_some_and(|agent_provider| provider == agent_provider);
+            (matches_agent || provider == "pi-bolt")
+                .then(|| after_prefix(title, token))
+                .flatten()
+        }),
         None => {
             let token = leading_token(title);
             theme::is_agent(token)
@@ -235,6 +248,16 @@ mod tests {
             "Inspect Bifrost - nix-homelab"
         );
         assert_eq!(display("π 01a0edc4", None), "01a0edc4");
+    }
+
+    #[test]
+    fn bolt_prefix_is_a_pi_bolt_vendor_and_strips_like_the_pi_mark() {
+        let title = "Bolt - Inspect Bifrost";
+        assert!(has_provider_prefix(title));
+        assert_eq!(session_provider(title), Some("pi-bolt"));
+        assert_eq!(session_vendor(title), theme::logo(Some("pi")));
+        assert_eq!(display(title, Some("pi")), "Inspect Bifrost");
+        assert_eq!(display(title, Some("pi-bolt")), "Inspect Bifrost");
     }
 
     #[test]
