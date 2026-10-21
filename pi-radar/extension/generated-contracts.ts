@@ -1385,3 +1385,107 @@ export interface ObservationTooLarge {
   limit_bytes: number;
   revision: number;
 }
+/**
+ * Input accepted by `spawn.list`.
+ *
+ * A caller presents itself; the parent whose launches it reads is derived from
+ * the claim it holds. There is deliberately no parent parameter: naming another
+ * subject would let any client read its launches.
+ */
+export interface SpawnListParamsDeserialize {
+  after?: string | null;
+  limit?: number | null;
+  registration_id?: string | null;
+}
+/**
+ * What a completed request did.
+ */
+export type SpawnListPageSerializeRequestOutcome = "completed" | "refused" | "unknown";
+/**
+ * What a spawn topology read can say about a child's process exit.
+ */
+export type SpawnListPageSerializePublicSpawnExitObservation =
+  | {
+      state: "unknown";
+    }
+  | {
+      code: number | null;
+      observed_at: string;
+      signal: number | null;
+      state: "exited";
+    };
+/**
+ * Freshness is independent of process identity or completion.
+ */
+export type SpawnListPageSerializeFreshness = "fresh" | "stale";
+/**
+ * The state of one edge in the recorded topology: the strongest statement a
+ * read can make about it, and nothing beyond the records and this read's own
+ * evidence.
+ */
+export type SpawnListPageSerializeSpawnState = "unbound" | "bound" | "unresolved";
+
+/**
+ * One page of spawn edges. `next` names the request id the page ended on.
+ */
+export interface SpawnListPageSerialize {
+  next?: string | null;
+  spawns: SpawnListPageSerializePublicSpawnTopology[];
+}
+/**
+ * One edge as a topology read reports it: the stored facts, plus the two things
+ * a read derives instead of inferring.
+ */
+export interface SpawnListPageSerializePublicSpawnTopology {
+  bound?: SpawnListPageSerializeBoundChild | null;
+  created: SpawnListPageSerializeRequestOutcome;
+  exit_observation?: SpawnListPageSerializePublicSpawnExitObservation | null;
+  /**
+   * Freshness of the recorded location against this read's evidence, in the
+   * registry's one freshness vocabulary: `fresh` when the backend reports the
+   * location now, `stale` when it does not — which is never evidence that the
+   * child stopped. Absent when the edge recorded no location, because there is
+   * nothing to verify.
+   */
+  freshness?: SpawnListPageSerializeFreshness | null;
+  launched: SpawnListPageSerializeRequestOutcome;
+  location?: SpawnListPageSerializeRegistryLocation | null;
+  parent: string;
+  parent_session_id?: string | null;
+  parent_subject_id?: string | null;
+  recorded_at: string;
+  request_id: string;
+  state: SpawnListPageSerializeSpawnState;
+  subject_id?: string | null;
+  version: number;
+}
+/**
+ * The child a token bound: the registering incarnation's own registry identity.
+ */
+export interface SpawnListPageSerializeBoundChild {
+  /**
+   * When the edge bound to this incarnation.
+   */
+  bound_at: string;
+  incarnation: string;
+  /**
+   * Exact registry identity returned to the registering child. Absent in legacy records.
+   */
+  registration_id?: string | null;
+  source: string;
+}
+/**
+ * Where an agent's incarnation lives on one backend, in that backend's own
+ * coordinates.
+ *
+ * The backend name is free-form so a source Radar does not ship yet is
+ * preserved rather than rejected; the rest are the coordinates as reported, and
+ * each is optional because a backend need not name every level.
+ */
+export interface SpawnListPageSerializeRegistryLocation {
+  backend: string;
+  instance?: string | null;
+  pane?: string | null;
+  tab?: string | null;
+  workspace?: string | null;
+}

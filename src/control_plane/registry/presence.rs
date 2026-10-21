@@ -153,6 +153,32 @@ fn write(registry: &Registry, name: &str, claim: &Claim) -> Result<(), String> {
     write_atomic(&directory, &directory.join(name), &bytes, MAX_BYTES)
 }
 
+/// One process's current authority over a subject: the pair a reader needs, and
+/// nothing about how it was established. Resolved once per request so no leaf
+/// re-reads the claims, and copied inward as a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub subject_id: String,
+    pub claim_id: String,
+}
+
+/// The attachment a registration currently holds, if any. A pending, duplicate
+/// or released claim is not authority.
+pub fn attachment(
+    registry: &Registry,
+    registration_id: &str,
+) -> Result<Option<Attachment>, String> {
+    Ok(
+        current(registry, registration_id)?.and_then(|claim| match claim.standing {
+            Standing::Granted => Some(Attachment {
+                claim_id: claim.claim_id,
+                subject_id: claim.subject_id?,
+            }),
+            _ => None,
+        }),
+    )
+}
+
 pub fn current(registry: &Registry, registration_id: &str) -> Result<Option<Claim>, String> {
     validate_registration_id(registration_id)?;
     match read(registry, &format!("current-{registration_id}.json"))? {

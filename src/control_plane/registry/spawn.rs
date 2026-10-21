@@ -90,7 +90,7 @@ impl SpawnBindRequest {
 }
 
 /// The child a token bound: the registering incarnation's own registry identity.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundChild {
     pub source: String,
@@ -237,7 +237,7 @@ pub enum PublicSpawnExitObservation {
 
 /// A spawn edge as a client reads it: the parent, the effects, the location and
 /// the bound child, with the token that bound it left behind.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicSpawnEdge {
     pub version: u32,
@@ -295,7 +295,7 @@ pub enum LocationEvidence {
 
 /// One edge as a topology read reports it: the stored facts, plus the two things
 /// a read derives instead of inferring.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PublicSpawnTopology {
     #[serde(flatten)]
     pub edge: PublicSpawnEdge,

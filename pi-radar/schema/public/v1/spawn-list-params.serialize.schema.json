@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Input accepted by `spawn.list`.\n\nA caller presents itself; the parent whose launches it reads is derived from\nthe claim it holds. There is deliberately no parent parameter: naming another\nsubject would let any client read its launches.",
+  "properties": {
+    "after": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "limit": {
+      "default": null,
+      "format": "uint",
+      "maximum": 100,
+      "minimum": 1,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "registration_id": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "registration_id",
+    "after",
+    "limit"
+  ],
+  "title": "spawn-list-params-serialize",
+  "type": "object"
+}

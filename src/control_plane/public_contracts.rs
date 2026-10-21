@@ -1,6 +1,7 @@
 //! Explicit DTOs whose shapes are part of Radar's public wire contract.
 
 pub mod observation;
+pub mod spawn_list;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

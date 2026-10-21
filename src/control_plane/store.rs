@@ -176,7 +176,7 @@ pub enum RecordState {
 }
 
 /// What a completed request did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOutcome {
     /// The operation ran and its effects are in the record.

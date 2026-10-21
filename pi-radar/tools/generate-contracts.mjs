@@ -91,13 +91,16 @@ try {
 		["spawn-exit-observation.serialize.schema.json", "SpawnExitObservation"],
 		["observation-get-params.deserialize.schema.json", "ObservationGetParamsDeserialize"],
 		["observation-get-response.serialize.schema.json", "ObservationGetResponseSerialize"],
+		["spawn-list-params.deserialize.schema.json", "SpawnListParamsDeserialize"],
+		["spawn-list-page.serialize.schema.json", "SpawnListPageSerialize"],
 	];
 	let declarations = "// Generated from the checked-in Rust-derived JSON Schemas. Do not edit.\n\n";
 	for (const [file, typeName] of types) {
 		let schema = JSON.parse(readFileSync(join(temporarySchemas, file), "utf8"));
-		// Presence DTOs share internal definition names with observation; namespace
-		// their generated declarations rather than accidentally merging interfaces.
-		if (file.startsWith("presence-")) {
+		// Some DTOs share internal definition names with others (a page names the
+		// freshness and state vocabularies observation also names); namespace their
+		// generated declarations rather than emitting a duplicate identifier.
+		if (file.startsWith("presence-") || file.startsWith("spawn-")) {
 			for (const name of Object.keys(schema.$defs ?? {})) {
 				const qualified = `${typeName}${name}`;
 				schema.$defs[qualified] = schema.$defs[name];

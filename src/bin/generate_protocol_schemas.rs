@@ -176,5 +176,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_pair::<ObservationGetParams>(&output, "observation-get-params")?;
     write_pair::<ObservationSnapshot>(&output, "observation-snapshot")?;
     write_pair::<ObservationGetResponse>(&output, "observation-get-response")?;
+    write_pair::<agent_radar::control_plane::public_contracts::spawn_list::SpawnListParams>(
+        &output,
+        "spawn-list-params",
+    )?;
+    write_pair::<agent_radar::control_plane::public_contracts::spawn_list::SpawnListPage>(
+        &output,
+        "spawn-list-page",
+    )?;
     Ok(())
 }

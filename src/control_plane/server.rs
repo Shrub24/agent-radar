@@ -1442,15 +1442,6 @@ struct ChildCloseParams {
     intent: registry::CloseIntent,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpawnListParams {
-    #[serde(default)]
-    after: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
 fn decode_params<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T, Response> {
     serde_json::from_value(request.params.clone()).map_err(|error| {
         Response::refused(
@@ -3113,10 +3104,11 @@ fn registry_request(
             execute_child_close(&close, request, core, verification)
         }
         "spawn.list" => {
-            let params: SpawnListParams = match decode_params(request) {
-                Ok(value) => value,
-                Err(response) => return response,
-            };
+            let params: crate::control_plane::public_contracts::spawn_list::SpawnListParams =
+                match decode_params(request) {
+                    Ok(value) => value,
+                    Err(response) => return response,
+                };
             match params.limit {
                 Some(0) => {
                     return Response::refused(
@@ -3140,10 +3132,38 @@ fn registry_request(
             // without reading the whole topology to page a bounded answer.
             let read = {
                 let core = locked(core);
-                match core
-                    .registry
-                    .spawn_edges_after(params.after.as_deref(), limit + 1)
-                {
+                let parent = match params.registration_id.as_deref() {
+                    Some(registration_id) => {
+                        match crate::control_plane::registry::presence::attachment(
+                            &core.registry,
+                            registration_id,
+                        ) {
+                            Ok(Some(attachment)) => Some(attachment.subject_id),
+                            Ok(None) => {
+                                return Response::refused(
+                                    &request.id,
+                                    &Refusal::new(
+                                        Code::Refused,
+                                        "this registration holds no subject",
+                                    ),
+                                );
+                            }
+                            Err(error) => return registry_error(request, error),
+                        }
+                    }
+                    None => None,
+                };
+                let page = match parent.as_deref() {
+                    Some(subject) => core.registry.spawn_edges_for_subject_after(
+                        subject,
+                        params.after.as_deref(),
+                        limit + 1,
+                    ),
+                    None => core
+                        .registry
+                        .spawn_edges_after(params.after.as_deref(), limit + 1),
+                };
+                match page {
                     Ok(edges) => edges,
                     Err(error) => return registry_error(request, error),
                 }
@@ -3160,11 +3180,9 @@ fn registry_request(
             let mut edges = Vec::new();
             let mut used = 0usize;
             for edge in &candidates {
-                let entry = json!(edge.topology(
-                    crate::control_plane::registry_read::location_evidence(
-                        inventory.as_ref(),
-                        edge
-                    )
+                let entry = edge.topology(crate::control_plane::registry_read::location_evidence(
+                    inventory.as_ref(),
+                    edge,
                 ));
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
                 if used + size > MAX_LIST_RESPONSE_BYTES {
@@ -3185,12 +3203,22 @@ fn registry_request(
             // The continuation follows the last key actually returned, so a page
             // cut short by the byte bound resumes without skipping an edge.
             let next = (edges.len() < candidates.len() || has_more).then(|| {
-                edges.last().expect("a continuation has a returned edge")["request_id"]
-                    .as_str()
-                    .expect("a public request id")
-                    .to_owned()
+                edges
+                    .last()
+                    .expect("a continuation has a returned edge")
+                    .edge
+                    .request_id
+                    .clone()
             });
-            Response::ok(&request.id, json!({"spawns": edges, "next": next}))
+            Response::ok(
+                &request.id,
+                json!(
+                    crate::control_plane::public_contracts::spawn_list::SpawnListPage {
+                        spawns: edges,
+                        next,
+                    }
+                ),
+            )
         }
         _ => Response::refused(
             &request.id,

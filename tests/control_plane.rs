@@ -2885,6 +2885,37 @@ fn spawn_params(parent: &str, executable: &str, argv: &[&str]) -> Value {
 }
 
 #[test]
+fn a_caller_without_a_claim_reads_no_launches_and_names_nothing_else() {
+    let sandbox = Sandbox::new("spawn-list-caller");
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES).observing(&["wA:p2"]);
+    let daemon = sandbox.daemon_with(backend);
+    let mut client = Client::dial(daemon.path());
+    let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
+    spawned_edge(&mut client, FIRST_EDGE, &parent);
+
+    // A registration that holds no claim has no authority to read launches, and
+    // the parent is never a parameter it can supply.
+    let refused = client.call(
+        "spawn.list",
+        json!({"registration_id": "0b000000-0000-4000-8000-000000000001"}),
+    );
+    assert_eq!(refused["error"]["code"], json!("refused"), "{refused}");
+
+    let named = client.call(
+        "spawn.list",
+        json!({
+            "registration_id": "0b000000-0000-4000-8000-000000000001",
+            "parent_subject_id": "3f8c1d20-1111-4a2b-8c4d-000000000001",
+        }),
+    );
+    assert_eq!(named["error"]["code"], json!("bad_params"), "{named}");
+
+    // Without a caller the page is the unfiltered topology read it always was.
+    let page = client.call("spawn.list", json!({}));
+    assert_eq!(request_ids(&page), vec![FIRST_EDGE]);
+}
+
+#[test]
 fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() {
     use agent_radar::control_plane::registry::{Registry, SpawnRequest};
 

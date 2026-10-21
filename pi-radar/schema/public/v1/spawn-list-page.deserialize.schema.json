@@ -1,0 +1,291 @@
+{
+  "$defs": {
+    "BoundChild": {
+      "additionalProperties": false,
+      "description": "The child a token bound: the registering incarnation's own registry identity.",
+      "properties": {
+        "bound_at": {
+          "description": "When the edge bound to this incarnation.",
+          "type": "string"
+        },
+        "incarnation": {
+          "type": "string"
+        },
+        "registration_id": {
+          "description": "Exact registry identity returned to the registering child. Absent in legacy records.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "incarnation",
+        "bound_at"
+      ],
+      "type": "object"
+    },
+    "Freshness": {
+      "description": "Freshness is independent of process identity or completion.",
+      "oneOf": [
+        {
+          "const": "fresh",
+          "description": "Accepted in this serving epoch by the current writer and not expired.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "Restored, reported by a replaced writer, retired, or expired.",
+          "type": "string"
+        }
+      ]
+    },
+    "PublicSpawnExitObservation": {
+      "description": "What a spawn topology read can say about a child's process exit.",
+      "oneOf": [
+        {
+          "properties": {
+            "state": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "code": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "observed_at": {
+              "type": "string"
+            },
+            "signal": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "state": {
+              "const": "exited",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "observed_at"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PublicSpawnTopology": {
+      "description": "One edge as a topology read reports it: the stored facts, plus the two things\na read derives instead of inferring.",
+      "properties": {
+        "bound": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BoundChild"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "created": {
+          "$ref": "#/$defs/RequestOutcome"
+        },
+        "exit_observation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicSpawnExitObservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "freshness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Freshness"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Freshness of the recorded location against this read's evidence, in the\nregistry's one freshness vocabulary: `fresh` when the backend reports the\nlocation now, `stale` when it does not — which is never evidence that the\nchild stopped. Absent when the edge recorded no location, because there is\nnothing to verify."
+        },
+        "launched": {
+          "$ref": "#/$defs/RequestOutcome"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistryLocation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parent": {
+          "type": "string"
+        },
+        "parent_session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_subject_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recorded_at": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/SpawnState"
+        },
+        "subject_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version",
+        "request_id",
+        "parent",
+        "created",
+        "launched",
+        "recorded_at",
+        "state"
+      ],
+      "type": "object"
+    },
+    "RegistryLocation": {
+      "additionalProperties": false,
+      "description": "Where an agent's incarnation lives on one backend, in that backend's own\ncoordinates.\n\nThe backend name is free-form so a source Radar does not ship yet is\npreserved rather than rejected; the rest are the coordinates as reported, and\neach is optional because a backend need not name every level.",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "instance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tab": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "type": "object"
+    },
+    "RequestOutcome": {
+      "description": "What a completed request did.",
+      "oneOf": [
+        {
+          "const": "completed",
+          "description": "The operation ran and its effects are in the record.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The operation did not run, and the record says why.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Execution began and the daemon cannot say what it did.",
+          "type": "string"
+        }
+      ]
+    },
+    "SpawnState": {
+      "description": "The state of one edge in the recorded topology: the strongest statement a\nread can make about it, and nothing beyond the records and this read's own\nevidence.",
+      "oneOf": [
+        {
+          "const": "unbound",
+          "description": "No child has presented this edge's token. The edge may still be pending,\nor its launch may never have reached a shell.",
+          "type": "string"
+        },
+        {
+          "const": "bound",
+          "description": "A child registered with this edge's token, so the edge names its exact\nidentity. Observation does not revise this.",
+          "type": "string"
+        },
+        {
+          "const": "unresolved",
+          "description": "The recorded location is not in the backend's own report: the record and\nthe world disagree. This is never a statement that the child stopped — a\nread observes panes, and a pane's absence is not a process's death.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One page of spawn edges. `next` names the request id the page ended on.",
+  "properties": {
+    "next": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "spawns": {
+      "items": {
+        "$ref": "#/$defs/PublicSpawnTopology"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "spawns"
+  ],
+  "title": "spawn-list-page-deserialize",
+  "type": "object"
+}
