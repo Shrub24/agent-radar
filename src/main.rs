@@ -572,7 +572,7 @@ fn dispatch(
         }) => {
             let operation = match operation {
                 agent_radar::app::Operation::Restart => radar::Operation::Restart,
-                agent_radar::app::Operation::ClosePane => radar::Operation::Cancel,
+                agent_radar::app::Operation::Delete => radar::Operation::Cancel,
                 _ => {
                     app.set_focus_message(Some("unsupported managed lifecycle action".into()));
                     return;

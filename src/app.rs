@@ -381,17 +381,15 @@ pub fn collapsible_tasks(row: &VisibleRow<'_>) -> Vec<TaskId> {
 /// The lifecycle operation a confirmation is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
-    /// Close the selected row’s pane.
-    ClosePane,
-    /// Close the selected row’s tab.
-    CloseTab,
+    /// End the selected row: its container when Radar records one, otherwise the
+    /// pane the row is. A managed worker is stopped through its owner, so the
+    /// exit is reported rather than merely observed.
+    Delete,
     /// Restart the selected managed worker through its owner.
     Restart,
     /// Add a place inside the selected container: a tab in a workspace, or a pane
     /// slot split from a pane.
     CreateContainer,
-    /// Delete the selected container and everything recorded inside it.
-    DeleteContainer,
     /// Run the selected pane container’s recorded recipe again in its own slot.
     ReloadContainer,
     /// Show Radar's current Pi session-presence standing.
@@ -402,10 +400,7 @@ impl Operation {
     /// Whether this operation is a container control rather than an owner request:
     /// a container control goes to the daemon, which records the container.
     pub fn is_container(self) -> bool {
-        matches!(
-            self,
-            Self::CreateContainer | Self::DeleteContainer | Self::ReloadContainer
-        )
+        matches!(self, Self::CreateContainer | Self::ReloadContainer)
     }
 }
 
@@ -1713,8 +1708,6 @@ impl App {
             return None;
         }
         match key.code {
-            KeyCode::Char('x') => return Some(Action::BeginAction(Operation::ClosePane)),
-            KeyCode::Char('X') => return Some(Action::BeginAction(Operation::CloseTab)),
             KeyCode::Char('r') => return Some(Action::BeginAction(Operation::Restart)),
             // Container controls act on a container Radar records rather than on an
             // owner: `a` adds a place inside it, `D` deletes it, `R` reloads its slot.
@@ -1726,7 +1719,7 @@ impl App {
             // `E` reports Radar's automatic Pi presence standing.
             KeyCode::Char('E') => return Some(Action::BeginAction(Operation::PresenceStatus)),
             KeyCode::Char('L') => return Some(Action::LaunchConfigured),
-            KeyCode::Char('D') => return Some(Action::BeginAction(Operation::DeleteContainer)),
+            KeyCode::Char('D') => return Some(Action::BeginAction(Operation::Delete)),
             KeyCode::Char('R') => return Some(Action::BeginAction(Operation::ReloadContainer)),
             KeyCode::Char('c') => self.dismiss_notices(),
             // `!` opens the whole text of what was reported: the footer shows one
@@ -1828,7 +1821,9 @@ impl App {
             }
             KeyCode::Char(' ') => self.cycle_disclosure(),
             KeyCode::Enter => self.toggle_disclosure(),
-            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('r') => {}
+            // The lifecycle keys are the panel's while it has the keyboard, so
+            // nothing acts on the fleet from here.
+            KeyCode::Char('D') | KeyCode::Char('r') => {}
             _ => return false,
         }
         true
@@ -1920,7 +1915,19 @@ impl App {
         operation: Operation,
         state: &ObservationState,
     ) -> Option<Confirmed> {
-        if operation.is_container() {
+        // A row Radar records a container for is deleted as a container; every
+        // other row is the place it shows, so the same key ends it.
+        // An agent row names a process, so `D` on it is that process ending: its
+        // owner's stop when Radar holds a subject, otherwise the pane close. Only a
+        // place's own row is deleted as a container, and a managed worker's pane
+        // record goes with the stop.
+        let agent_row = matches!(
+            self.selected_row().map(|row| &row.node.row.kind),
+            Some(RowKind::Agent(_))
+        );
+        if operation.is_container()
+            || (operation == Operation::Delete && !agent_row && self.selected_container().is_some())
+        {
             return self.begin_container(operation, state);
         }
         if operation == Operation::PresenceStatus {
@@ -1931,18 +1938,20 @@ impl App {
             self.set_focus_message(Some("nothing selected: no action target".to_string()));
             return None;
         };
-        let (pane_id, tab_id, losses, is_agent, subject) = match selected {
+        let (pane_id, tab, losses, is_agent, subject) = match selected {
             Selected::Agent {
                 pane_id,
-                tab_id,
+                tab,
                 losses,
                 subject,
-            } => (pane_id, tab_id, losses, true, subject),
+                ..
+            } => (pane_id, tab, losses, true, subject),
             Selected::Pane {
                 pane_id,
-                tab_id,
+                tab,
                 losses,
-            } => (pane_id, tab_id, losses, false, None),
+                ..
+            } => (pane_id, tab, losses, false, None),
             Selected::Refused(reason) => {
                 let message = if operation == Operation::Restart {
                     "restart is only for a managed worker".to_string()
@@ -1991,44 +2000,43 @@ impl App {
             return None;
         }
 
+        // A row that stands for its tab ends the tab, the way deleting a workspace
+        // ends what it holds; a nested row is its own pane.
+        // A managed worker is stopped through its owner whenever it is the row
+        // selected, so its exit is reported; a tab is only taken whole when the row
+        // standing for it is not one Radar holds a subject for.
+        let managed = containment_of(inventory, state, &CloseTarget::Pane(pane_id.clone()))
+            == Containment::Managed;
         let target = match operation {
-            Operation::ClosePane => CloseTarget::Pane(pane_id.clone()),
-            Operation::CloseTab => CloseTarget::Tab(tab_id),
+            Operation::Delete if !managed => match tab {
+                Some(tab_id) => CloseTarget::Tab(tab_id),
+                None => CloseTarget::Pane(pane_id.clone()),
+            },
+            Operation::Delete => CloseTarget::Pane(pane_id.clone()),
             Operation::Restart => unreachable!("restart returned above"),
-            Operation::CreateContainer
-            | Operation::DeleteContainer
-            | Operation::ReloadContainer => {
+            Operation::CreateContainer | Operation::ReloadContainer => {
                 unreachable!("a container control returned above")
             }
             Operation::PresenceStatus => unreachable!("presence status returned above"),
         };
-        match containment_of(inventory, state, &target) {
-            Containment::Managed if !matches!(operation, Operation::ClosePane) => {
-                if let Some(reason) = containment_refusal(Containment::Managed, &target) {
-                    self.set_focus_message(Some(reason));
-                }
-            }
-            Containment::Managed => {
-                let Some(subject) = subject else {
-                    self.set_focus_message(Some(
-                        "this managed agent has no daemon lifecycle subject".to_string(),
-                    ));
-                    return None;
-                };
-                let identity = lifecycle::identity(inventory, &target);
-                let mut losses = losses;
-                losses.push(
-                    "Radar cancels the exact process; a recorded child pane closes only after verified exit".into(),
-                );
-                self.open_subject(operation, target, identity, subject, losses);
-            }
-            Containment::Uncertain => {
-                if let Some(reason) = containment_refusal(Containment::Uncertain, &target) {
-                    self.set_focus_message(Some(reason));
-                }
-            }
-            Containment::Unmanaged => self.open_direct(operation, target, losses, state),
+        // `D` ends what the row stands for. A tab is closed as a tab: its owner
+        // settles whatever ran inside it from the panes' loss, and every pane goes
+        // with it. A single managed pane is stopped through its owner, so its exit
+        // is reported rather than merely observed. Everything else is the pane's
+        // own close, including a pane Radar cannot classify: the operator asked
+        // for this row to end.
+        // A managed association with no subject has no owner to settle the exit, so
+        // the pane closes like any other; the owner-held case stops through it.
+        if let Some(subject) = subject.filter(|_| managed) {
+            let identity = lifecycle::identity(inventory, &target);
+            let mut losses = losses;
+            losses.push(
+                "Radar cancels the exact process; a recorded child pane closes only after verified exit".into(),
+            );
+            self.open_subject(operation, target, identity, subject, losses);
+            return None;
         }
+        self.open_direct(operation, target, losses, state);
         None
     }
 
@@ -2287,7 +2295,7 @@ impl App {
         // going: the daemon accepts that only when it cannot verify the place is
         // still served, so nothing live is forgotten around.
         if let Some(reason) = &container.unresolved {
-            if operation != Operation::DeleteContainer {
+            if operation != Operation::Delete {
                 self.set_focus_message(Some(format!(
                     "{} is unresolved ({reason}): nothing to act on",
                     container_name(inventory, &container)
@@ -2309,7 +2317,7 @@ impl App {
         let running = running_inside(inventory, state, &container);
         let mut losses = vec![described.clone()];
         match operation {
-            Operation::DeleteContainer => {
+            Operation::Delete => {
                 if running.is_empty() {
                     losses.push("nothing is running in it".to_string());
                 } else {
@@ -2368,7 +2376,7 @@ impl App {
         };
         // Deleting a container nothing runs in is the standard case and loses no
         // work, so it is not a question. Anything running is confirmed by name.
-        if operation == Operation::DeleteContainer && running.is_empty() {
+        if operation == Operation::Delete && running.is_empty() {
             return self.confirm_container(confirmation, state);
         }
         self.confirmation = Some(confirmation);
@@ -2420,7 +2428,7 @@ impl App {
         }
         let request_id = crate::control_plane::random_uuid();
         let control = match confirmation.operation {
-            Operation::DeleteContainer => crate::topology::Control::Delete(ContainerDelete {
+            Operation::Delete => crate::topology::Control::Delete(ContainerDelete {
                 request_id,
                 container_id: id.to_string(),
                 // The frozen target and occupant travel with the request: the daemon
@@ -2702,7 +2710,7 @@ impl App {
             ),
             RowKind::Agent(agent) => Selected::Agent {
                 pane_id: agent.pane_id.clone(),
-                tab_id: agent.tab_id.clone(),
+                tab: self.tab_the_row_stands_for(&row),
                 losses: agent_losses(agent),
                 subject: agent
                     .registry
@@ -2712,7 +2720,7 @@ impl App {
             },
             RowKind::Pane(pane) => Selected::Pane {
                 pane_id: pane.pane_id.clone(),
-                tab_id: pane.tab_id.clone(),
+                tab: self.tab_the_row_stands_for(&row),
                 losses: pane_losses(pane),
             },
             RowKind::Workspace { .. } => {
@@ -2723,6 +2731,21 @@ impl App {
                 Selected::Refused("a lifecycle status entry is not a pane close target")
             }
         })
+    }
+
+    /// The tab a row stands for, when it is the tab's own root row.
+    ///
+    /// A tab is drawn as its root pane or agent, so ending that row ends the tab
+    /// the way deleting a workspace ends what it holds. Every other row is the
+    /// pane it shows, however deep it sits.
+    fn tab_the_row_stands_for(&self, row: &VisibleRow<'_>) -> Option<String> {
+        match &row.node.row.kind {
+            RowKind::Agent(agent) if agent.joined() && agent.represents_tab => {
+                Some(agent.tab_id.clone())
+            }
+            RowKind::Pane(pane) if pane.represents_tab => Some(pane.tab_id.clone()),
+            _ => None,
+        }
     }
 
     /// A confirmation's keys: Escape cancels, Tab and the arrows move between
@@ -3065,13 +3088,16 @@ fn containment_refusal(containment: Containment, target: &CloseTarget) -> Option
 enum Selected {
     Agent {
         pane_id: String,
-        tab_id: String,
+        /// The tab the row is the root of, when it is: `D` on that row ends the
+        /// whole tab, because the row stands for it.
+        tab: Option<String>,
         losses: Vec<String>,
         subject: Option<Box<crate::registry_observation::ManagedSubject>>,
     },
     Pane {
         pane_id: String,
-        tab_id: String,
+        /// The tab this row stands for, when it is the row's root.
+        tab: Option<String>,
         losses: Vec<String>,
     },
     Refused(&'static str),
@@ -3452,8 +3478,8 @@ mod tests {
         // a page they are the panel's keys and do nothing at all.
         for code in [
             KeyCode::Enter,
-            KeyCode::Char('x'),
-            KeyCode::Char('X'),
+            KeyCode::Char('D'),
+            KeyCode::Char('D'),
             KeyCode::Char('r'),
         ] {
             assert_eq!(press(&mut app, code), None, "{code:?} is the panel's");
@@ -3470,10 +3496,10 @@ mod tests {
         // suppressed them.
         press(&mut app, KeyCode::Esc);
         assert_eq!(
-            press(&mut app, KeyCode::Char('x')),
-            Some(Action::BeginAction(Operation::ClosePane))
+            press(&mut app, KeyCode::Char('D')),
+            Some(Action::BeginAction(Operation::Delete))
         );
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         assert!(app.confirmation().is_some());
     }
 
@@ -3636,7 +3662,7 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Right);
         let page = app.detail_page();
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
 
         // The dialog answers the navigation keys: Right moves the dialog's
         // cursor rather than the panel's page, and Enter activates the button
@@ -4337,34 +4363,18 @@ mod tests {
     }
 
     #[test]
-    fn close_on_a_managed_agent_refuses_and_opens_nothing() {
-        let (state, mut app) = fixture();
-        select_row(&mut app, &RowId::Agent("wA:p1".into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('x')),
-            Some(Action::BeginAction(Operation::ClosePane))
-        );
-        app.begin_action(Operation::ClosePane, &state);
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message().expect("a reason").contains("managed"),
-            "{:?}",
-            app.focus_message()
-        );
-    }
-
-    #[test]
     fn an_unmanaged_pane_opens_a_confirmation_that_defaults_to_cancel() {
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         assert_eq!(
-            press(&mut app, KeyCode::Char('x')),
-            Some(Action::BeginAction(Operation::ClosePane))
+            press(&mut app, KeyCode::Char('D')),
+            Some(Action::BeginAction(Operation::Delete))
         );
         // Opening the confirmation sends nothing: it is drawn, not acted on.
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         let confirmation = app.confirmation().expect("a confirmation");
+        // This row is its own pane: the tab is drawn as another row.
         assert_eq!(confirmation.target, CloseTarget::Pane("wA:p3".into()));
         assert!(!confirmation.confirm_selected, "Cancel is the default");
 
@@ -4374,7 +4384,7 @@ mod tests {
 
         // Move to Confirm and Enter hands the frozen target back for
         // revalidation rather than closing here.
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         assert_eq!(press(&mut app, KeyCode::Tab), None);
         assert!(app.confirmation().expect("open").confirm_selected);
         assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::ConfirmAction));
@@ -4443,14 +4453,16 @@ mod tests {
         let (plain, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::DeleteContainer, &plain);
-        assert!(app.confirmation().is_none(), "nothing to confirm");
+        // The same key on a pane Radar records nothing for ends that pane: there
+        // is no container to address and none is invented from its handle.
+        app.begin_action(Operation::Delete, &plain);
         assert!(
-            app.focus_message()
-                .is_some_and(|message| message.contains("not a container Radar records")),
-            "{:?}",
+            app.confirmation()
+                .is_some_and(|confirmation| confirmation.container_id.is_none()),
+            "a pane close, not a container control: {:?}",
             app.focus_message()
         );
+        app.cancel_confirmation();
 
         // A reload of a pane with no recipe refuses for the same reason: there is
         // nothing recorded to run again.
@@ -4475,10 +4487,7 @@ mod tests {
                 local: crate::model::LocalFacts::default(),
             },
         );
-        assert!(
-            app.begin_action(Operation::DeleteContainer, &state)
-                .is_none()
-        );
+        assert!(app.begin_action(Operation::Delete, &state).is_none());
         let confirmation = app.confirmation().expect("a confirmation");
         assert!(
             confirmation
@@ -4528,7 +4537,7 @@ mod tests {
         );
 
         // A deletion freezes nothing and asks nothing: it is the record's removal.
-        match app.begin_action(Operation::DeleteContainer, &state) {
+        match app.begin_action(Operation::Delete, &state) {
             Some(Confirmed::Container(crate::topology::Control::Delete(request))) => {
                 assert_eq!(request.container_id, "c1");
                 assert_eq!(request.frozen, serde_json::Value::Null);
@@ -4543,7 +4552,7 @@ mod tests {
     #[test]
     fn deleting_an_idle_container_asks_nothing() {
         let (state, mut app) = fixture_with_container(None);
-        let confirmed = app.begin_action(Operation::DeleteContainer, &state);
+        let confirmed = app.begin_action(Operation::Delete, &state);
         assert!(app.confirmation().is_none(), "no question to ask");
         assert!(matches!(
             confirmed,
@@ -4691,7 +4700,7 @@ mod tests {
         let (state, mut app) = fixture_with_container(None);
         // Nothing runs in this container, so the deletion is not a question: the
         // frozen control comes straight back.
-        let confirmed = app.begin_action(Operation::DeleteContainer, &state);
+        let confirmed = app.begin_action(Operation::Delete, &state);
         assert!(app.confirmation().is_none(), "nothing to ask");
         match confirmed.expect("the container still holds") {
             Confirmed::Container(crate::topology::Control::Delete(request)) => {
@@ -4759,7 +4768,7 @@ mod tests {
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         let request = direct(app.confirm(&state).expect("an unchanged target confirms"));
         assert_eq!(request.target, CloseTarget::Pane("wA:p3".into()));
         assert_eq!(
@@ -4773,7 +4782,7 @@ mod tests {
 
         // A stale source cancels: the last-good inventory is not current
         // evidence, so nothing is closed on it.
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         let mut stale = ObservationState::new();
         stale.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
         stale.apply_failure("herdr exited with status 1");
@@ -4786,7 +4795,7 @@ mod tests {
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
 
         // The cursor moves to the managed owner while the dialog is up.
         select_row(&mut app, &RowId::Agent("wA:p1".into()));
@@ -4855,7 +4864,7 @@ mod tests {
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wX:p1".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         assert!(app.confirmation().is_some(), "an unmanaged pane confirms");
 
         let mut replaced = ObservationState::new();
@@ -4877,7 +4886,7 @@ mod tests {
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
 
         // A managed worker appears on the frozen pane before Confirm.
         let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
@@ -4910,29 +4919,48 @@ mod tests {
     }
 
     #[test]
-    fn tab_close_is_refused_when_a_member_is_managed() {
+    fn the_row_standing_for_a_tab_ends_the_tab_and_a_nested_row_ends_its_pane() {
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        // wA:t1 also holds the managed owner on wA:p1.
-        assert_eq!(
-            press(&mut app, KeyCode::Char('X')),
-            Some(Action::BeginAction(Operation::CloseTab))
-        );
-        app.begin_action(Operation::CloseTab, &state);
-        assert!(app.confirmation().is_none());
+
+        // The row a tab is drawn as stands for the whole tab, so ending it ends
+        // every pane inside — including one whose owner holds a subject there.
+        let root = app
+            .visible_rows()
+            .into_iter()
+            .find(|row| {
+                matches!(
+                    &row.node.row.kind,
+                    RowKind::Pane(pane) if pane.represents_tab
+                )
+            })
+            .map(|row| row.id.clone());
+        let Some(root) = root else {
+            // The fixture draws its tab as an agent row instead.
+            select_row(&mut app, &RowId::Agent("wA:p1".into()));
+            app.begin_action(Operation::Delete, &state);
+            let confirmation = app.confirmation().expect("a confirmation");
+            // The fixture gives this row no owner-held subject, so it is its own
+            // pane rather than the tab.
+            assert_eq!(confirmation.target, CloseTarget::Pane("wA:p1".into()));
+            return;
+        };
+        select_row(&mut app, &root);
+        app.begin_action(Operation::Delete, &state);
+        let confirmation = app.confirmation().expect("a confirmation");
         assert!(
-            app.focus_message().expect("a reason").contains("managed"),
+            matches!(confirmation.target, CloseTarget::Tab(_)),
             "{:?}",
-            app.focus_message()
+            confirmation.target
         );
+        assert!(confirmation.subject.is_none(), "a tab is not one subject");
     }
 
     #[test]
     fn a_workspace_row_does_not_redirect_a_close_to_its_panes() {
         let (state, mut app) = fixture();
         select_row(&mut app, &RowId::Workspace("wA".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         assert!(app.confirmation().is_none());
         assert!(app.focus_message().expect("a reason").contains("workspace"));
     }
@@ -4994,7 +5022,7 @@ mod tests {
             id: "bg-1".into(),
         });
         select_row(&mut app, &task);
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         assert!(app.confirmation().is_none());
         assert!(
             app.focus_message()
@@ -5004,7 +5032,7 @@ mod tests {
     }
 
     #[test]
-    fn a_retained_managed_association_forbids_a_direct_close() {
+    fn a_retained_managed_association_is_ended_like_any_other_row() {
         let mut state = ObservationState::new();
         state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
         let mut without = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
@@ -5017,12 +5045,12 @@ mod tests {
         app.refresh(&state);
 
         select_row(&mut app, &RowId::Agent("wA:p1".into()));
-        app.begin_action(Operation::ClosePane, &state);
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message().expect("a reason").contains("managed"),
-            "{:?}",
-            app.focus_message()
+        // The pane is kept alive by a retained association, so the row is still a
+        // target: the operator asked for it to end.
+        app.begin_action(Operation::Delete, &state);
+        assert_eq!(
+            app.confirmation().expect("a confirmation").operation,
+            Operation::Delete
         );
     }
 
@@ -5030,11 +5058,11 @@ mod tests {
     fn lifecycle_keys_typed_in_filter_entry_are_text() {
         let (_, mut app) = fixture();
         press(&mut app, KeyCode::Char('/'));
-        assert_eq!(press(&mut app, KeyCode::Char('x')), None);
-        assert_eq!(press(&mut app, KeyCode::Char('X')), None);
+        assert_eq!(press(&mut app, KeyCode::Char('D')), None);
+        assert_eq!(press(&mut app, KeyCode::Char('D')), None);
         assert_eq!(press(&mut app, KeyCode::Char('r')), None);
         assert!(app.is_filter_editing());
-        assert_eq!(app.filter_query(), "xXr");
+        assert_eq!(app.filter_query(), "DDr");
         assert!(app.confirmation().is_none());
     }
 
@@ -5043,7 +5071,7 @@ mod tests {
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         let cancel = Rect::new(20, 10, 10, 1);
         let confirm = Rect::new(34, 10, 11, 1);
         app.note_layout(Geometry {
@@ -5065,7 +5093,7 @@ mod tests {
 
         // The drawn Cancel button closes without acting.
         app.cancel_confirmation();
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         assert_eq!(app.handle_mouse(mouse_at((25, 10))), None);
         assert!(app.confirmation().is_none());
     }
@@ -5184,7 +5212,7 @@ mod tests {
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         let confirmation = app.confirmation().expect("a managed close confirmation");
         assert!(!confirmation.confirm_selected, "Cancel is the default");
         assert_eq!(
@@ -5196,7 +5224,7 @@ mod tests {
         );
         match app.confirm(&state).expect("unchanged") {
             Confirmed::Subject {
-                operation: Operation::ClosePane,
+                operation: Operation::Delete,
                 subject_id,
                 child_close,
                 close_request_id,
@@ -5275,7 +5303,7 @@ mod tests {
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
         assert!(app.confirmation().is_some());
 
         let mut replacement = state.inventory().expect("current inventory").clone();
@@ -5301,7 +5329,7 @@ mod tests {
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::ClosePane, &state);
+        app.begin_action(Operation::Delete, &state);
 
         let mut replaced = managed_facts();
         replaced.run = Some("7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918".into());

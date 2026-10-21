@@ -196,6 +196,15 @@ impl TreeRow {
     }
 }
 
+/// What to call a workspace the backend names nothing: the last segment of its
+/// id, which is the backend's own name for the place. A whole handle such as
+/// `tmux:radar:$0` names the adapter and the server as well, which says nothing
+/// about the workspace, so it is never shown whole.
+fn unlabelled_workspace_name(workspace_id: &str) -> Option<String> {
+    let tail = workspace_id.rsplit(':').next().unwrap_or(workspace_id);
+    (!tail.is_empty() && tail != workspace_id).then(|| tail.to_string())
+}
+
 /// The daemon's own identity for the place a row shows, when it records one.
 ///
 /// The backend handle is evidence, never the identity itself: this is what a
@@ -259,6 +268,10 @@ pub struct LifecycleRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRow {
     pub pane_id: String,
+    /// Whether this row is the one its tab is drawn as. A tab is not a row of its
+    /// own, so the root row stands for it and a control aimed at the tab arrives
+    /// through this flag.
+    pub represents_tab: bool,
     pub workspace_id: String,
     pub workspace_label: Option<String>,
     pub tab_id: String,
@@ -327,6 +340,8 @@ impl AgentRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneRow {
     pub pane_id: String,
+    /// Whether this row is the one its tab is drawn as.
+    pub represents_tab: bool,
     pub workspace_id: String,
     pub workspace_label: Option<String>,
     pub tab_id: String,
@@ -515,9 +530,10 @@ impl FleetTree {
                 ));
             }
 
-            let (children, tabs) = nest_by_window(agents);
+            let (mut children, tabs) = nest_by_window(agents);
             for (tab, position) in tabs {
                 tab_rows.insert((workspace_id.clone(), tab), position);
+                mark_tab_root(&mut children[position]);
             }
             workspace_index.insert(workspace_id.as_str(), roots.len());
             roots.push(TreeNode {
@@ -525,7 +541,9 @@ impl FleetTree {
                     id: RowId::Workspace(workspace_id.clone()),
                     kind: RowKind::Workspace {
                         workspace_id: workspace_id.clone(),
-                        label: label.map(str::to_string),
+                        label: label
+                            .map(str::to_string)
+                            .or_else(|| unlabelled_workspace_name(workspace_id)),
                         number: workspace_numbers.get(workspace_id.as_str()).copied(),
                         container: places.workspaces.get(workspace_id.as_str()).cloned(),
                     },
@@ -550,6 +568,7 @@ impl FleetTree {
                     id: RowId::Pane(pane_id.to_string()),
                     kind: RowKind::Pane(Box::new(PaneRow {
                         pane_id: pane_id.to_string(),
+                        represents_tab: false,
                         workspace_id: pane.location.workspace_id.clone(),
                         workspace_label: places
                             .workspace_labels
@@ -738,6 +757,7 @@ fn agent_node(
             id,
             kind: RowKind::Agent(Box::new(AgentRow {
                 pane_id: location.pane_id.clone(),
+                represents_tab: false,
                 workspace_id: location.workspace_id.clone(),
                 workspace_label: places
                     .workspace_labels
@@ -962,6 +982,18 @@ fn nest_by_window(agents: Vec<(Nestable, String)>) -> (Vec<TreeNode>, Vec<(Strin
         children.push(node);
     }
     (children, tabs)
+}
+
+/// Marks the row a tab is drawn as, once nesting has decided which row that is.
+///
+/// Only a window whose rows collapse to a single root is drawn as a tab, so this
+/// is the only row that stands for one; every other pane is its own pane.
+fn mark_tab_root(node: &mut TreeNode) {
+    match &mut node.row.kind {
+        RowKind::Agent(agent) => agent.represents_tab = true,
+        RowKind::Pane(pane) => pane.represents_tab = true,
+        RowKind::Workspace { .. } | RowKind::Task(_) | RowKind::Lifecycle(_) => {}
+    }
 }
 
 /// One agent row as nesting needs it: the node itself, what it claims as its
@@ -1205,6 +1237,18 @@ fn remove_cycles(parent: &mut [Option<usize>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workspace the backend names nothing shows its own id, never the whole
+    /// handle, which would name the adapter and the server instead.
+    #[test]
+    fn a_workspace_the_backend_names_nothing_shows_its_own_id_not_a_handle() {
+        assert_eq!(
+            unlabelled_workspace_name("tmux:radar:$0").as_deref(),
+            Some("$0")
+        );
+        assert_eq!(unlabelled_workspace_name("wA"), None);
+        assert_eq!(unlabelled_workspace_name("tmux:radar:"), None);
+    }
     use crate::control_plane::containers::{
         Binding as ContainerBinding, Provenance, PublicContainer,
     };

@@ -486,11 +486,9 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
     let palette = theme::palette();
     let screen = frame.area();
     let title = match confirmation.operation {
-        Operation::ClosePane => "Close pane",
-        Operation::CloseTab => "Close tab",
+        Operation::Delete => "Delete",
         Operation::Restart => "Restart worker",
         Operation::CreateContainer => "Add to container",
-        Operation::DeleteContainer => "Delete container",
         Operation::ReloadContainer => "Reload pane",
         Operation::PresenceStatus => "Pi presence",
     };
@@ -7670,7 +7668,7 @@ mod tests {
         }
         // The page's lifecycle keys are the panel's either way: they open no
         // confirmation and focus no pane.
-        for code in [KeyCode::Char('x'), KeyCode::Char('X'), KeyCode::Char('r')] {
+        for code in [KeyCode::Char('D'), KeyCode::Char('D'), KeyCode::Char('r')] {
             assert_eq!(press_key(&mut app, code), None, "{code:?} is the panel's");
         }
         assert!(app.confirmation().is_none());
@@ -8869,7 +8867,7 @@ mod tests {
         let mut app = app_for(&state);
         show_all_panes(&mut app);
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
-        app.begin_action(crate::app::Operation::ClosePane, &state);
+        app.begin_action(crate::app::Operation::Delete, &state);
         assert!(
             app.confirmation().is_some(),
             "an unmanaged pane is eligible"
@@ -8888,7 +8886,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(screen.contains("Close pane"), "{screen}");
+        assert!(screen.contains("Delete"), "{screen}");
         assert!(screen.contains("wA:p3"), "{screen}");
         assert!(screen.contains("This may lose:"), "{screen}");
         assert!(screen.contains("[ Cancel ]"), "{screen}");
@@ -8910,16 +8908,20 @@ mod tests {
     }
 
     #[test]
-    fn a_managed_agent_shows_no_confirmation() {
+    fn the_delete_key_asks_before_an_agent_row_ends() {
         let state = fixture_state();
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p1");
-        app.begin_action(crate::app::Operation::ClosePane, &state);
-        assert!(app.confirmation().is_none());
+        app.begin_action(crate::app::Operation::Delete, &state);
+        assert!(
+            app.confirmation().is_some(),
+            "an agent row ends through a question: {:?}",
+            app.focus_message()
+        );
 
         let screen = render_text(&state, &app, 100, 30);
-        assert!(!screen.contains("[ Confirm ]"), "{screen}");
-        assert!(screen.contains("managed"), "{screen}");
+        assert!(screen.contains("[ Cancel ]"), "{screen}");
+        assert!(screen.contains("[ Confirm ]"), "{screen}");
     }
 
     #[test]
@@ -8928,7 +8930,7 @@ mod tests {
         let mut app = app_for(&state);
         show_all_panes(&mut app);
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
-        app.begin_action(crate::app::Operation::ClosePane, &state);
+        app.begin_action(crate::app::Operation::Delete, &state);
         for (width, height) in [(20u16, 6u16), (40, 10), (200, 60)] {
             let _ = render_text(&state, &app, width, height);
         }

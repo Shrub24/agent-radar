@@ -158,8 +158,7 @@ else `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
 | `n` / `N` | Select the next / previous row that needs attention (blocked, lost, waiting, unknown) |
 | `w` / `W` | Select the next / previous working row |
 | `d` | Show or hide the details panel |
-| `x` | Ask to close the selected agent's or pane's pane; opens a confirmation that sends nothing until confirmed |
-| `X` | Ask to close the selected row's tab; refused whole if any member is managed or unverified |
+| `D` | Delete the selected row: its container when Radar records one, else end what the row is. On an agent row a managed worker is stopped through its owner, so the exit is reported; the row a tab is drawn as ends the whole tab, every other row ends its own pane. Ends a container whose place is gone, closing a place that is still served is refused unless it was confirmed | 
 | `r` | Ask the selected worker's owner to restart it; offered only for an owner-advertised idle managed worker |
 | `c` | Dismiss the lifecycle outcome lines |
 | `e` | Show or hide finished sessions (panes whose label is a session that has gone) |
@@ -183,7 +182,7 @@ While the details hold the keyboard:
 | `/` and the view keys | Still act on the fleet, as they do from the tree |
 
 Reading a page never moves the selection, folds nothing and sends nothing: `Enter`,
-`x`, `X` and `r` are the panel's keys there and do nothing, so a reader cannot
+`D` and `r` are the panel's keys there and do nothing, so a reader cannot
 focus a pane or open a lifecycle confirmation by scrolling. Filter entry and an
 open confirmation keep precedence — the confirmation's arrows swap its buttons
 rather than turning a page, and typing goes to the filter.
@@ -420,31 +419,40 @@ contents or a layout. The focus request uses `herdr workspace focus` for a
 workspace and the socket API's `pane.focus` request for a pane; `herdr pane
 focus` moves by direction only.
 
-`x`, `X` and `r` open a **confirmation** instead of acting: it names the pane,
-tab or worker, lists what the action may lose (the agent and its assignment,
-outstanding background work, the tab's member panes, or the worker's process),
-and starts on **Cancel**. `Tab` or an arrow swaps the selection, `Enter`
-activates the selected button and `Escape` cancels; the mouse only ever hits the
-two buttons drawn. Nothing is sent until Confirm, and the frozen target is
-revalidated against the current observation first: a stale inventory, a
-disappeared target or a target whose identity changed cancels with a reason.
-Task and workspace rows never redirect a close or restart to a parent.
+`D` is one key for every row: it ends whatever the selected row is. A
+confirmation names the row and lists what the action may lose — the agent and its
+assignment, outstanding background work, the tab's member panes — and starts on
+**Cancel**. `Tab` or an arrow swaps the selection, `Enter` activates the selected
+button and `Escape` cancels; the mouse only ever hits the two buttons drawn.
+Nothing is sent until Confirm, and the frozen target is revalidated against the
+current observation first: a stale inventory, a disappeared target or a target
+whose identity changed cancels with a reason.
 
-Only a location with **positive unmanaged evidence** is closed directly through
-Herdr, and only after a second inventory is taken immediately before acting. A
-pane with no agent, or with an agent kind Pi Herdsman never manages, can be
-closed; a Pi pane publishing any `pi_herdsman_*` key is the owner's and refuses
-the direct path, and a Pi pane with no owner metadata is unverified and refuses.
-A pane carrying a registry candidate is protected the same way whether or not
-Radar could join it to that registration: an unresolved or ambiguous registered
-occupant is the case where a generic close would be a guess.
-A tab holding any managed or unverified member refuses whole, so nothing is
-partly applied. A direct mux close has no conditional form, so this cannot be
-atomic across the inventory read and the close — the checks narrow the window,
-they do not eliminate it. Radar never kills a process itself and never removes a
-row optimistically; a successful close is reconciled by the next collection.
+A container with nothing running is deleted without a question: it loses no work,
+so nothing is asked. What counts as running is the observed foreground command and
+`herdr-control/v1` jobs; an idle shell is not running anything. When something is,
+the question names it — `nvim is running`, or the worker's label — rather than
+leaking handles and ids.
 
-A **managed** pane close is routed to its owner instead: `x` on a managed worker
+The scope is the row's own. A workspace row deletes the workspace container and
+everything recorded inside it; the row a tab is drawn as ends the whole tab, every
+other pane row its own pane; an agent row names a process, so `D` on it is that
+process ending. A row Radar records no container for still ends: its pane is closed
+directly through the runtime.
+
+A **managed** worker's row is stopped through its owner, so the exit is reported
+rather than only observed: `D` asks the exact parent session, through
+`herdsman-control/v1`, never the runtime. A container or tab holding managed
+members is ended as a place, and each owner settles what ran inside it from the
+loss. Radar does not ask an owner to close a pane that is not its own.
+
+A container whose place is no longer served is **forgotten**: its records go and
+nothing is dispatched, because there is nothing left to close. A container whose
+place is still served is refused instead of forgotten around, so no live place is
+orphaned. This is the recovery path for a fleet whose backend was replaced
+underneath it.
+
+A **managed** pane close is routed to its owner instead: `D` on a managed worker
 asks the exact parent session, through `herdsman-control/v1`, never the mux.
 `r` restarts a managed worker the same way, and only when the owner advertises it
 idle: a working, waiting or blocked worker, a lead or standalone session, a
@@ -789,9 +797,9 @@ generic unmanaged close, including where its join is unresolved or ambiguous: th
 pane may be someone's agent even where Radar cannot prove whose. Close
 eligibility is a separate and stronger fact, established by a daemon-authored
 spawn edge to that exact child; a registration, a label, a session UUID or a
-metadata flag never makes a target eligible. `x` on a registration is routed to
-the worker's owner where the pane carries the lineage that route needs, and
-refused where it does not; it never becomes a generic unmanaged close.
+metadata flag never makes a target eligible. `D` on a registration is routed to
+the worker's owner where Radar holds a subject for it, and otherwise closes the
+pane the row shows; it never claims an owner it cannot name.
 
 ### What is still read from Herdr
 
@@ -973,8 +981,8 @@ One Cargo package, with `radar` as its binary:
   publication, bounded result reads, file-derived terminal states. `lifecycle.rs`
   holds containment policy, the direct-close worker and the off-thread
   owner-control worker that publishes a confirmed managed close or restart and
-  reads its outcome. Managed actions never touch the runtime seam; `x` on a
-  positively unmanaged pane is the only lifecycle action the mux performs.
+  reads its outcome. Managed actions never touch the runtime seam; the pane close of a
+  row without a recorded container is the only lifecycle action the mux performs.
 - `tests/`: sanitized fixtures, fake-executable and stub-socket transport
   checks at the adapter, collector and focus tests against an in-memory
   runtime, lifecycle tests against fake providers and a stub owner in temporary

@@ -851,10 +851,10 @@ fn metadata_only(metadata: Vec<AgentObservation>, panes: &[&str]) -> FleetObserv
 }
 
 /// Metadata that appears and then vanishes while its pane survives must never
-/// become an agent row, retained or current, yet still protects the pane from
-/// a direct close.
+/// become an agent row, retained or current. The pane row still ends: `D` on it is
+/// the operator's decision, and with no owner-held subject there is no owner to ask.
 #[test]
-fn vanished_metadata_shows_no_row_and_still_protects_its_pane() {
+fn vanished_metadata_shows_no_row_and_its_pane_can_still_be_ended() {
     let mut state = ObservationState::new();
     state.apply_success(metadata_only(vec![owner_metadata("wH:p1")], &["wH:p1"]));
     assert!(agent_node(&app_for(&state).tree().roots, "wH:p1").is_none());
@@ -873,24 +873,17 @@ fn vanished_metadata_shows_no_row_and_still_protects_its_pane() {
     app.cycle_panes();
     assert_eq!(app.pane_view(), PaneView::All);
     select(&mut app, &RowId::Pane("wH:p1".into()));
-    app.begin_action(Operation::ClosePane, &state);
-    assert!(
-        app.confirmation().is_none(),
-        "a managed pane was offered a direct close"
-    );
-    assert!(app.focus_message().is_some(), "the refusal left no reason");
-
-    app.begin_action(Operation::CloseTab, &state);
-    assert!(
-        app.confirmation().is_none(),
-        "a managed tab was offered a direct close"
+    app.begin_action(Operation::Delete, &state);
+    let confirmation = app.confirmation().expect("a close is asked");
+    assert_eq!(
+        confirmation.target,
+        agent_radar::CloseTarget::Pane("wH:p1".into())
     );
     assert!(
-        app.focus_message()
-            .is_some_and(|message| message.contains("managed by its owner")),
-        "{:?}",
-        app.focus_message()
+        confirmation.subject.is_none(),
+        "no subject survived, so no owner is asked"
     );
+    app.cancel_confirmation();
 }
 
 /// Installs the configuration the presentation tests draw with, once per test
@@ -1981,7 +1974,7 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
     }
 
     select(&mut app, &RowId::Registered("r1".into()));
-    app.begin_action(Operation::ClosePane, &state);
+    app.begin_action(Operation::Delete, &state);
     assert!(
         app.confirmation().is_none(),
         "an unresolved agent was offered a close"
