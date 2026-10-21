@@ -612,6 +612,10 @@ pub struct App {
     /// stale inventory is last-good rather than current, so `Enter` refuses on
     /// every row of it.
     source_current: bool,
+    /// Containers whose deletion was held back because an agent inside them did
+    /// not exit. The next `D` on one of them asks the daemon to close anyway, so
+    /// a wedged agent cannot make a place undeletable for good.
+    deletion_held: HashSet<String>,
     /// One line about the last action Radar took or refused — a focus or a
     /// lifecycle close — and when it was set. It clears on the next key press or
     /// after [`FOCUS_MESSAGE_TTL`].
@@ -2314,6 +2318,7 @@ impl App {
             return Some(Confirmed::Container(crate::topology::Control::Delete(
                 ContainerDelete {
                     request_id: crate::control_plane::random_uuid(),
+                    force: self.deletion_held.contains(&id),
                     container_id: id,
                     // No place to freeze: there is nothing recorded to close.
                     frozen: serde_json::Value::Null,
@@ -2438,6 +2443,7 @@ impl App {
         let control = match confirmation.operation {
             Operation::Delete => crate::topology::Control::Delete(ContainerDelete {
                 request_id,
+                force: self.deletion_held.contains(id),
                 container_id: id.to_string(),
                 // The frozen target and occupant travel with the request: the daemon
                 // refuses the deletion when that place no longer holds them.
@@ -2564,9 +2570,16 @@ impl App {
     pub fn apply_container_outcome(&mut self, finished: crate::topology::Finished) {
         let crate::topology::Finished {
             verb,
+            container_id,
             request_id,
             result,
         } = finished;
+        // A deletion the daemon held back is the operator's to repeat: the next
+        // `D` on the same container asks for it to close anyway. Any other answer
+        // clears the hold, so a plain deletion never carries force.
+        if let Some(id) = container_id.as_deref().filter(|_| verb != "delete") {
+            self.deletion_held.remove(id);
+        }
         match result {
             Ok(answer) => {
                 let outcome = answer.outcome().to_string();
@@ -2582,6 +2595,20 @@ impl App {
                     text.push_str(&format!(": {message}"));
                 }
                 let failed = outcome != "completed";
+                // The daemon files the hold under its own category, so what the
+                // UI acts on is a word, not a sentence.
+                if verb == "delete"
+                    && let Some(id) = container_id
+                {
+                    let held = answer.category().is_some_and(|category| {
+                        category == crate::control_plane::store::Category::AGENTS_ALIVE
+                    });
+                    if failed && held {
+                        self.deletion_held.insert(id);
+                    } else {
+                        self.deletion_held.remove(&id);
+                    }
+                }
                 self.record_notice(request_id, text, failed);
             }
             Err(message) => self.record_notice(
@@ -4902,6 +4929,46 @@ mod tests {
         stale.apply_failure("herdr exited with status 1");
         assert_eq!(app.confirm(&stale), None);
         assert!(app.focus_message().expect("a reason").contains("stale"));
+    }
+
+    /// A deletion the daemon held because an agent inside the place did not exit
+    /// is the operator's to repeat: the next `D` asks for the place to close.
+    #[test]
+    fn a_deletion_held_by_a_living_agent_is_repeated_with_force() {
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut container = pane_container("c1", "wA:p3", None);
+        container.unresolved = Some("no backend reports this container's handle".to_string());
+        observation.containers = vec![container];
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let mut app = App::new();
+        app.refresh(&state);
+        show_all_panes(&mut app);
+        select_row(&mut app, &RowId::Pane("wA:p3".into()));
+
+        let answer = crate::control_plane::client::ContainerAnswer {
+            request: serde_json::json!({
+                "request_id": "held",
+                "outcome": "refused",
+                "category": crate::control_plane::store::Category::AGENTS_ALIVE,
+                "message": "1 agent(s) inside pane wA:p3 did not exit",
+            }),
+            container: None,
+            removed: Vec::new(),
+        };
+        app.apply_container_outcome(crate::topology::Finished {
+            verb: "delete",
+            container_id: Some("c1".to_string()),
+            request_id: "held".to_string(),
+            result: Ok(answer),
+        });
+
+        match app.begin_action(Operation::Delete, &state) {
+            Some(Confirmed::Container(crate::topology::Control::Delete(request))) => {
+                assert!(request.force, "the repeat closes anyway")
+            }
+            other => panic!("a delete control: {other:?}"),
+        }
     }
 
     #[test]

@@ -4291,6 +4291,45 @@ fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
 /// The frozen normalized request a create or input carries under `request`,
 /// or the refusal to answer with. `extra` names further params this method
 /// accepts beside it.
+/// The launch subjects created inside a place, from the daemon's own spawn edges.
+///
+/// Membership is the edge's recorded location, never a pane name guessed from a
+/// report: an agent is inside the place the create that produced it named.
+fn subjects_inside(registry: &Registry, target: &crate::CloseTarget) -> Vec<String> {
+    let inside = |location: &crate::control_plane::registry::RegistryLocation| match target {
+        crate::CloseTarget::Pane(pane) => location.pane.as_deref() == Some(pane.as_str()),
+        crate::CloseTarget::Tab(tab) => location.tab.as_deref() == Some(tab.as_str()),
+        crate::CloseTarget::Workspace(workspace) => {
+            location.workspace.as_deref() == Some(workspace.as_str())
+        }
+    };
+    let mut subjects: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    while let Ok(edges) = registry.spawn_edges_after(cursor.as_deref(), MAX_PANE_OBSERVATIONS) {
+        let end = edges.len() < MAX_PANE_OBSERVATIONS;
+        cursor = edges.last().map(|edge| edge.request_id.clone());
+        for edge in &edges {
+            // An unbound edge may never have released a program, so it is no
+            // execution to cancel.
+            if edge.bound.is_none() {
+                continue;
+            }
+            let (Some(subject_id), Some(location)) =
+                (edge.subject_id.as_deref(), edge.location.as_ref())
+            else {
+                continue;
+            };
+            if inside(location) && !subjects.iter().any(|known| known == subject_id) {
+                subjects.push(subject_id.to_string());
+            }
+        }
+        if end {
+            break;
+        }
+    }
+    subjects
+}
+
 fn frozen_params(request: &Request, extra: &[&str]) -> Result<serde_json::Value, Response> {
     if request.params.as_object().is_none_or(|params| {
         params.keys().any(|key| {
@@ -4850,6 +4889,43 @@ fn execute_container_delete(
         );
         return write_deleted(request, settled, removed, core);
     }
+    // Every agent launched inside this place ends the way a single `D` on its own
+    // row ends it: fenced, SIGTERM, one shared window for the exit, and the exit
+    // recorded. Radar does not close the place over an agent that is still alive
+    // unless the operator asks twice.
+    let inside = subjects_inside(&registry, &frozen.target);
+    let mut stopped = Vec::new();
+    // Agents left alive by the window. On a repeat deletion the place closes
+    // anyway, and the outcome says which exits were never verified.
+    let mut alive: Vec<String> = Vec::new();
+    if !inside.is_empty() {
+        let verifier = Arc::clone(&locked(core).verifier);
+        let cancelled = crate::control_plane::lifecycle::cancel_many(
+            &registry,
+            &inside,
+            verifier.as_ref(),
+            store::now_ms(),
+        );
+        stopped = cancelled.stopped;
+        alive = cancelled.survivors;
+        let mut held = alive.clone();
+        if !held.is_empty() && !delete.force {
+            held.sort();
+            held.dedup();
+            return write_refused_with(
+                request,
+                record,
+                store::Category::AGENTS_ALIVE,
+                &format!(
+                    "{} agent(s) inside {} did not exit: {} — nothing was closed; delete again to close anyway",
+                    held.len(),
+                    frozen.target.description(),
+                    held.join(", ")
+                ),
+                core,
+            );
+        }
+    }
     let settled = match lifecycle::close_for_deletion(backend.as_ref(), &frozen, &cancel) {
         DirectClose::Completed => {
             let now = store::now_ms();
@@ -4865,9 +4941,16 @@ fn execute_container_delete(
             // The close is the runtime's confirmation that it removed the place,
             // not a re-observation of it, and the removals are the daemon's own
             // records: neither claims anything about a process.
+            let ended = match (stopped.len(), alive.len()) {
+                (0, 0) => String::new(),
+                (count, 0) => format!(" after {count} agent(s) exited"),
+                (count, alive) => format!(
+                    " after {count} agent(s) exited; {alive} agent(s) did not, and their exits are unverified"
+                ),
+            };
             let note = if failures.is_empty() {
                 format!(
-                    "{} was closed by the runtime; {} container record(s) marked removed",
+                    "{} was closed by the runtime{ended}; {} container record(s) marked removed",
                     frozen.target.description(),
                     removed.len()
                 )
@@ -5174,11 +5257,23 @@ fn write_refused(
     message: &str,
     core: &Arc<Mutex<Core>>,
 ) -> Response {
+    write_refused_with(request, record, Category::REFUSED, message, core)
+}
+
+/// A refusal filed under its own category, for the callers whose refusal the UI
+/// acts on rather than only reads.
+fn write_refused_with(
+    request: &Request,
+    record: RequestRecord,
+    category: &'static str,
+    message: &str,
+    core: &Arc<Mutex<Core>>,
+) -> Response {
     write_deleted(
         request,
         record.complete(
             RequestOutcome::Refused,
-            Some(Category::REFUSED),
+            Some(category),
             Some(message),
             Vec::new(),
             store::now_ms(),

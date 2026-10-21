@@ -121,6 +121,16 @@ impl Control {
     }
 
     /// The verb, as the operator sees it in the outcome line.
+    /// The container this control names, where it names one before it runs: a
+    /// creation names the container it made only once the daemon answers.
+    pub fn container_id(&self) -> Option<&str> {
+        match self {
+            Self::Create(_) => None,
+            Self::Delete(request) => Some(&request.container_id),
+            Self::Reload(request) => Some(&request.container_id),
+        }
+    }
+
     pub fn verb(&self) -> &'static str {
         match self {
             Self::Create(_) => "create",
@@ -136,6 +146,9 @@ impl Control {
 pub struct Finished {
     /// The verb the operator confirmed.
     pub verb: &'static str,
+    /// The container the control named, where it named one: the answer is about
+    /// that record even when the daemon refused it.
+    pub container_id: Option<String>,
     /// The request id the control was dispatched under, so the operation can be
     /// read back whether or not an answer arrived.
     pub request_id: String,
@@ -224,6 +237,7 @@ impl ContainerControl {
         let _ = request.worker.join();
         Some(Finished {
             verb: control.verb(),
+            container_id: control.container_id().map(str::to_string),
             request_id: control.request_id().to_string(),
             result,
         })

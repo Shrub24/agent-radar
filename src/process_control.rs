@@ -126,6 +126,47 @@ pub fn exited_within(fd: &OwnedFd, timeout: Duration) -> bool {
     }
 }
 
+/// Which of these processes exit within `timeout`, waited on together.
+///
+/// One deadline covers the whole set, so ending a workspace holding several
+/// agents costs one window rather than one per agent. A descriptor is only ever
+/// waited on, never signalled here: the caller has already fenced and signalled.
+pub fn exited_all_within(fds: &[&OwnedFd], timeout: Duration) -> Vec<bool> {
+    let mut exited = vec![false; fds.len()];
+    let started = std::time::Instant::now();
+    let mut remaining: Vec<usize> = (0..fds.len()).collect();
+    while !remaining.is_empty() {
+        let Some(left) = timeout.checked_sub(started.elapsed()) else {
+            return exited;
+        };
+        let mut polled: Vec<PollFd> = remaining
+            .iter()
+            .map(|&index| PollFd::new(fds[index], PollFlags::IN))
+            .collect();
+        let timespec = rustix::time::Timespec {
+            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(left.subsec_nanos()),
+        };
+        match poll(&mut polled, Some(&timespec)) {
+            Ok(0) => return exited,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return exited,
+            Ok(_) => {
+                let mut still: Vec<usize> = Vec::with_capacity(remaining.len());
+                for (polled, &index) in polled.iter().zip(remaining.iter()) {
+                    if polled.revents().contains(PollFlags::IN) {
+                        exited[index] = true;
+                    } else {
+                        still.push(index);
+                    }
+                }
+                remaining = still;
+            }
+        }
+    }
+    exited
+}
+
 fn open(pid: i32) -> Result<OwnedFd, rustix::io::Errno> {
     let pid = Pid::from_raw(pid).ok_or(rustix::io::Errno::INVAL)?;
     pidfd_open(pid, PidfdFlags::empty())

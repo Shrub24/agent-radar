@@ -1555,6 +1555,68 @@ fn stage(
     Ok(Stage::Watch { descriptor, signal })
 }
 
+/// The outcome of cancelling several executions under one window.
+pub struct Cancelled {
+    /// Executions whose exit was verified and recorded.
+    pub stopped: Vec<String>,
+    /// Executions still alive when the window closed, by subject id. A process
+    /// that could not be signalled is one of these: it is not known to be gone.
+    pub survivors: Vec<String>,
+}
+
+/// Cancels every named execution together: each is fenced, signalled once, and
+/// then the whole set is waited on under a single deadline.
+///
+/// One window rather than one per execution is what makes ending a place holding
+/// several agents bounded: the operator waits one window, not a series of them.
+pub fn cancel_many(
+    registry: &Registry,
+    subject_ids: &[String],
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+) -> Cancelled {
+    let mut report = Cancelled {
+        stopped: Vec::new(),
+        survivors: Vec::new(),
+    };
+    // Descriptors are held for the shared wait, so nothing is signalled twice and
+    // each wait is on the process that was signalled.
+    let mut watching: Vec<(String, std::os::fd::OwnedFd)> = Vec::new();
+    for subject_id in subject_ids {
+        match stage(registry, subject_id, verifier, now_ms) {
+            // Already verified gone: the exit is recorded and there is nothing to
+            // wait for.
+            Ok(Stage::Settled(Exit::Exited)) => report.stopped.push(subject_id.clone()),
+            // No captured process, or one already recorded as ended.
+            Ok(Stage::Settled(_)) => match record_exit(registry, subject_id, now_ms) {
+                Ok(()) => report.stopped.push(subject_id.clone()),
+                Err(_) => report.survivors.push(subject_id.clone()),
+            },
+            Ok(Stage::Watch { descriptor, signal }) => {
+                if signal && process_control::terminate(&descriptor).is_err() {
+                    report.survivors.push(subject_id.clone());
+                    continue;
+                }
+                watching.push((subject_id.clone(), descriptor));
+            }
+            // An identity that cannot be read is not a process to signal and not
+            // one to call gone.
+            Err(_) => report.survivors.push(subject_id.clone()),
+        }
+    }
+    let descriptors: Vec<&std::os::fd::OwnedFd> =
+        watching.iter().map(|(_, descriptor)| descriptor).collect();
+    let exited = process_control::exited_all_within(&descriptors, EXIT_DEADLINE);
+    for ((subject_id, _), exited) in watching.iter().zip(exited.iter()) {
+        if *exited && record_exit(registry, subject_id, now_ms).is_ok() {
+            report.stopped.push(subject_id.clone());
+        } else {
+            report.survivors.push(subject_id.clone());
+        }
+    }
+    report
+}
+
 fn record_exit(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<(), String> {
     let _transition = registry.transition();
     let mut subject = read_recorded(registry, subject_id)?;
@@ -3018,6 +3080,77 @@ mod tests {
             .expect("read")
             .expect("subject");
         assert_eq!(subject.state, State::Pending);
+    }
+
+    #[test]
+    fn cancelling_several_executions_signals_them_together_and_records_each_exit() {
+        let scratch = Scratch::new("cancel-many");
+        let registry = scratch.registry();
+        let mut children = Vec::new();
+        let mut subjects = Vec::new();
+        for _ in 0..2 {
+            let (subject, child, _process) = captured_child(&registry);
+            subjects.push(subject);
+            children.push(child);
+        }
+
+        let cancelled = cancel_many(&registry, &subjects, &LocalProcfsVerifier, 3);
+
+        assert_eq!(cancelled.survivors, Vec::<String>::new());
+        assert_eq!(cancelled.stopped.len(), 2, "both executions exited");
+        for subject_id in &subjects {
+            let subject = read(&registry, subject_id).expect("read").expect("subject");
+            assert!(subject.exited_at.is_some(), "an exit was recorded");
+        }
+        for child in &mut children {
+            let _ = child.0.wait();
+        }
+    }
+
+    #[test]
+    fn a_cancel_whose_window_closes_reports_the_execution_as_a_survivor() {
+        let scratch = Scratch::new("cancel-survivor");
+        let registry = scratch.registry();
+        let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
+        // A process that ignores SIGTERM: the window must end with a survivor, not
+        // a claim that it exited.
+        let mut child = Child(
+            Command::new("sh")
+                .arg("-c")
+                .arg("trap '' TERM; sleep 300")
+                .spawn()
+                .expect("shell"),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let process = LocalProcfsVerifier
+            .inspect(child.0.id() as i32)
+            .expect("procfs")
+            .expect("the child is alive");
+        capture(
+            &registry,
+            &ticket.subject_id,
+            &ticket.correlation,
+            &process,
+            &started_as(&launch()),
+            2,
+        )
+        .expect("capture");
+
+        let cancelled = cancel_many(
+            &registry,
+            std::slice::from_ref(&ticket.subject_id),
+            &LocalProcfsVerifier,
+            3,
+        );
+
+        assert_eq!(cancelled.survivors, vec![ticket.subject_id.clone()]);
+        assert!(cancelled.stopped.is_empty());
+        let subject = read(&registry, &ticket.subject_id)
+            .expect("read")
+            .expect("subject");
+        assert!(subject.exited_at.is_none(), "no exit was recorded");
+        let _ = child.0.kill();
+        let _ = child.0.wait();
     }
 
     #[test]

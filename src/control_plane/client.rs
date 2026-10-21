@@ -1131,6 +1131,9 @@ pub struct ContainerCreate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerDelete {
     pub request_id: String,
+    /// Set by a second `D` on the same place: an agent inside it held the first
+    /// deletion, and the operator has now asked for it to be closed anyway.
+    pub force: bool,
     pub container_id: String,
     /// The frozen target and occupant, as the daemon's close contract takes it:
     /// the daemon refuses the deletion when that place no longer holds it.
@@ -1176,6 +1179,11 @@ impl ContainerAnswer {
             .get("outcome")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
+    }
+
+    /// The category the record grouped its refusal under, when it wrote one.
+    pub fn category(&self) -> Option<&str> {
+        self.request.get("category").and_then(Value::as_str)
     }
 
     /// The record's own message, when it wrote one.

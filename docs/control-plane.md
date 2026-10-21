@@ -277,6 +277,7 @@ Durable request state, and what each word means:
 | `in_flight` | `category` | An unresolved request for the same target and method already exists |
 | `backend_unavailable` | `category` | The backend could not satisfy the operation: it lacks the capability, or it gave no usable answer (the record's `outcome` says which) |
 | `backend_refused` | `category` | The backend gave an explicit refusal before reporting success |
+| `agents_alive` | `category` | A container deletion was held because an agent inside it did not exit; the place stands until the operator repeats the deletion |
 
 State and outcome are deliberately separate: `state` says how far the durable
 record got, `outcome` says what the operation did. Neither is derived from the

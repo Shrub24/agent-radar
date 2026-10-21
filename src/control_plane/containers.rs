@@ -67,6 +67,11 @@ pub struct DeleteRequest {
     /// still served, so a live place is never forgotten around.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen: Option<CloseRequest>,
+    /// The operator asked a second time. An agent inside the place that did not
+    /// exit within the window holds the first deletion; the repeat closes the
+    /// place anyway and the outcome says what could not be verified.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Who made the container.

@@ -10668,6 +10668,7 @@ fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
     let deleted = controls
         .delete_container(
             &ContainerDelete {
+                force: false,
                 request_id: delete_id.clone(),
                 container_id: container.container_id.clone(),
                 frozen: json!({
@@ -10698,6 +10699,7 @@ fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
     let replayed = controls
         .delete_container(
             &ContainerDelete {
+                force: false,
                 request_id: delete_id,
                 container_id: container.container_id.clone(),
                 frozen: json!({

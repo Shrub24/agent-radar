@@ -5105,6 +5105,7 @@ mod tests {
              a pane split or a tab creation carries one";
         app.apply_container_outcome(crate::topology::Finished {
             verb: "create",
+            container_id: None,
             request_id: "7b5a6cd8-a22a-44f6-9159-2bfce42a8499".to_string(),
             result: Err(refusal.to_string()),
         });
@@ -5140,6 +5141,7 @@ mod tests {
         for index in 0..8 {
             app.apply_container_outcome(crate::topology::Finished {
                 verb: "create",
+                container_id: None,
                 request_id: format!("request-{index}"),
                 result: Err(format!("refusal number {index}")),
             });

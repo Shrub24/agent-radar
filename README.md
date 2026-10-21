@@ -441,6 +441,15 @@ When the answer is not empty the confirmation names the contents rather than the
 record that holds them — `nvim is running`, `worker-3 is working`, `pi has 2
 background task(s) running` — so the operator reads what dies, not a handle.
 
+A place holding agents ends them the way `D` on their own row ends them: each
+launch inside the container is fenced, sent SIGTERM, and the whole set is waited
+on under one window — so a workspace with three agents costs one wait, not three.
+Each verified exit is recorded before the place closes. An agent that is still
+alive when the window closes **holds the deletion**: the place is left standing
+and the refusal names the subjects, because Radar will not close a place over a
+living agent. A second `D` on the same container is the operator saying they mean
+it, and the place closes with the survivor reported as unverified.
+
 The scope is the row's own. A workspace row deletes the workspace container and
 everything recorded inside it; the row a tab is drawn as ends the whole tab, every
 other pane row its own pane; an agent row names a process, so `D` on it is that
@@ -449,9 +458,15 @@ directly through the runtime.
 
 A **managed** worker's row is stopped through its owner, so the exit is reported
 rather than only observed: `D` asks the exact parent session, through
-`herdsman-control/v1`, never the runtime. A container or tab holding managed
-members is ended as a place, and each owner settles what ran inside it from the
-loss. Radar does not ask an owner to close a pane that is not its own.
+`herdsman-control/v1`, never the runtime. Radar does not ask an owner to close a
+pane that is not its own.
+
+Ending a place asks no owner, because a place has many and one request per owner
+would be orchestration Radar does not do. So a container ends its recorded
+launches through Radar's own cancel, above, and settles the rest as a place: the
+panes Radar holds no subject for are closed by the runtime, and their owners learn
+from the loss. The difference is deliberate — an owner request is one worker and
+its assignment; a place is a region and its contents.
 
 A container whose place is no longer served is **forgotten**: its records go and
 nothing is dispatched, because there is nothing left to close. A container whose

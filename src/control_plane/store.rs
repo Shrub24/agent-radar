@@ -155,6 +155,9 @@ impl Category {
     /// The daemon refused the operation itself: an ineligible target, a frozen
     /// target that no longer matches, or an effect it will not dispatch.
     pub const REFUSED: &'static str = "refused";
+    /// A deletion was held because an agent inside the place did not exit. The
+    /// place stands until the operator asks again.
+    pub const AGENTS_ALIVE: &'static str = "agents_alive";
 }
 
 /// What has happened to a request so far. Written in order; `Completed` is
