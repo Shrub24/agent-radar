@@ -182,6 +182,33 @@ impl ManagedMetadata {
     }
 }
 
+/// The durable identity of one agent: the facts that outlive its attempts.
+///
+/// An attempt ([`Subject`]) is one launch or adoption and dies with its process.
+/// The agent does not: its identity, its managed metadata and which attempt is
+/// current are held here once, instead of being copied forward onto every
+/// successor. `current_claim` names today's attempt record by its `subject_id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectRecord {
+    pub version: u32,
+    pub subject_id: String,
+    #[serde(default)]
+    pub managed: ManagedMetadata,
+    /// The Pi session this subject runs, when one is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The attempt that is current for this subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_claim: Option<String>,
+    /// The current attempt's generation, kept so a later attempt can be compared
+    /// without reading the events log while its lock is held.
+    #[serde(default)]
+    pub current_generation: u32,
+    pub recorded_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Subject {
@@ -496,6 +523,42 @@ pub fn read_logical(
     if SessionUuid::parse(logical_subject_id).is_none() {
         return Err("`subject_id` must be a canonical UUID".into());
     }
+    let latest = latest_attempt_for_logical(registry, logical_subject_id)?;
+    // The record is authoritative once it exists; an attempt written before it
+    // existed is promoted here so the subject stops being derived by scanning.
+    let record = match read_subject_record(registry, logical_subject_id)? {
+        Some(record) => Some(record),
+        None => {
+            let attempt = match &latest {
+                Some(attempt_id) => read(registry, attempt_id)?,
+                None => None,
+            };
+            match attempt {
+                Some(attempt) if attempt.logical_subject_id.is_some() => {
+                    note_attempt(registry, &attempt)?;
+                    read_subject_record(registry, logical_subject_id)?
+                }
+                _ => None,
+            }
+        }
+    };
+    if let Some(record) = record {
+        return match record.current_claim {
+            Some(claim_id) => read(registry, &claim_id),
+            None => Ok(None),
+        };
+    }
+    match latest {
+        Some(attempt_id) => read(registry, &attempt_id),
+        None => read(registry, logical_subject_id),
+    }
+}
+
+/// The newest attempt assigned to one stable logical subject, if any.
+fn latest_attempt_for_logical(
+    registry: &Registry,
+    logical_subject_id: &str,
+) -> Result<Option<String>, String> {
     let mut execution: Option<(u32, String)> = None;
     let mut matching_count = 0usize;
     let mut has_unresolved = false;
@@ -528,10 +591,89 @@ pub fn read_logical(
             "logical subject {logical_subject_id} has unresolved execution continuity"
         ));
     }
-    match execution.map(|(_, execution_id)| execution_id) {
-        Some(execution_id) => read(registry, &execution_id),
-        None => read(registry, logical_subject_id),
+    Ok(execution.map(|(_, execution_id)| execution_id))
+}
+
+/// One agent's durable record, promoted from its attempts when none was written.
+pub fn read_subject_record(
+    registry: &Registry,
+    subject_id: &str,
+) -> Result<Option<SubjectRecord>, String> {
+    if SessionUuid::parse(subject_id).is_none() {
+        return Err("`subject_id` must be a canonical UUID".into());
     }
+    let path = subject_record_path(registry, subject_id);
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let bytes = read_record_file(&path, MAX_SUBJECT_BYTES)?;
+    let record: SubjectRecord =
+        serde_json::from_slice(&bytes).map_err(|_| "not a subject record".to_string())?;
+    if record.subject_id != subject_id {
+        return Err("subject record is filed under another subject".into());
+    }
+    Ok(Some(record))
+}
+
+/// Records which attempt is current for its subject, and which facts the subject
+/// carries. Called by the attempt writer, so every attempt change maintains it.
+fn note_attempt(registry: &Registry, subject: &Subject) -> Result<(), String> {
+    let logical_id = subject
+        .logical_subject_id
+        .clone()
+        .unwrap_or_else(|| subject.subject_id.clone());
+    let generation = subject.execution_generation.unwrap_or(1);
+    let existing = read_subject_record(registry, &logical_id)?;
+    let mut record = match existing {
+        Some(record) => record,
+        None => SubjectRecord {
+            version: SUBJECT_VERSION,
+            subject_id: logical_id.clone(),
+            managed: subject.managed.clone(),
+            session: subject.session.clone(),
+            current_claim: None,
+            current_generation: 0,
+            recorded_at: subject.recorded_at.clone(),
+            updated_at: subject.recorded_at.clone(),
+        },
+    };
+    // An earlier attempt reporting late never displaces the current one.
+    if generation < record.current_generation {
+        return Ok(());
+    }
+    let changed = record.current_claim.as_deref() != Some(subject.subject_id.as_str())
+        || record.managed != subject.managed
+        || record.session != subject.session;
+    if !changed {
+        return Ok(());
+    }
+    record.current_claim = Some(subject.subject_id.clone());
+    record.current_generation = generation;
+    record.managed = subject.managed.clone();
+    if subject.session.is_some() || record.session.is_none() {
+        record.session = subject.session.clone();
+    }
+    record.updated_at = subject.recorded_at.clone();
+    write_subject_record(registry, &record)
+}
+
+fn write_subject_record(registry: &Registry, record: &SubjectRecord) -> Result<(), String> {
+    let directory = registry.subjects().join("identity");
+    crate::control_plane::registry::prepare_directory(&directory)?;
+    let bytes = serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?;
+    write_atomic(
+        &directory,
+        &subject_record_path(registry, &record.subject_id),
+        &bytes,
+        MAX_SUBJECT_BYTES,
+    )
+}
+
+fn subject_record_path(registry: &Registry, subject_id: &str) -> PathBuf {
+    registry
+        .subjects()
+        .join("identity")
+        .join(format!("{subject_id}.json"))
 }
 
 /// All exact execution IDs durably assigned to one stable logical subject.
@@ -1802,6 +1944,11 @@ fn exchange(socket: &Path, method: &str, params: Value) -> Result<Value, String>
 }
 
 fn write(registry: &Registry, subject: &Subject) -> Result<(), String> {
+    write_attempt(registry, subject)?;
+    note_attempt(registry, subject)
+}
+
+fn write_attempt(registry: &Registry, subject: &Subject) -> Result<(), String> {
     use crate::control_plane::events::{Facts, Source, Transition};
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
     let previous = log.facts(&subject.subject_id).cloned();
@@ -2407,6 +2554,97 @@ mod tests {
         let listed = list_logical_after(&registry, None, 10).expect("logical list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].subject_id, second.subject_id);
+    }
+
+    #[test]
+    fn a_subject_record_names_the_current_attempt_and_keeps_the_subject_across_it() {
+        let scratch = Scratch::new("subject-record");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("first attempt");
+        let logical_id = first.subject_id.clone();
+
+        let record = read_subject_record(&registry, &logical_id)
+            .expect("read record")
+            .expect("the attempt created its subject");
+        assert_eq!(record.subject_id, logical_id);
+        assert_eq!(
+            record.current_claim.as_deref(),
+            Some(first.subject_id.as_str())
+        );
+        assert_eq!(record.current_generation, 1);
+
+        // A successor moves the pointer, and the subject itself is unchanged.
+        let second = create_with_identity(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((logical_id.clone(), 2)),
+            2,
+        )
+        .expect("successor attempt");
+        let record = read_subject_record(&registry, &logical_id)
+            .expect("read record")
+            .expect("the subject still exists");
+        assert_eq!(
+            record.current_claim.as_deref(),
+            Some(second.subject_id.as_str())
+        );
+        assert_eq!(record.current_generation, 2);
+        assert_eq!(
+            record.recorded_at,
+            read(&registry, &first.subject_id)
+                .expect("read")
+                .expect("attempt")
+                .recorded_at
+        );
+
+        // An earlier attempt reporting late does not displace the current one.
+        let earlier = read(&registry, &first.subject_id)
+            .expect("read")
+            .expect("attempt");
+        note_attempt(&registry, &earlier).expect("note the earlier attempt");
+        let record = read_subject_record(&registry, &logical_id)
+            .expect("read record")
+            .expect("subject");
+        assert_eq!(
+            record.current_claim.as_deref(),
+            Some(second.subject_id.as_str())
+        );
+    }
+
+    #[test]
+    fn an_attempt_written_before_its_subject_record_promotes_one() {
+        let scratch = Scratch::new("subject-promote");
+        let registry = scratch.registry();
+        // A root attempt names itself, so promotion is proved with a real
+        // successor chain whose record is removed before it is read.
+        let root = create(&registry, SPAWN, launch(), None, 1).expect("root");
+        let logical_id = root.subject_id.clone();
+        let successor = create_with_identity(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((logical_id.clone(), 2)),
+            2,
+        )
+        .expect("successor");
+        let path = subject_record_path(&registry, &logical_id);
+        fs::remove_file(&path).expect("remove the record");
+
+        let current = read_logical(&registry, &logical_id)
+            .expect("read logical")
+            .expect("current attempt");
+        assert_eq!(current.subject_id, successor.subject_id);
+        let promoted = read_subject_record(&registry, &logical_id)
+            .expect("read record")
+            .expect("promotion wrote a record");
+        assert_eq!(
+            promoted.current_claim.as_deref(),
+            Some(successor.subject_id.as_str())
+        );
+        assert_eq!(promoted.current_generation, 2);
     }
 
     #[test]
