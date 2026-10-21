@@ -97,8 +97,8 @@ const reply = (request: any, result: unknown): string => {
 		// Most tests exercise ordinary current daemons; old-revision cases use
 		// rawReply so the handshake gate remains explicitly covered.
 		revision:
-			typeof fields.revision === "number" && fields.revision < 3
-				? 3
+			typeof fields.revision === "number" && fields.revision < 4
+				? 4
 				: fields.revision,
 	});
 };
@@ -764,7 +764,7 @@ test("spawn carries validated Radar-owned launch metadata in the durable request
 		if (request.method === "daemon.ping")
 			return reply(request, {
 				protocol: 2,
-				revision: 3,
+				revision: 4,
 				contracts: ["registry.v1", "spawn.v1"],
 			});
 		assert.equal(request.method, "spawn.create");
@@ -964,7 +964,7 @@ test("an untrusted control socket is refused without dialling", async () => {
 	}
 });
 
-test("daemon.ping requires protocol 2, revision 3, and registry.v1", async () => {
+test("daemon.ping requires protocol 2, revision 4, and registry.v1", async () => {
 	const answers = [
 		(request: any) =>
 			reply(request, { protocol: 1, revision: 1, contracts: ["registry.v1"] }),
@@ -973,6 +973,13 @@ test("daemon.ping requires protocol 2, revision 3, and registry.v1", async () =>
 				protocol: 2,
 				revision: 2,
 				contracts: ["registry.v1"],
+			}),
+		(request: any) =>
+			rawReply(request, {
+				protocol: 2,
+				backend: "sqlite",
+				revision: 3,
+				contracts: ["registry.v1", "future.contract.v9"],
 			}),
 		(request: any) =>
 			reply(request, {
@@ -992,13 +999,18 @@ test("daemon.ping requires protocol 2, revision 3, and registry.v1", async () =>
 		const oldRevision = await client.ping();
 		assert.equal(oldRevision.ok, false);
 		assert.match(oldRevision.ok ? "" : oldRevision.message, /restart radar-daemon/);
+		// Revision 3 served managed lifecycle but no Pi presence, so a session on it
+		// would be accepted and then never gain a subject.
+		const presenceless = await client.ping();
+		assert.equal(presenceless.ok, false);
+		assert.match(presenceless.ok ? "" : presenceless.message, /revision 4/);
 		const capable = await client.ping();
 		assert.deepEqual(capable, {
 			ok: true,
 			value: {
 				protocol: 2,
 				backend: "sqlite",
-				revision: 3,
+				revision: 4,
 				instance: null,
 				contracts: ["registry.v1", "future.contract.v9"],
 				tasks: { available: false, error: null },
@@ -1031,9 +1043,9 @@ test("handoff inbox returns stable IDs and rejects malformed IDs", async () => {
 	}
 });
 
-test("handoff contract absence disables only handoff calls on a revision-three daemon", async () => {
+test("handoff contract absence disables only handoff calls", async () => {
 	const fixture = makeFixture((request) =>
-		reply(request, { protocol: 2, revision: 3, contracts: ["registry.v1"] }),
+		reply(request, { protocol: 2, revision: 4, contracts: ["registry.v1"] }),
 	);
 	try {
 		await listen(fixture);

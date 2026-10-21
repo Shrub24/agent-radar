@@ -30,8 +30,13 @@ import type {
  * served under the old name.
  */
 export const RADAR_PROTOCOL_VERSION = 2;
-/** The minimum daemon wire revision this client understands. */
-export const RADAR_MINIMUM_REVISION = 3;
+/**
+ * The minimum daemon wire revision this client understands. Revision 4 is where
+ * Pi presence and exact session release arrived; a revision-3 daemon would pass
+ * this handshake and then refuse every presence report, leaving a Pi session
+ * silently unmanaged instead of telling the operator to restart the daemon.
+ */
+export const RADAR_MINIMUM_REVISION = 4;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
