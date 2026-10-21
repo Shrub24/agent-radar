@@ -3691,6 +3691,21 @@ mod tests {
 
     const REAL_SHAPED: &str = include_str!("../tests/fixtures/snapshot_real_shaped.json");
 
+    /// The fixture with a command in a pane's foreground: what a close is asked
+    /// about, because it is what would be lost.
+    fn with_running_pane(mut state: ObservationState, pane_id: &str) -> ObservationState {
+        state.apply_evidence(
+            pane_id,
+            ForegroundEvidence::NonShell {
+                pid: 4242,
+                name: Some("nvim".to_string()),
+                command: Some("nvim src/main.rs".to_string()),
+                local: crate::model::LocalFacts::default(),
+            },
+        );
+        state
+    }
+
     fn fixture_state() -> ObservationState {
         let mut state = ObservationState::new();
         state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
@@ -8863,7 +8878,7 @@ mod tests {
 
     #[test]
     fn a_confirmation_names_the_target_and_records_its_drawn_buttons() {
-        let state = fixture_state();
+        let state = with_running_pane(fixture_state(), "wA:p3");
         let mut app = app_for(&state);
         show_all_panes(&mut app);
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
@@ -8908,8 +8923,17 @@ mod tests {
     }
 
     #[test]
-    fn the_delete_key_asks_before_an_agent_row_ends() {
+    fn the_delete_key_asks_before_a_working_agent_row_ends() {
         let state = fixture_state();
+        let mut observation = state.inventory().expect("current inventory").clone();
+        for agent in &mut observation.agents {
+            agent.status = Some(crate::model::RuntimeStatus::Working);
+        }
+        let state = {
+            let mut state = state;
+            state.apply_success(observation);
+            state
+        };
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p1");
         app.begin_action(crate::app::Operation::Delete, &state);

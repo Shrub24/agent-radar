@@ -851,10 +851,11 @@ fn metadata_only(metadata: Vec<AgentObservation>, panes: &[&str]) -> FleetObserv
 }
 
 /// Metadata that appears and then vanishes while its pane survives must never
-/// become an agent row, retained or current. The pane row still ends: `D` on it is
-/// the operator's decision, and with no owner-held subject there is no owner to ask.
+/// become an agent row, retained or current. The pane it was recorded against
+/// still refuses a direct close: Radar cannot verify the occupant and has no owner
+/// to route the stop to, so the refusal names that rather than guessing.
 #[test]
-fn vanished_metadata_shows_no_row_and_its_pane_can_still_be_ended() {
+fn vanished_metadata_shows_no_row_and_its_pane_refuses_a_direct_close() {
     let mut state = ObservationState::new();
     state.apply_success(metadata_only(vec![owner_metadata("wH:p1")], &["wH:p1"]));
     assert!(agent_node(&app_for(&state).tree().roots, "wH:p1").is_none());
@@ -873,17 +874,16 @@ fn vanished_metadata_shows_no_row_and_its_pane_can_still_be_ended() {
     app.cycle_panes();
     assert_eq!(app.pane_view(), PaneView::All);
     select(&mut app, &RowId::Pane("wH:p1".into()));
-    app.begin_action(Operation::Delete, &state);
-    let confirmation = app.confirmation().expect("a close is asked");
-    assert_eq!(
-        confirmation.target,
-        agent_radar::CloseTarget::Pane("wH:p1".into())
-    );
+    // Nothing is reported running, so no question is drawn; the close itself is
+    // refused because the pane's occupant cannot be verified as anyone's.
+    assert!(app.begin_action(Operation::Delete, &state).is_none());
+    assert!(app.confirmation().is_none(), "nothing was asked");
     assert!(
-        confirmation.subject.is_none(),
-        "no subject survived, so no owner is asked"
+        app.focus_message()
+            .is_some_and(|message| message.contains("managed by its owner")),
+        "{:?}",
+        app.focus_message()
     );
-    app.cancel_confirmation();
 }
 
 /// Installs the configuration the presentation tests draw with, once per test

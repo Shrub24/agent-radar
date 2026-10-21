@@ -2027,17 +2027,25 @@ impl App {
         // for this row to end.
         // A managed association with no subject has no owner to settle the exit, so
         // the pane closes like any other; the owner-held case stops through it.
+        // The same walk at every level: what the row contains decides whether the
+        // operator is asked, not which kind of row it is.
+        let mut walked = losses_under(inventory, state, &target);
+        let ask = !walked.is_empty();
         if let Some(subject) = subject.filter(|_| managed) {
             let identity = lifecycle::identity(inventory, &target);
-            let mut losses = losses;
-            losses.push(
+            walked.push(
                 "Radar cancels the exact process; a recorded child pane closes only after verified exit".into(),
             );
-            self.open_subject(operation, target, identity, subject, losses);
+            self.open_subject(operation, target, identity, subject, walked);
+        } else {
+            self.open_direct(operation, target, walked, state);
+        }
+        if ask {
             return None;
         }
-        self.open_direct(operation, target, losses, state);
-        None
+        // Nothing inside is mid-work, so this is not a question: the confirmation
+        // keeps its own revalidation and is taken straight through it.
+        self.confirm(state)
     }
 
     /// Opens the confirmation to enroll the selected registered lead.
@@ -2314,7 +2322,7 @@ impl App {
         }
         let target = container.kind.target(&container.handle);
         let described = container_name(inventory, &container);
-        let running = running_inside(inventory, state, &container);
+        let running = losses_under(inventory, state, &target);
         let mut losses = vec![described.clone()];
         match operation {
             Operation::Delete => {
@@ -3015,44 +3023,36 @@ fn container_name(inventory: &crate::model::FleetObservation, container: &Contai
     }
 }
 
-/// The panes recorded inside one container.
-fn panes_inside<'a>(
-    inventory: &'a crate::model::FleetObservation,
-    container: &ContainerRef,
-) -> Vec<&'a crate::model::Pane> {
-    inventory
-        .panes
-        .iter()
-        .filter(|pane| match container.kind {
-            crate::control_plane::containers::Kind::Workspace => {
-                pane.location.workspace_id == container.handle
-            }
-            crate::control_plane::containers::Kind::Tab => pane.location.tab_id == container.handle,
-            crate::control_plane::containers::Kind::Pane => {
-                pane.location.pane_id == container.handle
-            }
-        })
-        .collect()
-}
-
-/// What is running inside one container, named rather than identified: an agent
-/// by its label, a command by what the operating system calls it. An idle shell
-/// is nothing to lose, so it is not listed.
-fn running_inside(
+/// Everything ending this target would take with it, walked down from the level
+/// asked about so one rule applies at every level and the answer is collated
+/// there: an agent mid-task, a non-shell command in a pane, a running background
+/// task. Idle shells, idle agents and finished work are not losses.
+fn losses_under(
     inventory: &crate::model::FleetObservation,
     state: &ObservationState,
-    container: &ContainerRef,
+    target: &CloseTarget,
 ) -> Vec<String> {
-    let mut running: Vec<String> = Vec::new();
-    for pane in panes_inside(inventory, container) {
+    let mut lines: Vec<String> = Vec::new();
+    for pane in panes_in_scope(inventory, target) {
         let pane_id = pane.location.pane_id.as_str();
-        let named = inventory
+        if let Some(agent) = inventory
             .agents
             .iter()
             .find(|agent| agent.location.pane_id == pane_id)
-            .and_then(|agent| agent.label.as_deref().or(agent.name.as_deref()));
-        if let Some(named) = named {
-            running.push(format!("{named} is running"));
+        {
+            if agent_busy(agent) {
+                let name = agent
+                    .label
+                    .as_deref()
+                    .or(agent.name.as_deref())
+                    .unwrap_or("an agent");
+                let state = agent
+                    .status
+                    .as_ref()
+                    .map(|status| format!("{status:?}").to_lowercase())
+                    .unwrap_or_else(|| "unknown".to_string());
+                lines.push(format!("{name} is {state}"));
+            }
             continue;
         }
         if let Some(crate::model::ForegroundEvidence::NonShell { name, command, .. }) =
@@ -3062,14 +3062,66 @@ fn running_inside(
                 .as_deref()
                 .or(command.as_deref())
                 .unwrap_or("a command");
-            running.push(format!("{what} is running"));
+            lines.push(format!("{what} is running"));
         }
     }
-    running.sort();
-    running.dedup();
-    running
+    lines.extend(task_losses(inventory, target));
+    lines.sort();
+    lines.dedup();
+    lines
 }
 
+/// Whether an agent is in the middle of work its row's end would lose. Only a
+/// reported idle or finished agent holds nothing: a source that reported no state
+/// has not said the work is done, so it is asked about.
+fn agent_busy(agent: &crate::model::AgentObservation) -> bool {
+    !matches!(
+        agent.status,
+        Some(crate::model::RuntimeStatus::Idle) | Some(crate::model::RuntimeStatus::Done)
+    )
+}
+
+/// Background work still running in the target's panes: those processes go with
+/// the place, so they are named in the same question. The count is the pane's own
+/// publisher's, and it speaks only for the running ones.
+fn task_losses(inventory: &crate::model::FleetObservation, target: &CloseTarget) -> Vec<String> {
+    let panes: Vec<&str> = panes_in_scope(inventory, target)
+        .into_iter()
+        .map(|pane| pane.location.pane_id.as_str())
+        .collect();
+    inventory
+        .agents
+        .iter()
+        .filter(|agent| panes.contains(&agent.location.pane_id.as_str()))
+        .filter_map(|agent| {
+            let running = agent.facts.background_running.filter(|count| *count > 0)?;
+            let name = agent
+                .label
+                .as_deref()
+                .or(agent.name.as_deref())
+                .unwrap_or("an agent");
+            Some(format!("{name} has {running} background task(s) running"))
+        })
+        .collect()
+}
+
+/// The panes a target covers, at whatever depth they sit.
+fn panes_in_scope<'a>(
+    inventory: &'a crate::model::FleetObservation,
+    target: &CloseTarget,
+) -> Vec<&'a crate::model::Pane> {
+    inventory
+        .panes
+        .iter()
+        .filter(|pane| match target {
+            CloseTarget::Pane(pane_id) => pane.location.pane_id == *pane_id,
+            CloseTarget::Tab(tab_id) => pane.location.tab_id == *tab_id,
+            CloseTarget::Workspace(workspace_id) => pane.location.workspace_id == *workspace_id,
+        })
+        .collect()
+}
+
+/// The refusal a containment state gives a direct close, when it gives one.
 fn containment_refusal(containment: Containment, target: &CloseTarget) -> Option<String> {
     let described = target.description();
     match containment {
@@ -3499,8 +3551,11 @@ mod tests {
             press(&mut app, KeyCode::Char('D')),
             Some(Action::BeginAction(Operation::Delete))
         );
-        app.begin_action(Operation::Delete, &state);
-        assert!(app.confirmation().is_some());
+        // The pane is idle, so the action is handed back rather than drawn.
+        assert!(matches!(
+            app.begin_action(Operation::Delete, &state),
+            Some(Confirmed::Direct(_))
+        ));
     }
 
     #[test]
@@ -3656,7 +3711,10 @@ mod tests {
 
     #[test]
     fn a_confirmation_keeps_precedence_over_the_details_keys() {
-        let (state, mut app) = fixture();
+        let (state, _) = fixture();
+        let state = with_running_pane(state, "wA:p3");
+        let mut app = App::new();
+        app.refresh(&state);
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         press(&mut app, KeyCode::Tab);
@@ -3767,6 +3825,33 @@ mod tests {
 
     /// The fixture observation and a view refreshed against it, for tests that
     /// need to revalidate against the same state the view drew.
+    /// The fixture with an agent reported mid-task: work its row's end would lose.
+    fn with_busy_agent(mut state: ObservationState, pane_id: &str) -> ObservationState {
+        let mut observation = state.inventory().expect("current inventory").clone();
+        for agent in &mut observation.agents {
+            if agent.location.pane_id == pane_id {
+                agent.status = Some(crate::model::RuntimeStatus::Working);
+            }
+        }
+        state.apply_success(observation);
+        state
+    }
+
+    /// The fixture with a command in a pane's foreground: the case that loses
+    /// work, so the case that is asked about before it ends.
+    fn with_running_pane(mut state: ObservationState, pane_id: &str) -> ObservationState {
+        state.apply_evidence(
+            pane_id,
+            crate::model::ForegroundEvidence::NonShell {
+                pid: 4242,
+                name: Some("nvim".to_string()),
+                command: Some("nvim src/main.rs".to_string()),
+                local: crate::model::LocalFacts::default(),
+            },
+        );
+        state
+    }
+
     fn fixture() -> (ObservationState, App) {
         let mut state = ObservationState::new();
         state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
@@ -4363,7 +4448,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unmanaged_pane_opens_a_confirmation_that_defaults_to_cancel() {
+    fn an_idle_pane_ends_without_a_question_and_a_running_one_asks() {
         let (state, mut app) = fixture();
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
@@ -4371,12 +4456,39 @@ mod tests {
             press(&mut app, KeyCode::Char('D')),
             Some(Action::BeginAction(Operation::Delete))
         );
-        // Opening the confirmation sends nothing: it is drawn, not acted on.
+        // An idle shell holds nothing, so the standard case is not a question:
+        // the same key hands the close straight back for dispatch.
+        let dismissed = app.begin_action(Operation::Delete, &state);
+        assert!(app.confirmation().is_none(), "nothing to ask about");
+        assert!(
+            matches!(dismissed, Some(Confirmed::Direct(_))),
+            "{dismissed:?}"
+        );
+
+        // A pane with a command in the foreground is asked about, and the
+        // question starts on Cancel.
+        let mut state = state;
+        state.apply_evidence(
+            "wA:p3",
+            crate::model::ForegroundEvidence::NonShell {
+                pid: 4242,
+                name: Some("nvim".to_string()),
+                command: Some("nvim src/main.rs".to_string()),
+                local: crate::model::LocalFacts::default(),
+            },
+        );
         app.begin_action(Operation::Delete, &state);
         let confirmation = app.confirmation().expect("a confirmation");
-        // This row is its own pane: the tab is drawn as another row.
         assert_eq!(confirmation.target, CloseTarget::Pane("wA:p3".into()));
         assert!(!confirmation.confirm_selected, "Cancel is the default");
+        assert!(
+            confirmation
+                .losses
+                .iter()
+                .any(|line| line == "nvim is running"),
+            "{:?}",
+            confirmation.losses
+        );
 
         // Enter activates the selected button, so the default Cancel cancels.
         assert_eq!(press(&mut app, KeyCode::Enter), None);
@@ -4454,15 +4566,14 @@ mod tests {
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         // The same key on a pane Radar records nothing for ends that pane: there
-        // is no container to address and none is invented from its handle.
-        app.begin_action(Operation::Delete, &plain);
-        assert!(
-            app.confirmation()
-                .is_some_and(|confirmation| confirmation.container_id.is_none()),
-            "a pane close, not a container control: {:?}",
-            app.focus_message()
-        );
-        app.cancel_confirmation();
+        // is no container to address and none is invented from its handle. An idle
+        // pane is not a question, so the close is handed straight back.
+        match app.begin_action(Operation::Delete, &plain) {
+            Some(Confirmed::Direct(request)) => {
+                assert_eq!(request.target, CloseTarget::Pane("wA:p3".into()))
+            }
+            other => panic!("a pane close, not a container control: {other:?}"),
+        }
 
         // A reload of a pane with no recipe refuses for the same reason: there is
         // nothing recorded to run again.
@@ -4765,7 +4876,10 @@ mod tests {
 
     #[test]
     fn confirm_revalidates_against_the_latest_observation() {
-        let (state, mut app) = fixture();
+        let (state, _) = fixture();
+        let state = with_running_pane(state, "wA:p3");
+        let mut app = App::new();
+        app.refresh(&state);
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         app.begin_action(Operation::Delete, &state);
@@ -4792,7 +4906,12 @@ mod tests {
 
     #[test]
     fn moving_the_selection_does_not_redirect_the_frozen_target() {
-        let (state, mut app) = fixture();
+        // A command in the pane makes the close a question, which is what the
+        // frozen target belongs to.
+        let (state, _) = fixture();
+        let state = with_running_pane(state, "wA:p3");
+        let mut app = App::new();
+        app.refresh(&state);
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         app.begin_action(Operation::Delete, &state);
@@ -4883,7 +5002,11 @@ mod tests {
 
     #[test]
     fn a_target_that_became_managed_before_confirm_is_not_closed() {
-        let (state, mut app) = fixture();
+        // The pane holds a command, so the close is a question worth asking.
+        let (state, _) = fixture();
+        let state = with_running_pane(state, "wA:p3");
+        let mut app = App::new();
+        app.refresh(&state);
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         app.begin_action(Operation::Delete, &state);
@@ -4936,7 +5059,10 @@ mod tests {
             })
             .map(|row| row.id.clone());
         let Some(root) = root else {
-            // The fixture draws its tab as an agent row instead.
+            // The fixture draws its tab as an agent row instead, mid-task.
+            let state = with_busy_agent(state, "wA:p1");
+            app.refresh(&state);
+            show_all_panes(&mut app);
             select_row(&mut app, &RowId::Agent("wA:p1".into()));
             app.begin_action(Operation::Delete, &state);
             let confirmation = app.confirmation().expect("a confirmation");
@@ -4945,6 +5071,16 @@ mod tests {
             assert_eq!(confirmation.target, CloseTarget::Pane("wA:p1".into()));
             return;
         };
+        // The tab's own pane holds the work, so the tab is asked about.
+        let pane_of_root = match &root {
+            RowId::Pane(pane) => Some(pane.clone()),
+            RowId::Agent(pane) | RowId::Registered(pane) => Some(pane.clone()),
+            _ => None,
+        }
+        .expect("a pane row");
+        let state = with_running_pane(state, &pane_of_root);
+        app.refresh(&state);
+        show_all_panes(&mut app);
         select_row(&mut app, &root);
         app.begin_action(Operation::Delete, &state);
         let confirmation = app.confirmation().expect("a confirmation");
@@ -4954,6 +5090,14 @@ mod tests {
             confirmation.target
         );
         assert!(confirmation.subject.is_none(), "a tab is not one subject");
+        assert!(
+            confirmation
+                .losses
+                .iter()
+                .any(|line| line == "nvim is running"),
+            "{:?}",
+            confirmation.losses
+        );
     }
 
     #[test]
@@ -5045,12 +5189,16 @@ mod tests {
         app.refresh(&state);
 
         select_row(&mut app, &RowId::Agent("wA:p1".into()));
-        // The pane is kept alive by a retained association, so the row is still a
-        // target: the operator asked for it to end.
-        app.begin_action(Operation::Delete, &state);
-        assert_eq!(
-            app.confirmation().expect("a confirmation").operation,
-            Operation::Delete
+        // The pane is kept alive by a retained association, so Radar cannot verify
+        // its occupant and has no owner to ask: the direct close is refused with
+        // that reason rather than acted on behind an owner's back.
+        assert!(app.begin_action(Operation::Delete, &state).is_none());
+        assert!(app.confirmation().is_none());
+        assert!(
+            app.focus_message()
+                .is_some_and(|message| message.contains("managed by its owner")),
+            "{:?}",
+            app.focus_message()
         );
     }
 
@@ -5068,7 +5216,10 @@ mod tests {
 
     #[test]
     fn mouse_only_the_drawn_buttons_answer_a_confirmation() {
-        let (state, mut app) = fixture();
+        let (state, _) = fixture();
+        let state = with_running_pane(state, "wA:p3");
+        let mut app = App::new();
+        app.refresh(&state);
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         app.begin_action(Operation::Delete, &state);
@@ -5196,7 +5347,7 @@ mod tests {
 
     #[test]
     fn a_managed_worker_opens_a_daemon_subject_confirmation() {
-        let mut state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
+        let mut state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
         let mut observation = state.inventory().expect("current inventory").clone();
         observation.agents[0]
             .registry
@@ -5249,7 +5400,7 @@ mod tests {
 
     #[test]
     fn restart_is_offered_for_a_bound_daemon_subject_with_a_session() {
-        let state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
+        let state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
@@ -5299,7 +5450,7 @@ mod tests {
 
     #[test]
     fn confirm_refuses_a_managed_target_when_process_generation_changes() {
-        let mut state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
+        let mut state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
@@ -5325,7 +5476,7 @@ mod tests {
 
     #[test]
     fn confirm_refuses_a_managed_target_whose_run_changed() {
-        let state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
+        let state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));
@@ -5344,7 +5495,7 @@ mod tests {
 
     #[test]
     fn a_busy_worker_is_still_subject_targeted_for_daemon_refusal() {
-        let state = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
+        let state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
         let mut app = App::new();
         app.refresh(&state);
         select_row(&mut app, &RowId::Agent("wM:p1".into()));

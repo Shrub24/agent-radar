@@ -428,11 +428,18 @@ Nothing is sent until Confirm, and the frozen target is revalidated against the
 current observation first: a stale inventory, a disappeared target or a target
 whose identity changed cancels with a reason.
 
-A container with nothing running is deleted without a question: it loses no work,
-so nothing is asked. What counts as running is the observed foreground command and
-`herdr-control/v1` jobs; an idle shell is not running anything. When something is,
-the question names it — `nvim is running`, or the worker's label — rather than
-leaking handles and ids.
+Every level answers the same question, walked down from the row selected: what
+here would be lost? An agent is lossy unless it reports idle or done; a pane is
+lossy when a non-shell command is in its foreground; published background work
+still running counts too. Because the answer is collated from every pane the row
+covers, a workspace asks about the editor three panes down exactly as a pane row
+asks about itself. An idle shell, an idle agent and finished work are not losses,
+so the standard case is not a question: `D` ends the row and the outcome lands in
+the `!` panel.
+
+When the answer is not empty the confirmation names the contents rather than the
+record that holds them — `nvim is running`, `worker-3 is working`, `pi has 2
+background task(s) running` — so the operator reads what dies, not a handle.
 
 The scope is the row's own. A workspace row deletes the workspace container and
 everything recorded inside it; the row a tab is drawn as ends the whole tab, every
