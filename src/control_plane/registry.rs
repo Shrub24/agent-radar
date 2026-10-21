@@ -610,12 +610,23 @@ impl Registry {
     /// One page of spawn edges in stable request-id order, at most `limit` of
     /// them, starting after `after`. Each token is included: what a client may
     /// read is [`SpawnEdge::topology`].
+    /// [`Self::spawn_edges_after`] restricted to the edges one logical parent
+    /// subject launched, so a caller reads its own children, not the topology.
+    pub fn spawn_edges_for_subject_after(
+        &self,
+        parent_subject: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SpawnEdge>, String> {
+        spawn::list_after(self, after, limit, Some(parent_subject))
+    }
+
     pub fn spawn_edges_after(
         &self,
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SpawnEdge>, String> {
-        spawn::list_after(self, after, limit)
+        spawn::list_after(self, after, limit, None)
     }
 
     /// Records what one spawn's create did, and where, before its launch is

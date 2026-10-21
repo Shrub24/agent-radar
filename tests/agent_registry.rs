@@ -2267,6 +2267,7 @@ fn spawn_request(request_id: &str, parent: &str) -> SpawnRequest {
         request_id: request_id.into(),
         parent: parent.into(),
         parent_session_id: SESSION.into(),
+        parent_subject_id: None,
     }
 }
 

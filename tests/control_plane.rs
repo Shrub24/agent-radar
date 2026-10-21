@@ -2884,6 +2884,92 @@ fn spawn_params(parent: &str, executable: &str, argv: &[&str]) -> Value {
     })
 }
 
+#[test]
+fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() {
+    use agent_radar::control_plane::registry::{Registry, SpawnRequest};
+
+    let sandbox = Sandbox::new("spawn-subject-filter");
+    let registry = Registry::open(&sandbox.state()).expect("a registry");
+    let mine = "3f8c1d20-1111-4a2b-8c4d-000000000001";
+    let other = "3f8c1d20-2222-4a2b-8c4d-000000000002";
+    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let parent = registry
+        .register(
+            &agent_radar::control_plane::registry::RegistrationRequest {
+                source: "filter-test".into(),
+                incarnation: "3f8c1d20-3333-4a2b-8c4d-000000000003".into(),
+                session: Some(session.into()),
+                owner: None,
+                run: None,
+                label: None,
+                location: None,
+                process: None,
+                launch: None,
+                spawn_token: None,
+            },
+            1,
+        )
+        .expect("a parent registration");
+    registry
+        .publish_context(
+            &agent_radar::control_plane::registry::ContextRequest {
+                registration_id: parent.registration_id.clone(),
+                publisher: agent_radar::control_plane::registry::PublisherIdentity {
+                    source: parent.request.source.clone(),
+                    incarnation: parent.request.incarnation.clone(),
+                    reporting_owner: None,
+                },
+                writer_handle: None,
+                replace: None,
+                sequence: 1,
+                lease_ms: Some(60_000),
+                observed_at: None,
+                context: agent_radar::control_plane::registry::ContextValue {
+                    session: Some(session.into()),
+                    launch_identity: None,
+                },
+            },
+            2,
+        )
+        .expect("a session context");
+    let mut ids = Vec::new();
+    for (request_id, subject) in [
+        ("0a000001-0000-4000-8000-000000000001", Some(mine)),
+        ("0a000002-0000-4000-8000-000000000002", Some(other)),
+        ("0a000003-0000-4000-8000-000000000003", Some(mine)),
+        ("0a000004-0000-4000-8000-000000000004", None),
+    ] {
+        let request = SpawnRequest {
+            request_id: request_id.into(),
+            parent: parent.registration_id.clone(),
+            parent_session_id: session.into(),
+            parent_subject_id: subject.map(str::to_string),
+        };
+        registry.record_spawn(&request, 1).expect("an edge");
+        ids.push(request_id);
+    }
+
+    // The other subject's edge sits between this subject's two, so a filter that
+    // ran after the page was cut would return a short or wrong page.
+    let first = registry
+        .spawn_edges_for_subject_after(mine, None, 1)
+        .expect("first page");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].request_id, ids[0]);
+    let second = registry
+        .spawn_edges_for_subject_after(mine, Some(ids[0]), 10)
+        .expect("second page");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].request_id, ids[2]);
+    assert!(
+        registry
+            .spawn_edges_for_subject_after(other, None, 10)
+            .expect("other page")
+            .iter()
+            .all(|edge| edge.request_id == ids[1])
+    );
+}
+
 /// The incarnation of a child process that registers with the token its launch
 /// carried.
 const CHILD_INCARNATION: &str = "9d8c7b6a-5f4e-4d3c-9b2a-1809f7e6d5c4";

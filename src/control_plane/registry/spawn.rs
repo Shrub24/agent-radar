@@ -53,6 +53,9 @@ pub struct SpawnRequest {
     pub parent: String,
     /// Stable logical parent identity, verified against this registration's fresh context.
     pub parent_session_id: String,
+    /// The logical parent subject, when the request was made on behalf of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_subject_id: Option<String>,
 }
 
 impl SpawnRequest {
@@ -60,6 +63,9 @@ impl SpawnRequest {
         canonical_uuid("request_id", &self.request_id)?;
         canonical_uuid("parent", &self.parent)?;
         canonical_uuid("parent_session_id", &self.parent_session_id)?;
+        if let Some(id) = self.parent_subject_id.as_deref() {
+            canonical_uuid("parent_subject_id", id)?;
+        }
         Ok(())
     }
 }
@@ -121,6 +127,10 @@ pub struct SpawnEdge {
     /// Logical session parent; absent only on legacy v1 process-parented edges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// The logical subject that requested this launch, when it had one. Durable
+    /// parentage: a session moves on `/resume`, so it is not the parent key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_subject_id: Option<String>,
     /// The launch subject a tracked launch belongs to. Absent on an untracked
     /// edge, and then binding is not fenced by a subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +174,7 @@ impl SpawnEdge {
             request_id: self.request_id.clone(),
             parent: self.parent.clone(),
             parent_session_id: self.parent_session_id.clone(),
+            parent_subject_id: self.parent_subject_id.clone(),
             subject_id: self.subject_id.clone(),
             location: self.location.clone(),
             created: self.created,
@@ -234,6 +245,8 @@ pub struct PublicSpawnEdge {
     pub parent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_subject_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,6 +355,7 @@ pub fn record(
         request_id: request.request_id.clone(),
         parent: request.parent.clone(),
         parent_session_id: Some(request.parent_session_id.clone()),
+        parent_subject_id: request.parent_subject_id.clone(),
         subject_id: None,
         token: random_uuid(),
         location: None,
@@ -503,12 +517,21 @@ pub fn list_after(
     registry: &Registry,
     after: Option<&str>,
     limit: usize,
+    parent_subject: Option<&str>,
 ) -> Result<Vec<SpawnEdge>, String> {
     if let Some(after) = after {
         canonical_uuid("after", after)?;
     }
+    if let Some(subject) = parent_subject {
+        canonical_uuid("parent_subject_id", subject)?;
+    }
     let mut edges = edges(registry)?;
     edges.retain(|edge| after.is_none_or(|cursor| edge.request_id.as_str() > cursor));
+    // The filter applies before the page is cut, so a caller that pages its own
+    // launches never walks the whole topology to find them.
+    if let Some(subject) = parent_subject {
+        edges.retain(|edge| edge.parent_subject_id.as_deref() == Some(subject));
+    }
     edges.truncate(limit);
     Ok(edges)
 }

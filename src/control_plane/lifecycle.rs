@@ -2317,6 +2317,7 @@ mod tests {
                     request_id: request_id.into(),
                     parent: parent.registration_id.clone(),
                     parent_session_id: "2a4c6e80-1357-4b9d-8f01-23456789abcd".into(),
+                    parent_subject_id: None,
                 },
                 1,
             )

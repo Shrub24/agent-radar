@@ -5663,6 +5663,7 @@ fn execute_spawn(
         request_id: request.id.clone(),
         parent: params.parent.clone(),
         parent_session_id: params.parent_session_id.clone(),
+        parent_subject_id: params.managed.parent_subject_id.clone(),
     };
     if let Err(message) = intent.validate() {
         return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
@@ -6922,6 +6923,7 @@ fn restart_lead(
         request_id: successor.clone(),
         parent: params.parent.clone(),
         parent_session_id: params.parent_session_id.clone(),
+        parent_subject_id: params.managed.parent_subject_id.clone(),
     };
     let replacement = Request {
         id: successor.clone(),
