@@ -4,6 +4,7 @@
 pub mod app;
 pub mod attach;
 pub mod bus;
+pub mod cli;
 pub mod collector;
 pub mod config;
 pub mod control;

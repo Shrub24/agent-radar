@@ -12,6 +12,10 @@ name = "radar"
 path = "src/main.rs"
 
 [dependencies]
+# The command line is declared once, so `--help`, usage errors and completions
+# cannot drift from what the binary actually parses.
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.29"
 nucleo-picker = "0.12"
 tracing = "0.1"

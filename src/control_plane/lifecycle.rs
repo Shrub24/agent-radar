@@ -1633,14 +1633,14 @@ pub fn wake_command(
     ))
 }
 
-/// Runs as the wake a pane-death hook starts:
-/// `--socket <path> --subject <id> --server <pid>:<start>:<boot>`.
+/// Runs as the wake a pane-death hook starts, with the arguments the command
+/// line already parsed and checked.
 ///
 /// It asks the daemon to reconcile the launch and reports nothing: the hook has no
 /// reader, and a wake that never arrives is recovered by the next read.
-pub fn run_wake(arguments: &[String]) -> i32 {
-    let Some((socket, subject, server)) = parse_wake(arguments) else {
-        eprintln!("radar {WAKE_COMMAND}: malformed invocation");
+pub fn run_wake(socket: &str, subject: &str, server: &str) -> i32 {
+    let Some(server) = parse_server_identity(server) else {
+        eprintln!("radar {WAKE_COMMAND}: malformed server identity");
         return 2;
     };
     match exchange(
@@ -1656,34 +1656,16 @@ pub fn run_wake(arguments: &[String]) -> i32 {
     }
 }
 
-fn parse_wake(arguments: &[String]) -> Option<(&str, &str, ProcessIdentity)> {
-    let [
-        socket_flag,
-        socket,
-        subject_flag,
-        subject,
-        server_flag,
-        server,
-    ] = arguments
-    else {
-        return None;
-    };
-    if socket_flag != "--socket" || subject_flag != "--subject" || server_flag != "--server" {
-        return None;
-    }
+/// `pid:start_ticks:boot_id`, the generation a pane was created in.
+fn parse_server_identity(server: &str) -> Option<ProcessIdentity> {
     let mut fields = server.splitn(3, ':');
     let pid = fields.next()?.parse().ok()?;
     let start_ticks = fields.next()?.parse().ok()?;
-    let boot_id = fields.next()?.to_string();
-    Some((
-        socket,
-        subject,
-        ProcessIdentity {
-            boot_id,
-            pid,
-            start_ticks,
-        },
-    ))
+    Some(ProcessIdentity {
+        boot_id: fields.next()?.to_string(),
+        pid,
+        start_ticks,
+    })
 }
 
 /// Runs as the bootstrap inside a tracked pane: `--socket <path> -- <program>
@@ -1691,32 +1673,22 @@ fn parse_wake(arguments: &[String]) -> Option<(&str, &str, ProcessIdentity)> {
 ///
 /// Claims this process with the daemon, then replaces itself with the program.
 /// Returns only on failure, and an unreleased bootstrap never runs the program.
-pub fn run_bootstrap(arguments: &[String]) -> i32 {
-    let Some((socket, program)) = parse_bootstrap(arguments) else {
-        eprintln!("radar {BOOTSTRAP_COMMAND}: malformed invocation");
+pub fn run_bootstrap(socket: &str, program: &[String]) -> i32 {
+    if program.is_empty() {
+        eprintln!("radar {BOOTSTRAP_COMMAND}: no program to run");
         return 2;
-    };
+    }
     if let Err(message) = release(Path::new(socket)) {
         eprintln!("radar {BOOTSTRAP_COMMAND}: {message}");
         return 111;
     }
-    let error = Command::new(program[0])
+    let error = Command::new(&program[0])
         .args(&program[1..])
         .env_remove(SUBJECT_ENV)
         .env_remove(CORRELATION_ENV)
         .exec();
     eprintln!("radar {BOOTSTRAP_COMMAND}: could not run the program: {error}");
     127
-}
-
-fn parse_bootstrap(arguments: &[String]) -> Option<(&str, Vec<&str>)> {
-    let [flag, socket, separator, program @ ..] = arguments else {
-        return None;
-    };
-    if flag != "--socket" || separator != "--" || program.is_empty() {
-        return None;
-    }
-    Some((socket, program.iter().map(String::as_str).collect()))
 }
 
 fn release(socket: &Path) -> Result<(), String> {

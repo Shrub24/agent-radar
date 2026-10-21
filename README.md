@@ -119,7 +119,13 @@ radar                  # start the socket, connect, open the dashboard
 radar daemon stop      # stop the socket, then the daemon; the tmux server keeps running
 radar server stop      # refused while the server holds a pane or a pending operation
 radar server status
+radar --version        # the version this binary reports
+radar completions fish # a completion script for bash, zsh, fish or elvish
 ```
+
+`radar --help` and `radar <command> --help` are generated from the same
+declaration that parses the arguments, so they cannot describe a flag the binary
+does not take.
 
 An explicit stop holds until the next `radar` run or the next login, whichever comes
 first. A refused stop or restart sends no signal and names what is in the way.

@@ -16,136 +16,79 @@ use crossterm::event::{
 use crossterm::execute;
 use ratatui::widgets::ListState;
 
-const USAGE: &str = "\
-radar — read-only fleet overview for local coding agents
-
-usage: radar [--print-config] [--help] [--version]
-       radar daemon [start|stop|restart|status|--help]
-       radar server <start|stop|restart|status> [NAME]
-       radar lifecycle <reconcile|abandon REQUEST-ID>
-
-  --print-config   print the configuration in use, to copy and edit
-  --help           this message
-  --version, -v    print the version
-  daemon           control the daemon's user units; with no action, serve in
-                   the foreground (what the service unit runs)
-  server           control the tmux server a daemon serves, by name
-  lifecycle        reconcile unresolved operations, or abandon one so the target
-                   it holds can be operated on again
-
-Configuration is read from `$RADAR_CONFIG`, else
-`$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
-Radar draws without one.
-";
-
-const DAEMON_USAGE: &str = "\
-radar daemon — the control plane Radar talks to
-
-usage: radar daemon [start|stop|restart|status]
-
-With no action, serves one JSON request and one JSON response per line on the
-control socket, in the foreground, until signalled. The user units run it that
-way: under systemd the socket unit passes its listener, and the daemon serves it
-without unlinking the path. Standalone, it binds `$RADAR_CONTROL_SOCKET`, else
-`$XDG_RUNTIME_DIR/agent-radar/control.sock`, else `/tmp/agent-radar-<uid>/control.sock`.
-
-`start` starts the control socket, which lets the daemon run on the next
-connection. `stop` stops the socket, then the daemon; the tmux server keeps
-running. `restart` restarts the daemon. `status` reports both units.
-
-The physical backend is tmux on the `radar` server, set by `daemon.backend` and
-`daemon.tmux_server` in the configuration. `$RADAR_CONTROL_BACKEND` and
-`$RADAR_TMUX_SERVER` override them. A name that is no backend, or a server the
-daemon cannot serve, refuses startup rather than falling back to another backend.
-";
-
 fn main() -> io::Result<()> {
-    if let Some(code) = handle_arguments() {
-        std::process::exit(code);
+    let cli = <agent_radar::cli::Cli as clap::Parser>::parse();
+    if cli.print_config {
+        print!("{}", load_config().to_document());
+        return Ok(());
     }
-    let result = run();
-    disable_mouse_capture();
-    let restored = ratatui::try_restore();
-    result.and(restored)
+    let Some(invocation) = cli.invocation else {
+        let result = run();
+        disable_mouse_capture();
+        let restored = ratatui::try_restore();
+        return result.and(restored);
+    };
+    std::process::exit(invoke(invocation))
 }
 
-/// Handles the arguments that print something and exit. `None` means there is a
-/// dashboard to run.
-fn handle_arguments() -> Option<i32> {
-    let argument = std::env::args().nth(1);
-    match argument.as_deref() {
-        None => None,
-        Some("--print-config") => {
-            print!("{}", load_config().to_document());
-            Some(0)
-        }
-        Some("--help" | "-h") => {
-            print!("{USAGE}");
-            Some(0)
-        }
-        Some("--version" | "-v") => {
-            println!("radar {}", env!("CARGO_PKG_VERSION"));
-            Some(0)
-        }
-        Some(control_plane::lifecycle::BOOTSTRAP_COMMAND) => {
-            let arguments: Vec<String> = std::env::args().skip(2).collect();
-            Some(control_plane::lifecycle::run_bootstrap(&arguments))
-        }
-        Some(control_plane::lifecycle::WAKE_COMMAND) => {
-            let arguments: Vec<String> = std::env::args().skip(2).collect();
-            Some(control_plane::lifecycle::run_wake(&arguments))
-        }
-        Some("daemon") => Some(match std::env::args().nth(2).as_deref() {
-            Some("--help" | "-h") => {
-                print!("{DAEMON_USAGE}");
-                0
-            }
-            Some(action @ ("start" | "stop" | "restart" | "status")) => {
-                let (message, code) = agent_radar::service::daemon_command(action);
+/// Carries out one invocation that prints its answer and exits with a code.
+fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
+    use agent_radar::cli::Invocation;
+    match invocation {
+        Invocation::Daemon { action } => match action {
+            Some(action) => {
+                let (message, code) = agent_radar::service::daemon_command(action.as_str());
                 println!("{message}");
                 code
             }
-            Some(other) => {
-                eprintln!("radar daemon: unknown argument `{other}`\n\n{DAEMON_USAGE}");
-                2
-            }
             None => serve_daemon(),
-        }),
-        Some("server") => Some(run_server_command()),
-        Some("lifecycle") => Some(run_lifecycle_command()),
-        Some(other) => {
-            eprintln!("radar: unknown argument `{other}`\n\n{USAGE}");
-            Some(2)
+        },
+        Invocation::Server(action) => {
+            let (verb, name) = action.parts();
+            let name = match name {
+                Some(name) => name.to_string(),
+                None => load_config().daemon.tmux_server.clone(),
+            };
+            let (message, code) = agent_radar::service::server_command(verb, &name);
+            println!("{message}");
+            code
         }
+        Invocation::Lifecycle(action) => run_lifecycle_command(action),
+        Invocation::Completions { shell } => {
+            // Rendered first: a reader that stops early (`radar completions fish
+            // | head`) closes the pipe, and a half-written script is the reader's
+            // choice rather than an error worth a panic.
+            let mut command = <agent_radar::cli::Cli as clap::CommandFactory>::command();
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut command, "radar", &mut script);
+            match std::io::Write::write_all(&mut std::io::stdout(), &script) {
+                Ok(()) => 0,
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => 0,
+                Err(error) => {
+                    eprintln!("radar completions: {error}");
+                    1
+                }
+            }
+        }
+        Invocation::LaunchBootstrap { socket, program } => {
+            control_plane::lifecycle::run_bootstrap(&socket, &program)
+        }
+        Invocation::LifecycleWake {
+            socket,
+            subject,
+            server,
+        } => control_plane::lifecycle::run_wake(&socket, &subject, &server),
     }
 }
 
-/// `radar lifecycle <reconcile|abandon REQUEST-ID>`: the operator's end of
-/// unresolved-operation recovery.
+/// `radar lifecycle`: the operator's end of unresolved-operation recovery.
 ///
 /// `reconcile` re-reads current evidence and reports what it could establish and
 /// what it could not, with a reason. `abandon` ends one unresolved record's
 /// recovery obligation, releasing only the administrative block it holds; the
 /// uncertainty stays recorded and no effect is dispatched.
-fn run_lifecycle_command() -> i32 {
-    let mut arguments = std::env::args().skip(2);
-    let action = arguments.next();
-    // The argument is checked before anything is dialled: a mistyped command must
-    // not start a daemon to report itself.
-    let held = match action.as_deref() {
-        Some("reconcile") => None,
-        Some("abandon") => match arguments.next() {
-            Some(held) => Some(held),
-            None => {
-                eprintln!("radar lifecycle: abandon needs the unresolved request id\n\n{USAGE}");
-                return 2;
-            }
-        },
-        _ => {
-            eprintln!("radar lifecycle: expected reconcile or abandon REQUEST-ID\n\n{USAGE}");
-            return 2;
-        }
-    };
+fn run_lifecycle_command(action: agent_radar::cli::LifecycleAction) -> i32 {
+    use agent_radar::cli::LifecycleAction;
     let runtime = match agent_radar::control_plane::connect() {
         Ok(selected) => selected,
         Err(error) => {
@@ -158,9 +101,8 @@ fn run_lifecycle_command() -> i32 {
         return 1;
     };
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let request_id = agent_radar::control_plane::random_uuid();
-    match (action.as_deref(), held) {
-        (Some("reconcile"), _) => {
+    match action {
+        LifecycleAction::Reconcile => {
             let answer = match agent_radar::control_plane::client::reconcile(&cancel) {
                 Ok(answer) => answer,
                 Err(error) => {
@@ -171,47 +113,25 @@ fn run_lifecycle_command() -> i32 {
             println!("{answer}");
             0
         }
-        (_, Some(held)) => match lifecycle.abandon_record(&request_id, &held, &cancel) {
-            Ok(answer) => {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "request_id": held,
-                        "outcome": answer.outcome(),
-                        "message": answer.message(),
-                    })
-                );
-                0
+        LifecycleAction::Abandon { request_id: held } => {
+            let request_id = agent_radar::control_plane::random_uuid();
+            match lifecycle.abandon_record(&request_id, &held, &cancel) {
+                Ok(answer) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "request_id": held,
+                            "outcome": answer.outcome(),
+                            "message": answer.message(),
+                        })
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("radar lifecycle abandon: {error}");
+                    1
+                }
             }
-            Err(error) => {
-                eprintln!("radar lifecycle abandon: {error}");
-                1
-            }
-        },
-        _ => {
-            eprintln!("radar lifecycle: expected reconcile or abandon REQUEST-ID\n\n{USAGE}");
-            2
-        }
-    }
-}
-
-/// `radar server <action> [NAME]`: controls the tmux server a daemon serves. The
-/// name defaults to the configured server.
-fn run_server_command() -> i32 {
-    let mut arguments = std::env::args().skip(2);
-    let action = arguments.next();
-    let name = arguments
-        .next()
-        .unwrap_or_else(|| load_config().daemon.tmux_server);
-    match action.as_deref() {
-        Some(action @ ("start" | "stop" | "restart" | "status")) => {
-            let (message, code) = agent_radar::service::server_command(action, &name);
-            println!("{message}");
-            code
-        }
-        _ => {
-            eprintln!("radar server: expected start, stop, restart or status\n\n{USAGE}");
-            2
         }
     }
 }
