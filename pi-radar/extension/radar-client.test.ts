@@ -11,15 +11,7 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import {
-	RADAR_MAX_LINE_BYTES,
-	createRadarClient,
-	watchRadarEvents,
-	untrustedControlSocket,
-	type RadarClient,
-	type RadarClientOptions,
-	type RadarSocket,
-} from "./radar-client.ts";
+import { RADAR_MAX_LINE_BYTES, RADAR_MINIMUM_REVISION, createRadarClient, type RadarClient, type RadarClientOptions, type RadarSocket, untrustedControlSocket, watchRadarEvents } from "./radar-client.ts";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
 const UUID_B = "22222222-2222-4222-8222-222222222222";
@@ -97,8 +89,8 @@ const reply = (request: any, result: unknown): string => {
 		// Most tests exercise ordinary current daemons; old-revision cases use
 		// rawReply so the handshake gate remains explicitly covered.
 		revision:
-			typeof fields.revision === "number" && fields.revision < 4
-				? 4
+			typeof fields.revision === "number" && fields.revision < RADAR_MINIMUM_REVISION
+				? RADAR_MINIMUM_REVISION
 				: fields.revision,
 	});
 };
@@ -764,7 +756,7 @@ test("spawn carries validated Radar-owned launch metadata in the durable request
 		if (request.method === "daemon.ping")
 			return reply(request, {
 				protocol: 2,
-				revision: 4,
+				revision: RADAR_MINIMUM_REVISION,
 				contracts: ["registry.v1", "spawn.v1"],
 			});
 		assert.equal(request.method, "spawn.create");
@@ -964,7 +956,7 @@ test("an untrusted control socket is refused without dialling", async () => {
 	}
 });
 
-test("daemon.ping requires protocol 2, revision 4, and registry.v1", async () => {
+test("daemon.ping requires protocol 2, the minimum revision, and registry.v1", async () => {
 	const answers = [
 		(request: any) =>
 			reply(request, { protocol: 1, revision: 1, contracts: ["registry.v1"] }),
@@ -978,7 +970,7 @@ test("daemon.ping requires protocol 2, revision 4, and registry.v1", async () =>
 			rawReply(request, {
 				protocol: 2,
 				backend: "sqlite",
-				revision: 3,
+				revision: RADAR_MINIMUM_REVISION - 1,
 				contracts: ["registry.v1", "future.contract.v9"],
 			}),
 		(request: any) =>
@@ -1003,14 +995,14 @@ test("daemon.ping requires protocol 2, revision 4, and registry.v1", async () =>
 		// would be accepted and then never gain a subject.
 		const presenceless = await client.ping();
 		assert.equal(presenceless.ok, false);
-		assert.match(presenceless.ok ? "" : presenceless.message, /revision 4/);
+		assert.match(presenceless.ok ? "" : presenceless.message, /revision 5/);
 		const capable = await client.ping();
 		assert.deepEqual(capable, {
 			ok: true,
 			value: {
 				protocol: 2,
 				backend: "sqlite",
-				revision: 4,
+				revision: RADAR_MINIMUM_REVISION,
 				instance: null,
 				contracts: ["registry.v1", "future.contract.v9"],
 				tasks: { available: false, error: null },
@@ -1025,7 +1017,7 @@ test("handoff inbox returns stable IDs and rejects malformed IDs", async () => {
 	let malformed = false;
 	const fixture = makeFixture((request) => {
 		if (request.method === "daemon.ping")
-			return reply(request, { protocol: 2, revision: 4, contracts: ["communication.handoff.v1"] });
+			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["communication.handoff.v1"] });
 		return reply(request, { handoff_ids: [malformed ? "not-a-uuid" : UUID_A] });
 	});
 	try {
@@ -1045,7 +1037,7 @@ test("handoff inbox returns stable IDs and rejects malformed IDs", async () => {
 
 test("handoff contract absence disables only handoff calls", async () => {
 	const fixture = makeFixture((request) =>
-		reply(request, { protocol: 2, revision: 4, contracts: ["registry.v1"] }),
+		reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["registry.v1"] }),
 	);
 	try {
 		await listen(fixture);

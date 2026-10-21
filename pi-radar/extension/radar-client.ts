@@ -36,7 +36,7 @@ export const RADAR_PROTOCOL_VERSION = 2;
  * this handshake and then refuse every presence report, leaving a Pi session
  * silently unmanaged instead of telling the operator to restart the daemon.
  */
-export const RADAR_MINIMUM_REVISION = 4;
+export const RADAR_MINIMUM_REVISION = 5;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";

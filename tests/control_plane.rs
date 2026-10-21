@@ -11278,11 +11278,18 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
     assert_eq!(launches.len(), 1, "one successor, got {launches:?}");
     let current = client.call("lifecycle.get", json!({"subject_id": subject}));
     assert_eq!(current["result"]["subject"]["subject_id"], subject);
-    assert_ne!(current["result"]["subject"]["execution_id"], subject);
-    assert_eq!(current["result"]["subject"]["execution_generation"], 2);
-    let successor_id = current["result"]["subject"]["execution_id"]
+    // The successor is a new claim of the same agent, so it is named by its own
+    // claim id and no generation is published.
+    assert_ne!(current["result"]["subject"]["claim_id"], subject);
+    assert!(
+        current["result"]["subject"]
+            .get("execution_generation")
+            .is_none(),
+        "{current:?}"
+    );
+    let successor_id = current["result"]["subject"]["claim_id"]
         .as_str()
-        .expect("successor execution ID");
+        .expect("successor claim id");
     let events = client.call("events.read", json!({"after": 0, "limit": 256}));
     let successor_events: Vec<_> = events["result"]["events"]
         .as_array()

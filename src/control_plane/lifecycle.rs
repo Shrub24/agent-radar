@@ -1277,10 +1277,12 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
 /// The public projection of a subject: identities, binding and recorded facts.
 /// It carries no launch data and no correlation, which are private.
 pub fn public_view(subject: &Subject) -> Value {
+    // `subject_id` is the agent; `claim_id` is this attempt. Generation is not
+    // published: a claim id identifies the attempt exactly, so an ordinal would
+    // be a second, weaker name for the same thing.
     json!({
         "subject_id": subject.logical_subject_id.as_deref().unwrap_or(&subject.subject_id),
-        "execution_id": subject.subject_id,
-        "execution_generation": subject.execution_generation.unwrap_or(1),
+        "claim_id": subject.subject_id,
         "identity_unresolved": subject.identity_unresolved,
         "managed": subject.managed,
         "spawn_request_id": subject.spawn_request_id,
@@ -2547,10 +2549,12 @@ mod tests {
             Some(logical_id.as_str())
         );
         assert_eq!(current.execution_generation, Some(2));
+        // The agent carries the plain name; the attempt is named by its claim.
         let view = public_view(&current);
         assert_eq!(view["subject_id"], logical_id);
-        assert_eq!(view["execution_id"], second.subject_id);
-        assert_eq!(view["execution_generation"], 2);
+        assert_eq!(view["claim_id"], second.subject_id);
+        assert!(view.get("execution_generation").is_none(), "{view}");
+        assert!(view.get("execution_id").is_none(), "{view}");
 
         let listed = list_logical_after(&registry, None, 10).expect("logical list");
         assert_eq!(listed.len(), 1);
