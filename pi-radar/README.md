@@ -41,6 +41,74 @@ Lifecycle execution generations are bounded to `u32` and remain exactly represen
 
 Run `npm pack` to build the bundled runtime entrypoints before creating the tarball.
 
+## Testing against this SDK
+
+Fake the port, not the daemon. Every consumer-facing class here depends on a
+narrow `Pick` of the client, so a test double implements a handful of methods and
+no socket, framing, IDs, error envelope or durable state:
+
+| Port | Methods | Where |
+| --- | --- | --- |
+| `RadarPublicationClient` | `ping`, `presence`, `releasePresence`, `acquire`, `publish`, `retire` | `pi-radar/publication` |
+| `RadarHandoffPort` | `publish`, `inbox`, `get`, `ack` | `pi-radar/communication` |
+| anything else | `Pick<RadarClient, ...>` of the reads you call | `pi-radar/client` |
+
+```ts
+import type { RadarPublicationClient } from "pi-radar/publication";
+import { createRadarPublication } from "pi-radar/publication";
+
+const client: RadarPublicationClient = {
+	ping: async () => ({
+		ok: true,
+		value: {
+			protocol: 2, backend: "tmux", revision: 4, instance: null,
+			contracts: ["registry.v1"], tasks: { available: false, error: null },
+		},
+	}),
+	presence: async (report) => ({
+		ok: true,
+		value: {
+			registration_id: REGISTRATION,
+			claim_id: report.claim_id,
+			standing: "granted",
+			subject_id: SUBJECT,
+		},
+	}),
+	releasePresence: async (release) => ({
+		ok: true,
+		value: {
+			registration_id: release.registration_id,
+			claim_id: release.claim_id,
+			standing: "released",
+		},
+	}),
+	acquire: async () => ({
+		ok: true,
+		value: {
+			handle: "writer", source: "consumer", incarnation: INCARNATION,
+			generation: 1, sequence: 0,
+		},
+	}),
+	publish: async ({ sequence }) => ({ ok: true, value: { sequence } }),
+	retire: async () => ({ ok: true, value: undefined }),
+};
+
+const publication = createRadarPublication({
+	dataRoot, client, registration: { source: "consumer", label: "lead" },
+});
+```
+
+A socket-level fake daemon is a second implementation of Radar's protocol
+maintained by someone who does not own it. It drifts silently: it keeps passing
+while the real daemon refuses the same call, which is worse than having no fake
+at all. That is not hypothetical — a consumer's fake still answered the retired
+registration methods after the daemon had moved to presence, and its suite stayed
+green through the whole contract change.
+
+Wire-level proof belongs to one integration test against the real daemon (a
+temporary socket path and state root are enough; `tests/agent_publisher.py` in
+the Radar repository shows the shape), not to a fake every consumer re-implements.
+
 ## Releasing
 
 Publishing is one tag push and it runs in CI; no npm token is stored anywhere.
