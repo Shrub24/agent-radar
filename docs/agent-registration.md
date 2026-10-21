@@ -474,6 +474,20 @@ On graceful `session_shutdown`, pi-radar calls `agent.release` with the exact `r
 
 The daemon stores the grant/decision and projects its current standing through `agent.get`/`agent.list` and observation snapshots. Clients do not persist subject authority in Pi transcript entries or infer it from pane/session contents. Mutable location changes update process context without creating another registration.
 
+#### Pi session contract surface
+
+The JSON Schemas under `pi-radar/schema/public/v1/` are the machine-readable contract of record; they are generated from the Rust wire DTOs and shipped with the package, and a change to a Pi-facing call is not complete until they are regenerated. This table is the reviewer's index of which schema backs each call: change a call and its row changes in the same commit. Serialize and deserialize schemas are separate because Serde defaults, null handling and omission differ by direction.
+
+| Call | Gate | Schemas | pi-radar SDK |
+| --- | --- | --- | --- |
+| `agent.presence` | `registry.v1`, revision 4 | `presence-report.*`, `presence-answer.*` | `publication.presence.report(session)` |
+| `agent.release` | `registry.v1`, revision 4 | `presence-release.*`, `presence-answer.*` | `publication.presence.release()` |
+| `communication.handoff` publish/read/ack | `communication.handoff.v1` | `handoff-publish-params.*`, `handoff.*`, `handoff-inbox.*`, `handoff-receipt.*` | `createRadarHandoffPort(client, publication)` |
+| `spawn.create` with managed metadata | `spawn.v1` | `managed-launch-metadata.*` | `launchRadarWorker` |
+| `observation.get` | `registry.v1` | `observation-get-response.*`, `observation-snapshot.*` | `client.observe()` |
+
+The public process identifier is `registration_id`; there is no `agent_id` alias. Durable agent identity is `subject_id`, and `HandoffIdentity` carries both plus the execution it names.
+
 ### Sequences, leases and freshness
 
 A publish requires a positive per-generation sequence. Lease defaults to 30
