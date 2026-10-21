@@ -10079,12 +10079,14 @@ fn a_confirmed_deletion_closes_a_container_and_records_each_removal_once() {
 }
 
 #[test]
-fn a_deletion_that_would_end_a_live_worker_names_it_and_dispatches_nothing() {
+fn a_deletion_ends_the_place_whatever_is_registered_in_it() {
     let (_sandbox, backend, mut daemon, mut client) =
         deletion_setup("topology-delete-managed", "wA");
-    let (_id, request) = created_workspace(&mut client, "wA");
+    let (id, request) = created_workspace(&mut client, "wA");
 
-    // A worker registered into the workspace the deletion would take with it.
+    // A worker registered into the workspace the deletion takes with it. The
+    // operator confirmed the deletion, so the place is closed and the worker's
+    // own record settles from the pane's loss rather than blocking the deletion.
     let mut body = registration_body("3f1c7a2e-9d4b-4c58-9c7b-2d0e1a9f4b22", None, None);
     body["location"] = json!({"backend": "fake", "workspace": "wA"});
     let registered = client.call("agent.register", body);
@@ -10092,23 +10094,27 @@ fn a_deletion_that_would_end_a_live_worker_names_it_and_dispatches_nothing() {
     assert!(!worker.is_empty(), "{registered}");
 
     let deletion = client.call("topology.delete", request);
-    assert_eq!(result_record(&deletion)["outcome"], "refused", "{deletion}");
-    let message = result_record(&deletion)["message"]
-        .as_str()
-        .expect("a refusal message")
-        .to_string();
-    assert!(message.contains(&worker), "{message}");
-    assert!(message.contains("stop it first, then delete"), "{message}");
-    assert!(
-        backend.closed_targets().is_empty(),
-        "a refusal dispatches nothing"
-    );
-    // And the container is not history: the deletion did not happen.
-    let listed = client.call("topology.list", json!({}));
     assert_eq!(
-        listed["result"]["containers"][0]["removed_at"],
-        Value::Null,
-        "{listed}"
+        result_record(&deletion)["outcome"],
+        "completed",
+        "{deletion}"
+    );
+    assert_eq!(
+        backend.closed_targets(),
+        vec![CloseTarget::Workspace("wA".to_string())],
+        "the place is closed once"
+    );
+    let listed = client.call("topology.list", json!({}));
+    let deleted = listed["result"]["containers"]
+        .as_array()
+        .expect("the containers")
+        .iter()
+        .find(|container| container["container_id"] == json!(id))
+        .expect("the deleted container")
+        .clone();
+    assert!(
+        deleted["removed_at"].is_string(),
+        "the container is history now: {listed}"
     );
     daemon.stop();
 }

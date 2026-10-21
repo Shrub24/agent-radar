@@ -432,7 +432,13 @@ fn run() -> io::Result<()> {
                             attach.ask(&target);
                             focuser.start(target);
                         }
-                        Action::BeginAction(operation) => app.begin_action(operation, &state),
+                        Action::BeginAction(operation) => dispatch(
+                            app.begin_action(operation, &state),
+                            &mut app,
+                            &mut closer,
+                            &mut managed,
+                            &mut containers,
+                        ),
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
                             let path = std::env::var_os("PATH");
@@ -481,7 +487,13 @@ fn run() -> io::Result<()> {
                             attach.ask(&target);
                             focuser.start(target);
                         }
-                        Action::BeginAction(operation) => app.begin_action(operation, &state),
+                        Action::BeginAction(operation) => dispatch(
+                            app.begin_action(operation, &state),
+                            &mut app,
+                            &mut closer,
+                            &mut managed,
+                            &mut containers,
+                        ),
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
                             let path = std::env::var_os("PATH");

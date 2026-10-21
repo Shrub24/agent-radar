@@ -4768,64 +4768,6 @@ fn execute_container_delete(
         Ok(members) => members,
         Err(message) => return write_refused(request, record, &message, core),
     };
-    let mut places: Vec<(containers::Kind, String)> = Vec::new();
-    for id in &members {
-        match containers::read(&registry, id) {
-            Ok(Some(member)) => {
-                if let Some(binding) = member.binding.as_ref() {
-                    places.push((member.kind, binding.handle.clone()));
-                }
-            }
-            Ok(None) => {}
-            Err(error) => return write_refused(request, record, &error, core),
-        }
-    }
-    let registrations = match locked(core).registry.public_registrations() {
-        Ok(registrations) => registrations,
-        Err(message) => return write_refused(request, record, &message, core),
-    };
-    // A live managed process is named rather than closed around: the operator
-    // stops it first, and the stop reports the exit while the deletion reports
-    // the removal.
-    let occupied = lifecycle::registrations_in(&registrations, |location| {
-        places.iter().any(|(kind, handle)| match kind {
-            containers::Kind::Workspace => location.workspace.as_deref() == Some(handle),
-            containers::Kind::Tab => location.tab.as_deref() == Some(handle),
-            containers::Kind::Pane => location.pane.as_deref() == Some(handle),
-        })
-    });
-    // Only a worker whose process is verified alive holds the deletion back. A
-    // registration recorded into a place that no longer exists is a record, not a
-    // process: refusing on it would leave a container nothing can ever delete.
-    let mut alive: Vec<&registry::PublicRegistration> = Vec::new();
-    for registration in &occupied {
-        match registry.verify_process(&registration.registration_id, verifier.as_ref()) {
-            Ok(registry::ProcessVerification::Verified) => alive.push(registration),
-            // Unreadable procfs is not a dead worker, so it holds the deletion
-            // back exactly as a verified one does.
-            Err(_) | Ok(registry::ProcessVerification::Unavailable) => alive.push(registration),
-            Ok(_) => {}
-        }
-    }
-    if !alive.is_empty() {
-        let named: Vec<String> = alive
-            .iter()
-            .map(|registration| match registration.label.as_deref() {
-                Some(label) => format!("{label} ({})", registration.registration_id),
-                None => registration.registration_id.clone(),
-            })
-            .collect();
-        return write_refused(
-            request,
-            record,
-            &format!(
-                "deleting {} would end {}: stop it first, then delete; nothing was deleted",
-                delete.frozen.target.description(),
-                named.join(", ")
-            ),
-            core,
-        );
-    }
     // The recorded serving instance is gone when the server now serving is a
     // different process, or none is. The places recorded under it went with it:
     // there is nothing left to close, so no runtime confirmation is awaited and
@@ -4863,15 +4805,7 @@ fn execute_container_delete(
         );
         return write_deleted(request, settled, removed, core);
     }
-    // The guarded dispatch a generic close uses, unchanged: one fresh inventory,
-    // the frozen identity, and a registry that must answer.
-    let registrations = || locked(core).registry.public_registrations();
-    let settled = match lifecycle::close_unmanaged(
-        backend.as_ref(),
-        &delete.frozen,
-        &cancel,
-        registrations,
-    ) {
+    let settled = match lifecycle::close_for_deletion(backend.as_ref(), &delete.frozen, &cancel) {
         DirectClose::Completed => {
             let now = store::now_ms();
             let at = store::format_millis(now);

@@ -1915,18 +1915,21 @@ impl App {
     /// inventory refuses, a managed location is routed to its owner rather than
     /// the runtime, and only positive unmanaged evidence reaches the direct
     /// path. Nothing is sent here — Confirm is a separate act.
-    pub fn begin_action(&mut self, operation: Operation, state: &ObservationState) {
+    pub fn begin_action(
+        &mut self,
+        operation: Operation,
+        state: &ObservationState,
+    ) -> Option<Confirmed> {
         if operation.is_container() {
-            self.begin_container(operation, state);
-            return;
+            return self.begin_container(operation, state);
         }
         if operation == Operation::PresenceStatus {
             self.show_presence_status(state);
-            return;
+            return None;
         }
         let Some(selected) = self.selected_action() else {
             self.set_focus_message(Some("nothing selected: no action target".to_string()));
-            return;
+            return None;
         };
         let (pane_id, tab_id, losses, is_agent, subject) = match selected {
             Selected::Agent {
@@ -1947,28 +1950,28 @@ impl App {
                     reason.to_string()
                 };
                 self.set_focus_message(Some(message));
-                return;
+                return None;
             }
         };
         if !matches!(state.source_freshness(), SourceFreshness::Current) {
             self.set_focus_message(Some("the fleet is stale: not acting".to_string()));
-            return;
+            return None;
         }
         let Some(inventory) = state.inventory() else {
             self.set_focus_message(Some("no current inventory: not acting".to_string()));
-            return;
+            return None;
         };
         let subject = subject.map(|subject| *subject);
         if operation == Operation::Restart {
             if !is_agent {
                 self.set_focus_message(Some("restart is only for a managed worker".to_string()));
-                return;
+                return None;
             }
             let Some(subject) = subject else {
                 self.set_focus_message(Some(
                     "this agent has no daemon lifecycle subject".to_string(),
                 ));
-                return;
+                return None;
             };
             if subject.state != crate::control_plane::lifecycle::State::Bound
                 || subject.session.is_none()
@@ -1977,7 +1980,7 @@ impl App {
                 self.set_focus_message(Some(
                     "this lifecycle subject is not restartable".to_string(),
                 ));
-                return;
+                return None;
             }
             let target = CloseTarget::Pane(pane_id);
             let identity = lifecycle::identity(inventory, &target);
@@ -1985,7 +1988,7 @@ impl App {
             losses
                 .push("the verified process is stopped and resumed in its recorded session".into());
             self.open_subject(operation, target, identity, subject, losses);
-            return;
+            return None;
         }
 
         let target = match operation {
@@ -2010,7 +2013,7 @@ impl App {
                     self.set_focus_message(Some(
                         "this managed agent has no daemon lifecycle subject".to_string(),
                     ));
-                    return;
+                    return None;
                 };
                 let identity = lifecycle::identity(inventory, &target);
                 let mut losses = losses;
@@ -2026,6 +2029,7 @@ impl App {
             }
             Containment::Unmanaged => self.open_direct(operation, target, losses, state),
         }
+        None
     }
 
     /// Opens the confirmation to enroll the selected registered lead.
@@ -2259,20 +2263,24 @@ impl App {
     /// read from the cursor at Confirm: moving the selection while the dialog is up
     /// must not retarget it, and the daemon revalidates the frozen place before it
     /// changes anything.
-    fn begin_container(&mut self, operation: Operation, state: &ObservationState) {
+    fn begin_container(
+        &mut self,
+        operation: Operation,
+        state: &ObservationState,
+    ) -> Option<Confirmed> {
         if !matches!(state.source_freshness(), SourceFreshness::Current) {
             self.set_focus_message(Some("the fleet is stale: not acting".to_string()));
-            return;
+            return None;
         }
         let Some(inventory) = state.inventory() else {
             self.set_focus_message(Some("no current inventory: not acting".to_string()));
-            return;
+            return None;
         };
         let Some(container) = self.selected_container().cloned() else {
             self.set_focus_message(Some(
                 "this row is not a container Radar records: nothing to act on".to_string(),
             ));
-            return;
+            return None;
         };
         // A binding the daemon could not verify is not acted on: the container is
         // recorded, but nothing here can say the place is still its.
@@ -2281,40 +2289,33 @@ impl App {
                 "container {} is unresolved ({reason}): nothing to act on",
                 container.container_id
             )));
-            return;
+            return None;
         }
         let target = container.kind.target(&container.handle);
-        let mut losses = vec![format!(
-            "container {} — {} {}",
-            container.container_id,
-            match container.kind {
-                crate::control_plane::containers::Kind::Workspace => "workspace",
-                crate::control_plane::containers::Kind::Tab => "tab",
-                crate::control_plane::containers::Kind::Pane => "pane",
-            },
-            container.handle
-        )];
+        let described = container_name(inventory, &container);
+        let running = running_inside(inventory, state, &container);
+        let mut losses = vec![described.clone()];
         match operation {
             Operation::DeleteContainer => {
-                losses.push("everything recorded inside it is removed with it".to_string());
-                losses.push(
-                    "a live managed worker inside it refuses the deletion, naming itself"
-                        .to_string(),
-                );
+                if running.is_empty() {
+                    losses.push("nothing is running in it".to_string());
+                } else {
+                    losses.extend(running.iter().cloned());
+                }
             }
             Operation::ReloadContainer => {
                 if container.kind != crate::control_plane::containers::Kind::Pane {
                     self.set_focus_message(Some(
                         "only a pane slot runs a recipe: select a pane".to_string(),
                     ));
-                    return;
+                    return None;
                 }
                 if !container.recipe {
                     self.set_focus_message(Some(format!(
                         "container {} records no recipe: nothing to reload",
                         container.container_id
                     )));
-                    return;
+                    return None;
                 }
                 losses.push("the recorded recipe runs again in this pane".to_string());
                 losses.push(
@@ -2336,14 +2337,14 @@ impl App {
                         "select a pane in this tab to add a pane, or its workspace to add a tab"
                             .to_string(),
                     ));
-                    return;
+                    return None;
                 }
             },
-            _ => return,
+            _ => return None,
         }
-        losses.push("nothing already running is replaced".to_string());
+
         let identity = lifecycle::identity(inventory, &target);
-        self.confirmation = Some(Confirmation {
+        let confirmation = Confirmation {
             operation,
             target,
             identity,
@@ -2351,7 +2352,14 @@ impl App {
             confirm_selected: false,
             subject: None,
             container_id: Some(container.container_id),
-        });
+        };
+        // Deleting a container nothing runs in is the standard case and loses no
+        // work, so it is not a question. Anything running is confirmed by name.
+        if operation == Operation::DeleteContainer && running.is_empty() {
+            return self.confirm_container(confirmation, state);
+        }
+        self.confirmation = Some(confirmation);
+        None
     }
 
     /// Revalidates a container control against the latest current observation and
@@ -2942,6 +2950,90 @@ fn containment_of(
 }
 
 /// Why a target cannot be closed directly, when it cannot.
+/// A container named for a person: its label, or what the place is called. Its
+/// record id is never shown, because it names nothing an operator recognises.
+fn container_name(inventory: &crate::model::FleetObservation, container: &ContainerRef) -> String {
+    let kind = match container.kind {
+        crate::control_plane::containers::Kind::Workspace => "workspace",
+        crate::control_plane::containers::Kind::Tab => "tab",
+        crate::control_plane::containers::Kind::Pane => "pane",
+    };
+    let place = match container.kind {
+        crate::control_plane::containers::Kind::Workspace => inventory
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == container.handle)
+            .and_then(|workspace| workspace.label.clone()),
+        crate::control_plane::containers::Kind::Tab => inventory
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == container.handle)
+            .and_then(|tab| tab.label.clone()),
+        crate::control_plane::containers::Kind::Pane => inventory
+            .pane(&container.handle)
+            .and_then(|pane| pane.display_name().map(str::to_string)),
+    };
+    match place.filter(|place| !place.is_empty()) {
+        Some(place) => format!("{kind} {place}"),
+        None => format!("this {kind}"),
+    }
+}
+
+/// The panes recorded inside one container.
+fn panes_inside<'a>(
+    inventory: &'a crate::model::FleetObservation,
+    container: &ContainerRef,
+) -> Vec<&'a crate::model::Pane> {
+    inventory
+        .panes
+        .iter()
+        .filter(|pane| match container.kind {
+            crate::control_plane::containers::Kind::Workspace => {
+                pane.location.workspace_id == container.handle
+            }
+            crate::control_plane::containers::Kind::Tab => pane.location.tab_id == container.handle,
+            crate::control_plane::containers::Kind::Pane => {
+                pane.location.pane_id == container.handle
+            }
+        })
+        .collect()
+}
+
+/// What is running inside one container, named rather than identified: an agent
+/// by its label, a command by what the operating system calls it. An idle shell
+/// is nothing to lose, so it is not listed.
+fn running_inside(
+    inventory: &crate::model::FleetObservation,
+    state: &ObservationState,
+    container: &ContainerRef,
+) -> Vec<String> {
+    let mut running: Vec<String> = Vec::new();
+    for pane in panes_inside(inventory, container) {
+        let pane_id = pane.location.pane_id.as_str();
+        let named = inventory
+            .agents
+            .iter()
+            .find(|agent| agent.location.pane_id == pane_id)
+            .and_then(|agent| agent.label.as_deref().or(agent.name.as_deref()));
+        if let Some(named) = named {
+            running.push(format!("{named} is running"));
+            continue;
+        }
+        if let Some(crate::model::ForegroundEvidence::NonShell { name, command, .. }) =
+            state.foreground(pane_id)
+        {
+            let what = name
+                .as_deref()
+                .or(command.as_deref())
+                .unwrap_or("a command");
+            running.push(format!("{what} is running"));
+        }
+    }
+    running.sort();
+    running.dedup();
+    running
+}
+
 fn containment_refusal(containment: Containment, target: &CloseTarget) -> Option<String> {
     let described = target.description();
     match containment {
@@ -4324,20 +4416,13 @@ mod tests {
 
     #[test]
     fn a_container_row_offers_a_container_control_and_a_plain_pane_does_not() {
+        // A creation is always a question: it makes a place rather than ending one.
         let (state, mut app) = fixture_with_container(None);
-        app.begin_action(Operation::DeleteContainer, &state);
+        app.begin_action(Operation::CreateContainer, &state);
         let confirmation = app.confirmation().expect("a container confirmation");
         assert_eq!(confirmation.container_id.as_deref(), Some("c1"));
         assert_eq!(confirmation.target, CloseTarget::Pane("wA:p3".into()));
         assert!(!confirmation.confirm_selected, "Cancel is the default");
-        assert!(
-            confirmation
-                .losses
-                .iter()
-                .any(|line| line.contains("container c1")),
-            "the losses name the container: {:?}",
-            confirmation.losses
-        );
         app.cancel_confirmation();
 
         // A pane Radar records nothing for has no container to address, and none is
@@ -4361,6 +4446,56 @@ mod tests {
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         app.begin_action(Operation::ReloadContainer, &no_recipe);
         assert!(app.confirmation().is_none());
+    }
+
+    /// Deleting a container something is running in is a question, and the
+    /// question names what would die rather than the record that holds it.
+    #[test]
+    fn deleting_a_running_container_asks_first_and_names_what_is_running() {
+        let (mut state, mut app) = fixture_with_container(None);
+        state.apply_evidence(
+            "wA:p3",
+            crate::model::ForegroundEvidence::NonShell {
+                pid: 4242,
+                name: Some("nvim".to_string()),
+                command: Some("nvim src/main.rs".to_string()),
+                local: crate::model::LocalFacts::default(),
+            },
+        );
+        assert!(
+            app.begin_action(Operation::DeleteContainer, &state)
+                .is_none()
+        );
+        let confirmation = app.confirmation().expect("a confirmation");
+        assert!(
+            confirmation
+                .losses
+                .iter()
+                .any(|line| line == "nvim is running"),
+            "the losses name the command: {:?}",
+            confirmation.losses
+        );
+        assert!(
+            confirmation
+                .losses
+                .iter()
+                .all(|line| !line.contains("c1") && !line.contains("wA:p3")),
+            "no record id or pane handle is shown: {:?}",
+            confirmation.losses
+        );
+    }
+
+    /// Nothing running is the standard case: it loses no work, so it is not asked
+    /// about.
+    #[test]
+    fn deleting_an_idle_container_asks_nothing() {
+        let (state, mut app) = fixture_with_container(None);
+        let confirmed = app.begin_action(Operation::DeleteContainer, &state);
+        assert!(app.confirmation().is_none(), "no question to ask");
+        assert!(matches!(
+            confirmed,
+            Some(Confirmed::Container(crate::topology::Control::Delete(_)))
+        ));
     }
 
     fn launch_test_shell(name: &str) -> (std::path::PathBuf, std::ffi::OsString) {
@@ -4501,8 +4636,11 @@ mod tests {
     #[test]
     fn a_container_control_freezes_its_place_and_occupant_at_confirm() {
         let (state, mut app) = fixture_with_container(None);
-        app.begin_action(Operation::DeleteContainer, &state);
-        match app.confirm(&state).expect("the container still holds") {
+        // Nothing runs in this container, so the deletion is not a question: the
+        // frozen control comes straight back.
+        let confirmed = app.begin_action(Operation::DeleteContainer, &state);
+        assert!(app.confirmation().is_none(), "nothing to ask");
+        match confirmed.expect("the container still holds") {
             Confirmed::Container(crate::topology::Control::Delete(request)) => {
                 assert_eq!(request.container_id, "c1");
                 assert_eq!(
@@ -4542,7 +4680,7 @@ mod tests {
     #[test]
     fn a_container_changed_before_confirm_is_not_acted_on() {
         let (mut state, mut app) = fixture_with_container(None);
-        app.begin_action(Operation::DeleteContainer, &state);
+        app.begin_action(Operation::ReloadContainer, &state);
         assert!(app.confirmation().is_some());
 
         // The container is removed while the dialog is up: the place may now belong

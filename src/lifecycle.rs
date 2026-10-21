@@ -516,6 +516,42 @@ pub fn close_unmanaged(
     }
 }
 
+/// Closes one container's place for a deletion the operator confirmed.
+///
+/// The deletion has already verified the serving instance and that the recorded
+/// binding is this place, and the operator was shown what was running inside it.
+/// So this is not the generic close: it does not re-apply the containment guard,
+/// because ending the container is exactly what was asked for. A place that is
+/// already gone needs no close, which makes the deletion a success of nothing
+/// rather than a refusal.
+pub fn close_for_deletion(
+    provider: &dyn RuntimeProvider,
+    request: &CloseRequest,
+    cancel: &AtomicBool,
+) -> DirectClose {
+    let present = match provider.inventory(cancel) {
+        Ok(inventory) => Some(match &request.target {
+            CloseTarget::Pane(pane) => inventory.pane(pane).is_some(),
+            CloseTarget::Tab(id) => inventory.tabs.iter().any(|tab| tab.tab_id == *id),
+            CloseTarget::Workspace(id) => inventory
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.workspace_id == *id),
+        }),
+        // An unreadable inventory says nothing about the place; the close itself
+        // is still the last word.
+        Err(_) => None,
+    };
+    if present == Some(false) {
+        return DirectClose::Completed;
+    }
+    match provider.close_outcome(&request.target, cancel) {
+        CloseOutcome::Completed => DirectClose::Completed,
+        CloseOutcome::Refused(message) => DirectClose::Refused(message),
+        CloseOutcome::Unknown(message) => DirectClose::Unknown(message),
+    }
+}
+
 /// The operator-facing form of [`close_unmanaged`]: the same policy and the
 /// same messages, collapsed to what Radar's own close worker reports.
 fn run(
