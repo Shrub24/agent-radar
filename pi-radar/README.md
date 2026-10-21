@@ -40,3 +40,29 @@ From the repository checkout, run `npm run generate:contracts` in this directory
 Lifecycle execution generations are bounded to `u32` and remain exactly representable as JavaScript numbers. The initial schema set leaves operation sequences and event cursors unchanged; their long-horizon representation remains a separate wire-compatibility decision.
 
 Run `npm pack` to build the bundled runtime entrypoints before creating the tarball.
+
+## Releasing
+
+Publishing is one tag push and it runs in CI; no npm token is stored anywhere.
+`.github/workflows/publish-pi-radar.yml` publishes on a `pi-radar-vX.Y.Z` tag
+push, authenticating with npm trusted publishing (OIDC) and emitting provenance.
+
+One-time setup, on npmjs.com under the `pi-radar` package's settings: add a
+trusted publisher of type GitHub Actions naming owner `Shrub24`, repository
+`agent-radar`, workflow filename `publish-pi-radar.yml`, and no environment.
+The workflow sets no `environment:`, so a non-empty value here stops it from
+publishing; the same is true of an `NPM_TOKEN` secret, which trusted publishing
+does not use.
+
+To release:
+
+1. Bump `version` in `package.json` and `package-lock.json` on `main` and push.
+   Semantics: a breaking wire change bumps the minor, additive changes the patch.
+2. Tag that commit and push the tag: `git tag pi-radar-vX.Y.Z && git push origin pi-radar-vX.Y.Z`.
+
+The workflow refuses to publish unless the tag's version matches
+`package.json`, the tagged commit is on `main`, and that version is not already
+on npm; then it installs from the lockfile, runs `npm test`, preflights the
+tarball with `npm pack --dry-run` (which builds `dist/` through `prepack`), and
+publishes. A failed run is re-runnable by fixing the cause and re-pushing the
+tag; an already-published version fails by design rather than republishing.

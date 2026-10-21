@@ -1,5 +1,10 @@
 name: Publish pi-radar
 
+# Publishing is a tag push: `pi-radar-vX.Y.Z` must match pi-radar/package.json
+# and point at a commit on main. Authentication is npm trusted publishing
+# (OIDC) — this workflow holds no npm token. The package's trusted publisher on
+# npmjs.com must name this repository (Shrub24/agent-radar) and this filename
+# (publish-pi-radar.yml), with no environment.
 on:
   push:
     tags:
@@ -41,6 +46,35 @@ jobs:
           if (actual !== expected) throw new Error(`Tag version ${expected} does not match package.json version ${actual}`);
           NODE
 
+      - name: Refuse an already-published version
+        run: |
+          version="${GITHUB_REF_NAME#pi-radar-v}"
+          if npm view "pi-radar@${version}" version >/dev/null 2>&1; then
+            echo "::error::pi-radar ${version} is already on npm; bump the package and tag the new version"
+            exit 1
+          fi
+
+      - name: Ensure npm supports trusted publishing
+        run: |
+          current=$(npm --version)
+          if ! node -e '
+            const have = process.argv[1].split(".").map(Number);
+            const need = [11, 5, 1];
+            for (let i = 0; i < 3; i += 1) {
+              if (have[i] > need[i]) process.exit(0);
+              if (have[i] < need[i]) process.exit(1);
+            }
+            process.exit(0);
+          ' "$current"; then
+            echo "npm $current predates trusted publishing; installing npm 11"
+            npm install --global npm@11
+          fi
+          printf 'node %s, npm %s\n' "$(node --version)" "$(npm --version)"
+
       - run: npm ci
       - run: npm test
-      - run: npm publish --access public
+
+      - name: Preflight the tarball
+        run: npm pack --dry-run
+
+      - run: npm publish --access public --provenance
