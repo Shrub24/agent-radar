@@ -43,6 +43,24 @@ pub fn systemctl(arguments: &[&str]) -> Result<Output, String> {
         .map_err(|error| format!("systemctl --user: {error}"))
 }
 
+/// Runs one unit action that must succeed, naming the unit if it does not.
+///
+/// A launched process that returns is not a completed action: systemd refusing a
+/// start, stop or restart still leaves a zero-length stdout and a non-zero status.
+fn unit_action(verb: &str, unit: &str) -> Result<(), String> {
+    let output = systemctl(&[verb, unit]).map_err(|problem| format!("{unit}: {problem}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let reason = if reason.is_empty() {
+        format!("systemd exited with {}", output.status)
+    } else {
+        reason
+    };
+    Err(format!("{unit}: {reason}"))
+}
+
 /// Whether `unit` is active now.
 pub fn unit_active(unit: &str) -> bool {
     systemctl(&["is-active", "--quiet", unit]).is_ok_and(|output| output.status.success())
@@ -82,14 +100,7 @@ pub fn ensure_tmux_server(server: &str) -> Result<(), String> {
              Radar serves only the server its own unit owns and refuses this one"
         ));
     }
-    let started =
-        systemctl(&["start", &unit]).map_err(|problem| format!("starting {unit}: {problem}"))?;
-    if !started.status.success() {
-        return Err(format!(
-            "starting {unit}: {}",
-            String::from_utf8_lossy(&started.stderr).trim()
-        ));
-    }
+    unit_action("start", &unit).map_err(|problem| format!("starting {problem}"))?;
     let deadline = Instant::now() + SERVER_START_TIMEOUT;
     while !server_answers(server) {
         if Instant::now() >= deadline {
@@ -119,10 +130,13 @@ pub fn server_panes(server: &str) -> Result<Option<Vec<String>>, String> {
         .output()
         .map_err(|error| format!("tmux: {error}"))?;
     if !listing.status.success() {
-        return Err(format!(
-            "tmux server `{server}`: {}",
-            String::from_utf8_lossy(&listing.stderr).trim()
-        ));
+        let reason = String::from_utf8_lossy(&listing.stderr).trim().to_string();
+        // A server kept alive with no session has no target to list. That is no
+        // panes, not a failed read: tmux says so and exits non-zero.
+        if reason.contains("no current target") {
+            return Ok(Some(Vec::new()));
+        }
+        return Err(format!("tmux server `{server}`: {reason}"));
     }
     Ok(Some(
         String::from_utf8_lossy(&listing.stdout)
@@ -141,15 +155,9 @@ pub fn server_panes(server: &str) -> Result<Option<Vec<String>>, String> {
 pub fn stop_tmux_server(server: &str) -> Result<String, String> {
     refuse_while_busy(server, "stopped")?;
     let unit = tmux_unit(server);
-    let stopped = systemctl(&["stop", &unit])?;
-    if stopped.status.success() {
-        Ok(format!("stopped {unit}"))
-    } else {
-        Err(format!(
-            "stopping {unit}: {}",
-            String::from_utf8_lossy(&stopped.stderr).trim()
-        ))
-    }
+    unit_action("stop", &unit)
+        .map(|()| format!("stopped {unit}"))
+        .map_err(|problem| format!("stopping {problem}"))
 }
 
 /// The gate every server stop and restart passes before it touches the unit: no
@@ -182,15 +190,7 @@ fn refuse_while_busy(server: &str, verb: &str) -> Result<(), String> {
 /// Starts the control socket, which lets the daemon start on the next
 /// connection. Starting an already listening socket is a no-op.
 pub fn start_control_socket() -> Result<(), String> {
-    let started = systemctl(&["start", SOCKET_UNIT])?;
-    if started.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "starting {SOCKET_UNIT}: {}",
-            String::from_utf8_lossy(&started.stderr).trim()
-        ))
-    }
+    unit_action("start", SOCKET_UNIT).map_err(|problem| format!("starting {problem}"))
 }
 
 /// Names why the daemon cannot be reached, from systemd's view of its units.
@@ -203,7 +203,16 @@ pub fn explain_unreachable(problem: &str) -> String {
 }
 
 /// The rule behind [`explain_unreachable`], over the two unit states it reads.
-fn explain_states(socket: &str, daemon: &str, problem: &str) -> String {
+///
+/// A unit whose state could not be read explains nothing, so the connection's own
+/// reason is kept rather than being replaced by a guess.
+fn explain_states(
+    socket: &Result<String, String>,
+    daemon: &Result<String, String>,
+    problem: &str,
+) -> String {
+    let socket = socket.as_deref().unwrap_or("unknown");
+    let daemon = daemon.as_deref().unwrap_or("unknown");
     if socket == "failed" || daemon == "failed" {
         format!("daemon failed to start: see `journalctl --user -u {DAEMON_UNIT}` ({problem})")
     } else if matches!(socket, "inactive" | "deactivating") {
@@ -216,58 +225,104 @@ fn explain_states(socket: &str, daemon: &str, problem: &str) -> String {
 /// Runs one `radar daemon` action and returns the lines to print and the exit
 /// code.
 pub fn daemon_command(action: &str) -> (String, i32) {
-    let result = match action {
-        "start" => start_control_socket().map(|()| "started the control socket".to_string()),
+    match action {
+        "start" => {
+            settle(start_control_socket().map(|()| "started the control socket".to_string()))
+        }
         "stop" => {
             // The socket goes first: with it stopped nothing can reconnect the
-            // service between the two steps.
-            systemctl(&["stop", SOCKET_UNIT])
-                .and_then(|_| systemctl(&["stop", DAEMON_UNIT]))
-                .map(|_| "stopped the control socket and daemon".to_string())
+            // service between the two steps. Each stop is checked, so a refused
+            // socket stop never reports the daemon as stopped too.
+            let stopped = unit_action("stop", SOCKET_UNIT)
+                .map_err(|problem| format!("stopping {problem}"))
+                .and_then(|()| {
+                    unit_action("stop", DAEMON_UNIT).map_err(|problem| {
+                        format!("the control socket stopped, stopping {problem}")
+                    })
+                });
+            settle(stopped.map(|()| "stopped the control socket and daemon".to_string()))
         }
-        "restart" => systemctl(&["restart", DAEMON_UNIT]).map(|_| "restarted the daemon".into()),
-        "status" => Ok(format!(
-            "{SOCKET_UNIT}: {}\n{DAEMON_UNIT}: {}",
-            unit_state(SOCKET_UNIT),
-            unit_state(DAEMON_UNIT)
-        )),
-        other => Err(format!("unknown daemon action `{other}`")),
-    };
-    settle(result)
+        "restart" => settle(
+            unit_action("restart", DAEMON_UNIT)
+                .map(|()| "restarted the daemon".to_string())
+                .map_err(|problem| format!("restarting {problem}")),
+        ),
+        "status" => status_report(&[
+            (SOCKET_UNIT, unit_state(SOCKET_UNIT)),
+            (DAEMON_UNIT, unit_state(DAEMON_UNIT)),
+        ]),
+        other => settle(Err(format!("unknown daemon action `{other}`"))),
+    }
 }
 
 /// Runs one `radar server` action for `server` and returns the lines to print and
 /// the exit code.
 pub fn server_command(action: &str, server: &str) -> (String, i32) {
     let unit = tmux_unit(server);
-    let result = match action {
-        "start" => systemctl(&["start", &unit]).map(|_| format!("started {unit}")),
-        "stop" => stop_tmux_server(server),
-        "restart" => refuse_while_busy(server, "restarted")
-            .and_then(|()| systemctl(&["restart", &unit]))
-            .map(|_| format!("restarted {unit}")),
-        "status" => {
-            let panes = match server_panes(server) {
-                Ok(Some(panes)) => format!("{} pane(s)", panes.len()),
-                Ok(None) => "no server answering".to_string(),
-                Err(problem) => problem,
-            };
-            Ok(format!("{unit}: {}\n{panes}", unit_state(&unit)))
-        }
-        other => Err(format!("unknown server action `{other}`")),
-    };
-    settle(result)
+    match action {
+        "start" => settle(
+            unit_action("start", &unit)
+                .map(|()| format!("started {unit}"))
+                .map_err(|problem| format!("starting {problem}")),
+        ),
+        "stop" => settle(stop_tmux_server(server)),
+        "restart" => settle(
+            refuse_while_busy(server, "restarted")
+                .and_then(|()| unit_action("restart", &unit))
+                .map(|()| format!("restarted {unit}"))
+                .map_err(|problem| format!("restarting {problem}")),
+        ),
+        "status" => status_report(&[
+            (&unit, unit_state(&unit)),
+            (
+                "panes",
+                server_panes(server).map(|panes| match panes {
+                    Some(panes) => format!("{} pane(s)", panes.len()),
+                    None => "no server answering".to_string(),
+                }),
+            ),
+        ]),
+        other => settle(Err(format!("unknown server action `{other}`"))),
+    }
 }
 
-/// The unit's state as systemd names it, or why it could not be asked.
-fn unit_state(unit: &str) -> String {
-    match systemctl(&["show", "--property=ActiveState", "--value", unit]) {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        Err(problem) => problem,
+/// The unit's state as systemd names it, or why it could not be read.
+///
+/// A failed read is an `Err`, not a state: reporting the diagnostic where a state
+/// belongs would present an unknown unit as a known one.
+fn unit_state(unit: &str) -> Result<String, String> {
+    let output = systemctl(&["show", "--property=ActiveState", "--value", unit])
+        .map_err(|problem| format!("{unit}: {problem}"))?;
+    if !output.status.success() {
+        let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let reason = if reason.is_empty() {
+            format!("systemd exited with {}", output.status)
+        } else {
+            reason
+        };
+        return Err(format!("{unit}: {reason}"));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// One line per subject, and an exit code that matches what could be read.
+///
+/// A subject whose evidence could not be read is still named, so the operator
+/// sees the rest of the picture, but the command fails: a lookup that did not
+/// happen is never a successful report.
+fn status_report(rows: &[(&str, Result<String, String>)]) -> (String, i32) {
+    let mut lines = Vec::with_capacity(rows.len());
+    let mut read_all = true;
+    for (subject, state) in rows {
+        match state {
+            Ok(state) => lines.push(format!("{subject}: {state}")),
+            Err(problem) => {
+                read_all = false;
+                lines.push(format!("{subject}: unknown ({problem})"));
+            }
+        }
+    }
+    (lines.join("\n"), if read_all { 0 } else { 1 })
 }
 
 /// Turns an action's outcome into the lines to print and the exit code. A
@@ -310,17 +365,94 @@ mod tests {
         assert_eq!(tmux_unit("radar"), "radar-tmux@radar.service");
     }
 
+    fn state(state: &str) -> Result<String, String> {
+        Ok(state.to_string())
+    }
+
     #[test]
     fn a_stopped_socket_and_a_failed_unit_are_named_differently() {
-        assert!(explain_states("inactive", "inactive", "refused").starts_with("daemon stopped"));
         assert!(
-            explain_states("active", "failed", "refused").starts_with("daemon failed to start")
+            explain_states(&state("inactive"), &state("inactive"), "refused")
+                .starts_with("daemon stopped")
         );
         assert!(
-            explain_states("failed", "inactive", "refused").starts_with("daemon failed to start")
+            explain_states(&state("active"), &state("failed"), "refused")
+                .starts_with("daemon failed to start")
         );
-        // A state nothing could be read for keeps the connection's own reason.
-        assert_eq!(explain_states("unknown", "unknown", "refused"), "refused");
+        assert!(
+            explain_states(&state("failed"), &state("inactive"), "refused")
+                .starts_with("daemon failed to start")
+        );
+        // A state nothing could be read for keeps the connection's own reason,
+        // since an unread unit is not evidence of either state.
+        let unread = Err("socket: systemctl --user: timed out".to_string());
+        assert_eq!(
+            explain_states(&unread, &state("unknown"), "refused"),
+            "refused"
+        );
+    }
+
+    #[test]
+    fn a_status_report_is_a_failure_when_any_subject_could_not_be_read() {
+        let (lines, code) = status_report(&[
+            ("radar-control.socket", state("active")),
+            ("radar-daemon.service", state("inactive")),
+        ]);
+        assert_eq!(
+            lines,
+            "radar-control.socket: active\nradar-daemon.service: inactive"
+        );
+        assert_eq!(code, 0);
+
+        let (lines, code) = status_report(&[
+            ("radar-control.socket", state("active")),
+            (
+                "radar-daemon.service",
+                Err("radar-daemon.service: not found".to_string()),
+            ),
+        ]);
+        assert_eq!(
+            lines,
+            "radar-control.socket: active\n\
+             radar-daemon.service: unknown (radar-daemon.service: not found)"
+        );
+        assert_eq!(
+            code, 1,
+            "an unread unit was reported as a successful status"
+        );
+    }
+
+    #[test]
+    fn a_refused_unit_operation_names_the_unit_and_the_action() {
+        // A systemctl that always refuses: the message must name what was asked
+        // for, because the operator's next step depends on which part failed.
+        let refusing = format!(
+            "{}/radar-refusing-systemctl",
+            std::env::temp_dir().display()
+        );
+        std::fs::write(
+            &refusing,
+            "#!/bin/sh\necho 'Job failed. See journal.' >&2\nexit 1\n",
+        )
+        .expect("write a refusing systemctl");
+        let mut permissions = std::fs::metadata(&refusing)
+            .expect("stat the script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&refusing, permissions).expect("make it executable");
+        // SAFETY: the variable is read only by the call under test, which runs in
+        // this test's own process before any other test can observe it.
+        unsafe { std::env::set_var("RADAR_SYSTEMCTL", &refusing) };
+        let restart = daemon_command("restart");
+        let start = server_command("start", "radar");
+        unsafe { std::env::remove_var("RADAR_SYSTEMCTL") };
+        let _ = std::fs::remove_file(&refusing);
+
+        assert_eq!(restart.1, 1, "{}", restart.0);
+        assert!(restart.0.contains("restarting"), "{}", restart.0);
+        assert!(restart.0.contains("Job failed"), "{}", restart.0);
+        assert_eq!(start.1, 1, "{}", start.0);
+        assert!(start.0.contains("radar-tmux@radar.service"), "{}", start.0);
     }
 
     #[test]
@@ -355,6 +487,33 @@ mod tests {
         let problem = refused.expect_err("a pane refuses the stop");
         assert!(problem.contains("holds 1 pane"), "{problem}");
         assert!(problem.contains("not stopped"), "{problem}");
+    }
+
+    #[test]
+    fn a_server_with_no_session_holds_no_panes_rather_than_failing() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            return; // tmux is required for this check; the gate runs it where tmux exists.
+        }
+        let server = format!("radar-empty-probe-{}", std::process::id());
+        let run = |arguments: &[&str]| {
+            Command::new("tmux")
+                .args(["-L", &server])
+                .args(arguments)
+                .output()
+                .expect("tmux runs")
+        };
+        run(&["-f", "/dev/null", "new-session", "-d", "-s", "probe"]);
+        // Kept alive after its last session closes, which is how Radar's own unit
+        // is configured: an empty server is a state this must report, not refuse.
+        run(&["set-option", "-g", "exit-empty", "off"]);
+        run(&["kill-session", "-t", "probe"]);
+        let panes = server_panes(&server);
+        let _ = run(&["kill-server"]);
+        assert_eq!(
+            panes.expect("an empty server is readable"),
+            Some(Vec::new()),
+            "a running server with no session holds no panes"
+        );
     }
 
     #[test]
