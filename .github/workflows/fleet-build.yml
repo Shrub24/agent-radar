@@ -1,0 +1,24 @@
+name: fleet-build
+
+# The fleet build plane: dispatched by hand, so no push or pull request can reach a
+# privileged publication run. nix-fleet owns the builders, the cache and the runner
+# configuration; this file only declares what to build.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: Shrub24/nix-fleet/.github/workflows/build-push-cache.yml@v2
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      targets: .#packages.x86_64-linux.radar
+      systems: x86_64-linux
+      runner_system: x86_64-linux
+      profile: ci
+    secrets:
+      BUILDER_SSH_KEY: ${{ secrets.FLEET_BUILDER_SSH_KEY }}
