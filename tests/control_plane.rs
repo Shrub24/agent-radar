@@ -10114,29 +10114,40 @@ fn a_deletion_that_would_end_a_live_worker_names_it_and_dispatches_nothing() {
 }
 
 #[test]
-fn a_deletion_under_another_serving_instance_refuses_and_dispatches_nothing() {
+fn a_deletion_under_an_ended_serving_instance_forgets_the_records() {
     let (_sandbox, backend, mut daemon, mut client) =
         deletion_setup("topology-delete-replaced", "wA");
-    let (_id, request) = created_workspace(&mut client, "wA");
+    let (id, request) = created_workspace(&mut client, "wA");
 
-    // The handle is now served by another process: pid 1 is not this test's.
+    // The handle is now served by another process: pid 1 is not this test's, so
+    // the server the container was recorded under is provably gone and its places
+    // went with it.
     backend.served_by(1);
     let deletion = client.call("topology.delete", request);
-    assert_eq!(result_record(&deletion)["outcome"], "refused", "{deletion}");
-    assert!(
-        result_record(&deletion)["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("another serving instance")),
+    assert_eq!(
+        result_record(&deletion)["outcome"],
+        "completed",
         "{deletion}"
     );
+    let message = result_record(&deletion)["message"]
+        .as_str()
+        .expect("a note")
+        .to_string();
+    assert!(message.contains("no longer serves"), "{message}");
+    assert!(message.contains("forgotten"), "{message}");
+    assert!(
+        !message.contains("closed by the runtime") && !message.contains("exit"),
+        "nothing was closed and no exit is claimed: {message}"
+    );
+    let removed = deletion["result"]["removed"]
+        .as_array()
+        .expect("the removed containers")
+        .clone();
+    assert_eq!(removed.len(), 1, "{deletion}");
+    assert_eq!(removed[0]["container_id"], json!(id), "{deletion}");
     assert!(
         backend.closed_targets().is_empty(),
-        "a container recorded under another instance is not closed"
-    );
-    assert_eq!(
-        result_record(&deletion)["category"],
-        "refused",
-        "{deletion}"
+        "a container recorded under an ended instance has nothing left to close"
     );
     daemon.stop();
 }

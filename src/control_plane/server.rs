@@ -4761,17 +4761,6 @@ fn execute_container_delete(
             core,
         );
     };
-    if serving.as_ref() != Some(&recorded) {
-        return write_refused(
-            request,
-            record,
-            &format!(
-                "container {} was recorded under another serving instance: nothing was deleted",
-                container.id
-            ),
-            core,
-        );
-    }
     // What the deletion would take with it, from the daemon's own records: the
     // container, everything recorded inside it, and any worker registered into
     // one of those places.
@@ -4805,8 +4794,21 @@ fn execute_container_delete(
             containers::Kind::Pane => location.pane.as_deref() == Some(handle),
         })
     });
-    if !occupied.is_empty() {
-        let named: Vec<String> = occupied
+    // Only a worker whose process is verified alive holds the deletion back. A
+    // registration recorded into a place that no longer exists is a record, not a
+    // process: refusing on it would leave a container nothing can ever delete.
+    let mut alive: Vec<&registry::PublicRegistration> = Vec::new();
+    for registration in &occupied {
+        match registry.verify_process(&registration.registration_id, verifier.as_ref()) {
+            Ok(registry::ProcessVerification::Verified) => alive.push(registration),
+            // Unreadable procfs is not a dead worker, so it holds the deletion
+            // back exactly as a verified one does.
+            Err(_) | Ok(registry::ProcessVerification::Unavailable) => alive.push(registration),
+            Ok(_) => {}
+        }
+    }
+    if !alive.is_empty() {
+        let named: Vec<String> = alive
             .iter()
             .map(|registration| match registration.label.as_deref() {
                 Some(label) => format!("{label} ({})", registration.registration_id),
@@ -4823,6 +4825,43 @@ fn execute_container_delete(
             ),
             core,
         );
+    }
+    // The recorded serving instance is gone when the server now serving is a
+    // different process, or none is. The places recorded under it went with it:
+    // there is nothing left to close, so no runtime confirmation is awaited and
+    // no process is claimed to have exited. The records are forgotten instead.
+    if serving.as_ref() != Some(&recorded) {
+        let now = store::now_ms();
+        let at = store::format_millis(now);
+        let mut removed: Vec<containers::Container> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for id in &members {
+            match containers::record_removed(&registry, id, &at) {
+                Ok(container) => removed.push(container),
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+        let note = if failures.is_empty() {
+            format!(
+                "{} was recorded under a serving instance that no longer serves; {} container record(s) forgotten, nothing was closed",
+                delete.frozen.target.description(),
+                removed.len()
+            )
+        } else {
+            format!(
+                "{} was recorded under a serving instance that no longer serves; removals were not recorded for: {}",
+                delete.frozen.target.description(),
+                failures.join("; ")
+            )
+        };
+        let settled = record.complete(
+            RequestOutcome::Completed,
+            None,
+            Some(&note),
+            vec!["container.removal".into()],
+            now,
+        );
+        return write_deleted(request, settled, removed, core);
     }
     // The guarded dispatch a generic close uses, unchanged: one fresh inventory,
     // the frozen identity, and a registry that must answer.
@@ -7043,9 +7082,24 @@ fn spawn_sweeper(
                 // One inventory read serves both the pane evidence a bound launch
                 // needs and the adoption pass, so a pass costs one listing.
                 let observation = observed_inventory(&core);
-                if let Err(error) =
-                    observe_launch_panes(&registry, observation.as_ref(), &mut pane_cursor, now)
-                {
+                let serving = {
+                    let core = locked(&core);
+                    (
+                        core.backend.clone(),
+                        Arc::clone(&core.verifier),
+                        Arc::clone(&core.stopping),
+                    )
+                };
+                let serving = serving.0.as_ref().and_then(|backend| {
+                    serving_identity(backend, &serving.1, &serving.2, &verification)
+                });
+                if let Err(error) = observe_launch_panes(
+                    &registry,
+                    observation.as_ref(),
+                    serving.as_ref(),
+                    &mut pane_cursor,
+                    now,
+                ) {
                     tracing::error!(%error, "launch pane observation failed");
                 }
 
@@ -7096,6 +7150,19 @@ fn management_view(
     }
 }
 
+/// Whether the server generation a pane was created in is provably over.
+///
+/// A pane is owned by exactly one server process. When the server now serving is
+/// a different incarnation, every pane recorded under the earlier one died with
+/// it — that is absence by identity, not an unreadable read. No server answering
+/// at all is not the same claim, so it stays unconfirmed.
+fn generation_ended(
+    recorded: Option<&crate::model::ProcessIdentity>,
+    serving: Option<&crate::model::ProcessIdentity>,
+) -> bool {
+    matches!((recorded, serving), (Some(recorded), Some(serving)) if recorded != serving)
+}
+
 /// Records what one inventory read said about each bound launch's pane.
 ///
 /// Paging is fair rather than a sorted prefix: the pass continues after the last
@@ -7105,6 +7172,7 @@ fn management_view(
 fn observe_launch_panes(
     registry: &Arc<Registry>,
     observation: Option<&FleetObservation>,
+    serving: Option<&crate::model::ProcessIdentity>,
     cursor: &mut Option<String>,
     now_ms: i64,
 ) -> Result<usize, String> {
@@ -7129,6 +7197,12 @@ fn observe_launch_panes(
         };
         let evidence =
             match crate::control_plane::registry_read::location_evidence(observation, &edge) {
+                // A pane cannot outlive the server that owned it: a different
+                // server now serving is proof its generation ended, so the pane
+                // is gone whether or not a fresh listing reached it.
+                _ if generation_ended(edge.instance.as_ref(), serving) => {
+                    crate::control_plane::lifecycle::PaneEvidence::Absent
+                }
                 LocationEvidence::Present => crate::control_plane::lifecycle::PaneEvidence::Present,
                 LocationEvidence::Absent => crate::control_plane::lifecycle::PaneEvidence::Absent,
                 LocationEvidence::Unavailable => {
@@ -7513,6 +7587,25 @@ mod tests {
 
     fn path_value(value: &str) -> PathBuf {
         PathBuf::from(value)
+    }
+
+    fn identity(pid: i32) -> crate::model::ProcessIdentity {
+        crate::model::ProcessIdentity {
+            boot_id: "boot".to_string(),
+            pid,
+            start_ticks: pid as u64,
+        }
+    }
+
+    /// A pane recorded under a server that no longer serves is provably gone: a
+    /// pane cannot outlive the process that owned it. Silence and an unreachable
+    /// server claim nothing, so neither counts.
+    #[test]
+    fn a_pane_recorded_under_an_ended_server_generation_is_gone() {
+        assert!(generation_ended(Some(&identity(10)), Some(&identity(11))));
+        assert!(!generation_ended(Some(&identity(10)), Some(&identity(10))));
+        assert!(!generation_ended(Some(&identity(10)), None));
+        assert!(!generation_ended(None, Some(&identity(11))));
     }
 
     fn event(seq: u64) -> store::Event {
