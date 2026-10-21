@@ -60,7 +60,13 @@ pub struct DeleteRequest {
     pub container_id: String,
     /// The target and occupant frozen at confirmation, revalidated before the
     /// effect as the generic close does.
-    pub frozen: CloseRequest,
+    ///
+    /// Absent when there was no place to freeze: a container whose handle no
+    /// backend reports has nothing to close, so the deletion is only the record's
+    /// removal. The daemon accepts that only for a container it cannot verify as
+    /// still served, so a live place is never forgotten around.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen: Option<CloseRequest>,
 }
 
 /// Who made the container.

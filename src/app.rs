@@ -2282,14 +2282,27 @@ impl App {
             ));
             return None;
         };
-        // A binding the daemon could not verify is not acted on: the container is
-        // recorded, but nothing here can say the place is still its.
+        // A container whose place cannot be verified has nothing to freeze, so
+        // every control but a deletion is refused here. Deleting it is the record
+        // going: the daemon accepts that only when it cannot verify the place is
+        // still served, so nothing live is forgotten around.
         if let Some(reason) = &container.unresolved {
-            self.set_focus_message(Some(format!(
-                "container {} is unresolved ({reason}): nothing to act on",
-                container.container_id
+            if operation != Operation::DeleteContainer {
+                self.set_focus_message(Some(format!(
+                    "{} is unresolved ({reason}): nothing to act on",
+                    container_name(inventory, &container)
+                )));
+                return None;
+            }
+            let id = container.container_id.clone();
+            return Some(Confirmed::Container(crate::topology::Control::Delete(
+                ContainerDelete {
+                    request_id: crate::control_plane::random_uuid(),
+                    container_id: id,
+                    // No place to freeze: there is nothing recorded to close.
+                    frozen: serde_json::Value::Null,
+                },
             )));
-            return None;
         }
         let target = container.kind.target(&container.handle);
         let described = container_name(inventory, &container);
@@ -4483,6 +4496,46 @@ mod tests {
             "no record id or pane handle is shown: {:?}",
             confirmation.losses
         );
+    }
+
+    /// A container whose handle no backend reports has no place to freeze, so its
+    /// deletion is the record going — and the TUI must not refuse it before the
+    /// daemon can decide.
+    #[test]
+    fn an_unresolved_container_can_be_forgotten_but_not_otherwise_acted_on() {
+        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut container = pane_container("c1", "wA:p3", None);
+        container.unresolved = Some("no backend reports this container's handle".to_string());
+        observation.containers = vec![container];
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let mut app = App::new();
+        app.refresh(&state);
+        show_all_panes(&mut app);
+        select_row(&mut app, &RowId::Pane("wA:p3".into()));
+
+        // A reload needs a place to run in, so it still refuses.
+        assert!(
+            app.begin_action(Operation::ReloadContainer, &state)
+                .is_none()
+        );
+        assert!(app.confirmation().is_none());
+        assert!(
+            app.focus_message()
+                .is_some_and(|message| message.contains("is unresolved")),
+            "{:?}",
+            app.focus_message()
+        );
+
+        // A deletion freezes nothing and asks nothing: it is the record's removal.
+        match app.begin_action(Operation::DeleteContainer, &state) {
+            Some(Confirmed::Container(crate::topology::Control::Delete(request))) => {
+                assert_eq!(request.container_id, "c1");
+                assert_eq!(request.frozen, serde_json::Value::Null);
+            }
+            other => panic!("a records-only deletion: {other:?}"),
+        }
+        assert!(app.confirmation().is_none(), "nothing to ask");
     }
 
     /// Nothing running is the standard case: it loses no work, so it is not asked

@@ -10159,6 +10159,50 @@ fn a_deletion_under_an_ended_serving_instance_forgets_the_records() {
 }
 
 #[test]
+fn a_deletion_with_no_place_to_freeze_forgets_only_an_unserved_container() {
+    let (_sandbox, backend, mut daemon, mut client) =
+        deletion_setup("topology-delete-forget", "wA");
+    let (id, request) = created_workspace(&mut client, "wA");
+
+    // The container's place is still served, so a deletion that froze nothing
+    // would orphan it: refused, and nothing is forgotten.
+    let unfrozen = json!({"request": {"container_id": id}, "requester": "test"});
+    let served = client.call("topology.delete", unfrozen.clone());
+    assert_eq!(result_record(&served)["outcome"], "refused", "{served}");
+    assert!(
+        result_record(&served)["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("still served")),
+        "{served}"
+    );
+
+    // Its recorded serving instance is gone: there is no place left to freeze, and
+    // the records are all that remain.
+    backend.served_by(1);
+    let forgotten = client.call("topology.delete", unfrozen);
+    assert_eq!(
+        result_record(&forgotten)["outcome"],
+        "completed",
+        "{forgotten}"
+    );
+    assert!(
+        backend.closed_targets().is_empty(),
+        "a forgotten container has no place to close"
+    );
+    let listed = client.call("topology.list", json!({}));
+    let deleted = listed["result"]["containers"]
+        .as_array()
+        .expect("the containers")
+        .iter()
+        .find(|container| container["container_id"] == json!(id))
+        .expect("the forgotten container")
+        .clone();
+    assert!(deleted["removed_at"].is_string(), "{listed}");
+    let _ = request;
+    daemon.stop();
+}
+
+#[test]
 fn a_deletion_of_another_place_than_the_container_binds_is_refused() {
     let (_sandbox, backend, mut daemon, mut client) =
         deletion_setup("topology-delete-mismatch", "wA");

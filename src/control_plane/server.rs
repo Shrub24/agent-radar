@@ -4734,22 +4734,67 @@ fn execute_container_delete(
             core,
         );
     };
+    let verifier = Arc::clone(&locked(core).verifier);
+    let serving = serving_identity(&backend, &verifier, &cancel, verification);
+    // A container whose place cannot be verified is only ever forgotten: there is
+    // nothing to close, so the deletion is its records going. A place that is
+    // still served is never forgotten around, because that would orphan it.
+    let Some(frozen) = delete.frozen.clone() else {
+        let forgotten = match (binding.incarnation.as_ref(), serving.as_ref()) {
+            (Some(recorded), Some(serving)) => recorded != serving,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !forgotten {
+            return write_refused(
+                request,
+                record,
+                &format!(
+                    "container {} is still served by its place: nothing was deleted",
+                    container.id
+                ),
+                core,
+            );
+        }
+        let members = match containers::subtree(&registry, &container.id) {
+            Ok(members) => members,
+            Err(message) => return write_refused(request, record, &message, core),
+        };
+        let now = store::now_ms();
+        let at = store::format_millis(now);
+        let mut removed: Vec<containers::Container> = Vec::new();
+        for id in &members {
+            match containers::record_removed(&registry, id, &at) {
+                Ok(container) => removed.push(container),
+                Err(error) => return write_refused(request, record, &error, core),
+            }
+        }
+        let settled = record.complete(
+            RequestOutcome::Completed,
+            None,
+            Some(&format!(
+                "no place was recorded for this container; {} record(s) forgotten",
+                removed.len()
+            )),
+            vec!["container.removal".into()],
+            now,
+        );
+        return write_deleted(request, settled, removed, core);
+    };
     let expected = container.kind.target(&binding.handle);
-    if delete.frozen.target != expected {
+    if frozen.target != expected {
         return write_refused(
             request,
             record,
             &format!(
                 "{} is not container {}'s location ({}): nothing was deleted",
-                delete.frozen.target.description(),
+                frozen.target.description(),
                 container.id,
                 expected.description()
             ),
             core,
         );
     }
-    let verifier = Arc::clone(&locked(core).verifier);
-    let serving = serving_identity(&backend, &verifier, &cancel, verification);
     let Some(recorded) = binding.incarnation.clone() else {
         return write_refused(
             request,
@@ -4786,13 +4831,13 @@ fn execute_container_delete(
         let note = if failures.is_empty() {
             format!(
                 "{} was recorded under a serving instance that no longer serves; {} container record(s) forgotten, nothing was closed",
-                delete.frozen.target.description(),
+                frozen.target.description(),
                 removed.len()
             )
         } else {
             format!(
                 "{} was recorded under a serving instance that no longer serves; removals were not recorded for: {}",
-                delete.frozen.target.description(),
+                frozen.target.description(),
                 failures.join("; ")
             )
         };
@@ -4805,7 +4850,7 @@ fn execute_container_delete(
         );
         return write_deleted(request, settled, removed, core);
     }
-    let settled = match lifecycle::close_for_deletion(backend.as_ref(), &delete.frozen, &cancel) {
+    let settled = match lifecycle::close_for_deletion(backend.as_ref(), &frozen, &cancel) {
         DirectClose::Completed => {
             let now = store::now_ms();
             let at = store::format_millis(now);
@@ -4823,13 +4868,13 @@ fn execute_container_delete(
             let note = if failures.is_empty() {
                 format!(
                     "{} was closed by the runtime; {} container record(s) marked removed",
-                    delete.frozen.target.description(),
+                    frozen.target.description(),
                     removed.len()
                 )
             } else {
                 format!(
                     "{} was closed by the runtime; removals were not recorded for: {}",
-                    delete.frozen.target.description(),
+                    frozen.target.description(),
                     failures.join("; ")
                 )
             };
