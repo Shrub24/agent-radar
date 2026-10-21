@@ -98,7 +98,8 @@ pub struct ErrorBody {
 
 /// A refusal the daemon can state: the code a caller switches on and the
 /// sentence a human reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{}: {}", .code, .message)]
 pub struct Refusal {
     pub code: Code,
     pub message: String,
@@ -121,14 +122,6 @@ impl Refusal {
         }
     }
 }
-
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
-    }
-}
-
-impl std::error::Error for Refusal {}
 
 /// One decoded request, past the version check.
 ///

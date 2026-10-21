@@ -68,27 +68,12 @@ const SESSION_NAME_TOKEN: &str = "session";
 ///
 /// Malformed required inventory is rejected outright: it must never be
 /// presented as a successful empty fleet.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
-    Json(serde_json::Error),
+    #[error("not valid Herdr JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("malformed Herdr inventory: {0}")]
     Malformed(&'static str),
-}
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Json(error) => write!(f, "not valid Herdr JSON: {error}"),
-            Self::Malformed(what) => write!(f, "malformed Herdr inventory: {what}"),
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
-
-impl From<serde_json::Error> for DecodeError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error)
-    }
 }
 
 // ---------------------------------------------------------------------------

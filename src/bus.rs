@@ -81,39 +81,31 @@ pub enum Message {
 }
 
 /// Why a line must close its connection.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     /// The line exceeded [`MAX_LINE_BYTES`].
+    #[error("line exceeds {MAX_LINE_BYTES} bytes")]
     TooLong,
     /// Not valid JSON, or missing a required field.
-    Malformed(serde_json::Error),
+    #[error("not a valid bus line: {0}")]
+    Malformed(#[source] serde_json::Error),
     /// `hello` named a version other than [`PROTOCOL_VERSION`], or none at all.
+    #[error("{}", version_message(*.0))]
     UnsupportedVersion(Option<u32>),
     /// A known message other than `hello` arrived before the connection's hello.
+    #[error("message before hello")]
     MissingHello,
     /// A second `hello` on one connection.
+    #[error("second hello on one connection")]
     DuplicateHello,
 }
 
-impl std::fmt::Display for ProtocolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooLong => write!(f, "line exceeds {MAX_LINE_BYTES} bytes"),
-            Self::Malformed(error) => write!(f, "not a valid bus line: {error}"),
-            Self::UnsupportedVersion(Some(v)) => write!(f, "unsupported protocol version: {v}"),
-            Self::UnsupportedVersion(None) => write!(f, "hello without a protocol version"),
-            Self::MissingHello => write!(f, "message before hello"),
-            Self::DuplicateHello => write!(f, "second hello on one connection"),
-        }
-    }
-}
-
-impl std::error::Error for ProtocolError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Malformed(error) => Some(error),
-            _ => None,
-        }
+/// The two ways a `hello` can name the wrong protocol, kept apart because a
+/// message that omits the version must not read as one that carries a wrong one.
+fn version_message(version: Option<u32>) -> String {
+    match version {
+        Some(version) => format!("unsupported protocol version: {version}"),
+        None => "hello without a protocol version".to_string(),
     }
 }
 
@@ -527,6 +519,16 @@ mod tests {
             connection.ingest(br#"{"type":"hello","session":"x"}"#),
             Err(ProtocolError::UnsupportedVersion(None))
         ));
+        // A missing version is not a version that failed to match: the two read
+        // differently because they mean different things to the peer's build.
+        assert_eq!(
+            ProtocolError::UnsupportedVersion(Some(2)).to_string(),
+            "unsupported protocol version: 2"
+        );
+        assert_eq!(
+            ProtocolError::UnsupportedVersion(None).to_string(),
+            "hello without a protocol version"
+        );
     }
 
     #[test]

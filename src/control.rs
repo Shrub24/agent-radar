@@ -278,36 +278,30 @@ impl RequestState {
 }
 
 /// Why a control operation could not be carried out.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Each variant's message is the whole report a caller prints: the reason is
+/// already a sentence naming the path, identifier or contract that failed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ControlError {
     /// A directory failed the trust check, or was missing.
+    #[error("{0}")]
     Untrusted(String),
     /// An identifier was not a canonical UUID, so it cannot name a path.
+    #[error("{0}")]
     InvalidIdentifier(String),
     /// A document exceeded the contract's 8 KiB bound.
+    #[error("a control document exceeds {MAX_FILE_BYTES} bytes")]
     Oversized,
     /// A request id already exists in the inbox.
+    #[error("{0}")]
     Collision(String),
     /// A file that exists could not be read or parsed as the contract requires.
+    #[error("{0}")]
     InvalidEvidence(String),
     /// Any other filesystem failure, kept verbatim.
+    #[error("{0}")]
     Io(String),
 }
-
-impl std::fmt::Display for ControlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Untrusted(message)
-            | Self::InvalidIdentifier(message)
-            | Self::Collision(message)
-            | Self::InvalidEvidence(message)
-            | Self::Io(message) => f.write_str(message),
-            Self::Oversized => write!(f, "a control document exceeds {MAX_FILE_BYTES} bytes"),
-        }
-    }
-}
-
-impl std::error::Error for ControlError {}
 
 /// A validated owner control directory: its `inbox` and `results` subdirectories.
 ///
