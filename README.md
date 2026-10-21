@@ -131,8 +131,10 @@ An explicit stop holds until the next `radar` run or the next login, whichever c
 first. A refused stop or restart sends no signal and names what is in the way.
 
 The package builds `radar` from `Cargo.lock` in the Nix sandbox and runs the
-crate's own checks; building or running it needs no development shell. It also
-installs completions generated from the built binary, at
+crate's own checks; building or running it needs no development shell. The
+dependency graph is compiled as its own derivation, keyed on the manifests rather
+than on the sources, so an edit under `src/` rebuilds this crate and not the
+graph. Completions generated from the built binary are installed at
 `share/bash-completion/completions`, `share/zsh/site-functions` and
 `share/fish/vendor_completions.d`, so the shells load them from the package with
 no per-shell setup. Elsewhere, `radar completions <shell>` prints the same

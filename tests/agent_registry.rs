@@ -238,10 +238,13 @@ fn a_supplied_process_identity_is_never_claimed_verified() {
     let root = temp_root("process");
     let registry = Registry::open(&root).expect("a registry");
     let mut wanted = request(INCARNATION);
+    // Identifiers here are digits a UUID cannot collide with: the claim is that
+    // the process identity is absent from the public read, not that a particular
+    // four-digit number is, which a generated id may contain by chance.
     wanted.process = Some(ProcessIdentity {
         boot_id: "boot-abc".into(),
-        pid: 4242,
-        start_ticks: 99,
+        pid: 987_654_321,
+        start_ticks: 123_456_789,
     });
     let stored = registry.register(&wanted, 1_000).expect("a register");
 
@@ -249,7 +252,9 @@ fn a_supplied_process_identity_is_never_claimed_verified() {
     assert!(public.process_claimed);
     let json = serde_json::to_string(&public).expect("an encoding");
     assert!(!json.contains("verified"), "{json}");
-    assert!(!json.contains("4242"), "{json}");
+    assert!(!json.contains("987654321"), "{json}");
+    assert!(!json.contains("123456789"), "{json}");
+    assert!(!json.contains("boot-abc"), "{json}");
 
     let public = registry
         .register(&request(OTHER_INCARNATION), 1_001)

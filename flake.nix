@@ -2,9 +2,16 @@
   description = "Agent Radar: a full-screen fleet overview for local coding agents";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  # The package builder. Crane takes its nixpkgs from the caller, so one
+  # evaluation supplies both the library and the toolchain it compiles with.
+  inputs.crane.url = "github:ipetkov/crane";
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      crane,
+    }:
     let
       # The development shells keep every system the flake has always offered.
       devSystems = [
@@ -24,7 +31,7 @@
     in
     {
       packages = forPackageSystems (pkgs: rec {
-        radar = pkgs.callPackage ./nix/package.nix { };
+        radar = pkgs.callPackage ./nix/package.nix { inherit crane; };
         default = radar;
       });
 
