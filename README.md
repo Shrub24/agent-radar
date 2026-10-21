@@ -131,7 +131,12 @@ An explicit stop holds until the next `radar` run or the next login, whichever c
 first. A refused stop or restart sends no signal and names what is in the way.
 
 The package builds `radar` from `Cargo.lock` in the Nix sandbox and runs the
-crate's own checks; building or running it needs no development shell.
+crate's own checks; building or running it needs no development shell. It also
+installs completions generated from the built binary, at
+`share/bash-completion/completions`, `share/zsh/site-functions` and
+`share/fish/vendor_completions.d`, so the shells load them from the package with
+no per-shell setup. Elsewhere, `radar completions <shell>` prints the same
+script for a line that is not managed by Nix.
 
 Herdr is not bundled. Install it separately and keep it on `PATH`, which is
 where Radar invokes it. The optional `Herdr Agent Icons Max` font comes from

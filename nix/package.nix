@@ -7,6 +7,7 @@
 {
   lib,
   rustPlatform,
+  installShellFiles,
 }:
 
 let
@@ -34,6 +35,20 @@ rustPlatform.buildRustPackage {
   inherit src;
 
   cargoLock.lockFile = ../Cargo.lock;
+
+  # Completions are generated from the built binary and installed where each
+  # shell already looks: `share/bash-completion/completions`,
+  # `share/zsh/site-functions` and `share/fish/vendor_completions.d`. Installed
+  # this way they arrive with the package, so no consumer — Home Manager
+  # included — has to wire a shell up for them.
+  nativeBuildInputs = [ installShellFiles ];
+
+  postInstall = ''
+    installShellCompletion --cmd radar \
+      --bash <($out/bin/radar completions bash) \
+      --fish <($out/bin/radar completions fish) \
+      --zsh <($out/bin/radar completions zsh)
+  '';
 
   # The crate is `agent-radar`; the program a user runs is `radar`.
   meta = {
