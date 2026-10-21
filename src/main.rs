@@ -19,13 +19,14 @@ use ratatui::widgets::ListState;
 const USAGE: &str = "\
 radar — read-only fleet overview for local coding agents
 
-usage: radar [--print-config] [--help]
+usage: radar [--print-config] [--help] [--version]
        radar daemon [start|stop|restart|status|--help]
        radar server <start|stop|restart|status> [NAME]
        radar lifecycle <reconcile|abandon REQUEST-ID>
 
   --print-config   print the configuration in use, to copy and edit
   --help           this message
+  --version, -v    print the version
   daemon           control the daemon's user units; with no action, serve in
                    the foreground (what the service unit runs)
   server           control the tmux server a daemon serves, by name
@@ -80,6 +81,10 @@ fn handle_arguments() -> Option<i32> {
         }
         Some("--help" | "-h") => {
             print!("{USAGE}");
+            Some(0)
+        }
+        Some("--version" | "-v") => {
+            println!("radar {}", env!("CARGO_PKG_VERSION"));
             Some(0)
         }
         Some(control_plane::lifecycle::BOOTSTRAP_COMMAND) => {

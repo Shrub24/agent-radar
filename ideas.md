@@ -69,6 +69,7 @@ than imply that gathering several panes is atomic.
 | Sidebar host | Kitty outer split or nested tmux shell, compared on disposable resources | P1 (prototype) | low until measured | Sidebar prototype |
 | Structured activity, reasons and outcomes | Typed reasons on execution and assignment rows | P2 | medium | Operators cannot tell why a row is idle or blocked |
 | Known-process enrichment and descendant tree | Mechanisms recorded in plan.md | P3 | medium | Resource questions in daily use |
+| Optional systemd workload accounting and controls | [Exploration](docs/systemd-resource-management.md): shallow per-agent-execution slices containing a main scope and independently managed background-task scopes; subagents have separate slices. Logical ownership remains in Radar. Accounting first; no automatic freezing or ownership-driven migration. No implementation scope yet | P2 | medium; launch compatibility unverified | A concrete agent/task accounting or control need warrants the isolated feasibility experiment |
 | Preview and search | Peek into pane output | P3 | low | Repeated need to see output without focusing |
 
 ## Herdr removal and housekeeping
