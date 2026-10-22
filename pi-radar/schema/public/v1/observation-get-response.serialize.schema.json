@@ -2495,6 +2495,12 @@
             "null"
           ]
         },
+        "claim_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "parent": {
           "type": "string"
         },
@@ -2503,18 +2509,12 @@
         },
         "state": {
           "$ref": "#/$defs/SpawnState"
-        },
-        "subject_id": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
         "parent",
         "request_id",
-        "subject_id",
+        "claim_id",
         "child_source",
         "child_incarnation",
         "state"

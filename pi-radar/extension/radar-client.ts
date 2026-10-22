@@ -33,10 +33,8 @@ import type {
  */
 export const RADAR_PROTOCOL_VERSION = 2;
 /**
- * The minimum daemon wire revision this client understands. Revision 4 is where
- * Pi presence and exact session release arrived; a revision-3 daemon would pass
- * this handshake and then refuse every presence report, leaving a Pi session
- * silently unmanaged instead of telling the operator to restart the daemon.
+ * Revision 5 names attempts by claim_id and requires exact-claim controls.
+ * Earlier daemons expose different identity fields; require a coordinated update.
  */
 export const RADAR_MINIMUM_REVISION = 5;
 /** Public daemon contracts this client may preflight. */
@@ -566,7 +564,6 @@ function handoffAt(value: unknown): HandoffSerialize | undefined {
 	const version = numberAt(value, "version");
 	const id = stringAt(value, "id");
 	const sender = recordAt(value, "sender");
-	const senderGeneration = numberAt(sender, "execution_generation");
 	const target = stringAt(value, "recipient_subject_id");
 	const summary = stringAt(value, "summary");
 	const content = stringAt(value, "content");
@@ -577,8 +574,7 @@ function handoffAt(value: unknown): HandoffSerialize | undefined {
 	if (
 		version !== 1 || !isUuid(id) || !isUuid(stringAt(sender, "registration_id")) ||
 		!isUuid(stringAt(sender, "session_id")) || !isUuid(stringAt(sender, "subject_id")) ||
-		!isUuid(stringAt(sender, "execution_id")) || !Number.isSafeInteger(senderGeneration) ||
-		(senderGeneration ?? 0) < 1 || !isUuid(target) || summary === undefined || content === undefined ||
+		!isUuid(stringAt(sender, "claim_id")) || !isUuid(target) || summary === undefined || content === undefined ||
 		published === undefined || !Number.isSafeInteger(published) || published < 0 ||
 		(correlation !== undefined && correlation !== null &&
 			(typeof correlation !== "string" || correlation.length === 0 ||
@@ -591,13 +587,11 @@ function handoffReceiptAt(value: unknown): HandoffReceiptSerialize | undefined {
 	const version = numberAt(value, "version");
 	const handoffId = stringAt(value, "handoff_id");
 	const recipient = recordAt(value, "recipient");
-	const generation = numberAt(recipient, "execution_generation");
 	const received = numberAt(value, "received_at_unix_ms");
 	if (
 		version !== 1 || !isUuid(handoffId) || !isUuid(stringAt(recipient, "registration_id")) ||
 		!isUuid(stringAt(recipient, "session_id")) || !isUuid(stringAt(recipient, "subject_id")) ||
-		!isUuid(stringAt(recipient, "execution_id")) || !Number.isSafeInteger(generation) ||
-		(generation ?? 0) < 1 || received === undefined || !Number.isSafeInteger(received) || received < 0
+		!isUuid(stringAt(recipient, "claim_id")) || received === undefined || !Number.isSafeInteger(received) || received < 0
 	) return undefined;
 	return value as HandoffReceiptSerialize;
 }

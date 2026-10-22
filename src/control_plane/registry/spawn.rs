@@ -131,11 +131,10 @@ pub struct SpawnEdge {
     /// parentage: a session moves on `/resume`, so it is not the parent key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_subject_id: Option<String>,
-    /// The launch subject a tracked launch belongs to. Absent on an untracked
-    /// edge, and then binding is not fenced by a subject.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<String>,
-    /// Private. It appears in no projection and in no refusal.
+    /// Exact tracked attempt. The old private key remains readable on upgrade.
+    #[serde(default, alias = "subject_id", skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
+    /// Binding credential: the claim id for tracked launches, private otherwise.
     pub token: String,
     /// Where the child was created, once a create answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,7 +174,7 @@ impl SpawnEdge {
             parent: self.parent.clone(),
             parent_session_id: self.parent_session_id.clone(),
             parent_subject_id: self.parent_subject_id.clone(),
-            subject_id: self.subject_id.clone(),
+            claim_id: self.claim_id.clone(),
             location: self.location.clone(),
             created: self.created,
             launched: self.launched,
@@ -248,7 +247,7 @@ pub struct PublicSpawnEdge {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_subject_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<String>,
+    pub claim_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<RegistryLocation>,
     pub created: RequestOutcome,
@@ -356,7 +355,7 @@ pub fn record(
         parent: request.parent.clone(),
         parent_session_id: Some(request.parent_session_id.clone()),
         parent_subject_id: request.parent_subject_id.clone(),
-        subject_id: None,
+        claim_id: None,
         token: random_uuid(),
         location: None,
         instance: None,
@@ -390,13 +389,13 @@ pub fn attach_subject(
     canonical_uuid("claim_id", claim_id)?;
     let _transition = registry.transition();
     let stored = stored_edge(registry, request_id)?;
-    if stored.subject_id.is_some() {
+    if stored.claim_id.is_some() {
         return Err(format!(
             "spawn request {request_id} already names a launch subject"
         ));
     }
     let edge = SpawnEdge {
-        subject_id: Some(claim_id.to_string()),
+        claim_id: Some(claim_id.to_string()),
         token: claim_id.to_string(),
         ..stored
     };
@@ -640,7 +639,7 @@ fn bind_locked(
     // A tracked launch binds only to the process its daemon captured, and only
     // while its subject is still live. The subject is written first: an edge that
     // could not be written leaves the subject bound, which a same-content retry heals.
-    if let Some(subject_id) = &stored.subject_id {
+    if let Some(subject_id) = &stored.claim_id {
         lifecycle::fence_registration(registry, subject_id, process, registration_id, now_ms)?;
     }
     if let Some(bound) = &stored.bound {

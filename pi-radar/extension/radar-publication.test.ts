@@ -194,6 +194,29 @@ function publicationFor(
 	return publication;
 }
 
+test("managed startup spends its launch claim, but a reload creates a fresh claim", async () => {
+	const { store, cleanup } = makeRoot();
+	const launchClaim = "55555555-5555-4555-8555-555555555555";
+	try {
+		const daemon = fakeDaemon();
+		const { scheduler } = fakeScheduler();
+		const publication = publicationFor(daemon, {
+			store, scheduler, spawnToken: launchClaim,
+			location: async () => ({ state: "resolved", location: { backend: "tmux", pane: "%1" } }),
+		});
+		const binding = await publication.subject();
+		await settle();
+		assert.ok(binding, publication.diagnostic());
+		assert.equal(daemon.params("agent.presence").claim_id, launchClaim);
+		await publication.presence.release();
+		assert.equal(daemon.all("agent.release").at(-1).claim_id, launchClaim);
+		publication.presence.report(SESSION_A);
+		await settle();
+		assert.notEqual(daemon.all("agent.presence").at(-1).claim_id, launchClaim);
+		publication.stop();
+	} finally { cleanup(); }
+});
+
 test("radar records are private, atomic and bounded", () => {
 	const { root, store, cleanup } = makeRoot();
 	try {

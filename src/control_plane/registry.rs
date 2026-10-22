@@ -513,7 +513,7 @@ impl Registry {
             let event = crate::control_plane::store::Event {
                 subject_id: None,
                 claim_id: None,
-                execution_generation: None,
+
                 lifecycle_event_id: None,
                 seq: 0,
                 kind: kind.to_string(),

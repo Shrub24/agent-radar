@@ -175,6 +175,9 @@ pub enum Transition {
     SuccessorReserved {
         spawn_request_id: String,
     },
+    SuccessorCancelled {
+        spawn_request_id: String,
+    },
     /// Records the Pi session a launched process reported, once, on a bound subject
     /// that was launched without one.
     SessionRecorded {
@@ -563,6 +566,11 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
         }
         Transition::SuccessorReserved { spawn_request_id } if facts.successor.is_none() => {
             facts.successor = Some(spawn_request_id.clone())
+        }
+        Transition::SuccessorCancelled { spawn_request_id }
+            if facts.successor.as_deref() == Some(spawn_request_id.as_str()) =>
+        {
+            facts.successor = None;
         }
         Transition::SessionRecorded { session }
             if facts.state == State::Bound

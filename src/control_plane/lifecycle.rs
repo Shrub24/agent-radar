@@ -184,10 +184,10 @@ impl ManagedMetadata {
 
 /// The durable identity of one agent: the facts that outlive its attempts.
 ///
-/// An attempt ([`Subject`]) is one launch or adoption and dies with its process.
+/// A [`Claim`] records one launch or session attachment.
 /// The agent does not: its identity, its managed metadata and which attempt is
 /// current are held here once, instead of being copied forward onto every
-/// successor. `current_claim` names today's attempt record by its `subject_id`.
+/// successor. `current_claim` names the exact authorized attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubjectRecord {
     pub version: u32,
@@ -448,6 +448,7 @@ pub fn create_with_intent(
     managed: ManagedMetadata,
     now_ms: i64,
 ) -> Result<Ticket, String> {
+    managed.validate()?;
     let _transition = registry.transition();
     if let Some((subject_id, expected)) = &identity {
         let record = read_subject_record(registry, subject_id)?.ok_or("subject is not recorded")?;
@@ -468,7 +469,6 @@ pub fn create_with_intent(
             write(registry, &previous)?;
         }
     }
-    managed.validate()?;
     let subject = draft(spawn_request_id, launch, session, identity, managed, now_ms);
     write(registry, &subject)?;
     let id = subject
@@ -583,7 +583,10 @@ fn latest_attempt_for_logical(
     let attempts: BTreeMap<_, _> = log
         .all_facts()
         .into_iter()
-        .filter(|(_, facts)| facts.subject_id.as_deref() == Some(subject_id))
+        .filter(|(_, facts)| {
+            facts.subject_id.as_deref() == Some(subject_id)
+                && !(facts.state == State::Revoked && facts.process.is_none())
+        })
         .collect();
     let tails: Vec<_> = attempts
         .iter()
@@ -880,7 +883,12 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
     }
     if let Some(claim) = crate::control_plane::registry::presence::current(registry, agent)? {
         return Ok(claim.session_id == session
-            && claim.standing == crate::control_plane::registry::presence::Standing::Granted);
+            && claim.claim_id == subject.claim_id
+            && matches!(
+                claim.standing,
+                crate::control_plane::registry::presence::Standing::Granted
+                    | crate::control_plane::registry::presence::Standing::Pending
+            ));
     }
     Ok(registry
         .context(agent, now_ms)?
@@ -1017,11 +1025,12 @@ pub fn enroll_subject(
                 continue;
             }
             if is_attached(registry, subject, now_ms)? {
-                return if subject.bound_registration_id.as_deref() == Some(registration_id) {
-                    Ok(subject.claim_id.clone())
-                } else {
-                    Err("the session is already attached to another live process".into())
-                };
+                if subject.bound_registration_id.as_deref() != Some(registration_id) {
+                    return Err("the session is already attached to another live process".into());
+                }
+                if subject.claim_id == enrollment_id {
+                    return Ok(subject.claim_id.clone());
+                }
             }
             if prior
                 .as_ref()
@@ -1055,6 +1064,14 @@ pub fn enroll_subject(
         None => (None, ManagedMetadata::default()),
     };
     let subject_id = enrollment_id.to_string();
+    if let Some(mut previous) = prior
+        && previous.claim_id != subject_id
+        && previous.successor.is_none()
+    {
+        previous.successor = Some(subject_id.clone());
+        previous.recorded_at = format_millis(now_ms);
+        write(registry, &previous)?;
+    }
     let logical = logical.unwrap_or_else(|| subject_id.clone());
     let subject = Claim {
         observation: None,
@@ -1089,6 +1106,42 @@ pub fn enroll_subject(
     record.current_claim = Some(subject.claim_id.clone());
     write_subject_record(registry, &record)?;
     Ok(subject_id)
+}
+
+/// Withdraw an attempt that never dispatched after its incumbent could not stop.
+/// Pointer restoration is exact: a later claim can never be displaced here.
+pub fn cancel_reservation(
+    registry: &Registry,
+    predecessor: &str,
+    pending: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let _transition = registry.transition();
+    let mut next = read_recorded(registry, pending)?;
+    if next.state != State::Pending || next.process.is_some() {
+        return Err(
+            "the successor may have dispatched; its reservation cannot be withdrawn".into(),
+        );
+    }
+    let id = next.subject_id.as_deref().ok_or("claim has no subject")?;
+    let mut record = read_subject_record(registry, id)?.ok_or("subject is not recorded")?;
+    if record.current_claim.as_deref() != Some(pending) {
+        return Err("the subject's claim changed while stopping its previous process".into());
+    }
+    let mut previous = read_recorded(registry, predecessor)?;
+    if previous.successor.as_deref() != Some(next.spawn_request_id.as_str()) {
+        return Err("successor reservation does not match its predecessor".into());
+    }
+    next.state = State::Revoked;
+    next.correlation = None;
+    next.recorded_at = format_millis(now_ms);
+    write(registry, &next)?;
+    previous.successor = None;
+    previous.recorded_at = format_millis(now_ms);
+    write(registry, &previous)?;
+    record.current_claim = Some(predecessor.into());
+    record.updated_at = format_millis(now_ms);
+    write_subject_record(registry, &record)
 }
 
 /// Records the replacement dispatched for this process generation, before the
@@ -1291,7 +1344,7 @@ pub fn migrate_identity(registry: &Registry, now_ms: i64) -> Result<(), String> 
             break;
         }
         for edge in &page {
-            edges.insert(edge.request_id.clone(), edge.subject_id.clone());
+            edges.insert(edge.request_id.clone(), edge.claim_id.clone());
         }
         after = page.last().map(|edge| edge.request_id.clone());
         if page.len() < 256 {
@@ -1983,11 +2036,13 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
     } else if previous.successor != target.successor {
         (
             Source::Operator,
-            Transition::SuccessorReserved {
-                spawn_request_id: target
-                    .successor
-                    .clone()
-                    .ok_or("cannot remove a successor")?,
+            match &target.successor {
+                Some(id) => Transition::SuccessorReserved {
+                    spawn_request_id: id.clone(),
+                },
+                None => Transition::SuccessorCancelled {
+                    spawn_request_id: previous.successor.clone().ok_or("missing successor")?,
+                },
             },
         )
     } else if previous.ended_externally_at != target.ended_externally_at {
@@ -2634,6 +2689,41 @@ mod tests {
             record.current_claim.as_deref(),
             Some(reserved.claim_id.as_str())
         );
+    }
+
+    #[test]
+    fn an_undispatched_restart_reservation_restores_its_incumbent() {
+        let scratch = Scratch::new("reservation-cancel");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("incumbent");
+        let request = random_uuid();
+        let pending = create_with_identity(
+            &registry,
+            &request,
+            launch(),
+            None,
+            Some((first.subject_id.clone(), first.claim_id.clone())),
+            2,
+        )
+        .expect("reservation");
+        cancel_reservation(&registry, &first.claim_id, &pending.claim_id, 3).expect("withdraw");
+        let reopened = scratch.registry();
+        let current = read_logical(&reopened, &first.subject_id).unwrap().unwrap();
+        assert_eq!(current.claim_id, first.claim_id);
+        assert_eq!(current.successor, None);
+        assert_eq!(
+            read(&reopened, &pending.claim_id).unwrap().unwrap().state,
+            State::Revoked
+        );
+        create_with_identity(
+            &reopened,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((first.subject_id, first.claim_id)),
+            4,
+        )
+        .expect("a subsequent restart can reserve");
     }
 
     #[test]

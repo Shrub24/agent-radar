@@ -80,6 +80,7 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::EndedExternally(_) => "lifecycle.ended_externally",
         Transition::PaneCleanup(_) => "lifecycle.pane_cleanup",
         Transition::SuccessorReserved { .. } => "lifecycle.successor_reserved",
+        Transition::SuccessorCancelled { .. } => "lifecycle.successor_cancelled",
         Transition::SessionRecorded { .. } => "lifecycle.session_recorded",
         Transition::OperationAdmitted(_) => "lifecycle.operation.admitted",
         Transition::OperationStarted(_) => "lifecycle.operation.started",
@@ -106,9 +107,6 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
             .or_else(|| event.subject_id.clone()),
         claim_id: lifecycle_execution
             .then(|| event.subject_id.clone())
-            .flatten(),
-        execution_generation: lifecycle_execution
-            .then(|| facts.and_then(|facts| facts.execution_generation))
             .flatten(),
         lifecycle_event_id: Some(event.event_id.clone()),
         registration_id,

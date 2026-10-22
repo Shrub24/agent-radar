@@ -104,6 +104,12 @@
             }
           ]
         },
+        "claim_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "created": {
           "$ref": "#/$defs/RequestOutcome"
         },
@@ -164,12 +170,6 @@
         },
         "state": {
           "$ref": "#/$defs/SpawnState"
-        },
-        "subject_id": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "version": {
           "format": "uint32",

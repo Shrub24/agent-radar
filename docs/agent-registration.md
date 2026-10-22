@@ -94,9 +94,9 @@ One registration is one JSON file, `<state root>/agents/<registration_id>.json`,
 }
 ```
 
-Radar exposes one `agent.presence` operation. A report presents the process birth identity (boot ID, PID, start ticks), source/incarnation, current session UUID, session-load `claim_id`, mutable location and optional launch correlation/managed metadata. Radar resolves the process's `registration_id`, current context and durable session subject internally. The response is `granted`, `duplicate` or `pending`, with a `subject_id` only for a grant. A retry of one claim returns its stored decision; only a fresh Pi `session_start` creates another claim opportunity.
+Radar exposes one `agent.presence` operation. A report presents the process birth identity (boot ID, PID, start ticks), source/incarnation, current session UUID, session-load `claim_id`, mutable location and optional launch correlation/managed metadata. Radar resolves the process's `registration_id`, current context and durable session subject internally. The response is `granted`, `duplicate` or `pending`, with a `subject_id` only for a grant. A retry of one claim returns its stored decision; only a fresh Pi `session_start` creates another claim opportunity. On a managed launch's first load, pi-radar uses the pre-minted claim id as both launch correlation and `claim_id`; a later reload or session switch uses a fresh claim.
 
-The process birth tuple and `registration_id` identify the process registration. Session/location are mutable context; the subject ID follows the session and survives release. A duplicate claim is sticky across incumbent release and daemon restart. Procfs or storage uncertainty remains pending, never duplicate. Supplied launch correlation must match the recorded launch; it never falls back to manual adoption. The daemon validates process identity before recording a registration. Launch secrets and `spawn_token` are private and never appear in public projections.
+The process birth tuple and `registration_id` identify the process registration. Session/location are mutable context; the subject ID follows the session and survives release. A duplicate claim is sticky across incumbent release and daemon restart. Procfs or storage uncertainty remains pending, never duplicate. Supplied launch correlation must match the recorded launch; it never falls back to manual adoption. The daemon validates process identity before recording a registration. Private argv/environment and token fields are never projected. A tracked launch's claim id is public; presenting it does not grant authority without the captured process birth identity.
 
 `agent.release` names the exact registration and claim. It releases the current attachment but retains the process registration and durable session subject. It is idempotent; a delayed release cannot revoke a later claim. The process-exit sweep releases only when birth identity is verifiably absent or reused, never from pane loss or heartbeat expiry.
 
@@ -209,7 +209,7 @@ when a backend advertises `mux.observe`; otherwise the durable topology is still
 returned with unconfirmed freshness. Edges persist across daemon restarts. The
 public topology contains parent, optional bound child `(source, incarnation, registration_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains created/launched outcomes, optional created location, `state`,
 `freshness`, and `exit_observation`; a tracked edge publishes its claim id as
-`subject_id` and no separate token field, because that claim is the credential
+`claim_id` and no separate token field, because that claim is the credential
 and only the process whose birth identity matches can spend it, while an
 untracked edge carries a minted token that is never published. It never returns
 the private creating instance the dead-pane fence compares.

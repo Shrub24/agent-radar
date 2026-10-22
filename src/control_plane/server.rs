@@ -1107,18 +1107,21 @@ fn communication_identity(
         .context
         .session
         .ok_or_else(|| communication::Error::Invalid("sender has no current Pi session".into()))?;
-    let now_ms = unix_millis();
-    let subject = match subjects::attachment(registry, registration_id, &session_id, now_ms)
+    let attachment = registry::presence::attachment(registry, registration_id)
         .map_err(communication::Error::Internal)?
-    {
-        subjects::Attachment::Own(subject) => *subject,
-        _ => {
-            return Err(communication::Error::Invalid(
-                "handoff operations require a Radar-managed execution attached to the current session"
-                    .into(),
-            ));
-        }
-    };
+        .ok_or_else(|| {
+            communication::Error::Invalid(
+                "handoff operations require a current granted claim".into(),
+            )
+        })?;
+    let subject = subjects::read(registry, &attachment.claim_id)
+        .map_err(communication::Error::Internal)?
+        .filter(|claim| claim.session.as_deref() == Some(session_id.as_str()))
+        .ok_or_else(|| {
+            communication::Error::Invalid(
+                "the granted claim does not match the current session".into(),
+            )
+        })?;
     if subject.identity_unresolved {
         return Err(communication::Error::Invalid(
             "Radar launch identity is unresolved".into(),
@@ -1177,7 +1180,7 @@ fn append_communication_event(
     let event = store::Event {
         subject_id,
         claim_id: None,
-        execution_generation: None,
+
         lifecycle_event_id: None,
         seq: 0,
         kind: kind.to_owned(),
@@ -2452,8 +2455,8 @@ fn presence_request(
                 presence::save(&registry, &claim)?;
                 return Ok(claim);
             }
-            subjects::Attachment::Own(subject) => *subject,
-            subjects::Attachment::Free => {
+            subjects::Attachment::Own(subject) if subject.claim_id == report.claim_id => *subject,
+            subjects::Attachment::Own(_) | subjects::Attachment::Free => {
                 let id = record_enrollment(
                     &registry,
                     &verifier,
@@ -4342,7 +4345,7 @@ fn subjects_inside(registry: &Registry, target: &crate::CloseTarget) -> Vec<Stri
                 continue;
             }
             let (Some(subject_id), Some(location)) =
-                (edge.subject_id.as_deref(), edge.location.as_ref())
+                (edge.claim_id.as_deref(), edge.location.as_ref())
             else {
                 continue;
             };
@@ -6320,8 +6323,7 @@ fn install_exit_wake(
 struct SubjectParams {
     #[serde(default)]
     subject_id: Option<String>,
-    #[serde(default)]
-    claim_id: Option<String>,
+    claim_id: String,
     #[serde(default)]
     spawn_request_id: Option<String>,
 }
@@ -6679,8 +6681,7 @@ fn record_enrollment(
 #[serde(deny_unknown_fields)]
 struct RestartParams {
     subject_id: String,
-    #[serde(default)]
-    claim_id: Option<String>,
+    claim_id: String,
 }
 
 /// Restarts an enrolled or tracked lead: stops its verified process, then launches a
@@ -6740,11 +6741,7 @@ fn execute_restart(
         }
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    // A restart names the claim it was issued against; one that names none asks
-    // for the subject's current claim.
-    if let Some(claim_id) = params.claim_id.as_deref()
-        && claim_id != subject.claim_id
-    {
+    if params.claim_id != subject.claim_id {
         return Response::refused(
             &request.id,
             &Refusal::new(
@@ -6950,7 +6947,21 @@ fn restart_lead(
         Err(error) => return refusal_settlement(error),
     };
     let mut effects = Vec::new();
-    let termination = match subjects::stop(&registry, &subject.claim_id, verifier.as_ref(), now) {
+    let termination = subjects::stop(&registry, &subject.claim_id, verifier.as_ref(), now);
+    if !termination
+        .as_ref()
+        .is_ok_and(|result| matches!(result.exit, subjects::Exit::Exited))
+        && let Err(error) =
+            subjects::cancel_reservation(&registry, &subject.claim_id, &prepared.1.claim_id, now)
+    {
+        return (
+            RequestOutcome::Unknown,
+            Some(Category::BACKEND_UNAVAILABLE),
+            Some(error),
+            effects,
+        );
+    }
+    let termination = match termination {
         Ok(termination) => termination,
         Err(error) => {
             return (
@@ -7068,6 +7079,7 @@ fn current_presence_grant(registry: &Registry, subject: &subjects::Claim) -> Res
     };
     let expected_subject = subject.subject_id.as_deref().unwrap_or(&subject.claim_id);
     Ok(claim.standing == registry::presence::Standing::Granted
+        && claim.claim_id == subject.claim_id
         && claim.session_id == session
         && claim.subject_id.as_deref() == Some(expected_subject))
 }
@@ -7083,7 +7095,7 @@ fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String,
                 .spawn_edge(request_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "spawn is not recorded"))?;
-            let subject_id = edge.subject_id.clone().ok_or_else(|| {
+            let subject_id = edge.claim_id.clone().ok_or_else(|| {
                 Refusal::new(Code::Refused, "spawn is not a lifecycle-tracked launch")
             })?;
             subjects::read(registry, &subject_id)
@@ -7097,10 +7109,14 @@ fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String,
             ));
         }
     };
-    // A caller that names the claim it was issued against is fenced to it; one
-    // that names none asks for the subject's current claim.
-    if let Some(claim_id) = params.claim_id.as_deref()
-        && claim_id != subject.claim_id
+    let current = subjects::read_subject_record(
+        registry,
+        subject.subject_id.as_deref().unwrap_or(&subject.claim_id),
+    )
+    .map_err(internal)?;
+    if params.claim_id != subject.claim_id
+        || current
+            .is_none_or(|record| record.current_claim.as_deref() != Some(subject.claim_id.as_str()))
     {
         return Err(Refusal::new(
             Code::Refused,
@@ -7329,7 +7345,7 @@ fn observe_launch_panes(
         if edge.bound.is_none() {
             continue;
         }
-        let Some(subject_id) = edge.subject_id.as_deref() else {
+        let Some(subject_id) = edge.claim_id.as_deref() else {
             continue;
         };
         let Some(location) = edge.location.as_ref() else {
@@ -7757,16 +7773,19 @@ mod tests {
             1,
         )
         .expect("claim");
+        let missing = json!({"subject_id": claim.subject_id});
+        assert!(serde_json::from_value::<SubjectParams>(missing.clone()).is_err());
+        assert!(serde_json::from_value::<RestartParams>(missing).is_err());
         let stale = SubjectParams {
             subject_id: Some(claim.claim_id.clone()),
-            claim_id: Some(crate::control_plane::random_uuid()),
+            claim_id: crate::control_plane::random_uuid(),
             spawn_request_id: None,
         };
         let refusal = cancel_target(&registry, &stale).expect_err("a stale claim is refused");
         assert!(refusal.message.contains("not current"), "{refusal:?}");
         let current = SubjectParams {
             subject_id: Some(claim.claim_id.clone()),
-            claim_id: Some(claim.claim_id.clone()),
+            claim_id: claim.claim_id.clone(),
             spawn_request_id: None,
         };
         assert_eq!(
@@ -7801,7 +7820,7 @@ mod tests {
         store::Event {
             subject_id: None,
             claim_id: None,
-            execution_generation: None,
+
             lifecycle_event_id: None,
             seq,
             kind: "agent.registered".to_string(),

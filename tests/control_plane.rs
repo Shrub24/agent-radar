@@ -2000,6 +2000,22 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
     let root_session = random_uuid();
     publish_session_context(&mut client, &root, PARENT_INCARNATION, &root_session);
 
+    let grant =
+        |client: &mut Client, agent: &str, incarnation: &str, session: &str, claim: &str| {
+            let record = client.call("agent.get", json!({"registration_id": agent}));
+            let mut report =
+                registration_body(incarnation, Some(captured_identity(&state, claim)), None);
+            report["location"] = record["result"]["agent"]["registration"]["location"].clone();
+            report["registration_id"] = json!(agent);
+            report["session_id"] = json!(session);
+            report["claim_id"] = json!(claim);
+            report["spawn_token"] = json!(claim);
+            let granted = client.call("agent.presence", report.clone());
+            assert_eq!(
+                granted["result"]["standing"], "granted",
+                "{granted}; {report}; {record}"
+            );
+        };
     let (parent_subject, parent_agent, _parent_pane) = spawned_live_tmux_child(
         &mut client,
         &server,
@@ -2010,11 +2026,12 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         OTHER_INCARNATION,
     );
     let parent_session = random_uuid();
-    publish_session_context(
+    grant(
         &mut client,
         &parent_agent,
         OTHER_INCARNATION,
         &parent_session,
+        &parent_subject,
     );
 
     let (worker_subject, worker_agent, _worker_pane) = spawned_live_tmux_child(
@@ -2027,11 +2044,12 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         CHILD_INCARNATION,
     );
     let worker_session = random_uuid();
-    publish_session_context(
+    grant(
         &mut client,
         &worker_agent,
         CHILD_INCARNATION,
         &worker_session,
+        &worker_subject,
     );
     let attached = client.call("lifecycle.get", json!({"subject_id": worker_subject}));
     assert_eq!(
@@ -3088,7 +3106,7 @@ fn recorded_edge(state: &Path, request_id: &str) -> Value {
 /// capture is asynchronous to the spawn's own answer, so a test that registers
 /// its child waits for that durable fact first.
 fn await_captured_launch(state: &Path, request_id: &str) {
-    let subject = recorded_edge(state, request_id)["subject_id"]
+    let subject = recorded_edge(state, request_id)["claim_id"]
         .as_str()
         .expect("tracked launch subject")
         .to_string();
@@ -4470,7 +4488,7 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
     );
     assert!(spawned["result"].is_object(), "{spawned}");
     await_captured_launch(&state, &spawn_id);
-    let subject_id = recorded_edge(&state, &spawn_id)["subject_id"]
+    let subject_id = recorded_edge(&state, &spawn_id)["claim_id"]
         .as_str()
         .expect("tracked launch subject")
         .to_string();
@@ -4587,7 +4605,7 @@ fn tracked_spawn(client: &mut Client, state: &Path, parent: &str, argv: Value) -
     );
     assert!(spawned["result"].is_object(), "{spawned}");
     await_captured_launch(state, &spawn_id);
-    let subject = recorded_edge(state, &spawn_id)["subject_id"]
+    let subject = recorded_edge(state, &spawn_id)["claim_id"]
         .as_str()
         .expect("tracked launch subject")
         .to_string();
@@ -4623,7 +4641,7 @@ fn cancel_subject(client: &mut Client, request_id: &str, subject_id: &str) -> Va
     client.call_id(
         request_id,
         "lifecycle.cancel",
-        json!({"request": {"subject_id": subject_id}}),
+        json!({"request": {"subject_id": subject_id, "claim_id": subject_id}}),
     )
 }
 
@@ -4971,7 +4989,7 @@ fn a_tracked_launch_runs_its_requested_program_and_keeps_its_secrets_private() {
     );
     assert!(spawned["result"].is_object(), "{spawned}");
     await_captured_launch(&state, &spawn_id);
-    let subject = recorded_edge(&state, &spawn_id)["subject_id"]
+    let subject = recorded_edge(&state, &spawn_id)["claim_id"]
         .as_str()
         .expect("tracked launch subject")
         .to_string();
@@ -5440,7 +5458,7 @@ fn spawned_live_tmux_child(
         "parent": parent,
         "parent_session_id": session,
         "executable": "/bin/sh",
-        "argv": ["-c", "read -r _; exit 23"],
+        "argv": ["-c", "exec sleep 300"],
     });
     if !managed.is_null() {
         request["managed"] = managed;
@@ -5450,7 +5468,7 @@ fn spawned_live_tmux_child(
     await_captured_launch(state, &spawn_id);
     let edge = recorded_edge(state, &spawn_id);
     let token = edge["token"].as_str().expect("spawn token").to_string();
-    let subject = edge["subject_id"]
+    let subject = edge["claim_id"]
         .as_str()
         .expect("child subject")
         .to_string();
@@ -6367,7 +6385,7 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     // identifier: what binds the edge to its child is the verified process birth
     // identity, so publishing the claim id grants no one the launch.
     assert_eq!(
-        recorded_edge(&sandbox.state(), &id)["subject_id"].as_str(),
+        recorded_edge(&sandbox.state(), &id)["claim_id"].as_str(),
         Some(token.as_str()),
         "the credential is the claim id, not a second per-edge token"
     );
@@ -9216,7 +9234,7 @@ fn stop_subject(client: &mut Client, request_id: &str, subject_id: &str) -> Valu
     client.call_id(
         request_id,
         "lifecycle.stop",
-        json!({"request": {"subject_id": subject_id}}),
+        json!({"request": {"subject_id": subject_id, "claim_id": subject_id}}),
     )
 }
 
@@ -9366,7 +9384,7 @@ fn a_process_ignoring_sigterm_stops_uncertainly_and_is_not_signalled_again() {
     let cancellation = client.call_id(
         &random_uuid(),
         "lifecycle.cancel",
-        json!({"request": {"subject_id": subject}}),
+        json!({"request": {"subject_id": subject, "claim_id": subject}}),
     );
     assert!(
         !result_record(&cancellation)["effects"]
@@ -11053,15 +11071,19 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
         "location":{"backend":"tmux","pane":"wA:p1"}});
     let rejected = client.call("agent.presence", rejected_report.clone());
     assert_eq!(rejected["result"]["standing"], "duplicate", "{rejected}");
+    for method in ["lifecycle.cancel", "lifecycle.stop", "lifecycle.restart"] {
+        let missing = client.call(method, json!({"request": {"subject_id": subject}}));
+        assert_eq!(error_code(&missing), "bad_params", "{method}: {missing}");
+    }
     let release = json!({"registration_id":registration,"claim_id":claim,"process":lead.identity});
     let released = client.call("agent.release", release.clone());
     assert_eq!(released["result"]["standing"], "released", "{released}");
     let stopped = client.call_id(
         &random_uuid(),
         "lifecycle.stop",
-        json!({"request": {"subject_id": subject}}),
+        json!({"request": {"subject_id": subject, "claim_id": subject}}),
     );
-    assert_eq!(result_record(&stopped)["outcome"], "refused", "{stopped}");
+    assert_eq!(error_code(&stopped), "refused", "{stopped}");
     assert!(
         process_exists(lead.pid),
         "a released claim authorized a signal"
@@ -11087,6 +11109,11 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
     let granted = client.call("agent.presence", fresh.clone());
     assert_eq!(granted["result"]["standing"], "granted", "{granted}");
     assert_eq!(granted["result"]["subject_id"], subject);
+    let active = client.call("lifecycle.get", json!({"subject_id": subject}));
+    assert_eq!(
+        active["result"]["subject"]["claim_id"], fresh["claim_id"],
+        "{active}"
+    );
     client.call("agent.release", release);
     assert_eq!(
         client.call("agent.presence", fresh.clone())["result"]["standing"],
@@ -11103,8 +11130,17 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
     let mut daemon = Daemon::bind_with_backend(&sandbox.socket(), &sandbox.state(), Some(backend))
         .expect("reopen");
     let mut client = Client::dial(daemon.path());
-    let restored = client.call("agent.presence", fresh);
+    let restored = client.call("agent.presence", fresh.clone());
     assert_eq!(restored["result"]["subject_id"], subject, "{restored}");
+    let released = client.call("agent.release", json!({
+        "registration_id": registration, "claim_id": fresh["claim_id"], "process": lead.identity,
+    }));
+    assert_eq!(released["result"]["standing"], "released", "{released}");
+    let history = client.call("lifecycle.get", json!({"subject_id": subject}));
+    assert_eq!(
+        history["result"]["subject"]["claim_id"], fresh["claim_id"],
+        "{history}"
+    );
     assert_eq!(
         client.call("agent.presence", rejected_report)["result"]["standing"],
         "duplicate"
@@ -11182,7 +11218,7 @@ fn restart_lead_subject_with_id(client: &mut Client, request_id: &str, subject: 
     client.call_id(
         request_id,
         "lifecycle.restart",
-        json!({"request": {"subject_id": subject}}),
+        json!({"request": {"subject_id": subject, "claim_id": subject}}),
     )
 }
 

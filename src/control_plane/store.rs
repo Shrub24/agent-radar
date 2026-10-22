@@ -105,9 +105,6 @@ pub struct Event {
     /// Exact lifecycle execution affected by a subject event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_id: Option<String>,
-    /// One-based logical execution generation for lifecycle events.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_generation: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_event_id: Option<String>,
     pub kind: String,
@@ -1264,7 +1261,7 @@ mod tests {
                 .append_event(Event {
                     subject_id: None,
                     claim_id: None,
-                    execution_generation: None,
+
                     lifecycle_event_id: None,
                     seq: 0,
                     kind: format!("k{n}"),
@@ -1289,7 +1286,7 @@ mod tests {
             .append_event(Event {
                 subject_id: None,
                 claim_id: None,
-                execution_generation: None,
+
                 lifecycle_event_id: None,
                 seq: 0,
                 kind: "publication".into(),
@@ -1318,7 +1315,7 @@ mod tests {
                             .append_event(Event {
                                 subject_id: None,
                                 claim_id: None,
-                                execution_generation: None,
+
                                 lifecycle_event_id: None,
                                 seq: 0,
                                 kind: "concurrent".into(),

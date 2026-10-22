@@ -2244,6 +2244,12 @@
             "null"
           ]
         },
+        "claim_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "parent": {
           "type": "string"
         },
@@ -2252,12 +2258,6 @@
         },
         "state": {
           "$ref": "#/$defs/SpawnState"
-        },
-        "subject_id": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [

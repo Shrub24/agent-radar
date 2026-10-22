@@ -937,10 +937,10 @@ export interface ManagedMetadata {
 export interface SpawnBinding {
   child_incarnation: string | null;
   child_source: string | null;
+  claim_id: string | null;
   parent: string;
   request_id: string;
   state: SpawnState;
-  subject_id: string | null;
 }
 /**
  * What this machine knows about that process. Filled by the collector
@@ -1437,6 +1437,7 @@ export interface SpawnListPageSerialize {
  */
 export interface SpawnListPageSerializePublicSpawnTopology {
   bound?: SpawnListPageSerializeBoundChild | null;
+  claim_id?: string | null;
   created: SpawnListPageSerializeRequestOutcome;
   exit_observation?: SpawnListPageSerializePublicSpawnExitObservation | null;
   /**
@@ -1455,7 +1456,6 @@ export interface SpawnListPageSerializePublicSpawnTopology {
   recorded_at: string;
   request_id: string;
   state: SpawnListPageSerializeSpawnState;
-  subject_id?: string | null;
   version: number;
 }
 /**

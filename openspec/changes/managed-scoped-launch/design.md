@@ -48,7 +48,7 @@ Three roles, three ids, three lifespans:
 
 | Role | Id | Lifespan | Owner |
 | --- | --- | --- | --- |
-| The agent | `subject_id` | Survives processes, sessions and panes | Daemon |
+| The agent | `subject_id` | Durable identity of one Pi session, across processes and panes | Daemon |
 | One attempt | `claim_id` | One launch or adoption, from pre-mint to verified end | Daemon mints, the process presents |
 | One process incarnation | `registration_id` | One OS process | Process writes, daemon verifies |
 
@@ -61,6 +61,10 @@ Today's `subject_id` is the attempt and today's `logical_subject_id` is the agen
 - **The subject becomes a record.** Identity, managed metadata, `parent_subject_id` and `current_claim` live on it once, instead of being copied forward onto each successor.
 
 **Races resolve at pre-mint, which is what makes restart continuous.** Pre-minting is the exclusive act per subject: the first accepted pre-mint wins, and a competing launch or restart is refused or left pending. Because a restart pre-mints its successor before it dispatches the stop, the successor is already the subject's current claim at the moment the old process is signalled — the continuity gap closes there, not when the replacement eventually starts.
+
+If the stop fails before replacement dispatch, Radar revokes that undispatched reservation, records its cancellation, and restores the exact incumbent claim under the transition lock. Leaving a processless pending claim current would strand the still-running agent. A successor that may have dispatched is never rolled back this way. Scoped reads and handoffs require a granted decision whose claim still matches the subject pointer.
+
+pi-radar persists whether a report is the initial load: only that load spends the pre-minted launch claim. A later reload uses a fresh claim even if pending releases have already drained; deciding from the current release queue would accidentally reuse an old credential.
 
 **Migration re-keys nothing.** An existing execution record's UUID becomes its claim id, its `logical_subject_id` is promoted to the subject record on read, and a stored generation is ignored. No new ids are minted, no store is added, and the private record filenames stay as they are.
 

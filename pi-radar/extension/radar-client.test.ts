@@ -1035,6 +1035,26 @@ test("handoff inbox returns stable IDs and rejects malformed IDs", async () => {
 	}
 });
 
+test("handoff content and receipts decode the claim identity without execution ordinals", async () => {
+	const identity = { registration_id: UUID_A, session_id: UUID_A, subject_id: UUID_A, claim_id: UUID_A };
+	const handoff = { version: 1, id: UUID_A, sender: identity, recipient_subject_id: UUID_A,
+		summary: "complete", content: "result", published_at_unix_ms: 1 };
+	const receipt = { version: 1, handoff_id: UUID_A, recipient: identity, received_at_unix_ms: 2 };
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["communication.handoff.v1"] });
+		return reply(request, request.method === "communication.get" ? { handoff, receipt } : { receipt, created: true });
+	});
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		const fetched = await client.communicationGet({ registration_id: UUID_A, handoff_id: UUID_A });
+		assert.equal(fetched.ok, true, JSON.stringify(fetched));
+		const acked = await client.communicationAck({ registration_id: UUID_A, handoff_id: UUID_A });
+		assert.equal(acked.ok, true, JSON.stringify(acked));
+	} finally { cleanup(fixture); }
+});
+
 test("handoff contract absence disables only handoff calls", async () => {
 	const fixture = makeFixture((request) =>
 		reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["registry.v1"] }),

@@ -168,15 +168,22 @@ pub fn attachment(
     registry: &Registry,
     registration_id: &str,
 ) -> Result<Option<Attachment>, String> {
-    Ok(
-        current(registry, registration_id)?.and_then(|claim| match claim.standing {
-            Standing::Granted => Some(Attachment {
-                claim_id: claim.claim_id,
-                subject_id: claim.subject_id?,
-            }),
-            _ => None,
-        }),
-    )
+    let Some(claim) = current(registry, registration_id)? else {
+        return Ok(None);
+    };
+    let Some(subject_id) = claim.subject_id else {
+        return Ok(None);
+    };
+    if claim.standing != Standing::Granted
+        || crate::control_plane::lifecycle::read_subject_record(registry, &subject_id)?
+            .is_none_or(|record| record.current_claim.as_deref() != Some(claim.claim_id.as_str()))
+    {
+        return Ok(None);
+    }
+    Ok(Some(Attachment {
+        claim_id: claim.claim_id,
+        subject_id,
+    }))
 }
 
 pub fn current(registry: &Registry, registration_id: &str) -> Result<Option<Decision>, String> {

@@ -78,8 +78,6 @@ pub struct LifecycleSubject {
     #[serde(default)]
     pub claim_id: Option<String>,
     #[serde(default)]
-    pub execution_generation: Option<u32>,
-    #[serde(default)]
     pub spawn_request_id: Option<String>,
     #[serde(default)]
     pub bound_registration_id: Option<String>,
@@ -156,7 +154,7 @@ pub enum Binding {
 pub struct SpawnBinding {
     pub parent: String,
     pub request_id: String,
-    pub subject_id: Option<String>,
+    pub claim_id: Option<String>,
     pub child_source: Option<String>,
     pub child_incarnation: Option<String>,
     pub state: SpawnState,
@@ -368,7 +366,7 @@ fn managed_subject(
         metadata: subject.managed.clone(),
         child_close: spawn
             .filter(|spawn| {
-                spawn.subject_id.as_deref()
+                spawn.claim_id.as_deref()
                     == Some(subject.claim_id.as_deref().unwrap_or(&subject.subject_id))
             })
             .and_then(|spawn| {
@@ -398,7 +396,7 @@ fn spawn_binding(agent: &RegistryAgent, topology: &[PublicSpawnTopology]) -> Opt
         .map(|edge| SpawnBinding {
             parent: edge.edge.parent.clone(),
             request_id: edge.edge.request_id.clone(),
-            subject_id: edge.edge.subject_id.clone(),
+            claim_id: edge.edge.claim_id.clone(),
             child_source: edge.edge.bound.as_ref().map(|bound| bound.source.clone()),
             child_incarnation: edge
                 .edge
@@ -879,7 +877,7 @@ mod tests {
             Some(SpawnBinding {
                 parent: "parent-1".into(),
                 request_id: "r1".into(),
-                subject_id: None,
+                claim_id: None,
                 child_source: Some("test".into()),
                 child_incarnation: Some("11111111-1111-4111-8111-111111111111".into()),
                 state: SpawnState::Bound,
@@ -895,7 +893,7 @@ mod tests {
         let subject = LifecycleSubject {
             subject_id: "logical-subject-1".into(),
             claim_id: Some("subject-1".into()),
-            execution_generation: Some(1),
+
             spawn_request_id: Some("subject-1".into()),
             bound_registration_id: Some("lead".into()),
             process: Some(claim.clone()),
@@ -909,7 +907,7 @@ mod tests {
             "version": 1,
             "request_id": "spawn-1",
             "parent": "parent-1",
-            "subject_id": "subject-1",
+            "claim_id": "subject-1",
             "created": "completed",
             "launched": "completed",
             "bound": {"source":"lead", "incarnation":"11111111-1111-4111-8111-111111111111", "registration_id":"lead", "bound_at":"2026-01-01T00:00:00.000Z"},

@@ -975,6 +975,7 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 	type State = {
 		version: 2;
 		claim_id: string;
+	initial_load?: boolean;
 		session: string;
 		registration_id?: string;
 		subject_id?: string;
@@ -1032,6 +1033,13 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 			await releasePending();
 			const registration = await input.registration();
 			if (!registration?.process || state !== claim || stopped) return undefined;
+			// The first load spends the pre-minted launch claim. Reloads get a fresh
+			// claim; they must not reuse the released launch credential.
+			if (claim.initial_load) {
+				if (registration.spawn_token) claim.claim_id = registration.spawn_token;
+				claim.initial_load = false;
+				if (!save()) return undefined;
+			}
 			const answer = await client.presence({
 				...registration, process: registration.process,
 				session_id: claim.session, claim_id: claim.claim_id,
@@ -1071,7 +1079,7 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 				releases.push({ registration_id: state.registration_id, claim_id: state.claim_id });
 			}
 			standing = undefined;
-			state = { version: 2, session, claim_id: randomUUID(), releases };
+			state = { version: 2, session, claim_id: randomUUID(), initial_load: state === undefined, releases };
 			save(); stopped = false;
 			void ensure();
 		},
