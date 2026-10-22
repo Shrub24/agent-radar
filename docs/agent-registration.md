@@ -149,8 +149,11 @@ name a pane. The daemon splits to the right of that pane without focusing it;
 it does not use whichever pane has current focus. The caller supplies the
 resolved executable and argv. The daemon does not resolve a command, write an
 assignment, or alter process lifecycle. The command is passed to the backend
-unchanged, alongside a daemon-minted, single-use token exported to the child as
-`PI_RADAR_SPAWN_TOKEN`. The child captures that value, removes it from its
+unchanged, alongside the single-use credential exported to the child as
+`PI_RADAR_SPAWN_TOKEN`. A tracked launch's credential is the claim id the daemon
+pre-minted for that attempt, so a launch presents one secret rather than a claim
+plus a second per-edge token; an untracked spawn keeps a minted token because it
+has no claim. The child captures that value, removes it from its
 process environment, and includes it privately as `spawn_token` in its own
 `agent.presence` request. Keep the captured value only in bootstrap memory while
 an acknowledgement is uncertain; retry with identical source, incarnation,
@@ -205,8 +208,11 @@ location verification, one `mux.observe` inventory is consulted per response/pag
 when a backend advertises `mux.observe`; otherwise the durable topology is still
 returned with unconfirmed freshness. Edges persist across daemon restarts. The
 public topology contains parent, optional bound child `(source, incarnation, registration_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains created/launched outcomes, optional created location, `state`,
-`freshness`, and `exit_observation`; it never contains the token, and it never
-returns the private creating instance the dead-pane fence compares.
+`freshness`, and `exit_observation`; a tracked edge publishes its claim id as
+`subject_id` and no separate token field, because that claim is the credential
+and only the process whose birth identity matches can spend it, while an
+untracked edge carries a minted token that is never published. It never returns
+the private creating instance the dead-pane fence compares.
 
 `state` is `unbound` without a child, `bound` after token binding, or
 `unresolved` when a recorded pane is absent from a successful inventory.

@@ -344,10 +344,7 @@ fn validate_identity(identity: &HandoffIdentity) -> Result<(), Error> {
     if !is_id(&identity.registration_id) || !is_id(&identity.session_id) {
         return Err(Error::Invalid("identity is incomplete".into()));
     }
-    if is_id(&identity.subject_id)
-        && is_id(&identity.execution_id)
-        && identity.execution_generation > 0
-    {
+    if is_id(&identity.subject_id) && is_id(&identity.claim_id) && !identity.claim_id.is_empty() {
         Ok(())
     } else {
         Err(Error::Invalid("managed identity is incomplete".into()))
@@ -389,8 +386,7 @@ mod tests {
             registration_id: random_uuid(),
             session_id: random_uuid(),
             subject_id: subject_id.unwrap_or_else(random_uuid),
-            execution_id: random_uuid(),
-            execution_generation: 1,
+            claim_id: random_uuid(),
         }
     }
     fn sample(sender: &HandoffIdentity, recipient: &HandoffIdentity) -> Handoff {
@@ -501,8 +497,7 @@ mod tests {
         let successor = HandoffIdentity {
             registration_id: random_uuid(),
             session_id: random_uuid(),
-            execution_id: random_uuid(),
-            execution_generation: 2,
+            claim_id: random_uuid(),
             subject_id: recipient.subject_id.clone(),
         };
         assert!(store.pending(&successor).unwrap().len() == 1);

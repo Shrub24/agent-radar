@@ -102,9 +102,9 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         seq: 0,
         kind: kind.into(),
         subject_id: facts
-            .and_then(|facts| facts.logical_subject_id.clone())
+            .and_then(|facts| facts.subject_id.clone())
             .or_else(|| event.subject_id.clone()),
-        execution_id: lifecycle_execution
+        claim_id: lifecycle_execution
             .then(|| event.subject_id.clone())
             .flatten(),
         execution_generation: lifecycle_execution

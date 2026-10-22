@@ -248,7 +248,7 @@ pub fn observe_pane(
     }
 }
 
-fn terminal(subject: &super::Subject) -> bool {
+fn terminal(subject: &super::Claim) -> bool {
     subject.exited_at.is_some() || subject.ended_externally_at.is_some()
 }
 

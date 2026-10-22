@@ -1096,6 +1096,9 @@
             }
           ]
         },
+        "claim_id": {
+          "type": "string"
+        },
         "identity_unresolved": {
           "type": "boolean"
         },
@@ -1126,6 +1129,7 @@
       },
       "required": [
         "subject_id",
+        "claim_id",
         "process",
         "identity_unresolved",
         "metadata",

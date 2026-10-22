@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::{
-    EndedEvidence, Observation, Origin, PaneAbsence, PaneCleanup, State, Subject,
+    Claim, EndedEvidence, Observation, Origin, PaneAbsence, PaneCleanup, State,
 };
 use crate::control_plane::containers::{Container, ContainerObservation};
 use crate::control_plane::registry::publication::write_atomic;
@@ -53,7 +53,8 @@ const MAX_EVENT_BYTES: usize = 16 * 1024;
 pub struct Facts {
     /// Stable logical subject identity. Absent only in pre-migration events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logical_subject_id: Option<String>,
+    #[serde(rename = "logical_subject_id")]
+    pub subject_id: Option<String>,
     /// One-based execution generation within the logical subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_generation: Option<u32>,
@@ -86,10 +87,10 @@ pub struct Facts {
 }
 
 impl Facts {
-    pub fn from_subject(subject: &Subject) -> Self {
+    pub fn from_subject(subject: &Claim) -> Self {
         Self {
-            logical_subject_id: subject.logical_subject_id.clone(),
-            execution_generation: subject.execution_generation,
+            subject_id: subject.subject_id.clone(),
+            execution_generation: None,
             identity_unresolved: subject.identity_unresolved,
             managed: subject.managed.clone(),
             spawn_request_id: subject.spawn_request_id.clone(),
@@ -110,9 +111,8 @@ impl Facts {
         }
     }
 
-    pub fn apply_to(&self, subject: &mut Subject) {
-        subject.logical_subject_id = self.logical_subject_id.clone();
-        subject.execution_generation = self.execution_generation;
+    pub fn apply_to(&self, subject: &mut Claim) {
+        subject.subject_id = self.subject_id.clone();
         subject.identity_unresolved = self.identity_unresolved;
         subject.managed = self.managed.clone();
         subject.session = self.session.clone();
@@ -148,8 +148,10 @@ pub enum Transition {
     /// Adds stable logical identity to one legacy execution record without
     /// rewriting its existing event history.
     IdentityMapped {
-        logical_subject_id: String,
-        execution_generation: u32,
+        #[serde(rename = "logical_subject_id")]
+        subject_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_generation: Option<u32>,
         identity_unresolved: bool,
     },
     /// Marks continuity evidence ambiguous without rewriting an existing mapping.
@@ -498,22 +500,18 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
             facts.identity_unresolved = true;
         }
         Transition::IdentityMapped {
-            logical_subject_id,
+            subject_id: logical_subject_id,
             execution_generation,
             identity_unresolved,
         } => {
-            if facts.logical_subject_id.is_some()
-                || facts.execution_generation.is_some()
-                || logical_subject_id.is_empty()
-                || *execution_generation == 0
-            {
+            if facts.subject_id.is_some() || logical_subject_id.is_empty() {
                 return Err(format!(
-                    "identity mapping conflicts with current facts (logical={:?}, generation={:?}, new logical={logical_subject_id:?}, new generation={execution_generation})",
-                    facts.logical_subject_id, facts.execution_generation
+                    "identity mapping conflicts with current facts (logical={:?}, generation={:?}, new logical={logical_subject_id:?}, new generation={execution_generation:?})",
+                    facts.subject_id, facts.execution_generation
                 ));
             }
-            facts.logical_subject_id = Some(logical_subject_id.clone());
-            facts.execution_generation = Some(*execution_generation);
+            facts.subject_id = Some(logical_subject_id.clone());
+            facts.execution_generation = *execution_generation;
             facts.identity_unresolved = *identity_unresolved;
         }
         Transition::Captured(process) if facts.state == State::Pending => {
@@ -563,9 +561,7 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
         {
             facts.pane_cleanup = Some(outcome.clone())
         }
-        Transition::SuccessorReserved { spawn_request_id }
-            if facts.exited_at.is_some() && facts.successor.is_none() =>
-        {
+        Transition::SuccessorReserved { spawn_request_id } if facts.successor.is_none() => {
             facts.successor = Some(spawn_request_id.clone())
         }
         Transition::SessionRecorded { session }

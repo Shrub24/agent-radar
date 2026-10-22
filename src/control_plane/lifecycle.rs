@@ -189,7 +189,6 @@ impl ManagedMetadata {
 /// current are held here once, instead of being copied forward onto every
 /// successor. `current_claim` names today's attempt record by its `subject_id`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SubjectRecord {
     pub version: u32,
     pub subject_id: String,
@@ -201,26 +200,21 @@ pub struct SubjectRecord {
     /// The attempt that is current for this subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_claim: Option<String>,
-    /// The current attempt's generation, kept so a later attempt can be compared
-    /// without reading the events log while its lock is held.
-    #[serde(default)]
-    pub current_generation: u32,
     pub recorded_at: String,
     pub updated_at: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Subject {
+pub struct Claim {
     pub version: u32,
-    /// Execution-record ID retained for private storage and exact process fences.
-    pub subject_id: String,
+    /// Exact attempt identity; the private storage key is unchanged.
+    #[serde(rename = "subject_id")]
+    pub claim_id: String,
     /// Stable logical subject ID shared by every exact successor execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logical_subject_id: Option<String>,
-    /// One-based generation within the logical subject; absent only before migration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_generation: Option<u32>,
+    #[serde(rename = "logical_subject_id")]
+    pub subject_id: Option<String>,
+
     #[serde(default)]
     pub identity_unresolved: bool,
     pub spawn_request_id: String,
@@ -274,12 +268,11 @@ pub struct Subject {
 /// the correlation its bootstrap presents.
 pub struct Ticket {
     /// Exact execution record ID bound to the spawn edge.
-    pub subject_id: String,
+    pub claim_id: String,
     /// Stable logical subject identity issued for this process.
-    pub logical_subject_id: String,
+    pub subject_id: String,
     /// The exact Radar launch operation that created this execution.
     pub launch_id: String,
-    pub execution_generation: u32,
     pub parent_subject_id: Option<String>,
     pub correlation: String,
 }
@@ -352,22 +345,22 @@ fn draft(
     spawn_request_id: &str,
     launch: LaunchContext,
     session: Option<String>,
-    identity: Option<(String, u32)>,
+    identity: Option<(String, String)>,
     managed: ManagedMetadata,
     now_ms: i64,
-) -> Subject {
+) -> Claim {
     let execution_id = random_uuid();
-    let (logical_subject_id, execution_generation) =
-        identity.unwrap_or_else(|| (execution_id.clone(), 1));
-    Subject {
+    let logical_subject_id = identity
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| execution_id.clone());
+    Claim {
         observation: None,
         pane_absence: None,
         ended_externally_at: None,
         ended_evidence: None,
         version: SUBJECT_VERSION,
-        subject_id: execution_id,
-        logical_subject_id: Some(logical_subject_id),
-        execution_generation: Some(execution_generation),
+        claim_id: execution_id,
+        subject_id: Some(logical_subject_id),
         identity_unresolved: false,
         spawn_request_id: spawn_request_id.to_string(),
         origin: Origin::Spawned,
@@ -432,7 +425,7 @@ pub fn create_with_identity(
     spawn_request_id: &str,
     launch: LaunchContext,
     session: Option<String>,
-    identity: Option<(String, u32)>,
+    identity: Option<(String, String)>,
     now_ms: i64,
 ) -> Result<Ticket, String> {
     create_with_intent(
@@ -451,32 +444,52 @@ pub fn create_with_intent(
     spawn_request_id: &str,
     launch: LaunchContext,
     session: Option<String>,
-    identity: Option<(String, u32)>,
+    identity: Option<(String, String)>,
     managed: ManagedMetadata,
     now_ms: i64,
 ) -> Result<Ticket, String> {
     let _transition = registry.transition();
-    if identity
-        .as_ref()
-        .is_some_and(|(_, generation)| *generation == 0)
-    {
-        return Err("execution generation must be positive".into());
+    if let Some((subject_id, expected)) = &identity {
+        let record = read_subject_record(registry, subject_id)?.ok_or("subject is not recorded")?;
+        if record.current_claim.as_deref() != Some(expected.as_str()) {
+            return Err("the subject's current claim changed; no launch was reserved".into());
+        }
+        let mut previous = read_recorded(registry, expected)?;
+        if previous
+            .successor
+            .as_deref()
+            .is_some_and(|id| id != spawn_request_id)
+        {
+            return Err("a successor is already reserved for this claim".into());
+        }
+        if previous.successor.is_none() {
+            previous.successor = Some(spawn_request_id.into());
+            previous.recorded_at = format_millis(now_ms);
+            write(registry, &previous)?;
+        }
     }
     managed.validate()?;
     let subject = draft(spawn_request_id, launch, session, identity, managed, now_ms);
     write(registry, &subject)?;
+    let id = subject
+        .subject_id
+        .as_deref()
+        .ok_or("claim has no subject")?;
+    let mut record = read_subject_record(registry, id)?.ok_or("subject is not recorded")?;
+    record.current_claim = Some(subject.claim_id.clone());
+    record.updated_at = subject.recorded_at.clone();
+    write_subject_record(registry, &record)?;
     Ok(Ticket {
-        subject_id: subject.subject_id,
-        logical_subject_id: subject.logical_subject_id.unwrap_or_default(),
+        claim_id: subject.claim_id,
+        subject_id: subject.subject_id.unwrap_or_default(),
         launch_id: subject.spawn_request_id,
-        execution_generation: subject.execution_generation.unwrap_or(1),
         parent_subject_id: subject.managed.parent_subject_id,
         correlation: subject.correlation.unwrap_or_default(),
     })
 }
 
 /// The subject with this id, or `None` when none was recorded.
-pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Subject>, String> {
+pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Claim>, String> {
     if SessionUuid::parse(subject_id).is_none() {
         return Err("`subject_id` must be a canonical UUID".into());
     }
@@ -497,9 +510,9 @@ pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Subject>, St
         Ok(_) => {}
     }
     let bytes = read_record_file(&path, MAX_SUBJECT_BYTES)?;
-    let mut subject: Subject =
+    let mut subject: Claim =
         serde_json::from_slice(&bytes).map_err(|error| format!("not a launch subject: {error}"))?;
-    if !matches!(subject.version, 1 | SUBJECT_VERSION) || subject.subject_id != subject_id {
+    if !matches!(subject.version, 1 | SUBJECT_VERSION) || subject.claim_id != subject_id {
         return Err("launch subject does not match its name or version".into());
     }
     // Reading a legacy file upgrades only the in-memory view. The event log is
@@ -511,7 +524,7 @@ pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Subject>, St
     Ok(Some(subject))
 }
 
-fn read_recorded(registry: &Registry, subject_id: &str) -> Result<Subject, String> {
+fn read_recorded(registry: &Registry, subject_id: &str) -> Result<Claim, String> {
     read(registry, subject_id)?.ok_or_else(|| "tracked launch subject is unavailable".to_string())
 }
 
@@ -519,11 +532,15 @@ fn read_recorded(registry: &Registry, subject_id: &str) -> Result<Subject, Strin
 pub fn read_logical(
     registry: &Registry,
     logical_subject_id: &str,
-) -> Result<Option<Subject>, String> {
+) -> Result<Option<Claim>, String> {
     if SessionUuid::parse(logical_subject_id).is_none() {
         return Err("`subject_id` must be a canonical UUID".into());
     }
-    let latest = latest_attempt_for_logical(registry, logical_subject_id)?;
+    let latest = if read_subject_record(registry, logical_subject_id)?.is_none() {
+        latest_attempt_for_logical(registry, logical_subject_id)?
+    } else {
+        None
+    };
     // The record is authoritative once it exists; an attempt written before it
     // existed is promoted here so the subject stops being derived by scanning.
     let record = match read_subject_record(registry, logical_subject_id)? {
@@ -534,7 +551,7 @@ pub fn read_logical(
                 None => None,
             };
             match attempt {
-                Some(attempt) if attempt.logical_subject_id.is_some() => {
+                Some(attempt) if attempt.subject_id.is_some() => {
                     note_attempt(registry, &attempt)?;
                     read_subject_record(registry, logical_subject_id)?
                 }
@@ -545,7 +562,10 @@ pub fn read_logical(
     if let Some(record) = record {
         return match record.current_claim {
             Some(claim_id) => read(registry, &claim_id),
-            None => Ok(None),
+            None => match latest_attempt_for_logical(registry, logical_subject_id)? {
+                Some(claim_id) => read(registry, &claim_id),
+                None => Ok(None),
+            },
         };
     }
     match latest {
@@ -557,41 +577,28 @@ pub fn read_logical(
 /// The newest attempt assigned to one stable logical subject, if any.
 fn latest_attempt_for_logical(
     registry: &Registry,
-    logical_subject_id: &str,
+    subject_id: &str,
 ) -> Result<Option<String>, String> {
-    let mut execution: Option<(u32, String)> = None;
-    let mut matching_count = 0usize;
-    let mut has_unresolved = false;
-    for (execution_id, facts) in registry
-        .events
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    let attempts: BTreeMap<_, _> = log
         .all_facts()
-    {
-        if facts.logical_subject_id.as_deref() != Some(logical_subject_id) {
-            continue;
-        }
-        matching_count += 1;
-        has_unresolved |= facts.identity_unresolved;
-        let generation = facts.execution_generation.unwrap_or(0);
-        match &execution {
-            Some((current_generation, _current_id)) if *current_generation > generation => {}
-            Some((current_generation, current_id))
-                if *current_generation == generation && current_id != &execution_id =>
-            {
-                return Err(format!(
-                    "logical subject {logical_subject_id} has multiple executions at generation {generation}"
-                ));
-            }
-            _ => execution = Some((generation, execution_id)),
-        }
+        .into_iter()
+        .filter(|(_, facts)| facts.subject_id.as_deref() == Some(subject_id))
+        .collect();
+    let tails: Vec<_> = attempts
+        .iter()
+        .filter(|(_, facts)| {
+            facts.successor.is_none()
+                || !attempts
+                    .values()
+                    .any(|next| Some(next.spawn_request_id.as_str()) == facts.successor.as_deref())
+        })
+        .collect();
+    match tails.as_slice() {
+        [] if attempts.is_empty() => Ok(None),
+        [(id, _)] => Ok(Some((*id).clone())),
+        _ => Err("subject has ambiguous claim continuity".into()),
     }
-    if matching_count > 1 && has_unresolved {
-        return Err(format!(
-            "logical subject {logical_subject_id} has unresolved execution continuity"
-        ));
-    }
-    Ok(execution.map(|(_, execution_id)| execution_id))
 }
 
 /// One agent's durable record, promoted from its attempts when none was written.
@@ -617,43 +624,26 @@ pub fn read_subject_record(
 
 /// Records which attempt is current for its subject, and which facts the subject
 /// carries. Called by the attempt writer, so every attempt change maintains it.
-fn note_attempt(registry: &Registry, subject: &Subject) -> Result<(), String> {
-    let logical_id = subject
-        .logical_subject_id
-        .clone()
-        .unwrap_or_else(|| subject.subject_id.clone());
-    let generation = subject.execution_generation.unwrap_or(1);
-    let existing = read_subject_record(registry, &logical_id)?;
+fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
+    let id = claim.subject_id.as_deref().unwrap_or(&claim.claim_id);
+    let existing = read_subject_record(registry, id)?;
     let mut record = match existing {
+        Some(record) if record.current_claim.as_deref() != Some(&claim.claim_id) => return Ok(()),
         Some(record) => record,
         None => SubjectRecord {
             version: SUBJECT_VERSION,
-            subject_id: logical_id.clone(),
-            managed: subject.managed.clone(),
-            session: subject.session.clone(),
-            current_claim: None,
-            current_generation: 0,
-            recorded_at: subject.recorded_at.clone(),
-            updated_at: subject.recorded_at.clone(),
+            subject_id: id.into(),
+            managed: claim.managed.clone(),
+            session: claim.session.clone(),
+            current_claim: Some(claim.claim_id.clone()),
+            recorded_at: claim.recorded_at.clone(),
+            updated_at: claim.recorded_at.clone(),
         },
     };
-    // An earlier attempt reporting late never displaces the current one.
-    if generation < record.current_generation {
-        return Ok(());
+    if claim.session.is_some() {
+        record.session = claim.session.clone();
     }
-    let changed = record.current_claim.as_deref() != Some(subject.subject_id.as_str())
-        || record.managed != subject.managed
-        || record.session != subject.session;
-    if !changed {
-        return Ok(());
-    }
-    record.current_claim = Some(subject.subject_id.clone());
-    record.current_generation = generation;
-    record.managed = subject.managed.clone();
-    if subject.session.is_some() || record.session.is_none() {
-        record.session = subject.session.clone();
-    }
-    record.updated_at = subject.recorded_at.clone();
+    record.updated_at = claim.recorded_at.clone();
     write_subject_record(registry, &record)
 }
 
@@ -667,6 +657,25 @@ fn write_subject_record(registry: &Registry, record: &SubjectRecord) -> Result<(
         &bytes,
         MAX_SUBJECT_BYTES,
     )
+}
+
+/// Release authority, not the process or the attempt's recorded facts.
+pub fn release_attachment(
+    registry: &Registry,
+    claim_id: &str,
+    subject_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(subject_id) = subject_id else {
+        return Ok(());
+    };
+    let _transition = registry.transition();
+    if let Some(mut record) = read_subject_record(registry, subject_id)?
+        && record.current_claim.as_deref() == Some(claim_id)
+    {
+        record.current_claim = None;
+        write_subject_record(registry, &record)?;
+    }
+    Ok(())
 }
 
 fn subject_record_path(registry: &Registry, subject_id: &str) -> PathBuf {
@@ -684,7 +693,7 @@ pub fn execution_ids_for_logical(registry: &Registry, logical_subject_id: &str) 
         .unwrap_or_else(|e| e.into_inner())
         .all_facts()
         .into_iter()
-        .filter(|(_, facts)| facts.logical_subject_id.as_deref() == Some(logical_subject_id))
+        .filter(|(_, facts)| facts.subject_id.as_deref() == Some(logical_subject_id))
         .map(|(execution_id, _)| execution_id)
         .collect()
 }
@@ -694,76 +703,19 @@ pub fn list_logical_after(
     registry: &Registry,
     after: Option<&str>,
     limit: usize,
-) -> Result<Vec<Subject>, String> {
-    let facts = registry
+) -> Result<Vec<Claim>, String> {
+    let ids: BTreeSet<_> = registry
         .events
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .all_facts();
-    let mut known_executions = BTreeSet::new();
-    let mut latest = BTreeMap::<String, (u32, String)>::new();
-    let mut logical_counts = BTreeMap::<String, usize>::new();
-    let mut unresolved_logicals = BTreeSet::new();
-    for (execution_id, facts) in facts {
-        known_executions.insert(execution_id.clone());
-        let logical_id = facts
-            .logical_subject_id
-            .unwrap_or_else(|| execution_id.clone());
-        let generation = facts.execution_generation.unwrap_or(1);
-        *logical_counts.entry(logical_id.clone()).or_default() += 1;
-        if facts.identity_unresolved {
-            unresolved_logicals.insert(logical_id.clone());
-        }
-        match latest.get(&logical_id) {
-            Some((old_generation, _old_id)) if *old_generation > generation => {}
-            Some((old_generation, old_id))
-                if *old_generation == generation && old_id != &execution_id =>
-            {
-                return Err(format!(
-                    "logical subject {logical_id} has multiple executions at generation {generation}"
-                ));
-            }
-            _ => {
-                latest.insert(logical_id, (generation, execution_id));
-            }
-        }
-    }
-    if let Some(logical_id) = unresolved_logicals
-        .iter()
-        .find(|id| logical_counts.get(*id).copied().unwrap_or_default() > 1)
-    {
-        return Err(format!(
-            "logical subject {logical_id} has unresolved execution continuity"
-        ));
-    }
-    // Include pre-event legacy records without deserializing every record in the
-    // page scan. A record with no event facts is its own generation-one root.
-    let entries = match fs::read_dir(registry.subjects()) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("launch subjects: {error}")),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("launch subject directory entry: {error}"))?;
-        let filename = entry.file_name();
-        let Some(id) = filename
-            .to_str()
-            .and_then(|name| name.strip_suffix(".json"))
-            .filter(|id| SessionUuid::parse(id).is_some())
-        else {
-            continue;
-        };
-        if !known_executions.contains(id) {
-            latest
-                .entry(id.to_string())
-                .or_insert_with(|| (1, id.to_string()));
-        }
-    }
-    latest
+        .all_facts()
         .into_iter()
-        .filter(|(logical_id, _)| after.is_none_or(|cursor| logical_id.as_str() > cursor))
+        .map(|(id, facts)| facts.subject_id.unwrap_or(id))
+        .collect();
+    ids.into_iter()
+        .filter(|id| after.is_none_or(|cut| id.as_str() > cut))
+        .filter_map(|id| read_logical(registry, &id).transpose())
         .take(limit)
-        .map(|(_, (_, execution_id))| read_recorded(registry, &execution_id))
         .collect()
 }
 
@@ -893,9 +845,9 @@ pub fn observe_exit(
 #[derive(Clone, PartialEq, Eq)]
 pub enum Attachment {
     /// This registration already holds the session's live subject.
-    Own(Box<Subject>),
+    Own(Box<Claim>),
     /// Another registration's live subject holds the session.
-    Other(Box<Subject>),
+    Other(Box<Claim>),
     /// No live registration holds the session; this one may bind it.
     Free,
 }
@@ -907,7 +859,16 @@ pub enum Attachment {
 /// registration publishing a different session. A lost pane does not release it,
 /// because absence of a pane is not proof that the process is gone; a stale
 /// heartbeat does not release it either.
-pub fn is_attached(registry: &Registry, subject: &Subject, now_ms: i64) -> Result<bool, String> {
+pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<bool, String> {
+    let id = subject.subject_id.as_deref().unwrap_or(&subject.claim_id);
+    if read_subject_record(registry, id)?
+        .is_none_or(|record| record.current_claim.as_deref() != Some(&subject.claim_id))
+    {
+        return Ok(false);
+    }
+    if matches!(subject.state, State::Pending | State::Captured) && subject.exited_at.is_none() {
+        return Ok(true);
+    }
     let (Some(agent), Some(session)) = (
         subject.bound_registration_id.as_deref(),
         subject.session.as_deref(),
@@ -954,7 +915,7 @@ pub fn record_launch_session(
                 Attachment::Other(_)
             ) {
                 // The stored record is the one the transition is checked against.
-                let mut subject = read_recorded(registry, &found.subject_id)?;
+                let mut subject = read_recorded(registry, &found.claim_id)?;
                 subject.session = Some(session.to_string());
                 subject.recorded_at = format_millis(now_ms);
                 write(registry, &subject)?;
@@ -962,7 +923,7 @@ pub fn record_launch_session(
             return Ok(());
         }
         match page.last() {
-            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.claim_id.clone()),
             _ => return Ok(()),
         }
     }
@@ -981,14 +942,14 @@ pub fn record_launch_session(
 /// outside the registry transition.
 pub fn release_if_gone(
     registry: &Registry,
-    holder: &Subject,
+    holder: &Claim,
     verifier: &dyn crate::control_plane::registry::process::ProcessVerifier,
     now_ms: i64,
 ) -> Result<bool, String> {
     use crate::control_plane::registry::process::{ProcessVerification, verify_identity};
     match verify_identity(holder.process.as_ref(), verifier) {
         ProcessVerification::Absent | ProcessVerification::Mismatched => {
-            record_exit(registry, &holder.subject_id, now_ms)?;
+            record_exit(registry, &holder.claim_id, now_ms)?;
             Ok(true)
         }
         ProcessVerification::Verified | ProcessVerification::Unavailable => Ok(false),
@@ -1019,7 +980,7 @@ pub fn attachment(
             found = Attachment::Other(Box::new(subject.clone()));
         }
         match page.last() {
-            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.claim_id.clone()),
             _ => return Ok(found),
         }
     }
@@ -1047,7 +1008,7 @@ pub fn enroll_subject(
     now_ms: i64,
 ) -> Result<String, String> {
     let _transition = registry.transition();
-    let mut prior: Option<Subject> = None;
+    let mut prior: Option<Claim> = None;
     let mut after: Option<String> = None;
     loop {
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
@@ -1057,7 +1018,7 @@ pub fn enroll_subject(
             }
             if is_attached(registry, subject, now_ms)? {
                 return if subject.bound_registration_id.as_deref() == Some(registration_id) {
-                    Ok(subject.subject_id.clone())
+                    Ok(subject.claim_id.clone())
                 } else {
                     Err("the session is already attached to another live process".into())
                 };
@@ -1070,12 +1031,12 @@ pub fn enroll_subject(
             }
         }
         match page.last() {
-            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.subject_id.clone()),
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.claim_id.clone()),
             _ => break,
         }
     }
     // A reattachment continues the prior logical subject; a new session starts one.
-    let (logical, generation, managed) = match &prior {
+    let (logical, managed) = match &prior {
         Some(prior) if prior.identity_unresolved => {
             return Err(
                 "the session's prior subject has unresolved identity; resolve it before reattaching"
@@ -1085,30 +1046,24 @@ pub fn enroll_subject(
         Some(prior) => (
             Some(
                 prior
-                    .logical_subject_id
+                    .subject_id
                     .clone()
-                    .unwrap_or_else(|| prior.subject_id.clone()),
+                    .unwrap_or_else(|| prior.claim_id.clone()),
             ),
-            prior
-                .execution_generation
-                .unwrap_or(1)
-                .checked_add(1)
-                .ok_or("execution generation is exhausted")?,
             prior.managed.clone(),
         ),
-        None => (None, 1, ManagedMetadata::default()),
+        None => (None, ManagedMetadata::default()),
     };
-    let subject_id = random_uuid();
+    let subject_id = enrollment_id.to_string();
     let logical = logical.unwrap_or_else(|| subject_id.clone());
-    let subject = Subject {
+    let subject = Claim {
         observation: None,
         pane_absence: None,
         ended_externally_at: None,
         ended_evidence: None,
         version: SUBJECT_VERSION,
-        subject_id: subject_id.clone(),
-        logical_subject_id: Some(logical),
-        execution_generation: Some(generation),
+        claim_id: subject_id.clone(),
+        subject_id: Some(logical),
         identity_unresolved: false,
         spawn_request_id: enrollment_id.to_string(),
         origin: Origin::Enrolled,
@@ -1126,6 +1081,13 @@ pub fn enroll_subject(
         recorded_at: format_millis(now_ms),
     };
     write(registry, &subject)?;
+    let logical_id = subject
+        .subject_id
+        .as_deref()
+        .ok_or("claim has no subject")?;
+    let mut record = read_subject_record(registry, logical_id)?.ok_or("subject is not recorded")?;
+    record.current_claim = Some(subject.claim_id.clone());
+    write_subject_record(registry, &record)?;
     Ok(subject_id)
 }
 
@@ -1276,13 +1238,13 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
 
 /// The public projection of a subject: identities, binding and recorded facts.
 /// It carries no launch data and no correlation, which are private.
-pub fn public_view(subject: &Subject) -> Value {
+pub fn public_view(subject: &Claim) -> Value {
     // `subject_id` is the agent; `claim_id` is this attempt. Generation is not
     // published: a claim id identifies the attempt exactly, so an ordinal would
     // be a second, weaker name for the same thing.
     json!({
-        "subject_id": subject.logical_subject_id.as_deref().unwrap_or(&subject.subject_id),
-        "claim_id": subject.subject_id,
+        "subject_id": subject.subject_id.as_deref().unwrap_or(&subject.claim_id),
+        "claim_id": subject.claim_id,
         "identity_unresolved": subject.identity_unresolved,
         "managed": subject.managed,
         "spawn_request_id": subject.spawn_request_id,
@@ -1317,9 +1279,7 @@ pub fn migrate_identity(registry: &Registry, now_ms: i64) -> Result<(), String> 
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .all_facts();
-    if records.iter().all(|(_, facts)| {
-        facts.logical_subject_id.is_some() && facts.execution_generation.is_some()
-    }) {
+    if records.iter().all(|(_, facts)| facts.subject_id.is_some()) {
         return Ok(());
     }
     let records: BTreeMap<_, _> = records.into_iter().collect();
@@ -1421,56 +1381,36 @@ pub fn migrate_identity(registry: &Registry, now_ms: i64) -> Result<(), String> 
             continue;
         }
         let logical_id = chain[0].clone();
-        let expected: Option<Vec<_>> = chain
-            .iter()
-            .enumerate()
-            .map(|(index, id)| {
-                Some((
-                    id.clone(),
-                    logical_id.clone(),
-                    u32::try_from(index).ok()?.checked_add(1)?,
-                ))
-            })
-            .collect();
-        let Some(expected) = expected else {
-            unresolved.extend(chain.iter().cloned());
-            continue;
-        };
-        // A partially completed migration is safe to resume only when every
-        // already-written identity agrees with the deterministic chain mapping.
-        if expected.iter().any(|(id, logical, generation)| {
-            let facts = &records[id];
-            facts
-                .logical_subject_id
+        if chain.iter().any(|id| {
+            records[id]
+                .subject_id
                 .as_ref()
-                .is_some_and(|old| old != logical)
-                || facts
-                    .execution_generation
-                    .is_some_and(|old| old != *generation)
+                .is_some_and(|old| old != &logical_id)
         }) {
             unresolved.extend(chain.iter().cloned());
             continue;
         }
-        mappings.extend(expected.into_iter().filter(|(id, _, _)| {
-            records[id].logical_subject_id.is_none() || records[id].execution_generation.is_none()
-        }));
+        mappings.extend(
+            chain
+                .into_iter()
+                .filter(|id| records[id].subject_id.is_none())
+                .map(|id| (id, logical_id.clone())),
+        );
     }
     // Cyclic records were not visited by a root walk; assign each a distinct root.
     for execution_id in cyclic {
         let facts = &records[&execution_id];
-        if facts.logical_subject_id.is_none() && facts.execution_generation.is_none() {
-            mappings.push((execution_id.clone(), execution_id, 1));
+        if facts.subject_id.is_none() {
+            mappings.push((execution_id.clone(), execution_id));
         }
     }
 
     let pending_unresolved: Vec<_> = unresolved
         .iter()
         .filter(|id| {
-            records.get(id.as_str()).is_some_and(|facts| {
-                facts.logical_subject_id.is_some()
-                    && facts.execution_generation.is_some()
-                    && !facts.identity_unresolved
-            })
+            records
+                .get(id.as_str())
+                .is_some_and(|facts| facts.subject_id.is_some() && !facts.identity_unresolved)
         })
         .cloned()
         .collect();
@@ -1479,14 +1419,14 @@ pub fn migrate_identity(registry: &Registry, now_ms: i64) -> Result<(), String> 
     }
     let at = format_millis(now_ms);
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    for (execution_id, logical_subject_id, execution_generation) in mappings {
+    for (execution_id, logical_subject_id) in mappings {
         log.append(
             &execution_id,
             &at,
             crate::control_plane::events::Source::IdentityMigration,
             crate::control_plane::events::Transition::IdentityMapped {
-                logical_subject_id,
-                execution_generation,
+                subject_id: logical_subject_id,
+                execution_generation: None,
                 identity_unresolved: unresolved.contains(&execution_id),
             },
         )
@@ -1494,7 +1434,7 @@ pub fn migrate_identity(registry: &Registry, now_ms: i64) -> Result<(), String> 
             let prior = records.get(&execution_id).expect("migration record");
             format!(
                 "migrate lifecycle execution {execution_id} (logical={:?}, generation={:?}): {error}",
-                prior.logical_subject_id, prior.execution_generation
+                prior.subject_id, prior.execution_generation
             )
         })?;
     }
@@ -1514,7 +1454,7 @@ pub fn list_after(
     registry: &Registry,
     after: Option<&str>,
     limit: usize,
-) -> Result<Vec<Subject>, String> {
+) -> Result<Vec<Claim>, String> {
     let entries = match fs::read_dir(registry.subjects()) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1767,11 +1707,7 @@ fn record_exit(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<(),
     record_exit_locked(registry, &mut subject, now_ms)
 }
 
-fn record_exit_locked(
-    registry: &Registry,
-    subject: &mut Subject,
-    now_ms: i64,
-) -> Result<(), String> {
+fn record_exit_locked(registry: &Registry, subject: &mut Claim, now_ms: i64) -> Result<(), String> {
     if subject.exited_at.is_none() {
         subject.exited_at = Some(format_millis(now_ms));
         subject.recorded_at = format_millis(now_ms);
@@ -1800,7 +1736,7 @@ pub fn wrap(bootstrap: &Bootstrap, ticket: &Ticket, target: LaunchRequest) -> La
         executable,
     ];
     wrapped.extend(argv);
-    env.insert(SUBJECT_ENV.to_string(), ticket.subject_id.clone());
+    env.insert(SUBJECT_ENV.to_string(), ticket.claim_id.clone());
     env.insert(CORRELATION_ENV.to_string(), ticket.correlation.clone());
     if let Some(parent_subject_id) = &ticket.parent_subject_id {
         env.insert(
@@ -1945,23 +1881,23 @@ fn exchange(socket: &Path, method: &str, params: Value) -> Result<Value, String>
     }
 }
 
-fn write(registry: &Registry, subject: &Subject) -> Result<(), String> {
+fn write(registry: &Registry, subject: &Claim) -> Result<(), String> {
     write_attempt(registry, subject)?;
     note_attempt(registry, subject)
 }
 
-fn write_attempt(registry: &Registry, subject: &Subject) -> Result<(), String> {
+fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
     use crate::control_plane::events::{Facts, Source, Transition};
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    let previous = log.facts(&subject.subject_id).cloned();
+    let previous = log.facts(&subject.claim_id).cloned();
     let previous = if let Some(facts) = previous {
         Some(facts)
     } else {
-        let legacy_path = path(registry, &subject.subject_id);
+        let legacy_path = path(registry, &subject.claim_id);
         let legacy = if legacy_path.try_exists().map_err(|e| e.to_string())? {
             let bytes = read_record_file(&legacy_path, MAX_SUBJECT_BYTES)?;
             Some(
-                serde_json::from_slice::<Subject>(&bytes)
+                serde_json::from_slice::<Claim>(&bytes)
                     .map_err(|_| "invalid legacy lifecycle subject")?,
             )
         } else {
@@ -1974,14 +1910,14 @@ fn write_attempt(registry: &Registry, subject: &Subject) -> Result<(), String> {
             .map_err(|_| "cannot encode private lifecycle recipe")?;
         write_atomic(
             &directory,
-            &recipe_path(registry, &subject.subject_id),
+            &recipe_path(registry, &subject.claim_id),
             &bytes,
             MAX_SUBJECT_BYTES,
         )?;
         if let Some(legacy) = legacy {
             let facts = Facts::from_subject(&legacy);
             log.append(
-                &subject.subject_id,
+                &subject.claim_id,
                 &legacy.recorded_at,
                 Source::RecoveryImport,
                 Transition::Imported(facts.clone()),
@@ -1993,16 +1929,12 @@ fn write_attempt(registry: &Registry, subject: &Subject) -> Result<(), String> {
                 Origin::Spawned => (Source::Launch, Transition::Created(facts)),
                 Origin::Enrolled => (Source::Operator, Transition::Enrolled(facts)),
             };
-            return log.append(
-                &subject.subject_id,
-                &subject.recorded_at,
-                source,
-                transition,
-            );
+            return log.append(&subject.claim_id, &subject.recorded_at, source, transition);
         }
     };
     let previous = previous.expect("baseline established");
-    let target = Facts::from_subject(subject);
+    let mut target = Facts::from_subject(subject);
+    target.execution_generation = previous.execution_generation;
     if previous == target {
         return Ok(());
     }
@@ -2087,7 +2019,7 @@ fn write_attempt(registry: &Registry, subject: &Subject) -> Result<(), String> {
         return Err("unsupported lifecycle transition".into());
     };
     log.append_checked(
-        &subject.subject_id,
+        &subject.claim_id,
         &subject.recorded_at,
         source,
         transition,
@@ -2212,7 +2144,7 @@ mod tests {
         let scratch = Scratch::new("before-capture");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.subject_id.as_str();
+        let subject = ticket.claim_id.as_str();
 
         let cancelled = cancel(&registry, subject, &Uninspected, 2).expect("cancel");
         assert_eq!(
@@ -2263,7 +2195,7 @@ mod tests {
         successor: Option<&str>,
     ) -> crate::control_plane::events::Facts {
         crate::control_plane::events::Facts {
-            logical_subject_id: None,
+            subject_id: None,
             execution_generation: None,
             identity_unresolved: false,
             managed: ManagedMetadata::default(),
@@ -2416,23 +2348,23 @@ mod tests {
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             log.facts(&root)
-                .and_then(|facts| facts.logical_subject_id.as_deref()),
+                .and_then(|facts| facts.subject_id.as_deref()),
             Some(root.as_str())
         );
         assert_eq!(
             log.facts(&root)
                 .and_then(|facts| facts.execution_generation),
-            Some(1)
+            None
         );
         assert_eq!(
             log.facts(&next)
-                .and_then(|facts| facts.logical_subject_id.as_deref()),
+                .and_then(|facts| facts.subject_id.as_deref()),
             Some(root.as_str())
         );
         assert_eq!(
             log.facts(&next)
                 .and_then(|facts| facts.execution_generation),
-            Some(2)
+            None
         );
         for execution in [
             &isolated,
@@ -2444,11 +2376,8 @@ mod tests {
             &cycle_b,
         ] {
             let facts = log.facts(execution).expect("execution facts");
-            assert_eq!(
-                facts.logical_subject_id.as_deref(),
-                Some(execution.as_str())
-            );
-            assert_eq!(facts.execution_generation, Some(1));
+            assert_eq!(facts.subject_id.as_deref(), Some(execution.as_str()));
+            assert_eq!(facts.execution_generation, None);
             assert_eq!(facts.identity_unresolved, execution != &isolated);
         }
         let migrated_tail = log.tail();
@@ -2471,7 +2400,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .facts(&next)
-                .and_then(|facts| facts.logical_subject_id.as_deref()),
+                .and_then(|facts| facts.subject_id.as_deref()),
             Some(root.as_str())
         );
     }
@@ -2490,7 +2419,7 @@ mod tests {
         let first = create_with_intent(&registry, SPAWN, launch(), None, None, metadata.clone(), 1)
             .expect("accepted launch intent");
         assert_eq!(first.parent_subject_id, metadata.parent_subject_id);
-        let persisted = read(&registry, &first.subject_id)
+        let persisted = read(&registry, &first.claim_id)
             .expect("read subject")
             .expect("subject");
         assert_eq!(persisted.managed, metadata);
@@ -2501,14 +2430,14 @@ mod tests {
             &random_uuid(),
             launch(),
             None,
-            Some((first.subject_id.clone(), 2)),
+            Some((first.claim_id.clone(), first.claim_id.clone())),
             persisted.managed.clone(),
             2,
         )
         .expect("successor intent");
         assert_eq!(successor.parent_subject_id, metadata.parent_subject_id);
         assert_eq!(
-            read(&registry, &successor.subject_id)
+            read(&registry, &successor.claim_id)
                 .expect("read successor")
                 .expect("successor")
                 .managed,
@@ -2529,13 +2458,13 @@ mod tests {
         let scratch = Scratch::new("logical-current");
         let registry = scratch.registry();
         let first = create(&registry, SPAWN, launch(), None, 1).expect("first execution");
-        let logical_id = first.subject_id.clone();
+        let logical_id = first.claim_id.clone();
         let second = create_with_identity(
             &registry,
             &random_uuid(),
             launch(),
             None,
-            Some((logical_id.clone(), 2)),
+            Some((logical_id.clone(), logical_id.clone())),
             2,
         )
         .expect("successor execution");
@@ -2543,22 +2472,18 @@ mod tests {
         let current = read_logical(&registry, &logical_id)
             .expect("read logical subject")
             .expect("current execution");
-        assert_eq!(current.subject_id, second.subject_id);
-        assert_eq!(
-            current.logical_subject_id.as_deref(),
-            Some(logical_id.as_str())
-        );
-        assert_eq!(current.execution_generation, Some(2));
+        assert_eq!(current.claim_id, second.claim_id);
+        assert_eq!(current.subject_id.as_deref(), Some(logical_id.as_str()));
         // The agent carries the plain name; the attempt is named by its claim.
         let view = public_view(&current);
         assert_eq!(view["subject_id"], logical_id);
-        assert_eq!(view["claim_id"], second.subject_id);
+        assert_eq!(view["claim_id"], second.claim_id);
         assert!(view.get("execution_generation").is_none(), "{view}");
         assert!(view.get("execution_id").is_none(), "{view}");
 
         let listed = list_logical_after(&registry, None, 10).expect("logical list");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].subject_id, second.subject_id);
+        assert_eq!(listed[0].claim_id, second.claim_id);
     }
 
     #[test]
@@ -2566,7 +2491,7 @@ mod tests {
         let scratch = Scratch::new("subject-record");
         let registry = scratch.registry();
         let first = create(&registry, SPAWN, launch(), None, 1).expect("first attempt");
-        let logical_id = first.subject_id.clone();
+        let logical_id = first.claim_id.clone();
 
         let record = read_subject_record(&registry, &logical_id)
             .expect("read record")
@@ -2574,9 +2499,8 @@ mod tests {
         assert_eq!(record.subject_id, logical_id);
         assert_eq!(
             record.current_claim.as_deref(),
-            Some(first.subject_id.as_str())
+            Some(first.claim_id.as_str())
         );
-        assert_eq!(record.current_generation, 1);
 
         // A successor moves the pointer, and the subject itself is unchanged.
         let second = create_with_identity(
@@ -2584,7 +2508,7 @@ mod tests {
             &random_uuid(),
             launch(),
             None,
-            Some((logical_id.clone(), 2)),
+            Some((logical_id.clone(), logical_id.clone())),
             2,
         )
         .expect("successor attempt");
@@ -2593,19 +2517,11 @@ mod tests {
             .expect("the subject still exists");
         assert_eq!(
             record.current_claim.as_deref(),
-            Some(second.subject_id.as_str())
-        );
-        assert_eq!(record.current_generation, 2);
-        assert_eq!(
-            record.recorded_at,
-            read(&registry, &first.subject_id)
-                .expect("read")
-                .expect("attempt")
-                .recorded_at
+            Some(second.claim_id.as_str())
         );
 
         // An earlier attempt reporting late does not displace the current one.
-        let earlier = read(&registry, &first.subject_id)
+        let earlier = read(&registry, &first.claim_id)
             .expect("read")
             .expect("attempt");
         note_attempt(&registry, &earlier).expect("note the earlier attempt");
@@ -2614,7 +2530,7 @@ mod tests {
             .expect("subject");
         assert_eq!(
             record.current_claim.as_deref(),
-            Some(second.subject_id.as_str())
+            Some(second.claim_id.as_str())
         );
     }
 
@@ -2625,13 +2541,13 @@ mod tests {
         // A root attempt names itself, so promotion is proved with a real
         // successor chain whose record is removed before it is read.
         let root = create(&registry, SPAWN, launch(), None, 1).expect("root");
-        let logical_id = root.subject_id.clone();
+        let logical_id = root.claim_id.clone();
         let successor = create_with_identity(
             &registry,
             &random_uuid(),
             launch(),
             None,
-            Some((logical_id.clone(), 2)),
+            Some((logical_id.clone(), logical_id.clone())),
             2,
         )
         .expect("successor");
@@ -2641,15 +2557,107 @@ mod tests {
         let current = read_logical(&registry, &logical_id)
             .expect("read logical")
             .expect("current attempt");
-        assert_eq!(current.subject_id, successor.subject_id);
+        assert_eq!(current.claim_id, successor.claim_id);
         let promoted = read_subject_record(&registry, &logical_id)
             .expect("read record")
             .expect("promotion wrote a record");
         assert_eq!(
             promoted.current_claim.as_deref(),
-            Some(successor.subject_id.as_str())
+            Some(successor.claim_id.as_str())
         );
-        assert_eq!(promoted.current_generation, 2);
+    }
+
+    #[test]
+    fn a_claim_keeps_its_attempt_facts_out_of_the_subject_record() {
+        let scratch = Scratch::new("claim-facts");
+        let registry = scratch.registry();
+        let claim = create(&registry, SPAWN, launch(), None, 1).expect("claim");
+        let subject_id = claim.claim_id.clone();
+        let successor = random_uuid();
+        set_successor(&registry, &claim.claim_id, &successor, 2).expect("reserve successor");
+
+        // The attempt's facts survive a daemon restart on the attempt itself.
+        let reopened = scratch.registry();
+        let read_back = read(&reopened, &claim.claim_id)
+            .expect("read")
+            .expect("claim");
+        assert_eq!(read_back.successor.as_deref(), Some(successor.as_str()));
+
+        let record = read_subject_record(&reopened, &subject_id)
+            .expect("read record")
+            .expect("subject");
+        assert_eq!(
+            record.current_claim.as_deref(),
+            Some(claim.claim_id.as_str())
+        );
+        let stored =
+            fs::read_to_string(subject_record_path(&reopened, &subject_id)).expect("record file");
+        for attempt_only in ["successor", "signalled_at", "exited_at", "pane_cleanup"] {
+            assert!(
+                !stored.contains(attempt_only),
+                "{attempt_only} belongs to the claim, not the subject: {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subject_admits_one_successor_at_a_time() {
+        let scratch = Scratch::new("claim-exclusive");
+        let registry = scratch.registry();
+        let first = create(&registry, SPAWN, launch(), None, 1).expect("first claim");
+        let subject_id = first.claim_id.clone();
+        let reserved = create_with_identity(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            Some((subject_id.clone(), first.claim_id.clone())),
+            2,
+        )
+        .expect("successor reserves the predecessor");
+        assert!(
+            create_with_identity(
+                &registry,
+                &random_uuid(),
+                launch(),
+                None,
+                Some((subject_id.clone(), first.claim_id.clone())),
+                3,
+            )
+            .is_err(),
+            "a rival launch must not pre-mint a second successor"
+        );
+        let record = read_subject_record(&registry, &subject_id)
+            .expect("read record")
+            .expect("subject");
+        assert_eq!(
+            record.current_claim.as_deref(),
+            Some(reserved.claim_id.as_str())
+        );
+    }
+
+    #[test]
+    fn releasing_a_claim_keeps_the_attempt_and_detaches_the_subject() {
+        let scratch = Scratch::new("claim-release");
+        let registry = scratch.registry();
+        let claim = create(&registry, SPAWN, launch(), None, 1).expect("claim");
+        let subject_id = claim.claim_id.clone();
+        let pending = read(&registry, &claim.claim_id)
+            .expect("read")
+            .expect("claim");
+        assert!(is_attached(&registry, &pending, 2).expect("attached"));
+
+        release_attachment(&registry, &claim.claim_id, Some(&subject_id)).expect("release");
+
+        let attempt = read(&registry, &claim.claim_id)
+            .expect("read")
+            .expect("the attempt stays readable");
+        assert_eq!(attempt.state, State::Pending);
+        assert!(!is_attached(&registry, &attempt, 2).expect("attached"));
+        let record = read_subject_record(&registry, &subject_id)
+            .expect("read record")
+            .expect("subject");
+        assert_eq!(record.current_claim, None);
     }
 
     #[test]
@@ -2657,7 +2665,7 @@ mod tests {
         let scratch = Scratch::new("spent");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.subject_id.as_str();
+        let subject = ticket.claim_id.as_str();
         capture(
             &registry,
             subject,
@@ -2694,7 +2702,7 @@ mod tests {
         let scratch = Scratch::new("mismatch");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.subject_id.as_str();
+        let subject = ticket.claim_id.as_str();
 
         let mut altered = started_as(&launch());
         altered
@@ -2724,7 +2732,7 @@ mod tests {
         let scratch = Scratch::new("bound-first");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.subject_id.as_str();
+        let subject = ticket.claim_id.as_str();
         let mut child = Child(Command::new("sleep").arg("300").spawn().expect("sleep"));
         let pid = child.0.id() as i32;
         let process = LocalProcfsVerifier
@@ -2994,14 +3002,14 @@ mod tests {
             .expect("the child is alive");
         capture(
             registry,
-            &ticket.subject_id,
+            &ticket.claim_id,
             &ticket.correlation,
             &process,
             &started_as(&launch()),
             2,
         )
         .expect("capture");
-        (ticket.subject_id, child, process)
+        (ticket.claim_id, child, process)
     }
 
     /// Reports every PID as absent, as a process table that no longer lists it does.
@@ -3157,7 +3165,7 @@ mod tests {
         let scratch = Scratch::new("pane-cleanup");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.subject_id.as_str();
+        let subject = ticket.claim_id.as_str();
 
         // A launch no cancel revoked is not cleaned up: its pane is still the
         // launch's, and only a cancel acts on it.
@@ -3290,7 +3298,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let second = std::thread::spawn(move || {
             done_tx
-                .send(cancel(&independent, &other.subject_id, &Uninspected, 4))
+                .send(cancel(&independent, &other.claim_id, &Uninspected, 4))
                 .unwrap()
         });
         let done = done_rx.recv_timeout(Duration::from_secs(1));
@@ -3310,7 +3318,7 @@ mod tests {
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
 
-        let stopped = stop(&registry, &ticket.subject_id, &Uninspected, 2).expect("stop");
+        let stopped = stop(&registry, &ticket.claim_id, &Uninspected, 2).expect("stop");
         assert_eq!(
             stopped,
             Termination {
@@ -3319,7 +3327,7 @@ mod tests {
                 exit: Exit::Unresolved,
             }
         );
-        let subject = read(&registry, &ticket.subject_id)
+        let subject = read(&registry, &ticket.claim_id)
             .expect("read")
             .expect("subject");
         assert_eq!(subject.state, State::Pending);
@@ -3371,7 +3379,7 @@ mod tests {
             .expect("the child is alive");
         capture(
             &registry,
-            &ticket.subject_id,
+            &ticket.claim_id,
             &ticket.correlation,
             &process,
             &started_as(&launch()),
@@ -3381,14 +3389,14 @@ mod tests {
 
         let cancelled = cancel_many(
             &registry,
-            std::slice::from_ref(&ticket.subject_id),
+            std::slice::from_ref(&ticket.claim_id),
             &LocalProcfsVerifier,
             3,
         );
 
-        assert_eq!(cancelled.survivors, vec![ticket.subject_id.clone()]);
+        assert_eq!(cancelled.survivors, vec![ticket.claim_id.clone()]);
         assert!(cancelled.stopped.is_empty());
-        let subject = read(&registry, &ticket.subject_id)
+        let subject = read(&registry, &ticket.claim_id)
             .expect("read")
             .expect("subject");
         assert!(subject.exited_at.is_none(), "no exit was recorded");
@@ -3401,7 +3409,7 @@ mod tests {
         let scratch = Scratch::new("stop-reused");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.subject_id.as_str();
+        let subject = ticket.claim_id.as_str();
         let mut child = Child(Command::new("sleep").arg("300").spawn().expect("sleep"));
         let pid = child.0.id() as i32;
         let live = LocalProcfsVerifier
@@ -3440,7 +3448,7 @@ mod tests {
         let scratch = Scratch::new("stop-unreadable");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.subject_id.as_str();
+        let subject = ticket.claim_id.as_str();
         capture(
             &registry,
             subject,

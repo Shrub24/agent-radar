@@ -40,9 +40,7 @@ pub struct HandoffIdentity {
     pub registration_id: String,
     pub session_id: String,
     pub subject_id: String,
-    pub execution_id: String,
-    #[schemars(range(min = 1u32, max = 4294967295u32))]
-    pub execution_generation: u32,
+    pub claim_id: String,
 }
 
 /// Inputs for publishing an immutable handoff. The wire request ID carries the

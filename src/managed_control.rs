@@ -35,6 +35,7 @@ pub struct Control {
     pub operation: Operation,
     pub request_id: String,
     pub subject_id: String,
+    pub claim_id: String,
     pub child_close: Option<crate::registry_observation::ChildCloseTarget>,
     pub close_request_id: Option<String>,
     /// The registration and session an enrollment names. `subject_id` is the
@@ -88,6 +89,7 @@ fn execute(
     let request = LifecycleControlRequest {
         request_id: dispatched.request_id.clone(),
         subject_id: dispatched.subject_id.clone(),
+        claim_id: dispatched.claim_id.clone(),
     };
     let primary = match (dispatched.operation, dispatched.enrollment.as_ref()) {
         (Operation::Enroll, Some(enrollment)) => controls.enroll_agent(
@@ -323,6 +325,7 @@ mod tests {
             operation: Operation::Enroll,
             request_id: "enroll-id".into(),
             subject_id: "agent-1".into(),
+            claim_id: String::new(),
             child_close: None,
             close_request_id: None,
             enrollment: Some(Enrollment {
@@ -362,6 +365,7 @@ mod tests {
             operation: Operation::Cancel,
             request_id: "cancel-id".into(),
             subject_id: "subject-id".into(),
+            claim_id: "claim-id".into(),
             child_close: Some(crate::registry_observation::ChildCloseTarget {
                 spawn_request_id: "spawn-id".into(),
                 source: "worker".into(),

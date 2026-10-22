@@ -76,7 +76,7 @@ pub struct LifecycleSubject {
     pub subject_id: String,
     /// Exact execution record ID used to match its spawn edge and process.
     #[serde(default)]
-    pub execution_id: Option<String>,
+    pub claim_id: Option<String>,
     #[serde(default)]
     pub execution_generation: Option<u32>,
     #[serde(default)]
@@ -101,6 +101,7 @@ pub struct LifecycleSubject {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ManagedSubject {
     pub subject_id: String,
+    pub claim_id: String,
     pub process: ProcessIdentity,
     pub identity_unresolved: bool,
     pub metadata: crate::control_plane::lifecycle::ManagedMetadata,
@@ -361,18 +362,14 @@ fn managed_subject(
     }
     Some(ManagedSubject {
         subject_id: subject.subject_id.clone(),
+        claim_id: subject.claim_id.clone()?,
         process: claim.clone(),
         identity_unresolved: subject.identity_unresolved,
         metadata: subject.managed.clone(),
         child_close: spawn
             .filter(|spawn| {
                 spawn.subject_id.as_deref()
-                    == Some(
-                        subject
-                            .execution_id
-                            .as_deref()
-                            .unwrap_or(&subject.subject_id),
-                    )
+                    == Some(subject.claim_id.as_deref().unwrap_or(&subject.subject_id))
             })
             .and_then(|spawn| {
                 Some(ChildCloseTarget {
@@ -897,7 +894,7 @@ mod tests {
         let agent = registered("lead", at("p1"), Some(claim.clone()));
         let subject = LifecycleSubject {
             subject_id: "logical-subject-1".into(),
-            execution_id: Some("subject-1".into()),
+            claim_id: Some("subject-1".into()),
             execution_generation: Some(1),
             spawn_request_id: Some("subject-1".into()),
             bound_registration_id: Some("lead".into()),

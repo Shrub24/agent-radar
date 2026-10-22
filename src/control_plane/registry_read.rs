@@ -189,11 +189,11 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
 }
 
 /// The stable logical id a lifecycle read pages by.
-fn logical_id(subject: &crate::control_plane::lifecycle::Subject) -> String {
+fn logical_id(subject: &crate::control_plane::lifecycle::Claim) -> String {
     subject
-        .logical_subject_id
+        .subject_id
         .clone()
-        .unwrap_or_else(|| subject.subject_id.clone())
+        .unwrap_or_else(|| subject.claim_id.clone())
 }
 
 /// Every container the daemon records, read to the end of its pages.

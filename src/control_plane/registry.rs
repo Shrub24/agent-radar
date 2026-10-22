@@ -512,7 +512,7 @@ impl Registry {
         if let Some(store) = store {
             let event = crate::control_plane::store::Event {
                 subject_id: None,
-                execution_id: None,
+                claim_id: None,
                 execution_generation: None,
                 lifecycle_event_id: None,
                 seq: 0,

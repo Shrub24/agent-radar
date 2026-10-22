@@ -151,8 +151,7 @@ export interface HandoffSerialize {
  * generation identify the exact execution that took the action.
  */
 export interface HandoffIdentity {
-  execution_generation: number;
-  execution_id: string;
+  claim_id: string;
   registration_id: string;
   session_id: string;
   subject_id: string;
@@ -172,8 +171,7 @@ export interface HandoffReceiptSerialize {
  * generation identify the exact execution that took the action.
  */
 export interface HandoffIdentity {
-  execution_generation: number;
-  execution_id: string;
+  claim_id: string;
   registration_id: string;
   session_id: string;
   subject_id: string;
@@ -902,6 +900,7 @@ export interface RegistryLocation {
  */
 export interface ManagedSubject {
   child_close: ChildCloseTarget | null;
+  claim_id: string;
   identity_unresolved: boolean;
   metadata: ManagedMetadata;
   process: ProcessIdentity;

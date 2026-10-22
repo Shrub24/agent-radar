@@ -212,7 +212,7 @@ fn establish_lifecycle(
     // The one evidence read this pass makes: the same fenced birth-identity check
     // the observation pass uses, so a process that died while nobody watched is
     // established here and recorded through the same reducer.
-    match lifecycle::observe_exit(registry, &subject.subject_id, verifier, now_ms) {
+    match lifecycle::observe_exit(registry, &subject.claim_id, verifier, now_ms) {
         Ok(true) => Ok((
             Some(RequestOutcome::Completed),
             "the captured process is verifiably gone".into(),

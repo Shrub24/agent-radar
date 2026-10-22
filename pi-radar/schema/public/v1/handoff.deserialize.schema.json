@@ -4,13 +4,7 @@
       "additionalProperties": false,
       "description": "The current managed Pi execution that published or received a handoff.\n`subject_id` is stable across verified successors; `execution_id` and\ngeneration identify the exact execution that took the action.",
       "properties": {
-        "execution_generation": {
-          "format": "uint32",
-          "maximum": 4294967295,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "execution_id": {
+        "claim_id": {
           "type": "string"
         },
         "registration_id": {
@@ -27,8 +21,7 @@
         "registration_id",
         "session_id",
         "subject_id",
-        "execution_id",
-        "execution_generation"
+        "claim_id"
       ],
       "type": "object"
     }

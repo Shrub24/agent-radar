@@ -717,6 +717,7 @@ pub enum Confirmed {
         operation: Operation,
         request_id: String,
         subject_id: String,
+        claim_id: String,
         child_close: Option<crate::registry_observation::ChildCloseTarget>,
         close_request_id: Option<String>,
     },
@@ -2553,6 +2554,7 @@ impl App {
                     .child_close
                     .as_ref()
                     .map(|_| crate::control_plane::random_uuid()),
+                claim_id: expected.claim_id.clone(),
                 child_close: expected.child_close.clone(),
             });
         }
@@ -5398,6 +5400,7 @@ mod tests {
                     spawn: None,
                     managed: Some(crate::registry_observation::ManagedSubject {
                         subject_id: "subject-managed".into(),
+                    claim_id: "claim-managed".into(),
                         process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
                         identity_unresolved: false,
                         metadata: crate::control_plane::lifecycle::ManagedMetadata::default(),

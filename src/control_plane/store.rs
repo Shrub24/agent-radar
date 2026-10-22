@@ -104,7 +104,7 @@ pub struct Event {
     pub subject_id: Option<String>,
     /// Exact lifecycle execution affected by a subject event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_id: Option<String>,
+    pub claim_id: Option<String>,
     /// One-based logical execution generation for lifecycle events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_generation: Option<u32>,
@@ -1263,7 +1263,7 @@ mod tests {
             store
                 .append_event(Event {
                     subject_id: None,
-                    execution_id: None,
+                    claim_id: None,
                     execution_generation: None,
                     lifecycle_event_id: None,
                     seq: 0,
@@ -1288,7 +1288,7 @@ mod tests {
         let event = reopened
             .append_event(Event {
                 subject_id: None,
-                execution_id: None,
+                claim_id: None,
                 execution_generation: None,
                 lifecycle_event_id: None,
                 seq: 0,
@@ -1317,7 +1317,7 @@ mod tests {
                         store
                             .append_event(Event {
                                 subject_id: None,
-                                execution_id: None,
+                                claim_id: None,
                                 execution_generation: None,
                                 lifecycle_event_id: None,
                                 seq: 0,

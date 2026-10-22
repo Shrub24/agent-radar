@@ -2150,3 +2150,50 @@ test("a throwing diagnose is contained: the refusal does not end the watcher", a
 		controller.abort();
 	}
 });
+
+test("spawn.list uses process registration, paginates, and surfaces claim refusal", async () => {
+	const spawn = { version: 1, request_id: UUID_B, parent: UUID_A,
+		created: "completed", launched: "completed", state: "unbound",
+		recorded_at: "2026-10-22T00:00:00Z", parent_subject_id: UUID_A };
+	let granted = true;
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["registry.v1", "spawn.list.v1"] });
+		if (request.method === "agent.register")
+			return reply(request, { registration: { registration_id: UUID_A } });
+		if (!granted) return refuse(request, "refused", "registration has no granted subject");
+		return reply(request, request.params.after ? { spawns: [] } : { spawns: [spawn], next: UUID_B });
+	});
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		const missing = await client.spawnList({});
+		assert.equal(missing.ok ? "" : missing.code, "refused");
+		assert.equal(fixture.requests.length, 0);
+		assert.equal((await client.register({ source: "herdsman-pi", incarnation: UUID_A })).ok, true);
+		assert.deepEqual(await client.spawnList({ limit: 1 }), { ok: true, value: { spawns: [spawn], next: UUID_B } });
+		assert.deepEqual(await client.spawnList({ after: UUID_B, limit: 1 }), { ok: true, value: { spawns: [] } });
+		assert.deepEqual(fixture.requests.filter((r) => r.method === "spawn.list").map((r) => r.params), [
+			{ registration_id: UUID_A, limit: 1 }, { registration_id: UUID_A, after: UUID_B, limit: 1 },
+		]);
+		granted = false;
+		const refused = await client.spawnList({});
+		assert.equal(refused.ok ? "" : refused.code, "refused");
+		assert.match(refused.ok ? "" : refused.message, /granted subject/);
+	} finally { cleanup(fixture); }
+});
+
+test("spawn.list requires its negotiated capability before dispatch", async () => {
+	const fixture = makeFixture((request) => request.method === "daemon.ping"
+		? reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["registry.v1"] })
+		: reply(request, { registration: { registration_id: UUID_A } }));
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		await client.register({ source: "herdsman-pi", incarnation: UUID_A });
+		const result = await client.spawnList({});
+		assert.equal(result.ok ? "" : result.code, "unsupported");
+		assert.match(result.ok ? "" : result.message, /spawn.list.v1/);
+		assert.equal(fixture.requests.some((r) => r.method === "spawn.list"), false);
+	} finally { cleanup(fixture); }
+});

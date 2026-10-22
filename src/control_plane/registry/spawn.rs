@@ -378,12 +378,16 @@ pub fn record(
 
 /// Attaches the launch subject a tracked spawn's edge belongs to. An edge names
 /// at most one subject, and attaching it again is refused.
+/// Attaches the attempt a tracked launch pre-minted. That claim id is also the
+/// edge's credential, so a child presents one secret rather than the claim plus a
+/// second per-edge token.
 pub fn attach_subject(
     registry: &Registry,
     request_id: &str,
-    subject_id: &str,
+    claim_id: &str,
 ) -> Result<SpawnEdge, String> {
     canonical_uuid("request_id", request_id)?;
+    canonical_uuid("claim_id", claim_id)?;
     let _transition = registry.transition();
     let stored = stored_edge(registry, request_id)?;
     if stored.subject_id.is_some() {
@@ -392,7 +396,8 @@ pub fn attach_subject(
         ));
     }
     let edge = SpawnEdge {
-        subject_id: Some(subject_id.to_string()),
+        subject_id: Some(claim_id.to_string()),
+        token: claim_id.to_string(),
         ..stored
     };
     write_edge(registry, &edge)?;

@@ -567,6 +567,7 @@ fn dispatch(
             operation,
             request_id,
             subject_id,
+            claim_id,
             child_close,
             close_request_id,
         }) => {
@@ -582,6 +583,7 @@ fn dispatch(
                 operation,
                 request_id,
                 subject_id,
+                claim_id,
                 child_close,
                 close_request_id,
                 enrollment: None,

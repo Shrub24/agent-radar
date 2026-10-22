@@ -42,15 +42,15 @@ fn replay_restores_revocation_without_credentials_in_events() {
     let fixture = Fixture::new();
     let registry = fixture.registry();
     let ticket = create(&registry);
-    lifecycle::cancel(&registry, &ticket.subject_id, &LocalProcfsVerifier, 2000).unwrap();
-    let before = lifecycle::read(&registry, &ticket.subject_id)
+    lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).unwrap();
+    let before = lifecycle::read(&registry, &ticket.claim_id)
         .unwrap()
         .unwrap();
     assert_eq!(before.state, State::Revoked);
     assert!(before.correlation.is_none());
     drop(registry);
     let restored = fixture.registry();
-    let after = lifecycle::read(&restored, &ticket.subject_id)
+    let after = lifecycle::read(&restored, &ticket.claim_id)
         .unwrap()
         .unwrap();
     assert!(
@@ -84,9 +84,9 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
     let directory = fixture.directory();
     let displaced = fixture.0.join("displaced-events");
     fs::rename(&directory, &displaced).unwrap();
-    assert!(lifecycle::cancel(&registry, &ticket.subject_id, &LocalProcfsVerifier, 2000).is_err());
+    assert!(lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).is_err());
     assert_eq!(
-        lifecycle::read(&registry, &ticket.subject_id)
+        lifecycle::read(&registry, &ticket.claim_id)
             .unwrap()
             .unwrap()
             .state,
@@ -94,19 +94,19 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
     );
     fs::rename(&displaced, &directory).unwrap();
     assert!(
-        lifecycle::cancel(&registry, &ticket.subject_id, &LocalProcfsVerifier, 3000).is_err(),
+        lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 3000).is_err(),
         "a possibly committed sequence must not be overwritten"
     );
     drop(registry);
     let restored = fixture.registry();
     assert_eq!(
-        lifecycle::read(&restored, &ticket.subject_id)
+        lifecycle::read(&restored, &ticket.claim_id)
             .unwrap()
             .unwrap()
             .state,
         State::Pending
     );
-    lifecycle::cancel(&restored, &ticket.subject_id, &LocalProcfsVerifier, 4000).unwrap();
+    lifecycle::cancel(&restored, &ticket.claim_id, &LocalProcfsVerifier, 4000).unwrap();
 }
 
 #[test]
@@ -172,10 +172,10 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
     let displaced = fixture.0.join("displaced-pointer-journal");
     fs::rename(&journal, &displaced).unwrap();
     fs::create_dir(&journal).unwrap();
-    lifecycle::cancel(&registry, &ticket.subject_id, &LocalProcfsVerifier, 2000).unwrap();
+    lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).unwrap();
     assert!(store.events().is_err());
     assert_eq!(
-        lifecycle::read(&registry, &ticket.subject_id)
+        lifecycle::read(&registry, &ticket.claim_id)
             .unwrap()
             .unwrap()
             .state,
@@ -192,7 +192,7 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
         vec!["lifecycle.created", "lifecycle.revoked"]
     );
     assert!(pointers.iter().all(
-        |event| event.subject_id.as_deref() == Some(&ticket.subject_id)
+        |event| event.subject_id.as_deref() == Some(&ticket.claim_id)
             && event.lifecycle_event_id.is_some()
     ));
     assert_eq!(store.events().unwrap(), pointers);
@@ -248,7 +248,7 @@ fn legacy_subject_is_explicitly_imported_before_its_next_transition() {
     let fixture = Fixture::new();
     let registry = fixture.registry();
     let ticket = create(&registry);
-    let mut legacy = lifecycle::read(&registry, &ticket.subject_id)
+    let mut legacy = lifecycle::read(&registry, &ticket.claim_id)
         .unwrap()
         .unwrap();
     legacy.correlation = Some(ticket.correlation);
@@ -256,14 +256,14 @@ fn legacy_subject_is_explicitly_imported_before_its_next_transition() {
         fixture
             .0
             .join("lifecycle")
-            .join(format!("{}.json", ticket.subject_id)),
+            .join(format!("{}.json", ticket.claim_id)),
         serde_json::to_vec(&legacy).unwrap(),
     )
     .unwrap();
     drop(registry);
     fs::remove_dir_all(fixture.directory()).unwrap();
     let restored = fixture.registry();
-    lifecycle::cancel(&restored, &ticket.subject_id, &LocalProcfsVerifier, 2000).unwrap();
+    lifecycle::cancel(&restored, &ticket.claim_id, &LocalProcfsVerifier, 2000).unwrap();
     let first: Event = serde_json::from_slice(
         &fs::read(fixture.directory().join("00000000000000000001.json")).unwrap(),
     )

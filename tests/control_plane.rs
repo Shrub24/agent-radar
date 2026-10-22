@@ -2053,9 +2053,10 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         }),
     );
     assert_eq!(publish["result"]["created"], true, "{publish}");
+    // The sender names its attempt, not an ordinal position in a chain.
     assert_eq!(
-        publish["result"]["handoff"]["sender"]["execution_generation"],
-        1
+        publish["result"]["handoff"]["sender"]["claim_id"],
+        worker_subject
     );
     let replay = client.call_id(
         &handoff_id,
@@ -4486,6 +4487,7 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .cancel_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: cancel_id.clone(),
+                claim_id: subject_id.clone(),
                 subject_id: subject_id.clone(),
             },
             &AtomicBool::new(false),
@@ -4513,6 +4515,7 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .cancel_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: cancel_id,
+                claim_id: subject_id.clone(),
                 subject_id,
             },
             &AtomicBool::new(false),
@@ -4889,7 +4892,7 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
 
     let mut daemon = tmux_daemon(&socket, &state, &server);
     let mut client = Client::dial(&socket);
-    let cancelled = cancel_subject(&mut client, &random_uuid(), &ticket.subject_id);
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &ticket.claim_id);
     assert_eq!(
         result_record(&cancelled)["outcome"],
         "completed",
@@ -4900,7 +4903,7 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
         json!(["launch revoked", "pane kept", "process identity unresolved"]),
         "{cancelled}"
     );
-    let subject = subject_record(&state, &ticket.subject_id);
+    let subject = subject_record(&state, &ticket.claim_id);
     assert_eq!(subject["state"], "revoked");
     assert_eq!(subject["signalled_at"], Value::Null, "{subject}");
 
@@ -5017,7 +5020,6 @@ fn a_tracked_launch_runs_its_requested_program_and_keeps_its_secrets_private() {
         for secret in [
             "mark-value-7f3a",
             "exec sleep 300",
-            &token,
             "PI_RADAR_LAUNCH_CORRELATION",
         ] {
             assert!(!text.contains(secret), "{secret} is in {text}");
@@ -6361,10 +6363,14 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
         .expect("a minted token")
         .to_string();
     assert_eq!(launches[0].spawn_token, Some(token.clone()));
-    // The token is the only thing that binds the edge to its child, so it is a
-    // credential: it travels to the pane and appears in no answer.
-    no_secret(&response, &token);
-    no_secret(&client.call("mux.request.get", json!({"id": id})), &token);
+    // A tracked launch's credential is its pre-minted claim, which is a public
+    // identifier: what binds the edge to its child is the verified process birth
+    // identity, so publishing the claim id grants no one the launch.
+    assert_eq!(
+        recorded_edge(&sandbox.state(), &id)["subject_id"].as_str(),
+        Some(token.as_str()),
+        "the credential is the claim id, not a second per-edge token"
+    );
 
     let secret = "PRIVATE_ENV_SENTINEL_8812";
     let get = client.call("mux.request.get", json!({"id": id}));
@@ -11262,6 +11268,7 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         .restart_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: restart_id.clone(),
+                claim_id: subject.clone(),
                 subject_id: subject.clone(),
             },
             &AtomicBool::new(false),
@@ -11295,7 +11302,7 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         .as_array()
         .expect("semantic events")
         .iter()
-        .filter(|event| event["execution_id"] == successor_id)
+        .filter(|event| event["claim_id"] == successor_id)
         .collect();
     assert!(
         !successor_events.is_empty(),
@@ -11304,7 +11311,7 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
     assert!(
         successor_events
             .iter()
-            .all(|event| { event["subject_id"] == subject && event["execution_generation"] == 2 })
+            .all(|event| { event["subject_id"] == subject && event["claim_id"] == successor_id })
     );
     assert!(
         launches[0]
@@ -11324,6 +11331,7 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         .restart_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: restart_id.clone(),
+                claim_id: subject.clone(),
                 subject_id: subject.clone(),
             },
             &AtomicBool::new(false),

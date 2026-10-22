@@ -102,7 +102,7 @@ pub enum Standing {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Claim {
+pub struct Decision {
     pub registration_id: String,
     pub claim_id: String,
     pub session_id: String,
@@ -124,8 +124,8 @@ pub struct Answer {
     pub subject_id: Option<String>,
 }
 
-impl From<&Claim> for Answer {
-    fn from(claim: &Claim) -> Self {
+impl From<&Decision> for Answer {
+    fn from(claim: &Decision) -> Self {
         Self {
             registration_id: claim.registration_id.clone(),
             claim_id: claim.claim_id.clone(),
@@ -135,7 +135,7 @@ impl From<&Claim> for Answer {
     }
 }
 
-fn read(registry: &Registry, name: &str) -> Result<Option<Claim>, String> {
+fn read(registry: &Registry, name: &str) -> Result<Option<Decision>, String> {
     let path = registry.root.join("claims").join(name);
     if !path.try_exists().map_err(|e| e.to_string())? {
         return Ok(None);
@@ -146,7 +146,7 @@ fn read(registry: &Registry, name: &str) -> Result<Option<Claim>, String> {
         .map_err(|e| format!("claim {}: {e}", path.display()))
 }
 
-fn write(registry: &Registry, name: &str, claim: &Claim) -> Result<(), String> {
+fn write(registry: &Registry, name: &str, claim: &Decision) -> Result<(), String> {
     let directory = registry.root.join("claims");
     super::prepare_directory(&directory)?;
     let bytes = serde_json::to_vec(claim).map_err(|e| e.to_string())?;
@@ -179,7 +179,7 @@ pub fn attachment(
     )
 }
 
-pub fn current(registry: &Registry, registration_id: &str) -> Result<Option<Claim>, String> {
+pub fn current(registry: &Registry, registration_id: &str) -> Result<Option<Decision>, String> {
     validate_registration_id(registration_id)?;
     match read(registry, &format!("current-{registration_id}.json"))? {
         Some(pointer) => read(registry, &format!("{}.json", pointer.claim_id)),
@@ -194,7 +194,7 @@ pub fn begin(
     claim_id: &str,
     session_id: &str,
     location: Option<RegistryLocation>,
-) -> Result<Claim, String> {
+) -> Result<Decision, String> {
     for id in [registration_id, claim_id, session_id] {
         validate_registration_id(id)?;
     }
@@ -218,6 +218,11 @@ pub fn begin(
         return Ok(claim);
     }
     if let Some(mut previous) = current(registry, registration_id)? {
+        crate::control_plane::lifecycle::release_attachment(
+            registry,
+            &previous.claim_id,
+            previous.subject_id.as_deref(),
+        )?;
         previous.standing = Standing::Released;
         previous.subject_id = None;
         write(registry, &format!("{}.json", previous.claim_id), &previous)?;
@@ -227,7 +232,7 @@ pub fn begin(
             &previous,
         )?;
     }
-    let claim = Claim {
+    let claim = Decision {
         registration_id: registration_id.into(),
         claim_id: claim_id.into(),
         session_id: session_id.into(),
@@ -240,7 +245,7 @@ pub fn begin(
 }
 
 /// Decision first, current projection second. Reassertion heals an interrupted projection.
-pub fn save(registry: &Registry, claim: &Claim) -> Result<(), String> {
+pub fn save(registry: &Registry, claim: &Decision) -> Result<(), String> {
     write(registry, &format!("{}.json", claim.claim_id), claim)?;
     write(
         registry,
@@ -253,13 +258,18 @@ pub fn release(
     registry: &Registry,
     registration_id: &str,
     claim_id: &str,
-) -> Result<Claim, String> {
+) -> Result<Decision, String> {
     validate_registration_id(registration_id)?;
     validate_registration_id(claim_id)?;
     let mut claim = read(registry, &format!("{claim_id}.json"))?.ok_or("claim is not recorded")?;
     if claim.registration_id != registration_id {
         return Err("claim belongs to another registration".into());
     }
+    crate::control_plane::lifecycle::release_attachment(
+        registry,
+        claim_id,
+        claim.subject_id.as_deref(),
+    )?;
     claim.standing = Standing::Released;
     claim.subject_id = None;
     write(registry, &format!("{claim_id}.json"), &claim)?;

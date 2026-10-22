@@ -1056,6 +1056,7 @@ pub trait LifecycleControls: Send + Sync {
 pub struct LifecycleControlRequest {
     pub request_id: String,
     pub subject_id: String,
+    pub claim_id: String,
 }
 
 /// The operation record the daemon committed, without private launch data.
@@ -1207,7 +1208,7 @@ impl DaemonRuntime {
             &self.socket,
             &request.request_id,
             method,
-            json!({"request": {"subject_id": request.subject_id}, "requester": REQUESTER}),
+            json!({"request": {"subject_id": request.subject_id, "claim_id": request.claim_id}, "requester": REQUESTER}),
             cancel,
         )
         .map_err(|failure| failure.message)?;

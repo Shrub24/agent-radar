@@ -1128,11 +1128,10 @@ fn communication_identity(
         registration_id: registration_id.to_owned(),
         session_id,
         subject_id: subject
-            .logical_subject_id
+            .subject_id
             .clone()
-            .unwrap_or_else(|| subject.subject_id.clone()),
-        execution_id: subject.subject_id,
-        execution_generation: subject.execution_generation.unwrap_or(1),
+            .unwrap_or_else(|| subject.claim_id.clone()),
+        claim_id: subject.claim_id,
     })
 }
 
@@ -1177,7 +1176,7 @@ fn append_communication_event(
 ) {
     let event = store::Event {
         subject_id,
-        execution_id: None,
+        claim_id: None,
         execution_generation: None,
         lifecycle_event_id: None,
         seq: 0,
@@ -2327,7 +2326,7 @@ fn presence_request(
     };
     let _presence = registry.presence.lock().unwrap_or_else(|e| e.into_inner());
     let now = store::now_ms();
-    let result = (|| -> Result<presence::Claim, String> {
+    let result = (|| -> Result<presence::Decision, String> {
         if request.method == "agent.release" {
             let release: presence::Release =
                 serde_json::from_value(request.params.clone()).map_err(|e| e.to_string())?;
@@ -2469,7 +2468,7 @@ fn presence_request(
                 subjects::read(&registry, &id)?.ok_or("enrolled subject is missing")?
             }
         };
-        let subject_id = subject.logical_subject_id.unwrap_or(subject.subject_id);
+        let subject_id = subject.subject_id.unwrap_or(subject.claim_id);
         if report
             .subject_id
             .as_deref()
@@ -2807,7 +2806,7 @@ fn registry_request(
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as i64);
             if let Err(error) =
-                subjects::observe_exit(&registry, &current.subject_id, verifier.as_ref(), now)
+                subjects::observe_exit(&registry, &current.claim_id, verifier.as_ref(), now)
             {
                 return registry_error(request, error);
             }
@@ -2874,10 +2873,10 @@ fn registry_request(
                 .map(|subject| {
                     (
                         subject
-                            .logical_subject_id
+                            .subject_id
                             .clone()
-                            .unwrap_or_else(|| subject.subject_id.clone()),
-                        subject.subject_id.clone(),
+                            .unwrap_or_else(|| subject.claim_id.clone()),
+                        subject.claim_id.clone(),
                     )
                 })
                 .collect();
@@ -5794,7 +5793,9 @@ fn execute_spawn(
 #[derive(Default)]
 struct SpawnLineage {
     session: Option<String>,
-    identity: Option<(String, u32)>,
+    identity: Option<(String, String)>,
+    prepared: Option<(Bootstrap, subjects::Ticket)>,
+    in_place: bool,
 }
 
 /// Creates the pane a child runs in and launches it there, once its parent pane is
@@ -5884,7 +5885,9 @@ fn spawn_child(
     }
     // A backend that tracks its launches gets the subject before any effect, so
     // the bootstrap's correlation is recorded before the launch can run it.
-    let tracking = if backend
+    let tracking = if let Some(prepared) = lineage.prepared {
+        Some(prepared)
+    } else if backend
         .primitives()
         .contains(Primitives::LIFECYCLE_TRACKING)
     {
@@ -5925,11 +5928,19 @@ fn spawn_child(
     let verifier = Arc::clone(&locked(core).verifier);
     let instance = serving_identity(&backend, &verifier, &cancel, verification);
     let create_request = CreateRequest::PaneSplit {
-        pane_id: parent_pane,
+        pane_id: parent_pane.clone(),
         direction: SplitDirection::Right,
         focus: false,
     };
-    let created = backend.create(&create_request, &cancel);
+    let created = if lineage.in_place {
+        CreateOutcome::Completed(crate::runtime::CreatedLocation {
+            workspace_id: None,
+            tab_id: None,
+            pane_id: Some(parent_pane),
+        })
+    } else {
+        backend.create(&create_request, &cancel)
+    };
     let (created_outcome, named, mut created_message) = match &created {
         CreateOutcome::Completed(named) => (
             RequestOutcome::Completed,
@@ -5947,7 +5958,7 @@ fn spawn_child(
     // The pane this launch was dispatched into is recorded as one of this
     // daemon's containers before the edge and the launch are recorded: a spawned
     // agent's slot is topology, not only a location on an edge.
-    if let Some(named) = named {
+    if let Some(named) = named.filter(|_| !lineage.in_place) {
         let registry = {
             let core = locked(core);
             Arc::clone(&core.registry)
@@ -6115,7 +6126,7 @@ fn track_launch(
     request_id: &str,
     launch: subjects::LaunchContext,
     session: Option<String>,
-    identity: Option<(String, u32)>,
+    identity: Option<(String, String)>,
     managed: subjects::ManagedMetadata,
     now: i64,
 ) -> Result<(Bootstrap, subjects::Ticket), String> {
@@ -6128,7 +6139,7 @@ fn track_launch(
     let ticket = subjects::create_with_intent(
         &registry, request_id, launch, session, identity, managed, now,
     )?;
-    registry.attach_subject(request_id, &ticket.subject_id)?;
+    registry.attach_subject(request_id, &ticket.claim_id)?;
     Ok((bootstrap, ticket))
 }
 
@@ -6309,6 +6320,8 @@ fn install_exit_wake(
 struct SubjectParams {
     #[serde(default)]
     subject_id: Option<String>,
+    #[serde(default)]
+    claim_id: Option<String>,
     #[serde(default)]
     spawn_request_id: Option<String>,
 }
@@ -6666,6 +6679,8 @@ fn record_enrollment(
 #[serde(deny_unknown_fields)]
 struct RestartParams {
     subject_id: String,
+    #[serde(default)]
+    claim_id: Option<String>,
 }
 
 /// Restarts an enrolled or tracked lead: stops its verified process, then launches a
@@ -6725,8 +6740,20 @@ fn execute_restart(
         }
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    // The anchor is the lead's own pane: a dead lead's pane stays addressable under
-    // remain-on-exit, and a replacement is split from it rather than from a parent.
+    // A restart names the claim it was issued against; one that names none asks
+    // for the subject's current claim.
+    if let Some(claim_id) = params.claim_id.as_deref()
+        && claim_id != subject.claim_id
+    {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "the requested claim is not current; nothing was signalled",
+            ),
+        );
+    }
+    // A restart retains the lead's existing pane.
     let anchor = match subject.bound_registration_id.as_deref() {
         Some(agent) => match registry.get(agent) {
             Ok(Some(registration)) => registration
@@ -6751,12 +6778,12 @@ fn execute_restart(
     };
     let now = store::now_ms();
     let logical_subject_id = subject
-        .logical_subject_id
+        .subject_id
         .clone()
-        .unwrap_or_else(|| subject.subject_id.clone());
+        .unwrap_or_else(|| subject.claim_id.clone());
     let mut aliases = subjects::execution_ids_for_logical(&registry, &logical_subject_id);
-    if !aliases.contains(&subject.subject_id) {
-        aliases.push(subject.subject_id.clone());
+    if !aliases.contains(&subject.claim_id) {
+        aliases.push(subject.claim_id.clone());
     }
     let cancel = match admit_with_aliases(
         ops::Operation::Restart,
@@ -6806,7 +6833,7 @@ fn execute_restart(
 /// the successor record, then the replacement launch. Each stage reports on its own.
 fn restart_lead(
     core: &Arc<Mutex<Core>>,
-    subject: &subjects::Subject,
+    subject: &subjects::Claim,
     anchor: &str,
     cancel: &AtomicBool,
     verification: &Arc<VerificationBudget>,
@@ -6840,9 +6867,6 @@ fn restart_lead(
             "this process is already superseded by spawn {successor}"
         ));
     }
-    let Some(next_generation) = subject.execution_generation.unwrap_or(1).checked_add(1) else {
-        return refusal_settlement("execution generation is exhausted");
-    };
     match backend.inventory(cancel) {
         Ok(fleet)
             if fleet
@@ -6896,8 +6920,37 @@ fn restart_lead(
     if let Err(refusal) = preflight_launch(core, &params) {
         return refusal_settlement(refusal.message);
     }
+    let successor = store::random_uuid();
+    let intent = registry::SpawnRequest {
+        request_id: successor.clone(),
+        parent: params.parent.clone(),
+        parent_session_id: params.parent_session_id.clone(),
+        parent_subject_id: params.managed.parent_subject_id.clone(),
+    };
+    if let Err(error) = registry.record_spawn(&intent, now) {
+        return refusal_settlement(error);
+    }
+    let identity = (
+        subject
+            .subject_id
+            .clone()
+            .unwrap_or_else(|| subject.claim_id.clone()),
+        subject.claim_id.clone(),
+    );
+    let prepared = match track_launch(
+        core,
+        &successor,
+        requested_launch(&params),
+        Some(session.into()),
+        Some(identity.clone()),
+        subject.managed.clone(),
+        now,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return refusal_settlement(error),
+    };
     let mut effects = Vec::new();
-    let termination = match subjects::stop(&registry, &subject.subject_id, verifier.as_ref(), now) {
+    let termination = match subjects::stop(&registry, &subject.claim_id, verifier.as_ref(), now) {
         Ok(termination) => termination,
         Err(error) => {
             return (
@@ -6935,24 +6988,7 @@ fn restart_lead(
             );
         }
     }
-    let successor = store::random_uuid();
-    if let Err(error) =
-        subjects::set_successor(&registry, &subject.subject_id, &successor, store::now_ms())
-    {
-        return (
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some(error),
-            effects,
-        );
-    }
     effects.push(format!("successor {successor}"));
-    let intent = registry::SpawnRequest {
-        request_id: successor.clone(),
-        parent: params.parent.clone(),
-        parent_session_id: params.parent_session_id.clone(),
-        parent_subject_id: params.managed.parent_subject_id.clone(),
-    };
     let replacement = Request {
         id: successor.clone(),
         method: ops::Operation::Spawn.as_str().to_string(),
@@ -6974,13 +7010,9 @@ fn restart_lead(
         anchor.to_string(),
         SpawnLineage {
             session: Some(session.to_string()),
-            identity: Some((
-                subject
-                    .logical_subject_id
-                    .clone()
-                    .unwrap_or_else(|| subject.subject_id.clone()),
-                next_generation,
-            )),
+            identity: Some(identity),
+            prepared: Some(prepared),
+            in_place: true,
         },
     );
     match registry.spawn_edge(&successor) {
@@ -7018,10 +7050,7 @@ fn restart_lead(
 }
 
 /// The subject a cancel or stop names and the target it is admitted under.
-fn current_presence_grant(
-    registry: &Registry,
-    subject: &subjects::Subject,
-) -> Result<bool, String> {
+fn current_presence_grant(registry: &Registry, subject: &subjects::Claim) -> Result<bool, String> {
     let (Some(registration_id), Some(session)) = (
         subject.bound_registration_id.as_deref(),
         subject.session.as_deref(),
@@ -7037,10 +7066,7 @@ fn current_presence_grant(
     let Some(claim) = registry::presence::current(registry, registration_id)? else {
         return Ok(false);
     };
-    let expected_subject = subject
-        .logical_subject_id
-        .as_deref()
-        .unwrap_or(&subject.subject_id);
+    let expected_subject = subject.subject_id.as_deref().unwrap_or(&subject.claim_id);
     Ok(claim.standing == registry::presence::Standing::Granted
         && claim.session_id == session
         && claim.subject_id.as_deref() == Some(expected_subject))
@@ -7071,9 +7097,19 @@ fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String,
             ));
         }
     };
+    // A caller that names the claim it was issued against is fenced to it; one
+    // that names none asks for the subject's current claim.
+    if let Some(claim_id) = params.claim_id.as_deref()
+        && claim_id != subject.claim_id
+    {
+        return Err(Refusal::new(
+            Code::Refused,
+            "the requested claim is not current; nothing was signalled",
+        ));
+    }
     Ok((
-        subject.subject_id.clone(),
-        subject.logical_subject_id.unwrap_or(subject.subject_id),
+        subject.claim_id.clone(),
+        subject.subject_id.unwrap_or(subject.claim_id),
     ))
 }
 
@@ -7687,10 +7723,59 @@ fn remove_socket_if_owned(path: &Path, identity: Option<(u64, u64)>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     fn path_value(value: &str) -> PathBuf {
         PathBuf::from(value)
+    }
+
+    /// A control naming a claim the subject has moved past targets nothing: the
+    /// stale id is refused before any signal, so a reply that arrives late cannot
+    /// end the successor the operator never saw.
+    #[test]
+    fn a_control_naming_a_stale_claim_signals_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "radar-stale-claim-{}",
+            crate::control_plane::random_uuid()
+        ));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .expect("scratch root");
+        let registry = Registry::open(&root).expect("registry");
+        let claim = crate::control_plane::lifecycle::create(
+            &registry,
+            "01a10c77-8a6b-7035-8a0e-b1fa607bb507",
+            crate::control_plane::lifecycle::LaunchContext {
+                executable: "/bin/true".into(),
+                argv: Vec::new(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+            },
+            None,
+            1,
+        )
+        .expect("claim");
+        let stale = SubjectParams {
+            subject_id: Some(claim.claim_id.clone()),
+            claim_id: Some(crate::control_plane::random_uuid()),
+            spawn_request_id: None,
+        };
+        let refusal = cancel_target(&registry, &stale).expect_err("a stale claim is refused");
+        assert!(refusal.message.contains("not current"), "{refusal:?}");
+        let current = SubjectParams {
+            subject_id: Some(claim.claim_id.clone()),
+            claim_id: Some(claim.claim_id.clone()),
+            spawn_request_id: None,
+        };
+        assert_eq!(
+            cancel_target(&registry, &current)
+                .expect("the current claim is admitted")
+                .0,
+            claim.claim_id
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn identity(pid: i32) -> crate::model::ProcessIdentity {
@@ -7715,7 +7800,7 @@ mod tests {
     fn event(seq: u64) -> store::Event {
         store::Event {
             subject_id: None,
-            execution_id: None,
+            claim_id: None,
             execution_generation: None,
             lifecycle_event_id: None,
             seq,

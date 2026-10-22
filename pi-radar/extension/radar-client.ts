@@ -11,6 +11,8 @@ import type {
 	HandoffSerialize,
 	ManagedLaunchMetadataDeserialize,
 	SpawnExitObservationSerialize,
+	SpawnListParamsDeserialize,
+	SpawnListPageSerialize,
 } from "./generated-contracts.ts";
 
 /**
@@ -41,6 +43,7 @@ export const RADAR_MINIMUM_REVISION = 5;
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
 export const RADAR_SPAWN_CONTRACT = "spawn.v1";
+export const RADAR_SPAWN_LIST_CONTRACT = "spawn.list.v1";
 export const RADAR_SPAWN_CLOSE_CONTRACT = "spawn.close.v1";
 export const RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT = "spawn.launch_context.v1";
 export const RADAR_EVENTS_CONTRACT = "events.v1";
@@ -1104,6 +1107,8 @@ export type RadarClient = {
 		env?: Record<string, string>;
 		managed?: RadarManagedLaunchMetadata;
 	}): Promise<RadarResult<RadarSpawnEdge>>;
+	/** List launches owned by this client's registered process. */
+	spawnList(request: Pick<SpawnListParamsDeserialize, "after" | "limit">): Promise<RadarResult<SpawnListPageSerialize>>;
 	spawnGet(request_id: string): Promise<RadarResult<RadarSpawnTopology>>;
 	/** The registered child's process verdict, read from its immutable claim. */
 	agentGet(registration_id: string): Promise<RadarResult<RadarAgentProcess>>;
@@ -1447,6 +1452,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 			};
 		return answer;
 	};
+	let processRegistrationId: string | undefined;
 	let handshake: Promise<RadarResult<RadarHandshake>> | undefined;
 	const negotiated = async (): Promise<RadarResult<RadarHandshake>> => {
 		handshake ??= probe();
@@ -1552,6 +1558,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				const record = (answer.value as { registration?: unknown }).registration;
 				const agentId = stringAt(record, "registration_id");
 				if (!isUuid(agentId)) return protocol("registration reply carries no registration_id");
+				processRegistrationId = agentId;
 				return { ok: true, value: { registration_id: agentId } };
 			});
 		},
@@ -1704,6 +1711,32 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					);
 				},
 			);
+		},
+		async spawnList(request) {
+			const registrationId = processRegistrationId;
+			if (registrationId === undefined)
+				return { ok: false, code: "refused", message: "spawn.list requires this client's process registration" };
+			return withContract(RADAR_SPAWN_LIST_CONTRACT, async () => {
+				const params: SpawnListParamsDeserialize = {
+					registration_id: registrationId,
+					...(request.after !== undefined ? { after: request.after } : {}),
+					...(request.limit !== undefined ? { limit: request.limit } : {}),
+				};
+				const answer = await call("spawn.list", { ...params });
+				if (answer.ok === false) return answer;
+				const spawns = recordAt(answer.value, "spawns");
+				const next = recordAt(answer.value, "next");
+				if (!Array.isArray(spawns) || (next != null && !isUuid(next)))
+					return protocol("spawn.list reply carries no valid page");
+				for (const spawn of spawns) {
+					const decoded = spawnTopology(spawn);
+					if (decoded.ok === false) return decoded;
+					if (typeof recordAt(spawn, "version") !== "number" || typeof recordAt(spawn, "recorded_at") !== "string" ||
+						!["unbound", "bound", "unresolved"].includes(String(recordAt(spawn, "state"))))
+						return protocol("spawn.list reply carries an incomplete topology");
+				}
+				return { ok: true, value: answer.value as SpawnListPageSerialize };
+			});
 		},
 		async spawnGet(requestId) {
 			if (!isUuid(requestId))

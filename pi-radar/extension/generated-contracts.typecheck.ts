@@ -2,8 +2,12 @@ import type {
 	ObservationGetParamsDeserialize,
 	ObservationGetResponseSerialize,
 	ObservationSnapshot,
+	SpawnListParamsDeserialize,
+	SpawnListPageSerialize,
 } from "./generated-contracts.js";
 import type {
+	RadarClient,
+	RadarResult,
 	RadarFactsSnapshot,
 	RadarHandoff,
 	RadarHandoffInbox,
@@ -66,8 +70,7 @@ const handoff: RadarHandoff = {
 		registration_id: "33333333-3333-4333-8333-333333333333",
 		session_id: "44444444-4444-4444-8444-444444444444",
 		subject_id: "55555555-5555-4555-8555-555555555555",
-		execution_id: "66666666-6666-4666-8666-666666666666",
-		execution_generation: 1,
+		claim_id: "66666666-6666-4666-8666-666666666666",
 	},
 	recipient_subject_id: "11111111-1111-4111-8111-111111111111",
 	summary: "worker complete",
@@ -93,3 +96,13 @@ void [
 	inbox,
 	receipt,
 ];
+
+function spawnListApi(client: RadarClient, params: SpawnListParamsDeserialize) {
+	const page: Promise<RadarResult<SpawnListPageSerialize>> = client.spawnList({ after: params.after, limit: params.limit });
+	// @ts-expect-error Caller identity comes from process registration.
+	client.spawnList({ registration_id: "caller" });
+	// @ts-expect-error Parent identity cannot be chosen by callers.
+	client.spawnList({ parent_session_id: "parent" });
+	return page;
+}
+void spawnListApi;
