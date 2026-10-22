@@ -58,6 +58,9 @@ pub const BOOTSTRAP_METHOD: &str = "spawn.bootstrap";
 pub const WAKE_COMMAND: &str = "lifecycle-wake";
 pub const WAKE_METHOD: &str = "lifecycle.wake";
 
+/// Admission of an in-place managed launch into a pane the caller already occupies.
+pub const ADMIT_METHOD: &str = "launch.admit";
+
 /// The subcommand the Radar binary runs as the bootstrap.
 pub const BOOTSTRAP_COMMAND: &str = "launch-bootstrap";
 
@@ -228,6 +231,10 @@ pub struct Claim {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessRecord {
     pub version: u32,
+    /// The group this attempt runs in, when Radar launched it into one. Written
+    /// once at admission, by the path that actually wraps the launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::managed_scope::Scope>,
     pub registration_id: String,
     pub spawn_request_id: String,
     #[serde(default)]
@@ -345,6 +352,7 @@ enum Stage {
     Watch {
         descriptor: std::os::fd::OwnedFd,
         signal: bool,
+        group: Option<crate::managed_scope::Group>,
     },
 }
 
@@ -379,6 +387,7 @@ fn draft_process(
 ) -> ProcessRecord {
     ProcessRecord {
         version: SUBJECT_VERSION,
+        scope: None,
         registration_id,
         spawn_request_id: spawn_request_id.to_string(),
         origin: Origin::Spawned,
@@ -1454,7 +1463,8 @@ fn terminate(
     now_ms: i64,
     revoked: bool,
 ) -> Result<Termination, String> {
-    let (descriptor, signal) = match stage(registry, subject_id, verifier, now_ms)? {
+    let deadline = std::time::Instant::now() + EXIT_DEADLINE;
+    let (descriptor, signal, group) = match stage(registry, subject_id, verifier, now_ms)? {
         Stage::Settled(exit) => {
             return Ok(Termination {
                 revoked,
@@ -1462,12 +1472,20 @@ fn terminate(
                 exit,
             });
         }
-        Stage::Watch { descriptor, signal } => (descriptor, signal),
+        Stage::Watch {
+            descriptor,
+            signal,
+            group,
+        } => (descriptor, signal, group),
     };
     let mut signal_attempted = false;
     if signal {
         signal_attempted = true;
-        if let Err(error) = process_control::terminate(&descriptor) {
+        let sent = match &group {
+            Some(group) => crate::managed_scope::stop(&[group]),
+            None => process_control::terminate(&descriptor).map_err(|e| e.to_string()),
+        };
+        if let Err(error) = sent {
             return Ok(Termination {
                 revoked,
                 signal_attempted,
@@ -1475,7 +1493,20 @@ fn terminate(
             });
         }
     }
-    let exit = if process_control::exited_within(&descriptor, EXIT_DEADLINE) {
+    let remaining = group.as_ref().map(|g| g.remaining()).transpose();
+    let exit = if !remaining
+        .as_ref()
+        .is_ok_and(|names| names.as_ref().is_none_or(Vec::is_empty))
+    {
+        Exit::Unverified(match remaining {
+            Ok(Some(names)) => format!("still running: {}", names.join(", ")),
+            Err(error) => error,
+            _ => unreachable!(),
+        })
+    } else if process_control::exited_within(
+        &descriptor,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    ) {
         record_exit(registry, subject_id, now_ms)?;
         Exit::Exited
     } else {
@@ -1496,38 +1527,52 @@ fn stage(
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
 ) -> Result<Stage, String> {
-    let subject = read_recorded(registry, subject_id)?;
-    let Some(process) = subject.execution.process.clone() else {
+    let process = process_for_control(registry, subject_id)?;
+    let Some(identity) = process.process.as_ref() else {
         return Ok(Stage::Settled(Exit::Unresolved));
     };
-    if subject.execution.exited_at.is_some() {
+    if process.exited_at.is_some() {
         return Ok(Stage::Settled(Exit::Exited));
     }
-    let acquired = process_control::acquire(&process, verifier);
-    let _transition = registry.transition();
-    let mut subject = read_recorded(registry, subject_id)?;
-    if subject.execution.process.as_ref() != Some(&process) {
-        return Ok(Stage::Settled(Exit::Unresolved));
-    }
-    if subject.execution.exited_at.is_some() {
-        return Ok(Stage::Settled(Exit::Exited));
-    }
+    let acquired = process_control::acquire(identity, verifier);
     let descriptor = match acquired {
-        Ok(Acquired::Process(descriptor)) => descriptor,
+        Ok(Acquired::Process(fd)) => fd,
         Ok(Acquired::Absent | Acquired::Replaced) => {
-            record_exit_locked(registry, &mut subject, now_ms)?;
+            record_exit(registry, subject_id, now_ms)?;
             return Ok(Stage::Settled(Exit::Exited));
         }
-        // An identity that cannot be read is not a process to signal.
         Err(_) => return Ok(Stage::Settled(Exit::Unresolved)),
     };
-    let signal = subject.execution.signalled_at.is_none();
-    if signal {
-        subject.execution.signalled_at = Some(format_millis(now_ms));
-        subject.execution.recorded_at = format_millis(now_ms);
-        write(registry, &subject)?;
+    let group = match process.scope.clone() {
+        Some(scope) => match scope.verify(&process.registration_id, identity, verifier) {
+            Ok(group) => Some(group),
+            Err(message) => return Ok(Stage::Settled(Exit::Unverified(message))),
+        },
+        None => None,
+    };
+    let _transition = registry.transition();
+    let current = process_for_control(registry, subject_id)?;
+    if current.process != process.process {
+        return Ok(Stage::Settled(Exit::Unresolved));
     }
-    Ok(Stage::Watch { descriptor, signal })
+    if current.exited_at.is_some() {
+        return Ok(Stage::Settled(Exit::Exited));
+    }
+    let signal = current.signalled_at.is_none();
+    if signal {
+        record_process_transition(
+            registry,
+            &current.registration_id,
+            crate::control_plane::events::Source::ProcessControl,
+            crate::control_plane::events::Transition::SignalRequested,
+            now_ms,
+        )?;
+    }
+    Ok(Stage::Watch {
+        descriptor,
+        signal,
+        group,
+    })
 }
 
 /// The outcome of cancelling several executions under one window.
@@ -1550,52 +1595,91 @@ pub fn cancel_many(
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
 ) -> Cancelled {
+    let deadline = std::time::Instant::now() + EXIT_DEADLINE;
     let mut report = Cancelled {
         stopped: Vec::new(),
         survivors: Vec::new(),
     };
-    // Descriptors are held for the shared wait, so nothing is signalled twice and
-    // each wait is on the process that was signalled.
-    let mut watching: Vec<(String, std::os::fd::OwnedFd)> = Vec::new();
-    for subject_id in subject_ids {
-        match stage(registry, subject_id, verifier, now_ms) {
-            // Already verified gone: the exit is recorded and there is nothing to
-            // wait for.
-            Ok(Stage::Settled(Exit::Exited)) => report.stopped.push(subject_id.clone()),
-            // No captured process, or one already recorded as ended.
-            Ok(Stage::Settled(_)) => match record_exit(registry, subject_id, now_ms) {
-                Ok(()) => report.stopped.push(subject_id.clone()),
-                Err(_) => report.survivors.push(subject_id.clone()),
+    let mut watching = Vec::new();
+    for id in subject_ids {
+        match stage(registry, id, verifier, now_ms) {
+            Ok(Stage::Settled(Exit::Exited)) => report.stopped.push(id.clone()),
+            Ok(Stage::Settled(_)) => match record_exit(registry, id, now_ms) {
+                Ok(()) => report.stopped.push(id.clone()),
+                Err(_) => report.survivors.push(id.clone()),
             },
-            Ok(Stage::Watch { descriptor, signal }) => {
-                if signal && process_control::terminate(&descriptor).is_err() {
-                    report.survivors.push(subject_id.clone());
-                    continue;
+            Ok(Stage::Watch {
+                descriptor,
+                signal,
+                group,
+            }) => {
+                if signal && group.is_none() && process_control::terminate(&descriptor).is_err() {
+                    report.survivors.push(id.clone());
+                } else {
+                    watching.push((id.clone(), descriptor, signal, group));
                 }
-                watching.push((subject_id.clone(), descriptor));
             }
-            // An identity that cannot be read is not a process to signal and not
-            // one to call gone.
-            Err(_) => report.survivors.push(subject_id.clone()),
+            _ => report.survivors.push(id.clone()),
         }
     }
-    let descriptors: Vec<&std::os::fd::OwnedFd> =
-        watching.iter().map(|(_, descriptor)| descriptor).collect();
-    let exited = process_control::exited_all_within(&descriptors, EXIT_DEADLINE);
-    for ((subject_id, _), exited) in watching.iter().zip(exited.iter()) {
-        if *exited && record_exit(registry, subject_id, now_ms).is_ok() {
-            report.stopped.push(subject_id.clone());
+    let groups: Vec<_> = watching
+        .iter()
+        .filter(|(_, _, signal, _)| *signal)
+        .filter_map(|(_, _, _, group)| group.as_ref())
+        .collect();
+    let _stop = crate::managed_scope::stop(&groups);
+    let descriptors: Vec<_> = watching.iter().map(|(_, fd, _, _)| fd).collect();
+    let exited = process_control::exited_all_within(
+        &descriptors,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    );
+    for ((id, _, _, group), exited) in watching.iter().zip(exited) {
+        let empty = group
+            .as_ref()
+            .is_none_or(|g| g.remaining().is_ok_and(|names| names.is_empty()));
+        if exited && empty && record_exit(registry, id, now_ms).is_ok() {
+            report.stopped.push(id.clone());
         } else {
-            report.survivors.push(subject_id.clone());
+            report.survivors.push(id.clone());
         }
     }
     report
 }
 
-fn record_exit(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<(), String> {
+fn process_for_control(registry: &Registry, key: &str) -> Result<ProcessRecord, String> {
+    if let Some(process) = read_process(registry, key)? {
+        return Ok(process);
+    }
+    Ok(read_recorded(registry, key)?.execution)
+}
+
+fn record_process_transition(
+    registry: &Registry,
+    registration_id: &str,
+    source: crate::control_plane::events::Source,
+    transition: crate::control_plane::events::Transition,
+    now_ms: i64,
+) -> Result<(), String> {
+    registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .append(registration_id, &format_millis(now_ms), source, transition)
+}
+
+fn record_exit(registry: &Registry, key: &str, now_ms: i64) -> Result<(), String> {
     let _transition = registry.transition();
-    let mut subject = read_recorded(registry, subject_id)?;
-    record_exit_locked(registry, &mut subject, now_ms)
+    let process = process_for_control(registry, key)?;
+    if process.exited_at.is_none() {
+        record_process_transition(
+            registry,
+            &process.registration_id,
+            crate::control_plane::events::Source::ProcessControl,
+            crate::control_plane::events::Transition::ExitVerified,
+            now_ms,
+        )?;
+    }
+    Ok(())
 }
 
 fn record_exit_locked(registry: &Registry, subject: &mut Claim, now_ms: i64) -> Result<(), String> {
@@ -1610,7 +1694,11 @@ fn record_exit_locked(registry: &Registry, subject: &mut Claim, now_ms: i64) -> 
 /// The command a tracked launch runs: the bootstrap, carrying the target program
 /// and the private correlation. The target's executable, argv, cwd and the
 /// caller's environment overlay are passed through unchanged.
-pub fn wrap(bootstrap: &Bootstrap, ticket: &Ticket, target: LaunchRequest) -> LaunchRequest {
+pub fn wrap(
+    bootstrap: &Bootstrap,
+    ticket: &Ticket,
+    target: LaunchRequest,
+) -> Result<LaunchRequest, String> {
     let LaunchRequest {
         pane_id,
         executable,
@@ -1635,14 +1723,17 @@ pub fn wrap(bootstrap: &Bootstrap, ticket: &Ticket, target: LaunchRequest) -> La
             parent_subject_id.clone(),
         );
     }
-    LaunchRequest {
+    let scope = crate::managed_scope::Scope::for_registration(&ticket.registration_id)
+        .expect("a launch ticket has a canonical registration");
+    let (executable, argv) = scope.wrap(&bootstrap.executable, &wrapped)?;
+    Ok(LaunchRequest {
         pane_id,
-        executable: bootstrap.executable.clone(),
-        argv: wrapped,
+        executable,
+        argv,
         spawn_token,
         cwd,
         env,
-    }
+    })
 }
 
 /// The shell command a pane-death hook runs for one launch. It names the launch
@@ -1721,6 +1812,75 @@ pub fn run_bootstrap(socket: &str, program: &[String]) -> i32 {
         .env_remove(CORRELATION_ENV)
         .exec();
     eprintln!("radar {BOOTSTRAP_COMMAND}: could not run the program: {error}");
+    127
+}
+
+/// Runs `radar run -- COMMAND [ARG...]`: admits the command in this verified
+/// pane, then becomes it inside the execution's scope.
+///
+/// Returns only on failure. The program is never executed directly: the scope
+/// wrapper is what runs, so a scope that cannot be created runs nothing.
+pub fn run_managed(socket: &str, program: &[String]) -> i32 {
+    if program.is_empty() {
+        eprintln!("radar run: no command to run");
+        return 2;
+    }
+    let Ok(pane) = std::env::var("TMUX_PANE") else {
+        eprintln!("radar run: this is not a tmux pane");
+        return 2;
+    };
+    let Some(process) = LocalProcfsVerifier
+        .inspect(std::process::id() as i32)
+        .ok()
+        .flatten()
+    else {
+        eprintln!("radar run: this process has no identity to admit");
+        return 2;
+    };
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let answer = match exchange(
+        Path::new(socket),
+        ADMIT_METHOD,
+        json!({
+            "request_id": random_uuid(),
+            "pane": pane,
+            "process": process,
+            "executable": program[0],
+            "argv": &program[1..],
+            "cwd": cwd,
+        }),
+    ) {
+        Ok(answer) => answer,
+        Err(message) => {
+            eprintln!("radar run: {message}");
+            return 1;
+        }
+    };
+    let (Some(registration_id), Some(scope)) = (
+        answer["registration_id"].as_str(),
+        answer["scope"].as_object(),
+    ) else {
+        eprintln!("radar run: the daemon admitted the launch without an execution");
+        return 1;
+    };
+    let scope = crate::managed_scope::Scope {
+        unit: scope["unit"].as_str().unwrap_or_default().to_string(),
+        slice: scope["slice"].as_str().unwrap_or_default().to_string(),
+    };
+    let (launcher, argv) = match scope.wrap(&program[0], &program[1..]) {
+        Ok(wrapped) => wrapped,
+        Err(message) => {
+            eprintln!("radar run: {message}");
+            return 1;
+        }
+    };
+    let error = Command::new(launcher)
+        .args(&argv)
+        .env(crate::runtime::LAUNCH_TOKEN_ENV, registration_id)
+        .exec();
+    eprintln!("radar run: could not enter the execution scope: {error}");
     127
 }
 
@@ -1936,6 +2096,31 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
         source,
         transition,
         &target,
+    )
+}
+
+/// Records that this attempt was admitted into a group of its own.
+///
+/// Called by the launch path that actually wraps the command, so a claim states a
+/// group only when one was created for it. An observed registration has none and
+/// keeps the signal path.
+pub fn mark_scoped(registry: &Registry, claim_id: &str) -> Result<(), String> {
+    let mut claim = read_recorded(registry, claim_id)?;
+    claim.execution.scope = Some(crate::managed_scope::Scope::for_registration(
+        &claim.execution.registration_id,
+    )?);
+    write(registry, &claim)?;
+    // The recipe is the process record a read loads, so it is written here too;
+    // otherwise every later read would answer with the attempt the launch was
+    // before it was wrapped.
+    let directory = registry.subjects().join("private");
+    let bytes = serde_json::to_vec_pretty(&claim.execution)
+        .map_err(|_| "cannot encode private process recipe")?;
+    write_atomic(
+        &directory,
+        &recipe_path(registry, &claim.execution.registration_id),
+        &bytes,
+        MAX_SUBJECT_BYTES,
     )
 }
 
@@ -2775,6 +2960,7 @@ mod tests {
     /// Captures a live child as a tracked launch, bound to the test's agent.
     fn captured_child(registry: &Registry) -> (String, Child, ProcessIdentity) {
         let ticket = create(registry, SPAWN, launch(), None, 1).expect("subject");
+        // A sleep outside any scope: the fixture is about the signal path.
         let child = Child(Command::new("sleep").arg("300").spawn().expect("sleep"));
         let process = LocalProcfsVerifier
             .inspect(child.0.id() as i32)
@@ -3036,7 +3222,11 @@ mod tests {
             .read_after(0, 128)
             .expect("read lifecycle events")
             .into_iter()
-            .filter(|event| event.subject_id.as_deref() == Some(subject_id.as_str()))
+            // The exit is one physical fact, recorded once against the process
+            // that produced it rather than against whichever claim reported it.
+            .filter(|event| {
+                event.subject_id.as_deref() == Some(subject.execution.registration_id.as_str())
+            })
             .filter(|event| {
                 matches!(
                     event.transition,
@@ -3105,7 +3295,6 @@ mod tests {
         let scratch = Scratch::new("stop-pending");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-
         let stopped = stop(&registry, &ticket.claim_id, &Uninspected, 2).expect("stop");
         assert_eq!(
             stopped,

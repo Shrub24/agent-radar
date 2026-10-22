@@ -63,6 +63,13 @@ pub enum Invocation {
         /// The shell to generate a completion script for.
         shell: clap_complete::Shell,
     },
+    /// Run a command in this pane as a managed execution.
+    #[command(name = "run")]
+    Run {
+        /// The program and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        program: Vec<String>,
+    },
     /// Hand a launched child its own pane, then become the configured command.
     #[command(name = "launch-bootstrap", hide = true)]
     LaunchBootstrap {

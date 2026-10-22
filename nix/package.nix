@@ -86,6 +86,5 @@ buildPackage (
     meta = {
       description = manifest.package.description;
       mainProgram = "radar";
-    };
-  }
+    };  }
 )

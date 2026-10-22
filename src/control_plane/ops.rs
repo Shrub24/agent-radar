@@ -361,6 +361,8 @@ pub enum Method {
     /// program. Not a public operation: it is served only to a launch the daemon
     /// created, through its correlation.
     Bootstrap,
+    /// Admission of an in-place managed launch into a pane the caller occupies.
+    Admit,
     /// The internal notification a launch's pane-death hook sends. It is a hint
     /// that reconciles one launch against exact process evidence.
     Wake,
@@ -395,6 +397,7 @@ pub fn classify(method: &str) -> Option<Method> {
         "topology.get" | "topology.list" | "topology.reconcile" => Method::Registry,
         "mux.observe" | "mux.process_info" | "mux.output" => Method::Read,
         "spawn.bootstrap" => Method::Bootstrap,
+        "launch.admit" => Method::Admit,
         "lifecycle.wake" => Method::Wake,
         other => Method::Operation(Operation::from_method(other)?),
     })

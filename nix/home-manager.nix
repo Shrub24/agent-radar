@@ -16,6 +16,12 @@
 #   stop from taking the tmux server and its agents down with it.
 # - `radar-tmux@.service` runs one tmux server per instance name, in the
 #   foreground. It is started on demand and never restarted by systemd.
+#
+# Managed executions add a dependency the module does not create: a transient
+# `systemd-run --user --scope` per launch needs the user manager itself. The
+# daemon unit already requires it (it is a user unit), and a launch refuses
+# before running when the manager is unavailable — there is no unscoped
+# fallback, so nothing silently runs outside a scope.
 {
   config,
   lib,

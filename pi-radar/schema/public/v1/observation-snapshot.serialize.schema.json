@@ -2057,6 +2057,13 @@
         },
         "registration": {
           "$ref": "#/$defs/PublicRegistration"
+        },
+        "scoped": {
+          "description": "Whether this process runs inside a Radar-established execution scope. A\nprocess started outside the managed launch path has none and is observed.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "required": [

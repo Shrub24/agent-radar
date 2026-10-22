@@ -11,7 +11,8 @@ owns lifecycle operations, managed containers, and background-task publisher
 ingest; task detail reaches the TUI through `tasks.list.v1`. Confirmed actions
 are sent to the daemon and their durable outcomes remain readable by request ID.
 
-See [the daemon guide](docs/daemon.md) for operation and adoption status and
+See [the daemon guide](docs/daemon.md) for operation and adoption status,
+[managed execution](docs/managed-execution.md) for scoped launches, and
 [ideas.md](ideas.md) for deferred functionality and options.
 
 ## Development
@@ -145,6 +146,50 @@ where Radar invokes it. The optional `Herdr Agent Icons Max` font comes from
 `herdr-radar`; without it vendor marks use plain Unicode. `RADAR_ICONS` still
 overrides detection. Configuration is unchanged: `$RADAR_CONFIG`,
 else `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
+
+## Managed execution
+
+`radar run -- COMMAND [ARG...]` starts a command in the pane it was invoked from,
+inside a systemd user scope of its own. Nothing is created and no shell
+interprets the command, so a `$VAR`, a glob or a newline arrives intact. `L`
+launches through the same path, and so do restart and Herdsman spawn.
+
+```sh
+radar run -- pi                     # a scoped Pi in this pane
+```
+
+The daemon admits the launch before anything executes: it refuses unless this
+process is the pane's own descendant with a verified birth identity, and it
+records the process before the command runs. The command is never executed
+directly — `systemd-run --user --scope` is what runs — so a scope that cannot be
+created runs nothing and there is no unscoped fallback.
+
+One scope per process lifetime, named from a registration id that is never
+reused:
+
+```text
+radar.slice
+  radar-<registration>.slice
+    radar-<registration>-main.scope
+```
+
+A reload or `/resume` replaces the session's claim and leaves that group alone.
+
+Stopping is graceful only. Radar stops each group with one `systemctl --user
+stop`; managed scopes set `SendSIGKILL=no` and `TimeoutStopSec=2s`, so a process
+that ignores TERM stays running and Radar reports it as a survivor rather than
+claiming an exit. Scope state is never an outcome: `success` covers a nonzero
+exit, and exit status keeps coming from the typed tmux observation. An observed
+agent — one started outside this path — keeps the signal path it already had.
+
+A scoped row is a managed execution. An observed row keeps its subject, children
+and inbox and is marked as observed; the route to managed is a restart through
+`radar run`, not promotion in place. `radar-pi` is a `pi` that does this for
+every session; put it ahead of the real program on `PATH` to use it.
+
+This needs a systemd user manager and cgroup v2. Without a manager, a launch
+refuses before the command runs. See [managed execution](docs/managed-execution.md)
+for the full contract and the reset that older recorded history needs.
 
 ## Keys
 

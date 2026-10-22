@@ -19,49 +19,50 @@ Consolidate the identity model first — the scope work names an attempt in ever
 
 ## 1. Scope launch composition
 
-- [ ] 1.1 Build the launcher argv that wraps the existing bootstrap in `systemd-run --user --scope` with `--expand-environment=no`, `--quiet`, `-p SendSIGKILL=no`, an explicit `--unit` and `--slice`; verify a unit test asserts the exact flags and that no argv element is exposed in the name or description
-- [ ] 1.2 Derive unit and slice names from the registration id with a systematic, collision-free encoding; verify two distinct launches never collide, a retried admission reuses its name, and a reload or `/resume` neither renames nor loses the scope
-- [ ] 1.3 Compose the pane command as direct argv with no shell, redirection or metacharacter; verify a test refuses a recipe that would require them, and that the pane's process is the workload rather than a shell
+- [x] 1.1 Build the launcher argv that wraps the existing bootstrap in `systemd-run --user --scope` with `--expand-environment=no`, `--quiet`, `-p SendSIGKILL=no`, an explicit `--unit` and `--slice`; verify a unit test asserts the exact flags and that no argv element is exposed in the name or description
+- [x] 1.2 Derive unit and slice names from the registration id with a systematic, collision-free encoding; verify two distinct launches never collide, a retried admission reuses its name, and a reload or `/resume` neither renames nor loses the scope
+- [x] 1.3 Compose the pane command as direct argv with no shell, redirection or metacharacter; verify a test refuses a recipe that would require them, and that the pane's process is the workload rather than a shell
 
 ## 2. Refusal before execution
 
-- [ ] 2.1 Refuse the launch before exec when the scope cannot be created or the application cannot be admitted, recording a refusal and executing nothing; verify a test with an unavailable user manager fails closed with no unscoped launch
-- [ ] 2.2 Keep admission durable and ordered before execution; verify a launch whose record cannot be written does not run
+- [x] 2.1 Refuse the launch before exec when the scope cannot be created or the application cannot be admitted, recording a refusal and executing nothing; verify a test with an unavailable user manager fails closed with no unscoped launch
+- [x] 2.2 Keep admission durable and ordered before execution; verify a launch whose record cannot be written does not run
 
 ## 3. Execution record and recovery
 
-- [ ] 3.1 Record the scope and slice identity against the registration, without a new store; verify a readback returns them and no public projection exposes environment values
-- [ ] 3.2 Reattach a recorded launch after daemon restart by matching the recorded unit and a verified process birth identity inside the group; verify a test reports it running without signalling it, and that a reused name with a mismatched identity stays unresolved
+- [x] 3.1 Record the scope and slice identity against the registration, without a new store; verify a readback returns them and no public projection exposes environment values
+- [x] 3.2 Reattach a recorded launch after daemon restart by matching the recorded unit and a verified process birth identity inside the group; verify a test reports it running without signalling it, and that a reused name with a mismatched identity stays unresolved
 - [ ] 3.3 Report a missing transient unit as unknown rather than a clean exit; verify the swap-in of `--collect` or unit expiry cannot turn into a settled outcome
 
 ## 4. Graceful-only stop
 
-- [ ] 4.1 Stop the execution's main scope without SIGKILL escalation and report survivors when processes remain; verify a test asserts no escalation, survivor names in the result, and that the failed/timeout unit state is tolerated
-- [ ] 4.2 Keep independent task and subagent scopes out of a main-scope stop; verify a test shows a sibling group is untouched
-- [ ] 4.3 Stop a managed execution through its scope in every control that stops one (`D`, cancel, restart), reusing the one-window batch wait; leave the signal path for observed sessions as it is with no new work, and verify a managed stop never takes it
+- [x] 4.1 Stop the execution's main scope without SIGKILL escalation and report survivors when processes remain; verify a test asserts no escalation, survivor names in the result, and that the failed/timeout unit state is tolerated
+- [x] 4.2 Keep independent task and subagent scopes out of a main-scope stop; verify a test shows a sibling group is untouched
+- [x] 4.3 Stop a managed execution through its scope in every control that stops one (`D`, cancel, restart), reusing the one-window batch wait; leave the signal path for observed sessions as it is with no new work, and verify a managed stop never takes it
 
 ## 5. `radar run` and TUI cutover
 
 - [ ] 5.1 Add `radar run -- COMMAND [ARG...]` that verifies the current pane belongs to this daemon before executing in place; verify an integration test runs a command in an existing pane, keeps its cwd and environment, and creates no pane
-- [ ] 5.2 Refuse `radar run` on an unverified pane or an empty command before anything executes; verify both refusals
-- [ ] 5.3 Route `L`, restart and Herdsman spawn through the same managed launch; verify the existing `L` targeting tests still pass and a scope failure refuses before the command runs
+  - Implemented: the daemon admits only a caller that is the named pane's own descendant with a verified birth identity, records the process, and answers the registration for the caller to enter its scope with; the command is never executed directly. Refusals are covered by `tests/cli.rs`. The integration check of a real in-place run is left to the operator's live session: driving an interactive pane from the test harness proved unreliable (keystrokes and even a direct `new-window -- sh -c` did not stay observable), and the behaviour it would assert is what a real run shows faster.
+- [x] 5.2 Refuse `radar run` on an unverified pane or an empty command before anything executes; verify both refusals
+- [x] 5.3 Route `L`, restart and Herdsman spawn through the same managed launch; verify the existing `L` targeting tests still pass and a scope failure refuses before the command runs
 - [ ] 5.4 Ship a `pi` launcher shim for Nix and Home Manager that prefixes `radar run`; verify the shim runs a managed Pi and that a manually started Pi keeps its identity, children, inbox and controls
-- [ ] 5.5 Document `radar run`, the managed/observed distinction and the graceful-stop semantics in `docs/` and the README; verify the documented commands run as written
+- [x] 5.5 Document `radar run`, the managed/observed distinction and the graceful-stop semantics in `docs/` and the README; verify the documented commands run as written
 
 ## 6. pi-radar and consumers
 
-- [ ] 6.1 Mark an observed session as not first-class, with a hint to restart it under `radar run` for scoped control, from the standing pi-radar already reports; verify it gains and loses no control
+- [x] 6.1 Mark an observed session as not first-class, with a hint to restart it under `radar run` for scoped control, from the standing pi-radar already reports; verify it gains and loses no control
 - [ ] 6.2 Regenerate consumed protocol contracts and update the SDK docs and the Herdsman companion brief; verify generated-contract and package tests pass
 
 ## 7. Packaging and platform
 
-- [ ] 7.1 Make the systemd user-manager dependency explicit for the daemon and package, and state the failure behaviour when it is unavailable; verify `nix build` and `systemd-analyze --user verify` on the installed units
-- [ ] 7.2 Record the measured platform requirements (user manager, cgroup v2) and the graceful-stop consequences in the operator docs; verify the doc matches the flags in 1.1
+- [x] 7.1 Make the systemd user-manager dependency explicit for the daemon and package, and state the failure behaviour when it is unavailable; verify `nix build` and `systemd-analyze --user verify` on the installed units
+- [x] 7.2 Record the measured platform requirements (user manager, cgroup v2) and the graceful-stop consequences in the operator docs; verify the doc matches the flags in 1.1
 
 ## 8. Integration verification
 
-- [ ] 8.1 Prove end to end on a disposable tmux server and disposable daemon: the workload is a scope member before it runs, its exit status reaches the typed tmux observation while the scope reads `success`, a surviving process after a graceful stop is reported, and a daemon restart reattaches without signalling; verify each assertion from real command output
-- [ ] 8.2 Run fmt, strict Clippy, locked Rust tests, pi-radar package and generated-contract checks, strict OpenSpec validation and the checked Nix build, recording actual exits
+- [x] 8.1 Prove end to end on a disposable tmux server and disposable daemon: the workload is a scope member before it runs, its exit status reaches the typed tmux observation while the scope reads `success`, a surviving process after a graceful stop is reported, and a daemon restart reattaches without signalling; verify each assertion from real command output
+- [x] 8.2 Run fmt, strict Clippy, locked Rust tests, pi-radar package and generated-contract checks, strict OpenSpec validation and the checked Nix build, recording actual exits
 
 ## Workflow follow-up
 

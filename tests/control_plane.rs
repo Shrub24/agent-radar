@@ -4362,6 +4362,35 @@ impl TmuxServer {
 }
 
 /// Whether the test can run the server under a unit: a systemd user manager.
+/// Configures the scope launcher for a daemon that runs inside this test process.
+///
+/// A tracked launch always enters a scope, so an in-process daemon resolves the
+/// launcher from this process's environment. The value is the same one the child
+/// daemons get, and setting it twice is the same write.
+fn configure_scope_launcher() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: this is the only writer, it runs before any daemon in this
+        // process reads the variable, and the value never changes after.
+        unsafe { std::env::set_var("RADAR_SYSTEMD_RUN", scope_launcher()) };
+    });
+}
+
+/// The scope launcher the test daemons are configured with: the real one when
+/// this machine has it, so launches behave as they do in service.
+fn scope_launcher() -> &'static str {
+    static LAUNCHER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LAUNCHER.get_or_init(|| {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("systemd-run"))
+            .find(|candidate| candidate.is_file())
+            .and_then(|found| found.to_str().map(str::to_string))
+            .unwrap_or_else(|| "/bin/true".to_string())
+    })
+}
+
 fn user_manager_available() -> bool {
     Command::new("systemctl")
         .args(["--user", "show-environment"])
@@ -6256,6 +6285,7 @@ fn spawn_refuses_a_missing_managed_parent_subject_before_any_effect() {
 /// the command the caller resolved, and answers with the two records it wrote.
 #[test]
 fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effects() {
+    configure_scope_launcher();
     let sandbox = Sandbox::new("spawn-served");
     let backend = MuxBackend::new(TRACKED_SPAWN_PRIMITIVES);
     let mut daemon = sandbox.daemon_with(backend.clone());
@@ -8316,6 +8346,11 @@ impl DaemonChild {
             .arg("daemon")
             .env("RADAR_CONTROL_SOCKET", socket)
             .env("RADAR_CONTROL_STATE", state)
+            // Every tracked launch enters a scope, so the daemon needs the
+            // launcher the way it needs its tmux. A sandbox without one still
+            // names an absolute program, and a backend that never execs finds
+            // nothing missing.
+            .env("RADAR_SYSTEMD_RUN", scope_launcher())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (key, value) in environment {
@@ -9360,10 +9395,11 @@ fn a_process_ignoring_sigterm_stops_uncertainly_and_is_not_signalled_again() {
         json!(["sigterm dispatched"]),
         "{first}"
     );
+    // A managed stop names what is still running instead of claiming an exit.
     assert!(
         result_record(&first)["message"]
             .as_str()
-            .is_some_and(|message| message.contains("exit was not verified")),
+            .is_some_and(|message| message.starts_with("still running:")),
         "{first}"
     );
     assert!(process_exists(pid), "the process ignored SIGTERM");
@@ -9519,7 +9555,7 @@ fn an_unbound_launch_whose_process_may_still_be_live_keeps_its_pane() {
     assert!(
         result_record(&cancelled)["message"]
             .as_str()
-            .is_none_or(|message| message.contains("not")),
+            .is_none_or(|message| message.contains("not") || message.starts_with("still running:")),
         "{cancelled}"
     );
     // A refusal dispatches nothing, so it records no cleanup: the launch's pane
@@ -11271,6 +11307,7 @@ fn lifecycle_enrollment_without_a_presence_claim_is_refused() {
 
 #[test]
 fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
+    configure_scope_launcher();
     let sandbox = Sandbox::new("lead-restart");
     let lead = LeadProcess::start();
     let backend = MuxBackend::new(LEAD_PRIMITIVES)
@@ -11464,4 +11501,142 @@ fn presence_waits_without_a_current_pane_location() {
     assert_eq!(subjects["result"]["subjects"].as_array().unwrap().len(), 0);
     daemon.stop();
     lead.kill();
+}
+
+/// A managed launch end to end, from real output: the workload is a scope member
+/// before it runs, scope state is never the outcome, a process that ignores TERM
+/// is a survivor, and a daemon restart reattaches without signalling.
+#[test]
+fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
+    let Some(server) = TmuxServer::start("tmux-scope-e2e") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-scope-e2e");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let out = sandbox.root.join("out");
+    fs::create_dir_all(&out).expect("output directory");
+
+    // The program records its own cgroup before anything else: if the group did
+    // not exist first, there is no file to read.
+    // Both launches are admitted while the parent's published session is fresh;
+    // its context is a lease, so a later publication is a separate concern.
+    let stubborn = "trap '' TERM; exec sleep 300";
+    let (_, stubborn_subject) =
+        tracked_spawn(&mut client, &state, &parent, json!(["-c", stubborn]));
+    let script = format!(
+        "cat /proc/self/cgroup > {}/scope.cgroup; exec sleep 300",
+        out.display()
+    );
+    let (_, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", script]));
+
+    // The program records its own cgroup before anything else: if the group did
+    // not exist first, there is no file to read.
+    let membership = wait_for_text(&out.join("scope.cgroup"));
+    let recorded_registration = subject_record(&state, &subject)["registration_id"]
+        .as_str()
+        .expect("a registration")
+        .to_string();
+    let registration = recorded_registration.replace('-', "");
+    assert!(
+        membership.contains(&format!(
+            "/radar.slice/radar-{registration}.slice/radar-{registration}-main.scope"
+        )),
+        "the workload is not in its own scope: {membership}"
+    );
+
+    // Scope state is not an outcome: it reads `success` while the unit is active,
+    // and the typed tmux observation is what reports an exit.
+    let unit = format!("radar-{registration}-main.scope");
+    let shown = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &unit,
+            "--property=ActiveState",
+            "--property=Result",
+            "--value",
+        ])
+        .output()
+        .expect("systemctl show");
+    assert!(shown.status.success(), "systemctl show failed for {unit}");
+    let state_text = String::from_utf8_lossy(&shown.stdout).to_lowercase();
+    assert!(
+        state_text.contains("active") && !state_text.contains("failed"),
+        "{state_text}"
+    );
+
+    // One that ignores TERM is reported, not killed: no SIGKILL escalation.
+    let stubborn_pid = captured_identity(&state, &stubborn_subject).pid;
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &stubborn_subject);
+    let cancelled_record = result_record(&cancelled).clone();
+    assert!(
+        cancelled_record.to_string().contains("not verified")
+            || cancelled_record.to_string().contains("still running"),
+        "a TERM-ignoring process must be a survivor: {cancelled}"
+    );
+    assert!(process_exists(stubborn_pid), "the survivor was killed");
+    let _ = Command::new("kill")
+        .args(["-9", &stubborn_pid.to_string()])
+        .status();
+
+    // The record itself names the group: recovery needs it, and no public view
+    // carries the launch's environment.
+    let registry = agent_radar::control_plane::Registry::open(&state).expect("registry");
+    let recorded =
+        agent_radar::control_plane::lifecycle::read_process(&registry, &recorded_registration)
+            .expect("read the process")
+            .expect("the process is recorded");
+    let scope = recorded
+        .scope
+        .expect("a launch Radar admitted runs in a scope of its own");
+    assert_eq!(scope.unit, unit, "the record names the unit that exists");
+    assert_eq!(
+        scope.slice,
+        format!("{}.slice", unit.trim_end_matches("-main.scope")),
+        "the record names the slice that exists: {scope:?}"
+    );
+    // The other launch's process survived that group's stop: a stop of one
+    // group is not a stop of every group.
+    assert!(
+        process_exists(captured_identity(&state, &subject).pid),
+        "a sibling group's stop took this process"
+    );
+
+    // A restart re-reads the same launch and signals nothing.
+    let pid = captured_identity(&state, &subject).pid;
+    assert_eq!(daemon.stop(libc::SIGTERM, DEADLINE).code(), Some(0));
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let listed = client.call("lifecycle.get", json!({"subject_id": subject}));
+    let subject_view = &listed["result"]["subject"];
+    assert_eq!(
+        subject_view["process"]["pid"],
+        json!(pid),
+        "the restart re-read the same process: {listed}"
+    );
+    assert_eq!(subject_view["state"], "captured", "{listed}");
+    assert_eq!(subject_view["signalled_at"], json!(null), "{listed}");
+    assert!(process_exists(pid), "the restart signalled the workload");
+
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// Waits for a file a launched program writes, returning its text.
+fn wait_for_text(path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = fs::read_to_string(path) {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} was never written",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }

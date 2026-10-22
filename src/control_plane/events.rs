@@ -502,7 +502,19 @@ impl Log {
             .subject_id
             .as_deref()
             .ok_or("event has no record identity")?;
-        let previous = self.facts(id);
+        let previous = self.facts(id).or_else(|| {
+            self.processes.get(id).map(|execution| Facts {
+                attachment: AttachmentFacts {
+                    registration_id: id.into(),
+                    subject_id: None,
+                    execution_generation: None,
+                    identity_unresolved: false,
+                    managed: Default::default(),
+                    session: None,
+                },
+                execution: execution.clone(),
+            })
+        });
         let mut next = reduce(previous.as_ref(), event)?;
         if previous.is_none()
             && let Some(process) = self.processes.get(&next.attachment.registration_id)
@@ -567,7 +579,9 @@ impl Log {
             let facts = self.reduce_event(event)?;
             self.processes
                 .insert(facts.attachment.registration_id.clone(), facts.execution);
-            self.facts.insert(subject_id.to_owned(), facts.attachment);
+            if subject_id != facts.attachment.registration_id {
+                self.facts.insert(subject_id.to_owned(), facts.attachment);
+            }
         }
         self.last_subject_event
             .insert(subject_id.to_owned(), event.event_id.clone());

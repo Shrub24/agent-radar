@@ -35,6 +35,10 @@ pub struct RegistryAgent {
     /// Durable claim decision, if this registration has claimed a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_standing: Option<crate::control_plane::registry::presence::Standing>,
+    /// Whether this process runs inside a Radar-established execution scope. A
+    /// process started outside the managed launch path has none and is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped: Option<bool>,
     pub process: ProcessEvidence,
     /// Mutable current-session context, kept separate from registration identity.
     pub context: Option<PublicContext>,

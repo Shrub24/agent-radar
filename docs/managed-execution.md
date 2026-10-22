@@ -1,0 +1,94 @@
+# Managed execution
+
+Radar can admit a command durably, run it inside a systemd user scope, and stop
+it gracefully. A scope is one physical group of processes; it is never an
+application outcome. Exit status keeps coming from the typed tmux observation,
+because systemd reports `success` for a nonzero exit and `inactive` for a
+process that never started.
+
+## Starting one
+
+```sh
+radar run -- pi
+```
+
+`radar run` executes in the pane it was invoked from: no pane, window or
+workspace is created, and no shell interprets the command. Arguments are passed
+as written, so a `$VAR`, a glob or a newline reaches the program unchanged.
+
+Before anything executes, `radar run` asks the daemon to admit the launch. The
+daemon refuses unless the process is the named pane's own descendant and its
+birth identity verifies, so a pane Radar cannot verify starts nothing. On
+admission Radar records the process (its registration, recipe, scope) and
+answers with the registration id. The command then runs as
+`systemd-run --user --scope …`, so the group exists before the command does and
+a scope that cannot be created runs nothing.
+
+`L` launches through the same path after choosing its tab, and so do restart
+and Herdsman spawn. The pre-minted registration is handed to the child as
+`PI_RADAR_REGISTRATION_ID`; pi-radar captures it and removes it before it
+launches children.
+
+## Names
+
+One scope per process lifetime:
+
+```text
+radar.slice
+  radar-<registration>.slice
+    radar-<registration>-main.scope
+```
+
+The registration id is a UUID that is never reused, so a name cannot be
+recycled and a lost reply cannot create a second group under a fresh name. A
+reload or `/resume` replaces the session's claim and leaves the group alone;
+nothing is renamed or migrated. Unit descriptions name the unit only — argv,
+paths and environment never appear in unit metadata.
+
+## Stopping
+
+A managed stop is one `systemctl --user stop` for every group in the set, so a
+workspace with several agents waits one window rather than one per agent.
+Managed scopes set `SendSIGKILL=no` and `TimeoutStopSec=2s`: Radar sends TERM
+and never escalates on its own.
+
+A stop whose group still has members is reported as unresolved, with the
+surviving programs named. The unit's `failed`/`timeout` state is expected there
+and is not an outcome: a process that ignores TERM stays running and Radar says
+so rather than claiming it exited. Independently scoped tasks and subagents are
+outside a main-scope stop.
+
+An observed agent — one started outside the managed launch path — keeps the
+signal path it always had. It is not stopped through a scope it never entered.
+
+## Observed and managed
+
+Every Pi session keeps its durable subject, children, inbox and the controls
+that need no scope, whether or not Radar launched it. A managed row also has a
+scope, so its resource grouping is tracked; an observed row is marked and
+offers no new scope-dependent capability. The route to managed is a restart
+through `radar run`; there is no in-place promotion, and no capability is
+removed from an observed session because it is unobserved.
+
+## Requirements
+
+- A systemd **user manager** for the user running the daemon. Without one,
+  `systemd-run` and `systemctl --user` fail and managed launches refuse before
+  the command runs — there is no unscoped fallback.
+- **cgroup v2** with the unified hierarchy at `/sys/fs/cgroup`. Group
+  membership and survivor inspection read `cgroup.procs` from there.
+- `systemd-run` and `systemctl` on the daemon's `RADAR_SYSTEMCTL`/`PATH` as for
+  any other operator command.
+
+Platform behaviour that follows from this: a scope outlives a daemon restart, so
+recovery reattaches to it instead of signalling anything; a transient unit that
+has already been collected is reported as unknown rather than as a clean exit;
+and closing the pane's PTY can still end an interactive program even while its
+scope exists, so the two facts are reported apart.
+
+## Resetting old state
+
+Scopes are new, so processes recorded before this change have none and keep the
+signal path. Enabling the managed path for a fleet that already has recorded
+history is an explicit reset whose destructive scope must be agreed first; it is
+never implemented as stopping the tmux server.

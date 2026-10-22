@@ -59,6 +59,13 @@ pub(crate) fn agent_entry(
     Ok(json!({
         "registration": registration.public(),
         "claim_standing": crate::control_plane::registry::presence::current(registry, &registration.registration_id)?.map(|claim| claim.standing),
+        "scoped": match crate::control_plane::lifecycle::read_process(registry, &registration.registration_id) {
+            Ok(Some(process)) => Some(process.scope.is_some()),
+            // A process Radar did not admit has no scope to state.
+            Ok(None) => Some(false),
+            // An unreadable record is unknown, not unscoped.
+            Err(_) => None,
+        },
         "process": process_evidence(registration, verification),
         "execution": execution,
         "assignment": assignment,

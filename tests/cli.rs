@@ -30,6 +30,29 @@ fn the_version_flag_reports_this_crate_and_exits_cleanly() {
 }
 
 #[test]
+fn a_run_outside_a_pane_refuses_before_running_anything() {
+    // The only thing this could execute is the scope wrapper, and a refusal
+    // happens before that: the program never starts.
+    let output = Command::new(env!("CARGO_BIN_EXE_radar"))
+        .args(["run", "--", "sh", "-c", "exit 42"])
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("run radar run outside a pane");
+    assert_eq!(output.status.code(), Some(2));
+    let printed = String::from_utf8(output.stderr).expect("utf-8 refusal");
+    assert!(printed.contains("not a tmux pane"), "{printed}");
+}
+
+#[test]
+fn a_run_with_no_command_is_a_usage_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_radar"))
+        .args(["run", "--"])
+        .output()
+        .expect("run radar run with no command");
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
 fn the_usage_text_lists_the_version_flag() {
     let output = Command::new(env!("CARGO_BIN_EXE_radar"))
         .arg("--help")

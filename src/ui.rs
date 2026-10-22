@@ -1032,6 +1032,20 @@ fn row_item(
                     Style::new().fg(palette.stale),
                 ));
             }
+            if agent
+                .registry
+                .as_ref()
+                .is_some_and(|view| view.agent.scoped == Some(false))
+                && agent
+                    .registry
+                    .as_ref()
+                    .is_some_and(|view| view.agent.claim_standing.is_some())
+            {
+                spans.push(Span::styled(
+                    format!("{} ", theme::observed_mark()),
+                    Style::new().fg(palette.stale),
+                ));
+            }
             if agent.registry.as_ref().is_some_and(|view| {
                 view.agent.claim_standing
                     == Some(crate::control_plane::registry::presence::Standing::Duplicate)

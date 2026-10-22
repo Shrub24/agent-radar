@@ -14,6 +14,7 @@ pub mod herdr;
 pub mod lifecycle;
 pub mod log;
 pub mod managed_control;
+pub mod managed_scope;
 pub mod model;
 pub mod observation;
 pub mod process_control;

@@ -70,6 +70,10 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
                 }
             }
         }
+        Invocation::Run { program } => {
+            let socket = agent_radar::control_plane::socket_path();
+            control_plane::lifecycle::run_managed(&socket.to_string_lossy(), &program)
+        }
         Invocation::LaunchBootstrap { socket, program } => {
             control_plane::lifecycle::run_bootstrap(&socket, &program)
         }

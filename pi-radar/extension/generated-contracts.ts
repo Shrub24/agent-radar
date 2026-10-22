@@ -674,6 +674,11 @@ export interface RegistryAgent {
   facts: PublicChannelFacts | null;
   process: ProcessEvidence;
   registration: PublicRegistration;
+  /**
+   * Whether this process runs inside a Radar-established execution scope. A
+   * process started outside the managed launch path has none and is observed.
+   */
+  scoped?: boolean | null;
 }
 /**
  * A channel read for a reader that is not its writer: the same identity,

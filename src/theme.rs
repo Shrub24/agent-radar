@@ -223,6 +223,12 @@ pub fn duplicate_mark() -> &'static str {
     if nerd_font() { "⊘" } else { "=" }
 }
 
+/// An agent Radar observes but did not launch into a scope of its own. It keeps
+/// everything it has; the mark says its resource grouping is not tracked here.
+pub fn observed_mark() -> &'static str {
+    if nerd_font() { "◦" } else { "o" }
+}
+
 /// The stale mark for a terminal with or without the Nerd Font, so the choice
 /// is testable without controlling the process-wide font detection.
 fn stale_mark_for(nerd_font: bool) -> &'static str {

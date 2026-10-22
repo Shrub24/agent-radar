@@ -926,6 +926,7 @@ fn handle_line(
         Method::Tasks => answer(writer, read_tasks(core, &request)),
         Method::Registry => answer(writer, registry_request(core, &request, verification)),
         Method::Bootstrap => answer(writer, bootstrap_request(core, &request, verification)),
+        Method::Admit => answer(writer, admit_request(core, &request, verification)),
         Method::Wake => answer(writer, wake_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
         Method::Operation(operation) => {
@@ -6018,7 +6019,7 @@ fn spawn_child(
     let launched = location
         .as_ref()
         .and_then(|location| location.pane.clone())
-        .map(|pane| {
+        .and_then(|pane| {
             let target = LaunchRequest {
                 pane_id: pane,
                 executable: params.executable.clone(),
@@ -6028,11 +6029,29 @@ fn spawn_child(
                 env: params.env.clone(),
             };
             let launch = match &tracking {
-                Some((bootstrap, ticket)) => subjects::wrap(bootstrap, ticket, target),
+                Some((bootstrap, ticket)) => subjects::wrap(bootstrap, ticket, target).ok()?,
                 None => target,
             };
-            backend.launch(&launch, &cancel)
+            Some(backend.launch(&launch, &cancel))
         });
+    // A launch whose scope cannot be formed at all is refused before anything runs.
+    if tracking.is_some() && launched.is_none() {
+        let settled = record.created(pane).complete(
+            RequestOutcome::Refused,
+            Some(Category::BACKEND_UNAVAILABLE),
+            Some("no execution scope launcher is configured"),
+            effects,
+            store::now_ms(),
+        );
+        let _ = write_settled(request, settled, core);
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::BackendUnavailable,
+                "no execution scope launcher is configured",
+            ),
+        );
+    }
     let (launched_outcome, launch_message) = match &launched {
         Some(LaunchOutcome::Completed) => (Some(RequestOutcome::Completed), None),
         Some(LaunchOutcome::Refused(_)) => (
@@ -6139,6 +6158,9 @@ fn track_launch(
     let ticket = subjects::create_with_intent(
         &registry, request_id, launch, session, identity, managed, now,
     )?;
+    // This is the path that wraps the launch into a group, so this is where the
+    // attempt records which group it runs in.
+    subjects::mark_scoped(&registry, &ticket.claim_id)?;
     registry.attach_subject(request_id, &ticket.claim_id, &ticket.registration_id)?;
     Ok((bootstrap, ticket))
 }
@@ -6292,6 +6314,162 @@ fn bootstrap_request(
             Response::refused(&request.id, &Refusal::new(Code::Refused, error))
         }
     }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AdmitParams {
+    request_id: String,
+    pane: String,
+    process: crate::model::ProcessIdentity,
+    executable: String,
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Admits an in-place managed launch, then answers with the identity the caller
+/// must enter its scope under. The pane must already hold this process, so
+/// nothing is created and no unverified placement is accepted.
+fn admit_request(
+    core: &Arc<Mutex<Core>>,
+    request: &Request,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    let params: AdmitParams = match decode_params(request) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if params.executable.is_empty() {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(Code::BadParams, "`executable` must not be empty"),
+        );
+    }
+    let (registry, backend, verifier, stopping) = {
+        let core = locked(core);
+        let Some(backend) = core.backend.clone() else {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::BackendUnavailable, "no backend is wired"),
+            );
+        };
+        (
+            Arc::clone(&core.registry),
+            backend,
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.stopping),
+        )
+    };
+    // The caller reports its own placement; what makes the claim credible is that
+    // this process is the pane's own descendant, verified here and not taken from
+    // the caller's environment.
+    let foreground = match bounded_foreground(
+        &backend,
+        &params.pane,
+        &stopping,
+        verification,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(crate::model::ForegroundEvidence::NonShell { pid, .. }) if pid > 0 => pid,
+        Ok(_) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::Refused, "this pane's foreground is not the launch"),
+            );
+        }
+        Err(()) => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::BackendUnavailable,
+                    "foreground process evidence is unavailable",
+                ),
+            );
+        }
+    };
+    if !descends_from(params.process.pid, foreground) {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                "this process does not belong to the named pane",
+            ),
+        );
+    }
+    match verify_birth_identity(
+        params.process.pid,
+        &verifier,
+        &stopping,
+        verification,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(observed) if observed == params.process => {}
+        _ => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::Refused,
+                    "process birth identity is unavailable or changed",
+                ),
+            );
+        }
+    }
+    let launch = subjects::LaunchContext {
+        executable: params.executable,
+        argv: params.argv,
+        cwd: params.cwd,
+        env: std::collections::BTreeMap::new(),
+    };
+    let process =
+        match subjects::create_process(&registry, &params.request_id, launch, store::now_ms()) {
+            Ok(process) => process,
+            Err(error) => {
+                return Response::refused(&request.id, &Refusal::new(Code::Refused, error));
+            }
+        };
+    let scope = match process.scope.clone() {
+        Some(scope) => scope,
+        None => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(Code::Internal, "the admitted process has no scope"),
+            );
+        }
+    };
+    Response::ok(
+        &request.id,
+        json!({"registration_id": process.registration_id, "scope": scope}),
+    )
+}
+
+/// Whether `pid` is the pane process or runs under it. Bounded, so a malformed
+/// or recycled process tree cannot hold a request open.
+fn descends_from(pid: i32, ancestor: i32) -> bool {
+    let mut current = pid;
+    for _ in 0..64 {
+        if current == ancestor {
+            return true;
+        }
+        match parent_of(current) {
+            Some(parent) if parent > 1 => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn parent_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is parenthesised and may contain spaces, so the fields
+    // after it are read from the right of it: state, then the parent pid.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 /// Installs the pane-death wake for a launch, naming the server generation its
