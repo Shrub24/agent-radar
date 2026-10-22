@@ -12,8 +12,8 @@ Consolidate the identity model first — the scope work names an attempt in ever
 - [x] 0.5 Let pre-minting be the exclusive act per subject: verify two concurrent launch paths, one a restart, leave exactly one current claim and the other refused or pending, and that a restart pre-mints before it signals
 - [x] 0.6 Move attachment release off the attempt onto the subject's current claim, retire the per-edge spawn token in favour of the pre-minted claim, and verify a release while the process runs leaves the attempt readable and the subject unattached
 
-- [ ] 0.7 Record the logical parent subject on the spawn edge when the launch is admitted, so parentage is a durable key rather than a session correlation; verify an edge created by a managed launch reads back with its parent subject and an unmanaged parent records none
-- [ ] 0.8 Serve a caller's own launches as a derived read — the daemon resolves the caller's current subject and returns that subject's edges — and keep any explicit parent filter on the operator surface only; verify a caller cannot read another subject's launches by naming it and that the refusal names the reason
+- [x] 0.7 Record the logical parent subject on the spawn edge when the launch is admitted, so parentage is a durable key rather than a session correlation; verify an edge created by a managed launch reads back with its parent subject and an unmanaged parent records none
+- [x] 0.8 Serve a caller's own launches as a derived read — the daemon resolves the caller's current subject and returns that subject's edges — and keep any explicit parent filter on the operator surface only; verify a caller cannot read another subject's launches by naming it and that the refusal names the reason
 
 ## 1. Scope launch composition
 
