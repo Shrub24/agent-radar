@@ -2151,6 +2151,15 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         !events.to_string().contains("full immutable handoff"),
         "payload leaked into events: {events}"
     );
+    let stopped = client.call_id(
+        &random_uuid(),
+        "lifecycle.stop",
+        json!({"request": {
+            "spawn_request_id": attached["result"]["subject"]["spawn_request_id"],
+            "claim_id": worker_claim,
+        }}),
+    );
+    assert_eq!(result_record(&stopped)["outcome"], "completed", "{stopped}");
     let status = daemon.stop(libc::SIGTERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }

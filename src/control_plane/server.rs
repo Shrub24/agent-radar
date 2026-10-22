@@ -7096,9 +7096,22 @@ fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String,
             let subject_id = edge.claim_id.clone().ok_or_else(|| {
                 Refusal::new(Code::Refused, "spawn is not a lifecycle-tracked launch")
             })?;
-            subjects::read(registry, &subject_id)
+            let launched = subjects::read(registry, &subject_id)
                 .map_err(internal)?
-                .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?
+                .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
+            let subject = subjects::read_logical(
+                registry,
+                launched.subject_id.as_deref().unwrap_or(&launched.claim_id),
+            )
+            .map_err(internal)?
+            .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
+            if subject.execution.registration_id != launched.execution.registration_id {
+                return Err(Refusal::new(
+                    Code::Refused,
+                    "the spawn's process was replaced; nothing was signalled",
+                ));
+            }
+            subject
         }
         _ => {
             return Err(Refusal::new(

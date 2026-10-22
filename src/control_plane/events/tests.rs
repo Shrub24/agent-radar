@@ -21,20 +21,114 @@ impl Drop for Fixture {
     }
 }
 
+fn launch() -> LaunchContext {
+    LaunchContext {
+        executable: "program-secret".into(),
+        argv: vec!["argument-secret".into()],
+        cwd: Some("/private-path-secret".into()),
+        env: BTreeMap::from([("API_KEY".into(), "environment-secret".into())]),
+    }
+}
+
 fn create(registry: &Registry) -> lifecycle::Ticket {
     lifecycle::create(
         registry,
         "5b2e8c41-0a7d-4f36-b1d9-6c3a7e5f8b1d",
-        LaunchContext {
-            executable: "program-secret".into(),
-            argv: vec!["argument-secret".into()],
-            cwd: Some("/private-path-secret".into()),
-            env: BTreeMap::from([("API_KEY".into(), "environment-secret".into())]),
-        },
+        launch(),
         None,
         1000,
     )
     .unwrap()
+}
+
+#[test]
+fn a_process_can_be_recovered_without_fabricating_a_claim() {
+    let fixture = Fixture::new();
+    let registry = fixture.registry();
+    let process = lifecycle::create_process(&registry, &random_uuid(), launch(), 1000).unwrap();
+    assert!(
+        lifecycle::list_after(&registry, None, 10)
+            .unwrap()
+            .is_empty()
+    );
+    drop(registry);
+    let restored = fixture.registry();
+    let recovered = lifecycle::read_process(&restored, &process.registration_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        process == recovered,
+        "process identity and private recipe survive replay without a claim"
+    );
+    assert!(
+        crate::control_plane::registry::presence::attachment(&restored, &process.registration_id,)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn attachment_views_share_process_evidence_across_replay() {
+    let fixture = Fixture::new();
+    let registry = fixture.registry();
+    let ticket = create(&registry);
+    {
+        let mut log = registry.events.lock().unwrap();
+        log.append(
+            &ticket.claim_id,
+            "2026-01-01T00:00:00.000Z",
+            Source::Bootstrap,
+            Transition::Captured(ProcessIdentity {
+                pid: 10,
+                boot_id: "test-boot".into(),
+                start_ticks: 1,
+            }),
+        )
+        .unwrap();
+        let before_signal = log.facts(&ticket.claim_id).unwrap();
+        let next_claim = random_uuid();
+        log.append(
+            &next_claim,
+            "2026-01-01T00:00:01.000Z",
+            Source::Registration,
+            Transition::Enrolled(before_signal.clone()),
+        )
+        .unwrap();
+        log.append(
+            &next_claim,
+            "2026-01-01T00:00:02.000Z",
+            Source::ProcessControl,
+            Transition::SignalRequested,
+        )
+        .unwrap();
+        assert!(
+            log.facts(&ticket.claim_id)
+                .unwrap()
+                .execution
+                .signalled_at
+                .is_some()
+        );
+        assert!(
+            log.append(
+                &random_uuid(),
+                "2026-01-01T00:00:03.000Z",
+                Source::Registration,
+                Transition::Enrolled(before_signal)
+            )
+            .is_err(),
+            "a stale attachment cannot erase the signal"
+        );
+    }
+    drop(registry);
+    let restored = fixture.registry();
+    assert!(
+        lifecycle::read_process(&restored, &ticket.registration_id)
+            .unwrap()
+            .unwrap()
+            .signalled_at
+            .is_some(),
+        "process evidence survives replay independently of the reporting claim"
+    );
 }
 
 #[test]
@@ -190,14 +284,34 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
     assert_eq!(
         pointers
             .iter()
+            .filter(|event| event.kind.starts_with("lifecycle."))
             .map(|event| event.kind.as_str())
             .collect::<Vec<_>>(),
         vec!["lifecycle.created", "lifecycle.revoked"]
     );
-    assert!(pointers.iter().all(
-        |event| event.subject_id.as_deref() == Some(&ticket.claim_id)
-            && event.lifecycle_event_id.is_some()
-    ));
+    assert!(
+        pointers
+            .iter()
+            .all(|event| event.lifecycle_event_id.is_some())
+    );
+    let process = pointers
+        .iter()
+        .find(|event| event.kind == "process.created")
+        .expect("process pointer");
+    assert_eq!(
+        process.registration_id.as_deref(),
+        Some(ticket.registration_id.as_str())
+    );
+    assert!(
+        process.subject_id.is_none() && process.claim_id.is_none(),
+        "a process registration is not a claim or subject"
+    );
+    assert!(
+        pointers
+            .iter()
+            .filter(|event| event.kind.starts_with("lifecycle."))
+            .all(|event| event.subject_id.as_deref() == Some(&ticket.subject_id))
+    );
     assert_eq!(store.events().unwrap(), pointers);
     drop(store);
     drop(registry);
@@ -210,16 +324,17 @@ fn pointer_delivery_is_bounded_and_reports_its_remaining_source_backlog() {
     let fixture = Fixture::new();
     let registry = fixture.registry();
     let store = Store::open(&fixture.0).unwrap();
-    for _ in 0..260 {
+    while registry.events.lock().unwrap().tail() < 260 {
         create(&registry);
     }
+    let source_count = registry.events.lock().unwrap().tail() as usize;
     let (_, tail, _, first, pending) = store.event_snapshot().unwrap();
     assert_eq!(first.len(), 256);
     assert_eq!(tail, 256);
     assert!(pending);
     let (_, tail, _, second, pending) = store.event_snapshot().unwrap();
-    assert_eq!(second.len(), 260);
-    assert_eq!(tail, 260);
+    assert_eq!(second.len(), source_count);
+    assert_eq!(tail as usize, source_count);
     assert!(!pending);
     let ids: std::collections::BTreeSet<_> = second
         .iter()
@@ -227,7 +342,7 @@ fn pointer_delivery_is_bounded_and_reports_its_remaining_source_backlog() {
         .collect();
     assert_eq!(
         ids.len(),
-        260,
+        source_count,
         "catch-up must not duplicate committed source events"
     );
 }
@@ -244,39 +359,6 @@ fn a_missing_sequence_refuses_replay_instead_of_inventing_state() {
     )
     .unwrap();
     assert!(Registry::open_at(&fixture.0, 2000).is_err());
-}
-
-#[test]
-fn legacy_subject_is_explicitly_imported_before_its_next_transition() {
-    let fixture = Fixture::new();
-    let registry = fixture.registry();
-    let ticket = create(&registry);
-    let mut legacy = lifecycle::read(&registry, &ticket.claim_id)
-        .unwrap()
-        .unwrap();
-    legacy.execution.correlation = Some(ticket.correlation);
-    fs::write(
-        fixture
-            .0
-            .join("lifecycle")
-            .join(format!("{}.json", ticket.claim_id)),
-        serde_json::to_vec(&legacy).unwrap(),
-    )
-    .unwrap();
-    drop(registry);
-    fs::remove_dir_all(fixture.directory()).unwrap();
-    let restored = fixture.registry();
-    lifecycle::cancel(&restored, &ticket.claim_id, &LocalProcfsVerifier, 2000).unwrap();
-    let first: Event = serde_json::from_slice(
-        &fs::read(fixture.directory().join("00000000000000000001.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(matches!(first.transition, Transition::Imported(_)));
-    let second: Event = serde_json::from_slice(
-        &fs::read(fixture.directory().join("00000000000000000002.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(matches!(second.transition, Transition::Revoked));
 }
 
 #[test]

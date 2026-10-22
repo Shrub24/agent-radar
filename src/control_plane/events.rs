@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::{
-    Claim, EndedEvidence, Observation, Origin, PaneAbsence, PaneCleanup, State,
+    Claim, EndedEvidence, Observation, Origin, PaneAbsence, PaneCleanup, ProcessRecord, State,
 };
 use crate::control_plane::containers::{Container, ContainerObservation};
 use crate::control_plane::registry::publication::write_atomic;
@@ -44,13 +44,22 @@ pub fn shared(directory: &Path) -> Result<Arc<Mutex<Log>>, String> {
 #[cfg(test)]
 mod tests;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_EVENT_BYTES: usize = 16 * 1024;
 
 /// A secret-free baseline for explicitly imported records and new subjects.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Facts {
+    pub attachment: AttachmentFacts,
+    pub execution: ProcessFacts,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentFacts {
+    pub registration_id: String,
+    pub session: Option<String>,
     /// Stable logical subject identity. Absent only in pre-migration events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "logical_subject_id")]
@@ -63,10 +72,16 @@ pub struct Facts {
     pub identity_unresolved: bool,
     #[serde(default)]
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,
+}
+
+/// One registration's public process evidence. Recipes and captured environment
+/// remain private; attachments reference this projection rather than owning it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessFacts {
     pub spawn_request_id: String,
     pub origin: Origin,
     pub state: State,
-    pub session: Option<String>,
     pub successor: Option<String>,
     pub process: Option<ProcessIdentity>,
     #[serde(default)]
@@ -89,47 +104,56 @@ pub struct Facts {
 impl Facts {
     pub fn from_subject(subject: &Claim) -> Self {
         Self {
-            subject_id: subject.subject_id.clone(),
-            execution_generation: None,
-            identity_unresolved: subject.identity_unresolved,
-            managed: subject.managed.clone(),
-            spawn_request_id: subject.execution.spawn_request_id.clone(),
-            origin: subject.execution.origin,
-            state: subject.execution.state,
-            session: subject.session.clone(),
-            successor: subject.execution.successor.clone(),
-            process: subject.execution.process.clone(),
-            observation: subject.execution.observation.clone(),
-            pane_absence: subject.execution.pane_absence.clone(),
-            ended_externally_at: subject.execution.ended_externally_at.clone(),
-            ended_evidence: subject.execution.ended_evidence.clone(),
-            pane_cleanup: subject.execution.pane_cleanup.clone(),
-            bound_registration_id: subject.execution.bound_registration_id.clone(),
-            signalled_at: subject.execution.signalled_at.clone(),
-            exited_at: subject.execution.exited_at.clone(),
-            recorded_at: subject.execution.recorded_at.clone(),
+            attachment: AttachmentFacts {
+                registration_id: subject.execution.registration_id.clone(),
+                subject_id: subject.subject_id.clone(),
+                execution_generation: None,
+                identity_unresolved: subject.identity_unresolved,
+                managed: subject.managed.clone(),
+                session: subject.session.clone(),
+            },
+            execution: ProcessFacts::from(&subject.execution),
         }
     }
+}
 
-    pub fn apply_to(&self, subject: &mut Claim) {
-        subject.subject_id = self.subject_id.clone();
-        subject.identity_unresolved = self.identity_unresolved;
-        subject.managed = self.managed.clone();
-        subject.session = self.session.clone();
-        subject.execution.state = self.state;
-        subject.execution.successor = self.successor.clone();
-        subject.execution.process = self.process.clone();
-        subject.execution.observation = self.observation.clone();
-        subject.execution.pane_absence = self.pane_absence.clone();
-        subject.execution.ended_externally_at = self.ended_externally_at.clone();
-        subject.execution.ended_evidence = self.ended_evidence.clone();
-        subject.execution.pane_cleanup = self.pane_cleanup.clone();
-        subject.execution.bound_registration_id = self.bound_registration_id.clone();
-        subject.execution.signalled_at = self.signalled_at.clone();
-        subject.execution.exited_at = self.exited_at.clone();
-        subject.execution.recorded_at = self.recorded_at.clone();
+impl From<&ProcessRecord> for ProcessFacts {
+    fn from(process: &ProcessRecord) -> Self {
+        Self {
+            spawn_request_id: process.spawn_request_id.clone(),
+            origin: process.origin,
+            state: process.state,
+            successor: process.successor.clone(),
+            process: process.process.clone(),
+            observation: process.observation.clone(),
+            pane_absence: process.pane_absence.clone(),
+            ended_externally_at: process.ended_externally_at.clone(),
+            ended_evidence: process.ended_evidence.clone(),
+            pane_cleanup: process.pane_cleanup.clone(),
+            bound_registration_id: process.bound_registration_id.clone(),
+            signalled_at: process.signalled_at.clone(),
+            exited_at: process.exited_at.clone(),
+            recorded_at: process.recorded_at.clone(),
+        }
+    }
+}
+
+impl ProcessFacts {
+    pub fn apply_to(&self, process: &mut ProcessRecord) {
+        process.state = self.state;
+        process.successor = self.successor.clone();
+        process.process = self.process.clone();
+        process.observation = self.observation.clone();
+        process.pane_absence = self.pane_absence.clone();
+        process.ended_externally_at = self.ended_externally_at.clone();
+        process.ended_evidence = self.ended_evidence.clone();
+        process.pane_cleanup = self.pane_cleanup.clone();
+        process.bound_registration_id = self.bound_registration_id.clone();
+        process.signalled_at = self.signalled_at.clone();
+        process.exited_at = self.exited_at.clone();
+        process.recorded_at = self.recorded_at.clone();
         if self.state != State::Pending {
-            subject.execution.correlation = None;
+            process.correlation = None;
         }
     }
 }
@@ -142,6 +166,10 @@ impl Facts {
     deny_unknown_fields
 )]
 pub enum Transition {
+    ProcessCreated {
+        registration_id: String,
+        facts: ProcessFacts,
+    },
     Created(Facts),
     Enrolled(Facts),
     Imported(Facts),
@@ -245,7 +273,8 @@ pub struct Event {
 pub struct Log {
     directory: PathBuf,
     next_seq: u64,
-    facts: BTreeMap<String, Facts>,
+    facts: BTreeMap<String, AttachmentFacts>,
+    processes: BTreeMap<String, ProcessFacts>,
     operations: BTreeMap<String, RequestRecord>,
     containers: BTreeMap<String, Container>,
     last_subject_event: BTreeMap<String, String>,
@@ -256,7 +285,7 @@ pub struct Log {
 impl std::fmt::Debug for Facts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Facts")
-            .field("state", &self.state)
+            .field("state", &self.execution.state)
             .finish_non_exhaustive()
     }
 }
@@ -283,6 +312,7 @@ impl Log {
             directory: directory.to_owned(),
             next_seq: 1,
             facts: BTreeMap::new(),
+            processes: BTreeMap::new(),
             operations: BTreeMap::new(),
             containers: BTreeMap::new(),
             last_subject_event: BTreeMap::new(),
@@ -333,19 +363,30 @@ impl Log {
         Ok(events)
     }
 
-    pub fn facts(&self, subject_id: &str) -> Option<&Facts> {
-        self.facts.get(subject_id)
+    pub fn facts(&self, claim_id: &str) -> Option<Facts> {
+        let attachment = self.facts.get(claim_id)?;
+        let execution = self
+            .processes
+            .get(&attachment.registration_id)
+            .expect("every attachment references its recorded process");
+        Some(Facts {
+            attachment: attachment.clone(),
+            execution: execution.clone(),
+        })
     }
+    pub fn process(&self, registration_id: &str) -> Option<&ProcessFacts> {
+        self.processes.get(registration_id)
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = &String> {
         self.facts.keys()
     }
 
-    /// Stable snapshot of current per-execution facts, used by one-time
-    /// migrations without exposing the reducer's mutable map.
+    /// Materialized attachment views over the one process owner per registration.
     pub fn all_facts(&self) -> Vec<(String, Facts)> {
         self.facts
-            .iter()
-            .map(|(id, facts)| (id.clone(), facts.clone()))
+            .keys()
+            .map(|id| (id.clone(), self.facts(id).expect("recorded attachment")))
             .collect()
     }
     pub fn container(&self, id: &str) -> Option<&Container> {
@@ -374,7 +415,7 @@ impl Log {
             source: source.clone(),
             transition: transition.clone(),
         };
-        if &reduce(self.facts.get(subject_id), &event)? != expected {
+        if &self.reduce_event(&event)? != expected {
             return Err("lifecycle transition changes unrelated facts".into());
         }
         self.append(subject_id, at, source, transition)
@@ -432,13 +473,48 @@ impl Log {
             source,
             transition,
         };
-        if event.transition.is_container() {
+        if let Transition::ProcessCreated {
+            registration_id, ..
+        } = &event.transition
+        {
+            self.validate_process_creation(subject_id, registration_id)?;
+        } else if event.transition.is_container() {
             reduce_container(self.containers.get(subject_id), &event)?;
         } else {
-            reduce(self.facts.get(subject_id), &event)?;
+            self.reduce_event(&event)?;
         }
         self.persist(&event)?;
         self.replay(&event)
+    }
+
+    fn validate_process_creation(&self, key: &str, registration_id: &str) -> Result<(), String> {
+        if key != registration_id || SessionUuid::parse(registration_id).is_none() {
+            return Err("process event does not identify its registration".into());
+        }
+        if self.processes.contains_key(registration_id) {
+            return Err("process registration is already recorded".into());
+        }
+        Ok(())
+    }
+
+    fn reduce_event(&self, event: &Event) -> Result<Facts, String> {
+        let id = event
+            .subject_id
+            .as_deref()
+            .ok_or("event has no record identity")?;
+        let previous = self.facts(id);
+        let mut next = reduce(previous.as_ref(), event)?;
+        if previous.is_none()
+            && let Some(process) = self.processes.get(&next.attachment.registration_id)
+        {
+            // A new attachment can reference an existing process, never reset
+            // its recipe identity, birth, signal, exit or replacement evidence.
+            next.execution.recorded_at = process.recorded_at.clone();
+            if &next.execution != process {
+                return Err("a new attachment cannot replace existing process facts".into());
+            }
+        }
+        Ok(next)
     }
 
     fn persist(&mut self, event: &Event) -> Result<(), String> {
@@ -476,12 +552,22 @@ impl Log {
         {
             return Err("event causation is invalid".into());
         }
-        if event.transition.is_container() {
+        if let Transition::ProcessCreated {
+            registration_id,
+            facts,
+        } = &event.transition
+        {
+            self.validate_process_creation(subject_id, registration_id)?;
+            self.processes
+                .insert(registration_id.clone(), facts.clone());
+        } else if event.transition.is_container() {
             let container = reduce_container(self.containers.get(subject_id), event)?;
             self.containers.insert(subject_id.to_owned(), container);
         } else {
-            let facts = reduce(self.facts.get(subject_id), event)?;
-            self.facts.insert(subject_id.to_owned(), facts);
+            let facts = self.reduce_event(event)?;
+            self.processes
+                .insert(facts.attachment.registration_id.clone(), facts.execution);
+            self.facts.insert(subject_id.to_owned(), facts.attachment);
         }
         self.last_subject_event
             .insert(subject_id.to_owned(), event.event_id.clone());
@@ -500,89 +586,98 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
     };
     match &event.transition {
         Transition::IdentityUnresolved => {
-            facts.identity_unresolved = true;
+            facts.attachment.identity_unresolved = true;
         }
         Transition::IdentityMapped {
             subject_id: logical_subject_id,
             execution_generation,
             identity_unresolved,
         } => {
-            if facts.subject_id.is_some() || logical_subject_id.is_empty() {
+            if facts.attachment.subject_id.is_some() || logical_subject_id.is_empty() {
                 return Err(format!(
                     "identity mapping conflicts with current facts (logical={:?}, generation={:?}, new logical={logical_subject_id:?}, new generation={execution_generation:?})",
-                    facts.subject_id, facts.execution_generation
+                    facts.attachment.subject_id, facts.attachment.execution_generation
                 ));
             }
-            facts.subject_id = Some(logical_subject_id.clone());
-            facts.execution_generation = *execution_generation;
-            facts.identity_unresolved = *identity_unresolved;
+            facts.attachment.subject_id = Some(logical_subject_id.clone());
+            facts.attachment.execution_generation = *execution_generation;
+            facts.attachment.identity_unresolved = *identity_unresolved;
         }
-        Transition::Captured(process) if facts.state == State::Pending => {
-            facts.state = State::Captured;
-            facts.process = Some(process.clone());
+        Transition::Captured(process) if facts.execution.state == State::Pending => {
+            facts.execution.state = State::Captured;
+            facts.execution.process = Some(process.clone());
         }
-        Transition::Bound { registration_id } if facts.state == State::Captured => {
-            facts.state = State::Bound;
-            facts.bound_registration_id = Some(registration_id.clone());
+        Transition::Bound { registration_id } if facts.execution.state == State::Captured => {
+            facts.execution.state = State::Bound;
+            facts.execution.bound_registration_id = Some(registration_id.clone());
         }
-        Transition::Revoked if matches!(facts.state, State::Pending | State::Captured) => {
-            facts.state = State::Revoked
+        Transition::Revoked
+            if matches!(facts.execution.state, State::Pending | State::Captured) =>
+        {
+            facts.execution.state = State::Revoked
         }
         Transition::SignalRequested
-            if facts.process.is_some()
-                && facts.signalled_at.is_none()
-                && facts.exited_at.is_none() =>
+            if facts.execution.process.is_some()
+                && facts.execution.signalled_at.is_none()
+                && facts.execution.exited_at.is_none() =>
         {
-            facts.signalled_at = Some(event.at.clone())
+            facts.execution.signalled_at = Some(event.at.clone())
         }
         Transition::Observed(observation)
-            if facts.process.as_ref() == Some(&observation.process)
-                && facts.exited_at.is_none() =>
+            if facts.execution.process.as_ref() == Some(&observation.process)
+                && facts.execution.exited_at.is_none() =>
         {
-            facts.observation = Some(observation.clone());
+            facts.execution.observation = Some(observation.clone());
         }
         Transition::AbsencePending(absence)
-            if facts.exited_at.is_none() && facts.ended_externally_at.is_none() =>
+            if facts.execution.exited_at.is_none()
+                && facts.execution.ended_externally_at.is_none() =>
         {
-            facts.pane_absence = absence.clone();
+            facts.execution.pane_absence = absence.clone();
         }
         Transition::EndedExternally(evidence)
-            if facts.exited_at.is_none() && facts.ended_externally_at.is_none() =>
+            if facts.execution.exited_at.is_none()
+                && facts.execution.ended_externally_at.is_none() =>
         {
-            facts.ended_externally_at = Some(event.at.clone());
-            facts.ended_evidence = Some(evidence.clone());
+            facts.execution.ended_externally_at = Some(event.at.clone());
+            facts.execution.ended_evidence = Some(evidence.clone());
             // The confirmed absence is the reason, so no window is left pending.
-            facts.pane_absence = None;
+            facts.execution.pane_absence = None;
         }
-        Transition::ExitVerified if facts.process.is_some() && facts.exited_at.is_none() => {
-            facts.exited_at = Some(event.at.clone())
+        Transition::ExitVerified
+            if facts.execution.process.is_some() && facts.execution.exited_at.is_none() =>
+        {
+            facts.execution.exited_at = Some(event.at.clone())
         }
         // Only a launch this daemon revoked left a pane nobody owns, and its
         // cleanup outcome is recorded once: a later cancel reports it.
         Transition::PaneCleanup(outcome)
-            if facts.state == State::Revoked && facts.pane_cleanup.is_none() =>
+            if facts.execution.state == State::Revoked
+                && facts.execution.pane_cleanup.is_none() =>
         {
-            facts.pane_cleanup = Some(outcome.clone())
+            facts.execution.pane_cleanup = Some(outcome.clone())
         }
-        Transition::SuccessorReserved { spawn_request_id } if facts.successor.is_none() => {
-            facts.successor = Some(spawn_request_id.clone())
+        Transition::SuccessorReserved { spawn_request_id }
+            if facts.execution.successor.is_none() =>
+        {
+            facts.execution.successor = Some(spawn_request_id.clone())
         }
         Transition::SuccessorCancelled { spawn_request_id }
-            if facts.successor.as_deref() == Some(spawn_request_id.as_str()) =>
+            if facts.execution.successor.as_deref() == Some(spawn_request_id.as_str()) =>
         {
-            facts.successor = None;
+            facts.execution.successor = None;
         }
         Transition::SessionRecorded { session }
-            if facts.state == State::Bound
-                && facts.session.is_none()
-                && facts.exited_at.is_none()
-                && facts.ended_externally_at.is_none() =>
+            if facts.execution.state == State::Bound
+                && facts.attachment.session.is_none()
+                && facts.execution.exited_at.is_none()
+                && facts.execution.ended_externally_at.is_none() =>
         {
-            facts.session = Some(session.clone())
+            facts.attachment.session = Some(session.clone())
         }
         _ => return Err("invalid lifecycle transition".into()),
     }
-    facts.recorded_at = event.at.clone();
+    facts.execution.recorded_at = event.at.clone();
     Ok(facts)
 }
 

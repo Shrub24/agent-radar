@@ -485,7 +485,6 @@ impl Registry {
             observing: Mutex::new(std::collections::HashSet::new()),
             events: crate::control_plane::events::shared(&root.join("events"))?,
         };
-        crate::control_plane::lifecycle::migrate_identity(&registry, now_ms)?;
         Ok(registry)
     }
 

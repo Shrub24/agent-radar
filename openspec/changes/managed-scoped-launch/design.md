@@ -50,7 +50,7 @@ Three roles, three ids, three lifespans:
 | --- | --- | --- | --- |
 | The agent | `subject_id` | Durable identity of one Pi session, across processes and panes | Daemon |
 | One attachment | `claim_id` | The subject's proof of attachment to a process and session, from reservation to release | Daemon reserves a launch's claim; a process presents its own otherwise |
-| One process incarnation | `registration_id` | One OS process, launch to exit | Daemon pre-mints it for a managed launch, the process presents it; otherwise the process writes it. The daemon verifies |
+| One process incarnation | `registration_id` | One OS process, launch to exit | Daemon pre-mints it at launch or allocates it on first recognition; the process reports it thereafter |
 
 The first consolidation (tasks 0.1–0.8) gave the agent the plain `subject_id` and replaced execution generations with exact claims. Task 0.9 separates process lifetime from attachment lifetime:
 
@@ -59,7 +59,11 @@ The first consolidation (tasks 0.1–0.8) gave the agent the plain `subject_id` 
 - **`reserved` is a distinct standing.** `pending` already means a process's report is still being verified and the client retries it; `reserved` is waited on by Radar. It conveys no attachment authority: handoffs, derived reads and controls that need a granted claim ignore it. It is visible and controllable, so the TUI shows a starting row and `D` on it can cancel the launch.
 - **Attachment moves off the attempt.** Presence release clears the subject's current claim; it does not end the process or its registration.
 - **`execution_generation` is dropped.** It existed to fence and to name the latest attempt. A claim id is an exact attachment fence, and the subject's `current_claim` names its attachment without scanning for a maximum.
-- **The subject becomes a record.** Identity, managed metadata, `parent_subject_id` and `current_claim` live on it once, instead of being copied forward onto each successor.
+- **The subject becomes a record.** Identity, managed metadata, `parent_subject_id` and `current_claim` live on it once, instead of being copied forward onto each successor. `last_claim` retains the exact attachment provenance for a detached subject's history; it is never authority and never authorises a control.
+
+Process evidence remains in the existing durable event stream. Its disposable projection stores physical facts once per registration and keeps attachment provenance separately; reads compose a claim view over that process. Private recipes are written once under the registration id. A fresh attachment cannot overwrite captured birth, signal, exit or successor evidence. A command without an agent subject records only its process, without a dummy claim.
+
+A spawn-addressed control may follow a fresh claim in the same process registration, but must refuse if the subject has moved to a replacement process. The caller must still name the exact current claim.
 
 **Races resolve at reservation, which is what makes restart continuous.** Reserving a launch's claim is the exclusive act per subject: the first accepted reservation wins, and a competing launch or restart is refused or left pending. Because a restart reserves its successor (a new registration and claim) before it dispatches the stop, the successor is already the subject's current claim at the moment the old process is signalled — the continuity gap closes there, not when the replacement eventually starts.
 

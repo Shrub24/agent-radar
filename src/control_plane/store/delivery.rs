@@ -66,6 +66,7 @@ impl Store {
 
 fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
     let kind = match &event.transition {
+        Transition::ProcessCreated { .. } => "process.created",
         Transition::Created(_) => "lifecycle.created",
         Transition::Enrolled(_) => "lifecycle.enrolled",
         Transition::Imported(_) => "lifecycle.imported",
@@ -92,32 +93,47 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
     };
     let facts = event.subject_id.as_deref().and_then(|id| log.facts(id));
     let registration_id = match &event.transition {
-        Transition::Bound { registration_id } => Some(registration_id.clone()),
+        Transition::ProcessCreated {
+            registration_id, ..
+        }
+        | Transition::Bound { registration_id } => Some(registration_id.clone()),
         Transition::Enrolled(facts) | Transition::Imported(facts) => {
-            facts.bound_registration_id.clone()
+            facts.execution.bound_registration_id.clone()
         }
         _ => None,
     };
     let lifecycle_execution = event.operation_id.is_none() && facts.is_some();
+    let subject_id = if matches!(event.transition, Transition::ProcessCreated { .. }) {
+        None
+    } else {
+        facts
+            .as_ref()
+            .and_then(|facts| facts.attachment.subject_id.clone())
+            .or_else(|| event.subject_id.clone())
+    };
     Some(Event {
         seq: 0,
         kind: kind.into(),
-        subject_id: facts
-            .and_then(|facts| facts.subject_id.clone())
-            .or_else(|| event.subject_id.clone()),
+        subject_id,
         claim_id: lifecycle_execution
             .then(|| event.subject_id.clone())
             .flatten(),
         lifecycle_event_id: Some(event.event_id.clone()),
         registration_id,
         spawn: facts
-            .filter(|facts| facts.origin == Origin::Spawned)
-            .map(|facts| facts.spawn_request_id.clone()),
+            .filter(|facts| facts.execution.origin == Origin::Spawned)
+            .map(|facts| facts.execution.spawn_request_id.clone())
+            .or_else(|| match &event.transition {
+                Transition::ProcessCreated { facts, .. } if facts.origin == Origin::Spawned => {
+                    Some(facts.spawn_request_id.clone())
+                }
+                _ => None,
+            }),
         request_id: event
             .operation_id
             .clone()
             .or_else(|| match &event.transition {
-                Transition::Enrolled(facts) => Some(facts.spawn_request_id.clone()),
+                Transition::Enrolled(facts) => Some(facts.execution.spawn_request_id.clone()),
                 Transition::SuccessorReserved { spawn_request_id } => {
                     Some(spawn_request_id.clone())
                 }
