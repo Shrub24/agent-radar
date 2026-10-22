@@ -46,8 +46,8 @@ fn replay_restores_revocation_without_credentials_in_events() {
     let before = lifecycle::read(&registry, &ticket.claim_id)
         .unwrap()
         .unwrap();
-    assert_eq!(before.state, State::Revoked);
-    assert!(before.correlation.is_none());
+    assert_eq!(before.execution.state, State::Revoked);
+    assert!(before.execution.correlation.is_none());
     drop(registry);
     let restored = fixture.registry();
     let after = lifecycle::read(&restored, &ticket.claim_id)
@@ -89,6 +89,7 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
         lifecycle::read(&registry, &ticket.claim_id)
             .unwrap()
             .unwrap()
+            .execution
             .state,
         State::Pending
     );
@@ -103,6 +104,7 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
         lifecycle::read(&restored, &ticket.claim_id)
             .unwrap()
             .unwrap()
+            .execution
             .state,
         State::Pending
     );
@@ -178,6 +180,7 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
         lifecycle::read(&registry, &ticket.claim_id)
             .unwrap()
             .unwrap()
+            .execution
             .state,
         State::Revoked
     );
@@ -251,7 +254,7 @@ fn legacy_subject_is_explicitly_imported_before_its_next_transition() {
     let mut legacy = lifecycle::read(&registry, &ticket.claim_id)
         .unwrap()
         .unwrap();
-    legacy.correlation = Some(ticket.correlation);
+    legacy.execution.correlation = Some(ticket.correlation);
     fs::write(
         fixture
             .0

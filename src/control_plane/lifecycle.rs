@@ -206,29 +206,32 @@ pub struct SubjectRecord {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
-    pub version: u32,
-    /// Exact attempt identity; the private storage key is unchanged.
     #[serde(rename = "subject_id")]
     pub claim_id: String,
-    /// Process identity allocated before launch; unchanged by session claims.
-    pub registration_id: String,
-    /// Stable logical subject ID shared by every exact successor execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "logical_subject_id")]
     pub subject_id: Option<String>,
-
     #[serde(default)]
     pub identity_unresolved: bool,
+    #[serde(default)]
+    pub managed: ManagedMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(flatten)]
+    pub execution: ProcessRecord,
+}
+
+/// Facts of one process lifetime; changing a session attachment does not change
+/// their owner. The registration is allocated before a managed process starts.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessRecord {
+    pub version: u32,
+    pub registration_id: String,
     pub spawn_request_id: String,
     #[serde(default)]
     pub origin: Origin,
     pub state: State,
-    #[serde(default)]
-    pub managed: ManagedMetadata,
     pub launch: LaunchContext,
-    /// The Pi session a restart resumes. Present only on a restartable subject.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
     /// The replacement spawn dispatched for this process generation, recorded
     /// before its dispatch so a second replacement is never launched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,29 +360,31 @@ fn draft(
         .map(|(id, _)| id)
         .unwrap_or_else(|| execution_id.clone());
     Claim {
-        observation: None,
-        pane_absence: None,
-        ended_externally_at: None,
-        ended_evidence: None,
-        version: SUBJECT_VERSION,
         claim_id: execution_id,
-        registration_id: random_uuid(),
         subject_id: Some(logical_subject_id),
         identity_unresolved: false,
-        spawn_request_id: spawn_request_id.to_string(),
-        origin: Origin::Spawned,
-        state: State::Pending,
         managed,
-        launch,
-        correlation: Some(random_uuid()),
-        process: None,
-        bound_registration_id: None,
-        signalled_at: None,
-        exited_at: None,
-        pane_cleanup: None,
-        recorded_at: format_millis(now_ms),
         session,
-        successor: None,
+        execution: ProcessRecord {
+            version: SUBJECT_VERSION,
+            registration_id: random_uuid(),
+            spawn_request_id: spawn_request_id.to_string(),
+            origin: Origin::Spawned,
+            state: State::Pending,
+            launch,
+            correlation: Some(random_uuid()),
+            process: None,
+            bound_registration_id: None,
+            observation: None,
+            pane_absence: None,
+            ended_externally_at: None,
+            ended_evidence: None,
+            signalled_at: None,
+            exited_at: None,
+            pane_cleanup: None,
+            recorded_at: format_millis(now_ms),
+            successor: None,
+        },
     }
 }
 
@@ -461,15 +466,16 @@ pub fn create_with_intent(
         }
         let mut previous = read_recorded(registry, expected)?;
         if previous
+            .execution
             .successor
             .as_deref()
             .is_some_and(|id| id != spawn_request_id)
         {
             return Err("a successor is already reserved for this claim".into());
         }
-        if previous.successor.is_none() {
-            previous.successor = Some(spawn_request_id.into());
-            previous.recorded_at = format_millis(now_ms);
+        if previous.execution.successor.is_none() {
+            previous.execution.successor = Some(spawn_request_id.into());
+            previous.execution.recorded_at = format_millis(now_ms);
             write(registry, &previous)?;
         }
     }
@@ -481,22 +487,22 @@ pub fn create_with_intent(
         .ok_or("claim has no subject")?;
     crate::control_plane::registry::presence::reserve(
         registry,
-        &subject.registration_id,
+        &subject.execution.registration_id,
         &subject.claim_id,
         id,
         subject.session.clone(),
     )?;
     let mut record = read_subject_record(registry, id)?.ok_or("subject is not recorded")?;
     record.current_claim = Some(subject.claim_id.clone());
-    record.updated_at = subject.recorded_at.clone();
+    record.updated_at = subject.execution.recorded_at.clone();
     write_subject_record(registry, &record)?;
     Ok(Ticket {
-        registration_id: subject.registration_id,
+        registration_id: subject.execution.registration_id,
         claim_id: subject.claim_id,
         subject_id: subject.subject_id.unwrap_or_default(),
-        launch_id: subject.spawn_request_id,
+        launch_id: subject.execution.spawn_request_id,
         parent_subject_id: subject.managed.parent_subject_id,
-        correlation: subject.correlation.unwrap_or_default(),
+        correlation: subject.execution.correlation.unwrap_or_default(),
     })
 }
 
@@ -524,12 +530,12 @@ pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Claim>, Stri
     let bytes = read_record_file(&path, MAX_SUBJECT_BYTES)?;
     let mut subject: Claim =
         serde_json::from_slice(&bytes).map_err(|error| format!("not a launch subject: {error}"))?;
-    if !matches!(subject.version, 1 | SUBJECT_VERSION) || subject.claim_id != subject_id {
+    if !matches!(subject.execution.version, 1 | SUBJECT_VERSION) || subject.claim_id != subject_id {
         return Err("launch subject does not match its name or version".into());
     }
     // Reading a legacy file upgrades only the in-memory view. The event log is
     // migrated separately and remains the authoritative durable record.
-    subject.version = SUBJECT_VERSION;
+    subject.execution.version = SUBJECT_VERSION;
     if let Some(facts) = facts {
         facts.apply_to(&mut subject);
     }
@@ -651,14 +657,14 @@ fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
             managed: claim.managed.clone(),
             session: claim.session.clone(),
             current_claim: Some(claim.claim_id.clone()),
-            recorded_at: claim.recorded_at.clone(),
-            updated_at: claim.recorded_at.clone(),
+            recorded_at: claim.execution.recorded_at.clone(),
+            updated_at: claim.execution.recorded_at.clone(),
         },
     };
     if claim.session.is_some() {
         record.session = claim.session.clone();
     }
-    record.updated_at = claim.recorded_at.clone();
+    record.updated_at = claim.execution.recorded_at.clone();
     write_subject_record(registry, &record)
 }
 
@@ -745,14 +751,14 @@ pub fn record_pane_cleanup(
 ) -> Result<PaneCleanup, String> {
     let _transition = registry.transition();
     let mut subject = read_recorded(registry, subject_id)?;
-    if let Some(recorded) = subject.pane_cleanup.clone() {
+    if let Some(recorded) = subject.execution.pane_cleanup.clone() {
         return Ok(recorded);
     }
-    if subject.state != State::Revoked {
+    if subject.execution.state != State::Revoked {
         return Err("only a revoked launch's own pane is cleaned up".into());
     }
-    subject.pane_cleanup = Some(outcome.clone());
-    subject.recorded_at = format_millis(now_ms);
+    subject.execution.pane_cleanup = Some(outcome.clone());
+    subject.execution.recorded_at = format_millis(now_ms);
     write(registry, &subject)?;
     Ok(outcome)
 }
@@ -772,16 +778,18 @@ pub fn capture(
 ) -> Result<(), String> {
     let _transition = registry.transition();
     let mut subject = read(registry, subject_id)?.ok_or_else(|| NOT_AWAITING.to_string())?;
-    if subject.state != State::Pending || subject.correlation.as_deref() != Some(correlation) {
+    if subject.execution.state != State::Pending
+        || subject.execution.correlation.as_deref() != Some(correlation)
+    {
         return Err(NOT_AWAITING.into());
     }
-    if !subject.launch.launched_as(effective) {
+    if !subject.execution.launch.launched_as(effective) {
         return Err(LAUNCH_MISMATCH.into());
     }
-    subject.state = State::Captured;
-    subject.correlation = None;
-    subject.process = Some(process.clone());
-    subject.recorded_at = format_millis(now_ms);
+    subject.execution.state = State::Captured;
+    subject.execution.correlation = None;
+    subject.execution.process = Some(process.clone());
+    subject.execution.recorded_at = format_millis(now_ms);
     write(registry, &subject)
 }
 
@@ -799,23 +807,23 @@ pub(crate) fn fence_registration(
     now_ms: i64,
 ) -> Result<(), String> {
     let mut subject = read_recorded(registry, subject_id)?;
-    if registration_id.is_some_and(|id| id != subject.registration_id) {
+    if registration_id.is_some_and(|id| id != subject.execution.registration_id) {
         return Err("registration does not identify the launched process".into());
     }
-    match (subject.state, registration_id) {
+    match (subject.execution.state, registration_id) {
         (State::Bound, Some(agent))
-            if subject.bound_registration_id.as_deref() == Some(agent)
-                && subject.process.as_ref() == process =>
+            if subject.execution.bound_registration_id.as_deref() == Some(agent)
+                && subject.execution.process.as_ref() == process =>
         {
             Ok(())
         }
         (State::Bound, _) => Err("launch is already bound to another registration".into()),
         (State::Captured, Some(agent))
-            if process.is_some() && subject.process.as_ref() == process =>
+            if process.is_some() && subject.execution.process.as_ref() == process =>
         {
-            subject.state = State::Bound;
-            subject.bound_registration_id = Some(agent.to_string());
-            subject.recorded_at = format_millis(now_ms);
+            subject.execution.state = State::Bound;
+            subject.execution.bound_registration_id = Some(agent.to_string());
+            subject.execution.recorded_at = format_millis(now_ms);
             write(registry, &subject)
         }
         (State::Captured, _) => Err("registration does not match the launched process".into()),
@@ -884,16 +892,18 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
     {
         return Ok(false);
     }
-    if matches!(subject.state, State::Pending | State::Captured) && subject.exited_at.is_none() {
+    if matches!(subject.execution.state, State::Pending | State::Captured)
+        && subject.execution.exited_at.is_none()
+    {
         return Ok(true);
     }
     let (Some(agent), Some(session)) = (
-        subject.bound_registration_id.as_deref(),
+        subject.execution.bound_registration_id.as_deref(),
         subject.session.as_deref(),
     ) else {
         return Ok(false);
     };
-    if subject.state != State::Bound || subject.exited_at.is_some() {
+    if subject.execution.state != State::Bound || subject.execution.exited_at.is_some() {
         return Ok(false);
     }
     if crate::control_plane::registry::presence::decision(registry, &subject.claim_id)?.is_some_and(
@@ -932,11 +942,11 @@ pub fn record_launch_session(
     loop {
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
         if let Some(found) = page.iter().find(|subject| {
-            subject.bound_registration_id.as_deref() == Some(registration_id)
+            subject.execution.bound_registration_id.as_deref() == Some(registration_id)
                 && subject.session.is_none()
-                && subject.state == State::Bound
-                && subject.exited_at.is_none()
-                && subject.ended_externally_at.is_none()
+                && subject.execution.state == State::Bound
+                && subject.execution.exited_at.is_none()
+                && subject.execution.ended_externally_at.is_none()
         }) {
             if !matches!(
                 attachment(registry, registration_id, session, now_ms)?,
@@ -945,7 +955,7 @@ pub fn record_launch_session(
                 // The stored record is the one the transition is checked against.
                 let mut subject = read_recorded(registry, &found.claim_id)?;
                 subject.session = Some(session.to_string());
-                subject.recorded_at = format_millis(now_ms);
+                subject.execution.recorded_at = format_millis(now_ms);
                 write(registry, &subject)?;
             }
             return Ok(());
@@ -975,7 +985,7 @@ pub fn release_if_gone(
     now_ms: i64,
 ) -> Result<bool, String> {
     use crate::control_plane::registry::process::{ProcessVerification, verify_identity};
-    match verify_identity(holder.process.as_ref(), verifier) {
+    match verify_identity(holder.execution.process.as_ref(), verifier) {
         ProcessVerification::Absent | ProcessVerification::Mismatched => {
             record_exit(registry, &holder.claim_id, now_ms)?;
             Ok(true)
@@ -1002,7 +1012,7 @@ pub fn attachment(
             {
                 continue;
             }
-            if subject.bound_registration_id.as_deref() == Some(registration_id) {
+            if subject.execution.bound_registration_id.as_deref() == Some(registration_id) {
                 return Ok(Attachment::Own(Box::new(subject.clone())));
             }
             found = Attachment::Other(Box::new(subject.clone()));
@@ -1042,17 +1052,19 @@ pub fn enroll_subject(
     loop {
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
         for subject in &page {
-            if subject.registration_id == registration_id
-                && subject.process.as_ref() == Some(process)
-                && subject.origin == Origin::Spawned
+            if subject.execution.registration_id == registration_id
+                && subject.execution.process.as_ref() == Some(process)
+                && subject.execution.origin == Origin::Spawned
             {
                 launched = Some(subject.clone());
             }
-            if subject.session.as_deref() != Some(session) || subject.state != State::Bound {
+            if subject.session.as_deref() != Some(session)
+                || subject.execution.state != State::Bound
+            {
                 continue;
             }
             if is_attached(registry, subject, now_ms)? {
-                if subject.bound_registration_id.as_deref() != Some(registration_id) {
+                if subject.execution.bound_registration_id.as_deref() != Some(registration_id) {
                     return Err("the session is already attached to another live process".into());
                 }
                 if subject.claim_id == enrollment_id {
@@ -1061,7 +1073,7 @@ pub fn enroll_subject(
             }
             if prior
                 .as_ref()
-                .is_none_or(|p| p.recorded_at < subject.recorded_at)
+                .is_none_or(|p| p.execution.recorded_at < subject.execution.recorded_at)
             {
                 prior = Some(subject.clone());
             }
@@ -1093,10 +1105,10 @@ pub fn enroll_subject(
     let subject_id = enrollment_id.to_string();
     if let Some(mut previous) = prior
         && previous.claim_id != subject_id
-        && previous.successor.is_none()
+        && previous.execution.successor.is_none()
     {
-        previous.successor = Some(subject_id.clone());
-        previous.recorded_at = format_millis(now_ms);
+        previous.execution.successor = Some(subject_id.clone());
+        previous.execution.recorded_at = format_millis(now_ms);
         write(registry, &previous)?;
     }
     let logical = logical.unwrap_or_else(|| subject_id.clone());
@@ -1109,20 +1121,20 @@ pub fn enroll_subject(
             ManagedMetadata::default(),
             now_ms,
         );
-        adopted.origin = Origin::Enrolled;
+        adopted.execution.origin = Origin::Enrolled;
         adopted
     });
     subject.claim_id = subject_id.clone();
-    subject.registration_id = registration_id.to_string();
+    subject.execution.registration_id = registration_id.to_string();
     subject.subject_id = Some(logical);
-    subject.state = State::Bound;
+    subject.execution.state = State::Bound;
     subject.managed = managed;
     subject.session = Some(session.to_string());
-    subject.successor = None;
-    subject.correlation = None;
-    subject.process = Some(process.clone());
-    subject.bound_registration_id = Some(registration_id.to_string());
-    subject.recorded_at = format_millis(now_ms);
+    subject.execution.successor = None;
+    subject.execution.correlation = None;
+    subject.execution.process = Some(process.clone());
+    subject.execution.bound_registration_id = Some(registration_id.to_string());
+    subject.execution.recorded_at = format_millis(now_ms);
     write(registry, &subject)?;
     let logical_id = subject
         .subject_id
@@ -1144,7 +1156,7 @@ pub fn cancel_reservation(
 ) -> Result<(), String> {
     let _transition = registry.transition();
     let mut next = read_recorded(registry, pending)?;
-    if next.state != State::Pending || next.process.is_some() {
+    if next.execution.state != State::Pending || next.execution.process.is_some() {
         return Err(
             "the successor may have dispatched; its reservation cannot be withdrawn".into(),
         );
@@ -1155,15 +1167,15 @@ pub fn cancel_reservation(
         return Err("the subject's claim changed while stopping its previous process".into());
     }
     let mut previous = read_recorded(registry, predecessor)?;
-    if previous.successor.as_deref() != Some(next.spawn_request_id.as_str()) {
+    if previous.execution.successor.as_deref() != Some(next.execution.spawn_request_id.as_str()) {
         return Err("successor reservation does not match its predecessor".into());
     }
-    next.state = State::Revoked;
-    next.correlation = None;
-    next.recorded_at = format_millis(now_ms);
+    next.execution.state = State::Revoked;
+    next.execution.correlation = None;
+    next.execution.recorded_at = format_millis(now_ms);
     write(registry, &next)?;
-    previous.successor = None;
-    previous.recorded_at = format_millis(now_ms);
+    previous.execution.successor = None;
+    previous.execution.recorded_at = format_millis(now_ms);
     write(registry, &previous)?;
     record.current_claim = Some(predecessor.into());
     record.updated_at = format_millis(now_ms);
@@ -1181,13 +1193,13 @@ pub fn set_successor(
 ) -> Result<(), String> {
     let _transition = registry.transition();
     let mut subject = read_recorded(registry, subject_id)?;
-    if let Some(existing) = &subject.successor {
+    if let Some(existing) = &subject.execution.successor {
         return Err(format!(
             "this process is already superseded by spawn {existing}"
         ));
     }
-    subject.successor = Some(successor.to_string());
-    subject.recorded_at = format_millis(now_ms);
+    subject.execution.successor = Some(successor.to_string());
+    subject.execution.recorded_at = format_millis(now_ms);
     write(registry, &subject)
 }
 
@@ -1324,24 +1336,24 @@ pub fn public_view(subject: &Claim) -> Value {
     json!({
         "subject_id": subject.subject_id.as_deref().unwrap_or(&subject.claim_id),
         "claim_id": subject.claim_id,
-        "registration_id": subject.registration_id,
+        "registration_id": subject.execution.registration_id,
         "identity_unresolved": subject.identity_unresolved,
         "managed": subject.managed,
-        "spawn_request_id": subject.spawn_request_id,
-        "state": subject.state,
-        "process": subject.process,
-        "observation": subject.observation,
-        "pane_absence": subject.pane_absence,
-        "ended_externally_at": subject.ended_externally_at,
-        "ended_evidence": subject.ended_evidence,
-        "pane_cleanup": subject.pane_cleanup,
-        "bound_registration_id": subject.bound_registration_id,
-        "signalled_at": subject.signalled_at,
-        "exited_at": subject.exited_at,
-        "recorded_at": subject.recorded_at,
-        "origin": subject.origin,
+        "spawn_request_id": subject.execution.spawn_request_id,
+        "state": subject.execution.state,
+        "process": subject.execution.process,
+        "observation": subject.execution.observation,
+        "pane_absence": subject.execution.pane_absence,
+        "ended_externally_at": subject.execution.ended_externally_at,
+        "ended_evidence": subject.execution.ended_evidence,
+        "pane_cleanup": subject.execution.pane_cleanup,
+        "bound_registration_id": subject.execution.bound_registration_id,
+        "signalled_at": subject.execution.signalled_at,
+        "exited_at": subject.execution.exited_at,
+        "recorded_at": subject.execution.recorded_at,
+        "origin": subject.execution.origin,
         "session": subject.session,
-        "successor": subject.successor,
+        "successor": subject.execution.successor,
     })
 }
 
@@ -1623,12 +1635,12 @@ pub fn sweep(
 fn revoke(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<bool, String> {
     let _transition = registry.transition();
     let mut subject = read_recorded(registry, subject_id)?;
-    if !matches!(subject.state, State::Pending | State::Captured) {
+    if !matches!(subject.execution.state, State::Pending | State::Captured) {
         return Ok(false);
     }
-    subject.state = State::Revoked;
-    subject.correlation = None;
-    subject.recorded_at = format_millis(now_ms);
+    subject.execution.state = State::Revoked;
+    subject.execution.correlation = None;
+    subject.execution.recorded_at = format_millis(now_ms);
     write(registry, &subject)?;
     Ok(true)
 }
@@ -1686,19 +1698,19 @@ fn stage(
     now_ms: i64,
 ) -> Result<Stage, String> {
     let subject = read_recorded(registry, subject_id)?;
-    let Some(process) = subject.process.clone() else {
+    let Some(process) = subject.execution.process.clone() else {
         return Ok(Stage::Settled(Exit::Unresolved));
     };
-    if subject.exited_at.is_some() {
+    if subject.execution.exited_at.is_some() {
         return Ok(Stage::Settled(Exit::Exited));
     }
     let acquired = process_control::acquire(&process, verifier);
     let _transition = registry.transition();
     let mut subject = read_recorded(registry, subject_id)?;
-    if subject.process.as_ref() != Some(&process) {
+    if subject.execution.process.as_ref() != Some(&process) {
         return Ok(Stage::Settled(Exit::Unresolved));
     }
-    if subject.exited_at.is_some() {
+    if subject.execution.exited_at.is_some() {
         return Ok(Stage::Settled(Exit::Exited));
     }
     let descriptor = match acquired {
@@ -1710,10 +1722,10 @@ fn stage(
         // An identity that cannot be read is not a process to signal.
         Err(_) => return Ok(Stage::Settled(Exit::Unresolved)),
     };
-    let signal = subject.signalled_at.is_none();
+    let signal = subject.execution.signalled_at.is_none();
     if signal {
-        subject.signalled_at = Some(format_millis(now_ms));
-        subject.recorded_at = format_millis(now_ms);
+        subject.execution.signalled_at = Some(format_millis(now_ms));
+        subject.execution.recorded_at = format_millis(now_ms);
         write(registry, &subject)?;
     }
     Ok(Stage::Watch { descriptor, signal })
@@ -1788,9 +1800,9 @@ fn record_exit(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<(),
 }
 
 fn record_exit_locked(registry: &Registry, subject: &mut Claim, now_ms: i64) -> Result<(), String> {
-    if subject.exited_at.is_none() {
-        subject.exited_at = Some(format_millis(now_ms));
-        subject.recorded_at = format_millis(now_ms);
+    if subject.execution.exited_at.is_none() {
+        subject.execution.exited_at = Some(format_millis(now_ms));
+        subject.execution.recorded_at = format_millis(now_ms);
         write(registry, subject)?;
     }
     Ok(())
@@ -1998,18 +2010,23 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
             let facts = Facts::from_subject(&legacy);
             log.append(
                 &subject.claim_id,
-                &legacy.recorded_at,
+                &legacy.execution.recorded_at,
                 Source::RecoveryImport,
                 Transition::Imported(facts.clone()),
             )?;
             Some(facts)
         } else {
             let facts = Facts::from_subject(subject);
-            let (source, transition) = match subject.origin {
+            let (source, transition) = match subject.execution.origin {
                 Origin::Spawned => (Source::Launch, Transition::Created(facts)),
                 Origin::Enrolled => (Source::Operator, Transition::Enrolled(facts)),
             };
-            return log.append(&subject.claim_id, &subject.recorded_at, source, transition);
+            return log.append(
+                &subject.claim_id,
+                &subject.execution.recorded_at,
+                source,
+                transition,
+            );
         }
     };
     let previous = previous.expect("baseline established");
@@ -2102,7 +2119,7 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
     };
     log.append_checked(
         &subject.claim_id,
-        &subject.recorded_at,
+        &subject.execution.recorded_at,
         source,
         transition,
         &target,
@@ -2252,6 +2269,7 @@ mod tests {
             read(&reopened, subject)
                 .expect("read")
                 .expect("subject")
+                .execution
                 .state,
             State::Revoked
         );
@@ -2668,8 +2686,11 @@ mod tests {
         let read_back = read(&reopened, &claim.claim_id)
             .expect("read")
             .expect("claim");
-        assert_eq!(read_back.successor.as_deref(), Some(successor.as_str()));
-        assert_eq!(read_back.registration_id, claim.registration_id);
+        assert_eq!(
+            read_back.execution.successor.as_deref(),
+            Some(successor.as_str())
+        );
+        assert_eq!(read_back.execution.registration_id, claim.registration_id);
         assert_ne!(claim.registration_id, claim.claim_id);
         let reserved =
             crate::control_plane::registry::presence::current(&reopened, &claim.registration_id)
@@ -2755,9 +2776,13 @@ mod tests {
         let reopened = scratch.registry();
         let current = read_logical(&reopened, &first.subject_id).unwrap().unwrap();
         assert_eq!(current.claim_id, first.claim_id);
-        assert_eq!(current.successor, None);
+        assert_eq!(current.execution.successor, None);
         assert_eq!(
-            read(&reopened, &pending.claim_id).unwrap().unwrap().state,
+            read(&reopened, &pending.claim_id)
+                .unwrap()
+                .unwrap()
+                .execution
+                .state,
             State::Revoked
         );
         create_with_identity(
@@ -2787,7 +2812,7 @@ mod tests {
         let attempt = read(&registry, &claim.claim_id)
             .expect("read")
             .expect("the attempt stays readable");
-        assert_eq!(attempt.state, State::Pending);
+        assert_eq!(attempt.execution.state, State::Pending);
         assert!(!is_attached(&registry, &attempt, 2).expect("attached"));
         let record = read_subject_record(&registry, &subject_id)
             .expect("read record")
@@ -2883,9 +2908,9 @@ mod tests {
             Err(LAUNCH_MISMATCH.to_string())
         );
         let still_pending = read(&registry, subject).expect("read").expect("subject");
-        assert_eq!(still_pending.state, State::Pending);
+        assert_eq!(still_pending.execution.state, State::Pending);
         assert_eq!(
-            still_pending.correlation.as_deref(),
+            still_pending.execution.correlation.as_deref(),
             Some(ticket.correlation.as_str())
         );
     }
@@ -2938,6 +2963,7 @@ mod tests {
             read(&registry, subject)
                 .expect("read")
                 .expect("subject")
+                .execution
                 .state,
             State::Bound
         );
@@ -2960,6 +2986,7 @@ mod tests {
         let registration = read(registry, &subject_id)
             .expect("read")
             .expect("launch")
+            .execution
             .registration_id;
         fence_registration(
             registry,
@@ -2992,6 +3019,7 @@ mod tests {
         let pending = read(&registry, &subject_id)
             .expect("read")
             .expect("subject")
+            .execution
             .pane_absence
             .expect("a pending window");
         assert_eq!(pending.confirmations, 1);
@@ -3010,11 +3038,11 @@ mod tests {
             .expect("read")
             .expect("subject");
         assert!(
-            subject.pane_absence.is_none(),
+            subject.execution.pane_absence.is_none(),
             "a present read clears the window"
         );
-        assert!(subject.ended_externally_at.is_none());
-        assert!(subject.exited_at.is_none());
+        assert!(subject.execution.ended_externally_at.is_none());
+        assert!(subject.execution.exited_at.is_none());
     }
 
     #[test]
@@ -3034,10 +3062,17 @@ mod tests {
             .expect("read")
             .expect("subject");
         assert!(
-            subject.ended_externally_at.is_none(),
+            subject.execution.ended_externally_at.is_none(),
             "the window has not elapsed"
         );
-        assert_eq!(subject.pane_absence.expect("pending").confirmations, 3);
+        assert_eq!(
+            subject
+                .execution
+                .pane_absence
+                .expect("pending")
+                .confirmations,
+            3
+        );
     }
 
     #[test]
@@ -3082,13 +3117,13 @@ mod tests {
             .expect("read")
             .expect("subject");
         assert!(
-            subject.pane_absence.is_none(),
+            subject.execution.pane_absence.is_none(),
             "the window is consumed by the outcome"
         );
-        assert!(subject.ended_externally_at.is_some());
+        assert!(subject.execution.ended_externally_at.is_some());
         // A pane's absence is not a process's death, so no exit is claimed.
-        assert!(subject.exited_at.is_none());
-        let evidence = subject.ended_evidence.expect("evidence summary");
+        assert!(subject.execution.exited_at.is_none());
+        let evidence = subject.execution.ended_evidence.expect("evidence summary");
         assert_eq!(evidence.reason, EndedReason::PaneLost);
         assert_eq!(evidence.source, "tmux");
         assert_eq!(evidence.location, location);
@@ -3118,10 +3153,10 @@ mod tests {
             .expect("read")
             .expect("subject");
         assert!(
-            subject.pane_absence.is_none(),
+            subject.execution.pane_absence.is_none(),
             "an unavailable read is not a confirmation"
         );
-        assert!(subject.ended_externally_at.is_none());
+        assert!(subject.execution.ended_externally_at.is_none());
     }
 
     #[test]
@@ -3148,9 +3183,12 @@ mod tests {
         let subject = read(&registry, &subject_id)
             .expect("read")
             .expect("subject");
-        assert!(subject.exited_at.is_some(), "the verified exit stands");
-        assert!(subject.ended_externally_at.is_none());
-        assert!(subject.ended_evidence.is_none());
+        assert!(
+            subject.execution.exited_at.is_some(),
+            "the verified exit stands"
+        );
+        assert!(subject.execution.ended_externally_at.is_none());
+        assert!(subject.execution.ended_evidence.is_none());
     }
 
     #[test]
@@ -3169,8 +3207,8 @@ mod tests {
         let subject = read(&registry, &subject_id)
             .expect("read")
             .expect("subject");
-        assert!(subject.pane_absence.is_none());
-        assert!(subject.ended_externally_at.is_none());
+        assert!(subject.execution.pane_absence.is_none());
+        assert!(subject.execution.ended_externally_at.is_none());
     }
 
     /// Captures a live child as a tracked launch, bound to the test's agent.
@@ -3232,7 +3270,7 @@ mod tests {
             .expect("read")
             .expect("subject");
         assert!(
-            held.exited_at.is_none(),
+            held.execution.exited_at.is_none(),
             "a live or unreadable holder is not an exit"
         );
     }
@@ -3246,9 +3284,9 @@ mod tests {
         let holder = read(&registry, &gone_id).expect("read").expect("subject");
         assert!(release_if_gone(&registry, &holder, &Gone, 3).expect("verify"));
         let exited = read(&registry, &gone_id).expect("read").expect("subject");
-        assert!(exited.exited_at.is_some());
+        assert!(exited.execution.exited_at.is_some());
         assert!(
-            exited.ended_externally_at.is_none(),
+            exited.execution.ended_externally_at.is_none(),
             "a confirmed exit is not a pane loss"
         );
 
@@ -3259,6 +3297,7 @@ mod tests {
             read(&registry, &reused_id)
                 .expect("read")
                 .expect("subject")
+                .execution
                 .exited_at
                 .is_some()
         );
@@ -3279,8 +3318,11 @@ mod tests {
             Ok((1, None))
         );
         let recorded = read(&restarted, &subject).expect("read").expect("subject");
-        assert!(recorded.exited_at.is_some());
-        assert!(recorded.signalled_at.is_none(), "the sweep never signals");
+        assert!(recorded.execution.exited_at.is_some());
+        assert!(
+            recorded.execution.signalled_at.is_none(),
+            "the sweep never signals"
+        );
     }
 
     #[test]
@@ -3298,9 +3340,9 @@ mod tests {
             "still running"
         );
         let kept = read(&registry, &subject).expect("read").expect("subject");
-        assert!(kept.exited_at.is_none());
-        assert!(kept.signalled_at.is_none());
-        let observation = kept.observation.expect("running observation");
+        assert!(kept.execution.exited_at.is_none());
+        assert!(kept.execution.signalled_at.is_none());
+        let observation = kept.execution.observation.expect("running observation");
         assert_eq!(observation.evidence, Evidence::Running);
         assert_eq!(observation.source, Observer::Sweep);
         let tail = registry.events.lock().unwrap().tail();
@@ -3322,9 +3364,12 @@ mod tests {
         let (subject, mut child, _) = captured_child(&registry);
         assert!(observe_exit(&registry, &subject, &Unreadable, 3).is_err());
         let unknown = read(&registry, &subject).unwrap().unwrap();
-        assert_eq!(unknown.observation.unwrap().evidence, Evidence::Unavailable);
-        assert!(unknown.exited_at.is_none());
-        assert!(unknown.signalled_at.is_none());
+        assert_eq!(
+            unknown.execution.observation.unwrap().evidence,
+            Evidence::Unavailable
+        );
+        assert!(unknown.execution.exited_at.is_none());
+        assert!(unknown.execution.signalled_at.is_none());
         assert_eq!(
             observe_exit(&registry, &subject, &LocalProcfsVerifier, 4),
             Ok(false)
@@ -3333,6 +3378,7 @@ mod tests {
             read(&registry, &subject)
                 .unwrap()
                 .unwrap()
+                .execution
                 .observation
                 .unwrap()
                 .evidence,
@@ -3371,8 +3417,8 @@ mod tests {
         // The outcome is replayed from the log, not read from a mutable file.
         let reopened = crate::control_plane::Registry::open(&scratch.0).expect("reopen");
         let restored = read(&reopened, subject).expect("read").expect("subject");
-        assert_eq!(restored.pane_cleanup, Some(refused));
-        assert_eq!(restored.state, State::Revoked);
+        assert_eq!(restored.execution.pane_cleanup, Some(refused));
+        assert_eq!(restored.execution.state, State::Revoked);
     }
 
     #[test]
@@ -3420,8 +3466,8 @@ mod tests {
         let subject = read(&registry, &subject_id)
             .expect("read terminal subject")
             .expect("subject");
-        assert!(subject.exited_at.is_some());
-        assert!(subject.signalled_at.is_some());
+        assert!(subject.execution.exited_at.is_some());
+        assert!(subject.execution.signalled_at.is_some());
         let exits = registry
             .events
             .lock()
@@ -3511,7 +3557,7 @@ mod tests {
         let subject = read(&registry, &ticket.claim_id)
             .expect("read")
             .expect("subject");
-        assert_eq!(subject.state, State::Pending);
+        assert_eq!(subject.execution.state, State::Pending);
     }
 
     #[test]
@@ -3532,7 +3578,10 @@ mod tests {
         assert_eq!(cancelled.stopped.len(), 2, "both executions exited");
         for subject_id in &subjects {
             let subject = read(&registry, subject_id).expect("read").expect("subject");
-            assert!(subject.exited_at.is_some(), "an exit was recorded");
+            assert!(
+                subject.execution.exited_at.is_some(),
+                "an exit was recorded"
+            );
         }
         for child in &mut children {
             let _ = child.0.wait();
@@ -3580,7 +3629,10 @@ mod tests {
         let subject = read(&registry, &ticket.claim_id)
             .expect("read")
             .expect("subject");
-        assert!(subject.exited_at.is_none(), "no exit was recorded");
+        assert!(
+            subject.execution.exited_at.is_none(),
+            "no exit was recorded"
+        );
         let _ = child.0.kill();
         let _ = child.0.wait();
     }
@@ -3650,8 +3702,8 @@ mod tests {
             }
         );
         let record = read(&registry, subject).expect("read").expect("subject");
-        assert_eq!(record.signalled_at, None);
-        assert_eq!(record.exited_at, None);
+        assert_eq!(record.execution.signalled_at, None);
+        assert_eq!(record.execution.exited_at, None);
     }
 }
 

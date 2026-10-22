@@ -191,19 +191,19 @@ fn establish_lifecycle(
     };
     // A launch revoked before any process was released has nothing left to stop:
     // the revocation is the operation's whole effect.
-    if subject.state == State::Revoked && subject.process.is_none() {
+    if subject.execution.state == State::Revoked && subject.execution.process.is_none() {
         return Ok((
             Some(RequestOutcome::Completed),
             "the launch was revoked before a process was released".into(),
         ));
     }
-    if subject.process.is_none() {
+    if subject.execution.process.is_none() {
         return Ok((
             None,
             "the launch never captured a process, so nothing was signalled".into(),
         ));
     }
-    if subject.exited_at.is_some() {
+    if subject.execution.exited_at.is_some() {
         return Ok((
             Some(RequestOutcome::Completed),
             "the captured process is verifiably gone".into(),

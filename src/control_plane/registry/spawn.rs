@@ -568,7 +568,7 @@ pub(super) fn launched_registration(
     };
     match edge.claim_id {
         Some(claim_id) => lifecycle::read(registry, &claim_id)?
-            .map(|launch| Some(launch.registration_id))
+            .map(|launch| Some(launch.execution.registration_id))
             .ok_or_else(|| "launch reservation is missing".into()),
         None => Ok(None),
     }

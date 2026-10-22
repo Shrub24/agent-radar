@@ -3113,7 +3113,8 @@ fn await_captured_launch(state: &Path, request_id: &str) {
             && agent_radar::control_plane::lifecycle::read(&registry, &subject).is_ok_and(
                 |record| {
                     record.is_some_and(|subject| {
-                        subject.state == agent_radar::control_plane::lifecycle::State::Captured
+                        subject.execution.state
+                            == agent_radar::control_plane::lifecycle::State::Captured
                     })
                 },
             )

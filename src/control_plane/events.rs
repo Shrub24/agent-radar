@@ -93,21 +93,21 @@ impl Facts {
             execution_generation: None,
             identity_unresolved: subject.identity_unresolved,
             managed: subject.managed.clone(),
-            spawn_request_id: subject.spawn_request_id.clone(),
-            origin: subject.origin,
-            state: subject.state,
+            spawn_request_id: subject.execution.spawn_request_id.clone(),
+            origin: subject.execution.origin,
+            state: subject.execution.state,
             session: subject.session.clone(),
-            successor: subject.successor.clone(),
-            process: subject.process.clone(),
-            observation: subject.observation.clone(),
-            pane_absence: subject.pane_absence.clone(),
-            ended_externally_at: subject.ended_externally_at.clone(),
-            ended_evidence: subject.ended_evidence.clone(),
-            pane_cleanup: subject.pane_cleanup.clone(),
-            bound_registration_id: subject.bound_registration_id.clone(),
-            signalled_at: subject.signalled_at.clone(),
-            exited_at: subject.exited_at.clone(),
-            recorded_at: subject.recorded_at.clone(),
+            successor: subject.execution.successor.clone(),
+            process: subject.execution.process.clone(),
+            observation: subject.execution.observation.clone(),
+            pane_absence: subject.execution.pane_absence.clone(),
+            ended_externally_at: subject.execution.ended_externally_at.clone(),
+            ended_evidence: subject.execution.ended_evidence.clone(),
+            pane_cleanup: subject.execution.pane_cleanup.clone(),
+            bound_registration_id: subject.execution.bound_registration_id.clone(),
+            signalled_at: subject.execution.signalled_at.clone(),
+            exited_at: subject.execution.exited_at.clone(),
+            recorded_at: subject.execution.recorded_at.clone(),
         }
     }
 
@@ -116,20 +116,20 @@ impl Facts {
         subject.identity_unresolved = self.identity_unresolved;
         subject.managed = self.managed.clone();
         subject.session = self.session.clone();
-        subject.state = self.state;
-        subject.successor = self.successor.clone();
-        subject.process = self.process.clone();
-        subject.observation = self.observation.clone();
-        subject.pane_absence = self.pane_absence.clone();
-        subject.ended_externally_at = self.ended_externally_at.clone();
-        subject.ended_evidence = self.ended_evidence.clone();
-        subject.pane_cleanup = self.pane_cleanup.clone();
-        subject.bound_registration_id = self.bound_registration_id.clone();
-        subject.signalled_at = self.signalled_at.clone();
-        subject.exited_at = self.exited_at.clone();
-        subject.recorded_at = self.recorded_at.clone();
+        subject.execution.state = self.state;
+        subject.execution.successor = self.successor.clone();
+        subject.execution.process = self.process.clone();
+        subject.execution.observation = self.observation.clone();
+        subject.execution.pane_absence = self.pane_absence.clone();
+        subject.execution.ended_externally_at = self.ended_externally_at.clone();
+        subject.execution.ended_evidence = self.ended_evidence.clone();
+        subject.execution.pane_cleanup = self.pane_cleanup.clone();
+        subject.execution.bound_registration_id = self.bound_registration_id.clone();
+        subject.execution.signalled_at = self.signalled_at.clone();
+        subject.execution.exited_at = self.exited_at.clone();
+        subject.execution.recorded_at = self.recorded_at.clone();
         if self.state != State::Pending {
-            subject.correlation = None;
+            subject.execution.correlation = None;
         }
     }
 }

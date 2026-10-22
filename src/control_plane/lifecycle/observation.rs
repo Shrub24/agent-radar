@@ -110,10 +110,10 @@ pub fn observe_exit_from(
     source: Observer,
 ) -> Result<bool, String> {
     let subject = read_recorded(registry, subject_id)?;
-    if subject.exited_at.is_some() {
+    if subject.execution.exited_at.is_some() {
         return Ok(true);
     }
-    let Some(process) = subject.process else {
+    let Some(process) = subject.execution.process else {
         return Ok(false);
     };
     let mut collecting = registry.observing.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,25 +137,26 @@ pub fn observe_exit_from(
     };
     let _transition = registry.transition();
     let mut current = read_recorded(registry, subject_id)?;
-    if current.process.as_ref() != Some(&process) {
+    if current.execution.process.as_ref() != Some(&process) {
         return Err("process binding changed during reconciliation".into());
     }
-    if current.exited_at.is_some() {
+    if current.execution.exited_at.is_some() {
         return Ok(true);
     }
     if current
+        .execution
         .observation
         .as_ref()
         .is_none_or(|previous| previous.evidence != evidence)
     {
         let at = crate::control_plane::store::format_millis(now_ms);
-        current.observation = Some(Observation {
+        current.execution.observation = Some(Observation {
             process,
             evidence,
             source,
             changed_at: at.clone(),
         });
-        current.recorded_at = at;
+        current.execution.recorded_at = at;
         write(registry, &current)?;
     }
     match acquired {
@@ -183,7 +184,7 @@ pub fn observe_pane(
     now_ms: i64,
 ) -> Result<bool, String> {
     let subject = read_recorded(registry, subject_id)?;
-    if terminal(&subject) || subject.bound_registration_id.is_none() {
+    if terminal(&subject) || subject.execution.bound_registration_id.is_none() {
         return Ok(terminal(&subject));
     }
     let at = crate::control_plane::store::format_millis(now_ms);
@@ -197,21 +198,21 @@ pub fn observe_pane(
     if terminal(&current) {
         return Ok(true);
     }
-    if current.bound_registration_id.is_none() {
+    if current.execution.bound_registration_id.is_none() {
         return Ok(false);
     }
     match evidence {
         PaneEvidence::Unavailable => Ok(false),
         PaneEvidence::Present => {
             // A contradicting observation clears pending confirmation.
-            if current.pane_absence.take().is_some() {
-                current.recorded_at = at;
+            if current.execution.pane_absence.take().is_some() {
+                current.execution.recorded_at = at;
                 write(registry, &current)?;
             }
             Ok(false)
         }
         PaneEvidence::Absent => {
-            let pending = match current.pane_absence.take() {
+            let pending = match current.execution.pane_absence.take() {
                 Some(pending) if pending.location == *location => PaneAbsence {
                     location: location.clone(),
                     first_seen_at: pending.first_seen_at,
@@ -227,21 +228,21 @@ pub fn observe_pane(
                 },
             };
             if confirmed(&pending, now_ms) {
-                current.pane_absence = None;
-                current.ended_externally_at = Some(at.clone());
-                current.ended_evidence = Some(EndedEvidence {
+                current.execution.pane_absence = None;
+                current.execution.ended_externally_at = Some(at.clone());
+                current.execution.ended_evidence = Some(EndedEvidence {
                     reason: EndedReason::PaneLost,
                     source: location.backend.clone(),
                     location: location.clone(),
                     confirmations: pending.confirmations,
                     observed_at: at.clone(),
                 });
-                current.recorded_at = at;
+                current.execution.recorded_at = at;
                 write(registry, &current)?;
                 return Ok(true);
             }
-            current.pane_absence = Some(pending);
-            current.recorded_at = at;
+            current.execution.pane_absence = Some(pending);
+            current.execution.recorded_at = at;
             write(registry, &current)?;
             Ok(false)
         }
@@ -249,7 +250,7 @@ pub fn observe_pane(
 }
 
 fn terminal(subject: &super::Claim) -> bool {
-    subject.exited_at.is_some() || subject.ended_externally_at.is_some()
+    subject.execution.exited_at.is_some() || subject.execution.ended_externally_at.is_some()
 }
 
 /// Whether the window has elapsed with enough fresh confirmations. An unreadable
