@@ -49,22 +49,21 @@ Three roles, three ids, three lifespans:
 | Role | Id | Lifespan | Owner |
 | --- | --- | --- | --- |
 | The agent | `subject_id` | Durable identity of one Pi session, across processes and panes | Daemon |
-| One attempt | `claim_id` | One launch or adoption, from pre-mint to verified end | Daemon mints, the process presents |
-| One process incarnation | `registration_id` | One OS process | Process writes, daemon verifies |
+| One attachment | `claim_id` | The subject's proof of attachment to a process and session, from reservation to release | Daemon reserves a launch's claim; a process presents its own otherwise |
+| One process incarnation | `registration_id` | One OS process, launch to exit | Daemon pre-mints it for a managed launch, the process presents it; otherwise the process writes it. The daemon verifies |
 
 Today's `subject_id` is the attempt and today's `logical_subject_id` is the agent; the durable identity carries the qualified name. The merge renames them so the agent owns the plain name and the attempt is a claim:
 
-- **A claim is the attempt**, not only an attachment request. It already carries the launch facts that no client may write: the expected birth identity, the captured recipe, `signalled_at`, `exited_at`, pane evidence and the successor pointer. After the merge it also carries them for managed launches, because the daemon pre-mints it.
-- **A managed launch pre-mints its claim before dispatch**, embeds the id in the launch environment, and the child presents it. Binding then requires the captured birth identity, so a leaked id cannot bind a different process. The per-edge spawn token retires: for a managed launch the edge and its claim are one to one.
-- **Attachment moves off the attempt.** Presence release clears the subject's current claim; it does not end the attempt record and does not compete with exit on one state field.
+- **The registration is the process identity, entirely.** A managed launch pre-mints the registration before dispatch and puts it in the launch environment. The launch facts no client may write (expected birth identity, captured recipe, `signalled_at`, `exited_at`, pane evidence, scope and unit) belong to the process, so they are recorded against the registration, and unit and slice names derive from it. Binding requires the captured birth identity, so a leaked id cannot bind a different process. The per-edge spawn token retires.
+- **The claim is the subject's attachment**, identified by `(claim_id, subject_id, registration_id)`. A launch reserves one for its subject at the same time: standing `reserved`, meaning Radar has decided this registration may attach to this subject and the process has not received it yet. The claim id is never given to the process. At the process's first report Radar verifies the registration's birth identity, runs the duplicate check for the reported session, and replaces the reserved claim with the granted one under the `claim_id` the process presented. Reloads and `/resume` take the ordinary path with a fresh claim, so pi-radar needs no first-load rule and no claim in the environment.
+- **`reserved` is a distinct standing.** `pending` already means a process's report is still being verified and the client retries it; `reserved` is waited on by Radar. It conveys no attachment authority: handoffs, derived reads and controls that need a granted claim ignore it. It is visible and controllable, so the TUI shows a starting row and `D` on it can cancel the launch.
+- **Attachment moves off the attempt.** Presence release clears the subject's current claim; it does not end the process or its registration.
 - **`execution_generation` is dropped.** It existed to fence and to name the latest attempt. A claim id is an exact fence, and the subject's `current_claim` names the latest attempt without scanning for a maximum.
 - **The subject becomes a record.** Identity, managed metadata, `parent_subject_id` and `current_claim` live on it once, instead of being copied forward onto each successor.
 
-**Races resolve at pre-mint, which is what makes restart continuous.** Pre-minting is the exclusive act per subject: the first accepted pre-mint wins, and a competing launch or restart is refused or left pending. Because a restart pre-mints its successor before it dispatches the stop, the successor is already the subject's current claim at the moment the old process is signalled — the continuity gap closes there, not when the replacement eventually starts.
+**Races resolve at reservation, which is what makes restart continuous.** Reserving a launch's claim is the exclusive act per subject: the first accepted reservation wins, and a competing launch or restart is refused or left pending. Because a restart reserves its successor (a new registration and claim) before it dispatches the stop, the successor is already the subject's current claim at the moment the old process is signalled — the continuity gap closes there, not when the replacement eventually starts.
 
-If the stop fails before replacement dispatch, Radar revokes that undispatched reservation, records its cancellation, and restores the exact incumbent claim under the transition lock. Leaving a processless pending claim current would strand the still-running agent. A successor that may have dispatched is never rolled back this way. Scoped reads and handoffs require a granted decision whose claim still matches the subject pointer.
-
-pi-radar persists whether a report is the initial load: only that load spends the pre-minted launch claim. A later reload uses a fresh claim even if pending releases have already drained; deciding from the current release queue would accidentally reuse an old credential.
+If the stop fails before replacement dispatch, Radar revokes that undispatched reservation, records its cancellation, and restores the exact incumbent claim under the transition lock. Leaving a processless reserved claim current would strand the still-running agent. A successor that may have dispatched is never rolled back this way. Scoped reads and handoffs require a granted decision whose claim still matches the subject pointer.
 
 **Migration re-keys nothing.** An existing execution record's UUID becomes its claim id, its `logical_subject_id` is promoted to the subject record on read, and a stored generation is ignored. No new ids are minted, no store is added, and the private record filenames stay as they are.
 
@@ -114,7 +113,7 @@ Default scope stop sends SIGTERM and then SIGKILL after `TimeoutStopSec`. The me
 - Managed scopes set `SendSIGKILL=no`; Radar never escalates on its own.
 - A stop that leaves processes running is recorded as an unresolved stop with survivors named, not as success or failure of the workload.
 - `failed`/`timeout` unit state is tolerated and cleared after the workload ends; it is not an execution outcome.
-- Group stop targets the main scope only. Independently scoped tasks and subagents are untouched. A managed execution stops through its scope; the existing identity-fenced signal path stays as it is for observed sessions and receives no new work. The unit is stopped by name: names derive from a claim id that is never reused, and recovery still verifies a member's birth identity first, which covers a stale process rather than a hostile one.
+- Group stop targets the main scope only. Independently scoped tasks and subagents are untouched. A managed execution stops through its scope; the existing identity-fenced signal path stays as it is for observed sessions and receives no new work. The unit is stopped by name: names derive from a registration id that is never reused, and recovery still verifies a member's birth identity first, which covers a stale process rather than a hostile one.
 
 ### 5. Physical grouping without logical ownership
 
@@ -124,7 +123,7 @@ radar.slice
     radar-<execution>-main.scope
 ```
 
-The daemon and tmux server stay outside `radar.slice`. The execution slice is named from the launch's pre-minted claim id, not from the session subject, argv, prompt, cwd or environment, and the name is fixed at launch: it exists before exec, when no registration does. A later claim in the same process (a reload or `/resume` presents a fresh claim) does not rename or migrate the cgroup; it reaches the scope through the process identity the launch recorded. Unit names are visible to the user manager, journalled and `systemctl`-listable.
+The daemon and tmux server stay outside `radar.slice`. The execution slice is named from the launch's registration id, not from the session subject, a claim, argv, prompt, cwd or environment. The registration lives as long as the process, so a reload or `/resume` (which only replaces the claim) neither renames nor migrates the cgroup. Unit names are visible to the user manager, journalled and `systemctl`-listable.
 
 ### 6. Recovery binds by recorded identity, never by name alone
 
@@ -140,13 +139,13 @@ No conversion of existing subjects or executions. Rollout uses an explicit reset
 
 ### 9. The execution slice is established now, and the association lives on the claim
 
-Create the per-execution slice from the start rather than adding it when the first independent task scope appears: moving later would rename every live group. Record the unit and slice names plus the verified member identity on the launch claim that already records that attempt; later claims of the same process resolve the scope by that process identity. A separate store would be a second place to keep one fact.
+Create the per-execution slice from the start rather than adding it when the first independent task scope appears: moving later would rename every live group. Record the unit and slice names plus the verified member identity on the registration that already records that process. A separate store would be a second place to keep one fact.
 
 ## Risks / Trade-offs
 
 - **Scope state mistaken for an outcome** → only tmux's typed exit observation reports exit; unit `Result`/`ActiveState` are presentation facts.
 - **`failed` after a graceful stop looks like breakage** → documented as an expected survivor state; repeat stop and clear are normal.
-- **Unit name collision on retry** → derive the name from the launch's claim id so a lost reply cannot create a second attempt under a fresh name.
+- **Unit name collision on retry** → derive the name from the launch's registration id so a lost reply cannot create a second attempt under a fresh name.
 - **Environment expansion corrupting argv** → `--expand-environment=no` plus a test with a literal `$VAR` argument.
 - **Pane PID no longer the workload** → direct argv only; refuse a recipe that would need shell metacharacters.
 - **Radar becomes a startup dependency** → scope or admission failure refuses visibly before exec; no silent unscoped launch.
