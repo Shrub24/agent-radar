@@ -18,11 +18,16 @@ const CONFIGURATION: &str = "\
 Configuration is read from `$RADAR_CONFIG`, else `$XDG_CONFIG_HOME/radar/config.toml`,
 else `~/.config/radar/config.toml`. Radar draws without one.";
 
+/// The crate version and the control-plane wire revision this build speaks. The
+/// revision is the compatibility contract pi-radar checks; the version is for
+/// people. A test pins the literal to [`crate::control_plane::ops::PROTOCOL_REVISION`].
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (wire 5)");
+
 /// Everything Radar can be asked to do.
 #[derive(Debug, Parser)]
 #[command(
     name = "radar",
-    version,
+    version = VERSION,
     about = "Read-only fleet overview for local coding agents",
     after_help = CONFIGURATION,
     disable_help_subcommand = true,

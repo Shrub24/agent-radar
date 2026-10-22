@@ -18,7 +18,11 @@ fn the_version_flag_reports_this_crate_and_exits_cleanly() {
         let printed = String::from_utf8(output.stdout).expect("utf-8 version output");
         assert_eq!(
             printed.trim(),
-            format!("radar {}", env!("CARGO_PKG_VERSION")),
+            format!(
+                "radar {} (wire {})",
+                env!("CARGO_PKG_VERSION"),
+                agent_radar::control_plane::ops::PROTOCOL_REVISION
+            ),
             "{flag} printed {printed:?}"
         );
         assert!(output.stderr.is_empty(), "{flag} wrote to stderr");
