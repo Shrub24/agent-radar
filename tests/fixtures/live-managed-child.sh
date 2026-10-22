@@ -11,8 +11,8 @@ rest=${stat##*) }
 set -- $rest
 # The remainder begins at stat field 3 (state); starttime is field 22.
 start_ticks=${20}
-token=${PI_RADAR_SPAWN_TOKEN:?missing Radar spawn token}
-unset PI_RADAR_SPAWN_TOKEN
+token=${PI_RADAR_REGISTRATION_ID:?missing Radar registration}
+unset PI_RADAR_REGISTRATION_ID
 
 python3 - "$pid" "$boot_id" "$start_ticks" "$token" "$control_socket" "$record_path" "$PWD" "${RADAR_SMOKE_LITERAL-}" "${RADAR_SMOKE_EMPTY+x}" "${RADAR_SMOKE_EMPTY-}" "${RADAR_SMOKE_OVERRIDE-}" <<'PY'
 import json

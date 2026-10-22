@@ -1178,7 +1178,7 @@ fn launch_runs_argv_with_overlay_and_preserves_immediate_exit_status() {
         "RADAR_INHERITED_TEST",
         "inherited-sentinel",
     ]);
-    let script = "printf '<%s>\\n' \"$@\"; printf 'ENV=%s\\nTOKEN=%s\\nINHERITED=%s\\n' \"$RADAR_LAUNCH_TEST\" \"$PI_RADAR_SPAWN_TOKEN\" \"$RADAR_INHERITED_TEST\"; pwd";
+    let script = "printf '<%s>\\n' \"$@\"; printf 'ENV=%s\\nTOKEN=%s\\nINHERITED=%s\\n' \"$RADAR_LAUNCH_TEST\" \"$PI_RADAR_REGISTRATION_ID\" \"$RADAR_INHERITED_TEST\"; pwd";
     let request = LaunchRequest {
         pane_id: pane_id.clone(),
         executable: "/bin/sh".to_string(),

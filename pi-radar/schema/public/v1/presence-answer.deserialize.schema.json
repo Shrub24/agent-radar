@@ -2,6 +2,7 @@
   "$defs": {
     "Standing": {
       "enum": [
+        "reserved",
         "pending",
         "granted",
         "duplicate",

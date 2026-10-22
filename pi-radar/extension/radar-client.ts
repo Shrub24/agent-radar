@@ -517,7 +517,7 @@ function decodePresenceAnswer(value: unknown): RadarResult<RadarPresenceAnswer> 
 	if (
 		!isUuid(registrationId) ||
 		!isUuid(claimId) ||
-		!["pending", "granted", "duplicate", "released"].includes(String(standing)) ||
+		!["reserved", "pending", "granted", "duplicate", "released"].includes(String(standing)) ||
 		(subjectId !== undefined && !isUuid(subjectId)) ||
 		(standing === "granted" && !isUuid(subjectId))
 	)
@@ -745,7 +745,7 @@ function unresolvedOperation(requestId: string, detail: string): RadarResult<nev
 	};
 }
 
-export const RADAR_SPAWN_TOKEN_ENV = "PI_RADAR_SPAWN_TOKEN";
+export const RADAR_REGISTRATION_ENV = "PI_RADAR_REGISTRATION_ID";
 const RADAR_MANAGED_IDENTITY_ENV = new Set([
 	"PI_RADAR_MANAGED_SUBJECT_ID",
 	"PI_RADAR_MANAGED_LAUNCH_ID",
@@ -975,8 +975,8 @@ function spawnRequestShape(request: {
 	const env = Object.entries(request.env ?? {});
 	if (env.length > 256) return "spawn env names more than 256 entries";
 	for (const [name, value] of env) {
-		if (name === RADAR_SPAWN_TOKEN_ENV)
-			return `spawn env cannot set the reserved ${RADAR_SPAWN_TOKEN_ENV}`;
+		if (name === RADAR_REGISTRATION_ENV)
+			return `spawn env cannot set the reserved ${RADAR_REGISTRATION_ENV}`;
 		if (RADAR_MANAGED_IDENTITY_ENV.has(name))
 			return `spawn env cannot set Radar-issued identity variable ${name}`;
 		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || /\p{Cc}/u.test(value))

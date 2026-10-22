@@ -71,7 +71,7 @@ class RegistryError(RuntimeError):
 
 def consume_spawn_token() -> str | None:
     """Capture then remove the daemon credential from this process environment."""
-    return os.environ.pop("PI_RADAR_SPAWN_TOKEN", None)
+    return os.environ.pop("PI_RADAR_REGISTRATION_ID", None)
 
 
 def register_spawned_child(path: Path, registration: dict, token: str) -> dict:

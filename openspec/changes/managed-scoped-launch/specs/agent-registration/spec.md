@@ -17,49 +17,45 @@ Radar SHALL hold a private executable, argv, cwd and environment recipe for a ma
 - **WHEN** the daemon admits a managed launch
 - **THEN** the recipe it records is the one it is about to execute, not one inferred afterwards
 
-### Requirement: Registration may carry a single-use spawn token
-A registration MAY present the pre-minted claim of the attempt that launched it, privately, with its own source, incarnation and process claim. Registration SHALL consume that claim only for the exact registration whose verified birth identity matches the recorded expected one, and identical retry SHALL remain idempotent. One launch SHALL present one credential, so the per-edge token retires rather than becoming a second one. The publisher SHALL remove the claim id from its launch environment after capture.
+## ADDED Requirements
+
+### Requirement: Managed launch uses a pre-minted process registration
+A managed process SHALL present the registration id Radar allocated before its launch, with its source, incarnation and process birth identity. Radar SHALL bind that registration only when its verified birth identity matches the launch's captured identity; identical retry SHALL remain idempotent. The publisher SHALL capture the registration id from its launch environment and remove it before launching children. Neither a claim id nor a separate spawn credential is required from the publisher.
 
 #### Scenario: A registration binds its spawn
-- **WHEN** a registration presents the claim of a pending attempt it was launched with
-- **THEN** that attempt binds to that exact registration and reports the location it was launched into
+- **WHEN** a launched process presents its pre-minted registration id
+- **THEN** Radar verifies its birth identity against the captured launch and returns that same registration id
 
-#### Scenario: A public read hides the token
-- **WHEN** any agent registration, get or list read is served
-- **THEN** no claim id of a pending attempt and no launch credential appear in the response
+#### Scenario: Reserved identity is visible
+- **WHEN** the launch has not received a verified presence report
+- **THEN** its reserved claim and process registration remain visible and the operator can cancel the launch
 
-#### Scenario: A spent or malformed token
-- **WHEN** a registration presents a claim that already bound a process or is not a valid claim id
-- **THEN** the registration is refused and nothing binds
+#### Scenario: Another process presents the registration
+- **WHEN** a process presents a registration id whose captured birth identity differs from its own
+- **THEN** binding is refused and the original launch identity is unchanged
 
-#### Scenario: A foreign process presents the claim
-- **WHEN** a registration presents a claim whose recorded expected birth identity is not that process
-- **THEN** the registration is refused and the claim keeps its recorded expectation
+#### Scenario: Malformed or unknown registration
+- **WHEN** a process supplies a malformed registration id or one with no admitted launch or existing binding
+- **THEN** Radar refuses rather than falling back to adoption
 
-#### Scenario: Claim id is not persisted
-- **WHEN** a launched process has captured its claim id
-- **THEN** the claim id appears in no sidecar, fact, label or log the publisher writes
-
-### Requirement: Spawn bootstrap reuses exact registration
-A launched publisher SHALL present its pre-minted claim privately in registration with its own source, incarnation and process claim. Successful registration SHALL consume that claim for that exact registration, with identical retry remaining idempotent. The publisher SHALL remove the claim id from its launch environment after capture and SHALL NOT persist it in sidecars, facts, labels or logs.
+### Requirement: Presence binds the launch-issued registration
+A launched publisher SHALL present its pre-minted registration id with its source, incarnation, current session and process birth identity. Radar SHALL resolve the existing launch through that registration and SHALL NOT require a claim from the launch environment. Every fresh session load SHALL use an ordinary fresh client claim, and renewals SHALL reuse that claim.
 
 #### Scenario: Child bootstrap
-- **WHEN** a launched child registers with its own incarnation and the claim it was launched with
-- **THEN** the returned registration id identifies that registration and the attempt binds to it
+- **WHEN** a launched child reports its own incarnation and the registration it was launched with
+- **THEN** the returned registration id is the pre-minted one and the reserved attachment becomes an ordinary granted client claim
 
 #### Scenario: Registration answer is lost
 - **WHEN** the child repeats the identical registration after an uncertain acknowledgement
 - **THEN** it receives the existing registration and no second binding or registration is created
 
-#### Scenario: Token reused by another incarnation
-- **WHEN** another incarnation attempts to consume a claim that is already bound
+#### Scenario: Registration reused by another incarnation
+- **WHEN** another incarnation attempts to bind an existing registration
 - **THEN** registration refuses and the original binding remains unchanged
 
-#### Scenario: Claim presented after its process exited
-- **WHEN** a registration presents the claim of an attempt whose process is recorded as exited
-- **THEN** registration refuses and the recorded attempt keeps its own process
-
-## ADDED Requirements
+#### Scenario: Registration presented after its process exited
+- **WHEN** a process presents the registration of a launch whose captured process has exited
+- **THEN** registration refuses and the recorded launch keeps its own process
 
 ### Requirement: Managed standing requires an admitted or recovered execution
 Radar SHALL treat managed lifecycle standing as a consequence of an execution it admitted through its managed launch path or of a previously recorded execution it reverified. An externally started process MAY be registered, observed and retain its durable session identity, children and inbox, but SHALL NOT be reported as a managed execution. Every managed launch SHALL be admitted durably before it executes.
@@ -70,48 +66,44 @@ Radar SHALL treat managed lifecycle standing as a consequence of an execution it
 
 #### Scenario: Agent started outside Radar
 - **WHEN** a Pi process reports itself without an admitted or recovered execution
-- **THEN** Radar reports it as observed and offers no managed execution controls, while its session identity and history remain intact
+- **THEN** Radar marks it as observed, preserves its existing functionality and session history, and offers no new scope-dependent capability or substitute implementation
 
 #### Scenario: Admission precedes execution
 - **WHEN** the launch record cannot be made durable
 - **THEN** the command does not execute
 
-### Requirement: A managed launch pre-mints its attempt's claim
-Radar SHALL mint the claim for a managed launch before the launch is dispatched, recording that attempt's expected process birth identity, and SHALL embed the claim id in the launched environment as the identity the process presents. Registration SHALL bind that claim only when the presented id names an unspent pre-minted claim for the same subject and the registration's verified birth identity equals the expected one.
+### Requirement: Managed launch pre-mints a registration and optionally reserves a claim
+Radar SHALL allocate a process registration before dispatch. For a launch associated with a subject, it SHALL reserve that subject's attachment in standing `reserved` before dispatch. A reservation excludes a competing launch but grants no attachment authority. `pending` SHALL remain the standing for a client report still being verified, not a launch reservation. A launch without a subject SHALL NOT fabricate a claim.
 
-#### Scenario: Launch pre-mints its claim
-- **WHEN** Radar admits a managed launch
-- **THEN** the claim exists with its expected process identity before the command executes, and the launched process is given its id
+#### Scenario: Launch reserves an attachment
+- **WHEN** Radar admits a launch for a subject
+- **THEN** its registration and reserved claim exist before dispatch and only its registration id is injected into the child's environment
 
-#### Scenario: The child presents the claim
-- **WHEN** the launched process registers presenting its claim id
-- **THEN** the claim binds to that registration and the subject's current claim is the pre-minted one
+#### Scenario: Child reports a session
+- **WHEN** the child presents its pre-minted registration, verified birth identity, current session and fresh client claim
+- **THEN** Radar checks session exclusivity and replaces the reservation with the granted client claim
 
-#### Scenario: A leaked claim id cannot bind another process
-- **WHEN** a process presents a claim id whose recorded birth identity is not that process
-- **THEN** binding is refused and the claim is unchanged
+#### Scenario: Reservation is visible and controllable
+- **WHEN** a reserved launch is still starting
+- **THEN** Radar shows it as starting and the operator can cancel it without granting handoff or inbox authority
 
-#### Scenario: A pending claim is not published
-- **WHEN** a pre-minted claim has no bound process yet
-- **THEN** its id appears in no list or snapshot read, and only the requesting caller and the launched process hold it
-
-#### Scenario: The first pre-mint wins
-- **WHEN** two launch paths, including a restart, pre-mint a claim for one subject
-- **THEN** exactly one becomes current and the other is refused or left pending rather than replacing it
+#### Scenario: The first reservation wins
+- **WHEN** two launch paths, including a restart, reserve an attachment for one subject
+- **THEN** exactly one becomes current and the other is refused rather than replacing it
 
 #### Scenario: No generation identity
-- **WHEN** a subject's attempts are read in order
-- **THEN** they are ordered by their claim records and current pointer, and no attempt is identified or fenced by an ordinal
+- **WHEN** a subject's attachment is resolved
+- **THEN** it is identified by its exact current claim, not an ordinal
 
-### Requirement: A claim is the record of one attempt
-A claim SHALL record one attempt's expected and bound process, its recipe, its signal and exit evidence, and its successor. Exactly one claim per subject SHALL be current. An attempt SHALL NOT be identified or fenced by an ordinal generation.
+### Requirement: A claim records a subject attachment
+A claim SHALL associate its claim id, subject id and process registration id with the attachment's standing and provenance. A subject SHALL have at most one current claim. A process may change its session attachment without changing its registration or physical group. Claims SHALL NOT own process-lifetime facts.
 
-#### Scenario: Attempt facts stay with the attempt
-- **WHEN** a subject's attempt is read after a daemon restart
-- **THEN** that attempt's process, recipe, signal, exit and successor are read from its own claim
+#### Scenario: Attachment changes within a process
+- **WHEN** a process reloads or opens another session
+- **THEN** the ordinary presence path creates a fresh claim under the same registration and a delayed release cannot revoke the new claim
 
 #### Scenario: Current claim is a pointer
-- **WHEN** a subject's latest attempt is needed
+- **WHEN** a subject's attachment is needed
 - **THEN** it is named by the subject's current claim rather than found by comparing ordinals
 
 ### Requirement: Subject identity outlives its attempts
@@ -124,10 +116,6 @@ Radar SHALL hold the durable subject as a record carrying its identity, its mana
 #### Scenario: Release leaves the attempt readable
 - **WHEN** the attachment is released while the process still runs
 - **THEN** the attempt record and its facts remain readable and the subject is no longer attached
-
-#### Scenario: Existing records are promoted, not re-keyed
-- **WHEN** an execution record written before this consolidation is read
-- **THEN** its existing id becomes its claim id and its stored logical subject is promoted to the subject record
 
 ### Requirement: A launch records its durable parent and reads as the caller's own
 A managed launch SHALL record the logical parent subject that requested it on its spawn edge when the launch is admitted, from the identity the daemon validated. A caller SHALL read its own launches without naming a parent: the daemon SHALL resolve the caller's current subject and page only that subject's edges. A read SHALL NOT accept another subject's id from a caller as a parent. Parameters and results of this read SHALL be published as generated schemas.
@@ -143,3 +131,15 @@ A managed launch SHALL record the logical parent subject that requested it on it
 #### Scenario: Unmanaged parent
 - **WHEN** a launch was requested by a caller with no subject
 - **THEN** its edge records no parent subject rather than a session or a registration standing in for one
+
+## REMOVED Requirements
+
+### Requirement: Registration may carry a single-use spawn token
+**Reason**: A managed launch now supplies its pre-minted registration id, not a secret token or session claim. Public registration identity is safe to expose; binding requires the captured process birth identity.
+
+**Migration**: pi-radar captures `PI_RADAR_REGISTRATION_ID` and reports it through presence. It no longer consumes an env claim or sends `spawn_token` in presence.
+
+### Requirement: Spawn bootstrap reuses exact registration
+**Reason**: The token-based bootstrap protocol is replaced by presence binding the registration Radar allocated before launch. Ordinary fresh session claims use the same path for managed and observed processes.
+
+**Migration**: Use the launch-issued registration on the first report and subsequent reports; do not substitute it for a session claim id.

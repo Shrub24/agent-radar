@@ -210,6 +210,8 @@ pub struct Claim {
     /// Exact attempt identity; the private storage key is unchanged.
     #[serde(rename = "subject_id")]
     pub claim_id: String,
+    /// Process identity allocated before launch; unchanged by session claims.
+    pub registration_id: String,
     /// Stable logical subject ID shared by every exact successor execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "logical_subject_id")]
@@ -267,6 +269,7 @@ pub struct Claim {
 /// What a spawn needs to launch a tracked child: the subject it belongs to and
 /// the correlation its bootstrap presents.
 pub struct Ticket {
+    pub registration_id: String,
     /// Exact execution record ID bound to the spawn edge.
     pub claim_id: String,
     /// Stable logical subject identity issued for this process.
@@ -360,6 +363,7 @@ fn draft(
         ended_evidence: None,
         version: SUBJECT_VERSION,
         claim_id: execution_id,
+        registration_id: random_uuid(),
         subject_id: Some(logical_subject_id),
         identity_unresolved: false,
         spawn_request_id: spawn_request_id.to_string(),
@@ -475,11 +479,19 @@ pub fn create_with_intent(
         .subject_id
         .as_deref()
         .ok_or("claim has no subject")?;
+    crate::control_plane::registry::presence::reserve(
+        registry,
+        &subject.registration_id,
+        &subject.claim_id,
+        id,
+        subject.session.clone(),
+    )?;
     let mut record = read_subject_record(registry, id)?.ok_or("subject is not recorded")?;
     record.current_claim = Some(subject.claim_id.clone());
     record.updated_at = subject.recorded_at.clone();
     write_subject_record(registry, &record)?;
     Ok(Ticket {
+        registration_id: subject.registration_id,
         claim_id: subject.claim_id,
         subject_id: subject.subject_id.unwrap_or_default(),
         launch_id: subject.spawn_request_id,
@@ -787,6 +799,9 @@ pub(crate) fn fence_registration(
     now_ms: i64,
 ) -> Result<(), String> {
     let mut subject = read_recorded(registry, subject_id)?;
+    if registration_id.is_some_and(|id| id != subject.registration_id) {
+        return Err("registration does not identify the launched process".into());
+    }
     match (subject.state, registration_id) {
         (State::Bound, Some(agent))
             if subject.bound_registration_id.as_deref() == Some(agent)
@@ -881,8 +896,13 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
     if subject.state != State::Bound || subject.exited_at.is_some() {
         return Ok(false);
     }
+    if crate::control_plane::registry::presence::decision(registry, &subject.claim_id)?.is_some_and(
+        |claim| claim.standing == crate::control_plane::registry::presence::Standing::Reserved,
+    ) {
+        return Ok(true);
+    }
     if let Some(claim) = crate::control_plane::registry::presence::current(registry, agent)? {
-        return Ok(claim.session_id == session
+        return Ok(claim.session_id.as_deref() == Some(session)
             && claim.claim_id == subject.claim_id
             && matches!(
                 claim.standing,
@@ -1017,10 +1037,17 @@ pub fn enroll_subject(
 ) -> Result<String, String> {
     let _transition = registry.transition();
     let mut prior: Option<Claim> = None;
+    let mut launched: Option<Claim> = None;
     let mut after: Option<String> = None;
     loop {
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
         for subject in &page {
+            if subject.registration_id == registration_id
+                && subject.process.as_ref() == Some(process)
+                && subject.origin == Origin::Spawned
+            {
+                launched = Some(subject.clone());
+            }
             if subject.session.as_deref() != Some(session) || subject.state != State::Bound {
                 continue;
             }
@@ -1073,30 +1100,29 @@ pub fn enroll_subject(
         write(registry, &previous)?;
     }
     let logical = logical.unwrap_or_else(|| subject_id.clone());
-    let subject = Claim {
-        observation: None,
-        pane_absence: None,
-        ended_externally_at: None,
-        ended_evidence: None,
-        version: SUBJECT_VERSION,
-        claim_id: subject_id.clone(),
-        subject_id: Some(logical),
-        identity_unresolved: false,
-        spawn_request_id: enrollment_id.to_string(),
-        origin: Origin::Enrolled,
-        state: State::Bound,
-        managed,
-        launch,
-        session: Some(session.to_string()),
-        successor: None,
-        correlation: None,
-        process: Some(process.clone()),
-        bound_registration_id: Some(registration_id.to_string()),
-        signalled_at: None,
-        exited_at: None,
-        pane_cleanup: None,
-        recorded_at: format_millis(now_ms),
-    };
+    let mut subject = launched.unwrap_or_else(|| {
+        let mut adopted = draft(
+            enrollment_id,
+            launch,
+            None,
+            None,
+            ManagedMetadata::default(),
+            now_ms,
+        );
+        adopted.origin = Origin::Enrolled;
+        adopted
+    });
+    subject.claim_id = subject_id.clone();
+    subject.registration_id = registration_id.to_string();
+    subject.subject_id = Some(logical);
+    subject.state = State::Bound;
+    subject.managed = managed;
+    subject.session = Some(session.to_string());
+    subject.successor = None;
+    subject.correlation = None;
+    subject.process = Some(process.clone());
+    subject.bound_registration_id = Some(registration_id.to_string());
+    subject.recorded_at = format_millis(now_ms);
     write(registry, &subject)?;
     let logical_id = subject
         .subject_id
@@ -1298,6 +1324,7 @@ pub fn public_view(subject: &Claim) -> Value {
     json!({
         "subject_id": subject.subject_id.as_deref().unwrap_or(&subject.claim_id),
         "claim_id": subject.claim_id,
+        "registration_id": subject.registration_id,
         "identity_unresolved": subject.identity_unresolved,
         "managed": subject.managed,
         "spawn_request_id": subject.spawn_request_id,
@@ -2101,7 +2128,6 @@ mod tests {
     use super::*;
 
     const SPAWN: &str = "5b2e8c41-0a7d-4f36-b1d9-6c3a7e5f8b1d";
-    const AGENT: &str = "7d1f3a2b-4c5e-4f60-8a9b-0c1d2e3f4a5b";
 
     /// A state root under the temp directory, removed when the test ends.
     struct Scratch(PathBuf);
@@ -2230,7 +2256,13 @@ mod tests {
             State::Revoked
         );
         assert_eq!(
-            fence_registration(&reopened, subject, Some(&identity(7)), Some(AGENT), 4),
+            fence_registration(
+                &reopened,
+                subject,
+                Some(&identity(7)),
+                Some(&ticket.registration_id),
+                4
+            ),
             Err("launch was cancelled".to_string())
         );
         // A repeated cancel revokes nothing further and signals nothing.
@@ -2312,7 +2344,7 @@ mod tests {
             )
             .expect("spawn intent");
         registry
-            .attach_subject(request_id, execution_id)
+            .attach_subject(request_id, execution_id, &random_uuid())
             .expect("exact execution attachment");
     }
 
@@ -2637,6 +2669,19 @@ mod tests {
             .expect("read")
             .expect("claim");
         assert_eq!(read_back.successor.as_deref(), Some(successor.as_str()));
+        assert_eq!(read_back.registration_id, claim.registration_id);
+        assert_ne!(claim.registration_id, claim.claim_id);
+        let reserved =
+            crate::control_plane::registry::presence::current(&reopened, &claim.registration_id)
+                .expect("reservation read")
+                .expect("reservation");
+        assert_eq!(
+            reserved.standing,
+            crate::control_plane::registry::presence::Standing::Reserved
+        );
+        assert!(crate::control_plane::registry::presence::attachment(
+            &reopened, &claim.registration_id,
+        ).expect("authority read").is_none(), "a reservation grants no attachment authority");
 
         let record = read_subject_record(&reopened, &subject_id)
             .expect("read record")
@@ -2779,10 +2824,38 @@ mod tests {
             Err(NOT_AWAITING.to_string()),
             "a replayed correlation is spent"
         );
-        fence_registration(&reopened, subject, Some(&identity(7)), Some(AGENT), 4)
-            .expect("the captured identity binds");
+        fence_registration(
+            &reopened,
+            subject,
+            Some(&identity(7)),
+            Some(&ticket.registration_id),
+            4,
+        )
+        .expect("the captured identity binds");
+        let session = random_uuid();
+        record_launch_session(&reopened, &ticket.registration_id, &session, 4)
+            .expect("record session");
+        crate::control_plane::registry::presence::begin(
+            &reopened,
+            &ticket.registration_id,
+            &random_uuid(),
+            &session,
+            None,
+        )
+        .expect("pending report");
+        let reserved = read(&reopened, subject).expect("read").expect("launch");
+        assert!(
+            is_attached(&reopened, &reserved, 4).expect("reservation held"),
+            "an unverified report must not free the launch's reserved attachment"
+        );
         assert_eq!(
-            fence_registration(&reopened, subject, Some(&identity(8)), Some(AGENT), 5),
+            fence_registration(
+                &reopened,
+                subject,
+                Some(&identity(8)),
+                Some(&ticket.registration_id),
+                5
+            ),
             Err("launch is already bound to another registration".to_string())
         );
     }
@@ -2838,7 +2911,14 @@ mod tests {
             2,
         )
         .expect("capture");
-        fence_registration(&registry, subject, Some(&process), Some(AGENT), 3).expect("bind");
+        fence_registration(
+            &registry,
+            subject,
+            Some(&process),
+            Some(&ticket.registration_id),
+            3,
+        )
+        .expect("bind");
 
         let cancelled = cancel(&registry, subject, &LocalProcfsVerifier, 4).expect("cancel");
         assert_eq!(
@@ -2877,7 +2957,18 @@ mod tests {
     /// is evidence about.
     fn bound_child(registry: &Registry) -> (String, Child) {
         let (subject_id, child, process) = captured_child(registry);
-        fence_registration(registry, &subject_id, Some(&process), Some(AGENT), 2).expect("bind");
+        let registration = read(registry, &subject_id)
+            .expect("read")
+            .expect("launch")
+            .registration_id;
+        fence_registration(
+            registry,
+            &subject_id,
+            Some(&process),
+            Some(&registration),
+            2,
+        )
+        .expect("bind");
         (subject_id, child)
     }
 

@@ -336,9 +336,9 @@ def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend)
         # The scripted pane's foreground occupant is this test process, so the
         # child's registered birth identity is the one the daemon verifies.
         (fake_state / "foreground-pid").write_text(str(os.getpid()))
-        os.environ["PI_RADAR_SPAWN_TOKEN"] = private_token
+        os.environ["PI_RADAR_REGISTRATION_ID"] = private_token
         captured_token = publisher.consume_spawn_token()
-        check(captured_token == private_token and "PI_RADAR_SPAWN_TOKEN" not in os.environ,
+        check(captured_token == private_token and "PI_RADAR_REGISTRATION_ID" not in os.environ,
               "bootstrap must remove the token from its environment after capture")
         child = call(socket_path, "agent.register", {
             "source": "fixture-child", "incarnation": "34343434-3434-4343-8343-343434343434",

@@ -375,18 +375,17 @@ pub fn record(
     Ok(edge)
 }
 
-/// Attaches the launch subject a tracked spawn's edge belongs to. An edge names
-/// at most one subject, and attaching it again is refused.
-/// Attaches the attempt a tracked launch pre-minted. That claim id is also the
-/// edge's credential, so a child presents one secret rather than the claim plus a
-/// second per-edge token.
+/// Attach a launch reservation. The child presents its pre-minted registration,
+/// not the claim; binding still requires the captured process birth identity.
 pub fn attach_subject(
     registry: &Registry,
     request_id: &str,
     claim_id: &str,
+    registration_id: &str,
 ) -> Result<SpawnEdge, String> {
     canonical_uuid("request_id", request_id)?;
     canonical_uuid("claim_id", claim_id)?;
+    canonical_uuid("registration_id", registration_id)?;
     let _transition = registry.transition();
     let stored = stored_edge(registry, request_id)?;
     if stored.claim_id.is_some() {
@@ -396,7 +395,7 @@ pub fn attach_subject(
     }
     let edge = SpawnEdge {
         claim_id: Some(claim_id.to_string()),
-        token: claim_id.to_string(),
+        token: registration_id.to_string(),
         ..stored
     };
     write_edge(registry, &edge)?;
@@ -554,6 +553,25 @@ pub fn bind(
     request.validate()?;
     let _transition = registry.transition();
     bind_locked(registry, request, now_ms, None, None)
+}
+
+pub(super) fn launched_registration(
+    registry: &Registry,
+    token: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(token) = token else { return Ok(None) };
+    let Some(edge) = edges(registry)?
+        .into_iter()
+        .find(|edge| edge.token == token)
+    else {
+        return Err("no recorded spawn edge was minted with this token".into());
+    };
+    match edge.claim_id {
+        Some(claim_id) => lifecycle::read(registry, &claim_id)?
+            .map(|launch| Some(launch.registration_id))
+            .ok_or_else(|| "launch reservation is missing".into()),
+        None => Ok(None),
+    }
 }
 
 /// Binds the edge a registration's token names to that exact registration.

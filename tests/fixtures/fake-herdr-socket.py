@@ -20,8 +20,8 @@ try:
                 answer = {"result": {"pane": {"pane_id": "wA:p2"}}}
             elif method == "pane.send_input":
                 line = params["text"]
-                assert line.startswith("PI_RADAR_SPAWN_TOKEN="), line
-                token = line.split("PI_RADAR_SPAWN_TOKEN=", 1)[1].split(" ", 1)[0].strip("'")
+                assert line.startswith("PI_RADAR_REGISTRATION_ID="), line
+                token = line.split("PI_RADAR_REGISTRATION_ID=", 1)[1].split(" ", 1)[0].strip("'")
                 (state / "launch.json").write_text(json.dumps({"line": line, "token": token,
                                                                 "params": params}))
                 answer = {"result": {"accepted": True}}

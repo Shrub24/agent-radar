@@ -194,25 +194,28 @@ function publicationFor(
 	return publication;
 }
 
-test("managed startup spends its launch claim, but a reload creates a fresh claim", async () => {
+test("managed startup and reload use fresh claims under one launch registration", async () => {
 	const { store, cleanup } = makeRoot();
-	const launchClaim = "55555555-5555-4555-8555-555555555555";
+	const registrationId = "55555555-5555-4555-8555-555555555555";
 	try {
 		const daemon = fakeDaemon();
 		const { scheduler } = fakeScheduler();
 		const publication = publicationFor(daemon, {
-			store, scheduler, spawnToken: launchClaim,
+			store, scheduler, launchRegistrationId: registrationId,
 			location: async () => ({ state: "resolved", location: { backend: "tmux", pane: "%1" } }),
 		});
 		const binding = await publication.subject();
 		await settle();
 		assert.ok(binding, publication.diagnostic());
-		assert.equal(daemon.params("agent.presence").claim_id, launchClaim);
+		const initial = daemon.params("agent.presence").claim_id;
+		assert.notEqual(initial, registrationId);
+		assert.equal(daemon.params("agent.presence").registration_id, registrationId);
 		await publication.presence.release();
-		assert.equal(daemon.all("agent.release").at(-1).claim_id, launchClaim);
+		assert.equal(daemon.all("agent.release").at(-1).claim_id, initial);
 		publication.presence.report(SESSION_A);
 		await settle();
-		assert.notEqual(daemon.all("agent.presence").at(-1).claim_id, launchClaim);
+		assert.notEqual(daemon.all("agent.presence").at(-1).claim_id, initial);
+		assert.equal(daemon.all("agent.presence").at(-1).registration_id, registrationId);
 		publication.stop();
 	} finally { cleanup(); }
 });

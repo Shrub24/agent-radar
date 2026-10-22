@@ -661,8 +661,13 @@ impl Registry {
     }
 
     /// Records the launch subject a tracked spawn's edge belongs to.
-    pub fn attach_subject(&self, request_id: &str, subject_id: &str) -> Result<SpawnEdge, String> {
-        spawn::attach_subject(self, request_id, subject_id)
+    pub fn attach_subject(
+        &self,
+        request_id: &str,
+        claim_id: &str,
+        registration_id: &str,
+    ) -> Result<SpawnEdge, String> {
+        spawn::attach_subject(self, request_id, claim_id, registration_id)
     }
 
     /// Binds the edge a spawn token minted to the child that presented it,
@@ -878,7 +883,8 @@ impl Registry {
         }
         let registration = Registration {
             version: REGISTRATION_VERSION,
-            registration_id: random_uuid(),
+            registration_id: spawn::launched_registration(self, request.spawn_token.as_deref())?
+                .unwrap_or_else(random_uuid),
             registered_at: format_millis(now_ms),
             request: request.clone(),
         };

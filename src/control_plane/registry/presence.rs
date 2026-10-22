@@ -21,8 +21,6 @@ pub struct Report {
     #[serde(default)]
     pub location: Option<RegistryLocation>,
     #[serde(default)]
-    pub spawn_token: Option<String>,
-    #[serde(default)]
     pub owner: Option<String>,
     #[serde(default)]
     pub run: Option<String>,
@@ -44,6 +42,23 @@ pub fn registration(
     report: &Report,
     now_ms: i64,
 ) -> Result<super::Registration, String> {
+    let register = || {
+        registry.register(
+            &super::RegistrationRequest {
+                source: report.source.clone(),
+                incarnation: report.incarnation.clone(),
+                process: Some(report.process.clone()),
+                session: None,
+                location: None,
+                owner: report.owner.clone(),
+                run: report.run.clone(),
+                label: report.label.clone(),
+                launch: None,
+                spawn_token: report.registration_id.clone(),
+            },
+            now_ms,
+        )
+    };
     if let Some(id) = &report.registration_id {
         if let Some(existing) = registry.get(id)? {
             if existing.request.process.as_ref() != Some(&report.process)
@@ -52,11 +67,16 @@ pub fn registration(
             {
                 return Err("registration belongs to another process".into());
             }
+            let _transition = registry.transition();
+            super::spawn::heal_binding(registry, &existing.request, now_ms)?;
             return Ok(existing);
         }
-        return Err(
-            "acknowledged registration is missing; authoritative recovery is unresolved".into(),
-        );
+        if super::spawn::launched_registration(registry, Some(id))?.as_deref() != Some(id) {
+            return Err("registration was not admitted by a managed launch".into());
+        }
+        // Binding a pre-minted registration uses the same captured-birth fence
+        // as registration admission. An unknown ID refuses; never adopt instead.
+        return register();
     }
     let mut after = None;
     loop {
@@ -74,26 +94,13 @@ pub fn registration(
         }
         after = page.last().map(|r| r.registration_id.clone());
     }
-    registry.register(
-        &super::RegistrationRequest {
-            source: report.source.clone(),
-            incarnation: report.incarnation.clone(),
-            process: Some(report.process.clone()),
-            session: None,
-            location: None,
-            owner: report.owner.clone(),
-            run: report.run.clone(),
-            label: report.label.clone(),
-            launch: None,
-            spawn_token: report.spawn_token.clone(),
-        },
-        now_ms,
-    )
+    register()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Standing {
+    Reserved,
     Pending,
     Granted,
     Duplicate,
@@ -105,7 +112,7 @@ pub enum Standing {
 pub struct Decision {
     pub registration_id: String,
     pub claim_id: String,
-    pub session_id: String,
+    pub session_id: Option<String>,
     pub standing: Standing,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub subject_id: Option<String>,
@@ -186,6 +193,11 @@ pub fn attachment(
     }))
 }
 
+pub fn decision(registry: &Registry, claim_id: &str) -> Result<Option<Decision>, String> {
+    validate_registration_id(claim_id)?;
+    read(registry, &format!("{claim_id}.json"))
+}
+
 pub fn current(registry: &Registry, registration_id: &str) -> Result<Option<Decision>, String> {
     validate_registration_id(registration_id)?;
     match read(registry, &format!("current-{registration_id}.json"))? {
@@ -207,7 +219,9 @@ pub fn begin(
     }
     let name = format!("{claim_id}.json");
     if let Some(mut claim) = read(registry, &name)? {
-        if claim.registration_id != registration_id || claim.session_id != session_id {
+        if claim.registration_id != registration_id
+            || claim.session_id.as_deref() != Some(session_id)
+        {
             return Err("claim ID already identifies a different process or session".into());
         }
         if current(registry, registration_id)?
@@ -224,7 +238,9 @@ pub fn begin(
         save(registry, &claim)?;
         return Ok(claim);
     }
-    if let Some(mut previous) = current(registry, registration_id)? {
+    if let Some(mut previous) = current(registry, registration_id)?
+        && previous.standing != Standing::Reserved
+    {
         crate::control_plane::lifecycle::release_attachment(
             registry,
             &previous.claim_id,
@@ -242,13 +258,35 @@ pub fn begin(
     let claim = Decision {
         registration_id: registration_id.into(),
         claim_id: claim_id.into(),
-        session_id: session_id.into(),
+        session_id: Some(session_id.into()),
         standing: Standing::Pending,
         subject_id: None,
         location,
     };
     save(registry, &claim)?;
     Ok(claim)
+}
+
+/// A launch reserves its subject before the process can report a session. This
+/// does not grant any reader authority; only a verified presence report can.
+pub fn reserve(
+    registry: &Registry,
+    registration_id: &str,
+    claim_id: &str,
+    subject_id: &str,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    save(
+        registry,
+        &Decision {
+            registration_id: registration_id.into(),
+            claim_id: claim_id.into(),
+            subject_id: Some(subject_id.into()),
+            session_id,
+            standing: Standing::Reserved,
+            location: None,
+        },
+    )
 }
 
 /// Decision first, current projection second. Reassertion heals an interrupted projection.

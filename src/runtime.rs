@@ -274,7 +274,7 @@ pub struct LaunchRequest {
 }
 
 /// Environment variable carrying [`LaunchRequest::spawn_token`] to the child.
-pub const LAUNCH_TOKEN_ENV: &str = "PI_RADAR_SPAWN_TOKEN";
+pub const LAUNCH_TOKEN_ENV: &str = "PI_RADAR_REGISTRATION_ID";
 
 /// Typed backend primitives. These stay inside Radar; external consumers pin the
 /// daemon contracts derived from them instead of adapter implementation details.

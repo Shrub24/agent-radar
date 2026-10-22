@@ -11,7 +11,6 @@ export interface PresenceReportDeserialize {
   run?: string | null;
   session_id: string;
   source: string;
-  spawn_token?: string | null;
   subject_id?: string | null;
 }
 /**
@@ -54,7 +53,7 @@ export interface PresenceReportProcessIdentity {
   start_ticks: number;
   [k: string]: unknown;
 }
-export type PresenceAnswerStanding = "pending" | "granted" | "duplicate" | "released";
+export type PresenceAnswerStanding = "reserved" | "pending" | "granted" | "duplicate" | "released";
 
 /**
  * The small public receipt; session/location context stays inside Radar.
@@ -284,7 +283,7 @@ export type Freshness = "fresh" | "stale";
  * refused rather than silently dropped.
  */
 export type Report = Snapshot | AssignmentSnapshot | FactsSnapshot;
-export type Standing = "pending" | "granted" | "duplicate" | "released";
+export type Standing = "reserved" | "pending" | "granted" | "duplicate" | "released";
 /**
  * How a registration relates to the live panes.
  */

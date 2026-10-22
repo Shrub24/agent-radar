@@ -2000,31 +2000,29 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
     let root_session = random_uuid();
     publish_session_context(&mut client, &root, PARENT_INCARNATION, &root_session);
 
-    let grant =
-        |client: &mut Client, agent: &str, incarnation: &str, session: &str, claim: &str| {
-            let record = client.call("agent.get", json!({"registration_id": agent}));
-            let mut report =
-                registration_body(incarnation, Some(captured_identity(&state, claim)), None);
-            report["location"] = record["result"]["agent"]["registration"]["location"].clone();
-            report["registration_id"] = json!(agent);
-            report["session_id"] = json!(session);
-            report["claim_id"] = json!(claim);
-            report["spawn_token"] = json!(claim);
-            let granted = client.call("agent.presence", report.clone());
-            assert_eq!(
-                granted["result"]["standing"], "granted",
-                "{granted}; {report}; {record}"
-            );
-        };
-    let (parent_subject, parent_agent, _parent_pane) = spawned_live_tmux_child(
-        &mut client,
-        &server,
-        &state,
-        &root,
-        &root_session,
-        Value::Null,
-        OTHER_INCARNATION,
-    );
+    let grant = |client: &mut Client,
+                 agent: &str,
+                 incarnation: &str,
+                 session: &str,
+                 claim: &str,
+                 pane: &str| {
+        let mut report =
+            registration_body(incarnation, Some(captured_identity(&state, claim)), None);
+        report["location"] =
+            json!({"backend": "tmux", "pane": format!("tmux:{}:{pane}", server.name)});
+        report["registration_id"] = json!(agent);
+        report["session_id"] = json!(session);
+        let claim_id = random_uuid();
+        report["claim_id"] = json!(claim_id);
+        let granted = client.call("agent.presence", report.clone());
+        assert_eq!(
+            granted["result"]["standing"], "granted",
+            "{granted}; {report}"
+        );
+        claim_id
+    };
+    let (parent_subject, parent_agent, parent_pane) =
+        spawned_live_tmux_child(&mut client, &state, &root, &root_session, Value::Null);
     let parent_session = random_uuid();
     grant(
         &mut client,
@@ -2032,24 +2030,24 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         OTHER_INCARNATION,
         &parent_session,
         &parent_subject,
+        &parent_pane,
     );
 
-    let (worker_subject, worker_agent, _worker_pane) = spawned_live_tmux_child(
+    let (worker_subject, worker_agent, worker_pane) = spawned_live_tmux_child(
         &mut client,
-        &server,
         &state,
         &parent_agent,
         &parent_session,
         json!({"parent_subject_id": parent_subject}),
-        CHILD_INCARNATION,
     );
     let worker_session = random_uuid();
-    grant(
+    let worker_claim = grant(
         &mut client,
         &worker_agent,
         CHILD_INCARNATION,
         &worker_session,
         &worker_subject,
+        &worker_pane,
     );
     let attached = client.call("lifecycle.get", json!({"subject_id": worker_subject}));
     assert_eq!(
@@ -2074,7 +2072,7 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
     // The sender names its attempt, not an ordinal position in a chain.
     assert_eq!(
         publish["result"]["handoff"]["sender"]["claim_id"],
-        worker_subject
+        worker_claim
     );
     let replay = client.call_id(
         &handoff_id,
@@ -5016,7 +5014,7 @@ fn a_tracked_launch_runs_its_requested_program_and_keeps_its_secrets_private() {
     assert!(
         environment
             .lines()
-            .any(|line| line == format!("PI_RADAR_SPAWN_TOKEN={token}"))
+            .any(|line| line == format!("PI_RADAR_REGISTRATION_ID={token}"))
     );
     assert!(
         !environment.contains("PI_RADAR_LAUNCH_CORRELATION"),
@@ -5446,12 +5444,10 @@ fn publish_session_context(client: &mut Client, agent: &str, incarnation: &str, 
 /// agent, and its raw tmux pane.
 fn spawned_live_tmux_child(
     client: &mut Client,
-    server: &TmuxServer,
     state: &Path,
     parent: &str,
     session: &str,
     managed: Value,
-    incarnation: &str,
 ) -> (String, String, String) {
     let spawn_id = random_uuid();
     let mut request = json!({
@@ -5479,24 +5475,7 @@ fn spawned_live_tmux_child(
         .next()
         .expect("raw tmux pane")
         .to_string();
-    let pid = server
-        .tmux(&["display-message", "-p", "-t", &raw_pane, "#{pane_pid}"])
-        .trim()
-        .parse::<i32>()
-        .expect("child process pid");
-    let mut child_registration =
-        registration_body(incarnation, Some(process_identity_from_proc(pid)), None);
-    child_registration["spawn_token"] = json!(token);
-    // The child's own pane is where its own children are spawned.
-    child_registration["location"] = json!({"backend":"tmux", "pane": edge["location"]["pane"]});
-    let child_agent = registration_id(&client.call("agent.register", child_registration));
-    let bound = client.call("spawn.get", json!({"request_id": spawn_id}));
-    assert_eq!(
-        bound["result"]["spawn"]["bound"]["registration_id"],
-        json!(child_agent),
-        "{bound}"
-    );
-    (subject, child_agent, raw_pane)
+    (subject, token, raw_pane)
 }
 
 /// Spawns one managed child of `parent` in this daemon's tmux server, binds the
@@ -6381,13 +6360,15 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
         .expect("a minted token")
         .to_string();
     assert_eq!(launches[0].spawn_token, Some(token.clone()));
-    // A tracked launch's credential is its pre-minted claim, which is a public
-    // identifier: what binds the edge to its child is the verified process birth
-    // identity, so publishing the claim id grants no one the launch.
+    let launch_claim = recorded_edge(&sandbox.state(), &id)["claim_id"]
+        .as_str()
+        .expect("launch claim")
+        .to_string();
+    assert_ne!(launch_claim, token, "a claim does not identify the process");
     assert_eq!(
-        recorded_edge(&sandbox.state(), &id)["claim_id"].as_str(),
-        Some(token.as_str()),
-        "the credential is the claim id, not a second per-edge token"
+        subject_record(&sandbox.state(), &launch_claim)["registration_id"],
+        token,
+        "the launched process receives its admitted registration"
     );
 
     let secret = "PRIVATE_ENV_SENTINEL_8812";
@@ -6783,7 +6764,8 @@ fn the_wire_shapes_of_spawn_are_validated_before_dispatch() {
             "reserved launch token",
             {
                 let mut value = spawn_params(&parent, "/usr/bin/pi", &[]);
-                value["request"]["env"] = json!({"PI_RADAR_SPAWN_TOKEN":"WIRE_SECRET_SENTINEL"});
+                value["request"]["env"] =
+                    json!({"PI_RADAR_REGISTRATION_ID":"WIRE_SECRET_SENTINEL"});
                 value
             },
             "cannot set reserved",

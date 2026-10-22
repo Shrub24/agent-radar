@@ -269,6 +269,7 @@ export function createPublicationStore(root: string): PublicationStore {
  */
 export type RadarProcessSlot = {
 	incarnation?: string;
+	launchRegistrationId?: string;
 	publications: Map<string, RadarPublication>;
 };
 
@@ -280,7 +281,13 @@ export function radarProcessSlot(): RadarProcessSlot {
 	const host = globalThis as typeof globalThis & {
 		[PROCESS_SLOT]?: RadarProcessSlot;
 	};
-	return (host[PROCESS_SLOT] ??= createRadarProcessSlot());
+	if (!host[PROCESS_SLOT]) {
+		const slot = createRadarProcessSlot();
+		slot.launchRegistrationId = process.env.PI_RADAR_REGISTRATION_ID;
+		delete process.env.PI_RADAR_REGISTRATION_ID;
+		host[PROCESS_SLOT] = slot;
+	}
+	return host[PROCESS_SLOT];
 }
 
 /** The process incarnation, created on first use and kept for the process. */
@@ -975,7 +982,6 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 	type State = {
 		version: 2;
 		claim_id: string;
-	initial_load?: boolean;
 		session: string;
 		registration_id?: string;
 		subject_id?: string;
@@ -1033,13 +1039,6 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 			await releasePending();
 			const registration = await input.registration();
 			if (!registration?.process || state !== claim || stopped) return undefined;
-			// The first load spends the pre-minted launch claim. Reloads get a fresh
-			// claim; they must not reuse the released launch credential.
-			if (claim.initial_load) {
-				if (registration.spawn_token) claim.claim_id = registration.spawn_token;
-				claim.initial_load = false;
-				if (!save()) return undefined;
-			}
 			const answer = await client.presence({
 				...registration, process: registration.process,
 				session_id: claim.session, claim_id: claim.claim_id,
@@ -1079,7 +1078,7 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 				releases.push({ registration_id: state.registration_id, claim_id: state.claim_id });
 			}
 			standing = undefined;
-			state = { version: 2, session, claim_id: randomUUID(), initial_load: state === undefined, releases };
+			state = { version: 2, session, claim_id: randomUUID(), releases };
 			save(); stopped = false;
 			void ensure();
 		},
@@ -1159,7 +1158,7 @@ export type RadarPublicationOptions = {
 	/** Set on a managed child: the sidecar its owner correlates the subject with. */
 	binding?: { key: string; run: string; owner: string; label: string };
 	/** A daemon-spawned child's one-use launch token; sent privately, never stored in the process record. */
-	spawnToken?: string;
+	launchRegistrationId?: string;
 	leaseMs?: number;
 	heartbeatMs?: number;
 };
@@ -1234,8 +1233,8 @@ function createRadarPublicationInner(
 	const store = options.store ?? createPublicationStore(dataRoot);
 	const scheduler = options.scheduler ?? systemScheduler;
 	const client = options.client;
-	const spawnToken = options.spawnToken;
 	const slot = options.slot ?? radarProcessSlot();
+	const launchRegistrationId = options.launchRegistrationId ?? slot.launchRegistrationId;
 	const incarnation = options.incarnation ?? radarProcessIncarnation(slot);
 
 	const cacheKey = `${
@@ -1424,7 +1423,7 @@ function createRadarPublicationInner(
 			const { location: _initialLocation, ...identity } = record.registration;
 			return { ...identity,
 				...(location?.state === "resolved" ? { location: location.location } : {}),
-				...(spawnToken ? { spawn_token: spawnToken } : {}),
+				...(launchRegistrationId ? { registration_id: launchRegistrationId } : {}),
 			};
 		},
 		heartbeatMs: options.heartbeatMs ?? RADAR_HEARTBEAT_MS,

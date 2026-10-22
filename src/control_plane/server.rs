@@ -2358,9 +2358,6 @@ fn presence_request(
             Ok(_) => return Err("process birth identity is absent or mismatched".into()),
         }
         let registration = presence::registration(&registry, &report, now)?;
-        if report.spawn_token.is_some() && report.spawn_token != registration.request.spawn_token {
-            return Err("launch correlation does not match the recorded registration".into());
-        }
         let mut claim = presence::begin(
             &registry,
             &registration.registration_id,
@@ -6142,7 +6139,7 @@ fn track_launch(
     let ticket = subjects::create_with_intent(
         &registry, request_id, launch, session, identity, managed, now,
     )?;
-    registry.attach_subject(request_id, &ticket.claim_id)?;
+    registry.attach_subject(request_id, &ticket.claim_id, &ticket.registration_id)?;
     Ok((bootstrap, ticket))
 }
 
@@ -6652,7 +6649,7 @@ fn record_enrollment(
 ) -> Result<String, String> {
     let presence = registry::presence::current(registry, &params.registration_id)?
         .ok_or("lifecycle enrollment requires a current presence claim")?;
-    if presence.session_id != params.session
+    if presence.session_id.as_deref() != Some(params.session.as_str())
         || !matches!(
             presence.standing,
             registry::presence::Standing::Pending | registry::presence::Standing::Granted
@@ -7080,7 +7077,7 @@ fn current_presence_grant(registry: &Registry, subject: &subjects::Claim) -> Res
     let expected_subject = subject.subject_id.as_deref().unwrap_or(&subject.claim_id);
     Ok(claim.standing == registry::presence::Standing::Granted
         && claim.claim_id == subject.claim_id
-        && claim.session_id == session
+        && claim.session_id.as_deref() == Some(session)
         && claim.subject_id.as_deref() == Some(expected_subject))
 }
 

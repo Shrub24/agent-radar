@@ -51,10 +51,10 @@ export type RadarExecutionOptions = {
 	 */
 	location?: () => Promise<RadarLocationResolution>;
 	/**
-	 * A daemon-spawned child's one-use launch token, captured before this process
-	 * could observe anything else. It travels with the registration request only.
+	 * Registration allocated by Radar before this process launched. Normally
+	 * captured from the launch environment by the process-local publication.
 	 */
-	spawnToken?: string;
+	launchRegistrationId?: string;
 	/** Only a real fixed managed assignment is part of immutable registration. */
 	managedBinding?: { key: string; run: string; owner: string; label: string };
 	/**
@@ -207,8 +207,8 @@ export function createRadarExecutionAdapter(
 				? { location: options.location }
 				: {}),
 			...(managed !== undefined ? { binding: managed } : {}),
-			...(options.spawnToken !== undefined
-				? { spawnToken: options.spawnToken }
+			...(options.launchRegistrationId !== undefined
+				? { launchRegistrationId: options.launchRegistrationId }
 				: {}),
 		});
 	} catch {

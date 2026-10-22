@@ -123,13 +123,6 @@
     "source": {
       "type": "string"
     },
-    "spawn_token": {
-      "default": null,
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "subject_id": {
       "default": null,
       "type": [
@@ -147,7 +140,6 @@
     "registration_id",
     "subject_id",
     "location",
-    "spawn_token",
     "owner",
     "run",
     "label"

@@ -2078,6 +2078,9 @@ impl App {
             Some(crate::control_plane::registry::presence::Standing::Duplicate) => {
                 "this session claim was rejected; reload or resume from its last live state"
             }
+            Some(crate::control_plane::registry::presence::Standing::Reserved) => {
+                "Radar reserved this session attachment; waiting for the launched process"
+            }
             Some(crate::control_plane::registry::presence::Standing::Pending) => {
                 "Radar is still verifying this session claim"
             }

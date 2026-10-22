@@ -1115,11 +1115,12 @@ fn herdr_launch_context_is_quoted_and_preflighted_without_loss() {
         .validate_launch(&request)
         .expect("representable launch");
     assert!(runtime.primitives().contains(Primitives::LAUNCH_CONTEXT));
-    request
-        .env
-        .insert("PI_RADAR_SPAWN_TOKEN".into(), "override".into());
+    request.env.insert(
+        agent_radar::runtime::LAUNCH_TOKEN_ENV.into(),
+        "override".into(),
+    );
     assert!(request.validate().is_err());
-    request.env.remove("PI_RADAR_SPAWN_TOKEN");
+    request.env.remove(agent_radar::runtime::LAUNCH_TOKEN_ENV);
     request.env.insert("VALUE".into(), "line\nbreak".into());
     assert!(runtime.validate_launch(&request).is_err());
 

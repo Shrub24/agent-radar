@@ -8,7 +8,7 @@ See proposal.md for motivation. Current state that shapes this design:
 - Managed launches already run in a daemon-created tmux pane with direct argv and a recorded cwd/environment overlay.
 - Presence/claims (`unified-pi-registration`) bind the Pi session subject; launch correlation binds that session to the admitted launch.
 - Physical exit is already a typed tmux observation; scope state must not become a second one.
-- The identity model still carries two names for one attempt (`subject_id` for the execution record and `logical_subject_id` for the durable subject) plus an ordinal. Section "Prerequisite" consolidates it, because every decision below names an attempt and would otherwise freeze the duplicate into scope and unit names.
+- Tasks 0.1–0.8 shipped subject/claim separation and removed generation fencing. Task 0.9 separates the process registration from its session claims before physical groups are added.
 
 ## Goals / Non-Goals
 
@@ -42,7 +42,7 @@ Measurement caveats: the pane-PID result holds only when the pane command runs w
 
 ## Prerequisite: one identity per role
 
-The scope work names an attempt everywhere — unit name, slice name, recovery, stop, exit — so it is built after the identity model is consolidated, not on top of the duplicate.
+The scope names a process, not a session attachment. Registration identity must be allocated before execution so scopes, recovery and stop do not depend on which session the process currently has open.
 
 Three roles, three ids, three lifespans:
 
@@ -52,20 +52,20 @@ Three roles, three ids, three lifespans:
 | One attachment | `claim_id` | The subject's proof of attachment to a process and session, from reservation to release | Daemon reserves a launch's claim; a process presents its own otherwise |
 | One process incarnation | `registration_id` | One OS process, launch to exit | Daemon pre-mints it for a managed launch, the process presents it; otherwise the process writes it. The daemon verifies |
 
-Today's `subject_id` is the attempt and today's `logical_subject_id` is the agent; the durable identity carries the qualified name. The merge renames them so the agent owns the plain name and the attempt is a claim:
+The first consolidation (tasks 0.1–0.8) gave the agent the plain `subject_id` and replaced execution generations with exact claims. Task 0.9 separates process lifetime from attachment lifetime:
 
 - **The registration is the process identity, entirely.** A managed launch pre-mints the registration before dispatch and puts it in the launch environment. The launch facts no client may write (expected birth identity, captured recipe, `signalled_at`, `exited_at`, pane evidence, scope and unit) belong to the process, so they are recorded against the registration, and unit and slice names derive from it. Binding requires the captured birth identity, so a leaked id cannot bind a different process. The per-edge spawn token retires.
 - **The claim is the subject's attachment**, identified by `(claim_id, subject_id, registration_id)`. A launch reserves one for its subject at the same time: standing `reserved`, meaning Radar has decided this registration may attach to this subject and the process has not received it yet. The claim id is never given to the process. At the process's first report Radar verifies the registration's birth identity, runs the duplicate check for the reported session, and replaces the reserved claim with the granted one under the `claim_id` the process presented. Reloads and `/resume` take the ordinary path with a fresh claim, so pi-radar needs no first-load rule and no claim in the environment.
 - **`reserved` is a distinct standing.** `pending` already means a process's report is still being verified and the client retries it; `reserved` is waited on by Radar. It conveys no attachment authority: handoffs, derived reads and controls that need a granted claim ignore it. It is visible and controllable, so the TUI shows a starting row and `D` on it can cancel the launch.
 - **Attachment moves off the attempt.** Presence release clears the subject's current claim; it does not end the process or its registration.
-- **`execution_generation` is dropped.** It existed to fence and to name the latest attempt. A claim id is an exact fence, and the subject's `current_claim` names the latest attempt without scanning for a maximum.
+- **`execution_generation` is dropped.** It existed to fence and to name the latest attempt. A claim id is an exact attachment fence, and the subject's `current_claim` names its attachment without scanning for a maximum.
 - **The subject becomes a record.** Identity, managed metadata, `parent_subject_id` and `current_claim` live on it once, instead of being copied forward onto each successor.
 
 **Races resolve at reservation, which is what makes restart continuous.** Reserving a launch's claim is the exclusive act per subject: the first accepted reservation wins, and a competing launch or restart is refused or left pending. Because a restart reserves its successor (a new registration and claim) before it dispatches the stop, the successor is already the subject's current claim at the moment the old process is signalled — the continuity gap closes there, not when the replacement eventually starts.
 
 If the stop fails before replacement dispatch, Radar revokes that undispatched reservation, records its cancellation, and restores the exact incumbent claim under the transition lock. Leaving a processless reserved claim current would strand the still-running agent. A successor that may have dispatched is never rolled back this way. Scoped reads and handoffs require a granted decision whose claim still matches the subject pointer.
 
-**Migration re-keys nothing.** An existing execution record's UUID becomes its claim id, its `logical_subject_id` is promoted to the subject record on read, and a stored generation is ignored. No new ids are minted, no store is added, and the private record filenames stay as they are.
+**Rollout.** Tasks 0.1–0.8 preserved old record keys. The remaining process-record and scope work uses the explicit reset in decision 8 rather than building another legacy migration. The destructive scope of that reset must be agreed before deployment.
 
 ## Decisions
 
@@ -137,7 +137,7 @@ A recovered execution requires the recorded unit name **and** a verified process
 
 No conversion of existing subjects or executions. Rollout uses an explicit reset whose scope is agreed separately: it must never be implemented as "stop the tmux server" and must state what durable history, handoffs and inboxes it discards.
 
-### 9. The execution slice is established now, and the association lives on the claim
+### 9. Establish the process slice now; its association belongs to the registration
 
 Create the per-execution slice from the start rather than adding it when the first independent task scope appears: moving later would rename every live group. Record the unit and slice names plus the verified member identity on the registration that already records that process. A separate store would be a second place to keep one fact.
 

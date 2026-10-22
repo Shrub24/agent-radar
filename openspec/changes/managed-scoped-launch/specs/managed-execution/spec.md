@@ -21,7 +21,7 @@ Run a managed agent in place, inside a physical resource group established befor
 - **THEN** the launch is refused before anything executes and the reason is reported
 
 ### Requirement: The physical group exists before the command executes
-Every managed launch SHALL create a transient systemd user scope in a Radar slice and admit the application into it before the command runs. A required setup failure SHALL refuse the launch before execution, and SHALL NOT launch unscoped. The scope SHALL be named from the claim id of the attempt it runs, never from argv, cwd, environment, prompt text or session identity.
+Every managed launch SHALL create a transient systemd user scope in a Radar slice and admit the application into it before the command runs. A required setup failure SHALL refuse the launch before execution, and SHALL NOT launch unscoped. The scope SHALL be named from the process's registration id, never from argv, cwd, environment, prompt text or session identity.
 
 #### Scenario: Scope established first
 - **WHEN** a managed launch starts
@@ -83,14 +83,18 @@ Radar MAY expose a managed execution's group memory, CPU and task counts. It SHA
 - **WHEN** a managed execution's resource measurement is read
 - **THEN** it is labelled as a group measurement and not combined with a summed process metric
 
-### Requirement: An attempt's facts are recorded on its claim
-Radar SHALL record a managed attempt's unit and slice identity, its captured recipe, its expected and bound process, its signal and exit evidence and its successor on that attempt's claim. It SHALL NOT keep a second per-attempt store, and SHALL NOT place these facts on the subject.
+### Requirement: Process facts belong to the registration
+Radar SHALL record a managed process's unit and slice identity, captured recipe, expected and bound birth identity, signal and exit evidence against its registration. Changing a session attachment SHALL NOT rename its scope or create a second owner of those process facts. The subject SHALL NOT own process-lifetime facts.
 
-#### Scenario: Scope association survives a restart
-- **WHEN** the daemon restarts with a recorded attempt still running
-- **THEN** the claim still names its unit and slice, and recovery verifies the member identity before any effect
+#### Scenario: Scope association survives a daemon restart
+- **WHEN** the daemon restarts with a recorded process still running
+- **THEN** its registration still names its unit and slice, and recovery verifies the member identity before any effect
 
-#### Scenario: One attempt per record
-- **WHEN** a subject is restarted twice
-- **THEN** each attempt has its own claim with its own scope identity, and the subject has one current claim
+#### Scenario: Session changes in the same process
+- **WHEN** the process reloads or opens a different session
+- **THEN** its claim changes but its registration and physical group remain unchanged
+
+#### Scenario: A command has no Pi session
+- **WHEN** Radar launches a command with no subject attachment
+- **THEN** it records the process registration and scope without fabricating a subject or claim
 
