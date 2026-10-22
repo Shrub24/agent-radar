@@ -18,7 +18,7 @@ Consolidate the identity model first — the scope work names an attempt in ever
 ## 1. Scope launch composition
 
 - [ ] 1.1 Build the launcher argv that wraps the existing bootstrap in `systemd-run --user --scope` with `--expand-environment=no`, `--quiet`, `-p SendSIGKILL=no`, an explicit `--unit` and `--slice`; verify a unit test asserts the exact flags and that no argv element is exposed in the name or description
-- [ ] 1.2 Derive unit and slice names from Radar's durable execution identity with a systematic, collision-free encoding; verify a test shows two distinct executions never collide and that a retried admission reuses its name
+- [ ] 1.2 Derive unit and slice names from the launch's pre-minted claim id with a systematic, collision-free encoding; verify two distinct launches never collide, a retried admission reuses its name, and a later claim of the same process neither renames nor loses the scope
 - [ ] 1.3 Compose the pane command as direct argv with no shell, redirection or metacharacter; verify a test refuses a recipe that would require them, and that the pane's process is the workload rather than a shell
 
 ## 2. Refusal before execution
@@ -28,26 +28,27 @@ Consolidate the identity model first — the scope work names an attempt in ever
 
 ## 3. Execution record and recovery
 
-- [ ] 3.1 Record the scope and slice identity alongside the existing private launch/execution record, without a new store; verify a readback returns them and no public projection exposes environment values
-- [ ] 3.2 Reattach a recorded execution after daemon restart by matching the recorded unit and a verified process birth identity inside the group; verify a test reports it running without signalling it, and that a reused name with a mismatched identity stays unresolved
+- [ ] 3.1 Record the scope and slice identity on the launch claim, without a new store; later claims of the same process resolve it by process identity; verify a readback returns them and no public projection exposes environment values
+- [ ] 3.2 Reattach a recorded launch after daemon restart by matching the recorded unit and a verified process birth identity inside the group; verify a test reports it running without signalling it, and that a reused name with a mismatched identity stays unresolved
 - [ ] 3.3 Report a missing transient unit as unknown rather than a clean exit; verify the swap-in of `--collect` or unit expiry cannot turn into a settled outcome
 
 ## 4. Graceful-only stop
 
 - [ ] 4.1 Stop the execution's main scope without SIGKILL escalation and report survivors when processes remain; verify a test asserts no escalation, survivor names in the result, and that the failed/timeout unit state is tolerated
 - [ ] 4.2 Keep independent task and subagent scopes out of a main-scope stop; verify a test shows a sibling group is untouched
+- [ ] 4.3 Stop a managed execution through its scope in every control that stops one (`D`, cancel, restart), reusing the one-window batch wait; leave the signal path for observed sessions as it is with no new work, and verify a managed stop never takes it
 
 ## 5. `radar run` and TUI cutover
 
 - [ ] 5.1 Add `radar run -- COMMAND [ARG...]` that verifies the current pane belongs to this daemon before executing in place; verify an integration test runs a command in an existing pane, keeps its cwd and environment, and creates no pane
 - [ ] 5.2 Refuse `radar run` on an unverified pane or an empty command before anything executes; verify both refusals
 - [ ] 5.3 Route `L`, restart and Herdsman spawn through the same managed launch; verify the existing `L` targeting tests still pass and a scope failure refuses before the command runs
-- [ ] 5.4 Remove in-place promotion of separately started agents and expose an explicit restart-through-Radar transition that requires the previous process to have exited; verify the confirmation refuses while the old process is alive
+- [ ] 5.4 Ship a `pi` launcher shim for Nix and Home Manager that prefixes `radar run`, and leave observed sessions with their current functionality; verify the shim runs a managed Pi and a manually started Pi keeps its identity, children, inbox and controls
 - [ ] 5.5 Document `radar run`, the managed/observed distinction and the graceful-stop semantics in `docs/` and the README; verify the documented commands run as written
 
 ## 6. pi-radar and consumers
 
-- [ ] 6.1 Carry managed/observed standing and the launch association through pi-radar's report and shared runtime, negotiated by capability; verify a test shows an observed session keeps its identity and history while gaining no managed controls
+- [ ] 6.1 Mark an observed session as not first-class in the TUI and observation from the standing pi-radar already reports; verify it gains and loses no control
 - [ ] 6.2 Regenerate consumed protocol contracts and update the SDK docs and the Herdsman companion brief; verify generated-contract and package tests pass
 
 ## 7. Packaging and platform

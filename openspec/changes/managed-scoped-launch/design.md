@@ -114,7 +114,7 @@ Default scope stop sends SIGTERM and then SIGKILL after `TimeoutStopSec`. The me
 - Managed scopes set `SendSIGKILL=no`; Radar never escalates on its own.
 - A stop that leaves processes running is recorded as an unresolved stop with survivors named, not as success or failure of the workload.
 - `failed`/`timeout` unit state is tolerated and cleared after the workload ends; it is not an execution outcome.
-- Group stop targets the main scope only. Independently scoped tasks and subagents are untouched.
+- Group stop targets the main scope only. Independently scoped tasks and subagents are untouched. A managed execution stops through its scope; the existing identity-fenced signal path stays as it is for observed sessions and receives no new work. The unit is stopped by name: names derive from a claim id that is never reused, and recovery still verifies a member's birth identity first, which covers a stale process rather than a hostile one.
 
 ### 5. Physical grouping without logical ownership
 
@@ -124,7 +124,7 @@ radar.slice
     radar-<execution>-main.scope
 ```
 
-The daemon and tmux server stay outside `radar.slice`. The execution slice is named from the claim's id, not from the session subject, argv, prompt, cwd or environment: a `/resume` does not migrate a cgroup, and unit names are visible to the user manager, journalled and `systemctl`-listable.
+The daemon and tmux server stay outside `radar.slice`. The execution slice is named from the launch's pre-minted claim id, not from the session subject, argv, prompt, cwd or environment, and the name is fixed at launch: it exists before exec, when no registration does. A later claim in the same process (a reload or `/resume` presents a fresh claim) does not rename or migrate the cgroup; it reaches the scope through the process identity the launch recorded. Unit names are visible to the user manager, journalled and `systemctl`-listable.
 
 ### 6. Recovery binds by recorded identity, never by name alone
 
@@ -132,7 +132,7 @@ A recovered execution requires the recorded unit name **and** a verified process
 
 ### 7. Managed-first policy, no adoption parity
 
-`radar run`, `L`, restart and Herdsman spawn converge on the same scoped launch after placement is chosen. An externally started Pi is observed and keeps its durable session identity, children and inbox, but does not receive managed-launch standing; the transition is an operator-confirmed restart through Radar, which must confirm the previous process exited before starting its replacement.
+`radar run`, `L`, restart and Herdsman spawn converge on the same scoped launch after placement is chosen, and the managed path accepts no compromise to serve any other. An externally started Pi is observed: it keeps everything it has today (durable session identity, children, inbox, the controls that need no scope) and is marked as not first-class. It gets no new capability and no second implementation of a managed one, and nothing is removed from it merely because it is unmanaged. The expected route to managed is a `pi` shim that prefixes `radar run`, so observed sessions are a narrow case.
 
 ### 8. Reset instead of migration
 
@@ -140,13 +140,13 @@ No conversion of existing subjects or executions. Rollout uses an explicit reset
 
 ### 9. The execution slice is established now, and the association lives on the claim
 
-Create the per-execution slice from the start rather than adding it when the first independent task scope appears: moving later would rename every live group. Record the unit and slice names plus the verified member identity on the claim that already records that attempt. A separate store would be a second place to keep one fact.
+Create the per-execution slice from the start rather than adding it when the first independent task scope appears: moving later would rename every live group. Record the unit and slice names plus the verified member identity on the launch claim that already records that attempt; later claims of the same process resolve the scope by that process identity. A separate store would be a second place to keep one fact.
 
 ## Risks / Trade-offs
 
 - **Scope state mistaken for an outcome** → only tmux's typed exit observation reports exit; unit `Result`/`ActiveState` are presentation facts.
 - **`failed` after a graceful stop looks like breakage** → documented as an expected survivor state; repeat stop and clear are normal.
-- **Unit name collision on retry** → derive the name from the claim id so a lost reply cannot create a second attempt under a fresh name.
+- **Unit name collision on retry** → derive the name from the launch's claim id so a lost reply cannot create a second attempt under a fresh name.
 - **Environment expansion corrupting argv** → `--expand-environment=no` plus a test with a literal `$VAR` argument.
 - **Pane PID no longer the workload** → direct argv only; refuse a recipe that would need shell metacharacters.
 - **Radar becomes a startup dependency** → scope or admission failure refuses visibly before exec; no silent unscoped launch.
@@ -156,4 +156,4 @@ Create the per-execution slice from the start rather than adding it when the fir
 
 ## Migration Plan
 
-Land the identity consolidation first, then ship the daemon-side scope launch and recovery, then `radar run` and the `L` cutover in the same release, with pi-radar standing/negotiation updated together. Reset rather than convert. Rollback removes scope creation: managed launches then refuse rather than silently falling back to an unscoped launch, so a half-rolled-back fleet is visible rather than misreported.
+Land the identity consolidation first, then ship the daemon-side scope launch and recovery, then `radar run`, the `L` cutover and the `pi` shim in the same release so the whole path is testable together, with pi-radar updated alongside. Reset rather than convert. Rollback removes scope creation: managed launches then refuse rather than silently falling back to an unscoped launch, so a half-rolled-back fleet is visible rather than misreported.
