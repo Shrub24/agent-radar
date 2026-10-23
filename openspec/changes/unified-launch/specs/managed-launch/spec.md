@@ -23,15 +23,23 @@ A relaunch SHALL start the program with the given args, session selectors remove
 - **THEN** the program exits without creating a session and the launch is recorded as failed
 
 ### Requirement: A parent can continue its own child
-`spawn.create` SHALL accept an optional `continue_subject_id` and relaunch that subject with the program and args the parent sent, refused before any effect unless the subject is the caller's own child, has a recorded session, and has no reserved successor.
+`spawn.create` SHALL accept an optional `continue_subject_id` and relaunch that subject with the program and args the parent sent, refused before any effect unless the subject is the caller's own child, has a recorded session, and has no reserved successor. `if_running` SHALL default to `refuse`; only `replace` stops a live child.
 
 #### Scenario: Continuing a released child
 - **WHEN** a parent continues its child whose process ended
 - **THEN** the launch is reserved on that subject and the child runs in its recorded session
 
-#### Scenario: Continuing a live child
-- **WHEN** the child still runs
+#### Scenario: Continuing a live child by default
+- **WHEN** the child still runs and `if_running` is absent
+- **THEN** the request is refused and the child is not signalled
+
+#### Scenario: Replacing a live child
+- **WHEN** the child still runs and `if_running` is `replace`
 - **THEN** it is stopped and its exit awaited before the relaunch, and a child that does not exit leaves the relaunch withdrawn
+
+#### Scenario: A caller without a granted subject
+- **WHEN** a process whose claim is duplicate, pending or released asks to continue a child
+- **THEN** the request is refused before any effect
 
 #### Scenario: Another parent's child
 - **WHEN** the subject's recorded parent is not the caller's subject
