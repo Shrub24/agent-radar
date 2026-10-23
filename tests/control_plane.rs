@@ -4702,6 +4702,20 @@ fn subject_record(state: &Path, subject_id: &str) -> Value {
     serde_json::to_value(subject).expect("a subject projection")
 }
 
+/// The program a launch claim will deliver: the daemon's own record of it.
+fn recorded_launch(
+    state: &Path,
+    claim_id: &str,
+) -> agent_radar::control_plane::lifecycle::LaunchContext {
+    let registry =
+        agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
+    agent_radar::control_plane::lifecycle::read(&registry, claim_id)
+        .expect("replayable claim")
+        .expect("a launch claim")
+        .process
+        .launch
+}
+
 fn captured_identity(state: &Path, subject_id: &str) -> ProcessIdentity {
     serde_json::from_value(subject_record(state, subject_id)["process"].clone())
         .expect("a captured identity")
@@ -6423,14 +6437,9 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     assert_eq!(launches[0].pane_id, "wA:p2");
     assert_ne!(
         launches[0].executable, "/usr/bin/pi",
-        "tracked launches use Radar's bootstrap"
+        "tracked launches start Radar's launch chain"
     );
-    assert!(
-        launches[0]
-            .argv
-            .windows(3)
-            .any(|window| { window == ["--", "/usr/bin/pi", "--child"] })
-    );
+    assert_eq!(&launches[0].argv[..3], ["run", "--launch", "--socket"]);
     // Identity is the attached execution, never an injected variable.
     for retired in [
         agent_radar::control_plane::lifecycle::MANAGED_SUBJECT_ENV,
@@ -6453,6 +6462,9 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
         .as_str()
         .expect("launch claim")
         .to_string();
+    let delivered = recorded_launch(&sandbox.state(), &launch_claim);
+    assert_eq!(delivered.executable, "/usr/bin/pi");
+    assert_eq!(delivered.argv, ["--child", "row one"]);
     assert_ne!(launch_claim, token, "a claim does not identify the process");
     assert_eq!(
         subject_record(&sandbox.state(), &launch_claim)["registration_id"],
@@ -11553,13 +11565,14 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
             .iter()
             .all(|event| { event["subject_id"] == subject && event["claim_id"] == successor_id })
     );
+    let delivered = recorded_launch(&sandbox.state(), successor_id);
     assert!(
-        launches[0]
+        delivered
             .argv
             .windows(2)
             .any(|pair| pair == ["--session", TRACKED_SESSION]),
         "the successor resumes the live session: {:?}",
-        launches[0].argv
+        delivered.argv
     );
 
     // Same request ID replays its first answer even though the public subject ID

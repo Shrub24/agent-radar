@@ -445,7 +445,7 @@ struct Core {
     backend: Option<Arc<dyn RuntimeProvider>>,
     verifier: Arc<dyn ProcessVerifier>,
     stopping: Arc<AtomicBool>,
-    /// What a tracked launch runs as its bootstrap. `None` when this process has
+    /// The binary and socket a tracked launch starts as `radar run --launch`. `None` when this process has
     /// no executable path it can name, which refuses tracked launches.
     bootstrap: Option<Bootstrap>,
     /// Unix milliseconds of the last completed recovery sweep pass; 0 before one.
@@ -925,7 +925,7 @@ fn handle_line(
         Method::Communication => answer(writer, communication_request(core, &request)),
         Method::Tasks => answer(writer, read_tasks(core, &request)),
         Method::Registry => answer(writer, registry_request(core, &request, verification)),
-        Method::Bootstrap => answer(writer, bootstrap_request(core, &request, verification)),
+        Method::Claim => answer(writer, claim_request(core, &request, verification)),
         Method::Admit => answer(writer, admit_request(core, &request, verification)),
         Method::Wake => answer(writer, wake_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
@@ -5885,7 +5885,7 @@ fn spawn_child(
         return Response::refused(&request.id, &Refusal::new(Code::Refused, message));
     }
     // A backend that tracks its launches gets the subject before any effect, so
-    // the bootstrap's correlation is recorded before the launch can run it.
+    // the launch's correlation is recorded before the launch can run it.
     let tracking = if let Some(prepared) = lineage.prepared {
         Some(prepared)
     } else if backend
@@ -6129,7 +6129,7 @@ fn spawn_child(
     settle_spawn(request, done, &edge, core)
 }
 
-/// The bootstrap a tracked launch runs: this binary, serving `socket`. `None`
+/// The launch chain a tracked launch starts: this binary, serving `socket`. `None`
 /// when either path is not text the launch argv can carry.
 fn bootstrap_for(socket: &Path) -> Option<Bootstrap> {
     Some(Bootstrap {
@@ -6139,7 +6139,7 @@ fn bootstrap_for(socket: &Path) -> Option<Bootstrap> {
 }
 
 /// Records the launch subject for a tracked spawn and attaches it to the edge,
-/// returning what the launch needs to run through the bootstrap.
+/// returning what the launch needs to start its claim.
 fn track_launch(
     core: &Arc<Mutex<Core>>,
     request_id: &str,
@@ -6173,25 +6173,25 @@ fn requested_launch(params: &SpawnParams) -> subjects::LaunchContext {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BootstrapParams {
+struct ClaimParams {
     subject_id: String,
     correlation: String,
     process: ProcessIdentity,
 }
 
-/// Captures the process a tracked launch's bootstrap claims, and releases it to
-/// run its program.
+/// Captures the process a tracked launch's `radar run --launch` claims, and answers
+/// with the registration to enter a scope under and the launch's program.
 ///
 /// Released only when the subject is pending with this correlation, the pane the
 /// edge recorded has this process as its foreground, the identity matches the
 /// live process, and a pidfd can be opened on it. Every refusal reads the same
 /// way, so a caller cannot probe which of those checks failed.
-fn bootstrap_request(
+fn claim_request(
     core: &Arc<Mutex<Core>>,
     request: &Request,
     verification: &Arc<VerificationBudget>,
 ) -> Response {
-    let params: BootstrapParams = match decode_params(request) {
+    let params: ClaimParams = match decode_params(request) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -6273,7 +6273,7 @@ fn bootstrap_request(
             &Refusal::new(Code::BackendUnavailable, "launch context is unavailable"),
         );
     };
-    // The bootstrap runs no program before release, so its context reads describe
+    // The launch chain runs no program before it is answered, so its context reads describe
     // the claimed process only while that identity still holds.
     if !matches!(
         verifier.inspect(params.process.pid),
@@ -6304,7 +6304,14 @@ fn bootstrap_request(
         &effective,
         store::now_ms(),
     ) {
-        Ok(()) => Response::ok(&request.id, json!({ "released": true })),
+        Ok(()) => Response::ok(
+            &request.id,
+            json!({
+                "registration_id": subject.process.registration_id,
+                "executable": subject.process.launch.executable,
+                "argv": subject.process.launch.argv,
+            }),
+        ),
         Err(error) => {
             retire_wake(&backend, &params.subject_id, &stopping);
             Response::refused(&request.id, &Refusal::new(Code::Refused, error))

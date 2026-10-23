@@ -1,11 +1,11 @@
 ## 1. Checks
 
-- [ ] 1.1 Confirm a spawned launch's private record holds the program, cwd and environment overlay in replayable form, and that exit capture does not depend on the bootstrap process.
+- [x] 1.1 Confirm a spawned launch's private record holds the program, cwd and environment overlay in replayable form, and that exit capture does not depend on the bootstrap process.
 
 ## 2. One launch chain
 
-- [ ] 2.1 `radar run --launch` claims a recorded launch (correlation + birth identity), receives registration and program, wraps the scope and execs; every daemon-created launch uses it.
-- [ ] 2.2 Remove `launch-bootstrap`, `spawn.bootstrap` and daemon-side scope wrapping.
+- [x] 2.1 `radar run --launch` claims a recorded launch (correlation + birth identity), receives registration and program, wraps the scope and execs; every daemon-created launch uses it.
+- [x] 2.2 Remove `launch-bootstrap`, `spawn.bootstrap` and daemon-side scope wrapping.
 
 ## 3. One relaunch
 

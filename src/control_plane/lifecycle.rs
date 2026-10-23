@@ -1,16 +1,16 @@
 //! Daemon-owned launch subjects: the physical lifecycle of a tracked spawn.
 //!
-//! A tracked launch runs the requested program through a bootstrap that is the
-//! Radar binary itself. The bootstrap claims its own process incarnation with a
-//! private, one-use correlation; the daemon verifies that the claimed process is
-//! the pane's foreground process and was started with the requested launch, then
-//! records it and only then releases the bootstrap to exec the program. The exec
+//! A tracked launch starts `radar run --launch` in its pane. That process claims
+//! its own incarnation with a private, one-use correlation; the daemon verifies
+//! that it is the pane's foreground process and was started for the requested
+//! launch, records it, and only then answers with the program from its own record.
+//! The process enters the registration's scope and execs the program. The exec
 //! keeps the PID and birth identity, so the captured process is the program that
 //! runs. A correlation is spent at capture; a revoked subject never captures or binds.
 //!
 //! Every transition of a subject runs under the registry's transition lock. That
 //! lock is the one commit fence shared with registration binding, so a cancel and
-//! a bootstrap claim, or a cancel and a registration, have exactly one winner.
+//! a launch claim, or a cancel and a registration, have exactly one winner.
 //! The lock is never held across a wait for a process to exit.
 
 mod observation;
@@ -41,7 +41,7 @@ use crate::model::{ProcessIdentity, SessionUuid};
 use crate::process_control::{self, Acquired, Effective};
 use crate::runtime::LaunchRequest;
 
-/// Environment variables the bootstrap reads and removes before the program runs.
+/// Environment variables `radar run --launch` reads and removes before the program runs.
 pub const SUBJECT_ENV: &str = "PI_RADAR_LAUNCH_SUBJECT";
 pub const CORRELATION_ENV: &str = "PI_RADAR_LAUNCH_CORRELATION";
 // Retired: the managed subject is the attached execution, not an injected identity.
@@ -51,8 +51,8 @@ pub const MANAGED_LAUNCH_ENV: &str = "PI_RADAR_MANAGED_LAUNCH_ID";
 pub const MANAGED_GENERATION_ENV: &str = "PI_RADAR_MANAGED_EXECUTION_GENERATION";
 pub const MANAGED_PARENT_SUBJECT_ENV: &str = "PI_RADAR_MANAGED_PARENT_SUBJECT_ID";
 
-/// The internal method a bootstrap calls to claim its process.
-pub const BOOTSTRAP_METHOD: &str = "spawn.bootstrap";
+/// The internal method `radar run --launch` calls to claim its recorded launch.
+pub const CLAIM_METHOD: &str = "launch.claim";
 
 /// The subcommand a pane-death hook runs, and the internal method it calls.
 pub const WAKE_COMMAND: &str = "lifecycle-wake";
@@ -61,12 +61,9 @@ pub const WAKE_METHOD: &str = "lifecycle.wake";
 /// Admission of an in-place managed launch into a pane the caller already occupies.
 pub const ADMIT_METHOD: &str = "launch.admit";
 
-/// The subcommand the Radar binary runs as the bootstrap.
-pub const BOOTSTRAP_COMMAND: &str = "launch-bootstrap";
-
 /// Refusal for a claim the subject cannot take: unknown, spent, revoked, or no
 /// longer awaiting a process. It says nothing about which.
-pub const NOT_AWAITING: &str = "launch is not awaiting a bootstrap";
+pub const NOT_AWAITING: &str = "launch is not awaiting its process";
 
 /// Refusal for a captured process that was not started with the requested launch.
 pub const LAUNCH_MISMATCH: &str = "launch context does not match the requested launch";
@@ -76,7 +73,7 @@ const MAX_SUBJECT_BYTES: usize = 64 * 1024;
 /// How long a cancelled process gets to exit after SIGTERM before the operation
 /// reports the exit as not verified.
 const EXIT_DEADLINE: Duration = Duration::from_secs(2);
-/// How long a bootstrap waits for the daemon before it gives up without running
+/// How long a launch waits for the daemon before it gives up without running
 /// the program.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -85,7 +82,7 @@ const RELEASE_DEADLINE: Duration = Duration::from_secs(5);
 pub enum State {
     /// Launch recorded; no process has claimed it yet.
     Pending,
-    /// The bootstrap's process is captured and released to exec.
+    /// The launch's process is captured and has been given its program.
     Captured,
     /// A registration presented the token with the captured identity.
     Bound,
@@ -106,21 +103,22 @@ pub struct LaunchContext {
 }
 
 impl LaunchContext {
-    /// Whether the process was started with this launch: the program and its
-    /// argv, its working directory when one was requested, and each requested
+    /// Whether the process was started for this launch: it is the launch chain,
+    /// in the working directory requested if any, with each requested
     /// environment value. Variables the backend adds to every pane are not part
     /// of the launch and are not compared.
     fn launched_as(&self, effective: &Effective) -> bool {
-        let Some(separator) = effective.cmdline.iter().position(|arg| arg == "--") else {
-            return false;
-        };
-        let mut program = vec![self.executable.clone()];
-        program.extend(self.argv.iter().cloned());
+        // The program comes from this record, so the process is checked for being
+        // the launch chain that will fetch it, not for carrying the program.
+        let is_claim = effective
+            .cmdline
+            .windows(2)
+            .any(|pair| pair[0] == "run" && pair[1] == "--launch");
         let cwd_matches = self
             .cwd
             .as_deref()
             .is_none_or(|cwd| fs::canonicalize(cwd).ok().as_deref() == effective.cwd.as_deref());
-        &effective.cmdline[separator + 1..] == program.as_slice()
+        is_claim
             && cwd_matches
             && self
                 .env
@@ -299,7 +297,7 @@ pub struct ProcessRecord {
 }
 
 /// What a spawn needs to launch a tracked child: the subject it belongs to and
-/// the correlation its bootstrap presents.
+/// the correlation its launch claim presents.
 pub struct Ticket {
     pub registration_id: String,
     /// Exact execution record ID bound to the spawn edge.
@@ -323,7 +321,7 @@ pub struct Bootstrap {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Exit {
     /// No process identity was captured, so nothing was signalled. The launch
-    /// was revoked before any bootstrap could release a program.
+    /// was revoked before any launch could be given a program.
     Unresolved,
     /// The captured process is verified gone.
     Exited,
@@ -916,7 +914,7 @@ pub fn record_pane_cleanup(
     Ok(outcome)
 }
 
-/// Captures the process a bootstrap claimed, spending its correlation.
+/// Captures the process a launch claim named, spending its correlation.
 ///
 /// Refuses unless the subject is still pending with this correlation, and the
 /// process was started with the requested launch. A cancel that won the race
@@ -1438,7 +1436,7 @@ pub fn resume_launch(launch: &LaunchContext, session: &str) -> Result<LaunchCont
 }
 
 /// The launch a running process was started with, from its verified kernel record.
-/// Radar's own bootstrap and token variables are dropped, since a replacement is
+/// Radar's own launch and token variables are dropped, since a replacement is
 /// given fresh ones.
 pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
     let (executable, argv) = effective
@@ -1890,9 +1888,9 @@ fn record_exit_locked(registry: &Registry, subject: &mut Claim, now_ms: i64) -> 
     Ok(())
 }
 
-/// The command a tracked launch runs: the bootstrap, carrying the target program
-/// and the private correlation. The target's executable, argv, cwd and the
-/// caller's environment overlay are passed through unchanged.
+/// The command a tracked launch runs: `radar run --launch`, which claims the
+/// recorded launch and receives its program from the daemon. The caller's cwd and
+/// environment overlay are passed through, with the private correlation added.
 pub fn wrap(
     bootstrap: &Bootstrap,
     ticket: &Ticket,
@@ -1900,20 +1898,11 @@ pub fn wrap(
 ) -> Result<LaunchRequest, String> {
     let LaunchRequest {
         pane_id,
-        executable,
-        argv,
         spawn_token,
         cwd,
         mut env,
+        ..
     } = target;
-    let mut wrapped = vec![
-        BOOTSTRAP_COMMAND.to_string(),
-        "--socket".to_string(),
-        bootstrap.socket.clone(),
-        "--".to_string(),
-        executable,
-    ];
-    wrapped.extend(argv);
     env.insert(SUBJECT_ENV.to_string(), ticket.claim_id.clone());
     env.insert(CORRELATION_ENV.to_string(), ticket.correlation.clone());
     if let Some(parent_subject_id) = &ticket.parent_subject_id {
@@ -1922,13 +1911,18 @@ pub fn wrap(
             parent_subject_id.clone(),
         );
     }
-    let scope = crate::managed_scope::Scope::for_registration(&ticket.registration_id)
-        .expect("a launch ticket has a canonical registration");
-    let (executable, argv) = scope.wrap(&bootstrap.executable, &wrapped)?;
+    // A launch that could not enter its scope would run nothing, so it is refused
+    // here, before a pane is typed into.
+    crate::managed_scope::Scope::for_registration(&ticket.registration_id)?.wrap("", &[])?;
     Ok(LaunchRequest {
         pane_id,
-        executable,
-        argv,
+        executable: bootstrap.executable.clone(),
+        argv: vec![
+            "run".to_string(),
+            "--launch".to_string(),
+            "--socket".to_string(),
+            bootstrap.socket.clone(),
+        ],
         spawn_token,
         cwd,
         env,
@@ -1991,27 +1985,25 @@ fn parse_server_identity(server: &str) -> Option<ProcessIdentity> {
     })
 }
 
-/// Runs as the bootstrap inside a tracked pane: `--socket <path> -- <program>
-/// [argument...]`.
+/// Runs `radar run --launch --socket <path>` inside a tracked pane: claims the
+/// recorded launch, then becomes its program inside the registration's scope.
 ///
-/// Claims this process with the daemon, then replaces itself with the program.
-/// Returns only on failure, and an unreleased bootstrap never runs the program.
-pub fn run_bootstrap(socket: &str, program: &[String]) -> i32 {
-    if program.is_empty() {
-        eprintln!("radar {BOOTSTRAP_COMMAND}: no program to run");
-        return 2;
-    }
-    if let Err(message) = release(Path::new(socket)) {
-        eprintln!("radar {BOOTSTRAP_COMMAND}: {message}");
-        return 111;
-    }
-    let error = Command::new(&program[0])
-        .args(&program[1..])
-        .env_remove(SUBJECT_ENV)
-        .env_remove(CORRELATION_ENV)
-        .exec();
-    eprintln!("radar {BOOTSTRAP_COMMAND}: could not run the program: {error}");
-    127
+/// Returns only on failure. An unclaimed launch never runs its program.
+pub fn run_launch(socket: &str) -> i32 {
+    let claimed = match claim(Path::new(socket)) {
+        Ok(claimed) => claimed,
+        Err(message) => {
+            eprintln!("radar run: {message}");
+            return 111;
+        }
+    };
+    enter_scope(
+        &claimed.registration_id,
+        &claimed.executable,
+        &claimed.argv,
+        ProcessKind::Agent,
+        true,
+    )
 }
 
 /// Runs `radar run -- COMMAND [ARG...]`: admits the command in this verified
@@ -2062,6 +2054,20 @@ pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
         eprintln!("radar run: the daemon admitted the launch without a registration");
         return 1;
     };
+    enter_scope(registration_id, &program[0], &program[1..], kind, false)
+}
+
+/// Becomes `executable argv` inside the registration's scope, so the group exists
+/// before the program runs and a scope that cannot be created runs nothing. Only
+/// an agent is given its registration: a command's children must never inherit an
+/// identity they could present. A claimed launch also drops its launch variables.
+fn enter_scope(
+    registration_id: &str,
+    executable: &str,
+    argv: &[String],
+    kind: ProcessKind,
+    claimed: bool,
+) -> i32 {
     let scope = match crate::managed_scope::Scope::for_registration(registration_id) {
         Ok(scope) => scope,
         Err(message) => {
@@ -2069,7 +2075,7 @@ pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
             return 1;
         }
     };
-    let (launcher, argv) = match scope.wrap(&program[0], &program[1..]) {
+    let (launcher, argv) = match scope.wrap(executable, argv) {
         Ok(wrapped) => wrapped,
         Err(message) => {
             eprintln!("radar run: {message}");
@@ -2078,8 +2084,9 @@ pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
     };
     let mut launch = Command::new(launcher);
     launch.args(&argv);
-    // Only an agent will present its registration, so only an agent is given it.
-    // A command's children must never inherit an identity they could present.
+    if claimed {
+        launch.env_remove(SUBJECT_ENV).env_remove(CORRELATION_ENV);
+    }
     match kind {
         ProcessKind::Agent => {
             launch.env(crate::runtime::LAUNCH_TOKEN_ENV, registration_id);
@@ -2093,7 +2100,15 @@ pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
     127
 }
 
-fn release(socket: &Path) -> Result<(), String> {
+/// What the daemon answers a claimed launch: the registration to enter a scope
+/// under, and the program from its own record.
+struct Claimed {
+    registration_id: String,
+    executable: String,
+    argv: Vec<String>,
+}
+
+fn claim(socket: &Path) -> Result<Claimed, String> {
     let subject = std::env::var(SUBJECT_ENV).map_err(|_| "no launch subject".to_string())?;
     let correlation =
         std::env::var(CORRELATION_ENV).map_err(|_| "no launch correlation".to_string())?;
@@ -2102,13 +2117,21 @@ fn release(socket: &Path) -> Result<(), String> {
         .ok_or_else(|| "this process has no identity to claim".to_string())?;
     let result = exchange(
         socket,
-        BOOTSTRAP_METHOD,
+        CLAIM_METHOD,
         json!({"subject_id": subject, "correlation": correlation, "process": process}),
     )?;
-    match result.get("released") {
-        Some(Value::Bool(true)) => Ok(()),
-        _ => Err("launch was not released".into()),
-    }
+    let text = |key: &str| {
+        result[key]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "launch was not released".to_string())
+    };
+    Ok(Claimed {
+        registration_id: text("registration_id")?,
+        executable: text("executable")?,
+        argv: serde_json::from_value(result["argv"].clone())
+            .map_err(|_| "launch was not released".to_string())?,
+    })
 }
 
 /// One request on the daemon socket, answered with its result. A refusal is an
@@ -2381,19 +2404,12 @@ mod tests {
         }
     }
 
-    /// The kernel's view of a bootstrap that was started with `launch`.
+    /// The kernel's view of the launch chain a pane was started with.
     fn started_as(launch: &LaunchContext) -> Effective {
-        let mut cmdline = vec![
-            "radar".to_string(),
-            BOOTSTRAP_COMMAND.to_string(),
-            "--socket".to_string(),
-            "/run/radar.sock".to_string(),
-            "--".to_string(),
-            launch.executable.clone(),
-        ];
-        cmdline.extend(launch.argv.iter().cloned());
         Effective {
-            cmdline,
+            cmdline: ["radar", "run", "--launch", "--socket", "/run/radar.sock"]
+                .map(String::from)
+                .to_vec(),
             cwd: None,
             env: launch.env.clone(),
         }
@@ -3831,7 +3847,7 @@ mod resume_recipe_tests {
     }
 
     #[test]
-    fn captured_launch_drops_radar_bootstrap_and_token_variables() {
+    fn captured_launch_drops_radar_launch_and_token_variables() {
         let mut env = BTreeMap::new();
         env.insert(SUBJECT_ENV.to_string(), "s".to_string());
         env.insert(CORRELATION_ENV.to_string(), "c".to_string());

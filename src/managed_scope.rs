@@ -463,11 +463,7 @@ esac
         let (program, argv) = scope.wrap_with(
             "/run/current-system/sw/bin/systemd-run",
             "/private/radar",
-            &[
-                "launch-bootstrap".into(),
-                "--".into(),
-                "literal $HOME\n*".into(),
-            ],
+            &["run".into(), "--".into(), "literal $HOME\n*".into()],
         );
         assert!(
             program.starts_with('/'),
@@ -489,12 +485,7 @@ esac
         }
         assert_eq!(
             &argv[separator + 1..],
-            [
-                "/private/radar",
-                "launch-bootstrap",
-                "--",
-                "literal $HOME\n*"
-            ]
+            ["/private/radar", "run", "--", "literal $HOME\n*"]
         );
         assert!(
             !argv[..separator]

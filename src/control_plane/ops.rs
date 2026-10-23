@@ -357,10 +357,10 @@ pub enum Method {
     /// Registry reads and writes: the daemon's own durable records, answered
     /// whether or not a mux backend is wired.
     Registry,
-    /// The internal claim a tracked launch's bootstrap makes before it runs its
-    /// program. Not a public operation: it is served only to a launch the daemon
+    /// The internal claim a tracked launch's `radar run --launch` makes before it
+    /// is given its program. Not a public operation: it is served only to a launch the daemon
     /// created, through its correlation.
-    Bootstrap,
+    Claim,
     /// Admission of an in-place managed launch into a pane the caller occupies.
     Admit,
     /// The internal notification a launch's pane-death hook sends. It is a hint
@@ -396,7 +396,7 @@ pub fn classify(method: &str) -> Option<Method> {
         "lifecycle.get" | "lifecycle.list" | "lifecycle.reconcile" => Method::Registry,
         "topology.get" | "topology.list" | "topology.reconcile" => Method::Registry,
         "mux.observe" | "mux.process_info" | "mux.output" => Method::Read,
-        "spawn.bootstrap" => Method::Bootstrap,
+        "launch.claim" => Method::Claim,
         "launch.admit" => Method::Admit,
         "lifecycle.wake" => Method::Wake,
         other => Method::Operation(Operation::from_method(other)?),
