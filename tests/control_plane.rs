@@ -14,7 +14,7 @@
 //! run" answerable after a restart.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -2555,7 +2555,50 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        stop_recorded_units(&self.root);
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Stops the scopes and slices a test's daemon recorded on the real user manager,
+/// and clears the failed state a graceful stop leaves. The state directory names
+/// every unit its launches created, so only those are touched.
+fn stop_recorded_units(root: &Path) {
+    const SUFFIX: &str = "-main.scope";
+    let mut units = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Ok(text) = fs::read_to_string(&path) {
+                for (at, _) in text.match_indices(SUFFIX) {
+                    let name = &text[..at];
+                    if let Some(start) = name.len().checked_sub(6 + 32)
+                        && name.is_char_boundary(start)
+                        && let id = &name[start + 6..]
+                        && name[start..].starts_with("radar-")
+                        && id.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        units.insert(format!("radar-{id}.slice"));
+                        units.insert(format!("radar-{id}{SUFFIX}"));
+                    }
+                }
+            }
+        }
+    }
+    if units.is_empty() {
+        return;
+    }
+    for verb in ["stop", "reset-failed"] {
+        let _ = Command::new("systemctl")
+            .args(["--user", verb])
+            .args(&units)
+            .output();
     }
 }
 
@@ -4377,7 +4420,8 @@ fn configure_scope_launcher() {
 }
 
 /// The scope launcher the test daemons are configured with: the real one when
-/// this machine has it, so launches behave as they do in service.
+/// this machine has it, so launches behave as they do in service. Units a test
+/// creates are stopped when its sandbox is dropped.
 fn scope_launcher() -> &'static str {
     static LAUNCHER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LAUNCHER.get_or_init(|| {
@@ -11531,7 +11575,6 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
         out.display()
     );
     let (_, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", script]));
-
     // The program records its own cgroup before anything else: if the group did
     // not exist first, there is no file to read.
     let membership = wait_for_text(&out.join("scope.cgroup"));

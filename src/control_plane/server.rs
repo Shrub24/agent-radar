@@ -6432,18 +6432,11 @@ fn admit_request(
             return Response::refused(&request.id, &Refusal::new(Code::Refused, error));
         }
     };
-    let scope = match process.scope.clone() {
-        Some(scope) => scope,
-        None => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::Internal, "the admitted process has no scope"),
-            );
-        }
-    };
+    // The scope is a pure function of the registration, so the client derives it
+    // rather than receiving a second copy of the naming rule.
     Response::ok(
         &request.id,
-        json!({"registration_id": process.registration_id, "scope": scope}),
+        json!({"registration_id": process.registration_id}),
     )
 }
 
@@ -7382,7 +7375,9 @@ struct WakeParams {
 ///
 /// How long the recovery sweep waits between passes.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
-
+/// How often empty managed scopes are cleaned. Slice accumulation is not
+/// latency-sensitive, and an idle daemon should not pay a manager transaction per pass.
+const SCOPE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 /// Starts the bounded recovery sweep. It re-observes recorded launches on a fixed
 /// interval, so a missed exit notification is recovered without any client, and
 /// it stops with the daemon.
@@ -7416,6 +7411,12 @@ fn spawn_sweeper(
             // And for container observation, so a record set larger than one page
             // is reached over successive passes.
             let mut reconcile_after: Option<String> = None;
+            // Empty scopes are cleaned on their own cadence, not every pass, and
+            // only once a slice has been seen empty twice. The first pass waits a
+            // full interval so a starting daemon does not add manager calls to the
+            // launches already contending for it.
+            let mut next_cleanup = std::time::Instant::now() + SCOPE_CLEANUP_INTERVAL;
+            let mut empty_slices = std::collections::BTreeSet::new();
             while !stopping.load(Ordering::SeqCst) {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -7460,6 +7461,19 @@ fn spawn_sweeper(
                     &mut reconcile_after,
                 ) {
                     tracing::error!(%error, "topology adoption failed");
+                }
+                // A slice stop ends everything inside it, so this only ever stops a
+                // group that holds nothing, and it is what clears slices whose exit
+                // nothing observed.
+                if std::time::Instant::now() >= next_cleanup {
+                    match crate::managed_scope::sweep(Some(&mut empty_slices)) {
+                        Ok(swept) if swept != crate::managed_scope::Swept::default() => {
+                            tracing::info!(?swept, "stopped empty managed scopes");
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::error!(%error, "managed scope cleanup failed"),
+                    }
+                    next_cleanup = std::time::Instant::now() + SCOPE_CLEANUP_INTERVAL;
                 }
                 let deadline = std::time::Instant::now() + SWEEP_INTERVAL;
                 while std::time::Instant::now() < deadline && !stopping.load(Ordering::SeqCst) {

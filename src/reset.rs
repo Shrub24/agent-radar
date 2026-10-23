@@ -242,7 +242,11 @@ fn stop_scopes(registry: &Registry) -> Result<(), String> {
             survivors.join("; ")
         ));
     }
-    Ok(())
+    // The daemon is stopped, so no launch is in flight and every empty slice is dead,
+    // including those whose records an earlier reset already cleared.
+    crate::managed_scope::sweep(None)
+        .map(|_| ())
+        .map_err(|error| format!("managed scope cleanup: {error}"))
 }
 
 fn verify_recorded_scope(process: &ProcessRecord, registration_id: &str) -> Result<(), String> {

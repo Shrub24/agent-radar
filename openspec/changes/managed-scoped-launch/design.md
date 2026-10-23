@@ -88,9 +88,11 @@ Scopes win for interactive Pi: they preserve the pane PTY, environment and cwd, 
 
 **Rejected:** a custom Radar supervisor that waits for the main process. It reproduces what systemd already does, adds a long-lived process per launch, and creates a second result-delivery boundary.
 
-### 2. Run the existing bootstrap inside the scope
+### 2. Enter the scope without a release gate
 
-`radar run` resolves placement and the private recipe, records the launch, then execs `systemd-run --user --scope --expand-environment=no --unit=… --slice=… -- radar launch-bootstrap … -- pi …`. The scope is created before the bootstrap releases, so admission failure leaves an empty scope that disappears, and the application never executes unscoped. No new resident supervisor.
+`radar run` resolves placement and the private recipe, records the launch, then execs `systemd-run --user --scope --expand-environment=no --unit=… --slice=… -- PROGRAM …` directly. The scope is created before the program runs, so admission failure leaves an empty scope that disappears and the application never executes unscoped. No new resident supervisor.
+
+This path has no `launch-bootstrap` release gate, unlike `L`, restart and spawn, and one cannot be added without inventing a capability: `spawn.bootstrap` releases a subject-shaped launch by `subject_id` and `correlation`, a managed command has no subject by design, and an admitted agent has none until it binds. A gate would only guard a cancel that cannot be issued, because `cancel` and `stop` resolve their target through a subject or a spawn edge and an admitted process has neither. The fail-closed properties do not rest on it: the pane must be the caller's verified descendant, the birth identity must verify, and the scope exists before the program runs, so a cancel landing in between leaves a recorded, scoped process rather than a lost one.
 
 Required flags, each driven by a measured constraint:
 
@@ -146,10 +148,15 @@ No conversion of existing process records or executions. Rollout uses `radar res
 
 Create the per-execution slice from the start rather than adding it when the first independent task scope appears: moving later would rename every live group. Record the unit and slice names plus the verified member identity on the registration that already records that process. A separate store would be a second place to keep one fact.
 
+The slice is transient and its lifetime ends with the group. A slice is stopped, and its scope `reset-failed`, only when its cgroup is empty as read from `cgroup.procs`; emptiness is never inferred from a recorded exit. The two differ: a main process can be gone while a descendant keeps the group alive, and a recorded exit then makes the workload look finished while stopping the slice would kill that descendant. Cleanliness follows emptiness, so a stop of a scoped process whose main process is absent must still go through the scope stop and the survivor check rather than settling on the exit alone.
+
+Empty slices are reconciled rather than cleaned only at exit. An exit is recorded only when something observes it: `radar run` installs no pane-death wake, and a command carries no claim, so the recovery sweep's exit observation never applies to it. Slices older than a state reset have no records at all. A sweep on its own cadence, first run one interval after the daemon starts so startup adds no manager calls, therefore stops every `radar-*.slice` whose cgroup is empty and `reset-failed`s dead `radar-*` scopes, paged like the other passes. An empty slice holds no authority, so the sweep is safe, and `radar reset` runs the same sweep rather than stopping slices one by one.
+
 ## Risks / Trade-offs
 
 - **Scope state mistaken for an outcome** → only tmux's typed exit observation reports exit; unit `Result`/`ActiveState` are presentation facts.
 - **`failed` after a graceful stop looks like breakage** → documented as an expected survivor state; repeat stop and clear are normal.
+- **An empty slice outlives its process** → a slice is transient by design but systemd keeps it once the group empties, so leak growth is bounded by a reconcile sweep rather than by cleanup at exit alone.
 - **Unit name collision on retry** → derive the name from the launch's registration id so a lost reply cannot create a second attempt under a fresh name.
 - **Environment expansion corrupting argv** → `--expand-environment=no` plus a test with a literal `$VAR` argument.
 - **Pane PID no longer the workload** → direct argv only; refuse a recipe that would need shell metacharacters.

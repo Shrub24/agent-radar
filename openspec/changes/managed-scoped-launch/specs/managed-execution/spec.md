@@ -68,6 +68,10 @@ Managed scope stop SHALL send the configured termination signal without an autom
 - **WHEN** a managed stop leaves the program running
 - **THEN** Radar reports an unresolved stop with survivors and does not escalate to SIGKILL
 
+#### Scenario: Main process gone while a member lives
+- **WHEN** a stop is issued for a scoped process whose main process has already exited while a descendant keeps the group non-empty
+- **THEN** Radar goes through the scope stop and the survivor check and reports the stop as unresolved with the survivors named, rather than reporting a clean exit from the main process alone
+
 #### Scenario: Failed unit state after a graceful stop
 - **WHEN** the scope enters a failed or timeout state because processes survived
 - **THEN** Radar reports that state as expected and continues to track the workload

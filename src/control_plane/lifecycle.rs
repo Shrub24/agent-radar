@@ -1698,8 +1698,7 @@ fn stage(
     let descriptor = match acquired {
         Ok(Acquired::Process(fd)) => fd,
         Ok(Acquired::Absent | Acquired::Replaced) => {
-            record_exit(registry, subject_id, now_ms)?;
-            return Ok(Stage::Settled(Exit::Exited));
+            return settle_absent(registry, &process, subject_id, now_ms).map(Stage::Settled);
         }
         Err(_) => return Ok(Stage::Settled(Exit::Unresolved)),
     };
@@ -1733,6 +1732,42 @@ fn stage(
         signal,
         scope,
     })
+}
+
+/// Settles a stop whose main process is verifiably gone.
+///
+/// The main process exiting says nothing about the rest of its scope: a backgrounded
+/// child or a daemonised command outlives it. So while the scope is readable its
+/// members are stopped and counted, and the exit is recorded only once none remain.
+/// An unreadable scope is a unit systemd has already unloaded, which holds no
+/// members, so the verified exit of the main process is then the evidence.
+fn settle_absent(
+    registry: &Registry,
+    process: &ProcessRecord,
+    subject_id: &str,
+    now_ms: i64,
+) -> Result<Exit, String> {
+    if let Some(scope) = process
+        .scope
+        .as_ref()
+        .and_then(|scope| scope.verify_unit(&process.registration_id).ok())
+    {
+        let mut left = scope.remaining()?;
+        if !left.is_empty() {
+            if let Err(error) = crate::managed_scope::stop(&[&scope]) {
+                tracing::warn!(%error, unit = %scope.unit, "scope stop failed");
+            }
+            left = scope.remaining()?;
+        }
+        if !left.is_empty() {
+            return Ok(Exit::Unverified(format!(
+                "still running: {}",
+                left.join(", ")
+            )));
+        }
+    }
+    record_exit(registry, subject_id, now_ms)?;
+    Ok(Exit::Exited)
 }
 
 /// The outcome of cancelling several executions under one window.
@@ -1787,7 +1822,11 @@ pub fn cancel_many(
         .filter(|(_, _, signal, _)| *signal)
         .filter_map(|(_, _, _, scope)| scope.as_ref())
         .collect();
-    let _stop = crate::managed_scope::stop(&groups);
+    // Whether each member exited is judged from evidence below, so a failed stop
+    // is reported but never decides the outcome.
+    if let Err(error) = crate::managed_scope::stop(&groups) {
+        tracing::warn!(%error, "scope stop failed");
+    }
     let descriptors: Vec<_> = watching.iter().map(|(_, fd, _, _)| fd).collect();
     let exited = process_control::exited_all_within(
         &descriptors,
@@ -2019,16 +2058,16 @@ pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
             return 1;
         }
     };
-    let (Some(registration_id), Some(scope)) = (
-        answer["registration_id"].as_str(),
-        answer["scope"].as_object(),
-    ) else {
-        eprintln!("radar run: the daemon admitted the launch without an execution");
+    let Some(registration_id) = answer["registration_id"].as_str() else {
+        eprintln!("radar run: the daemon admitted the launch without a registration");
         return 1;
     };
-    let scope = crate::managed_scope::Scope {
-        unit: scope["unit"].as_str().unwrap_or_default().to_string(),
-        slice: scope["slice"].as_str().unwrap_or_default().to_string(),
+    let scope = match crate::managed_scope::Scope::for_registration(registration_id) {
+        Ok(scope) => scope,
+        Err(message) => {
+            eprintln!("radar run: {message}");
+            return 1;
+        }
     };
     let (launcher, argv) = match scope.wrap(&program[0], &program[1..]) {
         Ok(wrapped) => wrapped,

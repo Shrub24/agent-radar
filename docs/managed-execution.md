@@ -23,10 +23,10 @@ as `PI_RADAR_REGISTRATION_ID` so the session can present it, and the agent then
 gets a subject, a claim, a parent edge and fenced controls.
 
 `radar run -- COMMAND` is a managed command. It has a registration and a scope,
-and Radar reports and stops it as a scope member. It has no subject, no claim and
-no session. Nothing is exported to its environment, so a program it starts cannot
-present its identity, and a daemon asked to attach a command's registration
-refuses.
+which `radar reset` stops. It has no subject, no claim and no session, so no read
+reports it and no control reaches it yet; those wait for a consumer. Nothing is exported to its environment, so a
+program it starts cannot present its identity, and a daemon asked to attach a
+command's registration refuses.
 
 ## Starting one
 

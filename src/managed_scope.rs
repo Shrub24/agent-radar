@@ -5,7 +5,7 @@ use crate::{
     model::{ProcessIdentity, SessionUuid},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, fs, path::Path, process::Command};
+use std::{collections::BTreeSet, ffi::OsStr, fs, path::Path, process::Command};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,9 +217,224 @@ impl VerifiedScope {
     }
 }
 
+/// What one cleanup pass did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    /// Slices stopped because nothing was left inside them.
+    pub slices: usize,
+    /// Dead units whose failed state was cleared.
+    pub cleared: usize,
+}
+
+/// The unified hierarchy every scope lives under.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Stops every `radar-*.slice` whose cgroup is empty, then clears dead `radar-*` units.
+///
+/// A slice stop ends everything inside it, so emptiness is read from `cgroup.events`
+/// and never inferred from a recorded exit: a main process can be gone while a
+/// descendant keeps the group alive. An empty slice holds no authority, so this is
+/// safe to run without a record to justify it, which is what lets it clear slices
+/// left by a state reset or by an earlier run whose exit nobody observed.
+///
+/// `seen` carries the slices found empty by the previous pass. A launch creates its
+/// slice before its scope joins it, so a running daemon stops a slice only once it
+/// has been empty on two passes, never on first sight. `None` stops on first sight,
+/// for a caller that knows no launch can be in flight.
+pub fn sweep(seen: Option<&mut BTreeSet<String>>) -> Result<Swept, String> {
+    sweep_in(
+        &crate::service::program("RADAR_SYSTEMCTL", "systemctl"),
+        Path::new(CGROUP_ROOT),
+        seen,
+    )
+}
+
+fn sweep_in(
+    systemctl: &OsStr,
+    cgroup_root: &Path,
+    seen: Option<&mut BTreeSet<String>>,
+) -> Result<Swept, String> {
+    let empty = empty_slices(systemctl, cgroup_root)?;
+    let empty: Vec<String> = match seen {
+        Some(seen) => {
+            let stale = empty.intersection(seen).cloned().collect();
+            *seen = empty;
+            stale
+        }
+        None => empty.into_iter().collect(),
+    };
+    if !empty.is_empty() {
+        transact(systemctl, "stop", &empty)?;
+    }
+    let dead = list_units(systemctl, "radar-*", &["--state=failed"])?;
+    if !dead.is_empty() {
+        transact(systemctl, "reset-failed", &dead)?;
+    }
+    Ok(Swept {
+        slices: empty.len(),
+        cleared: dead.len(),
+    })
+}
+
+fn list_units(systemctl: &OsStr, pattern: &str, extra: &[&str]) -> Result<Vec<String>, String> {
+    let out = Command::new(systemctl)
+        .args([
+            "--user",
+            "list-units",
+            pattern,
+            "--all",
+            "--plain",
+            "--no-legend",
+        ])
+        .args(extra)
+        .output()
+        .map_err(|e| format!("unit listing: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "unit listing: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| unit.starts_with("radar-"))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The `radar-*.slice` units whose groups hold nothing, from one manager call
+/// however many slices exist. An unresolvable or unreadable group reads as populated,
+/// so a stop is never sent on a guess.
+fn empty_slices(systemctl: &OsStr, root: &Path) -> Result<BTreeSet<String>, String> {
+    let slices = list_units(systemctl, "radar-*.slice", &[])?;
+    if slices.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let out = Command::new(systemctl)
+        .args(["--user", "show", "-p", "Id", "-p", "ControlGroup"])
+        .args(&slices)
+        .output()
+        .map_err(|e| format!("scope membership: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "scope membership: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut empty = BTreeSet::new();
+    // One block per unit, separated by a blank line.
+    for block in String::from_utf8_lossy(&out.stdout).split("\n\n") {
+        let field = |name: &str| {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+        };
+        let (Some(id), Some(path)) = (field("Id="), field("ControlGroup=")) else {
+            continue;
+        };
+        if !path.starts_with('/') || path.split('/').any(|part| part == "." || part == "..") {
+            continue;
+        }
+        let events = root
+            .join(path.trim_start_matches('/'))
+            .join("cgroup.events");
+        // `populated` covers descendants, so a nested group with a live process
+        // keeps its slice.
+        if fs::read_to_string(events)
+            .is_ok_and(|text| text.lines().any(|line| line.trim() == "populated 0"))
+        {
+            empty.insert(id.to_owned());
+        }
+    }
+    Ok(empty)
+}
+
+fn transact(systemctl: &OsStr, verb: &str, units: &[String]) -> Result<(), String> {
+    let out = Command::new(systemctl)
+        .args(["--user", verb])
+        .args(units)
+        .output()
+        .map_err(|e| format!("unit {verb}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unit {verb}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_slice_with_nothing_left_in_it_is_stopped() {
+        let dir = std::env::temp_dir().join(format!("radar-sweep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let groups = dir.join("cgroup");
+        for (name, populated) in [("one", "0"), ("two", "1")] {
+            let group = groups.join(format!("radar.slice/radar-{name}.slice"));
+            fs::create_dir_all(&group).unwrap();
+            fs::write(
+                group.join("cgroup.events"),
+                format!("populated {populated}\nfrozen 0\n"),
+            )
+            .unwrap();
+        }
+        let record = dir.join("calls");
+        let systemctl = dir.join("systemctl");
+        fs::write(
+            &systemctl,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{record}'
+case "$*" in
+  *"list-units radar-*.slice"*) printf 'radar-one.slice loaded inactive dead - -\nradar-two.slice loaded active running - -\n' ;;
+  *"--state=failed"*) printf 'radar-dead.scope loaded failed failed - -\n' ;;
+  *show*)
+    printf 'ControlGroup=/radar.slice/radar-one.slice\nId=radar-one.slice\n\nControlGroup=/radar.slice/radar-two.slice\nId=radar-two.slice\n' ;;
+esac
+"#,
+                record = record.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut seen = BTreeSet::new();
+        let first = sweep_in(systemctl.as_os_str(), &groups, Some(&mut seen)).expect("first pass");
+        assert_eq!(
+            first.slices, 0,
+            "an empty slice is not stopped on first sight"
+        );
+        let swept = sweep_in(systemctl.as_os_str(), &groups, Some(&mut seen)).expect("sweep");
+
+        assert_eq!(
+            swept,
+            Swept {
+                slices: 1,
+                cleared: 1
+            }
+        );
+        let calls = fs::read_to_string(&record).unwrap();
+        assert!(calls.contains("--user stop radar-one.slice"), "{calls}");
+        assert!(
+            !calls
+                .lines()
+                .any(|line| line.starts_with("--user stop") && line.contains("radar-two")),
+            "a populated slice must never be stopped: {calls}"
+        );
+        assert!(
+            calls.contains("--user reset-failed radar-dead.scope"),
+            "{calls}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_launcher_that_cannot_be_found_refuses_before_anything_runs() {
