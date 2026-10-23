@@ -81,8 +81,8 @@ Radar SHALL withdraw a managed launch whose reservation has not been replaced by
 - **WHEN** the daemon restarts before a launch presents
 - **THEN** the ceiling still counts from the edge's recorded time and the launch is withdrawn on schedule
 
-#### Scenario: A failed restart or continue
-- **WHEN** a restarted or continued child is withdrawn
+#### Scenario: A withdrawn launch frees its subject
+- **WHEN** a launch is withdrawn
 - **THEN** the subject has no live claim and a later continue is accepted
 
 ### Requirement: A launch outcome is read from the edge
@@ -95,3 +95,14 @@ pi-radar SHALL report a launch, continue or restart as ready once the edge shows
 #### Scenario: The caller aborts its wait
 - **WHEN** the caller aborts while the launch is starting
 - **THEN** the wait ends and the daemon's ceiling still cleans the launch up
+
+### Requirement: A subject has one live claim, reserved or granted
+A reservation SHALL be a claim minted before its process exists. Reserving and granting SHALL pass through one transition that refuses while the subject has any other live claim, reserved or granted; a grant SHALL replace only the reservation naming the presenting process.
+
+#### Scenario: A second reservation
+- **WHEN** a subject holds a reserved or granted claim and another launch tries to reserve it
+- **THEN** the second reservation is refused
+
+#### Scenario: A grant against another's reservation
+- **WHEN** a process presents a session whose subject is reserved for a different process
+- **THEN** the report is refused as a duplicate and the reservation is unchanged
