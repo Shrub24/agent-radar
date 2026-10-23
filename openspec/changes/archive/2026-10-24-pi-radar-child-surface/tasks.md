@@ -14,4 +14,4 @@
 
 - [x] 3.1 Regenerate contracts and update the README. The release ships with `unified-launch` and `pi-radar-child-control` as pi-radar 0.9.0 and Radar 0.4.0 (wire revision 7); 0.8.0 and 0.3.1 were never tagged.
 - [x] 3.2 Rewrite the Herdsman brief section: pin 0.9.0, drop the parent's `registration_id` and the handoff registration match, key children by `subject_id`, and delete `support-radar.ts`. (Items 7 to 13 of the brief, with child control and continue.)
-- [ ] 3.3 Tag `pi-radar-v0.9.0` and `radar-v0.4.0` only after the Herdsman brief is sent and the user agrees.
+- [x] 3.3 Tagged and published `pi-radar-v0.9.0` and `radar-v0.4.0`; superseded by 0.10.0 / 0.5.0 (wire revision 8).
