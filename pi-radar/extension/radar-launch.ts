@@ -8,6 +8,7 @@ import {
 	type RadarSpawnEdge,
 } from "./radar-client.ts";
 import { radarPaneHandle } from "./radar-location.ts";
+import type { RadarPublication } from "./radar-publication.ts";
 
 /** The startup acknowledgement a launch waits for, named by its identity. */
 export type StartupExpectation = {
@@ -64,21 +65,17 @@ export type LaunchMailbox<State extends LaunchState> = {
  * different leaves the launch unresolved rather than placed.
  */
 
-/** The exact managed parent this launch may use, and nothing inferred about it. */
-export type RadarLaunchParent = {
-	registration_id: string;
-	/** Stable subject from this process's current Radar registration. */
-	subject_id: string;
-	location?: RadarLocation;
-};
-
 /** Everything one fresh managed worker is launched with. */
 export type RadarWorkerLaunch = {
 	/** The caller's durable key, persisted before dispatch and never replaced. */
 	request_id: string;
 	/** The nonce the child must repeat in its startup acknowledgment. */
 	generation: string;
-	parent: RadarLaunchParent;
+	/**
+	 * The pane this launch splits. The parent is the calling process itself, read
+	 * from its own publication, and must be registered on exactly this pane.
+	 */
+	pane_id: string;
 	parent_session_id: string;
 	executable: string;
 	argv: string[];
@@ -114,6 +111,8 @@ export type RadarWorkerLaunch = {
 
 export type RadarWorkerLaunched<State = unknown> = {
 	request_id: string;
+	/** The child's durable identity: the key that survives its restart and resume. */
+	subject_id: string;
 	registration_id: string;
 	pane_id: string;
 	/**
@@ -315,6 +314,8 @@ export async function relaunchRefusalForChild(
 
 export type RadarLaunchOptions<State extends LaunchState = LaunchState> = {
 	client: RadarClient;
+	/** This process's own publication, which names the parent of the launch. */
+	publication: Pick<RadarPublication, "subject">;
 	readers: LaunchMailbox<State>;
 	launch: RadarWorkerLaunch;
 	timeoutMs: number;
@@ -392,29 +393,34 @@ export async function launchRadarWorker<State extends LaunchState>(
 	const pollMs = options.pollMs ?? 250;
 	const deadline = Date.now() + options.timeoutMs;
 	const remaining = (): number => Math.max(0, deadline - Date.now());
-	const pane = launch.parent.location?.pane;
-	if (!isUuid(launch.parent.registration_id))
+	const parent = await options.publication.subject();
+	if (parent === undefined || !isUuid(parent.registration_id))
 		return refusedLaunch(
-			"the launch has no exact parent registration to spawn under",
+			"this process has no Radar registration, so a worker cannot be spawned under it",
 		);
-	if (!isUuid(launch.parent.subject_id))
+	if (parent.subject_id === undefined || !isUuid(parent.subject_id))
 		return refusedLaunch(
-			"the launch has no managed Radar subject for its parent",
+			"this process has no managed Radar subject, so a worker cannot be spawned under it",
 		);
 	// A spawn is created under the pane its parent registered, and this port
 	// registers no location it was not given: without one there is nothing to
 	// place the child beside, and a name or session lookup is not a substitute.
+	const pane = parent.location?.pane;
 	if (pane === undefined || pane === "")
 		return refusedLaunch(
-			"this process's Radar registration names no pane, so it cannot be a spawn parent",
+			"this process's Radar registration names no pane, so a worker cannot be placed beside it",
+		);
+	if (pane !== launch.pane_id)
+		return refusedLaunch(
+			`this process's Radar registration places it in pane ${pane}, not in the pane this launch would split`,
 		);
 
 	const spawned = await client.spawn({
 		request_id: launch.request_id,
-		parent: launch.parent.registration_id,
+		parent: parent.registration_id,
 		parent_session_id: launch.parent_session_id,
 		executable: launch.executable,
-		managed: { parent_subject_id: launch.parent.subject_id },
+		managed: { parent_subject_id: parent.subject_id },
 		argv: launch.argv,
 		...(launch.cwd !== "" ? { cwd: launch.cwd } : {}),
 		...(Object.keys(launch.env).length > 0 ? { env: launch.env } : {}),
@@ -475,6 +481,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 			kind: "ready",
 			value: {
 				request_id: launch.request_id,
+				subject_id: bound.subject_id,
 				registration_id: agentId,
 				pane_id: bound.pane_id,
 				bound_process: {
@@ -498,6 +505,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 type BoundChild =
 	| {
 			kind: "bound";
+			subject_id: string;
 			registration_id: string;
 			pane_id: string;
 			source: string;
@@ -577,8 +585,18 @@ async function waitForChild(
 						requestId,
 						`the daemon bound the child ${agentId} without recording the process it registered as`,
 					);
+				// The edge names the agent as well as its process. Without it the child
+				// has no durable key to be returned by, and a registration is never
+				// offered in its place.
+				const subjectId = edge.bound?.subject_id;
+				if (subjectId === undefined || !isUuid(subjectId))
+					return unresolvedLaunch(
+						requestId,
+						`the daemon bound the child ${agentId} without recording its subject`,
+					);
 				return {
 					kind: "bound",
+					subject_id: subjectId,
 					registration_id: agentId,
 					pane_id: pane,
 					source,

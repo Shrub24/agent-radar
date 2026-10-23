@@ -1,19 +1,15 @@
 ## ADDED Requirements
 
-### Requirement: Consumers address a child by its subject id
-pi-radar SHALL address a launched child, in the runtime surface a consumer imports, by the child's subject id and by no registration id, claim id, source or incarnation. It SHALL resolve the child's current registration from the daemon's spawn edge for each operation, so a child that restarted or resumed under the same subject is the same child.
-
-#### Scenario: A restarted child keeps its key
-- **WHEN** a child's process is replaced and the same subject attaches under a new registration
-- **THEN** assign, retire, inspect and observe by the recorded subject id reach the new process
+### Requirement: A launch result names the child by its subject id
+pi-radar SHALL return the launched child's subject id from a ready launch, and SHALL treat a bound edge that carries no subject as unresolved rather than substituting its registration.
 
 #### Scenario: A launch result names the subject
 - **WHEN** a launch completes
-- **THEN** the result carries the child's subject id and no registration id or bound process
+- **THEN** the result carries the child's subject id, taken from the spawn edge
 
-#### Scenario: A child with no subject yet
-- **WHEN** the child's edge is unbound
-- **THEN** the surface reports the child as not yet addressable and does not substitute a registration
+#### Scenario: An edge bound without a subject
+- **WHEN** the daemon binds the edge but records no subject
+- **THEN** the launch is unresolved and names the missing subject
 
 ### Requirement: A launch takes its parent from the caller's own publication
 `launch` SHALL derive the parent from the process's own publication and SHALL NOT accept registration or subject identifiers for the parent from the caller.

@@ -5,15 +5,11 @@ import type { RadarClient } from "./radar-client.ts";
 import { launchRadarWorker } from "./radar-launch.ts";
 import type { RadarWorkerLaunch } from "./radar-launch.ts";
 
-function launch(parentSubject: string): RadarWorkerLaunch {
+function launch(): RadarWorkerLaunch {
 	return {
 		request_id: randomUUID(),
 		generation: randomUUID(),
-		parent: {
-			registration_id: randomUUID(),
-			subject_id: parentSubject,
-			location: { backend: "herdr", pane: "parent-pane" },
-		},
+		pane_id: "parent-pane",
 		parent_session_id: randomUUID(),
 		executable: "/usr/bin/pi",
 		argv: [],
@@ -29,7 +25,17 @@ function launch(parentSubject: string): RadarWorkerLaunch {
 	};
 }
 
-test("worker launch passes the registered parent's stable subject as managed metadata", async () => {
+function publication(subject_id: string | undefined, pane = "parent-pane") {
+	return {
+		subject: async () => ({
+			registration_id: randomUUID(),
+			...(subject_id !== undefined ? { subject_id } : {}),
+			location: { backend: "herdr", pane },
+		}),
+	};
+}
+
+test("worker launch takes its parent from the caller's own publication", async () => {
 	const parentSubject = randomUUID();
 	const requests: Array<{ managed?: { parent_subject_id?: string } }> = [];
 	const client = {
@@ -40,7 +46,8 @@ test("worker launch passes the registered parent's stable subject as managed met
 	} as unknown as RadarClient;
 	const result = await launchRadarWorker({
 		client,
-		launch: launch(parentSubject),
+		publication: publication(parentSubject),
+		launch: launch(),
 		timeoutMs: 100,
 		readers: {
 			readState: () => undefined,
@@ -52,7 +59,7 @@ test("worker launch passes the registered parent's stable subject as managed met
 	assert.equal(requests[0]?.managed?.parent_subject_id, parentSubject);
 });
 
-test("worker launch refuses a missing parent subject before dispatch", async () => {
+test("worker launch refuses a caller with no managed subject before dispatch", async () => {
 	let dispatched = false;
 	const client = {
 		spawn: async () => {
@@ -62,7 +69,8 @@ test("worker launch refuses a missing parent subject before dispatch", async () 
 	} as unknown as RadarClient;
 	const result = await launchRadarWorker({
 		client,
-		launch: launch("not-a-subject-id"),
+		publication: publication(undefined),
+		launch: launch(),
 		timeoutMs: 100,
 		readers: {
 			readState: () => undefined,
