@@ -566,6 +566,33 @@ mod tests {
         );
     }
 
+    /// A contract the bundled SDK gates on must be one the daemon can advertise,
+    /// or the SDK refuses the call as unsupported against its own daemon.
+    #[test]
+    fn every_contract_the_sdk_pins_is_one_the_daemon_advertises() {
+        let sdk = include_str!("../../pi-radar/extension/radar-client.ts");
+        let pinned: Vec<&str> = sdk
+            .lines()
+            .filter(|line| {
+                line.starts_with("export const RADAR_") && line.contains("_CONTRACT = \"")
+            })
+            .filter_map(|line| line.split('"').nth(1))
+            .collect();
+        assert!(!pinned.is_empty(), "the SDK pins no contracts");
+        let known: Vec<&str> = Contract::ALL
+            .iter()
+            .copied()
+            .chain([Contract::TasksList])
+            .map(Contract::as_str)
+            .collect();
+        for name in pinned {
+            assert!(
+                known.contains(&name),
+                "the SDK pins {name}, which no daemon advertises"
+            );
+        }
+    }
+
     #[test]
     fn contracts_have_stable_wire_names_and_unknown_names_are_tolerated() {
         for contract in Contract::ALL.iter().copied().chain([Contract::TasksList]) {

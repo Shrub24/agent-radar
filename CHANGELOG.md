@@ -2,6 +2,10 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## pi-radar 0.10.1
+
+- Fixes `children.list`, `observe`, `inspect` and the assignment follow, which refused as unsupported against a matching daemon: `spawnList` pinned a `spawn.list.v1` contract that no daemon advertises. It now requires `registry.v1`, which serves `spawn.list`. 0.9.0 and 0.10.0 are affected; no daemon change.
+
 ## 0.5.0
 
 - The daemon withdraws a launch that has not presented within 30 seconds: it revokes the claim, stops a captured process through its scope, closes the launch's pane and records `withdrawn` (`at`, `reason`) on the spawn edge. The subject is then free to continue. Applies to `L`, spawn, continue and restart.

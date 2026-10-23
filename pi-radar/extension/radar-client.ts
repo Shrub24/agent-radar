@@ -43,7 +43,6 @@ export const RADAR_MINIMUM_REVISION = 8;
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
 export const RADAR_SPAWN_CONTRACT = "spawn.v1";
-export const RADAR_SPAWN_LIST_CONTRACT = "spawn.list.v1";
 export const RADAR_SPAWN_CLOSE_CONTRACT = "spawn.close.v1";
 export const RADAR_LIFECYCLE_RESTART_CONTRACT = "lifecycle.restart.v1";
 export const RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT = "spawn.launch_context.v1";
@@ -1778,7 +1777,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 			const registrationId = processRegistrationId;
 			if (registrationId === undefined)
 				return { ok: false, code: "refused", message: "spawn.list requires this client's process registration" };
-			return withContract(RADAR_SPAWN_LIST_CONTRACT, async () => {
+			return withRegistry(async () => {
 				const params: SpawnListParamsDeserialize = {
 					registration_id: registrationId,
 					...(request.after !== undefined ? { after: request.after } : {}),
