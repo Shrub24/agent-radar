@@ -1,6 +1,14 @@
+## 0. Continuation and the fresh-launch hole (daemon)
+
+- [x] 0.1 Confirmed from the code: a fresh launch reserves a placeholder subject, and a child that opens a released subject's session is granted the placeholder (decision 5).
+- [ ] 0.2 `spawn.create` `continue_subject_id`: validation, session from the subject record, reservation on the subject; published schema.
+- [ ] 0.3 First presence refuses a placeholder subject a session another subject holds a record for, and refuses a continued child reporting another session.
+- [ ] 0.4 Tests at the owned seams: a continuation binds its edge to the existing subject, and a fresh launch opening an owned session is refused while manual resume still reattaches.
+- [ ] 0.5 Wire revision 7, `RADAR_MINIMUM_REVISION` 7; SDK `launchRadarWorker` gains `continues?: subject_id`.
+
 ## 1. Resolve a subject to its child
 
-- [ ] 1.1 Confirm a launch resuming a session reserves under the session's existing subject; stop and revise decision 2 if not.
+- [x] 1.1 Superseded by 0.1–0.2: a continuation reserves on the existing subject by construction.
 - [ ] 1.2 Decode `bound_at` on the edge; resolve a subject to its current edge and registration per operation, with no cross-restart cache.
 
 ## 2. Subject-addressed control
