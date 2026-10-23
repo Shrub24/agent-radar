@@ -65,12 +65,7 @@ impl Scope {
     }
 
     /// A name alone never establishes an association with a running process.
-    pub fn verify(
-        &self,
-        id: &str,
-        process: &ProcessIdentity,
-        verifier: &dyn ProcessVerifier,
-    ) -> Result<VerifiedScope, String> {
+    pub fn verify_unit(&self, id: &str) -> Result<VerifiedScope, String> {
         if self != &Self::for_registration(id)? {
             return Err("scope does not identify its registration".into());
         }
@@ -98,6 +93,20 @@ impl Scope {
         {
             return Err("managed scope membership is unresolved".into());
         }
+        Ok(VerifiedScope {
+            unit: self.unit.clone(),
+            path,
+        })
+    }
+
+    pub fn verify(
+        &self,
+        id: &str,
+        process: &ProcessIdentity,
+        verifier: &dyn ProcessVerifier,
+    ) -> Result<VerifiedScope, String> {
+        let verified = self.verify_unit(id)?;
+        let path = &verified.path;
         if verifier.inspect(process.pid)?.as_ref() != Some(process) {
             return Err("scope member birth identity changed".into());
         }
@@ -106,7 +115,7 @@ impl Scope {
         if !membership.lines().any(|line| {
             line.strip_prefix("0::").is_some_and(|p| {
                 p == path
-                    || p.strip_prefix(&path)
+                    || p.strip_prefix(path)
                         .is_some_and(|rest| rest.starts_with('/'))
             })
         }) {
@@ -115,10 +124,7 @@ impl Scope {
         if verifier.inspect(process.pid)?.as_ref() != Some(process) {
             return Err("scope member birth identity changed".into());
         }
-        Ok(VerifiedScope {
-            unit: self.unit.clone(),
-            path,
-        })
+        Ok(verified)
     }
 }
 

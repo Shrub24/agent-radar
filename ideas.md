@@ -172,3 +172,12 @@ parent edge or fenced controls), and the pane shell's launch wrapper
 A `pi` started from that shell is its own agent launch under a sibling slice, so
 the "what would be lost" walk collects the shell's scope and every agent scope
 located in the pane.
+
+## Flush stale Radar state
+
+Consider a separate `/radar flush-stale` or TUI reconcile action for selectively
+forgetting records proven dead, distinct from `radar reset`'s full transient
+state reset. Reuse the existing proof rules (fresh readable tmux absence or
+server-generation mismatch; verified process exit; unreadable evidence never
+proves death). Scope and name remain open: a daemon command, a TUI action, or
+both. Do not add a broad `--stale` mode to reset.

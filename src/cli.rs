@@ -58,6 +58,15 @@ pub enum Invocation {
     /// Reconcile unresolved operations, or abandon one.
     #[command(subcommand)]
     Lifecycle(LifecycleAction),
+    /// Reset transient Radar state, managed scopes and its served tmux server.
+    Reset {
+        /// Also forget durable subject identities, relationships and communications.
+        #[arg(long)]
+        hard: bool,
+        /// Apply the reset after displaying its destructive scope.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Print shell completions for this command line.
     Completions {
         /// The shell to generate a completion script for.
@@ -255,6 +264,28 @@ mod tests {
         assert_eq!(socket, "/run/user/1000/agent-radar/control.sock");
         assert_eq!(subject, "6b1f3d0e-0000-4000-8000-000000000000");
         assert_eq!(server, "4242:991122:0f3d");
+    }
+
+    #[test]
+    fn reset_defaults_to_preserving_subjects_and_accepts_hard_confirmation_flags() {
+        let cli = Cli::try_parse_from(["radar", "reset"]).expect("reset parses");
+        assert!(matches!(
+            cli.invocation,
+            Some(Invocation::Reset {
+                hard: false,
+                yes: false
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["radar", "reset", "--hard", "--yes"])
+            .expect("confirmed hard reset parses");
+        assert!(matches!(
+            cli.invocation,
+            Some(Invocation::Reset {
+                hard: true,
+                yes: true
+            })
+        ));
     }
 
     /// `radar server start` names the configured server, so the name is optional.

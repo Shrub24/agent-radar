@@ -22,6 +22,7 @@ pub mod process_icons;
 pub mod procfs;
 pub mod project;
 pub mod registry_observation;
+pub mod reset;
 pub mod runtime;
 pub mod service;
 pub mod snapshot_fetch;

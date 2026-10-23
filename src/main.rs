@@ -54,6 +54,10 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
             code
         }
         Invocation::Lifecycle(action) => run_lifecycle_command(action),
+        Invocation::Reset { hard, yes } => {
+            let server = load_config().daemon.tmux_server;
+            agent_radar::reset::run(&server, hard, yes)
+        }
         Invocation::Completions { shell } => {
             // Rendered first: a reader that stops early (`radar completions fish
             // | head`) closes the pipe, and a half-written script is the reader's

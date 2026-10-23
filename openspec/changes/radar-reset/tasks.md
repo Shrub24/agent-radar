@@ -1,19 +1,20 @@
-## 1. Command
+## 1. Reset contract
 
-- [ ] 1.1 Add `radar reset` with a dry run that lists categories, counts and consequences and changes nothing; verify a test that a dry run leaves the state root byte-identical
-- [ ] 1.2 Refuse while the control socket answers; verify the refusal names the running daemon and changes nothing
-- [ ] 1.3 Move the state root aside atomically on `--yes` and leave the daemon able to start empty; verify the moved root keeps every record and a fresh daemon reports an empty registry
+- [x] 1.1 Add `radar reset` with a preview for default and hard modes; require explicit confirmation and verify an unconfirmed preview leaves state unchanged
+- [x] 1.2 Stop the daemon before reading process state or draining scopes; on refusal, restart it against unchanged state
+- [x] 1.3 Retain durable subject identity, Pi-session association, metadata/parentage and the communications store by default; clear claims and all process/launch/operation/publication/event state; verify a fresh claim reattaches the session to the same subject
+- [x] 1.4 Add `--hard` to remove subjects, relationships and communications too
 
-## 2. Scopes
+## 2. Stop managed processes and reset topology
 
-- [ ] 2.1 List Radar scopes with their members and refuse when any is populated; verify the refusal names them and an unreadable manager refuses rather than counting as none
-- [ ] 2.2 With `--stop-scopes`, stop them through the existing graceful stop and refuse to continue if a process survives; verify no SIGKILL is sent
+- [x] 2.1 After daemon stop, enumerate Radar's active/failed/deactivating scope units, bind each name to its persisted registration record, verify scope ownership, then gracefully stop the set; refuse on unknown units, unverifiable membership or survivors, without SIGKILL
+- [x] 2.2 Stop the daemon, drain scopes from persisted records, selectively clear state, restart only the configured tmux unit, then start the daemon; report each phase
+- [x] 2.3 Make cleanup and service retry idempotent after partial completion; a retry must not restore old state
 
-## 3. Handoffs and purge
+## 3. Documentation
 
-- [ ] 3.1 Add `--keep communications`; verify the handoff store is left in place and everything else is set aside
-- [ ] 3.2 Add `--purge` for previous resets; verify it removes only reset directories
+- [x] 3.1 Document the default preserved/deleted state, hard reset, managed process stop, tmux restart consequence and daemon restart/start behavior in `docs/managed-execution.md` and the README
 
-## 4. Documentation
+## 4. Operator acceptance
 
-- [ ] 4.1 Document what a reset discards, by category, in `docs/managed-execution.md` and the README, replacing the "explicit reset" placeholder; verify the commands run as written
+- [ ] 4.1 Run default and hard reset against the served fleet; verify scope stop, tmux replacement, daemon restart, retained subject/inbox behavior, and that a second tmux server is untouched

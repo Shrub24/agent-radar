@@ -160,6 +160,31 @@ pub fn stop_tmux_server(server: &str) -> Result<String, String> {
         .map_err(|problem| format!("stopping {problem}"))
 }
 
+/// Stops the socket before the daemon so reset cannot race a new client request.
+pub fn stop_for_reset() -> Result<(), String> {
+    unit_action("stop", SOCKET_UNIT).map_err(|problem| format!("stopping {problem}"))?;
+    unit_action("stop", DAEMON_UNIT).map_err(|problem| format!("stopping {problem}"))
+}
+
+/// Starts the daemon service behind its control socket after a reset.
+pub fn start_after_reset() -> Result<(), String> {
+    unit_action("start", SOCKET_UNIT).map_err(|problem| format!("starting {problem}"))?;
+    unit_action("start", DAEMON_UNIT).map_err(|problem| format!("starting {problem}"))
+}
+
+/// Reset is the one operator action that intentionally discards tmux topology;
+/// unlike the ordinary server restart it does not refuse while panes exist.
+pub fn restart_for_reset(server: &str) -> Result<(), String> {
+    let unit = tmux_unit(server);
+    unit_action("restart", &unit).map_err(|problem| format!("restarting {problem}"))?;
+    if !server_answers(server) {
+        return Err(format!(
+            "{unit} restarted but tmux server `{server}` does not answer"
+        ));
+    }
+    Ok(())
+}
+
 /// The gate every server stop and restart passes before it touches the unit: no
 /// pane, live or retained, and no durable operation pending. Nothing is signalled
 /// on refusal. The socket is consulted only while it is listening, since a

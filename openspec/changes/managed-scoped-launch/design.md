@@ -140,7 +140,7 @@ A recovered execution requires the recorded unit name **and** a verified process
 
 ### 8. Reset instead of migration
 
-No conversion of existing subjects or executions. Rollout uses an explicit reset whose scope is agreed separately: it must never be implemented as "stop the tmux server" and must state what durable history, handoffs and inboxes it discards.
+No conversion of existing process records or executions. Rollout uses `radar reset`: by default it clears transient process/claim/history state while retaining durable subject IDs, parent relationships and handoffs/inboxes, then restarts the Radar-served tmux server and daemon. `radar reset --hard` also forgets durable subjects and communications. The reset is specified in `openspec/changes/radar-reset/`.
 
 ### 9. Establish the process slice now; its association belongs to the registration
 

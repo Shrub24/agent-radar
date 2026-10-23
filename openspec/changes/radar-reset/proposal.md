@@ -1,20 +1,21 @@
 ## Why
 
-Radar keeps durable records of registrations, claims, spawn edges, operations, handoffs and events under one state root. When the model changes, or a fleet is left with records no process, pane or scope backs, the operator has no way to start clean: `reconcile` is effect-free, `abandon` ends one obligation, and the only remaining route is deleting directories by hand, which is easy to get wrong and silently loses handoffs. `managed-scoped-launch` also deliberately chose a reset over a migration and left its destructive scope to be agreed. This change defines it.
+Radar needs a supported way to clear transient state left by old models, dead processes and stale tmux topology. Manually deleting directories risks leaving records that refer to one another and durable data that should survive. Reset should create a clean operational slate without erasing the durable agent identities and communication that belong to those agents.
 
 ## What Changes
 
-- Add `radar reset`, an offline command that moves Radar's control state aside, so the daemon starts empty.
-- Make it safe by default: it lists what would be discarded and changes nothing until confirmed, refuses while the daemon answers, and refuses while a managed scope still has members unless the operator asks it to stop them gracefully first.
-- State what is lost, by category, including handoffs and inboxes, and keep the moved state so a reset is reversible until the operator purges it.
-- Never stop, restart or reconfigure the tmux server, and never signal a process outside a Radar scope.
+- Add `radar reset`, which previews the reset and requires confirmation before making changes.
+- By default, purge registrations, claims and attachments, process/scope evidence, launch and lifecycle history, spawn-operation records, ephemeral publications and event state.
+- Preserve durable subject IDs, their Pi-session association, subject-owned metadata and parent/child relationships, plus durable handoffs and inbox contents addressed to those subjects.
+- Orchestrate a complete reset: stop the daemon, gracefully stop verified Radar-managed scopes, clear the selected state, restart Radar's served tmux server, then start the daemon. If a managed process survives graceful stop, refuse before clearing state or restarting tmux.
+- Add `radar reset --hard` to also remove durable subjects, their relationships, handoffs and inboxes.
 
 ## Non-goals
 
-- Reconciling or pruning individual stale records (a `--stale` form) is a later slice; it reuses the delete path's proof of absence and needs its own scenarios.
-- Migrating records between models.
-- Resetting the tmux server, the user's configuration or pi-radar's own stored state.
+- Selectively pruning only records proven stale (`--stale`); reset is the whole transient-state boundary.
+- Migrating old process or lifecycle history.
+- Touching tmux servers Radar does not serve, user configuration, or processes outside Radar-managed scopes except for the normal consequences of restarting Radar's served tmux server.
 
 ## Impact
 
-New spec `state-reset`. Code: the `reset` subcommand, a state-root mover, and the existing scope stop. No wire change.
+New spec `state-reset`. Code: reset orchestrator, selective durable/transient state handling, graceful scope stop, and restart of the Radar-served tmux and daemon services. No wire change.

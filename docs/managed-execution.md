@@ -108,9 +108,19 @@ has already been collected is reported as unknown rather than as a clean exit;
 and closing the pane's PTY can still end an interactive program even while its
 scope exists, so the two facts are reported apart.
 
-## Resetting old state
+## Resetting Radar state
 
-Scopes are new, so processes recorded before this change have none and keep the
-signal path. Enabling the managed path for a fleet that already has recorded
-history is an explicit reset whose destructive scope must be agreed first; it is
-never implemented as stopping the tmux server.
+`radar reset` previews its effects and requires `--yes` to apply them. It stops
+the daemon, gracefully stops verified managed scopes (TERM, two seconds, no
+SIGKILL), clears transient registrations, claims, process records, launch
+history, operations and publications, restarts Radar's served tmux server, then
+starts the daemon. The tmux restart removes its panes and layout; arbitrary pane
+processes receive normal tmux shutdown behavior.
+
+By default, subject IDs, their Pi-session associations, durable subject metadata
+and parent relationships, and subject-addressed handoffs/inboxes survive. Claims
+and process authority are cleared; the next process for a retained session must
+establish a fresh claim. `radar reset --hard` also discards subjects and
+communications. Reset does not
+back up state. If a managed scope survives or cannot be verified, reset refuses
+before clearing state. Run `radar reset` first to inspect counts and consequences.

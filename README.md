@@ -195,7 +195,8 @@ to itself.
 
 This needs a systemd user manager and cgroup v2. Without a manager, a launch
 refuses before the command runs. See [managed execution](docs/managed-execution.md)
-for the full contract and the reset that older recorded history needs.
+for the full contract and `radar reset` for clearing transient state while
+preserving durable subjects and handoffs.
 
 ## Keys
 

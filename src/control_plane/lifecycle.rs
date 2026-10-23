@@ -218,8 +218,9 @@ pub struct SubjectRecord {
     /// The attempt that is current for this subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_claim: Option<String>,
-    /// Last attachment provenance retained when no claim holds authority.
-    pub last_claim: String,
+    /// Last attachment provenance retained when a claim still exists but is not current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_claim: Option<String>,
     pub recorded_at: String,
     pub updated_at: String,
 }
@@ -556,7 +557,7 @@ pub fn create_with_intent(
     )?;
     let mut record = read_subject_record(registry, id)?.ok_or("subject is not recorded")?;
     record.current_claim = Some(subject.claim_id.clone());
-    record.last_claim = subject.claim_id.clone();
+    record.last_claim = Some(subject.claim_id.clone());
     record.updated_at = subject.process.recorded_at.clone();
     write_subject_record(registry, &record)?;
     Ok(Ticket {
@@ -641,13 +642,14 @@ pub fn read_logical(
     let Some(record) = read_subject_record(registry, logical_subject_id)? else {
         return Ok(None);
     };
-    read(
-        registry,
-        record
-            .current_claim
-            .as_deref()
-            .unwrap_or(&record.last_claim),
-    )
+    let Some(claim_id) = record
+        .current_claim
+        .as_deref()
+        .or(record.last_claim.as_deref())
+    else {
+        return Ok(None);
+    };
+    read(registry, claim_id)
 }
 
 /// One agent's durable identity, authority pointer and attachment history.
@@ -671,6 +673,44 @@ pub fn read_subject_record(
     Ok(Some(record))
 }
 
+fn subject_record_for_session(
+    registry: &Registry,
+    session: &str,
+) -> Result<Option<SubjectRecord>, String> {
+    let directory = registry.subjects().join("identity");
+    if !directory.try_exists().map_err(|error| error.to_string())? {
+        return Ok(None);
+    }
+    let mut found = None;
+    for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let subject_id = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid subject record filename")?;
+        let Some(record) = read_subject_record(registry, subject_id)? else {
+            continue;
+        };
+        if record.session.as_deref() != Some(session) {
+            continue;
+        }
+        if found.is_some() {
+            return Err("the session is recorded for more than one subject".into());
+        }
+        found = Some(record);
+    }
+    Ok(found)
+}
+
 /// Records which attempt is current for its subject, and which facts the subject
 /// carries. Called by the attempt writer, so every attempt change maintains it.
 fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
@@ -685,7 +725,7 @@ fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
             managed: claim.managed.clone(),
             session: claim.session.clone(),
             current_claim: Some(claim.claim_id.clone()),
-            last_claim: claim.claim_id.clone(),
+            last_claim: Some(claim.claim_id.clone()),
             recorded_at: claim.process.recorded_at.clone(),
             updated_at: claim.process.recorded_at.clone(),
         },
@@ -695,6 +735,37 @@ fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
     }
     record.updated_at = claim.process.recorded_at.clone();
     write_subject_record(registry, &record)
+}
+
+pub(crate) fn clear_subject_attachments(registry: &Registry) -> Result<(), String> {
+    let directory = registry.subjects().join("identity");
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("subject identity store is not a real directory".into());
+    }
+    for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let subject_id = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid subject record filename")?;
+        let mut record = read_subject_record(registry, subject_id)?
+            .ok_or("subject record disappeared during reset")?;
+        record.current_claim = None;
+        record.last_claim = None;
+        write_subject_record(registry, &record)?;
+    }
+    Ok(())
 }
 
 fn write_subject_record(registry: &Registry, record: &SubjectRecord) -> Result<(), String> {
@@ -1111,7 +1182,13 @@ pub fn enroll_subject(
             _ => break,
         }
     }
-    // A reattachment continues the prior logical subject; a new session starts one.
+    // A reattachment continues the prior logical subject. The subject record is
+    // also sufficient after reset has deliberately removed every prior claim.
+    let retained = if prior.is_none() {
+        subject_record_for_session(registry, session)?
+    } else {
+        None
+    };
     let (logical, managed) = match &prior {
         Some(prior) if prior.identity_unresolved => {
             return Err(
@@ -1128,7 +1205,10 @@ pub fn enroll_subject(
             ),
             prior.managed.clone(),
         ),
-        None => (None, ManagedMetadata::default()),
+        None => match retained {
+            Some(record) => (Some(record.subject_id), record.managed),
+            None => (None, ManagedMetadata::default()),
+        },
     };
     let subject_id = enrollment_id.to_string();
     let logical = logical.unwrap_or_else(|| subject_id.clone());
@@ -1158,7 +1238,7 @@ pub fn enroll_subject(
         .ok_or("claim has no subject")?;
     let mut record = read_subject_record(registry, logical_id)?.ok_or("subject is not recorded")?;
     record.current_claim = Some(subject.claim_id.clone());
-    record.last_claim = subject.claim_id.clone();
+    record.last_claim = Some(subject.claim_id.clone());
     write_subject_record(registry, &record)?;
     Ok(subject_id)
 }
@@ -1195,7 +1275,7 @@ pub fn cancel_reservation(
     previous.process.recorded_at = format_millis(now_ms);
     write(registry, &previous)?;
     record.current_claim = Some(predecessor.into());
-    record.last_claim = predecessor.into();
+    record.last_claim = Some(predecessor.into());
     record.updated_at = format_millis(now_ms);
     write_subject_record(registry, &record)
 }
@@ -2380,6 +2460,56 @@ mod tests {
         let listed = list_logical_after(&registry, None, 10).expect("logical list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].claim_id, second.claim_id);
+    }
+
+    #[test]
+    fn a_new_claim_after_reset_reuses_the_subject_for_its_session() {
+        let scratch = Scratch::new("reset-session-reattach");
+        let registry = scratch.registry();
+        let subject_id = "00000000-0000-4000-8000-000000000101";
+        let parent_id = "00000000-0000-4000-8000-000000000102";
+        let session = random_uuid();
+        write_subject_record(
+            &registry,
+            &SubjectRecord {
+                version: SUBJECT_VERSION,
+                subject_id: subject_id.into(),
+                managed: ManagedMetadata {
+                    parent_subject_id: Some(parent_id.into()),
+                    ..ManagedMetadata::default()
+                },
+                session: Some(session.clone()),
+                current_claim: None,
+                last_claim: None,
+                recorded_at: format_millis(1),
+                updated_at: format_millis(1),
+            },
+        )
+        .expect("retained subject record");
+
+        let claim_id = random_uuid();
+        let registration_id = random_uuid();
+        let process = ProcessIdentity {
+            boot_id: "test-boot".into(),
+            pid: 1,
+            start_ticks: 1,
+        };
+        enroll_subject(
+            &registry,
+            &claim_id,
+            &registration_id,
+            &process,
+            &session,
+            launch(),
+            2,
+        )
+        .expect("fresh attachment");
+
+        let claim = read(&registry, &claim_id)
+            .expect("read claim")
+            .expect("new claim");
+        assert_eq!(claim.subject_id.as_deref(), Some(subject_id));
+        assert_eq!(claim.managed.parent_subject_id.as_deref(), Some(parent_id));
     }
 
     #[test]
