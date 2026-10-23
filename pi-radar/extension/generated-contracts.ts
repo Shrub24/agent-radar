@@ -911,7 +911,6 @@ export interface ManagedSubject {
   session: string | null;
   state: State;
   subject_id: string;
-  successor: string | null;
 }
 /**
  * Exact spawn-edge child identity required by `spawn.close`.
@@ -1323,7 +1322,6 @@ export interface LifecycleObservation {
   session: string | null;
   state: State;
   subject_id: string;
-  successor: string | null;
 }
 /**
  * A runtime pane: location plus optional display text.
@@ -1452,6 +1450,7 @@ export interface SpawnListPageSerializePublicSpawnTopology {
    * nothing to verify.
    */
   freshness?: SpawnListPageSerializeFreshness | null;
+  granted_at?: string | null;
   launched: SpawnListPageSerializeRequestOutcome;
   location?: SpawnListPageSerializeRegistryLocation | null;
   parent: string;
@@ -1461,6 +1460,7 @@ export interface SpawnListPageSerializePublicSpawnTopology {
   request_id: string;
   state: SpawnListPageSerializeSpawnState;
   version: number;
+  withdrawn?: SpawnListPageSerializeWithdrawn | null;
 }
 /**
  * The child a token bound: the registering incarnation's own registry identity.
@@ -1496,4 +1496,12 @@ export interface SpawnListPageSerializeRegistryLocation {
   pane?: string | null;
   tab?: string | null;
   workspace?: string | null;
+}
+/**
+ * Why and when a launch ended without ever presenting, so a reader never infers
+ * failure from absence.
+ */
+export interface SpawnListPageSerializeWithdrawn {
+  at: string;
+  reason: string;
 }

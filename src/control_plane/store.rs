@@ -223,6 +223,9 @@ pub struct RequestRecord {
     /// would have to parse is not an answer it can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<CreatedIdentity>,
+    /// The replacement edge a restart dispatched, retained for same-ID replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
     /// Set when an operator abandoned this record's recovery obligation. The
@@ -260,6 +263,7 @@ impl RequestRecord {
             message: None,
             effects: Vec::new(),
             created: None,
+            launch_request_id: None,
             completed_at: None,
             abandoned_at: None,
         }

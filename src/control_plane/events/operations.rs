@@ -168,6 +168,7 @@ pub fn apply(projection: &RequestRecord, seed: &mut RequestRecord) -> Result<(),
     seed.message = projection.message.clone();
     seed.effects = projection.effects.clone();
     seed.created = projection.created.clone();
+    seed.launch_request_id = projection.launch_request_id.clone();
     seed.completed_at = projection.completed_at.clone();
     Ok(())
 }

@@ -437,7 +437,7 @@ pub use publication::{
 pub use spawn::{
     BoundChild, LocationEvidence, MAX_SPAWN_BYTES, PublicSpawnEdge, PublicSpawnExitObservation,
     PublicSpawnTopology, SPAWN_VERSION, SpawnBindRequest, SpawnEdge, SpawnExitObservation,
-    SpawnRequest, SpawnState,
+    SpawnRequest, SpawnState, Withdrawn,
 };
 
 impl Registry {
@@ -657,6 +657,19 @@ impl Registry {
         now_ms: i64,
     ) -> Result<SpawnEdge, String> {
         spawn::record_exit_observation(self, request_id, code, signal, now_ms)
+    }
+
+    pub fn record_spawn_granted(&self, request_id: &str, now_ms: i64) -> Result<(), String> {
+        spawn::record_granted(self, request_id, now_ms)
+    }
+
+    pub fn record_spawn_withdrawn(
+        &self,
+        request_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<SpawnEdge, String> {
+        spawn::record_withdrawn(self, request_id, reason, now_ms)
     }
 
     /// Records the launch subject a tracked spawn's edge belongs to.

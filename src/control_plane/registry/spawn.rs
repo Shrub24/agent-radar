@@ -163,6 +163,11 @@ pub struct SpawnEdge {
     /// Pane disappearance alone never creates this fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<SpawnExitObservation>,
+    /// Set when the daemon withdrew this launch before its process presented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn: Option<Withdrawn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<String>,
     pub recorded_at: String,
 }
 
@@ -183,6 +188,8 @@ impl SpawnEdge {
             created: self.created,
             launched: self.launched,
             bound: self.bound.clone(),
+            withdrawn: self.withdrawn.clone(),
+            granted_at: self.granted_at.clone(),
             exit_observation: if self.version == LEGACY_SPAWN_VERSION {
                 None
             } else {
@@ -260,7 +267,20 @@ pub struct PublicSpawnEdge {
     pub bound: Option<BoundChild>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_observation: Option<PublicSpawnExitObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn: Option<Withdrawn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<String>,
     pub recorded_at: String,
+}
+
+/// Why and when a launch ended without ever presenting, so a reader never infers
+/// failure from absence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Withdrawn {
+    pub at: String,
+    pub reason: String,
 }
 
 /// The state of one edge in the recorded topology: the strongest statement a
@@ -367,6 +387,8 @@ pub fn record(
         launched: RequestOutcome::Unknown,
         bound: None,
         exit: None,
+        withdrawn: None,
+        granted_at: None,
         recorded_at: format_millis(now_ms),
     };
     write_edge(registry, &edge)?;
@@ -486,6 +508,46 @@ pub fn record_exit_observation(
     };
     write_edge(registry, &edge)?;
     registry.append_event("spawn.exited", None, None, Some(request_id));
+    Ok(edge)
+}
+
+pub fn record_granted(registry: &Registry, request_id: &str, now_ms: i64) -> Result<(), String> {
+    let _transition = registry.transition();
+    let mut edge = stored_edge(registry, request_id)?;
+    if edge.withdrawn.is_some() {
+        return Err("the launch was withdrawn".into());
+    }
+    if edge.granted_at.is_none() {
+        edge.granted_at = Some(format_millis(now_ms));
+        write_edge(registry, &edge)?;
+        registry.append_event("spawn.granted", None, None, Some(request_id));
+    }
+    Ok(())
+}
+
+/// Records that the daemon withdrew a launch whose process never presented. The
+/// first withdrawal stands.
+pub fn record_withdrawn(
+    registry: &Registry,
+    request_id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> Result<SpawnEdge, String> {
+    canonical_uuid("request_id", request_id)?;
+    let _transition = registry.transition();
+    let stored = stored_edge(registry, request_id)?;
+    if stored.withdrawn.is_some() {
+        return Ok(stored);
+    }
+    let edge = SpawnEdge {
+        withdrawn: Some(Withdrawn {
+            at: format_millis(now_ms),
+            reason: reason.into(),
+        }),
+        ..stored
+    };
+    write_edge(registry, &edge)?;
+    registry.append_event("spawn.withdrawn", None, None, Some(request_id));
     Ok(edge)
 }
 

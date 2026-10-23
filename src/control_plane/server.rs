@@ -1896,7 +1896,8 @@ fn cleanup_unbound_pane(
             "this backend cannot report whether the pane's command has exited".into(),
         ));
     }
-    let exited = subject.process.exited_at.is_some()
+    let exited = subject.process.identity.is_none()
+        || subject.process.exited_at.is_some()
         || (edge.exit.is_some()
             && matches!(
                 bounded_exit_observation(backend, &pane, stopping, budget),
@@ -2480,6 +2481,9 @@ fn presence_request(
         claim.subject_id = Some(subject_id);
         claim.standing = Standing::Granted;
         presence::save(&registry, &claim)?;
+        if subject.process.origin == subjects::Origin::Spawned {
+            registry.record_spawn_granted(&subject.process.spawn_request_id, now)?;
+        }
         Ok(claim)
     })();
     match result {
@@ -7096,7 +7100,7 @@ fn execute_restart(
         }
         Admission::Dispatch(_, cancel) => cancel,
     };
-    let record = RequestRecord::new(
+    let mut record = RequestRecord::new(
         &request.id,
         ops::Operation::Restart.as_str(),
         requester,
@@ -7104,6 +7108,8 @@ fn execute_restart(
         now,
     )
     .with_params(request.params.clone());
+    let launch_request_id = store::random_uuid();
+    record.launch_request_id = Some(launch_request_id.clone());
     let (outcome, category, message, effects) = restart_lead(
         core,
         &subject,
@@ -7111,9 +7117,9 @@ fn execute_restart(
         &anchor,
         &cancel,
         verification,
-        now,
+        &launch_request_id,
     );
-    write_settled(
+    write_settled_with(
         request,
         record.complete(
             outcome,
@@ -7122,6 +7128,7 @@ fn execute_restart(
             effects,
             store::now_ms(),
         ),
+        json!({}),
         core,
     )
 }
@@ -7135,8 +7142,9 @@ fn restart_lead(
     anchor: &str,
     cancel: &AtomicBool,
     verification: &Arc<VerificationBudget>,
-    now: i64,
+    successor: &str,
 ) -> Settlement {
+    let now = store::now_ms();
     let (registry, backend, verifier) = {
         let core = locked(core);
         (
@@ -7160,11 +7168,6 @@ fn restart_lead(
     ) else {
         return refusal_settlement("the subject has no session to resume; enroll it first");
     };
-    if let Some(successor) = &subject.process.successor {
-        return refusal_settlement(format!(
-            "this process is already superseded by spawn {successor}"
-        ));
-    }
     match backend.inventory(cancel) {
         Ok(fleet)
             if fleet
@@ -7220,9 +7223,8 @@ fn restart_lead(
     if let Err(refusal) = preflight_launch(core, &params) {
         return refusal_settlement(refusal.message);
     }
-    let successor = store::random_uuid();
     let intent = registry::SpawnRequest {
-        request_id: successor.clone(),
+        request_id: successor.to_string(),
         parent: params.parent.clone(),
         parent_session_id: params.parent_session_id.clone(),
         parent_subject_id: params.managed.parent_subject_id.clone(),
@@ -7239,7 +7241,7 @@ fn restart_lead(
     );
     let prepared = match track_launch(
         core,
-        &successor,
+        successor,
         requested_launch(&params),
         Some(session.into()),
         Some(identity.clone()),
@@ -7304,7 +7306,7 @@ fn restart_lead(
     }
     effects.push(format!("successor {successor}"));
     let replacement = Request {
-        id: successor.clone(),
+        id: successor.to_string(),
         method: ops::Operation::Spawn.as_str().to_string(),
         params: serde_json::json!({
             "parent": params.parent,
@@ -7329,7 +7331,7 @@ fn restart_lead(
             in_place: true,
         },
     );
-    match registry.spawn_edge(&successor) {
+    match registry.spawn_edge(successor) {
         Ok(Some(edge)) => match edge.launched {
             RequestOutcome::Completed => {
                 effects.push("launched replacement".to_string());
@@ -7579,6 +7581,7 @@ fn spawn_sweeper(
                     serving.as_ref(),
                     &mut pane_cursor,
                     now,
+                    &mut |edge| withdraw_unpresented(&core, &verification, edge, now),
                 ) {
                     tracing::error!(%error, "launch pane observation failed");
                 }
@@ -7613,6 +7616,49 @@ fn spawn_sweeper(
             }
         })
         .ok()
+}
+
+/// Withdraws a launch that never presented, then closes the pane it left behind.
+fn withdraw_unpresented(
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+    edge: &registry::SpawnEdge,
+    now_ms: i64,
+) {
+    let (registry, verifier, backend, stopping) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            Arc::clone(&core.verifier),
+            core.backend.clone(),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let cleanup = |claim_id: &str| {
+        if edge.location.is_none() {
+            return Ok(edge.created == RequestOutcome::Refused);
+        }
+        let Some(backend) = &backend else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            cleanup_unbound_pane(
+                &registry,
+                backend,
+                &verifier,
+                claim_id,
+                &stopping,
+                verification,
+                now_ms,
+            ),
+            Some(subjects::PaneCleanup::Cleaned)
+        ))
+    };
+    if let Err(error) =
+        subjects::withdraw_unpresented(&registry, edge, verifier.as_ref(), now_ms, cleanup)
+    {
+        tracing::warn!(%error, request = %edge.request_id, "launch withdrawal failed");
+    }
 }
 
 /// How many recorded spawn edges one pane-evidence pass may examine.
@@ -7668,6 +7714,7 @@ fn observe_launch_panes(
     serving: Option<&crate::model::ProcessIdentity>,
     cursor: &mut Option<String>,
     now_ms: i64,
+    unbound: &mut dyn FnMut(&registry::SpawnEdge),
 ) -> Result<usize, String> {
     let edges = registry.spawn_edges_after(cursor.as_deref(), MAX_PANE_OBSERVATIONS)?;
     *cursor = match edges.len() {
@@ -7679,7 +7726,10 @@ fn observe_launch_panes(
     for edge in edges {
         // Only a bound launch's pane is evidence about a process: an unbound edge
         // may never have released a program, and its absence says nothing.
-        if edge.bound.is_none() {
+        if edge.granted_at.is_none() {
+            unbound(&edge);
+        }
+        if edge.bound.is_none() || edge.withdrawn.is_some() {
             continue;
         }
         let Some(subject_id) = edge.claim_id.as_deref() else {

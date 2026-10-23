@@ -259,10 +259,6 @@ pub struct ProcessRecord {
     pub kind: ProcessKind,
     pub state: State,
     pub launch: LaunchContext,
-    /// The replacement spawn dispatched for this process generation, recorded
-    /// before its dispatch so a second replacement is never launched.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub successor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation: Option<String>,
     /// The captured birth identity of the launched process.
@@ -430,7 +426,6 @@ fn draft_process(
         exited_at: None,
         pane_cleanup: None,
         recorded_at: format_millis(now_ms),
-        successor: None,
     }
 }
 
@@ -584,12 +579,6 @@ pub fn create_with_intent(
             != Some(expected.as_str())
         {
             return Err("the subject's current claim changed; no launch was reserved".into());
-        }
-        let mut previous = read_recorded(registry, expected)?;
-        if previous.process.successor.is_none() {
-            previous.process.successor = Some(spawn_request_id.into());
-            previous.process.recorded_at = format_millis(now_ms);
-            write(registry, &previous)?;
         }
     }
     let subject = draft(spawn_request_id, launch, session, identity, managed, now_ms);
@@ -1093,11 +1082,34 @@ pub fn record_launch_session(
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
         if let Some(found) = page.iter().find(|subject| {
             subject.process.bound_registration_id.as_deref() == Some(registration_id)
-                && subject.session.is_none()
                 && subject.process.state == State::Bound
                 && subject.process.exited_at.is_none()
                 && subject.process.ended_externally_at.is_none()
         }) {
+            if found.process.origin != Origin::Spawned
+                || registry
+                    .spawn_edge(&found.process.spawn_request_id)?
+                    .is_some_and(|edge| edge.granted_at.is_some())
+            {
+                return Ok(());
+            }
+            if found
+                .session
+                .as_deref()
+                .is_some_and(|expected| expected != session)
+            {
+                return Err("the reported session does not match the continued subject".into());
+            }
+            if subject_record_for_session(registry, session)?.is_some_and(|record| {
+                Some(record.subject_id.as_str()) != found.subject_id.as_deref()
+            }) {
+                return Err(
+                    "this session belongs to an existing subject; continue it explicitly".into(),
+                );
+            }
+            if found.session.is_some() {
+                return Ok(());
+            }
             if !matches!(
                 attachment(registry, registration_id, session, now_ms)?,
                 Attachment::Other(_)
@@ -1285,42 +1297,90 @@ pub fn cancel_reservation(
     if record.current_claim.as_deref() != Some(pending) {
         return Err("the subject's claim changed while stopping its previous process".into());
     }
-    let mut previous = read_recorded(registry, predecessor)?;
-    if previous.process.successor.as_deref() != Some(next.process.spawn_request_id.as_str()) {
-        return Err("successor reservation does not match its predecessor".into());
-    }
     next.process.state = State::Revoked;
     next.process.correlation = None;
     next.process.recorded_at = format_millis(now_ms);
     write(registry, &next)?;
-    previous.process.successor = None;
-    previous.process.recorded_at = format_millis(now_ms);
-    write(registry, &previous)?;
     record.current_claim = Some(predecessor.into());
     record.last_claim = Some(predecessor.into());
     record.updated_at = format_millis(now_ms);
     write_subject_record(registry, &record)
 }
 
-/// Records the replacement dispatched for this process generation, before the
-/// dispatch. A generation that already has a successor refuses, so no second
-/// replacement can be launched for it.
-pub fn set_successor(
+/// How long a launch has to present before it is withdrawn. A constant until
+/// someone needs to tighten it; it counts from the edge's own recorded time, which
+/// a restart of the daemon does not move.
+const LAUNCH_DEADLINE_MS: i64 = 30_000;
+
+/// Withdraws a launch whose process never presented: revokes its claim, stops
+/// what was captured and marks its edge, so a reader sees an outcome instead of an
+/// absence. A launch someone already revoked is finished the same way. The edge is
+/// marked only once the process is verifiably gone, so the next pass retries a
+/// stop that did not settle. Returns the claim when the edge was marked, for the
+/// caller to close the pane the launch left.
+pub fn withdraw_unpresented(
     registry: &Registry,
-    subject_id: &str,
-    successor: &str,
+    edge: &crate::control_plane::registry::SpawnEdge,
+    verifier: &dyn ProcessVerifier,
     now_ms: i64,
-) -> Result<(), String> {
-    let _transition = registry.transition();
-    let mut subject = read_recorded(registry, subject_id)?;
-    if let Some(existing) = &subject.process.successor {
-        return Err(format!(
-            "this process is already superseded by spawn {existing}"
-        ));
+    mut cleanup: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<Option<String>, String> {
+    // Presence takes this same lock through grant. A stale sweep page must never
+    // revoke a launch that granted while the page was being read.
+    let _presence = registry.presence.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(edge) = registry.spawn_edge(&edge.request_id)? else {
+        return Ok(None);
+    };
+    let Some(claim_id) = edge.claim_id.as_deref() else {
+        return Ok(None);
+    };
+    if edge.granted_at.is_some() || edge.withdrawn.is_some() {
+        return Ok(None);
+    };
+    let Some(claim) = read(registry, claim_id)? else {
+        return Ok(None);
+    };
+    if crate::control_plane::registry::presence::attachment(
+        registry,
+        &claim.process.registration_id,
+    )?
+    .is_some()
+    {
+        registry.record_spawn_granted(&edge.request_id, now_ms)?;
+        return Ok(None);
     }
-    subject.process.successor = Some(successor.to_string());
-    subject.process.recorded_at = format_millis(now_ms);
-    write(registry, &subject)
+    let overdue = crate::control::timestamp_millis(&edge.recorded_at)
+        .is_some_and(|recorded| now_ms - recorded >= LAUNCH_DEADLINE_MS);
+    let reason = match claim.process.state {
+        State::Revoked if !overdue => "the launch was cancelled before it presented",
+        State::Revoked | State::Pending | State::Captured | State::Bound if overdue => {
+            "the launch did not present within 30 seconds"
+        }
+        _ => return Ok(None),
+    };
+    {
+        let _transition = registry.transition();
+        let mut claim = read_recorded(registry, claim_id)?;
+        claim.process.state = State::Revoked;
+        claim.process.correlation = None;
+        claim.process.recorded_at = format_millis(now_ms);
+        write(registry, &claim)?;
+    }
+    // A revoked launch captures nothing afterwards, so one with no identity has
+    // no process to stop.
+    let stopped = match cancel(registry, claim_id, verifier, now_ms)?.exit {
+        Exit::Exited => true,
+        Exit::Unresolved => {
+            read(registry, claim_id)?.is_some_and(|claim| claim.process.identity.is_none())
+        }
+        Exit::Unverified(_) => false,
+    };
+    if !stopped || !cleanup(claim_id)? {
+        return Ok(None);
+    }
+    release_attachment(registry, claim_id, claim.subject_id.as_deref())?;
+    registry.record_spawn_withdrawn(&edge.request_id, reason, now_ms)?;
+    Ok(Some(claim_id.to_string()))
 }
 
 /// Pi's value-taking flags that a restart keeps, from `pi --help`. Any other flag
@@ -1473,7 +1533,6 @@ pub fn public_view(subject: &Claim) -> Value {
         "recorded_at": subject.process.recorded_at,
         "origin": subject.process.origin,
         "session": subject.session,
-        "successor": subject.process.successor,
     })
 }
 
@@ -2248,22 +2307,6 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
         )
     } else if previous.execution.signalled_at != target.execution.signalled_at {
         (Source::ProcessControl, Transition::SignalRequested)
-    } else if previous.execution.successor != target.execution.successor {
-        (
-            Source::Operator,
-            match &target.execution.successor {
-                Some(id) => Transition::SuccessorReserved {
-                    spawn_request_id: id.clone(),
-                },
-                None => Transition::SuccessorCancelled {
-                    spawn_request_id: previous
-                        .execution
-                        .successor
-                        .clone()
-                        .ok_or("missing successor")?,
-                },
-            },
-        )
     } else if previous.execution.ended_externally_at != target.execution.ended_externally_at {
         (
             Source::ProcessObservation,
@@ -2510,8 +2553,8 @@ mod tests {
     }
 
     #[test]
-    fn a_reservation_excludes_a_second_reservation_and_another_process_grant() {
-        let scratch = Scratch::new("one-live-claim");
+    fn a_reserved_session_is_held_by_its_own_process_and_by_no_other() {
+        let scratch = Scratch::new("reserved-holder");
         let registry = scratch.registry();
         let session = random_uuid();
         let first = create_with_intent(
@@ -2524,7 +2567,6 @@ mod tests {
             1,
         )
         .expect("reservation");
-        // The session is held by the reservation's own process, not by another.
         assert!(matches!(
             attachment(&registry, &first.registration_id, &session, 2).expect("own"),
             Attachment::Own(_)
@@ -2533,30 +2575,6 @@ mod tests {
             attachment(&registry, &random_uuid(), &session, 2).expect("other"),
             Attachment::Other(_)
         ));
-        let named = Some((first.claim_id.clone(), first.claim_id.clone()));
-        create_with_intent(
-            &registry,
-            &random_uuid(),
-            launch(),
-            None,
-            named.clone(),
-            ManagedMetadata::default(),
-            3,
-        )
-        .expect("the named predecessor is replaced once");
-        assert!(
-            create_with_intent(
-                &registry,
-                &random_uuid(),
-                launch(),
-                None,
-                named,
-                ManagedMetadata::default(),
-                4,
-            )
-            .is_err(),
-            "a second reservation for the same predecessor is refused"
-        );
     }
 
     #[test]
@@ -2744,18 +2762,12 @@ mod tests {
         let registry = scratch.registry();
         let claim = create(&registry, SPAWN, launch(), None, 1).expect("claim");
         let subject_id = claim.claim_id.clone();
-        let successor = random_uuid();
-        set_successor(&registry, &claim.claim_id, &successor, 2).expect("reserve successor");
 
         // The attempt's facts survive a daemon restart on the attempt itself.
         let reopened = scratch.registry();
         let read_back = read(&reopened, &claim.claim_id)
             .expect("read")
             .expect("claim");
-        assert_eq!(
-            read_back.process.successor.as_deref(),
-            Some(successor.as_str())
-        );
         assert_eq!(read_back.process.registration_id, claim.registration_id);
         assert_ne!(claim.registration_id, claim.claim_id);
         let reserved =
@@ -2842,7 +2854,6 @@ mod tests {
         let reopened = scratch.registry();
         let current = read_logical(&reopened, &first.subject_id).unwrap().unwrap();
         assert_eq!(current.claim_id, first.claim_id);
-        assert_eq!(current.process.successor, None);
         assert_eq!(
             read(&reopened, &pending.claim_id)
                 .unwrap()
@@ -2923,9 +2934,29 @@ mod tests {
             4,
         )
         .expect("the captured identity binds");
+        let prior_session = random_uuid();
+        let prior = create(
+            &reopened,
+            &random_uuid(),
+            launch(),
+            Some(prior_session.clone()),
+            3,
+        )
+        .expect("an existing subject");
+        release_attachment(&reopened, &prior.claim_id, Some(&prior.subject_id)).unwrap();
+        assert!(
+            record_launch_session(&reopened, &ticket.registration_id, &prior_session, 4)
+                .expect_err("a fresh launch cannot adopt an existing subject's session")
+                .contains("continue it explicitly")
+        );
         let session = random_uuid();
         record_launch_session(&reopened, &ticket.registration_id, &session, 4)
             .expect("record session");
+        assert!(
+            record_launch_session(&reopened, &ticket.registration_id, &random_uuid(), 4)
+                .expect_err("first presence must match the recorded session")
+                .contains("does not match")
+        );
         crate::control_plane::registry::presence::begin(
             &reopened,
             &ticket.registration_id,

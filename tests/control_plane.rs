@@ -2823,7 +2823,7 @@ fn observation_reads_are_revisioned_and_never_append_to_the_journal() {
         "expected not_modified, got {same}"
     );
 
-    // A revision from another process is not this daemon's revision 7.
+    // A revision from another process is not this daemon's revision 8.
     let other = client.call(
         "observation.get",
         json!({"epoch": "11111111-1111-4111-8111-111111111111", "since_revision": revision}),
@@ -3125,19 +3125,15 @@ fn a_caller_without_a_claim_reads_no_launches_and_names_nothing_else() {
     assert_eq!(request_ids(&page), vec![FIRST_EDGE]);
 }
 
-#[test]
-fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() {
-    use agent_radar::control_plane::registry::{Registry, SpawnRequest};
-
-    let sandbox = Sandbox::new("spawn-subject-filter");
-    let registry = Registry::open(&sandbox.state()).expect("a registry");
-    let mine = "3f8c1d20-1111-4a2b-8c4d-000000000001";
-    let other = "3f8c1d20-2222-4a2b-8c4d-000000000002";
-    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+/// A registered parent with a fresh published session, so edges can name it.
+fn registry_parent(
+    registry: &agent_radar::control_plane::registry::Registry,
+    session: &str,
+) -> agent_radar::control_plane::registry::Registration {
     let parent = registry
         .register(
             &agent_radar::control_plane::registry::RegistrationRequest {
-                source: "filter-test".into(),
+                source: "test-parent".into(),
                 incarnation: "3f8c1d20-3333-4a2b-8c4d-000000000003".into(),
                 session: Some(session.into()),
                 owner: None,
@@ -3173,6 +3169,19 @@ fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() 
             2,
         )
         .expect("a session context");
+    parent
+}
+
+#[test]
+fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() {
+    use agent_radar::control_plane::registry::{Registry, SpawnRequest};
+
+    let sandbox = Sandbox::new("spawn-subject-filter");
+    let registry = Registry::open(&sandbox.state()).expect("a registry");
+    let mine = "3f8c1d20-1111-4a2b-8c4d-000000000001";
+    let other = "3f8c1d20-2222-4a2b-8c4d-000000000002";
+    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let parent = registry_parent(&registry, session);
     let mut ids = Vec::new();
     for (request_id, subject) in [
         ("0a000001-0000-4000-8000-000000000001", Some(mine)),
@@ -3208,6 +3217,142 @@ fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() 
             .expect("other page")
             .iter()
             .all(|edge| edge.request_id == ids[1])
+    );
+}
+
+#[test]
+fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
+    use agent_radar::control_plane::lifecycle::{self, LaunchContext, ManagedMetadata};
+    use agent_radar::control_plane::registry::{LocalProcfsVerifier, Registry, SpawnRequest};
+
+    let sandbox = Sandbox::new("launch-withdrawn");
+    let registry = Registry::open(&sandbox.state()).expect("a registry");
+    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let parent = registry_parent(&registry, session);
+    let request_id = "0a000001-0000-4000-8000-000000000001";
+    registry
+        .record_spawn(
+            &SpawnRequest {
+                request_id: request_id.into(),
+                parent: parent.registration_id.clone(),
+                parent_session_id: session.into(),
+                parent_subject_id: None,
+            },
+            1_000,
+        )
+        .expect("an edge");
+    let launch = LaunchContext {
+        executable: "/bin/true".into(),
+        argv: Vec::new(),
+        cwd: None,
+        env: BTreeMap::new(),
+    };
+    let ticket = lifecycle::create_with_intent(
+        &registry,
+        request_id,
+        launch,
+        None,
+        None,
+        ManagedMetadata::default(),
+        1_000,
+    )
+    .expect("a reservation");
+    registry
+        .attach_subject(request_id, &ticket.claim_id, &ticket.registration_id)
+        .expect("attached");
+    let edge = registry
+        .spawn_edge(request_id)
+        .expect("read")
+        .expect("edge");
+
+    let early = lifecycle::withdraw_unpresented(
+        &registry,
+        &edge,
+        &LocalProcfsVerifier,
+        1_000 + 29_999,
+        |_| Ok(true),
+    )
+    .expect("an early pass");
+    assert_eq!(early, None, "a launch inside its deadline is left alone");
+
+    assert_eq!(
+        lifecycle::withdraw_unpresented(&registry, &edge, &LocalProcfsVerifier, 31_000, |_| Ok(
+            false
+        ))
+        .expect("cleanup not confirmed"),
+        None,
+    );
+    assert!(
+        registry
+            .spawn_edge(request_id)
+            .unwrap()
+            .unwrap()
+            .withdrawn
+            .is_none()
+    );
+
+    let due = lifecycle::withdraw_unpresented(
+        &registry,
+        &edge,
+        &LocalProcfsVerifier,
+        1_000 + 30_000,
+        |_| Ok(true),
+    )
+    .expect("a due pass");
+    assert_eq!(due.as_deref(), Some(ticket.claim_id.as_str()));
+    let withdrawn = registry
+        .spawn_edge(request_id)
+        .expect("read")
+        .expect("edge");
+    assert!(
+        withdrawn
+            .withdrawn
+            .as_ref()
+            .is_some_and(|w| w.reason.contains("30 seconds"))
+    );
+    let record = lifecycle::read_subject_record(&registry, &ticket.subject_id)
+        .expect("read")
+        .expect("subject");
+    assert_eq!(
+        record.current_claim, None,
+        "the subject is free to continue"
+    );
+    let late = registry
+        .bind_spawn(
+            &agent_radar::control_plane::registry::SpawnBindRequest {
+                token: edge.token.clone(),
+                source: "late-child".into(),
+                incarnation: random_uuid(),
+            },
+            31_001,
+        )
+        .expect_err("a withdrawn launch cannot bind");
+    assert!(late.contains("cancelled"), "{late}");
+    lifecycle::create_with_identity(
+        &registry,
+        &random_uuid(),
+        LaunchContext {
+            executable: "/bin/true".into(),
+            argv: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        },
+        None,
+        Some((ticket.subject_id.clone(), ticket.claim_id.clone())),
+        31_002,
+    )
+    .expect("the freed subject accepts another reservation");
+    assert_eq!(
+        lifecycle::withdraw_unpresented(
+            &registry,
+            &withdrawn,
+            &LocalProcfsVerifier,
+            1_000 + 60_000,
+            |_| Ok(true),
+        )
+        .expect("a repeat pass"),
+        None,
+        "a withdrawn launch is not withdrawn twice"
     );
 }
 

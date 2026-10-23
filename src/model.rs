@@ -618,7 +618,6 @@ pub struct LifecycleObservation {
     pub process: Option<ProcessIdentity>,
     pub state: LifecycleState,
     pub session: Option<String>,
-    pub successor: Option<String>,
 }
 
 /// One successful inventory: workspaces, tabs, panes, reported agents and

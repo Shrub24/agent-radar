@@ -2,6 +2,13 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## 0.5.0
+
+- The daemon withdraws a launch that has not presented within 30 seconds: it revokes the claim, stops a captured process through its scope, closes the launch's pane and records `withdrawn` (`at`, `reason`) on the spawn edge. The subject is then free to continue. Applies to `L`, spawn, continue and restart.
+- `lifecycle.restart` answers with `launch_request_id`, the edge of the replacement.
+- A subject's authority pointer is the one check behind reserving and granting a claim. The separate `successor` field is gone from stored records, events and the observation read.
+- Wire revision 8 — restart the daemon with pi-radar 0.10.0, which drops `timeoutMs` from `launchRadarWorker`, reports `failed` instead of `refused`, and adds `children.restart`.
+
 ## 0.4.0
 
 - Every tracked launch (`L`, restart, spawn) starts `radar run --launch` in its pane; the daemon answers the claim with the program from its own record and the process enters its scope. `launch-bootstrap` and `spawn.bootstrap` are gone.

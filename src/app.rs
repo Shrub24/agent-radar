@@ -1989,7 +1989,6 @@ impl App {
             };
             if subject.state != crate::control_plane::lifecycle::State::Bound
                 || subject.session.is_none()
-                || subject.successor.is_some()
             {
                 self.set_focus_message(Some(
                     "this lifecycle subject is not restartable".to_string(),
@@ -5410,7 +5409,6 @@ mod tests {
                         child_close: None,
                         state: crate::control_plane::lifecycle::State::Bound,
                         session: Some(MANAGED_OWNER.into()),
-                        successor: None,
                     }),
                 }),
             }],

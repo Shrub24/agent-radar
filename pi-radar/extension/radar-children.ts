@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import type { RadarClient, RadarChannelSnapshot, RadarResult } from "./radar-client.ts";
 import type { SpawnListPageSerializePublicSpawnTopology as ListedEdge } from "./generated-contracts.ts";
 import { inspectRadarChild, type RadarInspection } from "./radar-inspection.ts";
-import { observeRadarChild, type RadarChildObservation } from "./radar-launch.ts";
+import { observeRadarChild, waitForChild, launchFailure, type RadarChildObservation, type RadarLaunchOutcome } from "./radar-launch.ts";
 import type { RadarPublication } from "./radar-publication.ts";
 
 const PAGE = 100;
@@ -23,8 +24,25 @@ export type RadarChildAssignment = {
 	retire(): void;
 };
 
+/** The program a restarted child runs as. */
+export type RadarChildProgram = {
+	executable: string;
+	argv: string[];
+	cwd?: string;
+	env?: Record<string, string>;
+};
+
 export type RadarChildren = {
 	list(): Promise<RadarResult<RadarChild[]>>;
+	/**
+	 * Replace this caller's live child with a new process in its own pane and
+	 * session, and wait for the daemon to grant it or withdraw the launch.
+	 */
+	restart(
+		subject: string,
+		program: RadarChildProgram,
+		options?: { pollMs?: number; signal?: AbortSignal },
+	): Promise<RadarLaunchOutcome>;
 	assignment(subject: string, owner: string): RadarChildAssignment;
 	retire(subject: string): void;
 	observe(
@@ -43,8 +61,8 @@ type Resolved = { child: RadarChild; registration_id: string };
  * this surface exists to hide. An edge bound without a subject is not addressable.
  */
 export function createRadarChildren(
-	client: Pick<RadarClient, "spawnList" | "spawnGet" | "agentGet" | "output" | "processInfo">,
-	publication: Pick<RadarPublication, "assignment" | "retireAssignment">,
+	client: Pick<RadarClient, "spawnList" | "spawnGet" | "agentGet" | "output" | "processInfo" | "restart">,
+	publication: Pick<RadarPublication, "assignment" | "retireAssignment" | "subject">,
 ): RadarChildren {
 	const held = new Map<
 		string,
@@ -59,7 +77,7 @@ export function createRadarChildren(
 			if (read.ok === false) return read;
 			for (const edge of read.value.spawns as ListedEdge[]) {
 				const bound = edge.bound;
-				if (!bound?.subject_id || !bound.registration_id || edge.launched !== "completed") continue;
+				if (!bound?.subject_id || !bound.registration_id || edge.granted_at == null || edge.withdrawn != null) continue;
 				const at = Date.parse(bound.bound_at);
 				if (Number.isNaN(at)) continue;
 				const current = newest.get(bound.subject_id);
@@ -113,6 +131,34 @@ export function createRadarChildren(
 			if (!all.ok) return all;
 			follow(all.value);
 			return { ok: true, value: [...all.value.values()].map((entry) => entry.child) };
+		},
+		async restart(subject, program, options) {
+			const parent = await publication.subject();
+			if (parent?.subject_id === undefined)
+				return { kind: "failed", message: "this process has no Radar registration to restart a child under" };
+			const request_id = randomUUID();
+			const requested = await client.restart({
+				request_id,
+				parent: parent.registration_id,
+				subject_id: subject,
+				...program,
+			});
+			if (requested.ok === false)
+				return launchFailure(requested, request_id);
+			const bound = await waitForChild(client, requested.value.launch_request_id, {
+				pollMs: options?.pollMs ?? 250,
+				...(options?.signal !== undefined ? { signal: options.signal } : {}),
+			});
+			if (bound.kind !== "bound") return bound;
+			await resolveAndFollow(subject);
+			return {
+				kind: "ready",
+				value: {
+					request_id: requested.value.launch_request_id,
+					subject_id: bound.subject_id,
+					pane_id: bound.pane_id,
+				},
+			};
 		},
 		assignment(subject, owner) {
 			const existing = held.get(subject);

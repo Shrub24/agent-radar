@@ -82,7 +82,6 @@ pub struct ProcessFacts {
     pub spawn_request_id: String,
     pub origin: Origin,
     pub state: State,
-    pub successor: Option<String>,
     pub process: Option<ProcessIdentity>,
     #[serde(default)]
     pub observation: Option<Observation>,
@@ -123,7 +122,6 @@ impl From<&ProcessRecord> for ProcessFacts {
             spawn_request_id: process.spawn_request_id.clone(),
             origin: process.origin,
             state: process.state,
-            successor: process.successor.clone(),
             process: process.identity.clone(),
             observation: process.observation.clone(),
             pane_absence: process.pane_absence.clone(),
@@ -141,7 +139,6 @@ impl From<&ProcessRecord> for ProcessFacts {
 impl ProcessFacts {
     pub fn apply_to(&self, process: &mut ProcessRecord) {
         process.state = self.state;
-        process.successor = self.successor.clone();
         process.identity = self.process.clone();
         process.observation = self.observation.clone();
         process.pane_absence = self.pane_absence.clone();
@@ -200,12 +197,6 @@ pub enum Transition {
     /// verified process exit records `ExitVerified`.
     EndedExternally(EndedEvidence),
     PaneCleanup(PaneCleanup),
-    SuccessorReserved {
-        spawn_request_id: String,
-    },
-    SuccessorCancelled {
-        spawn_request_id: String,
-    },
     /// Records the Pi session a launched process reported, once, on a bound subject
     /// that was launched without one.
     SessionRecorded {
@@ -626,7 +617,10 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
             facts.execution.bound_registration_id = Some(registration_id.clone());
         }
         Transition::Revoked
-            if matches!(facts.execution.state, State::Pending | State::Captured) =>
+            if matches!(
+                facts.execution.state,
+                State::Pending | State::Captured | State::Bound
+            ) =>
         {
             facts.execution.state = State::Revoked
         }
@@ -670,16 +664,6 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
                 && facts.execution.pane_cleanup.is_none() =>
         {
             facts.execution.pane_cleanup = Some(outcome.clone())
-        }
-        Transition::SuccessorReserved { spawn_request_id }
-            if facts.execution.successor.is_none() =>
-        {
-            facts.execution.successor = Some(spawn_request_id.clone())
-        }
-        Transition::SuccessorCancelled { spawn_request_id }
-            if facts.execution.successor.as_deref() == Some(spawn_request_id.as_str()) =>
-        {
-            facts.execution.successor = None;
         }
         Transition::SessionRecorded { session }
             if facts.execution.state == State::Bound

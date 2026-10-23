@@ -5,72 +5,15 @@ import {
 	type RadarErrorCode,
 	type RadarLocation,
 	type RadarResult,
-	type RadarSpawnEdge,
 } from "./radar-client.ts";
-import { radarPaneHandle } from "./radar-location.ts";
 import type { RadarPublication } from "./radar-publication.ts";
 
-/** The startup acknowledgement a launch waits for, named by its identity. */
-export type StartupExpectation = {
-	generation: string;
-	runId: string;
-	ownerSessionId: string;
-	workspaceId: string;
-	agentLabel: string;
-	paneId: string;
-};
-
-/**
- * The mailbox readers a launch needs. The mailbox belongs to the caller (Herdsman
- * supplies its own state shape and readers); this module only takes the path it
- * is handed and asks these questions of it.
- */
-export type LaunchState = { paneId: string };
-
-export type LaunchMailbox<State extends LaunchState> = {
-	readState(path: string): State | undefined;
-	waitForState(
-		path: string,
-		predicate: (state: State) => boolean,
-		options: { timeoutMs: number; signal?: AbortSignal },
-	): Promise<State>;
-	startupAckMatches(state: State | undefined, expected: StartupExpectation): boolean;
-};
-
-/**
- * Launching one fresh managed worker through Radar's spawn operation.
- *
- * A spawn is one durable effect behind the caller's own request UUID, and three
- * separate facts decide whether a child can take an assignment:
- *
- * 1. the daemon created a pane under this process's registered pane, launched
- *    the child's exact command into it, and still reports that pane in its own
- *    inventory;
- * 2. a child registered with the launch's private token, so the edge names the
- *    exact `registration_id` that child obtained — never a label, pane or session;
- * 3. that child wrote a fresh startup acknowledgment for this launch generation
- *    after Herdsman startup finished, naming the pane the daemon created as its
- *    own location.
- *
- * Only the third is application readiness; the first two are prerequisites. A
- * lost reply is reconciled against the same request UUID and never re-sent, so a
- * failed launch cannot leave a second pane or a second child behind.
- *
- * The child's location is a fact about the pane the daemon created, not about
- * the environment it was launched with: the daemon passes an environment overlay
- * to a mux-created pane and cannot remove what that pane already carries, so a
- * child that inherited its parent's pane coordinates would claim the parent's
- * pane. The daemon's fresh record of the created pane and the child's own claim
- * must therefore name the same pane, and either one being stale, missing or
- * different leaves the launch unresolved rather than placed.
- */
+/** A launch succeeds when Radar grants its child's verified first presence. */
 
 /** Everything one fresh managed worker is launched with. */
 export type RadarWorkerLaunch = {
 	/** The caller's durable key, persisted before dispatch and never replaced. */
 	request_id: string;
-	/** The nonce the child must repeat in its startup acknowledgment. */
-	generation: string;
 	/**
 	 * Start this released child agent again rather than a new one. The daemon takes
 	 * the session from its own record, so no session id or path is sent.
@@ -87,33 +30,24 @@ export type RadarWorkerLaunch = {
 	cwd: string;
 	/** The environment overlay the child needs, not a replacement environment. */
 	env: Record<string, string>;
-	/** The child's mailbox: its own state is the readiness evidence. */
-	mailbox: string;
-	/** The identity the child's state and acknowledgment must repeat exactly. */
-	identity: {
-		runId: string;
-		ownerSessionId: string;
-		workspaceId: string;
-		agentLabel: string;
-	};
 };
 
-export type RadarWorkerLaunched<State = unknown> = {
+export type RadarWorkerLaunched = {
 	request_id: string;
 	/** The child's durable identity: the key that survives its restart and resume. */
 	subject_id: string;
 	pane_id: string;
-	state: State;
 };
 
 /**
- * `refused` is a launch that provably did not begin; `unresolved` is one whose
- * pane, child or readiness cannot be established, which the caller reports
- * rather than retries.
+ * `ready` is a child whose first presence the daemon granted. `failed` is a launch
+ * the daemon withdrew (or that provably never began), so a retry is safe.
+ * `unresolved` is the rare launch whose outcome cannot be read at all, which the
+ * caller reports rather than retries.
  */
-export type RadarLaunchOutcome<State = unknown> =
-	| { kind: "ready"; value: RadarWorkerLaunched<State> }
-	| { kind: "refused"; message: string }
+export type RadarLaunchOutcome =
+	| { kind: "ready"; value: RadarWorkerLaunched }
+	| { kind: "failed"; message: string }
 	| { kind: "unresolved"; request_id: string; message: string };
 
 /**
@@ -158,8 +92,8 @@ function trajectory(reason: string): string {
  *
  * The durable spawn record and the child's own binding say *which* subject this
  * launch created; they are provenance, not liveness, and they stay true after a
- * child is gone. The startup acknowledgment says the child is ready, which is
- * also not liveness. Only a current topology read decides: `bound` has to name
+ * child is gone. A presence grant is startup evidence, not perpetual liveness.
+ * Only a current topology read decides: `bound` has to name
  * the same subject, the read has to record the pane this launch claims, no
  * process exit may have been observed, and the read's own `freshness` has to
  * report that the daemon's inventory currently places that pane. Anything else -
@@ -293,44 +227,30 @@ export async function relaunchRefusalForChild(
 	return `the child's registered process is ${verification === "verified" ? "still running" : "not proved gone"}`;
 }
 
-export type RadarLaunchOptions<State extends LaunchState = LaunchState> = {
+export type RadarLaunchOptions = {
 	client: RadarClient;
 	/** This process's own publication, which names the parent of the launch. */
 	publication: Pick<RadarPublication, "subject">;
-	readers: LaunchMailbox<State>;
 	launch: RadarWorkerLaunch;
-	timeoutMs: number;
-	/** How often the binding and readiness waits re-read; 0 in driven tests. */
+	/** How often the wait re-reads the launch; 0 in driven tests. */
 	pollMs?: number;
+	/** Stops the wait. The daemon's own deadline still withdraws the launch. */
 	signal?: AbortSignal;
 };
 
-function refusedLaunch(message: string): Extract<RadarLaunchOutcome, { kind: "refused" | "unresolved" }> {
-	return { kind: "refused", message };
+function refusedLaunch(message: string): Extract<RadarLaunchOutcome, { kind: "failed" | "unresolved" }> {
+	return { kind: "failed", message };
 }
 
 function unresolvedLaunch(
 	requestId: string,
 	message: string,
-): Extract<RadarLaunchOutcome, { kind: "refused" | "unresolved" }> {
+): Extract<RadarLaunchOutcome, { kind: "failed" | "unresolved" }> {
 	return {
 		kind: "unresolved",
 		request_id: requestId,
 		message: `spawn ${requestId} is unresolved (${message})`,
 	};
-}
-
-/** Whether the edge's own two effects already prove a launch happened. */
-function edgeStanding(edge: RadarSpawnEdge): "launched" | "refused" | "unknown" {
-	if (edge.created === "refused" || edge.launched === "refused")
-		return "refused";
-	return edge.created === "completed" && edge.launched === "completed"
-		? "launched"
-		: "unknown";
-}
-
-function edgeMessage(edge: RadarSpawnEdge): string {
-	return `the daemon's spawn record is created ${edge.created} and launched ${edge.launched}`;
 }
 
 /**
@@ -353,27 +273,24 @@ const PRE_EFFECT_CODES: readonly RadarErrorCode[] = [
 	"backend_unavailable",
 ];
 
-function spawnFailure(
-	result: Extract<RadarResult<RadarSpawnEdge>, { ok: false }>,
+export function launchFailure(
+	result: Extract<RadarResult<unknown>, { ok: false }>,
 	requestId: string,
-): Extract<RadarLaunchOutcome, { kind: "refused" | "unresolved" }> {
+): Extract<RadarLaunchOutcome, { kind: "failed" | "unresolved" }> {
 	return PRE_EFFECT_CODES.includes(result.code)
 		? refusedLaunch(result.message)
 		: unresolvedLaunch(requestId, result.message);
 }
 
 /**
- * Wait for the child's own registration to bind this edge, then for its startup
- * acknowledgment. The edge is re-read by the same request UUID: a spawn that
- * already answered is never sent again.
+ * Wait for the child's verified presence grant or the daemon's withdrawal. The
+ * same request UUID is read throughout; a lost reply never starts another child.
  */
-export async function launchRadarWorker<State extends LaunchState>(
-	options: RadarLaunchOptions<State>,
-): Promise<RadarLaunchOutcome<State>> {
+export async function launchRadarWorker(
+	options: RadarLaunchOptions,
+): Promise<RadarLaunchOutcome> {
 	const { client, launch, signal } = options;
 	const pollMs = options.pollMs ?? 250;
-	const deadline = Date.now() + options.timeoutMs;
-	const remaining = (): number => Math.max(0, deadline - Date.now());
 	const parent = await options.publication.subject();
 	if (parent === undefined || !isUuid(parent.registration_id))
 		return refusedLaunch(
@@ -408,87 +325,46 @@ export async function launchRadarWorker<State extends LaunchState>(
 		...(Object.keys(launch.env).length > 0 ? { env: launch.env } : {}),
 	});
 	if (spawned.ok === false) {
-		const refusal = spawnFailure(spawned, launch.request_id);
-		if (refusal.kind === "refused") return refusal;
-	}
-	if (spawned.ok === true) {
-		const standing = edgeStanding(spawned.value);
-		if (standing === "refused")
-			return refusedLaunch(edgeMessage(spawned.value));
-		if (standing === "unknown")
-			return unresolvedLaunch(launch.request_id, edgeMessage(spawned.value));
+		const refusal = launchFailure(spawned, launch.request_id);
+		if (refusal.kind === "failed") return refusal;
 	}
 
 	const bound = await waitForChild(client, launch.request_id, {
-		remaining,
 		pollMs,
 		...(signal !== undefined ? { signal } : {}),
 	});
 	if (bound.kind !== "bound") return bound;
-	const agentId = bound.registration_id;
-	try {
-		const state = await options.readers.waitForState(
-			launch.mailbox,
-			(candidate) =>
-				options.readers.startupAckMatches(candidate, {
-					generation: launch.generation,
-					runId: launch.identity.runId,
-					ownerSessionId: launch.identity.ownerSessionId,
-					workspaceId: launch.identity.workspaceId,
-					agentLabel: launch.identity.agentLabel,
-						// The child writes the raw TMUX_PANE of the pane it runs in. Requiring
-						// the pane the daemon created is what refuses a child that inherited
-						// another process's coordinates.
-					paneId: radarPaneHandle(bound.pane_id),
-				}),
-			{ timeoutMs: remaining(), ...(signal !== undefined ? { signal } : {}) },
-		);
-		return {
-			kind: "ready",
-			value: {
-				request_id: launch.request_id,
-				subject_id: bound.subject_id,
-				pane_id: bound.pane_id,
-				state,
-			},
-		};
-	} catch (error) {
-		const claimed = options.readers.readState(launch.mailbox)?.paneId;
-		return unresolvedLaunch(
-			launch.request_id,
-			claimed !== undefined && claimed !== radarPaneHandle(bound.pane_id)
-				? `the bound child ${agentId} claims the pane ${claimed}, not the pane ${bound.pane_id} this launch created for it`
-				: `the bound child ${agentId} has not acknowledged this launch's startup (${String(error)})`,
-		);
-	}
+	return {
+		kind: "ready",
+		value: {
+			request_id: launch.request_id,
+			subject_id: bound.subject_id,
+			pane_id: bound.pane_id,
+		},
+	};
 }
 
 type BoundChild =
 	| {
 			kind: "bound";
 			subject_id: string;
-			registration_id: string;
 			pane_id: string;
-			source: string;
-			incarnation: string;
 	  }
-	| Extract<RadarLaunchOutcome, { kind: "refused" | "unresolved" }>;
+	| Extract<RadarLaunchOutcome, { kind: "failed" | "unresolved" }>;
 
 /**
- * Poll the edge this request id authored until a child presents its token.
+ * Poll the edge this request id authored until the daemon grants its child or
+ * withdraws the launch. There is no timeout here: the daemon owns the deadline and
+ * records a withdrawal on the edge, so waiting longer than it would only wait for
+ * an outcome that is already decided.
  *
- * The daemon binds the edge once, to the exact registration the token produced,
- * so `bound.registration_id` is the child identity. A refusal or an unknown launch
- * effect ends the wait at once: neither becomes a child by waiting longer. An
- * edge whose recorded pane the daemon no longer reports ends it too: waiting
- * cannot create the pane a launch claims, and a location read afterwards would
- * be that of whatever moved in.
+ * Registration binding alone is not success: a pending or duplicate presence
+ * can bind an edge without ever acquiring attachment authority.
  */
-async function waitForChild(
-	client: RadarClient,
+export async function waitForChild(
+	client: Pick<RadarClient, "spawnGet">,
 	requestId: string,
 	options: {
-		remaining: () => number;
 		pollMs: number;
 		signal?: AbortSignal;
 	},
@@ -499,53 +375,22 @@ async function waitForChild(
 			return unresolvedLaunch(requestId, `the launch was cancelled (${last})`);
 		const answer = await client.spawnGet(requestId);
 		if (answer.ok === true) {
-			const { edge, state, freshness } = answer.value;
-			const standing = edgeStanding(edge);
-			if (standing === "refused")
-				return refusedLaunch(`${edgeMessage(edge)}`);
-			if (standing === "unknown")
-				return unresolvedLaunch(requestId, edgeMessage(edge));
+			const { edge } = answer.value;
+			if (edge.withdrawn !== undefined)
+				return refusedLaunch(`the daemon withdrew this launch: ${edge.withdrawn.reason}`);
+			if (edge.granted_at === undefined) {
+				await delay(options.pollMs);
+				continue;
+			}
 			const pane = edge.location?.pane;
 			if (pane === undefined || pane === "")
 				return unresolvedLaunch(
 					requestId,
 					"the daemon's launch recorded no pane to verify the child against",
 				);
-			// The recorded pane is the daemon's own statement about where it created
-			// and launched this child, and `fresh` is its inventory confirming that
-			// pane right now. Without that confirmation the launch has no verified
-			// location to give the child, and no later read can supply one.
-			if (freshness !== "fresh")
-				return unresolvedLaunch(
-					requestId,
-					state === "unresolved"
-						? `the daemon's inventory does not report the pane ${pane} its own record names for this child`
-						: `the daemon cannot confirm the pane ${pane} it recorded for this child`,
-				);
-			// An observed exit is the child's process, and a pane's shell can outlive it.
-			if (edge.exit_observation?.state === "exited")
-				return unresolvedLaunch(
-					requestId,
-					"the daemon observed the launched child's process exit",
-				);
+
 			const agentId = edge.bound?.registration_id;
 			if (agentId !== undefined && isUuid(agentId)) {
-				// A child the daemon bound without the process it registered as is a
-				// child no assignment can be addressed to, and an unaddressed Radar
-				// assignment is exactly what addressing exists to prevent: the launch
-				// stays unresolved rather than degrading to a V5 request.
-				const source = edge.bound?.source;
-				const incarnation = edge.bound?.incarnation;
-				if (
-					source === undefined ||
-					source === "" ||
-					incarnation === undefined ||
-					incarnation === ""
-				)
-					return unresolvedLaunch(
-						requestId,
-						`the daemon bound the child ${agentId} without recording the process it registered as`,
-					);
 				// The edge names the agent as well as its process. Without it the child
 				// has no durable key to be returned by, and a registration is never
 				// offered in its place.
@@ -558,20 +403,13 @@ async function waitForChild(
 				return {
 					kind: "bound",
 					subject_id: subjectId,
-					registration_id: agentId,
 					pane_id: pane,
-					source,
-					incarnation,
 				};
 			}
 			last = "no child has registered with this launch's token yet";
 		} else {
-			last = answer.message;
+			return unresolvedLaunch(requestId, answer.message);
 		}
-		if (options.remaining() <= 0)
-			return unresolvedLaunch(requestId, last);
-		await delay(options.pollMs, undefined, {
-			...(options.signal !== undefined ? { signal: options.signal } : {}),
-		});
+		await delay(options.pollMs);
 	}
 }

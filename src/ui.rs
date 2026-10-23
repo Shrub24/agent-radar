@@ -9053,7 +9053,6 @@ mod tests {
                         child_close: None,
                         state: crate::control_plane::lifecycle::State::Bound,
                         session: Some("01a10c77-8a6b-7035-8a0e-b1fa607bb507".into()),
-                        successor: None,
                     }),
                 }),
             }],

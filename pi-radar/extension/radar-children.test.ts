@@ -9,6 +9,7 @@ function edge(registration: string, boundAt: string, extra: object = {}) {
 	return {
 		request_id: randomUUID(),
 		launched: "completed",
+		granted_at: boundAt,
 		state: "bound",
 		location: { backend: "tmux", pane: "%7" },
 		bound: { source: "herdsman-pi", incarnation: randomUUID(), registration_id: registration, subject_id: subject, bound_at: boundAt },
@@ -23,6 +24,7 @@ function harness(spawns: object[]) {
 	const publication = {
 		assignment: (target: string) => ({ update: (snapshot: unknown) => published.push({ target, text: snapshot }) }),
 		retireAssignment: (target: string) => retired.push(target),
+		subject: async () => ({ registration_id: randomUUID() }),
 	};
 	return {
 		published,
@@ -53,4 +55,28 @@ test("an edge bound without a subject is not a child of this surface", async () 
 	delete (legacy.bound as { subject_id?: string }).subject_id;
 	const h = harness([legacy]);
 	assert.deepEqual(await h.children.list(), { ok: true, value: [] });
+});
+
+test("a restart waits for the replacement's launch and reports the daemon's withdrawal", async () => {
+	const launch = randomUUID();
+	const client = {
+		restart: async () => ({ ok: true as const, value: { request_id: randomUUID(), launch_request_id: launch } }),
+		spawnGet: async () => ({
+			ok: true as const,
+			value: {
+				edge: {
+					request_id: launch,
+					parent: randomUUID(),
+					created: "completed",
+					launched: "completed",
+					withdrawn: { at: "2026-01-01T00:00:30.000Z", reason: "the launch did not present within 30 seconds" },
+				},
+				state: "unbound",
+				freshness: "fresh",
+			},
+		}),
+	};
+	const children = createRadarChildren(client as never, { subject: async () => ({ registration_id: randomUUID(), subject_id: randomUUID() }) } as never);
+	const result = await children.restart(subject, { executable: "/usr/bin/pi", argv: [] }, { pollMs: 0 });
+	assert.deepEqual(result, { kind: "failed", message: "the daemon withdrew this launch: the launch did not present within 30 seconds" });
 });

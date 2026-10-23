@@ -941,12 +941,6 @@
         },
         "subject_id": {
           "type": "string"
-        },
-        "successor": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
@@ -954,8 +948,7 @@
         "bound_registration_id",
         "process",
         "state",
-        "session",
-        "successor"
+        "session"
       ],
       "type": "object"
     },
@@ -1119,12 +1112,6 @@
         },
         "subject_id": {
           "type": "string"
-        },
-        "successor": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
@@ -1135,8 +1122,7 @@
         "metadata",
         "child_close",
         "state",
-        "session",
-        "successor"
+        "session"
       ],
       "type": "object"
     },

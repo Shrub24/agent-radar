@@ -41,9 +41,11 @@ The handoff API stores immutable bounded content separately from the recipient r
 
 To start a released child again, pass `continues: subject_id`: the daemon takes the session from its own record, so no session id or path is sent, and it refuses a child that is not yours or is still running. `client.restart` replaces your own live child under a new program. Both need Radar 0.4.0 or newer.
 
+A launch is ready when the daemon grants the child's first presence, and `failed` when the daemon withdraws it. The daemon owns a 30-second deadline and records the withdrawal on the launch, so `failed` means the launch is already cleaned up and a retry is safe. `launchRadarWorker` has no timeout of its own; pass a `signal` to stop waiting. `unresolved` is left for a launch whose outcome cannot be read at all. `children.restart(subject, program)` replaces a live child in its own pane and waits on the same outcome.
+
 ## Addressing children by subject
 
-The runtime's `children` service (`RADAR_RUNTIME_VERSION` 3) is the surface for everything after a launch. `list()` returns the caller's children as `{ subject_id, request_id, pane_id, state, exited }`; `observe`, `inspect`, `assignment` and `retire` take the subject. pi-radar resolves a subject to its newest bound launch on every call and never remembers the process, so a child replaced under the same subject is reached by the same key. A held assignment follows a replaced child: the next `list`, `observe` or `inspect` finds the new process and moves the assignment onto it, retiring it from the old one. Consumers need no registration or claim id.
+The runtime's `children` service (`RADAR_RUNTIME_VERSION` 4) is the surface for everything after a launch. `list()` returns the caller's children as `{ subject_id, request_id, pane_id, state, exited }`; `observe`, `inspect`, `assignment` and `retire` take the subject. pi-radar resolves a subject to its newest bound launch on every call and never remembers the process, so a child replaced under the same subject is reached by the same key. A held assignment follows a replaced child: the next `list`, `observe` or `inspect` finds the new process and moves the assignment onto it, retiring it from the old one. Consumers need no registration or claim id.
 
 ## Generated protocol contracts
 

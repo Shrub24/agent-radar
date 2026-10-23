@@ -85,7 +85,7 @@ test("the handoff ignores incompatible request versions and malformed handles", 
 	provideRadarRuntime(events, runtime("baseline"));
 	let offered = 0;
 	events.emit("pi-radar/runtime-request", {
-		version: 3,
+		version: 4,
 		provide: () => offered++,
 	});
 	events.emit("pi-radar/runtime-request", {

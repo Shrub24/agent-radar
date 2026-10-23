@@ -2017,7 +2017,6 @@ mod tests {
                     process: None,
                     state: crate::control_plane::lifecycle::State::Pending,
                     session: None,
-                    successor: None,
                 },
                 LifecycleObservation {
                     subject_id: "subject-bound-unjoined".into(),
@@ -2029,7 +2028,6 @@ mod tests {
                     }),
                     state: crate::control_plane::lifecycle::State::Bound,
                     session: None,
-                    successor: None,
                 },
                 LifecycleObservation {
                     subject_id: "subject-revoked".into(),
@@ -2037,7 +2035,6 @@ mod tests {
                     process: None,
                     state: crate::control_plane::lifecycle::State::Revoked,
                     session: None,
-                    successor: None,
                 },
             ],
             ..FleetObservation::default()

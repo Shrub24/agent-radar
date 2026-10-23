@@ -94,8 +94,6 @@ pub struct LifecycleSubject {
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,
     #[serde(default)]
     pub session: Option<String>,
-    #[serde(default)]
-    pub successor: Option<String>,
 }
 
 /// A daemon-owned process lifecycle target, joined to one registration by exact
@@ -110,7 +108,6 @@ pub struct ManagedSubject {
     pub child_close: Option<ChildCloseTarget>,
     pub state: crate::control_plane::lifecycle::State,
     pub session: Option<String>,
-    pub successor: Option<String>,
 }
 
 /// The process evidence `agent.list` serves beside a registration. Only the
@@ -382,7 +379,6 @@ fn managed_subject(
             }),
         state: subject.state,
         session: subject.session.clone(),
-        successor: subject.successor.clone(),
     })
 }
 
@@ -905,7 +901,6 @@ mod tests {
             identity_unresolved: false,
             managed: crate::control_plane::lifecycle::ManagedMetadata::default(),
             session: Some("session".into()),
-            successor: None,
         };
         let edge: PublicSpawnTopology = serde_json::from_value(json!({
             "version": 1,

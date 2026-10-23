@@ -31,7 +31,7 @@ command's registration refuses.
 ## Starting one
 
 ```sh
-radar run -- pi
+radar run --agent -- pi
 ```
 
 `radar run` executes in the pane it was invoked from: no pane, window or
@@ -50,6 +50,21 @@ a scope that cannot be created runs nothing.
 and Herdsman spawn. The pre-minted registration is handed to the child as
 `PI_RADAR_REGISTRATION_ID`; pi-radar captures it and removes it before it
 launches children.
+
+A daemon-created agent launch succeeds when its first verified presence is
+granted, not merely when a process binds its registration. Radar records that
+fact as `granted_at` on the launch edge. If it has not happened within 30 seconds
+of `recorded_at`, the daemon revokes the launch and stops its captured process
+through the scope. Only after confirming pane cleanup does it record
+`withdrawn: {at, reason}` and free the subject for another launch. A surviving
+process or uncertain cleanup is not reported as a safe-to-retry failure.
+
+Continue names the parent's released child with `continue_subject_id`; restart
+replaces a live child in its existing pane. Both use the subject's recorded
+session and the shared `resume_launch`/`spawn_child` path. A continued launch
+reporting a different session is refused. A new launch cannot claim a session
+already recorded for another subject; it must continue that subject explicitly.
+Later session switches in a granted process keep their normal presence behavior.
 
 ## Names
 

@@ -38,7 +38,7 @@ export const RADAR_PROTOCOL_VERSION = 2;
  * parent continue or restart its own child by subject.
  * Earlier daemons expose different identity fields; require a coordinated update.
  */
-export const RADAR_MINIMUM_REVISION = 7;
+export const RADAR_MINIMUM_REVISION = 8;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
@@ -309,6 +309,9 @@ export type RadarSpawnEdge = {
 	location?: RadarLocation;
 	bound?: { source: string; incarnation: string; registration_id?: string; subject_id?: string };
 	exit_observation?: RadarSpawnExitObservation;
+	/** Set when the daemon withdrew the launch before its process presented. */
+	withdrawn?: { at: string; reason: string };
+	granted_at?: string;
 };
 
 /**
@@ -830,6 +833,9 @@ function spawnEdge(value: unknown): RadarResult<RadarSpawnEdge> {
 	const agentId = stringAt(bound, "registration_id");
 	const subjectId = stringAt(bound, "subject_id");
 	const exit = exitAt(recordAt(value, "exit_observation"));
+	const withdrawnRecord = recordAt(value, "withdrawn");
+	const withdrawnAt = stringAt(withdrawnRecord, "at");
+	const withdrawnReason = stringAt(withdrawnRecord, "reason");
 	return {
 		ok: true,
 		value: {
@@ -849,6 +855,10 @@ function spawnEdge(value: unknown): RadarResult<RadarSpawnEdge> {
 					}
 				: {}),
 			...(exit !== undefined ? { exit_observation: exit } : {}),
+			...(stringAt(value, "granted_at") !== undefined ? { granted_at: stringAt(value, "granted_at") } : {}),
+			...(withdrawnAt !== undefined && withdrawnReason !== undefined
+				? { withdrawn: { at: withdrawnAt, reason: withdrawnReason } }
+				: {}),
 		},
 	};
 }
@@ -1124,7 +1134,7 @@ export type RadarClient = {
 		argv: string[];
 		cwd?: string;
 		env?: Record<string, string>;
-	}): Promise<RadarResult<{ request_id: string }>>;
+	}): Promise<RadarResult<{ request_id: string; launch_request_id: string }>>;
 	/** List launches owned by this client's registered process. */
 	spawnList(request: Pick<SpawnListParamsDeserialize, "after" | "limit">): Promise<RadarResult<SpawnListPageSerialize>>;
 	spawnGet(request_id: string): Promise<RadarResult<RadarSpawnTopology>>;
@@ -1757,7 +1767,11 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					request.request_id,
 				);
 				if (answer.ok === false) return answer;
-				return focusOutcome(recordAt(answer.value, "request"), request.request_id);
+				const settled = focusOutcome(recordAt(answer.value, "request"), request.request_id);
+				if (settled.ok === false) return settled;
+				const launch = recordAt(recordAt(answer.value, "request"), "launch_request_id");
+				if (!isUuid(launch)) return protocol("lifecycle.restart reply names no launch");
+				return { ok: true, value: { ...settled.value, launch_request_id: launch } };
 			});
 		},
 		async spawnList(request) {

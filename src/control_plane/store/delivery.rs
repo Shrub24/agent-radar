@@ -80,8 +80,6 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::AbsencePending(_) => "lifecycle.absence_pending",
         Transition::EndedExternally(_) => "lifecycle.ended_externally",
         Transition::PaneCleanup(_) => "lifecycle.pane_cleanup",
-        Transition::SuccessorReserved { .. } => "lifecycle.successor_reserved",
-        Transition::SuccessorCancelled { .. } => "lifecycle.successor_cancelled",
         Transition::SessionRecorded { .. } => "lifecycle.session_recorded",
         Transition::OperationAdmitted(_) => "lifecycle.operation.admitted",
         Transition::OperationStarted(_) => "lifecycle.operation.started",
@@ -134,9 +132,6 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
             .clone()
             .or_else(|| match &event.transition {
                 Transition::Enrolled(facts) => Some(facts.execution.spawn_request_id.clone()),
-                Transition::SuccessorReserved { spawn_request_id } => {
-                    Some(spawn_request_id.clone())
-                }
                 _ => None,
             }),
         at: event.at.clone(),

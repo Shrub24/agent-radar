@@ -893,12 +893,6 @@
         },
         "subject_id": {
           "type": "string"
-        },
-        "successor": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
@@ -1060,12 +1054,6 @@
         },
         "subject_id": {
           "type": "string"
-        },
-        "successor": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
