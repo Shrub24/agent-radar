@@ -31,7 +31,7 @@ function harness(spawns: object[]) {
 	};
 }
 
-test("a child replaced under the same subject is reached by its subject and carries its assignment", async () => {
+test("a child replaced under the same subject is reached by its subject and carries its assignment once the caller reads its children", async () => {
 	const first = randomUUID();
 	const second = randomUUID();
 	const spawns = [edge(first, "2026-01-01T00:00:00.000Z")];
@@ -42,7 +42,7 @@ test("a child replaced under the same subject is reached by its subject and carr
 	assert.deepEqual(h.published.map((entry) => entry.target), [first]);
 
 	spawns.push(edge(second, "2026-01-02T00:00:00.000Z"));
-	await assignment.refresh();
+	await h.children.list();
 	assert.deepEqual(h.published.map((entry) => entry.target), [first, second]);
 	assert.deepEqual(h.retired, [first]);
 	assert.equal((await h.children.list() as { value: unknown[] }).value.length, 1);

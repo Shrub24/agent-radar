@@ -7,7 +7,7 @@
 - Assign, retire, inspect and observe take the child's subject id. pi-radar resolves the current registration inside, from the spawn edges, and never caches it across a child's restart.
 - A subject has one edge per launch. The current one is the edge with the newest `bound_at` among those naming the subject and a bound registration; the SDK decodes `bound_at`.
 - An assignment follows the agent: pi-radar keeps each child's last published assignment keyed by subject, and when the child's registration changes it retires the old writer, opens one on the new registration and republishes that state.
-- Once Herdsman has cut over, the registration and `bound_process` leave the launch result and the inspection evidence.
+- The registration, `bound_process`, `onBound` and `observedChildAgent` leave the launch, with no transitional support.
 
 ## Non-goals
 

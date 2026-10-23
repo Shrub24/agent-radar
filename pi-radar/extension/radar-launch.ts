@@ -96,37 +96,13 @@ export type RadarWorkerLaunch = {
 		workspaceId: string;
 		agentLabel: string;
 	};
-	/**
-	 * The child's own published registration, once it has one. It is the second
-	 * witness that the edge's bound id is this launch's child, and it is read
-	 * through the owner's publication store rather than assumed from the pane.
-	 */
-	observedChildAgent?: () => string | undefined;
-	/**
-	 * Persist the daemon's own binding of this launch's edge, the subject it bound
-	 * and the pane it recorded, before readiness is waited for. This is the only
-	 * moment those facts are authoritative: the launch can end without ever
-	 * reaching an acknowledgment, and a reload in that window still has to read
-	 * where the daemon put this child. Throwing leaves the launch unresolved,
-	 * because a binding that was not persisted is one no later reader can hold the
-	 * child by.
-	 */
-	onBound?: (bound: { registration_id: string; pane_id: string }) => void;
 };
 
 export type RadarWorkerLaunched<State = unknown> = {
 	request_id: string;
 	/** The child's durable identity: the key that survives its restart and resume. */
 	subject_id: string;
-	registration_id: string;
 	pane_id: string;
-	/**
-	 * The process the daemon bound this launch's edge to, taken from that same
-	 * answer: the source and incarnation the child registered under. They are what
-	 * an assignment to this child is addressed with, so the first task of a fresh
-	 * launch is addressed exactly as a retained continuation is.
-	 */
-	bound_process: { source: string; incarnation: string };
 	state: State;
 };
 
@@ -450,20 +426,6 @@ export async function launchRadarWorker<State extends LaunchState>(
 	});
 	if (bound.kind !== "bound") return bound;
 	const agentId = bound.registration_id;
-	// The binding is recorded before the readiness wait, not after it: the child
-	// may never acknowledge, and the subject and pane the daemon named are still
-	// what a reload has to prove this child by.
-	if (launch.onBound !== undefined) {
-		try {
-			launch.onBound({ registration_id: agentId, pane_id: bound.pane_id });
-		} catch (error) {
-			return unresolvedLaunch(
-				launch.request_id,
-				`the daemon's binding of the child ${agentId} could not be recorded (${String(error)})`,
-			);
-		}
-	}
-
 	try {
 		const state = await options.readers.waitForState(
 			launch.mailbox,
@@ -478,9 +440,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 						// the pane the daemon created is what refuses a child that inherited
 						// another process's coordinates.
 					paneId: radarPaneHandle(bound.pane_id),
-				}) &&
-				(launch.observedChildAgent === undefined ||
-					launch.observedChildAgent() === agentId),
+				}),
 			{ timeoutMs: remaining(), ...(signal !== undefined ? { signal } : {}) },
 		);
 		return {
@@ -488,12 +448,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 			value: {
 				request_id: launch.request_id,
 				subject_id: bound.subject_id,
-				registration_id: agentId,
 				pane_id: bound.pane_id,
-				bound_process: {
-					source: bound.source,
-					incarnation: bound.incarnation,
-				},
 				state,
 			},
 		};

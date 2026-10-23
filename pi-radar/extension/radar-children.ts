@@ -20,8 +20,6 @@ export type RadarChild = {
 /** The assignment a child is held to: published again when its process is replaced. */
 export type RadarChildAssignment = {
 	update(snapshot: RadarChannelSnapshot): void;
-	/** Publish the held assignment on the child's current process. Call after a replacement. */
-	refresh(): Promise<void>;
 	retire(): void;
 };
 
@@ -48,7 +46,10 @@ export function createRadarChildren(
 	client: Pick<RadarClient, "spawnList" | "spawnGet" | "agentGet" | "output" | "processInfo">,
 	publication: Pick<RadarPublication, "assignment" | "retireAssignment">,
 ): RadarChildren {
-	const held = new Map<string, { writer: RadarChildAssignment; published?: string }>();
+	const held = new Map<
+		string,
+		{ writer: RadarChildAssignment; published?: string; publish?: (target: Resolved) => void }
+	>();
 
 	async function resolveAll(): Promise<RadarResult<Map<string, Resolved & { at: number }>>> {
 		const newest = new Map<string, Resolved & { at: number }>();
@@ -86,34 +87,57 @@ export function createRadarChildren(
 		return all.ok ? all.value.get(subject) : undefined;
 	}
 
+	async function resolveAndFollow(subject: string): Promise<Resolved | undefined> {
+		const all = await resolveAll();
+		if (!all.ok) return undefined;
+		follow(all.value);
+		return all.value.get(subject);
+	}
+
+	/**
+	 * A child replaced under its subject has a new process with no assignment. Each
+	 * read the caller already makes finds the new registration and moves the held
+	 * assignment onto it, so no caller has to notice a replacement.
+	 */
+	function follow(all: Map<string, Resolved>): void {
+		for (const [subject, entry] of held) {
+			const target = all.get(subject);
+			if (target !== undefined && entry.published !== target.registration_id)
+				entry.publish?.(target);
+		}
+	}
+
 	return {
 		async list() {
 			const all = await resolveAll();
-			return all.ok
-				? { ok: true, value: [...all.value.values()].map((entry) => entry.child) }
-				: all;
+			if (!all.ok) return all;
+			follow(all.value);
+			return { ok: true, value: [...all.value.values()].map((entry) => entry.child) };
 		},
 		assignment(subject, owner) {
 			const existing = held.get(subject);
 			if (existing !== undefined) return existing.writer;
 			let latest: RadarChannelSnapshot | undefined;
-			const entry: { writer: RadarChildAssignment; published?: string } = {
-				writer: undefined as unknown as RadarChildAssignment,
-			};
-			const publish = async (): Promise<void> => {
-				const target = await resolve(subject);
-				if (target === undefined || latest === undefined) return;
+			const entry: {
+				writer: RadarChildAssignment;
+				published?: string;
+				publish?: (target: Resolved) => void;
+			} = { writer: undefined as unknown as RadarChildAssignment };
+			const send = (target: Resolved): void => {
+				if (latest === undefined) return;
 				if (entry.published !== undefined && entry.published !== target.registration_id)
 					publication.retireAssignment(entry.published);
 				entry.published = target.registration_id;
 				publication.assignment(target.registration_id, owner).update(latest);
 			};
+			entry.publish = send;
 			entry.writer = {
 				update(snapshot) {
 					latest = snapshot;
-					void publish();
+					void resolve(subject).then((target) => {
+						if (target !== undefined) send(target);
+					});
 				},
-				refresh: publish,
 				retire() {
 					latest = undefined;
 					if (entry.published !== undefined) publication.retireAssignment(entry.published);
@@ -128,7 +152,7 @@ export function createRadarChildren(
 			held.delete(subject);
 		},
 		async observe(subject, session_id) {
-			const target = await resolve(subject);
+			const target = await resolveAndFollow(subject);
 			if (target === undefined)
 				return { kind: "unknown", diagnostic: "the daemon records no bound launch for this child" };
 			return observeRadarChild(client as RadarClient, {
@@ -139,7 +163,7 @@ export function createRadarChildren(
 			});
 		},
 		async inspect(subject, session_id) {
-			const target = await resolve(subject);
+			const target = await resolveAndFollow(subject);
 			if (target?.child.pane_id === undefined)
 				throw new Error("Inspection target is not a bound child with a pane");
 			return inspectRadarChild(client as RadarClient, {

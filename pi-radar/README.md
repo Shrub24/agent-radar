@@ -43,7 +43,7 @@ To start a released child again, pass `continues: subject_id`: the daemon takes 
 
 ## Addressing children by subject
 
-The runtime's `children` service (`RADAR_RUNTIME_VERSION` 3) is the surface for everything after a launch. `list()` returns the caller's children as `{ subject_id, request_id, pane_id, state, exited }`; `observe`, `inspect`, `assignment` and `retire` take the subject. pi-radar resolves a subject to its newest bound launch on every call and never remembers the process, so a child replaced under the same subject is reached by the same key. A held assignment is published again on the new process when you call `refresh()` after a replacement; nothing is published for a process the edge does not bind to that subject. An edge bound without a subject (a legacy record) is not listed. Consumers need no registration or claim id.
+The runtime's `children` service (`RADAR_RUNTIME_VERSION` 3) is the surface for everything after a launch. `list()` returns the caller's children as `{ subject_id, request_id, pane_id, state, exited }`; `observe`, `inspect`, `assignment` and `retire` take the subject. pi-radar resolves a subject to its newest bound launch on every call and never remembers the process, so a child replaced under the same subject is reached by the same key. A held assignment follows a replaced child: the next `list`, `observe` or `inspect` finds the new process and moves the assignment onto it, retiring it from the old one. Consumers need no registration or claim id.
 
 ## Generated protocol contracts
 
