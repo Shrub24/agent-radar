@@ -1,3 +1,5 @@
+[![Keep the Why](https://keepthewhy.com/assets/badge.svg)](https://keepthewhy.com)
+
 # Agent Radar
 
 A full-screen fleet control plane for coding agents. Radar uses the daemon by
