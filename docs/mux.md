@@ -114,8 +114,8 @@ matching `parent_session_id`; duplicate attaches are not selected by UUID alone.
 
 The request supplies a resolved executable and literal argv, optional absolute
 cwd and an environment **overlay**, not replacement of the inherited environment.
-Radar reserves `PI_RADAR_SPAWN_TOKEN`, passes its private one-use token to the
-child, and consumes it when that exact child registers. New bindings expose the
+Radar reserves `PI_RADAR_REGISTRATION_ID`, exports the launch's pre-minted registration id to the
+child, and binds it when that exact child presents it. New bindings expose the
 actual registration `registration_id`; old bindings may lack that field.
 
 Use flat `spawn.get` readback: `result.spawn.bound.registration_id`, not

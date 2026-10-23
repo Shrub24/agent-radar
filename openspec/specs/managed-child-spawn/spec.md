@@ -131,8 +131,8 @@ A spawn SHALL accept an optional absolute working directory and an environment o
 - **WHEN** a compatible spawn request omits cwd and environment
 - **THEN** launch retains the existing inherited environment and placement-derived cwd behavior
 
-#### Scenario: Reserved token override
-- **WHEN** a caller supplies PI_RADAR_SPAWN_TOKEN in its environment overlay
+#### Scenario: Reserved registration id override
+- **WHEN** a caller supplies PI_RADAR_REGISTRATION_ID in its environment overlay
 - **THEN** admission refuses without accepting the request or creating a pane
 
 ### Requirement: Launch context is representable before creation

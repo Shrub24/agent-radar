@@ -89,14 +89,14 @@ One registration is one JSON file, `<state root>/agents/<registration_id>.json`,
       "provenance": "herdsman",
       "revision": "7"
     },
-    "spawn_token": "<private token from PI_RADAR_SPAWN_TOKEN>"
+    "spawn_token": "<private launch token>"
   }
 }
 ```
 
-Radar exposes one `agent.presence` operation. A report presents the process birth identity (boot ID, PID, start ticks), source/incarnation, current session UUID, session-load `claim_id`, mutable location and optional launch correlation/managed metadata. Radar resolves the process's `registration_id`, current context and durable session subject internally. The response is `granted`, `duplicate` or `pending`, with a `subject_id` only for a grant. A retry of one claim returns its stored decision; only a fresh Pi `session_start` creates another claim opportunity. On a managed launch's first load, pi-radar uses the pre-minted claim id as both launch correlation and `claim_id`; a later reload or session switch uses a fresh claim.
+Radar exposes one `agent.presence` operation. A report presents the process birth identity (boot ID, PID, start ticks), source/incarnation, current session UUID, session-load `claim_id`, mutable location and optional launch correlation/managed metadata. Radar resolves the process's `registration_id`, current context and durable session subject internally. The response is `granted`, `duplicate` or `pending`, with a `subject_id` only for a grant. A retry of one claim returns its stored decision; only a fresh Pi `session_start` creates another claim opportunity. A managed launch's pre-minted `registration_id` identifies the process; every session load, including the first, presents a fresh `claim_id`.
 
-The process birth tuple and `registration_id` identify the process registration. Session/location are mutable context; the subject ID follows the session and survives release. A duplicate claim is sticky across incumbent release and daemon restart. Procfs or storage uncertainty remains pending, never duplicate. Supplied launch correlation must match the recorded launch; it never falls back to manual adoption. The daemon validates process identity before recording a registration. Private argv/environment and token fields are never projected. A tracked launch's claim id is public; presenting it does not grant authority without the captured process birth identity.
+The process birth tuple and `registration_id` identify the process registration. Session/location are mutable context; the subject ID follows the session and survives release. A duplicate claim is sticky across incumbent release and daemon restart. Procfs or storage uncertainty remains pending, never duplicate. Supplied launch correlation must match the recorded launch; it never falls back to manual adoption. The daemon validates process identity before recording a registration. Private argv/environment and token fields are never projected. A launch's pre-minted registration id is exported to the child as `PI_RADAR_REGISTRATION_ID`; presenting it grants no authority without the captured process birth identity.
 
 `agent.release` names the exact registration and claim. It releases the current attachment but retains the process registration and durable session subject. It is idempotent; a delayed release cannot revoke a later claim. The process-exit sweep releases only when birth identity is verifiably absent or reused, never from pane loss or heartbeat expiry.
 
@@ -149,15 +149,12 @@ name a pane. The daemon splits to the right of that pane without focusing it;
 it does not use whichever pane has current focus. The caller supplies the
 resolved executable and argv. The daemon does not resolve a command, write an
 assignment, or alter process lifecycle. The command is passed to the backend
-unchanged, alongside the single-use credential exported to the child as
-`PI_RADAR_SPAWN_TOKEN`. A tracked launch's credential is the claim id the daemon
-pre-minted for that attempt, so a launch presents one secret rather than a claim
-plus a second per-edge token; an untracked spawn keeps a minted token because it
-has no claim. The child captures that value, removes it from its
-process environment, and includes it privately as `spawn_token` in its own
-`agent.presence` request. Keep the captured value only in bootstrap memory while
-an acknowledgement is uncertain; retry with identical source, incarnation,
-process claim and token. The returned `registration.registration_id` is the exact child
+unchanged, alongside the registration id the daemon pre-minted for that launch,
+exported to the child as `PI_RADAR_REGISTRATION_ID`. The child captures that
+value, removes it from its process environment, and presents it as its
+`registration_id` in its own `agent.presence` request. Keep the captured value
+only in bootstrap memory while an acknowledgement is uncertain; retry with
+identical source, incarnation, process claim and registration id. The returned `registration.registration_id` is the exact child
 identity. A parent obtains the same identity from `spawn.get`/`spawn.list` at
 `spawn.bound.registration_id`, then calls `agent.get` with that value. The token is
 private, stored
@@ -486,10 +483,12 @@ The JSON Schemas under `pi-radar/schema/public/v1/` are the machine-readable con
 
 | Call | Gate | Schemas | pi-radar SDK |
 | --- | --- | --- | --- |
-| `agent.presence` | `registry.v1`, revision 4 | `presence-report.*`, `presence-answer.*` | `publication.presence.report(session)` |
-| `agent.release` | `registry.v1`, revision 4 | `presence-release.*`, `presence-answer.*` | `publication.presence.release()` |
+| `agent.presence` | `registry.v1` | `presence-report.*`, `presence-answer.*` | `publication.presence.report(session)` |
+| `agent.release` | `registry.v1` | `presence-release.*`, `presence-answer.*` | `publication.presence.release()` |
 | `communication.handoff` publish/read/ack | `communication.handoff.v1` | `handoff-publish-params.*`, `handoff.*`, `handoff-inbox.*`, `handoff-receipt.*` | `createRadarHandoffPort(client, publication)` |
-| `spawn.create` with managed metadata | `spawn.v1` | `managed-launch-metadata.*` | `launchRadarWorker` |
+| `spawn.create` with managed metadata, optionally `continue_subject_id` | `spawn.v1` | `managed-launch-metadata.*` | `launchRadarWorker` |
+| `spawn.list` (the caller's own children) | `registry.v1` | `spawn-list-params.*`, `spawn-list-page.*` | `runtime.children.list`, `observe`, `inspect` |
+| `lifecycle.restart` by the recorded parent | `lifecycle.restart.v1` | — | `runtime.children.restart` |
 | `observation.get` | `registry.v1` | `observation-get-response.*`, `observation-snapshot.*` | `client.observe()` |
 
 The public process identifier is `registration_id`; there is no `agent_id` alias. Durable agent identity is `subject_id`, and `HandoffIdentity` carries both plus the execution it names.

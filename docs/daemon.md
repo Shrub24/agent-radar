@@ -60,8 +60,8 @@ Spawn accepts optional absolute cwd and an environment overlay, requiring the
 `spawn.launch_context.v1` contract (`mux.create`, `mux.launch` and
 `mux.launch_context`). Herdr quotes a single launch line and refuses
 unrepresentable values before creation. Public operation readbacks omit
-environment values. The child captures/removes the private
-`PI_RADAR_SPAWN_TOKEN` and registers with it; new bindings persist the returned
+environment values. The child captures/removes the exported
+`PI_RADAR_REGISTRATION_ID` and presents it as its registration; new bindings persist the returned
 `registration_id`. Read `result.spawn.bound.registration_id` from flat `spawn.get` and use that
 exact ID with `agent.get`, not aliases or a nonexistent `spawn.edge` object.
 Legacy bindings may omit the ID. New v2 edges retain process and session parent

@@ -151,13 +151,13 @@ else `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
 
 ## Managed execution
 
-`radar run -- COMMAND [ARG...]` starts a command in the pane it was invoked from,
+`radar run [--agent] -- COMMAND [ARG...]` starts a command in the pane it was invoked from,
 inside a systemd user scope of its own. Nothing is created and no shell
 interprets the command, so a `$VAR`, a glob or a newline arrives intact. `L`
 launches through the same path, and so do restart and Herdsman spawn.
 
 ```sh
-radar run -- pi                     # a scoped Pi in this pane
+radar run --agent -- pi            # a scoped Pi in this pane, reporting in as an agent
 ```
 
 The daemon admits the launch before anything executes: it refuses unless this
@@ -207,7 +207,7 @@ preserving durable subjects and handoffs.
 | `j` / `↓`, `k` / `↑` | Select the next / previous visible row |
 | `space` or `←` / `→` | Fold or unfold the selected branch |
 | `/` | Enter a case-insensitive filter; Backspace edits |
-| `Enter` | Focus the selected row's pane (or workspace) in Herdr; while entering filter text, keeps the filter instead |
+| `Enter` | Focus the selected row's pane (or workspace) in the backend; while entering filter text, keeps the filter instead |
 | `Escape` | Clear the filter and leave text entry |
 | `p` | Cycle the pane view: agents → running → all |
 | `s` | Cycle the order: source → state → name |
@@ -215,7 +215,13 @@ preserving durable subjects and handoffs.
 | `w` / `W` | Select the next / previous working row |
 | `d` | Show or hide the details panel |
 | `D` | Delete the selected row: its container when Radar records one, else end what the row is. On an agent row a managed worker is stopped through its owner, so the exit is reported; the row a tab is drawn as ends the whole tab, every other row ends its own pane. Ends a container whose place is gone, closing a place that is still served is refused unless it was confirmed | 
-| `r` | Ask the selected worker's owner to restart it; offered only for an owner-advertised idle managed worker |
+| `r` | Restart the selected managed agent in its recorded session: the daemon stops it with a verified exit, then relaunches it. Offered for a bound daemon subject with a session |
+| `a` | Add a place inside the selected container Radar records |
+| `A` | Start a new workspace; nothing is selected, replaced or confirmed |
+| `R` | Reload the selected container's recorded recipe |
+| `L` | Launch the configured managed agent in a new tab or pane |
+| `E` | Report the selected Pi session's claim standing (granted, duplicate, reserved, pending or released); sends nothing |
+| `!` | Open the full text of what was last reported; `c` dismisses it |
 | `c` | Dismiss the lifecycle outcome lines |
 | `e` | Show or hide finished sessions (panes whose label is a session that has gone) |
 | `b` | Show or hide background-task children in the current view |
