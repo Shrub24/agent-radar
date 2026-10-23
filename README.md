@@ -184,8 +184,12 @@ agent — one started outside this path — keeps the signal path it already had
 
 A scoped row is a managed execution. An observed row keeps its subject, children
 and inbox and is marked as observed; the route to managed is a restart through
-`radar run`, not promotion in place. `radar-pi` is a `pi` that does this for
-every session; put it ahead of the real program on `PATH` to use it.
+`radar run`, not promotion in place. With Home Manager, list a program in
+`programs.radar.managedPrograms` (for example your Pi package) and it is
+installed under its own name as a wrapper that runs `radar run -- <original>`;
+without it, `lib.managedProgram pkgs program` from the flake builds the same
+wrapper. The wrapper names the original by store path, so it never resolves back
+to itself.
 
 This needs a systemd user manager and cgroup v2. Without a manager, a launch
 refuses before the command runs. See [managed execution](docs/managed-execution.md)

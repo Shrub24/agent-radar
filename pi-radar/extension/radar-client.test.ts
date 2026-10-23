@@ -995,7 +995,7 @@ test("daemon.ping requires protocol 2, the minimum revision, and registry.v1", a
 		// would be accepted and then never gain a subject.
 		const presenceless = await client.ping();
 		assert.equal(presenceless.ok, false);
-		assert.match(presenceless.ok ? "" : presenceless.message, /revision 5/);
+		assert.match(presenceless.ok ? "" : presenceless.message, /revision 6/);
 		const capable = await client.ping();
 		assert.deepEqual(capable, {
 			ok: true,

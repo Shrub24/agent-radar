@@ -32,7 +32,7 @@ Consolidate the identity model first — the scope work names an attempt in ever
 
 - [x] 3.1 Record the scope and slice identity against the registration, without a new store; verify a readback returns them and no public projection exposes environment values
 - [x] 3.2 Reattach a recorded launch after daemon restart by matching the recorded unit and a verified process birth identity inside the group; verify a test reports it running without signalling it, and that a reused name with a mismatched identity stays unresolved
-- [ ] 3.3 Report a missing transient unit as unknown rather than a clean exit; verify the swap-in of `--collect` or unit expiry cannot turn into a settled outcome
+- [x] 3.3 Report a missing transient unit as unknown rather than a clean exit; verify the swap-in of `--collect` or unit expiry cannot turn into a settled outcome
 
 ## 4. Graceful-only stop
 
@@ -46,13 +46,14 @@ Consolidate the identity model first — the scope work names an attempt in ever
   - Implemented: the daemon admits only a caller that is the named pane's own descendant with a verified birth identity, records the process, and answers the registration for the caller to enter its scope with; the command is never executed directly. Refusals are covered by `tests/cli.rs`. The integration check of a real in-place run is left to the operator's live session: driving an interactive pane from the test harness proved unreliable (keystrokes and even a direct `new-window -- sh -c` did not stay observable), and the behaviour it would assert is what a real run shows faster.
 - [x] 5.2 Refuse `radar run` on an unverified pane or an empty command before anything executes; verify both refusals
 - [x] 5.3 Route `L`, restart and Herdsman spawn through the same managed launch; verify the existing `L` targeting tests still pass and a scope failure refuses before the command runs
-- [ ] 5.4 Ship a `pi` launcher shim for Nix and Home Manager that prefixes `radar run`; verify the shim runs a managed Pi and that a manually started Pi keeps its identity, children, inbox and controls
+- [ ] 5.4 Ship a `pi` launcher for Nix and Home Manager that prefixes `radar run`; verify the launcher runs a managed Pi and that a manually started Pi keeps its identity, children, inbox and controls
+  - Implemented as `lib.managedProgram` and `programs.radar.managedPrograms`: the wrapper takes the program's own name and names the original by store path, so it cannot resolve back to itself (the first `radar-pi` package could). Built against `pkgs.hello` and its script checked. The run of a real managed Pi is the operator's live acceptance.
 - [x] 5.5 Document `radar run`, the managed/observed distinction and the graceful-stop semantics in `docs/` and the README; verify the documented commands run as written
 
 ## 6. pi-radar and consumers
 
 - [x] 6.1 Mark an observed session as not first-class, with a hint to restart it under `radar run` for scoped control, from the standing pi-radar already reports; verify it gains and loses no control
-- [ ] 6.2 Regenerate consumed protocol contracts and update the SDK docs and the Herdsman companion brief; verify generated-contract and package tests pass
+- [x] 6.2 Regenerate consumed protocol contracts and update the SDK docs and the Herdsman companion brief; verify generated-contract and package tests pass
 
 ## 7. Packaging and platform
 

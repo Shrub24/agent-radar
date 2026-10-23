@@ -36,7 +36,7 @@ export const RADAR_PROTOCOL_VERSION = 2;
  * Revision 5 names attempts by claim_id and requires exact-claim controls.
  * Earlier daemons expose different identity fields; require a coordinated update.
  */
-export const RADAR_MINIMUM_REVISION = 5;
+export const RADAR_MINIMUM_REVISION = 6;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";

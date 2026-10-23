@@ -2099,11 +2099,14 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
     )
 }
 
-/// Records that this attempt was admitted into a group of its own.
+/// Records the group this launch was wrapped to run in.
 ///
-/// Called by the launch path that actually wraps the command, so a claim states a
-/// group only when one was created for it. An observed registration has none and
-/// keeps the signal path.
+/// This is the launch's intent, written by the path that wraps the command; it
+/// is not proof that the process is a member. Every stop and every recovery
+/// re-establishes membership (the unit's cgroup, the recorded birth identity and
+/// the process's own cgroup) before acting, and a unit that cannot be found is
+/// unknown, never an exit. An observed registration has none and keeps the
+/// signal path.
 pub fn mark_scoped(registry: &Registry, claim_id: &str) -> Result<(), String> {
     let mut claim = read_recorded(registry, claim_id)?;
     claim.execution.scope = Some(crate::managed_scope::Scope::for_registration(
@@ -2976,6 +2979,28 @@ mod tests {
         )
         .expect("capture");
         (ticket.claim_id, child, process)
+    }
+
+    #[test]
+    fn a_scoped_launch_whose_unit_is_missing_is_unknown_and_not_signalled() {
+        let scratch = Scratch::new("scope-missing");
+        let registry = scratch.registry();
+        let (subject, mut child, _) = captured_child(&registry);
+        // The launch was wrapped into a scope, but no such unit exists: it was
+        // collected, expired, or never created. That is not evidence of an exit.
+        mark_scoped(&registry, &subject).expect("scoped");
+
+        let cancelled = cancel(&registry, &subject, &LocalProcfsVerifier, 4).expect("cancel");
+
+        assert!(!cancelled.signal_attempted, "nothing was signalled");
+        assert!(
+            matches!(cancelled.exit, Exit::Unverified(_)),
+            "a missing unit is unknown: {cancelled:?}"
+        );
+        let record = read(&registry, &subject).expect("read").expect("subject");
+        assert!(record.execution.exited_at.is_none(), "no exit was recorded");
+        assert!(child.0.try_wait().expect("wait").is_none(), "still alive");
+        let _ = child.0.kill();
     }
 
     /// Reports every PID as absent, as a process table that no longer lists it does.

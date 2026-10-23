@@ -32,20 +32,19 @@
     {
       packages = forPackageSystems (pkgs: rec {
         radar = pkgs.callPackage ./nix/package.nix { inherit crane; };
-        # A `pi` that enters a managed execution scope wherever it is started.
-        # Naming it `pi` is the point: put it ahead of the real program on
-        # `PATH` and every Pi session becomes a scoped launch. Nothing installs
-        # it automatically, and a session that keeps the unscoped `pi` stays
-        # observed rather than losing anything.
-        radar-pi = pkgs.writeShellApplication {
-          name = "pi";
-          text = ''
-            exec ${radar}/bin/radar run -- pi "$@"
-          '';
-          meta.description = "pi, started as a Radar managed execution";
-        };
         default = radar;
       });
+
+      # Wraps one program so it starts as a managed execution under its own name.
+      # A consumer applies it to the real package, which is why it is a function
+      # rather than a package here: the wrapper must name the original by store
+      # path, and this flake does not know which Pi a consumer runs.
+      lib.managedProgram =
+        pkgs: program:
+        pkgs.callPackage ./nix/managed-program.nix {
+          radar = self.packages.${pkgs.stdenv.hostPlatform.system}.radar;
+          inherit program;
+        };
 
       apps = forPackageSystems (pkgs: rec {
         default = {
