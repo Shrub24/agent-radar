@@ -33,7 +33,6 @@ use super::{Freshness, Registry, RegistryLocation, bounded_text, read_record_fil
 /// The record shape this build writes and reads. A record naming another version
 /// fails explicitly rather than being read as this one.
 pub const SPAWN_VERSION: u32 = 2;
-pub const LEGACY_SPAWN_VERSION: u32 = 1;
 
 /// The largest spawn edge this daemon reads or writes, so a planted file cannot
 /// be read into memory whole.
@@ -71,22 +70,11 @@ impl SpawnRequest {
 }
 
 /// A registration presenting the token minted for its launch.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SpawnBindRequest {
+struct SpawnBindRequest {
     /// Private: the token the launch carried into the child.
-    pub token: String,
-    pub source: String,
-    pub incarnation: String,
-}
-
-impl SpawnBindRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        canonical_uuid("token", &self.token)?;
-        bounded_text("source", &self.source, false)?;
-        canonical_uuid("incarnation", &self.incarnation)?;
-        Ok(())
-    }
+    token: String,
+    source: String,
+    incarnation: String,
 }
 
 /// The child a token bound: the registering incarnation's own registry identity.
@@ -95,10 +83,8 @@ impl SpawnBindRequest {
 pub struct BoundChild {
     pub source: String,
     pub incarnation: String,
-    /// Exact registry identity returned to the registering child. Absent in legacy records.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "agent_id")]
-    pub registration_id: Option<String>,
+    /// Exact registry identity returned to the registering child.
+    pub registration_id: String,
     /// The durable agent the bound child attaches as. Absent for an edge without
     /// a tracked launch and in records written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,15 +114,14 @@ pub struct SpawnEdge {
     pub version: u32,
     pub request_id: String,
     pub parent: String,
-    /// Logical session parent; absent only on legacy v1 process-parented edges.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session_id: Option<String>,
+    /// Logical session parent.
+    pub parent_session_id: String,
     /// The logical subject that requested this launch, when it had one. Durable
     /// parentage: a session moves on `/resume`, so it is not the parent key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_subject_id: Option<String>,
-    /// Exact tracked attempt. The old private key remains readable on upgrade.
-    #[serde(default, alias = "subject_id", skip_serializing_if = "Option::is_none")]
+    /// Exact tracked attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_id: Option<String>,
     /// Binding credential: the claim id for tracked launches, private otherwise.
     pub token: String,
@@ -146,8 +131,8 @@ pub struct SpawnEdge {
     /// The verified birth identity of the process that served the create which
     /// named this location: the instance this pane belongs to.
     ///
-    /// Absent on an edge whose create recorded none — a legacy edge, a backend
-    /// that names no server process, or a capture that could not be verified.
+    /// Absent on an edge whose create recorded none — a backend that names no
+    /// server process, or a capture that could not be verified.
     /// A generation is never inferred from a pane id, a server name or history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<ProcessIdentity>,
@@ -190,17 +175,13 @@ impl SpawnEdge {
             bound: self.bound.clone(),
             withdrawn: self.withdrawn.clone(),
             granted_at: self.granted_at.clone(),
-            exit_observation: if self.version == LEGACY_SPAWN_VERSION {
-                None
-            } else {
-                Some(match &self.exit {
-                    Some(exit) => PublicSpawnExitObservation::Exited {
-                        code: exit.code,
-                        signal: exit.signal,
-                        observed_at: exit.observed_at.clone(),
-                    },
-                    None => PublicSpawnExitObservation::Unknown,
-                })
+            exit_observation: match &self.exit {
+                Some(exit) => PublicSpawnExitObservation::Exited {
+                    code: exit.code,
+                    signal: exit.signal,
+                    observed_at: exit.observed_at.clone(),
+                },
+                None => PublicSpawnExitObservation::Unknown,
             },
             recorded_at: self.recorded_at.clone(),
         }
@@ -253,8 +234,7 @@ pub struct PublicSpawnEdge {
     pub version: u32,
     pub request_id: String,
     pub parent: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session_id: Option<String>,
+    pub parent_session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_subject_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,8 +245,7 @@ pub struct PublicSpawnEdge {
     pub launched: RequestOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound: Option<BoundChild>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_observation: Option<PublicSpawnExitObservation>,
+    pub exit_observation: PublicSpawnExitObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawn: Option<Withdrawn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,9 +327,7 @@ pub fn record(
     let _transition = registry.transition();
     if let Some(existing) = read_edge(registry, &request.request_id)? {
         if existing.parent == request.parent
-            && (existing.parent_session_id.as_deref() == Some(request.parent_session_id.as_str())
-                || (existing.version == LEGACY_SPAWN_VERSION
-                    && existing.parent_session_id.is_none()))
+            && existing.parent_session_id == request.parent_session_id
         {
             return Ok(existing);
         }
@@ -377,7 +354,7 @@ pub fn record(
         version: SPAWN_VERSION,
         request_id: request.request_id.clone(),
         parent: request.parent.clone(),
-        parent_session_id: Some(request.parent_session_id.clone()),
+        parent_session_id: request.parent_session_id.clone(),
         parent_subject_id: request.parent_subject_id.clone(),
         claim_id: None,
         token: random_uuid(),
@@ -605,22 +582,6 @@ pub fn list_after(
     Ok(edges)
 }
 
-/// Binds the edge a spawn token minted to the child that presented it.
-///
-/// A token binds once: its first bind spends it, and every later presentation —
-/// including the child it already bound — is refused as spent, so one spawn
-/// cannot claim two children. Nothing observable about a pane is consulted: the
-/// child is whichever incarnation presented the token.
-pub fn bind(
-    registry: &Registry,
-    request: &SpawnBindRequest,
-    now_ms: i64,
-) -> Result<SpawnEdge, String> {
-    request.validate()?;
-    let _transition = registry.transition();
-    bind_locked(registry, request, now_ms, None, None)
-}
-
 pub(super) fn launched_registration(
     registry: &Registry,
     token: Option<&str>,
@@ -670,7 +631,7 @@ pub(super) fn bind_presented_token(
         registry,
         &registration_bind(token, request),
         now_ms,
-        Some(registration_id),
+        registration_id,
         request.process.as_ref(),
     )?;
     Ok(())
@@ -706,7 +667,7 @@ pub(super) fn heal_binding(
         registry,
         &bind,
         now_ms,
-        Some(&registration.registration_id),
+        &registration.registration_id,
         request.process.as_ref(),
     )
     .map(|_| ())
@@ -725,7 +686,7 @@ fn bind_locked(
     registry: &Registry,
     request: &SpawnBindRequest,
     now_ms: i64,
-    registration_id: Option<&str>,
+    registration_id: &str,
     process: Option<&ProcessIdentity>,
 ) -> Result<SpawnEdge, String> {
     let mut matches = edges(registry)?
@@ -744,39 +705,14 @@ fn bind_locked(
     // could not be written leaves the subject bound, which a same-content retry heals.
     let mut subject = None;
     if let Some(claim_id) = &stored.claim_id {
-        lifecycle::fence_registration(registry, claim_id, process, registration_id, now_ms)?;
+        lifecycle::fence_registration(registry, claim_id, process, Some(registration_id), now_ms)?;
         subject = lifecycle::read(registry, claim_id)?
             .map(|launch| launch.subject_id.unwrap_or(launch.claim_id));
     }
     if let Some(bound) = &stored.bound {
-        if bound.source == request.source
-            && bound.incarnation == request.incarnation
-            && let Some(registration_id) = registration_id
-        {
-            if bound
-                .registration_id
-                .as_deref()
-                .is_some_and(|existing| existing != registration_id)
-            {
+        if bound.source == request.source && bound.incarnation == request.incarnation {
+            if bound.registration_id != registration_id {
                 return Err("spawn binding names a different registry identity".into());
-            }
-            if bound.registration_id.is_none() {
-                let edge = SpawnEdge {
-                    bound: Some(BoundChild {
-                        registration_id: Some(registration_id.to_string()),
-                        subject_id: subject,
-                        ..bound.clone()
-                    }),
-                    ..stored
-                };
-                write_edge(registry, &edge)?;
-                registry.append_event(
-                    "spawn.bound",
-                    Some(registration_id),
-                    None,
-                    Some(&edge.request_id),
-                );
-                return Ok(edge);
             }
             return Ok(stored);
         }
@@ -786,14 +722,19 @@ fn bind_locked(
         bound: Some(BoundChild {
             source: request.source.clone(),
             incarnation: request.incarnation.clone(),
-            registration_id: registration_id.map(str::to_owned),
+            registration_id: registration_id.to_owned(),
             subject_id: subject,
             bound_at: format_millis(now_ms),
         }),
         ..stored
     };
     write_edge(registry, &edge)?;
-    registry.append_event("spawn.bound", registration_id, None, Some(&edge.request_id));
+    registry.append_event(
+        "spawn.bound",
+        Some(registration_id),
+        None,
+        Some(&edge.request_id),
+    );
     Ok(edge)
 }
 
@@ -843,20 +784,13 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
     }
     let edge: SpawnEdge =
         serde_json::from_slice(bytes).map_err(|error| format!("not a spawn edge: {error}"))?;
-    if ![LEGACY_SPAWN_VERSION, SPAWN_VERSION].contains(&edge.version) {
+    if edge.version != SPAWN_VERSION {
         return Err(format!(
-            "spawn edge version {} is not served; this daemon reads v1 and writes {SPAWN_VERSION}",
+            "spawn edge version {} is not served; this daemon reads v{SPAWN_VERSION}",
             edge.version
         ));
     }
-    if (edge.version == LEGACY_SPAWN_VERSION && edge.parent_session_id.is_some())
-        || (edge.version == SPAWN_VERSION && edge.parent_session_id.is_none())
-    {
-        return Err("spawn edge parent session identity does not match its version".into());
-    }
-    if let Some(session_id) = &edge.parent_session_id {
-        canonical_uuid("parent_session_id", session_id)?;
-    }
+    canonical_uuid("parent_session_id", &edge.parent_session_id)?;
     if edge.request_id != request_id {
         return Err("spawn edge id does not match its filename".into());
     }
@@ -877,9 +811,7 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
         if timestamp_millis(&bound.bound_at).is_none() {
             return Err("spawn edge bound_at is not a timestamp".into());
         }
-        if let Some(registration_id) = &bound.registration_id {
-            canonical_uuid("bound.registration_id", registration_id)?;
-        }
+        canonical_uuid("bound.registration_id", &bound.registration_id)?;
     }
     if let Some(exit) = &edge.exit {
         match (exit.code, exit.signal) {

@@ -304,7 +304,6 @@ impl RegistrationRequest {
 pub struct Registration {
     pub version: u32,
     /// The daemon-issued process-registration UUID and durable key.
-    #[serde(alias = "agent_id")]
     pub registration_id: String,
     pub registered_at: String,
     pub request: RegistrationRequest,
@@ -436,8 +435,8 @@ pub use publication::{
 };
 pub use spawn::{
     BoundChild, LocationEvidence, MAX_SPAWN_BYTES, PublicSpawnEdge, PublicSpawnExitObservation,
-    PublicSpawnTopology, SPAWN_VERSION, SpawnBindRequest, SpawnEdge, SpawnExitObservation,
-    SpawnRequest, SpawnState, Withdrawn,
+    PublicSpawnTopology, SPAWN_VERSION, SpawnEdge, SpawnExitObservation, SpawnRequest, SpawnState,
+    Withdrawn,
 };
 
 impl Registry {
@@ -680,12 +679,6 @@ impl Registry {
         registration_id: &str,
     ) -> Result<SpawnEdge, String> {
         spawn::attach_subject(self, request_id, claim_id, registration_id)
-    }
-
-    /// Binds the edge a spawn token minted to the child that presented it,
-    /// spending the token.
-    pub fn bind_spawn(&self, request: &SpawnBindRequest, now_ms: i64) -> Result<SpawnEdge, String> {
-        spawn::bind(self, request, now_ms)
     }
 
     /// The opaque serving epoch of this registry instance.

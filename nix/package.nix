@@ -24,7 +24,8 @@ let
 
   # Only what the Rust build reads. `tests/fixtures/` is embedded with
   # `include_str!`, and `docs/radar-bus.fixture.json` is read by the bus tests at
-  # runtime through `CARGO_MANIFEST_DIR` — they panic without it. The README, the
+  # runtime through `CARGO_MANIFEST_DIR` — they panic without it. The SDK client is
+  # embedded by the contract drift test. The README, the
   # plans and the VCS/dev directories are not build inputs.
   src = lib.fileset.toSource {
     root = ../.;
@@ -34,6 +35,7 @@ let
       ../Cargo.toml
       ../Cargo.lock
       ../docs/radar-bus.fixture.json
+      ../pi-radar/extension/radar-client.ts
     ];
   };
 

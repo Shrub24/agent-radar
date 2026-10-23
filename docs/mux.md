@@ -59,8 +59,7 @@ with Radar's observation time. This is tmux's retained pane-command status, not
 independent proof of the bound agent's process identity. A same-UID client can
 `respawn-pane` before Radar's first read and replace the retained status; direct
 out-of-band pane respawn is inside the existing same-UID trust boundary. Herdr
-reports unknown. A missing pane is not proof of exit, legacy v1 edges omit the
-field, and exit observation does not change agent execution/assignment facts. It
+reports unknown. A missing pane is not proof of exit, and exit observation does not change agent execution/assignment facts. It
 authorizes dead-pane cleanup only together with the edge's own recorded exit and
 the creating-instance fence.
 

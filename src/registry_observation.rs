@@ -89,8 +89,6 @@ pub struct LifecycleSubject {
     pub process: Option<ProcessIdentity>,
     pub state: crate::control_plane::lifecycle::State,
     #[serde(default)]
-    pub identity_unresolved: bool,
-    #[serde(default)]
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,
     #[serde(default)]
     pub session: Option<String>,
@@ -103,7 +101,6 @@ pub struct ManagedSubject {
     pub subject_id: String,
     pub claim_id: String,
     pub process: ProcessIdentity,
-    pub identity_unresolved: bool,
     pub metadata: crate::control_plane::lifecycle::ManagedMetadata,
     pub child_close: Option<ChildCloseTarget>,
     pub state: crate::control_plane::lifecycle::State,
@@ -363,7 +360,6 @@ fn managed_subject(
         subject_id: subject.subject_id.clone(),
         claim_id: subject.claim_id.clone()?,
         process: claim.clone(),
-        identity_unresolved: subject.identity_unresolved,
         metadata: subject.managed.clone(),
         child_close: spawn
             .filter(|spawn| {
@@ -391,7 +387,7 @@ fn spawn_binding(agent: &RegistryAgent, topology: &[PublicSpawnTopology]) -> Opt
             edge.edge
                 .bound
                 .as_ref()
-                .is_some_and(|bound| bound.registration_id.as_deref() == Some(id))
+                .is_some_and(|bound| bound.registration_id == id)
         })
         .map(|edge| SpawnBinding {
             parent: edge.edge.parent.clone(),
@@ -623,6 +619,8 @@ mod tests {
             "version": 1,
             "request_id": "r1",
             "parent": "parent-1",
+            "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+            "exit_observation": {"state": "unknown"},
             "created": "completed",
             "launched": "completed",
             "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "registration_id": registration_id, "bound_at": "2026-01-01T00:00:00.000Z"},
@@ -858,6 +856,8 @@ mod tests {
             "version": 1,
             "request_id": "r1",
             "parent": "parent-1",
+            "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+            "exit_observation": {"state": "unknown"},
             "created": "completed",
             "launched": "completed",
             "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "registration_id": "child", "bound_at": "2026-01-01T00:00:00.000Z"},
@@ -898,7 +898,6 @@ mod tests {
             bound_registration_id: Some("lead".into()),
             process: Some(claim.clone()),
             state: crate::control_plane::lifecycle::State::Bound,
-            identity_unresolved: false,
             managed: crate::control_plane::lifecycle::ManagedMetadata::default(),
             session: Some("session".into()),
         };
@@ -906,6 +905,8 @@ mod tests {
             "version": 1,
             "request_id": "spawn-1",
             "parent": "parent-1",
+            "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+            "exit_observation": {"state": "unknown"},
             "claim_id": "subject-1",
             "created": "completed",
             "launched": "completed",

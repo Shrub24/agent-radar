@@ -571,36 +571,6 @@ function pendingAt(
 	return { sequence, snapshot, lease_ms: lease, observed_at: observed };
 }
 
-const CONTEXT_PENDING_KEYS = "lease_ms,observed_at,sequence,session";
-const CONTEXT_ACCEPTED_KEYS = "lease_ms,observed_at,sent_at,sequence,session";
-// Records written before session-bound management also carry a launch-identity
-// marker. It is read past and never used: the attached subject is the identity.
-const CONTEXT_PENDING_LEGACY_KEYS = "launch_identity,lease_ms,observed_at,sequence,session";
-const CONTEXT_ACCEPTED_LEGACY_KEYS = "launch_identity,lease_ms,observed_at,sent_at,sequence,session";
-
-/** The reported session, or `undefined` when the field is not one of the two. */
-function sessionAt(value: unknown): string | null | undefined {
-	if (typeof value !== "object" || value === null) return undefined;
-	const found = (value as Record<string, unknown>).session;
-	if (found === null) return null;
-	return typeof found === "string" ? found : undefined;
-}
-
-function contextReportAt(
-	value: unknown,
-	keys: string,
-	legacyKeys: string,
-): ContextReport | undefined {
-	if (!exactKeys(value, keys) && !exactKeys(value, legacyKeys)) return undefined;
-	const sequence = numberAt(value, "sequence");
-	const lease = numberAt(value, "lease_ms");
-	const observed = textAt(value, "observed_at");
-	const session = sessionAt(value);
-	if (sequence === undefined || sequence < 1) return undefined;
-	if (lease === undefined || observed === undefined || session === undefined)
-		return undefined;
-	return { sequence, session, lease_ms: lease, observed_at: observed };
-}
 
 export type RadarFactsWriter = Omit<RadarChannelWriter, "update"> & {
 	update(snapshot: RadarFactsSnapshot): void;

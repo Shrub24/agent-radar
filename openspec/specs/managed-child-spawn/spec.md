@@ -147,18 +147,14 @@ The daemon SHALL validate launch-context shape, bounds and selected-backend repr
 - **THEN** the child receives those values literally and no embedded shell commands execute
 
 ### Requirement: Topology names the exact child registration
-A new token-bound spawn SHALL report the exact bound child agent_id alongside existing source/incarnation provenance. Identical registration replay SHALL preserve that binding. Legacy records without agent_id SHALL remain readable without inferred identity. A rename, shared session or similar label SHALL NOT change the binding.
+A token-bound spawn SHALL report the exact bound child registration_id alongside source/incarnation provenance. Identical registration replay SHALL preserve that binding. A rename, shared session or similar label SHALL NOT change the binding.
 
 #### Scenario: Binding readback
 - **WHEN** a child successfully registers with its spawn token and the caller reads spawn.get
-- **THEN** the response names the same agent_id returned to that registration
-
-#### Scenario: Legacy binding
-- **WHEN** a legacy bound edge without agent_id is read
-- **THEN** its recorded source/incarnation remains available and no agent_id is guessed
+- **THEN** the response names the same registration_id returned to that registration
 
 ### Requirement: Spawn topology reports exit observation
-Spawn topology reads SHALL include `exit_observation` for each current edge as `{state:"unknown"}` or `{state:"exited", code|signal, observed_at}`. Backends that cannot observe exit SHALL report unknown, and legacy edges SHALL omit the field without inference.
+Spawn topology reads SHALL include `exit_observation` for each current edge as `{state:"unknown"}` or `{state:"exited", code|signal, observed_at}`. Backends that cannot observe exit SHALL report unknown.
 
 #### Scenario: Herdr child
 - **WHEN** a Herdr-launched child's edge is read

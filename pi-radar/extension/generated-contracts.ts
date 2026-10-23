@@ -905,7 +905,6 @@ export interface RegistryLocation {
 export interface ManagedSubject {
   child_close: ChildCloseTarget | null;
   claim_id: string;
-  identity_unresolved: boolean;
   metadata: ManagedMetadata;
   process: ProcessIdentity;
   session: string | null;
@@ -1441,7 +1440,7 @@ export interface SpawnListPageSerializePublicSpawnTopology {
   bound?: SpawnListPageSerializeBoundChild | null;
   claim_id?: string | null;
   created: SpawnListPageSerializeRequestOutcome;
-  exit_observation?: SpawnListPageSerializePublicSpawnExitObservation | null;
+  exit_observation: SpawnListPageSerializePublicSpawnExitObservation;
   /**
    * Freshness of the recorded location against this read's evidence, in the
    * registry's one freshness vocabulary: `fresh` when the backend reports the
@@ -1454,7 +1453,7 @@ export interface SpawnListPageSerializePublicSpawnTopology {
   launched: SpawnListPageSerializeRequestOutcome;
   location?: SpawnListPageSerializeRegistryLocation | null;
   parent: string;
-  parent_session_id?: string | null;
+  parent_session_id: string;
   parent_subject_id?: string | null;
   recorded_at: string;
   request_id: string;
@@ -1472,9 +1471,9 @@ export interface SpawnListPageSerializeBoundChild {
   bound_at: string;
   incarnation: string;
   /**
-   * Exact registry identity returned to the registering child. Absent in legacy records.
+   * Exact registry identity returned to the registering child.
    */
-  registration_id?: string | null;
+  registration_id: string;
   source: string;
   /**
    * The durable agent the bound child attaches as. Absent for an edge without

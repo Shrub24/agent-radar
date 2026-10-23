@@ -48,20 +48,8 @@ pub(super) fn execute_subject_control(
         Ok(target) => target,
         Err(refusal) => return Response::refused(&request.id, &refusal),
     };
-    let mut aliases = subjects::claim_ids_for_subject(&registry, &target);
-    if !aliases.contains(&subject_id) {
-        aliases.push(subject_id.clone());
-    }
     let now = store::now_ms();
-    match admit_with_aliases(
-        operation,
-        request,
-        Some(&target),
-        &aliases,
-        &requester,
-        now,
-        core,
-    ) {
+    match admit(operation, request, Some(&target), &requester, now, core) {
         Admission::Answered(response) => return response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
@@ -513,15 +501,10 @@ pub(super) fn execute_restart(
         .subject_id
         .clone()
         .unwrap_or_else(|| subject.claim_id.clone());
-    let mut aliases = subjects::claim_ids_for_subject(&registry, &logical_subject_id);
-    if !aliases.contains(&subject.claim_id) {
-        aliases.push(subject.claim_id.clone());
-    }
-    let cancel = match admit_with_aliases(
+    let cancel = match admit(
         ops::Operation::Restart,
         request,
         Some(&logical_subject_id),
-        &aliases,
         &requester,
         now,
         core,

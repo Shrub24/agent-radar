@@ -496,7 +496,6 @@ impl AcceptedSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct ChannelRecord {
     pub version: u32,
-    #[serde(alias = "agent_id")]
     pub registration_id: String,
     pub channel: Channel,
     pub writer: WriterBinding,

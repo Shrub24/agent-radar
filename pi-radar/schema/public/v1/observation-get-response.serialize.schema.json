@@ -1092,9 +1092,6 @@
         "claim_id": {
           "type": "string"
         },
-        "identity_unresolved": {
-          "type": "boolean"
-        },
         "metadata": {
           "$ref": "#/$defs/ManagedMetadata"
         },
@@ -1118,7 +1115,6 @@
         "subject_id",
         "claim_id",
         "process",
-        "identity_unresolved",
         "metadata",
         "child_close",
         "state",

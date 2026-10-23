@@ -1839,9 +1839,11 @@ fn report(registration_id: &str, channel: &str, freshness: &str, snapshot: Value
 /// A spawn edge that binds `child` under `parent`, as the daemon serves it.
 fn bound_edge(parent: &str, child: &str) -> PublicSpawnTopology {
     serde_json::from_value(json!({
-        "version": 1,
+        "version": 2,
         "request_id": format!("request-{child}"),
         "parent": parent,
+        "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+        "exit_observation": {"state": "unknown"},
         "created": "completed",
         "launched": "completed",
         "bound": {"source": "test", "incarnation": REGISTRY_INCARNATION, "registration_id": child,

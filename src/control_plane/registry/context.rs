@@ -177,7 +177,6 @@ impl AcceptedContext {
 #[serde(deny_unknown_fields)]
 pub struct SessionContext {
     pub version: u32,
-    #[serde(alias = "agent_id")]
     pub registration_id: String,
     pub writer: WriterBinding,
     pub context: AcceptedContext,

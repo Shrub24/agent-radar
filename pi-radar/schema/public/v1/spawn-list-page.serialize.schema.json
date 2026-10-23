@@ -12,11 +12,8 @@
           "type": "string"
         },
         "registration_id": {
-          "description": "Exact registry identity returned to the registering child. Absent in legacy records.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "Exact registry identity returned to the registering child.",
+          "type": "string"
         },
         "source": {
           "type": "string"
@@ -32,6 +29,7 @@
       "required": [
         "source",
         "incarnation",
+        "registration_id",
         "bound_at"
       ],
       "type": "object"
@@ -126,14 +124,7 @@
           "$ref": "#/$defs/RequestOutcome"
         },
         "exit_observation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PublicSpawnExitObservation"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/PublicSpawnExitObservation"
         },
         "freshness": {
           "anyOf": [
@@ -145,6 +136,12 @@
             }
           ],
           "description": "Freshness of the recorded location against this read's evidence, in the\nregistry's one freshness vocabulary: `fresh` when the backend reports the\nlocation now, `stale` when it does not — which is never evidence that the\nchild stopped. Absent when the edge recorded no location, because there is\nnothing to verify."
+        },
+        "granted_at": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "launched": {
           "$ref": "#/$defs/RequestOutcome"
@@ -163,10 +160,7 @@
           "type": "string"
         },
         "parent_session_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "parent_subject_id": {
           "type": [
@@ -187,14 +181,26 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "withdrawn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Withdrawn"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "version",
         "request_id",
         "parent",
+        "parent_session_id",
         "created",
         "launched",
+        "exit_observation",
         "recorded_at",
         "state"
       ],
@@ -276,6 +282,23 @@
           "type": "string"
         }
       ]
+    },
+    "Withdrawn": {
+      "additionalProperties": false,
+      "description": "Why and when a launch ended without ever presenting, so a reader never infers\nfailure from absence.",
+      "properties": {
+        "at": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "reason"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",

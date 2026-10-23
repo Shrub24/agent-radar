@@ -7,8 +7,7 @@ For the overall surface, lifecycle and adoption path, start with the
 normative wire reference for direct agent
 registry producers. The records it documents carry their own `version`, which is
 independent of the control-plane protocol version: registrations, close records
-and context records are `1`, and an edge written now is `2` while a legacy edge
-is `1` — see [the version table](control-plane.md#versions). The canonical
+and context records are `1`, and a spawn edge is `2` — see [the version table](control-plane.md#versions). The canonical
 request/response exchanges are in
 [`agent-registration.fixture.jsonl`](agent-registration.fixture.jsonl); the
 stdlib-only reconnecting owner publisher is
@@ -204,7 +203,7 @@ Both topology methods require `registry.v1`, regardless of backend. For
 location verification, one `mux.observe` inventory is consulted per response/page
 when a backend advertises `mux.observe`; otherwise the durable topology is still
 returned with unconfirmed freshness. Edges persist across daemon restarts. The
-public topology contains parent, optional bound child `(source, incarnation, registration_id)`. New bindings include the exact ID returned by token-consuming registration; legacy bound records omit it and must not be resolved by label, pane, or session. It also contains created/launched outcomes, optional created location, `state`,
+public topology contains parent, optional bound child `(source, incarnation, registration_id)`. A binding carries the exact ID returned by the registration that spent the token; a child is never resolved by label, pane, or session. It also contains created/launched outcomes, optional created location, `state`,
 `freshness`, and `exit_observation`; a tracked edge publishes its claim id as
 `claim_id` and no separate token field, because that claim is the credential
 and only the process whose birth identity matches can spend it, while an
@@ -226,7 +225,7 @@ backend confirms the pane command exited, then as
 `mux.exit_observation`) advertises backend
 support; without it, current v2 edges remain unknown. Herdr has no
 exit-observation capability, and a missing pane is never inferred to be exited.
-Legacy v1 edges omit the field. Exit evidence is the backend's pane-command
+Exit evidence is the backend's pane-command
 status, not proof of the bound agent's process identity after an out-of-band
 respawn; it does not change agent execution or assignment publications, and it
 authorizes dead-pane cleanup only together with the edge's own recorded exit and
@@ -273,7 +272,7 @@ the daemon recorded privately on the edge before its create. That last check is
 the generation fence: a pane id outlives the server that answered the create,
 and a backend restarting under the same name hands the same ids to panes Radar
 never created, so history and a pane id are both insufficient. An edge that
-records no instance — a legacy edge, or an edge on a backend that cannot name
+records no instance — an edge on a backend that cannot name
 its serving process, such as Herdr — is unfenced and refuses before admission
 rather than inferring a generation. Dead-pane cleanup additionally needs
 `mux.exit_observation`, and reads the exit `code`/`signal` the edge stored
@@ -491,7 +490,7 @@ The JSON Schemas under `pi-radar/schema/public/v1/` are the machine-readable con
 | `lifecycle.restart` by the recorded parent | `lifecycle.restart.v1` | — | `runtime.children.restart` |
 | `observation.get` | `registry.v1` | `observation-get-response.*`, `observation-snapshot.*` | `client.observe()` |
 
-The public process identifier is `registration_id`; there is no `agent_id` alias. Durable agent identity is `subject_id`, and `HandoffIdentity` carries both plus the execution it names.
+The public process identifier is `registration_id`. Durable agent identity is `subject_id`, and `HandoffIdentity` carries both plus the execution it names.
 
 ### Sequences, leases and freshness
 
@@ -648,8 +647,7 @@ epoch freshness/reconnect, then stops the child in `finally`. It is not live
 publisher or fleet integration. The pi-extensions port is a separate follow-up:
 Herdsman must adopt `agent.presence` on session start/switch/fork under its existing
 publisher/writer handling. Map its current owner projection to assignment and
-its child execution facts to their separate channel, retain optional legacy
-metadata reporting only as an intentional compatibility bridge, and do not add
+its child execution facts to their separate channel, do not add
 process execution or recovery policy here.
 
 ## Errors, trust and limits

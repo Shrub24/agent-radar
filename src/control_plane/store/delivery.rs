@@ -69,8 +69,6 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::ProcessCreated { .. } => "process.created",
         Transition::Created(_) => "lifecycle.created",
         Transition::Enrolled(_) => "lifecycle.enrolled",
-        Transition::Imported(_) => "lifecycle.imported",
-        Transition::IdentityMapped { .. } | Transition::IdentityUnresolved => return None,
         Transition::Captured(_) => "lifecycle.captured",
         Transition::Bound { .. } => "lifecycle.bound",
         Transition::Revoked => "lifecycle.revoked",
@@ -84,7 +82,6 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::OperationAdmitted(_) => "lifecycle.operation.admitted",
         Transition::OperationStarted(_) => "lifecycle.operation.started",
         Transition::OperationSettled(_) => "lifecycle.settled",
-        Transition::OperationImported(_) => "lifecycle.operation.imported",
         Transition::ContainerCreated(_) => "container.created",
         Transition::ContainerObserved(_) => "container.observed",
         Transition::ContainerRemoved => "container.removed",
@@ -95,9 +92,7 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
             registration_id, ..
         }
         | Transition::Bound { registration_id } => Some(registration_id.clone()),
-        Transition::Enrolled(facts) | Transition::Imported(facts) => {
-            facts.execution.bound_registration_id.clone()
-        }
+        Transition::Enrolled(facts) => facts.execution.bound_registration_id.clone(),
         _ => None,
     };
     let lifecycle_execution = event.operation_id.is_none() && facts.is_some();

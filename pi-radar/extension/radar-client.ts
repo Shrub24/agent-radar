@@ -810,8 +810,7 @@ function locationAt(value: unknown): RadarLocation | undefined {
 
 /**
  * One durable edge, decoded strictly. The bound child's `registration_id` is kept only
- * when it is a canonical UUID: a legacy binding has none, and an unreadable one
- * is not an identity to correlate with.
+ * when it is a canonical UUID: an unreadable one is not an identity to correlate with.
  */
 function spawnEdge(value: unknown): RadarResult<RadarSpawnEdge> {
 	const requestId = stringAt(value, "request_id");

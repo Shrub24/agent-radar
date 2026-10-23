@@ -274,14 +274,9 @@ pub(super) fn replay_existing_operation_inner(
             json!({ "request": public_record(record) }),
         ))
     } else {
-        let message = if record.params.is_none() {
-            "legacy record cannot establish content-equivalent replay"
-        } else {
-            "request id already names different contents"
-        };
         Some(Response::refused(
             &request.id,
-            &Refusal::new(Code::Refused, message),
+            &Refusal::new(Code::Refused, "request id already names different contents"),
         ))
     }
 }
@@ -290,38 +285,6 @@ pub(super) fn admit(
     operation: ops::Operation,
     request: &Request,
     target: Option<&str>,
-    requester: &Option<String>,
-    now: i64,
-    core: &Arc<Mutex<Core>>,
-) -> Admission {
-    admit_with_aliases(operation, request, target, &[], requester, now, core)
-}
-
-pub(super) fn unresolved_for_targets(
-    store: &store::Store,
-    target: Option<&str>,
-    aliases: &[String],
-    now: i64,
-) -> Result<Option<RequestRecord>, String> {
-    if let Some(held) = store.unresolved(target, now)? {
-        return Ok(Some(held));
-    }
-    for alias in aliases {
-        if target == Some(alias.as_str()) {
-            continue;
-        }
-        if let Some(held) = store.unresolved(Some(alias), now)? {
-            return Ok(Some(held));
-        }
-    }
-    Ok(None)
-}
-
-pub(super) fn admit_with_aliases(
-    operation: ops::Operation,
-    request: &Request,
-    target: Option<&str>,
-    target_aliases: &[String],
     requester: &Option<String>,
     now: i64,
     core: &Arc<Mutex<Core>>,
@@ -356,17 +319,12 @@ pub(super) fn admit_with_aliases(
                 }
                 return Admission::Answered(Response::ok(&request.id, result));
             }
-            let message = if record.params.is_none() {
-                "legacy record cannot establish content-equivalent replay"
-            } else {
-                "request id already names different contents"
-            };
             return Admission::Answered(Response::refused(
                 &request.id,
-                &Refusal::new(Code::Refused, message),
+                &Refusal::new(Code::Refused, "request id already names different contents"),
             ));
         }
-        let held = match unresolved_for_targets(&core.store, target, target_aliases, now) {
+        let held = match core.store.unresolved(target, now) {
             Ok(held) => held,
             Err(error) => {
                 return Admission::Answered(Response::refused(

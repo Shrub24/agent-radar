@@ -109,7 +109,6 @@ pub struct Event {
     pub lifecycle_event_id: Option<String>,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "agent_id")]
     pub registration_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn: Option<String>,
@@ -200,11 +199,8 @@ pub struct RequestRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Canonical params provide exact semantic equality on same-ID retries.
-    /// Legacy fingerprint-only records remain readable but cannot prove a match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fingerprint: Option<String>,
     /// RFC 3339 UTC with milliseconds, as [`now`] writes it.
     pub requested_at: String,
     pub expires_at: String,
@@ -254,7 +250,6 @@ impl RequestRecord {
             requester,
             target,
             params: None,
-            fingerprint: None,
             requested_at: format_millis(now_ms),
             expires_at: format_millis(now_ms + (ttl_seconds(method) as i64) * 1000),
             state: RecordState::Pending,
@@ -683,7 +678,7 @@ impl Store {
                 &bytes,
                 MAX_RECORD_BYTES,
             )?;
-            return log.record_operation(record, false);
+            return log.record_operation(record);
         }
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|error| format!("request {}: {error}", record.id))?;
@@ -727,14 +722,11 @@ impl Store {
             .get(&record.id)?
             .ok_or_else(|| format!("request {} does not exist", record.id))?;
         if super::events::operations::managed(&record.method) {
-            if previous.params != record.params || previous.fingerprint != record.fingerprint {
+            if previous.params != record.params {
                 return Err("operation update changes private admitted parameters".into());
             }
             let mut log = self.events.lock().unwrap_or_else(|e| e.into_inner());
-            if log.operation(&record.id).is_none() {
-                log.record_operation(&previous, true)?;
-            }
-            return log.record_operation(record, false);
+            return log.record_operation(record);
         }
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|error| format!("request {}: {error}", record.id))?;

@@ -41,10 +41,6 @@ The daemon SHALL record the bound child's subject id on the spawn edge's `bound`
 - **WHEN** a managed child presents its registration and the edge binds
 - **THEN** `bound` carries that registration's granted subject id
 
-#### Scenario: A legacy edge
-- **WHEN** an edge was recorded before this field existed
-- **THEN** it reads with no subject and no migration is run
-
 ### Requirement: A consumer lists its own children
 pi-radar SHALL list the calling process's children, derived from its own granted subject, each with its subject id, Pi session id, state (live, released or gone), pane and label, and a caller without a granted subject SHALL get no children.
 

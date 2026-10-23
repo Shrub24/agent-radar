@@ -315,10 +315,3 @@ pi-radar SHALL NOT write or require Pi-session launch identity markers. Historic
 #### Scenario: Old marker exists or host lacks custom entries
 - **WHEN** a session contains historical launch markers or the host cannot write custom session entries
 - **THEN** ordinary binding behavior is unchanged and no old execution identity is inherited
-
-### Requirement: Legacy subject adaptation preserves authority
-Radar SHALL preserve existing subject IDs, operation history, inboxes and parentage when establishing an unambiguous session association. It SHALL NOT silently merge conflicting legacy subjects or infer missing session evidence. Rollback support SHALL be documented according to persisted-format compatibility rather than presumed.
-
-#### Scenario: Multiple old subjects name one session
-- **WHEN** legacy records give conflicting subject identities for the same session
-- **THEN** Radar exposes an unresolved association without merging or deleting their authority

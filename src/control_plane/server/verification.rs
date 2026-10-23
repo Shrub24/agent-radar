@@ -256,7 +256,7 @@ pub(super) enum DeadPane {
 /// is that the daemon created this location (the edge names this backend and
 /// server instance and was created in it), that the pane's command exit is
 /// already a recorded fact of this edge, and that the backend reports the pane
-/// dead in a fresh read. History alone never closes anything, and a legacy or
+/// dead in a fresh read. History alone never closes anything, and a
 /// re-pointed edge is not eligible.
 pub(super) fn dead_pane_evidence(
     registry: &Arc<Registry>,
@@ -273,9 +273,6 @@ pub(super) fn dead_pane_evidence(
     let Ok(Some(edge)) = registry.spawn_edge(&close.spawn_request_id) else {
         return DeadPane::Unresolved;
     };
-    if edge.version != registry::SPAWN_VERSION {
-        return DeadPane::Unresolved;
-    }
     let Some(location) = edge.location.as_ref() else {
         return DeadPane::Unresolved;
     };
@@ -454,11 +451,6 @@ pub(super) fn cleanup_unbound_pane(
     let Ok(Some(edge)) = registry.spawn_edge(&subject.process.spawn_request_id) else {
         return None;
     };
-    if edge.version != registry::SPAWN_VERSION {
-        return Some(PaneCleanup::Refused(
-            "a legacy spawn edge names no pane of this daemon's".into(),
-        ));
-    }
     let Some(location) = edge.location.as_ref() else {
         return Some(PaneCleanup::Refused("the launch records no pane".into()));
     };
@@ -626,7 +618,7 @@ pub(super) fn observe_spawn_exits(
     }
     let pending: Vec<_> = edges
         .iter()
-        .filter(|edge| edge.version == registry::SPAWN_VERSION && edge.exit.is_none())
+        .filter(|edge| edge.exit.is_none())
         .filter_map(|edge| {
             edge.location
                 .as_ref()
@@ -641,7 +633,7 @@ pub(super) fn observe_spawn_exits(
     edges
         .iter()
         .map(|edge| {
-            if edge.version != registry::SPAWN_VERSION || edge.exit.is_some() {
+            if edge.exit.is_some() {
                 return Ok(edge.clone());
             }
             let Some(pane) = edge

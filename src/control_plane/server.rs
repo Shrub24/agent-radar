@@ -1370,46 +1370,6 @@ mod tests {
     }
 
     #[test]
-    fn stable_subject_admission_still_sees_legacy_execution_target_blocks() {
-        let directory = std::env::temp_dir().join(format!(
-            "agent-radar-server-test-{}-{}",
-            std::process::id(),
-            store::now_ms()
-        ));
-        std::fs::create_dir_all(&directory).expect("create temporary store root");
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("secure temporary store root");
-        let store = store::Store::open(&directory).expect("open store");
-        let execution_id = "11111111-1111-4111-8111-111111111111";
-        let request = RequestRecord::new(
-            "22222222-2222-4222-8222-222222222222",
-            "lifecycle.restart",
-            None,
-            Some(execution_id.to_string()),
-            1,
-        )
-        .with_params(serde_json::json!({}));
-        store.create(&request).expect("create pending record");
-        store
-            .write(&request.claim().start())
-            .expect("write in-flight legacy record");
-
-        let aliases = vec![execution_id.to_string()];
-        let held = unresolved_for_targets(
-            &store,
-            Some("33333333-3333-4333-8333-333333333333"),
-            &aliases,
-            2,
-        )
-        .expect("look up aliases")
-        .expect("legacy record blocks the stable subject");
-        assert_eq!(held.id, request.id);
-        assert_eq!(held.target.as_deref(), Some(execution_id));
-        drop(store);
-        std::fs::remove_dir_all(directory).expect("remove temporary store root");
-    }
-
-    #[test]
     fn the_socket_path_follows_the_documented_order() {
         let uid = 4242;
         assert_eq!(

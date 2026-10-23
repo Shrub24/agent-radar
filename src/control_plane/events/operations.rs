@@ -11,7 +11,6 @@ pub fn managed(method: &str) -> bool {
 
 fn public(mut record: RequestRecord) -> RequestRecord {
     record.params = None;
-    record.fingerprint = None;
     record
 }
 
@@ -24,11 +23,7 @@ impl Log {
         self.operations.get(id)
     }
 
-    pub fn record_operation(
-        &mut self,
-        record: &RequestRecord,
-        imported: bool,
-    ) -> Result<(), String> {
+    pub fn record_operation(&mut self, record: &RequestRecord) -> Result<(), String> {
         let subject_id = record
             .params
             .as_ref()
@@ -41,16 +36,12 @@ impl Log {
         if self.operations.get(&record.id) == Some(&record) {
             return Ok(());
         }
-        let transition = if imported {
-            Transition::OperationImported(record.clone())
-        } else {
-            match record.state {
-                RecordState::Pending | RecordState::Claimed => {
-                    Transition::OperationAdmitted(record.clone())
-                }
-                RecordState::Started => Transition::OperationStarted(record.clone()),
-                RecordState::Completed => Transition::OperationSettled(record.clone()),
+        let transition = match record.state {
+            RecordState::Pending | RecordState::Claimed => {
+                Transition::OperationAdmitted(record.clone())
             }
+            RecordState::Started => Transition::OperationStarted(record.clone()),
+            RecordState::Completed => Transition::OperationSettled(record.clone()),
         };
         let event = Event {
             version: VERSION,
@@ -63,11 +54,7 @@ impl Log {
                 .completed_at
                 .clone()
                 .unwrap_or_else(crate::control_plane::store::now),
-            source: if imported {
-                Source::RecoveryImport
-            } else {
-                Source::ProcessControl
-            },
+            source: Source::ProcessControl,
             transition,
         };
         self.validate_operation(&event)?;
@@ -79,15 +66,13 @@ impl Log {
         let record = match &event.transition {
             Transition::OperationAdmitted(record)
             | Transition::OperationStarted(record)
-            | Transition::OperationSettled(record)
-            | Transition::OperationImported(record) => record,
+            | Transition::OperationSettled(record) => record,
             _ => return Err("operation event has no operation payload".into()),
         };
         if event.operation_id.as_deref() != Some(&record.id)
             || SessionUuid::parse(&record.id).is_none()
             || !managed(&record.method)
             || record.params.is_some()
-            || record.fingerprint.is_some()
         {
             return Err("invalid or private operation event payload".into());
         }
@@ -109,7 +94,6 @@ impl Log {
             return Err("operation event changes its admitted identity".into());
         }
         let valid = match (&event.transition, prior) {
-            (Transition::OperationImported(_), None) => true,
             (Transition::OperationAdmitted(_), None) => {
                 record.state == RecordState::Pending && record.outcome.is_none()
             }

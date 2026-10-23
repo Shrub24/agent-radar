@@ -2,6 +2,10 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Unreleased
+
+- Removes every compatibility path for state written by earlier builds. A spawn edge must be version 2 with a session parent, an exit observation and a bound `registration_id`; the `agent_id` and `bound_agent_id` read aliases, the pre-migration `IdentityMapped` / `IdentityUnresolved` / `Imported` lifecycle transitions, `execution_generation`, `identity_unresolved`, fingerprint-only operation records, per-execution alias admission and the registration-less `bind_spawn` are gone. Run `radar reset --hard` once after installing; older state is refused rather than adapted.
+
 ## pi-radar 0.10.1
 
 - Fixes `children.list`, `observe`, `inspect` and the assignment follow, which refused as unsupported: `spawnList` pinned a `spawn.list.v1` contract no daemon advertises. It now requires `registry.v1`, which serves `spawn.list`.

@@ -233,8 +233,6 @@ pub struct Claim {
     #[serde(rename = "logical_subject_id")]
     pub subject_id: Option<String>,
     #[serde(default)]
-    pub identity_unresolved: bool,
-    #[serde(default)]
     pub managed: ManagedMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
@@ -278,7 +276,6 @@ pub struct ProcessRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_evidence: Option<EndedEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "bound_agent_id")]
     pub bound_registration_id: Option<String>,
     /// Recorded before a SIGTERM is sent, so a signal is never sent twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -386,7 +383,6 @@ fn draft(
     Claim {
         claim_id: execution_id,
         subject_id: Some(logical_subject_id),
-        identity_unresolved: false,
         managed,
         session,
         process: draft_process(spawn_request_id, launch, random_uuid(), now_ms),
@@ -627,7 +623,6 @@ pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Claim>, Stri
     let subject = Claim {
         claim_id: subject_id.into(),
         subject_id: facts.attachment.subject_id.clone(),
-        identity_unresolved: facts.attachment.identity_unresolved,
         managed: facts.attachment.managed.clone(),
         session: facts.attachment.session.clone(),
         process: execution,
@@ -843,19 +838,6 @@ fn subject_record_path(registry: &Registry, subject_id: &str) -> PathBuf {
         .subjects()
         .join("identity")
         .join(format!("{subject_id}.json"))
-}
-
-/// All exact execution IDs durably assigned to one stable logical subject.
-pub fn claim_ids_for_subject(registry: &Registry, logical_subject_id: &str) -> Vec<String> {
-    registry
-        .events
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .all_facts()
-        .into_iter()
-        .filter(|(_, facts)| facts.attachment.subject_id.as_deref() == Some(logical_subject_id))
-        .map(|(execution_id, _)| execution_id)
-        .collect()
 }
 
 /// Lists one latest execution per stable logical subject, ordered by logical ID.
@@ -1231,17 +1213,7 @@ pub fn enroll_subject(
     // A reattachment continues the session's subject, so its children, inbox and
     // managed metadata continue with it.
     let (logical, managed) = match subject_record_for_session(registry, session)? {
-        Some(record) => {
-            if let Some(last) = record.last_claim.as_deref()
-                && read(registry, last)?.is_some_and(|claim| claim.identity_unresolved)
-            {
-                return Err(
-                    "the session's prior subject has unresolved identity; resolve it before reattaching"
-                        .into(),
-                );
-            }
-            (Some(record.subject_id), record.managed)
-        }
+        Some(record) => (Some(record.subject_id), record.managed),
         None => (None, ManagedMetadata::default()),
     };
     let subject_id = enrollment_id.to_string();
@@ -1255,7 +1227,6 @@ pub fn enroll_subject(
     let mut subject = Claim {
         claim_id: subject_id.clone(),
         subject_id: Some(logical),
-        identity_unresolved: false,
         managed,
         session: Some(session.to_string()),
         process: execution,
@@ -1517,7 +1488,6 @@ pub fn public_view(subject: &Claim) -> Value {
         "subject_id": subject.subject_id.as_deref().unwrap_or(&subject.claim_id),
         "claim_id": subject.claim_id,
         "registration_id": subject.process.registration_id,
-        "identity_unresolved": subject.identity_unresolved,
         "managed": subject.managed,
         "spawn_request_id": subject.process.spawn_request_id,
         "state": subject.process.state,
@@ -2251,8 +2221,7 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
             );
         }
     };
-    let mut target = Facts::from_subject(subject);
-    target.attachment.execution_generation = previous.attachment.execution_generation;
+    let target = Facts::from_subject(subject);
     if previous == target {
         return Ok(());
     }
@@ -2602,7 +2571,6 @@ mod tests {
         let view = public_view(&current);
         assert_eq!(view["subject_id"], logical_id);
         assert_eq!(view["claim_id"], second.claim_id);
-        assert!(view.get("execution_generation").is_none(), "{view}");
         assert!(view.get("execution_id").is_none(), "{view}");
 
         let listed = list_logical_after(&registry, None, 10).expect("logical list");

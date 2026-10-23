@@ -3318,11 +3318,18 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
         "the subject is free to continue"
     );
     let late = registry
-        .bind_spawn(
-            &agent_radar::control_plane::registry::SpawnBindRequest {
-                token: edge.token.clone(),
+        .register(
+            &agent_radar::control_plane::registry::RegistrationRequest {
                 source: "late-child".into(),
                 incarnation: random_uuid(),
+                session: None,
+                owner: None,
+                run: None,
+                label: None,
+                location: None,
+                process: None,
+                launch: None,
+                spawn_token: Some(edge.token.clone()),
             },
             31_001,
         )

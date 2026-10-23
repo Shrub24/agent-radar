@@ -187,11 +187,6 @@ pub(super) fn communication_identity(
                 "the granted claim does not match the current session".into(),
             )
         })?;
-    if subject.identity_unresolved {
-        return Err(communication::Error::Invalid(
-            "Radar launch identity is unresolved".into(),
-        ));
-    }
     Ok(crate::control_plane::public_contracts::HandoffIdentity {
         registration_id: registration_id.to_owned(),
         session_id,
@@ -212,19 +207,9 @@ pub(super) fn validate_handoff_recipient(
     let sender_subject = subjects::read_logical(registry, sender_subject_id)
         .map_err(communication::Error::Internal)?
         .ok_or(communication::Error::NotFound)?;
-    if sender_subject.identity_unresolved {
-        return Err(communication::Error::Invalid(
-            "sender logical identity is unresolved".into(),
-        ));
-    }
-    let recipient_subject = subjects::read_logical(registry, recipient_subject_id)
+    subjects::read_logical(registry, recipient_subject_id)
         .map_err(communication::Error::Internal)?
         .ok_or(communication::Error::NotFound)?;
-    if recipient_subject.identity_unresolved {
-        return Err(communication::Error::Invalid(
-            "recipient logical identity is unresolved".into(),
-        ));
-    }
     if communication::is_parent_recipient(
         sender_subject.managed.parent_subject_id.as_deref(),
         recipient_subject_id,

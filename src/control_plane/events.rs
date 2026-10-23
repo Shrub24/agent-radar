@@ -60,16 +60,10 @@ pub struct Facts {
 pub struct AttachmentFacts {
     pub registration_id: String,
     pub session: Option<String>,
-    /// Stable logical subject identity. Absent only in pre-migration events.
+    /// Stable logical subject identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "logical_subject_id")]
     pub subject_id: Option<String>,
-    /// One-based execution generation within the logical subject.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_generation: Option<u32>,
-    /// True when legacy links or later evidence cannot establish this execution's continuity.
-    #[serde(default)]
-    pub identity_unresolved: bool,
     #[serde(default)]
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,
 }
@@ -93,7 +87,6 @@ pub struct ProcessFacts {
     pub ended_evidence: Option<EndedEvidence>,
     #[serde(default)]
     pub pane_cleanup: Option<PaneCleanup>,
-    #[serde(alias = "bound_agent_id")]
     pub bound_registration_id: Option<String>,
     pub signalled_at: Option<String>,
     pub exited_at: Option<String>,
@@ -106,8 +99,6 @@ impl Facts {
             attachment: AttachmentFacts {
                 registration_id: subject.process.registration_id.clone(),
                 subject_id: subject.subject_id.clone(),
-                execution_generation: None,
-                identity_unresolved: subject.identity_unresolved,
                 managed: subject.managed.clone(),
                 session: subject.session.clone(),
             },
@@ -169,21 +160,8 @@ pub enum Transition {
     },
     Created(Facts),
     Enrolled(Facts),
-    Imported(Facts),
-    /// Adds stable logical identity to one legacy execution record without
-    /// rewriting its existing event history.
-    IdentityMapped {
-        #[serde(rename = "logical_subject_id")]
-        subject_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        execution_generation: Option<u32>,
-        identity_unresolved: bool,
-    },
-    /// Marks continuity evidence ambiguous without rewriting an existing mapping.
-    IdentityUnresolved,
     Captured(ProcessIdentity),
     Bound {
-        #[serde(alias = "agent_id")]
         registration_id: String,
     },
     Revoked,
@@ -205,7 +183,6 @@ pub enum Transition {
     OperationAdmitted(RequestRecord),
     OperationStarted(RequestRecord),
     OperationSettled(RequestRecord),
-    OperationImported(RequestRecord),
     ContainerCreated(Container),
     ContainerObserved(ContainerObservation),
     ContainerRemoved,
@@ -232,8 +209,6 @@ pub enum Source {
     ProcessControl,
     ProcessObservation,
     PaneControl,
-    RecoveryImport,
-    IdentityMigration,
     /// A topology effect this daemon dispatched: a container it created, deleted
     /// or reloaded.
     TopologyControl,
@@ -498,8 +473,6 @@ impl Log {
                 attachment: AttachmentFacts {
                     registration_id: id.into(),
                     subject_id: None,
-                    execution_generation: None,
-                    identity_unresolved: false,
                     managed: Default::default(),
                     session: None,
                 },
@@ -582,32 +555,13 @@ impl Log {
 
 fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
     let mut facts = match (&event.transition, previous) {
-        (
-            Transition::Created(facts) | Transition::Enrolled(facts) | Transition::Imported(facts),
-            None,
-        ) => return Ok(facts.clone()),
+        (Transition::Created(facts) | Transition::Enrolled(facts), None) => {
+            return Ok(facts.clone());
+        }
         (_, Some(facts)) => facts.clone(),
         _ => return Err("lifecycle transition has no baseline".into()),
     };
     match &event.transition {
-        Transition::IdentityUnresolved => {
-            facts.attachment.identity_unresolved = true;
-        }
-        Transition::IdentityMapped {
-            subject_id: logical_subject_id,
-            execution_generation,
-            identity_unresolved,
-        } => {
-            if facts.attachment.subject_id.is_some() || logical_subject_id.is_empty() {
-                return Err(format!(
-                    "identity mapping conflicts with current facts (logical={:?}, generation={:?}, new logical={logical_subject_id:?}, new generation={execution_generation:?})",
-                    facts.attachment.subject_id, facts.attachment.execution_generation
-                ));
-            }
-            facts.attachment.subject_id = Some(logical_subject_id.clone());
-            facts.attachment.execution_generation = *execution_generation;
-            facts.attachment.identity_unresolved = *identity_unresolved;
-        }
         Transition::Captured(process) if facts.execution.state == State::Pending => {
             facts.execution.state = State::Captured;
             facts.execution.process = Some(process.clone());

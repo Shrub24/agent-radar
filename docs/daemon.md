@@ -64,8 +64,7 @@ environment values. The child captures/removes the exported
 `PI_RADAR_REGISTRATION_ID` and presents it as its registration; new bindings persist the returned
 `registration_id`. Read `result.spawn.bound.registration_id` from flat `spawn.get` and use that
 exact ID with `agent.get`, not aliases or a nonexistent `spawn.edge` object.
-Legacy bindings may omit the ID. New v2 edges retain process and session parent
-identities; v1 edges have no inferred session parent. Current v2 topology also
+Edges retain process and session parent identities. Topology also
 reports `exit_observation`: tmux can persist a typed pane-command exit after
 arming `remain-on-exit`; Herdr and backends without `mux.exit_observation` report
 unknown. Missing panes do not imply exit, and exit evidence never changes
@@ -77,7 +76,7 @@ child's process birth identity. A pane whose command has exited is cleaned up as
 `already_exited`, but only when the edge recorded that exact exit and the
 process serving the backend now is the one whose verified birth identity the
 daemon recorded before the create: a pane id outlives the server that answered
-the create. An edge with no recorded creating instance — a legacy edge, or an
+the create. An edge with no recorded creating instance — an
 edge on a backend that cannot name its serving process, such as Herdr — is never
 fenced, so its dead panes are refused rather than inferred. `already_exited`
 confirms retained-pane cleanup and the pane command's recorded exit; it never
