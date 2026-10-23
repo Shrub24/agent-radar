@@ -23,19 +23,15 @@ A relaunch SHALL start the program with the given args, session selectors remove
 - **THEN** the program exits without creating a session and the launch is recorded as failed
 
 ### Requirement: A parent can continue its own child
-`spawn.create` SHALL accept an optional `continue_subject_id` and relaunch that subject with the program and args the parent sent, refused before any effect unless the subject is the caller's own child, has a recorded session, and has no reserved successor. `if_running` SHALL default to `refuse`; only `replace` stops a live child.
+`spawn.create` SHALL accept an optional `continue_subject_id` and relaunch that subject with the program and args the parent sent, refused before any effect unless the subject is the caller's own child, has a recorded session, and has no reserved successor.
 
 #### Scenario: Continuing a released child
 - **WHEN** a parent continues its child whose process ended
 - **THEN** the launch is reserved on that subject and the child runs in its recorded session
 
-#### Scenario: Continuing a live child by default
-- **WHEN** the child still runs and `if_running` is absent
+#### Scenario: Continuing a live child
+- **WHEN** the child still runs or a successor is already reserved
 - **THEN** the request is refused and the child is not signalled
-
-#### Scenario: Replacing a live child
-- **WHEN** the child still runs and `if_running` is `replace`
-- **THEN** it is stopped and its exit awaited before the relaunch, and a child that does not exit leaves the relaunch withdrawn
 
 #### Scenario: A caller without a granted subject
 - **WHEN** a process whose claim is duplicate, pending or released asks to continue a child
@@ -44,6 +40,17 @@ A relaunch SHALL start the program with the given args, session selectors remove
 #### Scenario: Another parent's child
 - **WHEN** the subject's recorded parent is not the caller's subject
 - **THEN** the request is refused and nothing is created
+
+### Requirement: A parent can restart its own child
+`lifecycle.restart` SHALL accept a request from the subject's recorded parent addressed by subject alone, with the program and args the parent sends; the daemon SHALL resolve the current process itself, stop it through its scope, await its exit and relaunch. An operator restart SHALL stay fenced by the claim it names.
+
+#### Scenario: Restart under a new definition
+- **WHEN** a parent restarts its live child with a new program
+- **THEN** the current process is stopped and the child relaunches in its own pane and session with the new program
+
+#### Scenario: Two restarts in a row
+- **WHEN** an operator restart and a parent restart of the same child arrive one after the other
+- **THEN** the second replaces the first's successor, and a restart arriving while a successor is reserved is refused
 
 ### Requirement: A relaunch keeps the agent's pane when it exists
 A relaunch SHALL place the process in the agent's own pane when that pane still exists, and otherwise split beside the parent.
