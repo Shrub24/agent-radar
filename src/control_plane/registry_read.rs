@@ -177,10 +177,11 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
     let mut subjects_seen = Vec::new();
     let mut after: Option<String> = None;
     loop {
-        let page = subjects::list_logical_after(registry, after.as_deref(), PAGE)?;
-        let last = page.last().map(logical_id);
+        let page = subjects::list_subjects_after(registry, after.as_deref(), PAGE)?;
+        let last = page.last().map(subject_of);
         for subject in &page {
-            let Some(current) = subjects::read_logical(registry, &logical_id(subject))? else {
+            let Some(current) = subjects::current_attachment(registry, &subject_of(subject))?
+            else {
                 continue;
             };
             let view = subjects::public_view(&current);
@@ -195,8 +196,8 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
     }
 }
 
-/// The stable logical id a lifecycle read pages by.
-fn logical_id(subject: &crate::control_plane::lifecycle::Claim) -> String {
+/// The subject a lifecycle read pages by.
+fn subject_of(subject: &crate::control_plane::lifecycle::Claim) -> String {
     subject
         .subject_id
         .clone()

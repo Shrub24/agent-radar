@@ -76,7 +76,7 @@ pub struct RegistryRead {
 /// part of the dashboard's registry read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LifecycleSubject {
-    /// Stable logical subject used by public control requests.
+    /// The subject used by public control requests.
     pub subject_id: String,
     /// Exact execution record ID used to match its spawn edge and process.
     #[serde(default)]

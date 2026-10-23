@@ -60,9 +60,8 @@ pub struct Facts {
 pub struct AttachmentFacts {
     pub registration_id: String,
     pub session: Option<String>,
-    /// Stable logical subject identity.
+    /// The durable agent this attachment is one process of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "logical_subject_id")]
     pub subject_id: Option<String>,
     #[serde(default)]
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,

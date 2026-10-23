@@ -183,7 +183,7 @@ fn establish_lifecycle(
     let Some(target) = record.target.as_deref() else {
         return Ok((None, "the record names no subject to verify".into()));
     };
-    let Some(subject) = lifecycle::read_logical(registry, target)? else {
+    let Some(subject) = lifecycle::current_attachment(registry, target)? else {
         return Ok((
             None,
             format!("the subject `{target}` it named is not recorded"),

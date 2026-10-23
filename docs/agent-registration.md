@@ -316,7 +316,7 @@ Three roles, kept apart so no participant keeps a second writable copy of
 another's state:
 
 - **Radar is the lifecycle authority** for a managed Pi process. It records the
-  logical subject, the execution generations, the accepted launch intent and its
+  subject, the current attachment, the accepted launch intent and its
   outcome, and it alone decides a transition. Owner, run, label, role and parent
   values supplied in an accepted launch are Radar state; a publisher has no write
   path to them.

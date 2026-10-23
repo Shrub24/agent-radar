@@ -478,7 +478,7 @@ mod tests {
         drop(registry);
         let registry = Registry::open(&scratch.0).expect("registry reopens after reset");
         assert!(
-            lifecycle::read_logical(&registry, SUBJECT_ID)
+            lifecycle::current_attachment(&registry, SUBJECT_ID)
                 .unwrap()
                 .is_none()
         );

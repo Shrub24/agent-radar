@@ -481,7 +481,7 @@ pub(super) fn registry_request(
                 let core = locked(core);
                 (Arc::clone(&core.registry), Arc::clone(&core.verifier))
             };
-            let current = match subjects::read_logical(&registry, &params.subject_id) {
+            let current = match subjects::current_attachment(&registry, &params.subject_id) {
                 Ok(Some(subject)) => subject,
                 Ok(None) => {
                     return Response::refused(
@@ -492,7 +492,7 @@ pub(super) fn registry_request(
                 Err(error) => return registry_error(request, error),
             };
             // Observe exit for the latest execution by verified identity before
-            // answering; the public ID remains the stable logical subject.
+            // answering; the public ID remains the durable subject.
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as i64);
@@ -501,7 +501,7 @@ pub(super) fn registry_request(
             {
                 return registry_error(request, error);
             }
-            match subjects::read_logical(&registry, &params.subject_id) {
+            match subjects::current_attachment(&registry, &params.subject_id) {
                 Ok(Some(subject)) => Response::ok(
                     &request.id,
                     json!({"subject": subjects::public_view(&subject), "source": observation_source(core)}),
@@ -552,11 +552,14 @@ pub(super) fn registry_request(
                 (Arc::clone(&core.registry), Arc::clone(&core.verifier))
             };
             // One record beyond the page tells whether a continuation exists.
-            let read =
-                match subjects::list_logical_after(&registry, params.after.as_deref(), limit + 1) {
-                    Ok(read) => read,
-                    Err(error) => return registry_error(request, error),
-                };
+            let read = match subjects::list_subjects_after(
+                &registry,
+                params.after.as_deref(),
+                limit + 1,
+            ) {
+                Ok(read) => read,
+                Err(error) => return registry_error(request, error),
+            };
             let has_more = read.len() > limit;
             let page: Vec<(String, String)> = read
                 .iter()
@@ -573,20 +576,20 @@ pub(super) fn registry_request(
                 .collect();
             let now = unix_millis();
             let mut views = Vec::with_capacity(page.len());
-            for (logical_id, execution_id) in &page {
+            for (subject_id, claim_id) in &page {
                 if let Err(error) =
-                    subjects::observe_exit(&registry, execution_id, verifier.as_ref(), now)
+                    subjects::observe_exit(&registry, claim_id, verifier.as_ref(), now)
                 {
                     return registry_error(request, error);
                 }
-                match subjects::read_logical(&registry, logical_id) {
+                match subjects::current_attachment(&registry, subject_id) {
                     Ok(Some(subject)) => views.push(subjects::public_view(&subject)),
                     Ok(None) => {}
                     Err(error) => return registry_error(request, error),
                 }
             }
             let next_after = if has_more {
-                page.last().map(|(logical, _)| logical.clone())
+                page.last().map(|(subject, _)| subject.clone())
             } else {
                 None
             };

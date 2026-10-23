@@ -204,10 +204,10 @@ pub(super) fn validate_handoff_recipient(
     recipient_subject_id: &str,
 ) -> Result<(), communication::Error> {
     let sender_subject_id = sender.subject_id.as_str();
-    let sender_subject = subjects::read_logical(registry, sender_subject_id)
+    let sender_subject = subjects::current_attachment(registry, sender_subject_id)
         .map_err(communication::Error::Internal)?
         .ok_or(communication::Error::NotFound)?;
-    subjects::read_logical(registry, recipient_subject_id)
+    subjects::current_attachment(registry, recipient_subject_id)
         .map_err(communication::Error::Internal)?
         .ok_or(communication::Error::NotFound)?;
     if communication::is_parent_recipient(

@@ -50,9 +50,9 @@ pub struct SpawnRequest {
     pub request_id: String,
     /// Exact agent registration used as the live process parent.
     pub parent: String,
-    /// Stable logical parent identity, verified against this registration's fresh context.
+    /// Parent subject, verified against this registration's fresh context.
     pub parent_session_id: String,
-    /// The logical parent subject, when the request was made on behalf of one.
+    /// The parent subject, when the request was made on behalf of one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_subject_id: Option<String>,
 }
@@ -116,7 +116,7 @@ pub struct SpawnEdge {
     pub parent: String,
     /// Logical session parent.
     pub parent_session_id: String,
-    /// The logical subject that requested this launch, when it had one. Durable
+    /// The subject that requested this launch, when it had one. Durable
     /// parentage: a session moves on `/resume`, so it is not the parent key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_subject_id: Option<String>,

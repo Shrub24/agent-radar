@@ -5,6 +5,7 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 ## Unreleased
 
 - Removes every compatibility path for state written by earlier builds. A spawn edge must be version 2 with a session parent, an exit observation and a bound `registration_id`; the `agent_id` and `bound_agent_id` read aliases, the pre-migration `IdentityMapped` / `IdentityUnresolved` / `Imported` lifecycle transitions, `execution_generation`, `identity_unresolved`, fingerprint-only operation records, per-execution alias admission and the registration-less `bind_spawn` are gone. Run `radar reset --hard` once after installing; older state is refused rather than adapted.
+- Renames the stored claim keys: a claim is stored under `claim_id` and its durable agent under `subject_id`, where they were `subject_id` and `logical_subject_id`. `lifecycle::read_logical` and `list_logical_after` are now `current_attachment` and `list_subjects_after`.
 
 ## pi-radar 0.10.1
 

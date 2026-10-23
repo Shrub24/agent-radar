@@ -405,7 +405,7 @@ pub(super) fn spawn_child(
         && let Some(parent_subject_id) = params.managed.parent_subject_id.as_deref()
     {
         let registry = Arc::clone(&locked(core).registry);
-        match subjects::read_logical(&registry, parent_subject_id) {
+        match subjects::current_attachment(&registry, parent_subject_id) {
             Ok(Some(parent_subject))
                 if parent_subject.process.bound_registration_id.as_deref()
                     == Some(params.parent.as_str()) => {}

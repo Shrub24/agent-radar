@@ -99,7 +99,7 @@ fn journal_lock(root: &Path) -> Arc<Mutex<()>> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub seq: u64,
-    /// Stable logical lifecycle subject ID, or a container ID for topology events.
+    /// The subject a lifecycle event belongs to, or a container ID for topology events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
     /// Exact lifecycle execution affected by a subject event.

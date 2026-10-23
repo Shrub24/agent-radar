@@ -227,10 +227,8 @@ pub struct SubjectRecord {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
-    #[serde(rename = "subject_id")]
     pub claim_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "logical_subject_id")]
     pub subject_id: Option<String>,
     #[serde(default)]
     pub managed: ManagedMetadata,
@@ -377,12 +375,12 @@ fn draft(
     now_ms: i64,
 ) -> Claim {
     let execution_id = random_uuid();
-    let logical_subject_id = identity
+    let subject_id = identity
         .map(|(id, _)| id)
         .unwrap_or_else(|| execution_id.clone());
     Claim {
         claim_id: execution_id,
-        subject_id: Some(logical_subject_id),
+        subject_id: Some(subject_id),
         managed,
         session,
         process: draft_process(spawn_request_id, launch, random_uuid(), now_ms),
@@ -668,12 +666,9 @@ fn read_recorded(registry: &Registry, subject_id: &str) -> Result<Claim, String>
     read(registry, subject_id)?.ok_or_else(|| "tracked launch subject is unavailable".to_string())
 }
 
-/// Resolve current attachment authority, or the last attachment's history when detached.
-pub fn read_logical(
-    registry: &Registry,
-    logical_subject_id: &str,
-) -> Result<Option<Claim>, String> {
-    let Some(record) = read_subject_record(registry, logical_subject_id)? else {
+/// Resolve a subject's current attachment, or its last one when detached.
+pub fn current_attachment(registry: &Registry, subject_id: &str) -> Result<Option<Claim>, String> {
+    let Some(record) = read_subject_record(registry, subject_id)? else {
         return Ok(None);
     };
     let Some(claim_id) = record
@@ -840,8 +835,8 @@ fn subject_record_path(registry: &Registry, subject_id: &str) -> PathBuf {
         .join(format!("{subject_id}.json"))
 }
 
-/// Lists one latest execution per stable logical subject, ordered by logical ID.
-pub fn list_logical_after(
+/// Lists one current attachment per subject, ordered by subject id.
+pub fn list_subjects_after(
     registry: &Registry,
     after: Option<&str>,
     limit: usize,
@@ -856,7 +851,7 @@ pub fn list_logical_after(
         .collect();
     ids.into_iter()
         .filter(|id| after.is_none_or(|cut| id.as_str() > cut))
-        .filter_map(|id| read_logical(registry, &id).transpose())
+        .filter_map(|id| current_attachment(registry, &id).transpose())
         .take(limit)
         .collect()
 }
@@ -2547,7 +2542,7 @@ mod tests {
     }
 
     #[test]
-    fn public_logical_subject_resolves_to_its_latest_execution() {
+    fn a_subject_resolves_to_its_current_attachment() {
         let scratch = Scratch::new("logical-current");
         let registry = scratch.registry();
         let first = create(&registry, SPAWN, launch(), None, 1).expect("first execution");
@@ -2562,7 +2557,7 @@ mod tests {
         )
         .expect("successor execution");
 
-        let current = read_logical(&registry, &logical_id)
+        let current = current_attachment(&registry, &logical_id)
             .expect("read logical subject")
             .expect("current execution");
         assert_eq!(current.claim_id, second.claim_id);
@@ -2573,7 +2568,7 @@ mod tests {
         assert_eq!(view["claim_id"], second.claim_id);
         assert!(view.get("execution_id").is_none(), "{view}");
 
-        let listed = list_logical_after(&registry, None, 10).expect("logical list");
+        let listed = list_subjects_after(&registry, None, 10).expect("subject list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].claim_id, second.claim_id);
     }
@@ -2820,7 +2815,9 @@ mod tests {
         .expect("reservation");
         cancel_reservation(&registry, &first.claim_id, &pending.claim_id, 3).expect("withdraw");
         let reopened = scratch.registry();
-        let current = read_logical(&reopened, &first.subject_id).unwrap().unwrap();
+        let current = current_attachment(&reopened, &first.subject_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(current.claim_id, first.claim_id);
         assert_eq!(
             read(&reopened, &pending.claim_id)

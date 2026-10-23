@@ -430,7 +430,7 @@ pub(super) fn execute_restart(
         return response;
     }
     let registry = Arc::clone(&locked(core).registry);
-    let subject = match subjects::read_logical(&registry, &params.subject_id) {
+    let subject = match subjects::current_attachment(&registry, &params.subject_id) {
         Ok(Some(subject)) => subject,
         Ok(None) => {
             return Response::refused(
@@ -459,7 +459,7 @@ pub(super) fn execute_restart(
         (None, Some(parent)) => {
             let owned = match subject.managed.parent_subject_id.as_deref() {
                 Some(parent_subject) => matches!(
-                    subjects::read_logical(&registry, parent_subject),
+                    subjects::current_attachment(&registry, parent_subject),
                     Ok(Some(claim)) if claim.process.bound_registration_id.as_deref() == Some(parent.as_str())
                 ),
                 None => false,
@@ -497,14 +497,14 @@ pub(super) fn execute_restart(
         );
     };
     let now = store::now_ms();
-    let logical_subject_id = subject
+    let subject_key = subject
         .subject_id
         .clone()
         .unwrap_or_else(|| subject.claim_id.clone());
     let cancel = match admit(
         ops::Operation::Restart,
         request,
-        Some(&logical_subject_id),
+        Some(&subject_key),
         &requester,
         now,
         core,
@@ -515,7 +515,7 @@ pub(super) fn execute_restart(
                 ops::Operation::Restart,
                 request,
                 &message,
-                Some(logical_subject_id.clone()),
+                Some(subject_key.clone()),
                 core,
             );
         }
@@ -525,7 +525,7 @@ pub(super) fn execute_restart(
         &request.id,
         ops::Operation::Restart.as_str(),
         requester,
-        Some(logical_subject_id),
+        Some(subject_key),
         now,
     )
     .with_params(request.params.clone());
@@ -819,7 +819,7 @@ pub(super) fn cancel_target(
 ) -> Result<(String, String), Refusal> {
     let internal = |error: String| Refusal::new(Code::Internal, error);
     let subject = match (&params.subject_id, &params.spawn_request_id) {
-        (Some(subject_id), None) => subjects::read_logical(registry, subject_id)
+        (Some(subject_id), None) => subjects::current_attachment(registry, subject_id)
             .map_err(internal)?
             .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?,
         (None, Some(request_id)) => {
@@ -833,7 +833,7 @@ pub(super) fn cancel_target(
             let launched = subjects::read(registry, &subject_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
-            let subject = subjects::read_logical(
+            let subject = subjects::current_attachment(
                 registry,
                 launched.subject_id.as_deref().unwrap_or(&launched.claim_id),
             )

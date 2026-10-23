@@ -608,7 +608,7 @@ impl Registry {
     /// One page of spawn edges in stable request-id order, at most `limit` of
     /// them, starting after `after`. Each token is included: what a client may
     /// read is [`SpawnEdge::topology`].
-    /// [`Self::spawn_edges_after`] restricted to the edges one logical parent
+    /// [`Self::spawn_edges_after`] restricted to the edges one parent subject
     /// subject launched, so a caller reads its own children, not the topology.
     pub fn spawn_edges_for_subject_after(
         &self,

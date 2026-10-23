@@ -51,7 +51,7 @@ The public process identifier is `registration_id`. Durable agent identity is `s
 
 From the repository checkout, run `npm run generate:contracts` in this directory to regenerate schemas and TypeScript declarations. `npm test` checks the generated artifacts are current, typechecks the public SDK aliases, validates canonical wire fixtures and integer bounds against the schemas, and runs the package tests. Generation uses the locked Schemars crate plus pinned `json-schema-to-typescript` and TypeScript development dependencies; it adds no runtime package dependency.
 
-Lifecycle execution generations are bounded to `u32` and remain exactly representable as JavaScript numbers. The initial schema set leaves operation sequences and event cursors unchanged; their long-horizon representation remains a separate wire-compatibility decision.
+Operation sequences and event cursors stay exactly representable as JavaScript numbers and are unchanged by the schemas in this package; their long-horizon representation remains a separate wire decision.
 
 Run `npm pack` to build the bundled runtime entrypoints before creating the tarball.
 
