@@ -17,7 +17,7 @@ The daemon SHALL register an agent incarnation independently of its session UUID
 - **THEN** it does not validate the registered incarnation
 
 ### Requirement: Direct reports preserve provenance
-The daemon SHALL accept execution and assignment snapshots directly without consulting or writing Herdr. Execution evidence, owner assignment projection, waiting reason, last outcome and advertised actions SHALL stay separate and source-labelled. Unknown vocabulary SHALL be preserved. Registration and advertising SHALL NOT by themselves authorize restart or certify assignment completion.
+The daemon SHALL accept execution and assignment snapshots directly without consulting or writing backend state. Execution evidence, owner assignment projection, waiting reason, last outcome and advertised actions SHALL stay separate and source-labelled. Unknown vocabulary SHALL be preserved. Registration and advertising SHALL NOT by themselves authorize restart or certify assignment completion.
 
 #### Scenario: Failed turn on an idle process
 - **WHEN** execution reports idle and a failed last outcome while its owner reports an unsettled assignment
@@ -80,7 +80,7 @@ Registry reads and writes SHALL use the daemon's trusted socket and private stat
 
 #### Scenario: Existing report client
 - **WHEN** a client sends the existing mux report method
-- **THEN** its established Herdr-forwarding semantics remain unchanged
+- **THEN** its established forwarding semantics remain unchanged
 
 ### Requirement: Current session context is mutable and fenced
 pi-radar SHALL report process birth identity, current location, session UUID and a session-load claim ID through one presence operation. Radar SHALL answer with `registration_id`, the claim ID and a `granted`, `duplicate`, `pending` or `released` standing; only a grant includes `subject_id`. Retries SHALL reuse the claim ID, and generic publisher operations SHALL NOT be the session-management path.
@@ -184,7 +184,7 @@ A spawned publisher SHALL present the delivered token privately in agent.registe
 - **THEN** registration refuses and the original binding remains unchanged
 
 ### Requirement: Binding does not imply application readiness
-Token binding SHALL establish only the exact registration associated with a daemon spawn. It SHALL NOT certify assignment readiness, process exit or assignment completion. Consumers SHALL read execution and assignment reports separately with their own freshness and provenance; never treat launch dispatch, pane presence or a Herdr alias as application readiness.
+Token binding SHALL establish only the exact registration associated with a daemon spawn. It SHALL NOT certify assignment readiness, process exit or assignment completion. Consumers SHALL read execution and assignment reports separately with their own freshness and provenance; never treat launch dispatch, pane presence or a backend alias as application readiness.
 
 #### Scenario: Bound but no execution publication
 - **WHEN** a child is bound but has not published fresh execution facts
@@ -192,7 +192,7 @@ Token binding SHALL establish only the exact registration associated with a daem
 
 #### Scenario: Bound with fresh execution publication
 - **WHEN** a bound child publishes execution facts
-- **THEN** a consumer can read those facts using its exact agent_id without looking up a Herdr agent alias
+- **THEN** a consumer can read those facts using its exact agent_id without looking up a backend alias
 
 ### Requirement: Agent facts are a separate self-authored channel
 The registry SHALL accept a separate self-authored `facts` channel for model, provider, thinking, context window usage, session display name and unresolved background tasks. Context window usage SHALL be `context_window` carrying integer `tokens` in context and integer `window` size, where `window` is greater than zero and `tokens` does not exceed it. It SHALL use independent writer fencing, sequence and freshness and SHALL NOT merge facts with execution or assignment.

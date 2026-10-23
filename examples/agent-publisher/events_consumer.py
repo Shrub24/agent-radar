@@ -58,7 +58,7 @@ def full_read(path: Path) -> None:
 
 
 def consume(path: Path) -> None:
-    if "events.v1" not in call(path, "daemon.ping", {})["capabilities"]:
+    if "events.v1" not in call(path, "daemon.ping", {})["contracts"]:
         raise RuntimeError("daemon does not advertise events.v1")
     epoch = None
     after = 0
@@ -76,8 +76,8 @@ def consume(path: Path) -> None:
             continue
         epoch = result["epoch"]
         for event in result["events"]:
-            if event.get("agent_id") is not None:
-                value = call(path, "agent.get", {"agent_id": event["agent_id"]})
+            if event.get("registration_id") is not None:
+                value = call(path, "agent.get", {"registration_id": event["registration_id"]})
                 print(json.dumps({"event": event, "agent": value.get("agent")}, separators=(",", ":")), flush=True)
             elif event.get("spawn") is not None:
                 value = call(path, "spawn.get", {"request_id": event["spawn"]})

@@ -1,20 +1,20 @@
 //! Title normalisation: what a row shows, once the runtime's own prefixes are
 //! taken off.
 //!
-//! Agents write their mark and their name into the terminal title, and Herdr
+//! Agents write their mark and their name into the terminal title, and the backend
 //! keeps the last one a pane had even after the session it came from is gone.
 //! A row that already draws the vendor's mark does not need the mark repeated
 //! in text, and a pane whose title is a finished session's is not saying
 //! anything about what the pane is now.
 //!
-//! The rules follow `herdr-radar`'s `stripPiMark`/`stripVendorPulse`
+//! The rules follow the vendor mark and pulse conventions
 //! (`lib/state.js`): strip only a mark or a name at the very start, only when a
 //! separator says the rest is a title, and only when something is left over.
 //! `gemini rocks` keeps its words — the vendor was not a prefix there.
 
 use crate::theme;
 
-/// A bracket Herdr and some agents pulse while something waits: `[!] foo`.
+/// A bracketed mark pulses while something waits: `[!] foo`.
 fn strip_pulse(title: &str) -> &str {
     let Some(rest) = title.strip_prefix('[') else {
         return title;
@@ -116,7 +116,7 @@ pub fn session_vendor(text: &str) -> Option<&'static str> {
 /// the terminal title says what the pane is now, and the old title belongs in
 /// the details, superseded.
 ///
-/// A title that only repeats the workspace is dropped for the pane id: Herdr's
+/// A title that only repeats the workspace is dropped for the pane id: the backend's
 /// abbreviated cwd is most often the project directory the group header has
 /// already named, and printing `~/P/d/nix-fleet` under `nix-fleet` spends the
 /// width the rest of the row needs. A path somewhere else is kept — a pane in a

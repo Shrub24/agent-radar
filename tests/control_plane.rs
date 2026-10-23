@@ -4365,9 +4365,17 @@ fn the_daemon_subcommand_serves_prints_and_stops_cleanly_on_a_signal() {
         let sandbox = Sandbox::new(name);
         let socket = sandbox.socket();
         let state = sandbox.state();
-        // Herdr starts without a systemd unit, so the serving path runs here.
-        let mut child =
-            DaemonChild::spawn_with(&socket, &state, &[("RADAR_CONTROL_BACKEND", "herdr")]);
+        let Some(server) = TmuxServer::start("daemon-signal") else {
+            return;
+        };
+        let mut child = DaemonChild::spawn_with(
+            &socket,
+            &state,
+            &[
+                ("RADAR_CONTROL_BACKEND", "tmux"),
+                ("RADAR_TMUX_SERVER", server.name.as_str()),
+            ],
+        );
         let mut lines = BufReader::new(child.process.stdout.take().expect("stdout")).lines();
         let greeting = lines
             .next()
@@ -4468,7 +4476,7 @@ fn refused_startup(name: &str, environment: &[(&str, &str)]) -> String {
 fn a_physical_backend_the_daemon_cannot_serve_refuses_startup() {
     let unknown = refused_startup("backend-unknown", &[("RADAR_CONTROL_BACKEND", "docker")]);
     assert!(unknown.contains("docker"), "{unknown}");
-    for supported in ["herdr", "tmux"] {
+    for supported in ["tmux"] {
         assert!(unknown.contains(supported), "{unknown}");
     }
 
@@ -9409,8 +9417,17 @@ fn the_real_daemon_passes_the_clients_handshake() {
     let sandbox = Sandbox::new("client-real-daemon");
     let socket = sandbox.socket();
     let state = sandbox.state();
-    // Herdr starts without a systemd unit, so the handshake runs against it here.
-    let mut child = DaemonChild::spawn_with(&socket, &state, &[("RADAR_CONTROL_BACKEND", "herdr")]);
+    let Some(server) = TmuxServer::start("client-real-daemon") else {
+        return;
+    };
+    let mut child = DaemonChild::spawn_with(
+        &socket,
+        &state,
+        &[
+            ("RADAR_CONTROL_BACKEND", "tmux"),
+            ("RADAR_TMUX_SERVER", server.name.as_str()),
+        ],
+    );
     let mut lines = BufReader::new(child.process.stdout.take().expect("stdout")).lines();
     lines
         .next()

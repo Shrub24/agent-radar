@@ -1,14 +1,14 @@
 # mux-control-plane Specification
 
 ## Purpose
-Abstract physical multiplexer operations behind a backend-neutral daemon interface, with Herdr as the first backend, so Radar and future consumers stay independent of any one mux grammar or transport while mux-specific decoding remains adapter-owned.
+Abstract physical multiplexer operations behind a backend-neutral daemon interface, so Radar and future consumers stay independent of any one mux grammar or transport while mux-specific decoding remains adapter-owned.
 
 ## Requirements
 
 ### Requirement: The control plane exposes normalized mux primitives
-The daemon SHALL expose inventory, foreground evidence, focus, guarded close, creation/splitting, input, bounded output reads and metadata reporting through a backend-neutral interface. Herdr SHALL be the first backend; its grammar, wire shapes and discovery SHALL remain adapter-owned. Unsupported operations SHALL refuse explicitly through declared capabilities.
+The daemon SHALL expose inventory, foreground evidence, focus, guarded close, creation/splitting, input, bounded output reads and metadata reporting through a backend-neutral interface. tmux SHALL be the backend; its grammar, wire shapes and discovery SHALL remain adapter-owned. Unsupported operations SHALL refuse explicitly through declared capabilities.
 
-#### Scenario: Herdr inventory parity
+#### Scenario: Inventory parity
 - **WHEN** direct and daemon adapters decode the same snapshot
 - **THEN** their normalized fleet observations agree
 
@@ -99,7 +99,7 @@ The control plane SHALL wrap source-provided state, session and display metadata
 
 #### Scenario: Extension reports metadata
 - **WHEN** a client supplies display tokens and a source sequence
-- **THEN** the Herdr adapter forwards the report without deriving additional agent facts
+- **THEN** the adapter forwards the report without deriving additional agent facts
 
 ### Requirement: Radar chooses transport without effectful fallback retries
 Radar SHALL support the daemon client and the existing direct adapter. Startup failure to handshake may select the direct adapter with a diagnostic. Once an operation may have been accepted by the daemon, Radar SHALL not retry it directly. Managed lifecycle eligibility and confirmation SHALL remain unchanged. Radar SHALL not auto-start the daemon.
@@ -110,7 +110,7 @@ Radar SHALL support the daemon client and the existing direct adapter. Startup f
 
 #### Scenario: Daemon disconnects during close
 - **WHEN** the close response is lost after submission
-- **THEN** Radar does not call Herdr directly to repeat close
+- **THEN** Radar does not call the backend directly to repeat close
 
 ### Requirement: Wrapper scope does not claim session recovery
 This change SHALL not derive resume commands, restart leads, register agent topology or claim recovery from a new PID or a shared session UUID. Creation and input SHALL be named mux primitives, not a promise to restore agent assignments or results. Later lifecycle policy SHALL be added independently of the mux backend.
@@ -231,7 +231,7 @@ Environment values and spawn tokens SHALL be kept only in bounded private launch
 - **THEN** the daemon reports a bounded diagnostic without launch environment values or the token
 
 ### Requirement: Daemon physical backend is explicitly selected
-The daemon SHALL use exactly one physical backend per process, chosen by explicit configuration, with `herdr` as the default. A tmux backend SHALL target a named tmux server and never the default one. An unknown backend or unreachable server SHALL fail startup or refuse operations, with no fallback to another backend.
+The daemon SHALL use exactly one physical backend per process, chosen by explicit configuration. The tmux backend SHALL target a named tmux server and never the default one. An unknown backend or unreachable server SHALL fail startup or refuse operations, with no fallback to another backend.
 
 #### Scenario: Unknown backend
 - **WHEN** the daemon is configured with an unknown backend name
@@ -304,7 +304,7 @@ The handshake SHALL list capabilities as `<namespace>.<name>`, with a `.v<N>` su
 - **THEN** `spawn.close.v1` is not advertised and `spawn.close` is refused with no record
 
 ### Requirement: The handshake names the real backend
-`daemon.ping` SHALL report the protocol version, the wired backend identity (`herdr`, `tmux` or `none`) and, for tmux, the server instance. It SHALL NOT report a generic placeholder.
+`daemon.ping` SHALL report the protocol version, the wired backend identity (`tmux` or `none`) and, for tmux, the server instance. It SHALL NOT report a generic placeholder.
 
 #### Scenario: tmux daemon
 - **WHEN** the daemon runs against tmux server `radar`

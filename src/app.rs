@@ -53,7 +53,7 @@ const DISCLOSURE_WIDTH: u16 = 2;
 /// What a key asked the main loop to do outside the view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Ask Herdr to focus this location.
+    /// Ask the backend to focus this location.
     Focus(Target),
     /// `x`/`X`/`r` asked for confirmation of a lifecycle action. The caller
     /// opens it against the current observation, because eligibility is a
@@ -1457,7 +1457,7 @@ impl App {
         }
         if disclosure {
             // The pointer said where, not which row to act on: the disclosure
-            // cell folds this branch alone and leaves Herdr alone.
+            // cell folds this branch alone and leaves the backend alone.
             self.toggle_branch(&id);
             return None;
         }
@@ -3457,13 +3457,10 @@ mod tests {
         Binding as ContainerBinding, Kind as ContainerKind, Provenance as ContainerProvenance,
         PublicContainer,
     };
-    use crate::herdr::decode_snapshot;
     use crate::model::{
         AgentObservation, FleetObservation, Location, Pane, RuntimeStatus, SessionIdentity, Tab,
         Workspace,
     };
-
-    const REAL_SHAPED: &str = include_str!("../tests/fixtures/snapshot_real_shaped.json");
 
     fn row_ids(app: &App) -> Vec<RowId> {
         app.visible_rows()
@@ -3591,7 +3588,7 @@ mod tests {
 
     #[test]
     fn space_picks_the_pages_next_block_and_enter_opens_only_that_one() {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         let owner = observation
             .agents
             .iter_mut()
@@ -3607,7 +3604,7 @@ mod tests {
             .as_str()
             .to_string();
         // Publisher task snapshots join by fresh registry context, not by the
-        // legacy lineage fact in this Herdr-shaped fixture.
+        // legacy lineage fact in this fixture.
         let registration_id = "task-owner";
         let mut registry_agent: crate::registry_observation::RegistryAgent =
             serde_json::from_value(serde_json::json!({
@@ -3841,7 +3838,7 @@ mod tests {
     /// The fixture with the worker moved into its owner's window, so it nests
     /// under the owner: the shape that folds and filters act on.
     fn nested_fixture() -> (ObservationState, App) {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
                 agent.location.tab_id = "wA:t1".into();
@@ -3885,7 +3882,7 @@ mod tests {
 
     fn fixture() -> (ObservationState, App) {
         let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
+        state.apply_success(crate::model::testing::fleet());
         let mut app = App::new();
         app.refresh(&state);
         (state, app)
@@ -4091,7 +4088,7 @@ mod tests {
         app.collapse_selected();
 
         // Same facts, plus a status change (the worker goes done).
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
                 agent.status = Some(RuntimeStatus::Done);
@@ -4113,7 +4110,7 @@ mod tests {
     #[test]
     fn running_view_lists_only_panes_with_a_command_in_the_foreground() {
         let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
+        state.apply_success(crate::model::testing::fleet());
         state.apply_evidence(
             "wA:p3",
             crate::model::ForegroundEvidence::command(
@@ -4145,7 +4142,7 @@ mod tests {
             .expect("worker row");
 
         // The worker's pane disappears from the source.
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         observation
             .agents
             .retain(|agent| agent.location.pane_id != "wA:p2");
@@ -4321,9 +4318,9 @@ mod tests {
     #[test]
     fn enter_on_a_retained_row_focuses_the_pane_it_was_last_seen_on() {
         let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
+        state.apply_success(crate::model::testing::fleet());
         // The owner stops being reported while its pane stays reported.
-        let mut without_owner = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut without_owner = crate::model::testing::fleet();
         without_owner
             .agents
             .retain(|agent| agent.location.pane_id != "wA:p1");
@@ -4357,8 +4354,8 @@ mod tests {
     #[test]
     fn a_stale_inventory_refuses_and_the_message_clears_on_the_next_key() {
         let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
-        state.apply_failure("herdr timed out after 5s");
+        state.apply_success(crate::model::testing::fleet());
+        state.apply_failure("tmux timed out after 5s");
         let mut app = App::new();
         app.refresh(&state);
 
@@ -4463,7 +4460,7 @@ mod tests {
     #[test]
     fn a_focus_message_expires_on_its_own() {
         let mut app = app_with_fixture();
-        app.set_focus_message(Some("herdr refused to focus: pane_not_found".into()));
+        app.set_focus_message(Some("tmux refused to focus: pane_not_found".into()));
         assert!(!app.expire_focus_message(Instant::now()));
         assert!(app.expire_focus_message(Instant::now() + FOCUS_MESSAGE_TTL));
         assert_eq!(app.focus_message(), None);
@@ -4559,7 +4556,7 @@ mod tests {
     /// The fixture with one container Radar created for a pane, every pane listed,
     /// and that pane's row selected.
     fn fixture_with_container(removed: Option<&str>) -> (ObservationState, App) {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         observation.containers = vec![pane_container("c1", "wA:p3", removed)];
         if let Some(workspace) = observation.workspaces.first_mut() {
             workspace.session_path = Some("/home/saurabhj/Projects/dev/agent-radar".into());
@@ -4654,7 +4651,7 @@ mod tests {
     /// daemon can decide.
     #[test]
     fn an_unresolved_container_can_be_forgotten_but_not_otherwise_acted_on() {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         let mut container = pane_container("c1", "wA:p3", None);
         container.unresolved = Some("no backend reports this container's handle".to_string());
         observation.containers = vec![container];
@@ -4889,7 +4886,7 @@ mod tests {
 
         // The container is removed while the dialog is up: the place may now belong
         // to whatever the backend put there, so nothing is sent.
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         observation.containers = vec![pane_container(
             "c1",
             "wA:p3",
@@ -4929,8 +4926,8 @@ mod tests {
         // evidence, so nothing is closed on it.
         app.begin_action(Operation::Delete, &state);
         let mut stale = ObservationState::new();
-        stale.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
-        stale.apply_failure("herdr exited with status 1");
+        stale.apply_success(crate::model::testing::fleet());
+        stale.apply_failure("tmux exited with status 1");
         assert_eq!(app.confirm(&stale), None);
         assert!(app.focus_message().expect("a reason").contains("stale"));
     }
@@ -4939,7 +4936,7 @@ mod tests {
     /// is the operator's to repeat: the next `D` asks for the place to close.
     #[test]
     fn a_deletion_held_by_a_living_agent_is_repeated_with_force() {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         let mut container = pane_container("c1", "wA:p3", None);
         container.unresolved = Some("no backend reports this container's handle".to_string());
         observation.containers = vec![container];
@@ -5083,7 +5080,7 @@ mod tests {
         app.begin_action(Operation::Delete, &state);
 
         // A managed worker appears on the frozen pane before Confirm.
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         observation.agents.push(AgentObservation {
             location: Location {
                 workspace_id: "wA".into(),
@@ -5249,8 +5246,8 @@ mod tests {
     #[test]
     fn a_retained_managed_association_is_ended_like_any_other_row() {
         let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
-        let mut without = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        state.apply_success(crate::model::testing::fleet());
+        let mut without = crate::model::testing::fleet();
         // The managed owner stops being reported while its pane stays.
         without
             .agents

@@ -5,7 +5,7 @@
 //! machine that runs no daemon. [`protocol`] is the wire format, [`store`] is the
 //! durable record every operation is derived from, [`server`] is the listener,
 //! [`ops`] classifies methods, [`client`] is Radar's own end of the socket, and
-//! the normalized backend port reuses the runtime seam without exposing Herdr
+//! the normalized backend port reuses the runtime seam without exposing tmux
 //! wire types. [`registry`] is the durable agent registration store served by
 //! independent trusted-socket methods.
 

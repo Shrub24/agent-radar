@@ -53,8 +53,14 @@ def main():
         root = Path(directory)
         os.chmod(root, 0o700)
         sock, state = root / "daemon.sock", root / "state"
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import tmux_server
+        server = tmux_server.name("events")
+        if not tmux_server.start(server):
+            print("skipped: a disposable tmux server needs tmux and a user manager")
+            return
         env = {**os.environ, "RADAR_CONTROL_SOCKET": str(sock), "RADAR_CONTROL_STATE": str(state),
-               "RADAR_CONTROL_BACKEND": "herdr"}
+               "RADAR_CONTROL_BACKEND": "tmux", "RADAR_TMUX_SERVER": server}
         daemon = subprocess.Popen([str(binary), "daemon"], env=env,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:
@@ -94,6 +100,7 @@ def main():
             except subprocess.TimeoutExpired:
                 daemon.kill()
                 daemon.wait(timeout=2)
+            tmux_server.stop(server)
 
 
 if __name__ == "__main__":

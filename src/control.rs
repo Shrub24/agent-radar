@@ -67,7 +67,7 @@ pub struct ControlRequest {
     /// Exact runtime label of the target.
     pub agent: String,
     pub run_id: String,
-    /// Optional cross-check: the herdr pane of that run.
+    /// Optional cross-check: the backend pane of that run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
     /// Optional cross-check: the Pi session of that run.

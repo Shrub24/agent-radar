@@ -15,6 +15,9 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests/fixtures"))
+import tmux_server  # noqa: E402
+
 MODULE = ROOT / "examples/agent-publisher/publisher.py"
 spec = importlib.util.spec_from_file_location("agent_publisher", MODULE)
 publisher = importlib.util.module_from_spec(spec)
@@ -202,6 +205,12 @@ def validate_fixture(path):
             expected_agent["facts"]["snapshot"]["received_at"] = actual["agents"][0]["facts"]["snapshot"]["received_at"]
             expected_agent["facts"]["snapshot"]["expires_at"] = actual["agents"][0]["facts"]["snapshot"]["expires_at"]
             expected_agent["context"]["registration_id"] = registration_id
+            # A list entry carries the agent's own standing and scope facts, which
+            # the single-agent read does not; this registration is neither.
+            check(actual["agents"][0]["claim_standing"] is None, str(actual["agents"][0]))
+            check(actual["agents"][0]["scoped"] is False, str(actual["agents"][0]))
+            expected_agent["claim_standing"] = None
+            expected_agent["scoped"] = False
             check(actual["agents"] == [expected_agent], f"fixture agent.list mismatch: {actual}")
             check(actual["next"] is None, str(actual))
             continue
@@ -222,16 +231,12 @@ def validate_fixture(path):
     check(all(set(event) == {"seq", "kind", "registration_id", "at"} and event["registration_id"] == registration_id
               for event in pointers), f"facts pointer carries more than identifiers: {pointers}")
     check("claude-opus-example" not in json.dumps(events), "facts value leaked into the journal")
-    # The scripted-backend sequence below validates spawn wire shapes end to end.
 
 
-def spawn_daemon(binary, socket_path, state_path, herdr_fake=None):
+def spawn_daemon(binary, socket_path, state_path, server):
     env = {**os.environ, "RADAR_CONTROL_SOCKET": str(socket_path),
-           "RADAR_CONTROL_STATE": str(state_path), "RADAR_CONTROL_BACKEND": "herdr"}
-    if herdr_fake is not None:
-        env["PATH"] = f"{herdr_fake.parent}:{os.environ['PATH']}"
-        env["RADAR_SPAWN_FAKE_STATE"] = str(herdr_fake.parent / "fake-state")
-        env["RADAR_HERDR_FAKE_SOCKET"] = str(herdr_fake.parent / "fake-state" / "herdr.sock")
+           "RADAR_CONTROL_STATE": str(state_path), "RADAR_CONTROL_BACKEND": "tmux",
+           "RADAR_TMUX_SERVER": server}
     child = subprocess.Popen([str(binary), "daemon"], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=env)
     deadline = time.monotonic() + 5
@@ -290,123 +295,6 @@ def call_with_id(path, request_id, method, params):
     return answer["result"]
 
 
-def validate_spawn_scripted(binary, socket_path, state_path, root, fake_backend):
-    fake_bin = root / "fake-bin"
-    fake_state = fake_bin / "fake-state"
-    fake_state.mkdir(parents=True)
-    fake = fake_bin / "herdr"
-    fake.write_text(fake_backend)
-    fake.chmod(0o755)
-    server = subprocess.Popen([sys.executable, str(fake), "__serve"], env={**os.environ,
-                                 "RADAR_SPAWN_FAKE_STATE": str(fake_state),
-                                 "RADAR_HERDR_FAKE_SOCKET": str(fake_state / "herdr.sock")})
-    deadline = time.monotonic() + 3
-    while not (fake_state / "herdr.sock").exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    daemon = spawn_daemon(binary, socket_path, state_path, fake)
-    try:
-        ping = call(socket_path, "daemon.ping", {})
-        check(ping["protocol"] == publisher.PROTOCOL_VERSION, str(ping))
-        check("spawn.v1" in ping["contracts"], str(ping))
-        parent = call(socket_path, "agent.register", {
-            "source": "fixture-parent", "incarnation": "11111111-1111-4111-8111-111111111111",
-            "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p1"},
-        })["registration"]["registration_id"]
-        parent_session_id = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
-        call(socket_path, "agent.context", {"registration_id": parent,
-             "publisher": {"source": "fixture-parent", "incarnation": "1c2d3e4f-5678-4abc-9def-0123456789ab"},
-             "sequence": 1, "lease_ms": 30000, "context": {"session": parent_session_id}})
-        launch_env = {"PI_HERDSMAN_MAILBOX": "mailbox-smoke", "PI_HERDSMAN_OWNER": "owner-smoke"}
-        response = call(socket_path, "spawn.create", {"request": {"parent": parent,
-                            "parent_session_id": parent_session_id,
-                            "executable": "/usr/bin/pi", "argv": ["--child", "row one"],
-                            "cwd": "/tmp", "env": launch_env},
-                            "requester": "herdsman"})
-        edge = response["spawn"]
-        check(response["request"]["outcome"] == "completed", str(response))
-        check(edge["created"] == "completed" and edge["launched"] == "completed", str(edge))
-        check("bound" not in edge and "token" not in json.dumps(response), "spawn response leaked token")
-        private_edge = next((state_path / "spawns").glob("*.json"))
-        private_token = json.loads(private_edge.read_text())["token"]
-        check(private_token, "edge did not persist token")
-        launch = json.loads((fake_state / "launch.json").read_text())
-        check(launch["token"] == private_token, "launched environment token differs from edge token")
-        check("/tmp" in launch["line"] and "PI_HERDSMAN_MAILBOX" in launch["line"],
-              "spawn launch context was not transported")
-        # The scripted pane's foreground occupant is this test process, so the
-        # child's registered birth identity is the one the daemon verifies.
-        (fake_state / "foreground-pid").write_text(str(os.getpid()))
-        os.environ["PI_RADAR_REGISTRATION_ID"] = private_token
-        captured_token = publisher.consume_spawn_token()
-        check(captured_token == private_token and "PI_RADAR_REGISTRATION_ID" not in os.environ,
-              "bootstrap must remove the token from its environment after capture")
-        child = call(socket_path, "agent.register", {
-            "source": "fixture-child", "incarnation": "34343434-3434-4343-8343-343434343434",
-            "location": {"backend": "herdr", "workspace": "wA", "tab": "wA:t1", "pane": "wA:p2"},
-            "process": process_birth_identity(os.getpid()),
-            "spawn_token": captured_token,
-        })["registration"]
-        check("spawn_token" not in json.dumps(child), "registration response leaked token")
-        get = call(socket_path, "spawn.get", {"request_id": edge["request_id"]})["spawn"]
-        check(get["state"] == "bound" and get["bound"]["incarnation"] == child["incarnation"], str(get))
-        check(get["bound"]["registration_id"] == child["registration_id"], str(get))
-        check(get["freshness"] == "fresh" and "token" not in json.dumps(get), str(get))
-        listed = call(socket_path, "spawn.list", {"limit": 10})
-        check(listed["spawns"] == [get] and listed["next"] is None, str(listed))
-        bound_child = get_agent(socket_path, get["bound"]["registration_id"])
-        check(bound_child["execution"] is None, "binding must not imply execution readiness")
-        check(bound_child["facts"] is None, "a child that published no facts reads them as null")
-        check(bound_child["registration"]["registration_id"] == child["registration_id"], str(bound_child))
-        for channel, publisher_identity in (
-            ("assignment", {"source": "fixture-owner", "incarnation": "9f8e7d6c-4321-4def-8abc-0123456789ab", "reporting_owner": "owner-smoke"}),
-            ("execution", {"source": "fixture-pi", "incarnation": "2f8e7d6c-4321-4def-8abc-0123456789ab"}),
-        ):
-            binding = call(socket_path, "agent.acquire", {
-                "registration_id": child["registration_id"], "channel": channel, "publisher": publisher_identity,
-            })["writer"]
-            call(socket_path, "agent.publish", {
-                "registration_id": child["registration_id"], "channel": channel,
-                "writer_handle": binding["handle"], "sequence": 1,
-                "snapshot": {"activity": f"{channel}-before-close", "actions": ["inspect"]},
-            })
-        before_agent = get_agent(socket_path, child["registration_id"])
-        before_topology = call(socket_path, "spawn.get", {"request_id": edge["request_id"]})["spawn"]
-        public = json.dumps([response, child, get, listed])
-        check(private_token not in public, "token leaked through a public spawn projection")
-        close_request, close_response = next(
-            pair for pair in fixture_pairs() if pair[0]["method"] == "spawn.close")
-        close_id = close_request["id"]
-        close_params = {"spawn_request_id": edge["request_id"], "source": child["source"],
-                        "incarnation": child["incarnation"], "intent": close_request["params"]["intent"]}
-        expected_close = json.loads(json.dumps(close_response["result"]["close"]))
-        # The fixture's close entry and its identical replay both answer from the
-        # one recorded outcome; only the first of the two may dispatch.
-        for _ in range(2):
-            actual = call_with_id(socket_path, close_id, "spawn.close", close_params)
-            check(actual == {"close": expected_close}, f"spawn.close fixture differs: {actual}")
-        check((fake_state / "close-count").read_text() == "1",
-              "same-ID close replay dispatched more than once")
-        after_agent = get_agent(socket_path, child["registration_id"])
-        after_topology = call(socket_path, "spawn.get", {"request_id": edge["request_id"]})["spawn"]
-        for channel in ("assignment", "execution"):
-            check(after_agent[channel] == before_agent[channel],
-                  f"child.close changed {channel} publication")
-        check(after_topology == before_topology, "child.close changed spawn topology")
-        # A second registration with the consumed token refuses rather than rebinding.
-        try:
-            call(socket_path, "agent.register", {
-                "source": "fixture-other-child", "incarnation": "44444444-4444-4444-8444-444444444444",
-                "spawn_token": private_token,
-            })
-            raise AssertionError("spent token bound twice")
-        except publisher.RegistryError as error:
-            check(error.code == "refused", str(error))
-    finally:
-        stop_daemon(daemon)
-        server.terminate()
-        server.wait(timeout=2)
-
-
 def main():
     fixture_pairs()
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "target/debug/radar").resolve()
@@ -430,7 +318,11 @@ def main():
         snapshot = publisher.owner_snapshot(
             "owner-waiting-new-state", "custom-waiting-reason",
             {"result": "custom-unclassified-outcome"}, ["custom-action"])
-        daemon = spawn_daemon(binary, socket_path, state_path)
+        server = tmux_server.name("publisher")
+        if not tmux_server.start(server):
+            print("skipped: a disposable tmux server needs tmux and a user manager")
+            return
+        daemon = spawn_daemon(binary, socket_path, state_path, server)
         try:
             validate_fixture(socket_path)
             check("events.v1" in call(socket_path, "daemon.ping", {})["contracts"],
@@ -534,7 +426,7 @@ def main():
                 check(error.code == "refused", str(error))
 
             stop_daemon(daemon)
-            daemon = spawn_daemon(binary, socket_path, state_path)
+            daemon = spawn_daemon(binary, socket_path, state_path, server)
             restored = get_agent(socket_path, registration_id)["assignment"]["snapshot"]
             check(restored["restored"] is True and restored["freshness"] == "stale", str(restored))
             restored_facts = get_agent(socket_path, registration_id)["facts"]["snapshot"]
@@ -562,15 +454,11 @@ def main():
                   "session switch/null; privacy; replay/heartbeat; replacement/fencing; restart freshness")
         finally:
             stop_daemon(daemon)
-        spawn_socket, spawn_state = root / "spawn.sock", root / "spawn-state"
-        validate_spawn_scripted(binary, spawn_socket, spawn_state, root,
-                                (ROOT / "tests/fixtures/fake-herdr.py").read_text())
+            tmux_server.stop(server)
         smoke = subprocess.run([sys.executable, str(ROOT / "tests/fixtures/events_consumer_smoke.py"),
-                                str(binary)], capture_output=True, text=True, timeout=20)
+                                str(binary)], capture_output=True, text=True, timeout=60)
         check(smoke.returncode == 0, f"events consumer smoke failed: {smoke.stdout} {smoke.stderr}")
         print(smoke.stdout.strip())
-        print("PASS: scripted Herdr spawn; child token binding; spawn.get/list freshness and redaction; "
-              "verified child close with same-ID replay, unchanged publications and topology")
 
 
 if __name__ == "__main__":

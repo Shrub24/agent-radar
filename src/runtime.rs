@@ -5,7 +5,7 @@
 //! own normalized values. Collection reads a [`FleetObservation`] and
 //! [`ForegroundEvidence`]; focus is asked to move to a [`Target`]. Nothing on
 //! either path names a runtime's executable, CLI grammar, JSON shapes or
-//! socket; those live in the adapter ([`crate::herdr`]), the only module that
+//! socket; those live in the adapter ([`crate::tmux`]), the only module that
 //! sees them. A second runtime is a second adapter at assembly time, not a
 //! change to the collector, the focuser, the reconciler or the view.
 //!
@@ -636,7 +636,7 @@ impl ReportedState {
 /// set to nothing, a source and an agent name cannot.
 pub const MAX_REPORTED_TEXT_BYTES: usize = 1024;
 
-/// How many display tokens or state labels one report may carry. Herdr's own
+/// How many display tokens or state labels one report may carry. The backend's own
 /// bound for tokens, applied to both maps so neither can grow a record without
 /// end.
 pub const MAX_REPORTED_ENTRIES: usize = 16;
@@ -938,7 +938,7 @@ pub enum ReportOutcome {
 /// later join if it names the backend that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendIdentity {
-    /// `herdr`, `tmux`, or the name a test backend gives itself.
+    /// `tmux`, or the name a test backend gives itself.
     pub name: String,
     /// The server instance, for a backend that addresses one.
     pub instance: Option<String>,
@@ -1249,7 +1249,7 @@ mod tests {
             "target": {"kind": "pane", "pane_id": "wA:p1"},
             "source": "herdsman",
             "tokens": {"summary": "3 tasks", "title-suffix": null},
-            "applies_to_source": "herdr:pi",
+            "applies_to_source": "tmux:pi",
             "state_labels": {"working": "thinking"},
             "ttl_ms": 30000,
         }))

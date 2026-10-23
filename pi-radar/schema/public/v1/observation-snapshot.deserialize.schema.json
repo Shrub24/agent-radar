@@ -732,7 +732,7 @@
           "type": "array"
         },
         "context_usage": {
-          "description": "The percentage a Herdr token states, percent sign included. It carries no\ncounts, so it is never presented as a typed window.",
+          "description": "The percentage a background-task token states, percent sign included. It carries no\ncounts, so it is never presented as a typed window.",
           "type": [
             "string",
             "null"
@@ -757,7 +757,7 @@
           ]
         },
         "label": {
-          "description": "A managed worker's runtime label: the name its owner and its siblings\nuse for it, and the only faithful source for a worker's name. Herdr's\nown agent name truncates it and its title welds it to the task.",
+          "description": "A managed worker's runtime label: the name its owner and its siblings\nuse for it, and the only faithful source for a worker's name. The backend's\nown agent name truncates it and its title welds it to the task.",
           "type": [
             "string",
             "null"
@@ -962,7 +962,7 @@
       "type": "object"
     },
     "Location": {
-      "description": "Connector-scoped runtime location: Herdr workspace, tab and pane identifiers.\n\nPane identity is a runtime location detail; it is never an agent identity.",
+      "description": "Backend-scoped runtime location: workspace, tab and pane identifiers.\n\nPane identity is a runtime location detail; it is never an agent identity.",
       "properties": {
         "pane_id": {
           "type": "string"
@@ -2313,7 +2313,7 @@
       ]
     },
     "Tab": {
-      "description": "A Herdr tab within a workspace; shown as location detail, not a tree level.",
+      "description": "A tab within a workspace; shown as location detail, not a tree level.",
       "properties": {
         "label": {
           "type": [
@@ -2539,7 +2539,7 @@
       ]
     },
     "Workspace": {
-      "description": "A Herdr workspace: the first display grouping for the fleet tree.",
+      "description": "A workspace: the first display grouping for the fleet tree.",
       "properties": {
         "label": {
           "type": [

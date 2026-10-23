@@ -2,7 +2,7 @@
 //!
 //! The daemon's registry is the only source of agent facts on the daemon path.
 //! This module joins each registration to a pane by exact evidence and projects
-//! its fresh channels onto the normalized agent model. Nothing here reads Herdr
+//! its fresh channels onto the normalized agent model. Nothing here reads a backend
 //! agent records, pane metadata or native status.
 //!
 //! A registration joins a pane only when its backend-qualified location names the
@@ -609,8 +609,8 @@ mod tests {
         .expect("registration fixture decodes")
     }
 
-    fn herdr() -> BackendIdentity {
-        BackendIdentity::named("herdr")
+    fn backend() -> BackendIdentity {
+        BackendIdentity::named("tmux")
     }
 
     /// The daemon's spawn edge for a child already bound to `registration_id`.
@@ -689,7 +689,7 @@ mod tests {
                 topology,
                 ..RegistryRead::default()
             };
-            project(&panes, &herdr(), read, &[])
+            project(&panes, &backend(), read, &[])
                 .into_iter()
                 .filter_map(|agent| Some(agent.registry?.agent.registration.registration_id))
                 .collect()
@@ -721,7 +721,7 @@ mod tests {
     }
 
     fn at(pane_id: &str) -> Value {
-        json!({"backend": "herdr", "workspace": "w1", "tab": "t1", "pane": pane_id})
+        json!({"backend": "tmux", "workspace": "w1", "tab": "t1", "pane": pane_id})
     }
 
     #[test]
@@ -757,7 +757,7 @@ mod tests {
                 "tab disagrees with the pane",
                 registered(
                     "a",
-                    json!({"backend": "herdr", "tab": "t9", "pane": "p1"}),
+                    json!({"backend": "tmux", "tab": "t9", "pane": "p1"}),
                     Some(live.clone()),
                 ),
                 vec![foreground("p1", live.clone())],
@@ -765,7 +765,7 @@ mod tests {
             ),
         ];
         for (name, agent, evidence, expected) in cases {
-            let projected = project(&panes, &herdr(), read(vec![agent]), &evidence);
+            let projected = project(&panes, &backend(), read(vec![agent]), &evidence);
             let view = projected[0].registry.as_ref().expect("registry view");
             assert_eq!(view.binding, expected, "case: {name}");
             assert_eq!(
@@ -784,7 +784,7 @@ mod tests {
             topology: vec![spawn_edge("a")],
             ..RegistryRead::default()
         };
-        let projected = project(&panes, &herdr(), read, &[]);
+        let projected = project(&panes, &backend(), read, &[]);
         let view = projected[0].registry.as_ref().expect("registry view");
         assert_eq!(view.binding, Binding::Unjoined(Unjoined::PaneAbsent));
         assert_eq!(projected[0].location.pane_id, "p9");
@@ -796,9 +796,9 @@ mod tests {
         // The pane exists in t1, but the registration reports t9: it must not
         // borrow the pane's own tab.
         let panes = inventory(vec![pane("p1", "t1")]);
-        let reported = json!({"backend": "herdr", "workspace": "w1", "tab": "t9", "pane": "p1"});
+        let reported = json!({"backend": "tmux", "workspace": "w1", "tab": "t9", "pane": "p1"});
         let agent = registered("a", reported, Some(identity(7, 5)));
-        let projected = project(&panes, &herdr(), read(vec![agent]), &[]);
+        let projected = project(&panes, &backend(), read(vec![agent]), &[]);
         assert_eq!(
             projected[0].registry.as_ref().map(|view| &view.binding),
             Some(&Binding::Unjoined(Unjoined::LocationMismatch))
@@ -818,7 +818,7 @@ mod tests {
             registered("a", location, Some(live.clone()))
         };
         let on = |instance: Option<&str>| BackendIdentity {
-            name: "herdr".into(),
+            name: "tmux".into(),
             instance: instance.map(str::to_string),
         };
         let fg = || vec![foreground("p1", live.clone())];
@@ -870,7 +870,7 @@ mod tests {
             topology: vec![edge],
             ..RegistryRead::default()
         };
-        let projected = project(&panes, &herdr(), read, &[]);
+        let projected = project(&panes, &backend(), read, &[]);
         let view = projected[0].registry.as_ref().expect("registry view");
         assert_eq!(
             view.spawn,
@@ -920,7 +920,7 @@ mod tests {
             lifecycle: vec![subject.clone()],
             ..RegistryRead::default()
         };
-        let projected = project(&panes, &herdr(), read, &[foreground("p1", claim.clone())]);
+        let projected = project(&panes, &backend(), read, &[foreground("p1", claim.clone())]);
         assert_eq!(
             projected[0]
                 .registry
@@ -956,7 +956,7 @@ mod tests {
                 lifecycle,
                 ..RegistryRead::default()
             };
-            let projected = project(&panes, &herdr(), read, &[foreground("p1", claim.clone())]);
+            let projected = project(&panes, &backend(), read, &[foreground("p1", claim.clone())]);
             assert!(
                 projected[0]
                     .registry
@@ -972,7 +972,7 @@ mod tests {
             lifecycle: vec![subject],
             ..RegistryRead::default()
         };
-        let projected = project(&panes, &herdr(), read, &[foreground("p1", claim)]);
+        let projected = project(&panes, &backend(), read, &[foreground("p1", claim)]);
         assert!(
             projected[0]
                 .registry
@@ -990,7 +990,7 @@ mod tests {
             registered("b", at("p2"), Some(second.clone())),
         ];
         let evidence = [foreground("p1", first), foreground("p2", second)];
-        let projected = project(&panes, &herdr(), read(agents), &evidence);
+        let projected = project(&panes, &backend(), read(agents), &evidence);
         assert!(
             projected
                 .iter()
@@ -1008,7 +1008,12 @@ mod tests {
             registered("a", at("p1"), Some(shared.clone())),
             registered("b", at("p1"), Some(shared.clone())),
         ];
-        let projected = project(&panes, &herdr(), read(agents), &[foreground("p1", shared)]);
+        let projected = project(
+            &panes,
+            &backend(),
+            read(agents),
+            &[foreground("p1", shared)],
+        );
         for agent in &projected {
             assert_eq!(
                 agent.registry.as_ref().unwrap().binding,
@@ -1036,7 +1041,7 @@ mod tests {
                          "snapshot": {"activity": "idle"}}
         }))
         .expect("execution fixture decodes");
-        let projected = project(&panes, &herdr(), read(vec![agent]), &[]);
+        let projected = project(&panes, &backend(), read(vec![agent]), &[]);
         assert_eq!(projected[0].status, None);
         assert_eq!(projected[0].state(), crate::model::AgentState::Unknown);
     }

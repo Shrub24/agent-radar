@@ -146,7 +146,7 @@ Radar SHALL offer three views of ordinary non-agent panes — hidden, running an
 - **THEN** only the retained row appears for that pane
 
 #### Scenario: Pane whose label is a finished session
-- **WHEN** an ordinary pane reports no agent and its label is a provider session title left there by Herdr
+- **WHEN** an ordinary pane reports no agent and its label is a provider session title left there by the backend
 - **THEN** its row carries the session's own name and vendor mark, in the receded ink, with `exited` as its state and the pane's current identity in the detail panel
 - **AND** the session title is never presented as the pane's current name
 
@@ -206,7 +206,7 @@ Radar SHALL draw an agent row as its name — a managed worker's runtime label, 
 
 #### Scenario: A worker's name
 - **WHEN** a managed worker publishes its runtime label
-- **THEN** its row is named by that label rather than by Herdr's truncated agent name or its task-bearing title
+- **THEN** its row is named by that label rather than by the backend's truncated agent name or its task-bearing title
 
 #### Scenario: A worker with an active assignment
 - **WHEN** a worker holds an active assignment with a start time
@@ -338,7 +338,7 @@ Radar SHALL support a case-insensitive text filter over displayed labels and ava
 Radar SHALL handle resizing and quitting without blocking on collection and SHALL restore terminal input/display modes on normal exit and handled application errors. Runtime-provided labels and metadata SHALL NOT execute terminal control sequences through rendering.
 
 #### Scenario: Quit during a stalled collection
-- **WHEN** the user quits while Herdr collection is stalled
+- **WHEN** the user quits while backend collection is stalled
 - **THEN** the application exits without waiting for the collection timeout and restores the terminal
 
 #### Scenario: Control characters in a label

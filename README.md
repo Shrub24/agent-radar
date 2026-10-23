@@ -2,11 +2,9 @@
 
 # Agent Radar
 
-A full-screen fleet control plane for coding agents. Radar uses the daemon by
-default, with tmux as its physical backend; Herdr is available only as an
-explicit backend during the cutover. The tree abstracts tmux workspaces and
-windows into Radar's workspace and tab hierarchy, with agent ownership kept
-within a window.
+A full-screen fleet control plane for coding agents. Radar drives a tmux server it
+owns as its physical backend. The tree abstracts tmux workspaces and windows into
+Radar's workspace and tab hierarchy, with agent ownership kept within a window.
 
 The TUI is a display and control client, not an ingest authority. The daemon
 owns lifecycle operations, managed containers, and background-task publisher
@@ -33,14 +31,13 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked
-python3 tests/terminal_smoke.py
+python3 tests/tmux_acceptance.py target/debug/radar
 ```
 
-Herdr is optional and is never the default: it is used only when selected with
-`RADAR_CONTROL_BACKEND=herdr`. Radar's control daemon and its tmux server run as user units
+Radar's control daemon and its tmux server run as user units
 (see [Daemon and tmux server](#daemon-and-tmux-server)), and `radar` starts them. Start with the [daemon consumer guide](docs/daemon.md)
 for the API, lifecycle and adoption path. The [mux integration contract](docs/mux.md)
-covers physical guarantees, backend responsibilities and remaining cutover work.
+covers physical guarantees, backend responsibilities and what a backend may promise.
 See the [control-plane protocol and extension examples](docs/control-plane.md)
 and the direct [agent-registration
 contract and publisher example](docs/agent-registration.md). Version control
@@ -143,10 +140,9 @@ graph. Completions generated from the built binary are installed at
 no per-shell setup. Elsewhere, `radar completions <shell>` prints the same
 script for a line that is not managed by Nix.
 
-Herdr is not bundled. Install it separately and keep it on `PATH`, which is
-where Radar invokes it. The optional `Herdr Agent Icons Max` font comes from
-`herdr-radar`; without it vendor marks use plain Unicode. `RADAR_ICONS` still
-overrides detection. Configuration is unchanged: `$RADAR_CONFIG`,
+tmux is expected on `PATH`, which is where Radar invokes it. The optional agent
+icon font (`Herdr Agent Icons Max`) draws vendor marks as logos; without it marks
+use plain Unicode. `RADAR_ICONS` overrides detection. Configuration is unchanged: `$RADAR_CONFIG`,
 else `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
 
 ## Managed execution
@@ -474,12 +470,10 @@ pane its owner row names, and on a workspace row focuses that workspace. Radar
 stays open and keeps its selection. A row whose pane the
 current observation no longer reports, or any row while the displayed inventory is
 last-good rather than current, is refused: nothing is sent and the last line says
-why. A failure — Herdr unreachable, the request refused, or the request past its
+why. A failure — tmux unreachable, the request refused, or the request past its
 timeout — is stated on that line too, which clears on the next key press or after
-a few seconds. Nothing the focus path asks Herdr for changes an agent, a pane's
-contents or a layout. The focus request uses `herdr workspace focus` for a
-workspace and the socket API's `pane.focus` request for a pane; `herdr pane
-focus` moves by direction only.
+a few seconds. Nothing the focus path asks tmux for changes an agent, a pane's
+contents or a layout: it selects the window or the pane and nothing else.
 
 `D` is one key for every row: it ends whatever the selected row is. A
 confirmation names the row and lists what the action may lose — the agent and its
@@ -562,10 +556,10 @@ Radar never infers a pane close from the outcome alone.
 ## Presentation
 
 The marks and colours are taken from the tools around Radar rather than
-invented, so a Radar pane and its Herdr sidebar agree on what a row says. The
-vendor marks, the title rules and the parked/finished/exited shapes come from
-`herdr-radar`; the semantic states come from Herdsman's own status widget, which
-already draws them:
+invented, so a mark means the same thing here as in the sidebar next to it. The
+vendor marks, the title rules and the parked/finished/exited shapes follow the
+agent icon and title conventions Radar was built beside; the semantic states come
+from Herdsman's own status widget, which already draws them:
 
 - Every state has its own **shape**, not only a hue: `⣀`-style frames while an
   agent works, `◷` waiting on work it depends on, `◐` blocked on its owner,
@@ -616,7 +610,7 @@ already draws them:
   follows the rows actually drawn — filtering or folding a branch changes it
   rather than leaving a line behind — and takes the `subtle` ink, with its
   width part of the row's Unicode-aware fitting. Clicking a branch's disclosure
-  marker folds that branch and sends nothing to Herdr; clicking anywhere else
+  marker folds that branch and sends nothing to the backend; clicking anywhere else
   on a row selects it, and a second click focuses it.
 - Details sit **beside** the tree, not under it: the tree is a list of short rows
   and the details are a few long lines, so a column costs the tree less than a
@@ -670,9 +664,8 @@ it is showing:
 
 The `running` view is what answers "what is actually happening in this fleet":
 builds, editors, merge tools and editors that no agent owns. It costs one
-`herdr pane process-info` per pane (about 3 ms each, so ~0.1 s for a
-30-pane fleet) and only sweeps while a pane view is active; the first press of
-`p` fills it in on the next refresh. A pane an agent is already reporting is not
+`#{pane_pid}`/`#{pane_current_command}` read per pane and only sweeps while a pane
+view is active; the first press of `p` fills it in on the next refresh. A pane an agent is already reporting is not
 listed twice — the agent row is the row for that pane.
 
 Which task children those views list is a choice of its own rather than the pane
@@ -732,7 +725,7 @@ is the same kind of table, and it declares no licence, so it is not vendored
 here — its entries go into `[processes]` if you want them.
 
 A pane's title is the one it was given, minus a leading provider mark. When the
-only thing Herdr has for it is the directory its workspace is named after
+only thing the backend has for it is the directory its workspace is named after
 (`~/P/d/nix-fleet` under a `nix-fleet` header), the row shows just the pane id
 rather than repeating the header; a path somewhere else is kept.
 
@@ -784,7 +777,7 @@ with the built-in colours.
 
 ### Marks and the icon font
 
-`herdr-radar` installs a font (`Herdr Agent Icons Max`) carrying drawn vendor
+An optional agent icon font (`Herdr Agent Icons Max`) carries drawn vendor
 logos in the Private Use Area. When that font is present, Radar draws those
 logos; otherwise it falls back to the ordinary-Unicode table (`π`, `§`, `✦`), so
 no row depends on a font being installed. `RADAR_ICONS=font|text|none` overrides
@@ -794,8 +787,8 @@ rather than in the user font directory (`$XDG_DATA_HOME/fonts`, else
 
 ### Titles and finished sessions
 
-Agents write their mark and name into the terminal title, and Herdr keeps the
-last title a pane had after the session is gone. Radar strips a leading provider
+Agents write their mark and name into the terminal title, and the backend keeps
+the last title a pane had after the session is gone. Radar strips a leading provider
 mark or name (`π Lint sweep` → `Lint sweep`, `π - Inspect Bifrost - x` →
 `Inspect Bifrost - x`) — but only at the very start, only with a separator, and
 never when it would empty the title, so `gemini rocks` keeps its words.
@@ -814,7 +807,7 @@ its location. If the pane is in use again, it stops being history: the row leads
 with the command in its foreground, and the finished session stays in the
 details.
 
-Herdr latches a session title as the pane's **label**, and it survives the
+The backend latches a session title as the pane's **label**, and it survives the
 session: on a fleet that has run many agents, most ordinary panes carry one.
 Those are historical, not running, so they stay out of the default `agents` view
 — `e` lists them there anyway, and `e` again hides them.
@@ -822,18 +815,18 @@ Those are historical, not running, so they stay out of the default `agents` view
 ## Observation and continuity
 
 Radar observes in one of two modes, chosen once before anything is drawn, and
-neither reads agent facts from Herdr's own agent state:
+neither reads agent facts from the backend's own agent records:
 
 - **Through the daemon** (the default), every agent fact comes
   from the daemon's registry. One refresh reads the daemon's pane inventory,
   every registered agent (`agent.list`, paged) and the spawn topology
   (`spawn.list`), and joins them in one pass, so a frame comes from one moment.
-  Herdr's own agent records, display metadata and native agent status are not
+  A backend's own agent records, display metadata and native agent status are not
   read for anything the dashboard shows. A daemon that does not declare
   `registry.v1` and `spawn.v1` fails the refresh with that diagnostic rather
   than showing a fleet sourced from somewhere else.
 - **No direct mode.** If the daemon is unreachable the dashboard shows a blocking
-  diagnostic and retries. It never falls back to Herdr's agent state or to a
+  diagnostic and retries. It never falls back to a backend's agent state or to a
   pane-only tree.
 
 ### Where an agent row's facts come from
@@ -885,14 +878,14 @@ metadata flag never makes a target eligible. `D` on a registration is routed to
 the worker's owner where Radar holds a subject for it, and otherwise closes the
 pane the row shows; it never claims an owner it cannot name.
 
-### What is still read from Herdr
+### What is still read from pane metadata
 
-Herdr's agent records and the `pi_herdsman_*` pane tokens are read as **physical
-and containment evidence only**: they keep a pane that has an occupant protected
+A backend's own agent records and the `pi_herdsman_*` pane tokens are read as
+**physical and containment evidence only**: they keep a pane that has an occupant protected
 while Radar cannot name that occupant. They are never display facts for an agent
 row — a registered row is named by its registration, its label else its agent id,
-and its values come from the channels above. Ordinary panes keep Herdr's pane
-title and label, which describe the pane rather than an agent.
+and its values come from the channels above. Ordinary panes keep the backend's
+pane title and label, which describe the pane rather than an agent.
 
 ### Refresh and continuity
 
@@ -934,7 +927,7 @@ title and label, which describe the pane rather than an agent.
   attached to the server (`[tui] terminal`, else `$TERMINAL -e`) and asks again. Children are not nested under their
   parent: the exact spawn edge is shown in the details. An ordinary pane never
   duplicates a current or retained agent row.
-- Radar does not read Herdsman mailboxes, does not treat Herdr's agent name or
+- Radar does not read Herdsman mailboxes, does not treat a backend's agent name or
   title as a Herdsman fact, and never infers ownership from tab position or from
   the human session name — ownership is exact session identity.
 - When an agent disappears but its pane remains, Radar keeps its last observation
@@ -949,11 +942,11 @@ title and label, which describe the pane rather than an agent.
 
 Polling is best effort: inventory and process reads are not atomic, short
 commands between polls can be missed, and foreground confirmation can lag by two
-refresh cycles. Continuity across Herdr restarts or session moves is not promised.
+refresh cycles. Continuity across backend restarts or session moves is not promised.
 
 ## Background-task detail (the bus)
 
-Herdr's `pi_bg_*` pane tokens summarize background-task state but cannot carry
+The `pi_bg_*` pane tokens summarize background-task state but cannot carry
 the task detail, so `pi-bash-processes` publishes full snapshots. The daemon
 owns that ingest and exposes volatile detail through `tasks.list.v1`; the TUI
 never listens to publisher connections. Until the publisher migrates, the daemon
@@ -1031,10 +1024,10 @@ daemon-backed fleet visible and labels task detail `· bus off`.
 One Cargo package, with `radar` as its binary:
 
 - `src/main.rs`: terminal lifecycle and event loop.
-- `src/runtime.rs` / `src/herdr.rs`: the runtime seam and its Herdr adapter.
+- `src/runtime.rs` / `src/tmux.rs`: the runtime seam and its tmux adapter.
   Collection asks the seam for a normalized inventory and per-pane foreground
   evidence, and focus asks it to move to a normalized workspace or pane target;
-  the adapter owns Herdr's executable, CLI arguments, socket discovery, wire
+  the adapter owns tmux's executable, server selection, format strings, wire
   decoding and the bounded runner that kills and reaps a stalled command.
   Managed-agent lifecycle controls go through the daemon's semantic lifecycle
   methods; they do not use the in-process adapter or an owner-file request.
@@ -1074,26 +1067,25 @@ One Cargo package, with `radar` as its binary:
   a focused PTY check that also connects one to the running dashboard, plus
   `tests/tmux_acceptance.py`, which runs the dashboard against a disposable
   daemon on a disposable tmux server and asserts the registry-backed rows. No
-  real Herdr runtime is modified by these tests, and no real lifecycle request is
+  real tmux server is modified by these tests, and no real lifecycle request is
   written.
 
 `Cargo.lock` and `flake.lock` record reproducible dependency versions. The approved
 scope and task list are in
 [`openspec/changes/archive/2026-10-06-initial-fleet-overview/`](openspec/changes/archive/2026-10-06-initial-fleet-overview/).
 
-Manual acceptance: run `cargo run --locked` against your Herdr instance. Check the
+Manual acceptance: run `cargo run --locked` against your tmux server. Check the
 workspace inventory, cycle the pane views, navigate/fold/filter, show and hide the
 details, and inspect location, ownership, freshness and unavailable metadata.
 Press `Enter` on an agent row, a workspace row and a retained row, and confirm
-Herdr's focus lands where the row says; then the same with Herdr stopped, which
+the focus lands where the row says; then the same with tmux stopped, which
 must leave Radar usable and say why on the last line. Real
 runtime/UX acceptance is deliberately manual; automated checks use controlled
 fixtures and executables.
 
 The local control plane now wraps backend-neutral physical mux observations and
 primitives (focus, guarded unmanaged close, creation, literal input, bounded
-output reads and curated metadata reporting); Herdr is the production backend
-today. This does not add agent/session authority, a publisher registry, inferred
+output reads and curated metadata reporting); tmux is the only backend. This does not add agent/session authority, a publisher registry, inferred
 resume/restart, topology, or a production tmux backend. Managed-worker close and
 restart remain requests to the worker's owner, not mux operations. The daemon's
 [protocol reference](docs/control-plane.md) documents capabilities, durable

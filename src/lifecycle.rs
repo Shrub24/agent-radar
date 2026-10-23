@@ -1249,7 +1249,7 @@ mod tests {
     }
 
     /// A pane whose only evidence is a registration that did not join: no
-    /// Herdr metadata, no lineage, no label.
+    /// pane metadata, no lineage, no label.
     fn registered_only_inventory() -> FleetObservation {
         let mut observation = inventory(&["wA:p1"], Vec::new());
         let agent: crate::registry_observation::RegistryAgent = serde_json::from_value(json!({
@@ -1259,7 +1259,7 @@ mod tests {
                 "registered_at": "2026-01-01T00:00:00.000Z",
                 "source": "herdsman",
                 "incarnation": "11111111-1111-4111-8111-111111111111",
-                "location": {"backend": "herdr", "pane": "wA:p1"},
+                "location": {"backend": "tmux", "pane": "wA:p1"},
                 "process_claimed": true,
                 "launch": {"available": false}
             },
@@ -1271,7 +1271,7 @@ mod tests {
         .expect("registration decodes");
         observation.agents = crate::registry_observation::project(
             &observation,
-            &crate::runtime::BackendIdentity::named("herdr"),
+            &crate::runtime::BackendIdentity::named("tmux"),
             crate::registry_observation::RegistryRead {
                 agents: vec![agent],
                 ..Default::default()

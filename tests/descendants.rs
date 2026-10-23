@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use agent_radar::{
-    Collector, CollectorConfig, FleetObservation, HerdrConfig, HerdrRuntime, ObservationState,
+    Collector, CollectorConfig, FleetObservation, ObservationState, TmuxConfig, TmuxRuntime,
 };
 use std::{
     fs,
@@ -15,7 +15,7 @@ use std::{
 fn shutdown_does_not_wait_for_descendants_holding_output_pipes() {
     let dir = std::env::temp_dir().join(format!("radar-descendants-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let executable = dir.join("herdr");
+    let executable = dir.join("tmux");
     let ready = dir.join("ready");
     fs::write(
         &executable,
@@ -28,10 +28,12 @@ fn shutdown_does_not_wait_for_descendants_holding_output_pipes() {
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
     let mut collector = Collector::new(
         CollectorConfig::default(),
-        HerdrRuntime::new(HerdrConfig {
+        TmuxRuntime::new(TmuxConfig {
             executable,
+            server: "radar".to_string(),
             command_timeout: Duration::from_secs(5),
-        }),
+        })
+        .expect("a usable server name"),
         // This test reads a backend, not a registry: the daemon's own read is
         // what a collector is given in production.
         Arc::new(|_fleet: &FleetObservation, _cancel: &AtomicBool| Ok(None)),

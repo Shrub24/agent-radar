@@ -36,13 +36,13 @@ Radar SHALL, on ordinary Enter outside confirmation, ask the runtime provider to
 
 ### Requirement: No focus on a location Radar cannot prove
 
-Radar SHALL ask Herdr to focus a row's location whenever the current observation holds that location. Radar SHALL NOT ask when the displayed inventory is not current (a failed collection showing last-good data) or when the row's pane is absent from the observation, and SHALL say why in one line.
+Radar SHALL ask the backend to focus a row's location whenever the current observation holds that location. Radar SHALL NOT ask when the displayed inventory is not current (a failed collection showing last-good data) or when the row's pane is absent from the observation, and SHALL say why in one line.
 
 A retained row is not a refusal: continuity keeps a row only while its pane is still observed, so a retained agent's row focuses the pane it was last seen on.
 
 #### Scenario: A retained row
 - **WHEN** the user presses `Enter` on a retained row
-- **THEN** Herdr is asked to focus the pane that row was last observed on
+- **THEN** the backend is asked to focus the pane that row was last observed on
 
 #### Scenario: A stale inventory
 - **WHEN** collection has failed and the displayed rows are last-good data
@@ -56,7 +56,7 @@ A retained row is not a refusal: continuity keeps a row only while its pane is s
 
 Radar SHALL NOT block input or quitting while a focus request is outstanding, and SHALL state a failure in one line that does not replace the source diagnostic.
 
-#### Scenario: Herdr does not answer
+#### Scenario: The backend does not answer
 - **WHEN** a focus request exceeds the command timeout
 - **THEN** the interface remains responsive, the request is abandoned and a failure line is shown
 

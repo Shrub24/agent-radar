@@ -4,7 +4,7 @@
 
 Radar SHALL NOT block input or quitting while a focus request is outstanding, and SHALL state a failure in one line that does not replace the source diagnostic. A focus SHALL NOT hold its target against a later mutation however it ended. A tmux focus with no client attached to the server SHALL be refused before anything changes, with a refusal that names that case.
 
-#### Scenario: Herdr does not answer
+#### Scenario: The backend does not answer
 - **WHEN** a focus request exceeds the command timeout
 - **THEN** the interface remains responsive, the request is abandoned and a failure line is shown
 

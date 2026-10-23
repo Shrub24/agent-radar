@@ -1,9 +1,9 @@
 //! What this machine can say about a process that the runtime cannot.
 //!
-//! Herdr reports which command holds a pane's foreground. The kernel reports
+//! The backend reports which command holds a pane's foreground. The kernel reports
 //! four further facts Radar presents: how long that process has been alive,
 //! whether it has taken the terminal over, whether it is running the program
-//! that is installed now, and what it is using. None is in the Herdr API, so
+//! that is installed now, and what it is using. None is in the backend API, so
 //! all are read here and nowhere else — a process that is gone, or a platform
 //! whose state cannot be read, yields unknown facts rather than a guess.
 //!

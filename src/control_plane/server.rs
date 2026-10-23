@@ -13,7 +13,7 @@
 //! records where they are, because the records are what a later question is
 //! answered from.
 //!
-//! The daemon speaks only the normalized [`RuntimeProvider`] seam. Herdr
+//! The daemon speaks only the normalized [`RuntimeProvider`] seam. tmux
 //! transport and decoding remain inside the adapter.
 
 use std::io::{ErrorKind, Write};
@@ -56,7 +56,7 @@ use crate::runtime::{
     OutputRead, OutputRequest, PaneExitObservation, Primitives, ReportOutcome, ReportRequest,
     RuntimeProvider, SplitDirection, Target, validate_command,
 };
-use crate::{HerdrConfig, HerdrRuntime, TmuxConfig, TmuxRuntime};
+use crate::{TmuxConfig, TmuxRuntime};
 
 mod admission;
 mod child_close;
@@ -271,8 +271,6 @@ fn current_uid() -> u32 {
 /// reaches a daemon that is already running.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PhysicalBackend {
-    /// Herdr, through the adapter in [`crate::herdr`]. The default.
-    Herdr,
     /// A tmux server the operator named, never tmux's default server: a tmux
     /// selection that names no server is refused instead of reaching the one
     /// tmux would pick for itself.
@@ -300,10 +298,7 @@ impl std::fmt::Display for BackendConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownBackend { name } => {
-                write!(
-                    f,
-                    "control backend `{name}`: not a backend; use `herdr` or `tmux`"
-                )
+                write!(f, "control backend `{name}`: not a backend; use `tmux`")
             }
             Self::TmuxServerMissing => write!(
                 f,
@@ -344,11 +339,9 @@ pub fn physical_backend_with(
         Some(name) if !name.is_empty() => name,
         _ => match file.backend {
             crate::config::ControlBackend::Tmux => "tmux".to_string(),
-            crate::config::ControlBackend::Herdr => "herdr".to_string(),
         },
     };
     match name.as_str() {
-        "herdr" => Ok(PhysicalBackend::Herdr),
         "tmux" => {
             let server = tmux_server
                 .map(|value| value.to_string_lossy().trim().to_string())
@@ -372,7 +365,6 @@ impl PhysicalBackend {
     /// startup refusal, never a backend that quietly serves another one.
     fn adapter(&self) -> Result<Arc<dyn RuntimeProvider>, BackendConfigError> {
         match self {
-            Self::Herdr => Ok(Arc::new(HerdrRuntime::new(HerdrConfig::default()))),
             Self::Tmux { server } => TmuxRuntime::new(TmuxConfig::for_server(server))
                 .map(|runtime| Arc::new(runtime) as Arc<dyn RuntimeProvider>)
                 .map_err(|problem| BackendConfigError::AdapterConfiguration {
@@ -443,9 +435,8 @@ impl Daemon {
         let backend = physical_backend().map_err(|error| error.to_string())?;
         // The adapter validates the server name before anything is started under it.
         let adapter = backend.adapter().map_err(|error| error.to_string())?;
-        if let PhysicalBackend::Tmux { server } = &backend {
-            crate::service::ensure_tmux_server(server)?;
-        }
+        let PhysicalBackend::Tmux { server } = &backend;
+        crate::service::ensure_tmux_server(server)?;
         let task_socket = crate::bus::socket_path();
         Self::bind_with_backend_and_verifier_and_ingest(
             &socket_path(),
@@ -461,11 +452,6 @@ impl Daemon {
         Self::bind_with_backend(socket, state, None)
     }
 
-    /// Binds a production Herdr adapter at custom test/application paths.
-    pub fn bind_herdr_at(socket: &Path, state: &Path, config: HerdrConfig) -> Result<Self, String> {
-        Self::bind_with_backend(socket, state, Some(Arc::new(HerdrRuntime::new(config))))
-    }
-
     /// Binds `socket`, keeping records under `state`, creating and verifying both
     /// directories.
     ///
@@ -474,7 +460,10 @@ impl Daemon {
     /// another daemon answers on, a bind that failed, or a state directory that
     /// failed the same checks.
     pub fn bind_at(socket: &Path, state: &Path) -> Result<Self, String> {
-        let backend = Arc::new(HerdrRuntime::new(HerdrConfig::default()));
+        let backend = Arc::new(
+            TmuxRuntime::new(TmuxConfig::for_server(crate::config::DEFAULT_TMUX_SERVER))
+                .expect("the documented tmux defaults are usable"),
+        );
         Self::bind_with_backend(socket, state, Some(backend))
     }
 
@@ -1447,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn the_physical_backend_is_the_configured_one_and_herdr_only_when_named() {
+    fn the_physical_backend_is_the_configured_one_and_only_named_names_serve() {
         let value = std::ffi::OsStr::new;
         let file = crate::config::DaemonConfig::default();
         // Unset and empty fall back to the configured backend, which is tmux on
@@ -1462,8 +1451,10 @@ mod tests {
             );
         }
         assert_eq!(
-            physical_backend_with(Some(value(" Herdr ")), None, &file),
-            Ok(PhysicalBackend::Herdr)
+            physical_backend_with(Some(value(" Tmux ")), None, &file),
+            Ok(PhysicalBackend::Tmux {
+                server: "radar".to_string()
+            })
         );
     }
 

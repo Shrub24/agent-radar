@@ -136,10 +136,10 @@ A spawn SHALL accept an optional absolute working directory and an environment o
 - **THEN** admission refuses without accepting the request or creating a pane
 
 ### Requirement: Launch context is representable before creation
-The daemon SHALL validate launch-context shape, bounds and selected-backend representability before accepting a spawn or creating a pane. Unsupported cwd or environment transport SHALL refuse explicitly, never silently drop supplied fields. Herdr SHALL refuse newline or terminal-control values that its single-line launch transport cannot represent.
+The daemon SHALL validate launch-context shape, bounds and selected-backend representability before accepting a spawn or creating a pane. Unsupported cwd or environment transport SHALL refuse explicitly, never silently drop supplied fields. The adapter SHALL refuse newline or terminal-control values that its single-line launch transport cannot represent.
 
 #### Scenario: Unrepresentable environment value
-- **WHEN** a Herdr-backed spawn supplies an environment value containing a newline
+- **WHEN** a spawn supplies an environment value containing a newline
 - **THEN** the spawn refuses before creation and does not leave a pane or accepted operation
 
 #### Scenario: Shell-sensitive values
@@ -156,8 +156,8 @@ A token-bound spawn SHALL report the exact bound child registration_id alongside
 ### Requirement: Spawn topology reports exit observation
 Spawn topology reads SHALL include `exit_observation` for each current edge as `{state:"unknown"}` or `{state:"exited", code|signal, observed_at}`. Backends that cannot observe exit SHALL report unknown.
 
-#### Scenario: Herdr child
-- **WHEN** a Herdr-launched child's edge is read
+#### Scenario: A child on a backend that observes no exit
+- **WHEN** a child's edge is read and its backend observes no exit
 - **THEN** its exit observation is unknown
 
 #### Scenario: tmux child exited

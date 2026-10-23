@@ -551,7 +551,7 @@ export interface HerdsmanFacts {
    */
   background_tasks: string[];
   /**
-   * The percentage a Herdr token states, percent sign included. It carries no
+   * The percentage a background-task token states, percent sign included. It carries no
    * counts, so it is never presented as a typed window.
    */
   context_usage: string | null;
@@ -565,7 +565,7 @@ export interface HerdsmanFacts {
   definition: string | null;
   /**
    * A managed worker's runtime label: the name its owner and its siblings
-   * use for it, and the only faithful source for a worker's name. Herdr's
+   * use for it, and the only faithful source for a worker's name. The backend's
    * own agent name truncates it and its title welds it to the task.
    */
   label: string | null;
@@ -639,7 +639,7 @@ export interface Lineage {
   session: SessionUuid;
 }
 /**
- * Connector-scoped runtime location: Herdr workspace, tab and pane identifiers.
+ * Backend-scoped runtime location: workspace, tab and pane identifiers.
  *
  * Pane identity is a runtime location detail; it is never an agent identity.
  */
@@ -1339,7 +1339,7 @@ export interface Pane {
   title: string | null;
 }
 /**
- * A Herdr tab within a workspace; shown as location detail, not a tree level.
+ * A tab within a workspace; shown as location detail, not a tree level.
  */
 export interface Tab {
   label: string | null;
@@ -1348,7 +1348,7 @@ export interface Tab {
   workspace_id: string;
 }
 /**
- * A Herdr workspace: the first display grouping for the fleet tree.
+ * A workspace: the first display grouping for the fleet tree.
  */
 export interface Workspace {
   label: string | null;

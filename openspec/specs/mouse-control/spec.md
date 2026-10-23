@@ -44,7 +44,7 @@ Radar SHALL select the row a click lands on, SHALL fold or unfold a workspace he
 
 #### Scenario: Acting on the selected row
 - **WHEN** the selected agent row is clicked again and its pane is observed
-- **THEN** Herdr is asked to focus that pane
+- **THEN** the backend is asked to focus that pane
 
 #### Scenario: A heading
 - **WHEN** a workspace heading is clicked

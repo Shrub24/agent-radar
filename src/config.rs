@@ -184,8 +184,6 @@ impl Default for Appearance {
 pub enum ControlBackend {
     /// tmux on the named server, which Radar owns and starts through its user unit.
     Tmux,
-    /// Herdr, selected only explicitly.
-    Herdr,
 }
 
 /// The tmux server a daemon serves when none is named. Never tmux's own default.
@@ -395,10 +393,9 @@ impl Config {
         if let Some(backend) = daemon.backend {
             config.daemon.backend = match backend.trim().to_ascii_lowercase().as_str() {
                 "tmux" => ControlBackend::Tmux,
-                "herdr" => ControlBackend::Herdr,
                 other => {
                     return Err(format!(
-                        "daemon.backend: `{other}` is not a backend; use `tmux` or `herdr`"
+                        "daemon.backend: `{other}` is not a backend; use `tmux`"
                     ));
                 }
             };
@@ -555,14 +552,13 @@ impl Config {
         }
         let backend = match self.daemon.backend {
             ControlBackend::Tmux => "tmux",
-            ControlBackend::Herdr => "herdr",
         };
         let server = &self.daemon.tmux_server;
         out.push_str(&format!(
             "\n\n# What the control daemon serves. `tmux` serves the named tmux server, which\n\
-             # Radar owns and starts through its own user unit; `herdr` serves Herdr instead.\n\
+             # Radar owns and starts through its own user unit.\n\
              [daemon]\n\
-             # `tmux` or `herdr`\n\
+             # `tmux`\n\
              backend = \"{backend}\"\n\
              # the tmux server a `tmux` backend serves; never tmux's default server\n\
              tmux_server = \"{server}\""
@@ -1052,14 +1048,14 @@ htop = "none"
 
     #[test]
     fn the_daemon_backend_and_server_are_configurable() {
-        let config = Config::parse("[daemon]\nbackend = \"herdr\"\ntmux_server = \"work\"\n")
+        let config = Config::parse("[daemon]\nbackend = \"tmux\"\ntmux_server = \"work\"\n")
             .expect("parses");
-        assert_eq!(config.daemon.backend, ControlBackend::Herdr);
+        assert_eq!(config.daemon.backend, ControlBackend::Tmux);
         assert_eq!(config.daemon.tmux_server, "work");
 
         // The document prints the choice and reads back as the same config.
         let printed = config.to_document();
-        assert!(printed.contains("backend = \"herdr\""), "{printed}");
+        assert!(printed.contains("backend = \"tmux\""), "{printed}");
         assert!(printed.contains("tmux_server = \"work\""), "{printed}");
         assert_eq!(Config::parse(&printed).expect("round trips"), config);
         let printed = Config::default().to_document();

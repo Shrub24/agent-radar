@@ -25,7 +25,7 @@ journal exchanges against a disposable daemon and compares each response
 against its template, substituting only generated and clock-derived fields.
 The registry exchanges include self facts with no owner, an extended owner
 assignment and an independent facts replacement; freshness is checked per channel.
-The spawn exchanges use a disposable scripted Herdr socket; these validate the
+The spawn exchanges use a disposable scripted backend socket; these validate the
 served daemon's operation, token binding and public redaction without a live
 mux or partial whole-object comparison. The final
 `spawn.close` exchanges close the spawned child pane after a scripted
@@ -45,7 +45,7 @@ channel accepted-snapshot handles).
 This documents the durable agent-registration records and direct publication
 channels served on the trusted control socket. They are a **foundation**: private
 storage, writer fencing and freshness rules are implemented and tested. Registry
-operations are independent of mux capabilities and make no Herdr calls. They
+operations are independent of mux capabilities and make no backend calls. They
 perform no lifecycle controls.
 
 The registry is backend-independent. It holds agent identity separately from
@@ -73,7 +73,7 @@ One registration is one JSON file, `<state root>/agents/<registration_id>.json`,
     "run": null,
     "label": "worker",
     "location": {
-      "backend": "herdr",
+      "backend": "tmux",
       "instance": null,
       "workspace": "wA",
       "tab": "wA:t1",
@@ -116,7 +116,7 @@ control socket also serves `agent.acquire`, `agent.publish`, `agent.retire`,
 regardless of mux backend. `registry.facts.v1` is served whenever `registry.v1`
 is, and names the facts channel and the assignment extension below; an older
 daemon rejects both as `bad_params`. The `agent.*` methods are
-independent of the physical backend and do not call Herdr. `spawn.create` is
+independent of the physical backend and do not call it. `spawn.create` is
 different: it requires the `spawn.v1` contract, which the backend's
 `mux.create` and `mux.launch` capabilities make servable,
 and `spawn.launch_context.v1` when cwd or environment is supplied;
@@ -163,7 +163,7 @@ A successful response carries the durable operation record beside its public
 edge projection:
 
 ```json
-{"request":{"id":"<request UUID>","method":"spawn.create","outcome":"completed","created":{"kind":"pane","id":"wA:p2"},"effects":["created pane wA:p2","launched child"]},"spawn":{"version":2,"request_id":"<request UUID>","parent":"<agent UUID>","created":"completed","launched":"completed","location":{"backend":"herdr","workspace":"wA","tab":"wA:t1","pane":"wA:p2"}}}
+{"request":{"id":"<request UUID>","method":"spawn.create","outcome":"completed","created":{"kind":"pane","id":"wA:p2"},"effects":["created pane wA:p2","launched child"]},"spawn":{"version":2,"request_id":"<request UUID>","parent":"<agent UUID>","created":"completed","launched":"completed","location":{"backend":"tmux","workspace":"wA","tab":"wA:t1","pane":"wA:p2"}}}
 ```
 
 The example omits generated fields; use the fixture for complete shapes. A
@@ -179,7 +179,7 @@ are `unknown`. Do not retry an uncertain spawn under another request id or fall
 back to another launch path: the pane or child may already exist. Same request
 id and identical request content only reads back the recorded outcome; changed
 content is refused. A backend missing either capability refuses before create,
-edge creation, or token minting. Herdr refuses argv containing a newline before
+edge creation, or token minting. The adapter refuses argv containing a newline before
 pane input; no private-script fallback is implemented.
 
 Before the create is dispatched, the daemon reads the process serving the
@@ -223,7 +223,7 @@ backend confirms the pane command exited, then as
 `{"state":"exited","code":23,"signal":null,"observed_at":"<daemon-time>"}`
 (the signal form has `code:null`). `spawn.exit_observation.v1` (the backend's
 `mux.exit_observation`) advertises backend
-support; without it, current v2 edges remain unknown. Herdr has no
+support; without it, edges remain unknown. A backend has no
 exit-observation capability, and a missing pane is never inferred to be exited.
 Exit evidence is the backend's pane-command
 status, not proof of the bound agent's process identity after an out-of-band
@@ -273,7 +273,7 @@ the generation fence: a pane id outlives the server that answered the create,
 and a backend restarting under the same name hands the same ids to panes Radar
 never created, so history and a pane id are both insufficient. An edge that
 records no instance — an edge on a backend that cannot name
-its serving process, such as Herdr — is unfenced and refuses before admission
+its serving process is unfenced and refuses before admission
 rather than inferring a generation. Dead-pane cleanup additionally needs
 `mux.exit_observation`, and reads the exit `code`/`signal` the edge stored
 rather than the code a same-UID respawn could change. Both fence reads run on
@@ -626,7 +626,7 @@ when it has explicitly observed incumbent generation and handle and sends both
 under `replace`; replacement is valid only after incumbent retirement or lease
 expiry. A refusal that says the writer/handle changed means this producer has
 been fenced: stop and reconcile with the owner, do not retry with `replace` or
-new identity. This example contains no Herdr invocation, Herdr token parsing,
+new identity. This example contains no backend invocation, token parsing,
 subprocess or physical lifecycle call. Herdsman's existing owner assignment
 projection can map to `channel: "assignment"`; target process activity belongs
 on the separate `execution` channel with its own publisher identity and sequence.
@@ -678,5 +678,5 @@ facts, retirement, replacement, freshness or process verification establishes li
 eligibility, assignment completion or authority to launch/stop/resume. No
 publisher API here executes physical controls.
 
-The existing mux `report` method and its Herdr-forwarding behaviour are
+The existing mux `report` method and its backend-forwarding behaviour are
 unchanged.

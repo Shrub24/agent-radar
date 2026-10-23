@@ -14,7 +14,7 @@ The flake SHALL expose `packages.<system>.radar`, its `default` alias and a defa
 - **AND** the default app invokes that installed executable
 
 #### Scenario: Noninteractive invocation without a fleet
-- **WHEN** the installed binary is invoked with `--help` or `--print-config` in an isolated user environment with no Herdr executable or owner-control directories
+- **WHEN** the installed binary is invoked with `--help` or `--print-config` in an isolated user environment with no tmux executable or owner-control directories
 - **THEN** it produces its existing help or effective configuration output without requiring fleet access
 
 #### Scenario: Development shell preserved
@@ -66,11 +66,11 @@ The module SHALL expose nullable freeform TOML `programs.radar.settings`, defaul
 - **AND** the module does not force an overriding `RADAR_CONFIG` value
 
 ### Requirement: Explicit runtime dependencies and consumer guidance
-The distribution SHALL leave Herdr and optional icon fonts separately installed and preserve native fallback behavior. Installation documentation SHALL show the canonical flake URL, package/app use and Home Manager import/configuration, including runtime prerequisites and the supported package systems.
+The distribution SHALL leave tmux and optional icon fonts separately installed and preserve native fallback behavior. Installation documentation SHALL show the canonical flake URL, package/app use and Home Manager import/configuration, including runtime prerequisites and the supported package systems.
 
 #### Scenario: No bundled runtime
 - **WHEN** a consumer installs Radar from the flake
-- **THEN** it does not implicitly install Herdr, copy font assets or depend on a local developer checkout
+- **THEN** it does not implicitly install tmux, copy font assets or depend on a local developer checkout
 - **AND** missing runtime/font behavior remains the same as the source-built program
 
 #### Scenario: Direct flake input

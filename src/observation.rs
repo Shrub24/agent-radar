@@ -6,7 +6,7 @@
 //! live pane is retained until positive evidence supersedes it. Nothing is
 //! persisted — a fresh state (a Radar restart) starts empty.
 //!
-//! All transitions are pure: no I/O, no clock, no Herdr knowledge. The
+//! All transitions are pure: no I/O, no clock, no backend knowledge. The
 //! collector supplies decoded [`ForegroundEvidence`] for the panes returned by
 //! [`ObservationState::evidence_candidates`].
 
@@ -77,7 +77,7 @@ pub struct ObservationState {
     /// exists in the inventory and has no presented agent reported on it.
     retained: BTreeMap<String, RetainedAgent>,
     /// Close containment: the same retention over every agent record, presented
-    /// or Herdr metadata. Never displayed, so a vanished metadata record keeps
+    /// or pane metadata. Never displayed, so a vanished metadata record keeps
     /// its pane protected without becoming a row.
     containment: BTreeMap<String, RetainedAgent>,
     /// Retained panes that have not yet been evidence-queried this cycle;
@@ -108,7 +108,7 @@ impl ObservationState {
     /// - source freshness becomes [`SourceFreshness::Current`].
     ///
     /// Display continuity reads presented agents only. Containment reads every
-    /// record, so Herdr metadata that vanishes still protects its pane.
+    /// record, so pane metadata that vanishes still protects its pane.
     pub fn apply_success(&mut self, observation: FleetObservation) {
         let previous = self.inventory.take();
 
@@ -259,7 +259,7 @@ impl ObservationState {
     }
 
     /// Retained presented agents keyed by pane id, for display (empty when
-    /// nothing is retained). Herdr metadata never appears here.
+    /// nothing is retained). Pane metadata never appears here.
     pub fn retained(&self) -> &BTreeMap<String, RetainedAgent> {
         &self.retained
     }
@@ -389,7 +389,7 @@ mod tests {
 
     fn reported(value: &str) -> SessionIdentity {
         SessionIdentity::Reported {
-            source: Some("herdr:pi".into()),
+            source: Some("tmux:pi".into()),
             value: value.into(),
         }
     }
@@ -651,7 +651,7 @@ mod tests {
         let mut state = state_with_agent();
         state.apply_success(observation(&["wA:p1"], vec![]));
         state.apply_evidence("wA:p1", ForegroundEvidence::Shell);
-        state.apply_failure("herdr exited with status 1".to_string());
+        state.apply_failure("tmux exited with status 1".to_string());
 
         // The inventory stands as last-good, retention survives, and the
         // diagnostic is recorded — failure is not disappearance.
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(
             state.source_freshness(),
             &SourceFreshness::Stale {
-                diagnostic: "herdr exited with status 1".to_string()
+                diagnostic: "tmux exited with status 1".to_string()
             }
         );
     }

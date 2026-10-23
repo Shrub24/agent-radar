@@ -17,8 +17,7 @@ The daemon exposes physical control, registry reads/publications, and volatile b
 | Direct agent registry | Register agent incarnations; publish execution, assignment and session facts; read current snapshots and process verification | [Agent registration](agent-registration.md) |
 | Background-task read | Read volatile task snapshots grouped by exact Pi session UUID | [Publisher bridge](radar-bus.md) |
 
-The physical backend defaults to tmux on the server named `radar`. Herdr is
-selected only explicitly with `RADAR_CONTROL_BACKEND=herdr`. The server name comes from
+The physical backend is tmux on the server named `radar`. The server name comes from
 `RADAR_TMUX_SERVER` or the `[daemon] tmux_server` setting. The daemon runs the
 executables named by `RADAR_TMUX` and `RADAR_SYSTEMCTL` (absolute paths in the
 Home Manager unit, `tmux` and `systemctl` from `PATH` otherwise), so its unit
@@ -47,8 +46,7 @@ recorded directory or pane's current directory. The shell initializes its normal
 environment and applies direnv for that target; Radar does not copy the dashboard's
 environment. The launch is a managed `topology.create` recipe. Use `a` to add an
 empty shell for arbitrary commands.
-Registry calls work without a mux backend and do not publish
-through Herdr. The older mux `report` method still forwards state/session/metadata
+Registry calls work without a mux backend. The older mux `report` method still forwards state/session/metadata
 to the backend; it is **not** direct registry publication.
 
 The daemon can create and launch a child through `spawn.create`, recording a
@@ -58,7 +56,7 @@ session UUID never selects among live registrations.
 
 Spawn accepts optional absolute cwd and an environment overlay, requiring the
 `spawn.launch_context.v1` contract (`mux.create`, `mux.launch` and
-`mux.launch_context`). Herdr quotes a single launch line and refuses
+`mux.launch_context`). The adapter quotes a single launch line and refuses
 unrepresentable values before creation. Public operation readbacks omit
 environment values. The child captures/removes the exported
 `PI_RADAR_REGISTRATION_ID` and presents it as its registration; new bindings persist the returned
@@ -66,7 +64,7 @@ environment values. The child captures/removes the exported
 exact ID with `agent.get`, not aliases or a nonexistent `spawn.edge` object.
 Edges retain process and session parent identities. Topology also
 reports `exit_observation`: tmux can persist a typed pane-command exit after
-arming `remain-on-exit`; Herdr and backends without `mux.exit_observation` report
+arming `remain-on-exit`; a backend without `mux.exit_observation` reports
 unknown. Missing panes do not imply exit, and exit evidence never changes
 assignment or execution publications.
 
@@ -77,7 +75,7 @@ child's process birth identity. A pane whose command has exited is cleaned up as
 process serving the backend now is the one whose verified birth identity the
 daemon recorded before the create: a pane id outlives the server that answered
 the create. An edge with no recorded creating instance — an
-edge on a backend that cannot name its serving process, such as Herdr — is never
+edge on a backend that cannot name its serving process — is never
 fenced, so its dead panes are refused rather than inferred. `already_exited`
 confirms retained-pane cleanup and the pane command's recorded exit; it never
 proves the registered process exited and never authorizes relaunch. Neither path
@@ -171,11 +169,12 @@ or ingest messages. A daemon that does not serve `observation.get.v1` fails the
 dashboard's startup with that diagnostic rather than showing a fleet from another
 source, and there is no fallback to collecting locally. Publishing a revision is
 not a durable event: nothing about a sample enters the journal.
-Herdr's agent records, its display metadata and its native agent status are never
-display facts: a registered row is named by its registration and shows the
+A backend's own agent records, its display metadata and its native agent status
+are never display facts: a registered row is named by its registration and shows the
 execution, assignment and facts channels, each with its own provenance and
 freshness. A registration at a pane also protects it — and the tab containing it
-— from a generic unmanaged close, joined or not; managed controls use daemon lifecycle methods and refuse rather than falling back when the daemon is unavailable. No agent fact in the dashboard comes from a Herdr token once the daemon serves the registry.
+— from a generic unmanaged close, joined or not; managed controls use daemon lifecycle methods and refuse rather than falling back when the daemon is unavailable. No agent fact in the dashboard comes from a pane metadata token once the daemon
+serves the registry.
 
 ## Connect and negotiate
 
@@ -374,8 +373,8 @@ The first port can be small:
 - Register lead/worker subjects directly and retain their daemon identities.
 - Publish Herdsman's existing owner projection on `assignment`; publish Pi
   execution evidence separately on `execution`.
-- Keep optional Herdr metadata mirroring only where an existing consumer needs
-  it. Registry publication itself needs no Herdr commands or token parsing.
+- Keep optional pane-metadata mirroring only where an existing consumer needs it.
+  Registry publication itself needs no backend commands or token parsing.
 - Publish the session's own `facts` channel (model, provider, thinking, context
   usage, session name, background tasks) where a dashboard consumer needs it.
   Adoption is additive: a dashboard shows the assignment extension and `facts`
@@ -421,21 +420,21 @@ separately.
 Run `cargo build --locked && python3 tests/agent_publisher.py` for the disposable
 daemon smoke. It replays registry and spawn fixture exchanges; spawn uses a
 scripted backend to verify create, launch, token binding and redaction without a
-live Herdr session. Its close exchanges cover the live-pane path and its same-ID
+live backend. Its close exchanges cover the live-pane path and its same-ID
 replay; the dead-pane `already_exited` path needs a retained pane and a fenced
-edge, and a scripted Herdr backend can never fence one, so that path is covered
-by the isolated disposable-tmux tests instead.
+edge, and a scripted backend can never fence one, so that path is covered by the
+isolated disposable-tmux tests instead.
 `python3 tests/tmux_acceptance.py target/debug/radar` is the dashboard
 acceptance: it runs the TUI against a disposable daemon on a disposable tmux
 server, registers agents whose panes run real foreground processes, and asserts
 the registry-backed rows, the refusal of a generic close for a registration, and
-that no Herdr call is made. It needs no Herdr, and it leaves no server, pane,
+that no backend command is made. It needs no live server, and it leaves no pane,
 daemon or socket behind, on success or failure. The publisher example itself
 remains a registry-publisher
 reference and does not launch children. It retains publisher identity for one
 process lifetime; a production publisher must define durable reconnect state.
-The real Herdr launch smoke belongs to the independent final verification gate;
-there is no live user-fleet integration.
+A live launch smoke belongs to the operator's own acceptance; there is no live
+user-fleet integration in the test suite.
 
 Consumers should negotiate contracts, tolerate unfamiliar contract names, and
 switch on error codes rather than human-readable messages. Bundled Radar clients

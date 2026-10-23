@@ -100,7 +100,7 @@ const MAX_RECENT_LINES: u32 = 1000;
 
 /// Command names that mean the pane's own shell still holds its terminal.
 ///
-/// The list matches the one the Herdr adapter uses, so the same program is
+/// The list names the programs a pane is known by, so the same program is
 /// classified the same way whichever backend reports it.
 const SHELLS: &[&str] = &[
     "sh",
@@ -949,7 +949,7 @@ impl TmuxRuntime {
                     pane_id: self.handle(id),
                 },
                 // tmux has no pane label of its own; a pane's declared label is
-                // Herdr's. The title is the pane's terminal title, which the
+                // The title is the pane's terminal title, which the
                 // program in it sets and may clear.
                 label: None,
                 title: text_field(title),
@@ -1328,7 +1328,7 @@ mod tests {
     fn a_handle_of_another_backend_server_or_kind_is_refused() {
         let runtime = runtime("probe");
         for handle in [
-            "wA:p1",           // Herdr's own handle
+            "wA:p1",           // the backend's own handle
             "tmux:other:%3",   // another server
             "tmux:probe:@1",   // a window where a pane was asked for
             "tmux:probe:%",    // no id at all

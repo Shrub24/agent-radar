@@ -1,5 +1,5 @@
 //! Runtime observations and their fleet-overview projection.
-//! Herdr wire formats stay in the connector; presentation uses normalized facts.
+//! Backend wire formats stay in the adapter; presentation uses normalized facts.
 
 pub mod app;
 pub mod attach;
@@ -10,7 +10,6 @@ pub mod config;
 pub mod control;
 pub mod control_plane;
 pub mod focus;
-pub mod herdr;
 pub mod lifecycle;
 pub mod log;
 pub mod managed_control;
@@ -47,7 +46,6 @@ pub use control_plane::{
     install_signal_handlers, socket_path, state_dir,
 };
 pub use focus::Focuser;
-pub use herdr::{DecodeError, HerdrConfig, HerdrRuntime, decode_process_info, decode_snapshot};
 pub use lifecycle::{
     CloseRequest, Closer, Containment, ManagedActions, ManagedRequest, Update, UpdateKind,
 };

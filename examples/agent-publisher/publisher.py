@@ -90,12 +90,12 @@ def publish_assignment(path: Path, registration: dict, publisher: dict,
     replay does not extend the lease.
     """
     registered = call(path, "agent.register", registration)["registration"]
-    acquire = {"agent_id": registered["agent_id"], "channel": "assignment",
+    acquire = {"registration_id": registered["registration_id"], "channel": "assignment",
                "publisher": publisher}
     if replace is not None:
         acquire["replace"] = replace
     binding = call(path, "agent.acquire", acquire)["writer"]
-    params = {"agent_id": registered["agent_id"], "channel": "assignment",
+    params = {"registration_id": registered["registration_id"], "channel": "assignment",
               "writer_handle": binding["handle"], "sequence": sequence,
               "snapshot": snapshot}
     if lease_ms is not None:
@@ -104,27 +104,27 @@ def publish_assignment(path: Path, registration: dict, publisher: dict,
     return registered, channel
 
 
-def publish_facts(path: Path, agent_id: str, publisher: dict, snapshot: dict,
+def publish_facts(path: Path, registration_id: str, publisher: dict, snapshot: dict,
                   sequence: int, *, lease_ms: int | None = None) -> dict:
     """Acquire the facts writer and publish one complete facts snapshot.
 
     The publisher is the session itself; no owner is named. A new snapshot
     replaces every field, so omitted facts are withdrawn.
     """
-    binding = call(path, "agent.acquire", {"agent_id": agent_id, "channel": "facts",
+    binding = call(path, "agent.acquire", {"registration_id": registration_id, "channel": "facts",
                                            "publisher": publisher})["writer"]
-    params = {"agent_id": agent_id, "channel": "facts", "writer_handle": binding["handle"],
+    params = {"registration_id": registration_id, "channel": "facts", "writer_handle": binding["handle"],
               "sequence": sequence, "snapshot": snapshot}
     if lease_ms is not None:
         params["lease_ms"] = lease_ms
     return call(path, "agent.publish", params)["channel"]
 
 
-def publish_context(path: Path, agent_id: str, publisher: dict,
+def publish_context(path: Path, registration_id: str, publisher: dict,
                     writer: dict | None, sequence: int, session: str | None,
                     *, lease_ms: int | None = None) -> tuple[dict, dict]:
     """Publish a changed current session; explicit null clears the association."""
-    params = {"agent_id": agent_id, "publisher": publisher, "sequence": sequence,
+    params = {"registration_id": registration_id, "publisher": publisher, "sequence": sequence,
               "context": {"session": session}}
     if writer is not None:
         params["writer_handle"] = writer["handle"]
@@ -180,11 +180,11 @@ def main() -> int:
             current_session = args.session
             if current_session != published_session:
                 context_writer, context = publish_context(
-                    args.socket, registered["agent_id"], publisher, context_writer,
+                    args.socket, registered["registration_id"], publisher, context_writer,
                     context_sequence + 1, current_session, lease_ms=DEFAULT_LEASE_MS)
                 context_sequence += 1
                 published_session = current_session
-            print(json.dumps({"agent_id": registered["agent_id"],
+            print(json.dumps({"registration_id": registered["registration_id"],
                               "generation": channel["writer"]["generation"],
                               "sequence": sequence,
                               "freshness": channel.get("snapshot", {}).get("freshness"),

@@ -11,7 +11,7 @@
 //!
 //! The runtime's transport is not this module's business. Which executable
 //! runs, what its arguments, output shapes and sockets are, and how a stalled
-//! command is killed and reaped all live in the adapter ([`crate::herdr`]). A
+//! command is killed and reaped all live in the adapter ([`crate::tmux`]). A
 //! provider is anything that answers with Radar's normalized facts, so this
 //! path is also driven by an in-memory fake in tests.
 //!

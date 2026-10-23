@@ -1,8 +1,8 @@
 //! Normalized fleet facts shared by the connector, the continuity reconciler
 //! and (later) the tree/UI.
 //!
-//! These types deliberately contain no Herdr DTO shapes, metadata-token keys or
-//! CLI details: raw `herdr` output is decoded inside [`crate::herdr`] and only
+//! These types deliberately contain no backend DTO shapes, metadata-token keys or
+//! CLI details: raw `tmux` output is decoded inside [`crate::tmux`] and only
 //! these facts cross the seam.
 
 use std::time::Duration;
@@ -37,7 +37,7 @@ mod option_duration_millis {
     }
 }
 
-/// Connector-scoped runtime location: Herdr workspace, tab and pane identifiers.
+/// Backend-scoped runtime location: workspace, tab and pane identifiers.
 ///
 /// Pane identity is a runtime location detail; it is never an agent identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -156,7 +156,7 @@ impl std::fmt::Display for RuntimeStatus {
     }
 }
 
-/// A Herdr workspace: the first display grouping for the fleet tree.
+/// A workspace: the first display grouping for the fleet tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Workspace {
     pub workspace_id: String,
@@ -167,7 +167,7 @@ pub struct Workspace {
     pub session_path: Option<String>,
 }
 
-/// A Herdr tab within a workspace; shown as location detail, not a tree level.
+/// A tab within a workspace; shown as location detail, not a tree level.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Tab {
     pub tab_id: String,
@@ -328,7 +328,7 @@ impl From<&RuntimeStatus> for AgentState {
     }
 }
 
-/// What Herdsman publishes about an agent through Herdr's pane metadata.
+/// What Herdsman publishes about an agent through the backend's pane metadata.
 ///
 /// Every field is `None` until the source publishes it: the contract is
 /// additive, so an absent key means unavailable rather than a default.
@@ -337,6 +337,19 @@ impl From<&RuntimeStatus> for AgentState {
 /// Highest integer JavaScript can represent exactly when the facts channel is
 /// consumed by the TypeScript SDK.
 pub const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Fixtures shared by the presentation tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::FleetObservation;
+
+    /// The documentary fleet: two workspaces with agents, panes and one empty
+    /// pane, as the normalized model reads it.
+    pub(crate) fn fleet() -> FleetObservation {
+        serde_json::from_str(include_str!("../tests/fixtures/fleet_observation.json"))
+            .expect("the fleet fixture decodes")
+    }
+}
 
 /// How much of a model's context window a session has used, as counts.
 ///
@@ -381,7 +394,7 @@ pub struct HerdsmanFacts {
     /// The agent definition a pane reports as its display agent.
     pub definition: Option<String>,
     /// A managed worker's runtime label: the name its owner and its siblings
-    /// use for it, and the only faithful source for a worker's name. Herdr's
+    /// use for it, and the only faithful source for a worker's name. The backend's
     /// own agent name truncates it and its title welds it to the task.
     pub label: Option<String>,
     /// A managed worker's run identity.
@@ -418,7 +431,7 @@ pub struct HerdsmanFacts {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub thinking: Option<String>,
-    /// The percentage a Herdr token states, percent sign included. It carries no
+    /// The percentage a background-task token states, percent sign included. It carries no
     /// counts, so it is never presented as a typed window.
     pub context_usage: Option<String>,
     /// The context window a registry publisher reports as counts.

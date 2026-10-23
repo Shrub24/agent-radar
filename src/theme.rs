@@ -1,8 +1,7 @@
 //! Visual vocabulary: agent marks, lifecycle marks and colours.
 //!
-//! The glyph tables and the palette follow `herdr-radar`'s conventions so a
-//! Radar pane and a Herdr sidebar agree on what a mark means. Marks are kept
-//! to ordinary Unicode ([`TEXT`]); the Private Use Area face herdr-radar can
+//! The glyph tables and the palette keep one meaning per mark. Marks are kept
+//! to ordinary Unicode ([`TEXT`]); the Private Use Area face an agent icon font can
 //! install is a font-level concern, not a rendering one, and shape — not only
 //! colour — distinguishes every lifecycle state.
 //!
@@ -19,7 +18,7 @@ use tui_spinner::FluxFrames;
 use crate::config::{Config, Palette};
 use crate::model::AgentState;
 
-/// Ordinary-Unicode mark per agent, keyed by the name Herdr reports.
+/// Ordinary-Unicode mark per agent, keyed by the name the backend reports.
 pub const TEXT: &[(&str, &str)] = &[
     ("claude", "§"),
     ("codex", "Λ"),
@@ -52,8 +51,8 @@ pub const TEXT: &[(&str, &str)] = &[
     ("crush", "♥"),
 ];
 
-/// The same marks in the Private Use Area of the icon font `herdr-radar`
-/// installs (`Herdr Agent Icons Max`), whose glyphs are drawn logos rather
+/// The same marks in the Private Use Area of an agent icon font (`Herdr Agent
+/// Icons Max`), whose glyphs are drawn logos rather
 /// than borrowed punctuation. Selected only when that font is actually
 /// present, so a terminal without it never shows tofu.
 pub const PUA: &[(&str, &str)] = &[
@@ -121,7 +120,7 @@ fn detect_icons() -> Icons {
     }
 }
 
-/// Whether the icon font is in the user font directory, where `herdr-radar`
+/// Whether the icon font is in the user font directory, where the font
 /// installs it (`$XDG_DATA_HOME/fonts`, else `~/.local/share/fonts`).
 fn icon_font_installed() -> bool {
     let base = std::env::var_os("XDG_DATA_HOME")

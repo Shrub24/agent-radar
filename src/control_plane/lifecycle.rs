@@ -2473,7 +2473,7 @@ mod tests {
         let scratch = Scratch::new("managed-metadata");
         let registry = scratch.registry();
         let metadata = ManagedMetadata {
-            owner: Some("herdr".into()),
+            owner: Some("extension".into()),
             run: Some("run-17".into()),
             label: Some("reviewer".into()),
             role: Some("worker".into()),
@@ -2486,7 +2486,7 @@ mod tests {
             .expect("read subject")
             .expect("subject");
         assert_eq!(persisted.managed, metadata);
-        assert_eq!(public_view(&persisted)["managed"]["owner"], "herdr");
+        assert_eq!(public_view(&persisted)["managed"]["owner"], "extension");
 
         let successor = create_with_intent(
             &registry,

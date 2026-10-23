@@ -1,7 +1,7 @@
 //! Workspace and ownership projection: normalized observations → display rows.
 //!
 //! [`FleetTree::build`] turns the observation surface into display-ready
-//! rows: one group per Herdr workspace, agent rows nested under unambiguous
+//! rows: one group per workspace, agent rows nested under unambiguous
 //! same-workspace owners (any tab), and at most one ordinary-pane row per
 //! pane. Tabs stay location detail on the rows rather than a tree level.
 //!
@@ -580,7 +580,7 @@ impl FleetTree {
                             .get(pane.location.tab_id.as_str())
                             .map(|label| (*label).to_string()),
                         container: places.panes.get(pane_id).cloned(),
-                        // Herdr keeps the last title an agent set as the pane's
+                        // The backend keeps the last title an agent set as the pane's
                         // label. When the pane reports no agent, that label is a
                         // finished session, not what the pane is now.
                         exited: pane
@@ -1252,13 +1252,10 @@ mod tests {
     use crate::control_plane::containers::{
         Binding as ContainerBinding, Provenance, PublicContainer,
     };
-    use crate::herdr::decode_snapshot;
     use crate::model::{
         FleetObservation, Lineage, Location, RuntimeStatus, SessionIdentity, SessionUuid, Tab,
         Workspace,
     };
-
-    const REAL_SHAPED: &str = include_str!("../tests/fixtures/snapshot_real_shaped.json");
 
     /// A canonical UUID derived from a small integer, so tests never embed
     /// UUID-shaped literals (which secret scanners mangle on write).
@@ -1269,7 +1266,7 @@ mod tests {
 
     fn fixture_state() -> ObservationState {
         let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
+        state.apply_success(crate::model::testing::fleet());
         state
     }
 
@@ -1677,7 +1674,7 @@ mod tests {
         // Move the worker into its owner's window: the owner has no owner in that
         // window, so it is the window's root and the tab, and the worker nests
         // beneath it.
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
                 agent.location.tab_id = "wA:t1".into();
@@ -1715,7 +1712,7 @@ mod tests {
         // Both agents are roots of the window and neither owns the other, so the
         // window has no single identity and its agents stay flat beneath the
         // workspace.
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
                 agent.location.tab_id = "wA:t1".into();
@@ -1857,7 +1854,7 @@ mod tests {
         let mut state = fixture_state();
         // Move the worker's ownership link to a session owned in workspace wB
         // (the reviewer's), which must not nest across workspaces.
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         let worker = observation
             .agents
             .iter_mut()
@@ -1942,7 +1939,7 @@ mod tests {
     fn retained_association_projects_a_marked_agent_row_without_a_pane_duplicate() {
         let mut state = fixture_state();
         // The owner stops being reported while its pane stays.
-        let mut without_owner = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut without_owner = crate::model::testing::fleet();
         without_owner
             .agents
             .retain(|agent| agent.location.pane_id != "wA:p1");
@@ -1978,7 +1975,7 @@ mod tests {
     #[test]
     fn duplicate_source_records_yield_single_rows() {
         let mut state = fixture_state();
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         // Duplicate pane record and duplicate agent record for the same pane.
         let pane = observation.panes[0].clone();
         observation.panes.push(pane);

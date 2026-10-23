@@ -5,7 +5,7 @@
 //! runtime and is therefore terminal-untrusted: [`sanitize`] strips control
 //! characters (including ESC) before they reach a [`ratatui::text::Span`], so a
 //! label can never move the cursor or change terminal modes. Nothing here
-//! inspects Herdr tokens — rows and details are rendered from
+//! inspects pane metadata tokens — rows and details are rendered from
 //! [`crate::tree`] facts.
 //!
 //! [`render`] is stateless apart from the caller-owned [`ListState`], which
@@ -3340,7 +3340,7 @@ fn activity_lines(facts: &HerdsmanFacts, blocks: &Blocks<'_>, page: &mut PageLin
     if let Some(role) = facts.role.as_deref() {
         page.push(field("role", sanitize(role)));
     }
-    // Herdr's own display agent is where a worker's agent definition comes
+    // The backend's own display agent is where a worker's agent definition comes
     // from; it earns a line only when it says more than the role already does.
     if let Some(definition) = facts.definition.as_deref()
         && Some(definition) != facts.role.as_deref()
@@ -3375,7 +3375,7 @@ fn activity_lines(facts: &HerdsmanFacts, blocks: &Blocks<'_>, page: &mut PageLin
         page.push(field("thinking", sanitize(thinking)));
     }
     // Counts, when a registry publisher gave them, are the better fact: the
-    // percentage is derived from them. A Herdr token has only the percentage.
+    // percentage is derived from them. A token carries only the percentage.
     if let Some(window) = facts.context_window {
         page.push(field(
             "context usage",
@@ -3693,7 +3693,6 @@ mod tests {
     };
 
     use crate::app::Action;
-    use crate::herdr::decode_snapshot;
     use crate::model::{
         AgentObservation, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent,
         DescendantResources, DescendantSample, FleetObservation, ForegroundEvidence, HerdsmanFacts,
@@ -3702,8 +3701,6 @@ mod tests {
     };
     use crate::runtime::Target;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
-
-    const REAL_SHAPED: &str = include_str!("../tests/fixtures/snapshot_real_shaped.json");
 
     /// The fixture with a command in a pane's foreground: what a close is asked
     /// about, because it is what would be lost.
@@ -3722,14 +3719,14 @@ mod tests {
 
     fn fixture_state() -> ObservationState {
         let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(REAL_SHAPED).expect("fixture decodes"));
+        state.apply_success(crate::model::testing::fleet());
         state
     }
 
     /// The fixture with the worker moved into its owner's window, so it nests
     /// under the owner: the shape a folded branch hides.
     fn nested_fixture_state() -> ObservationState {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
                 agent.location.tab_id = "wA:t1".into();
@@ -4186,7 +4183,7 @@ mod tests {
         assert!(screen.contains("agent: pi"), "{screen}");
         // The reported identity is a source-qualified reference, shown as
         // reported (long values wrap).
-        assert!(screen.contains("identity: herdr:pi"), "{screen}");
+        assert!(screen.contains("identity: tmux:pi"), "{screen}");
         assert!(screen.contains("--home-dev-projects-beta--"), "{screen}");
         assert!(screen.contains("status: working"), "{screen}");
         // The row draws a state and the panel says which opinion it is.
@@ -4239,7 +4236,7 @@ mod tests {
     #[test]
     fn retained_observation_renders_as_last_observed_and_never_duplicates_its_pane() {
         let mut state = fixture_state();
-        let mut without_owner = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut without_owner = crate::model::testing::fleet();
         without_owner
             .agents
             .retain(|agent| agent.location.pane_id != "wA:p1");
@@ -4283,7 +4280,7 @@ mod tests {
     #[test]
     fn stale_source_is_marked_with_its_diagnostic_on_every_row() {
         let mut state = fixture_state();
-        state.apply_failure("herdr exited with status 1");
+        state.apply_failure("tmux exited with status 1");
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p1");
         let screen = render_pages(&state, &mut app, 180, 30);
@@ -4306,23 +4303,20 @@ mod tests {
     #[test]
     fn initial_failure_reads_as_unavailable_not_an_empty_fleet() {
         let mut state = ObservationState::new();
-        state.apply_failure("herdr not found");
+        state.apply_failure("tmux not found");
         let app = App::new();
         let screen = render_text(&state, &app, 80, 30);
 
         assert!(screen.contains("Fleet · UNAVAILABLE"), "{screen}");
         assert!(screen.contains("UNAVAILABLE"), "{screen}");
-        assert!(screen.contains("herdr not found"), "{screen}");
+        assert!(screen.contains("tmux not found"), "{screen}");
         assert!(!screen.contains("no workspaces reported"), "{screen}");
     }
 
     #[test]
     fn successful_empty_inventory_reads_as_empty_not_a_failure() {
         let mut state = ObservationState::new();
-        state.apply_success(
-            decode_snapshot(include_str!("../tests/fixtures/snapshot_empty.json"))
-                .expect("empty fixture decodes"),
-        );
+        state.apply_success(FleetObservation::default());
         let app = App::new();
         let screen = render_text(&state, &app, 80, 30);
 
@@ -4349,7 +4343,7 @@ mod tests {
 
     #[test]
     fn control_sequences_in_runtime_text_never_reach_the_screen() {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         let owner = observation
             .agents
             .iter_mut()
@@ -4529,7 +4523,7 @@ mod tests {
 
     #[test]
     fn provider_prefixes_are_stripped_from_projected_titles() {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         // Give the workspace the name the agent's title ends with, so the
         // suffix check below has something to strip on a row that fits: the
         // clipped row this fixture drew by default left that check resting on
@@ -4678,10 +4672,10 @@ mod tests {
         assert!(screen.contains("Enter focus"), "{screen}");
         assert!(screen.contains("q quit"), "{screen}");
 
-        app.set_focus_message(Some("herdr refused to focus: pane wA:p9 not found".into()));
+        app.set_focus_message(Some("tmux refused to focus: pane wA:p9 not found".into()));
         let failed = render_text(&state, &app, 100, 24);
         assert!(
-            failed.contains("herdr refused to focus: pane wA:p9 not found"),
+            failed.contains("tmux refused to focus: pane wA:p9 not found"),
             "{failed}"
         );
         assert!(!failed.contains("j/k"), "{failed}");
@@ -4804,7 +4798,7 @@ mod tests {
         select_agent(&mut app, "wH:p1");
         let screen = render_pages(&state, &mut app, 180, 34);
 
-        // The row is the runtime label Herdsman publishes — neither Herdr's
+        // The row is the runtime label Herdsman publishes — neither the backend's
         // truncated agent name nor its task-bearing title — with how long the
         // assignment has run and the model without its provider prefix.
         assert!(
@@ -5234,61 +5228,74 @@ mod tests {
         }
     }
 
-    /// A snapshot of one agent per pane, in as many workspaces as the test
-    /// names: `(pane, workspace, agent_status, title)`.
+    use serde_json::{Value, json};
+
+    /// A fleet of one agent per pane, in as many workspaces as the test names:
+    /// `(pane, workspace, agent_status, title, facts)`.
     ///
-    /// The real-shaped fixture is documentary; a test that needs a particular
-    /// state or label places it here instead.
-    fn state_of(agents: &[(&str, &str, &str, &str, &str)]) -> ObservationState {
+    /// The documentary fixture is what a real daemon reports; a test that needs
+    /// a particular state or label places it here instead.
+    fn state_of(agents: &[(&str, &str, &str, &str, Value)]) -> ObservationState {
         let mut workspaces: Vec<&str> = Vec::new();
         for (_, workspace, _, _, _) in agents {
             if !workspaces.contains(workspace) {
                 workspaces.push(workspace);
             }
         }
-        let workspace_records: Vec<String> = workspaces
-            .iter()
-            .enumerate()
-            .map(|(index, workspace)| {
-                format!(
-                    r#"{{"workspace_id":"{workspace}","label":"{workspace}","number":{},"agent_status":"idle","tokens":{{}}}}"#,
-                    index + 1
-                )
-            })
-            .collect();
-        let tab_records: Vec<String> = workspaces
-            .iter()
-            .map(|workspace| {
-                format!(
-                    r#"{{"tab_id":"{workspace}:t1","workspace_id":"{workspace}","label":"tab","number":1,"agent_status":"idle"}}"#
-                )
-            })
-            .collect();
-        let pane_records: Vec<String> = agents
-            .iter()
-            .map(|(pane, workspace, status, title, tokens)| {
-                format!(
-                    r#"{{"pane_id":"{pane}","tab_id":"{workspace}:t1","workspace_id":"{workspace}","label":"{title}","agent":"pi","agent_status":"{status}","terminal_title":"{title}","tokens":{{{tokens}}}}}"#
-                )
-            })
-            .collect();
-        let agent_records: Vec<String> = agents
-            .iter()
-            .map(|(pane, workspace, status, title, tokens)| {
-                format!(
-                    r#"{{"pane_id":"{pane}","tab_id":"{workspace}:t1","workspace_id":"{workspace}","agent":"pi","agent_status":"{status}","terminal_title":"{title}","tokens":{{{tokens}}}}}"#
-                )
-            })
-            .collect();
-        let json = format!(
-            r#"{{"result":{{"snapshot":{{"workspaces":[{}],"tabs":[{}],"panes":[{}],"agents":[{}]}}}}}}"#,
-            workspace_records.join(","),
-            tab_records.join(","),
-            pane_records.join(","),
-            agent_records.join(","),
-        );
+        let tab_of = |workspace: &str| format!("{workspace}:t1");
+        let at = |workspace: &str, pane: &str| json!({"workspace_id": workspace, "tab_id": tab_of(workspace), "pane_id": pane});
+        // A row reads a published fact only when the source publishes it, so the
+        // fixture starts from every fact unavailable and the test overrides what
+        // it cares about.
+        let facts_of = |overrides: &Value| {
+            let mut facts = serde_json::to_value(HerdsmanFacts::default())
+                .expect("the unavailable-facts baseline encodes");
+            for (key, value) in overrides.as_object().expect("facts are an object") {
+                facts[key] = value.clone();
+            }
+            facts
+        };
+        let observation: FleetObservation = serde_json::from_value(json!({
+            "workspaces": workspaces
+                .iter()
+                .enumerate()
+                .map(|(index, workspace)| json!({
+                    "workspace_id": workspace,
+                    "label": workspace,
+                    "number": index + 1,
+                }))
+                .collect::<Vec<Value>>(),
+            "tabs": workspaces
+                .iter()
+                .map(|workspace| json!({
+                    "tab_id": tab_of(workspace),
+                    "workspace_id": workspace,
+                    "label": "tab",
+                    "number": 1,
+                }))
+                .collect::<Vec<Value>>(),
+            "panes": agents
+                .iter()
+                .map(|(pane, workspace, _, title, _)| json!({
+                    "location": at(workspace, pane),
+                    "title": title,
+                }))
+                .collect::<Vec<Value>>(),
+            "agents": agents
+                .iter()
+                .map(|(pane, workspace, status, title, facts)| json!({
+                    "location": at(workspace, pane),
+                    "name": "pi",
+                    "label": title,
+                    "status": serde_json::to_value(RuntimeStatus::from_reported(status))
+                        .expect("a runtime status encodes"),
+                    "facts": facts_of(facts),
+                }))
+                .collect::<Vec<Value>>(),
+        }))
+        .expect("the built fleet decodes");
         let mut state = ObservationState::new();
-        state.apply_success(decode_snapshot(&json).expect("the built snapshot decodes"));
+        state.apply_success(observation);
         state
     }
 
@@ -5342,8 +5349,8 @@ mod tests {
     #[test]
     fn a_click_selects_the_row_it_lands_on_and_a_second_click_focuses_it() {
         let state = state_of(&[
-            ("wA:p1", "wA", "idle", "first", ""),
-            ("wA:p2", "wA", "idle", "second", ""),
+            ("wA:p1", "wA", "idle", "first", json!({})),
+            ("wA:p2", "wA", "idle", "second", json!({})),
         ]);
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
@@ -5367,7 +5374,7 @@ mod tests {
 
     #[test]
     fn a_click_on_a_heading_folds_it_and_a_click_beside_a_row_does_nothing() {
-        let state = state_of(&[("wA:p1", "wA", "idle", "first", "")]);
+        let state = state_of(&[("wA:p1", "wA", "idle", "first", json!({}))]);
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
         app.note_layout(geometry.clone());
@@ -5407,10 +5414,10 @@ mod tests {
     #[test]
     fn the_wheel_scrolls_the_panel_under_the_pointer() {
         let state = state_of(&[
-            ("wA:p1", "wA", "idle", "one", ""),
-            ("wA:p2", "wA", "idle", "two", ""),
-            ("wA:p3", "wA", "idle", "three", ""),
-            ("wA:p4", "wA", "idle", "four", ""),
+            ("wA:p1", "wA", "idle", "one", json!({})),
+            ("wA:p2", "wA", "idle", "two", json!({})),
+            ("wA:p3", "wA", "idle", "three", json!({})),
+            ("wA:p4", "wA", "idle", "four", json!({})),
         ]);
         let mut app = app_for(&state);
         // A viewport shorter than the list, so there is somewhere to scroll to.
@@ -5732,9 +5739,9 @@ mod tests {
     #[test]
     fn a_fold_and_the_selected_row_survive_a_re_sort() {
         let state = state_of(&[
-            ("wA:p1", "wA", "idle", "alpha", ""),
-            ("wA:p2", "wA", "working", "beta", ""),
-            ("wA:p3", "wA", "done", "gamma", ""),
+            ("wA:p1", "wA", "idle", "alpha", json!({})),
+            ("wA:p2", "wA", "working", "beta", json!({})),
+            ("wA:p3", "wA", "done", "gamma", json!({})),
         ]);
         let mut app = app_for(&state);
         let beta = crate::tree::RowId::Agent("wA:p2".to_string());
@@ -5788,13 +5795,7 @@ mod tests {
 
     #[test]
     fn a_jump_never_selects_a_row_the_view_hides() {
-        let state = state_of(&[(
-            "wA:p1",
-            "wA",
-            "idle",
-            "stuck",
-            r#""pi_herdsman_state":"lost""#,
-        )]);
+        let state = state_of(&[("wA:p1", "wA", "idle", "stuck", json!({"state": "lost"}))]);
         let mut app = app_for(&state);
         let workspace = crate::tree::RowId::Workspace("wA".to_string());
         select_row(&mut app, workspace.clone());
@@ -5839,8 +5840,8 @@ mod tests {
     #[test]
     fn a_click_maps_to_the_row_drawn_there_after_a_fold() {
         let state = state_of(&[
-            ("wA:p1", "wA", "idle", "alpha", ""),
-            ("wB:p1", "wB", "idle", "gamma", ""),
+            ("wA:p1", "wA", "idle", "alpha", json!({})),
+            ("wB:p1", "wB", "idle", "gamma", json!({})),
         ]);
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
@@ -5883,7 +5884,7 @@ mod tests {
 
     #[test]
     fn a_click_with_a_stale_inventory_answers_with_a_message_not_a_request() {
-        let mut state = state_of(&[("wA:p1", "wA", "idle", "alpha", "")]);
+        let mut state = state_of(&[("wA:p1", "wA", "idle", "alpha", json!({}))]);
         let mut app = app_for(&state);
         let geometry = geometry_of(&app);
         app.note_layout(geometry.clone());
@@ -5897,7 +5898,7 @@ mod tests {
             Some(Action::Focus(_))
         ));
 
-        state.apply_failure("herdr exited with status 1");
+        state.apply_failure("tmux exited with status 1");
         app.refresh(&state);
         app.note_layout(geometry.clone());
         assert!(
@@ -5913,7 +5914,7 @@ mod tests {
 
     #[test]
     fn the_order_cycles_and_names_itself_in_the_footer() {
-        let state = state_of(&[("wA:p1", "wA", "working", "moving", "")]);
+        let state = state_of(&[("wA:p1", "wA", "working", "moving", json!({}))]);
         let mut app = app_for(&state);
         assert_eq!(app.order(), crate::app::RowOrder::Source);
         for (key, label) in [("s", "state"), ("s", "name"), ("s", "source")] {
@@ -5932,17 +5933,11 @@ mod tests {
     #[test]
     fn state_order_puts_what_needs_a_human_first_and_keeps_children_under_their_parent() {
         let state = state_of(&[
-            ("wA:p1", "wA", "working", "moving", ""),
-            ("wA:p2", "wA", "done", "finished", ""),
-            ("wA:p3", "wA", "idle", "parked", ""),
-            (
-                "wA:p4",
-                "wA",
-                "idle",
-                "stuck",
-                r#""pi_herdsman_state":"lost""#,
-            ),
-            ("wB:p1", "wB", "idle", "quiet", ""),
+            ("wA:p1", "wA", "working", "moving", json!({})),
+            ("wA:p2", "wA", "done", "finished", json!({})),
+            ("wA:p3", "wA", "idle", "parked", json!({})),
+            ("wA:p4", "wA", "idle", "stuck", json!({"state": "lost"})),
+            ("wB:p1", "wB", "idle", "quiet", json!({})),
         ]);
         let mut app = app_for(&state);
         assert_eq!(
@@ -5968,10 +5963,10 @@ mod tests {
     #[test]
     fn a_jump_reaches_the_next_row_of_its_kind_and_wraps() {
         let state = state_of(&[
-            ("wA:p1", "wA", "working", "moving", ""),
-            ("wA:p2", "wA", "blocked", "stuck one", ""),
-            ("wA:p3", "wA", "done", "finished", ""),
-            ("wA:p4", "wA", "blocked", "stuck two", ""),
+            ("wA:p1", "wA", "working", "moving", json!({})),
+            ("wA:p2", "wA", "blocked", "stuck one", json!({})),
+            ("wA:p3", "wA", "done", "finished", json!({})),
+            ("wA:p4", "wA", "blocked", "stuck two", json!({})),
         ]);
         let mut app = app_for(&state);
         let selected = |app: &App| {
@@ -6006,7 +6001,7 @@ mod tests {
 
     #[test]
     fn a_jump_that_finds_nothing_moves_nothing() {
-        let state = state_of(&[("wA:p1", "wA", "done", "finished", "")]);
+        let state = state_of(&[("wA:p1", "wA", "done", "finished", json!({}))]);
         let mut app = app_for(&state);
         select_row(&mut app, crate::tree::RowId::Agent("wA:p1".to_string()));
         press(&mut app, 'w');
@@ -6128,7 +6123,7 @@ mod tests {
     fn a_workspace_the_backend_numbers_shows_its_number_and_one_it_does_not_shows_none() {
         // tmux names a session and numbers nothing: the row omits the number, and
         // the details page must not draw an unreadable fact in its place.
-        let mut unnumbered = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut unnumbered = crate::model::testing::fleet();
         for workspace in &mut unnumbered.workspaces {
             workspace.number = None;
         }
@@ -6217,7 +6212,7 @@ mod tests {
     /// last status anyone saw is `working` with nothing observing it now.
     fn retained_working_state() -> ObservationState {
         let mut state = fixture_state();
-        let mut without_worker = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut without_worker = crate::model::testing::fleet();
         without_worker
             .agents
             .retain(|agent| agent.location.pane_id != "wA:p2");
@@ -6743,7 +6738,7 @@ mod tests {
         );
         // The evidence survives a failed collection, and none of it may be
         // drawn as a live measurement.
-        state.apply_failure("herdr exited with status 1");
+        state.apply_failure("tmux exited with status 1");
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
         let processes = panel_text(&state, &mut app, DetailPage::Processes);
@@ -8038,7 +8033,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_session_has_a_distinct_inline_mark() {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         let row = &mut observation.agents[0];
         row.registry = Some(
             serde_json::from_value(serde_json::json!({
@@ -8554,7 +8549,7 @@ mod tests {
         // process withheld rather than as live.
         let mut stale = fixture_state();
         stale.apply_evidence("wA:p2", binary_evidence(stale_identity()));
-        stale.apply_failure("herdr exited with status 1");
+        stale.apply_failure("tmux exited with status 1");
         assert_no_process_block(&stale, "a stale source");
         // And a row that does name one offers exactly that block.
         let mut live = fixture_state();
@@ -8670,7 +8665,7 @@ mod tests {
         // A retained row's process is gone; a shell or an inconclusive answer
         // names none. None of them may borrow the identity fields.
         let mut retained = fixture_state();
-        let mut without_worker = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut without_worker = crate::model::testing::fleet();
         without_worker
             .agents
             .retain(|agent| agent.location.pane_id != "wA:p2");
@@ -8715,7 +8710,7 @@ mod tests {
         state.apply_evidence("wA:p2", binary_evidence(stale_identity()));
         // The last-good inventory and its foreground evidence survive a failed
         // collection; neither may be presented as a fresh comparison.
-        state.apply_failure("herdr exited with status 1");
+        state.apply_failure("tmux exited with status 1");
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p2");
         let source = render_page(&state, &mut app, DetailPage::Source, 180, 34);
@@ -8796,7 +8791,7 @@ mod tests {
             "wA:p2",
             ForegroundEvidence::command(4242, Some("pi".into()), Some("pi".into())),
         );
-        stale.apply_failure("herdr exited with status 1");
+        stale.apply_failure("tmux exited with status 1");
         let mut app = app_for(&stale);
         select_agent(&mut app, "wA:p2");
         let screen = render_pages(&stale, &mut app, 180, 34);
@@ -8807,7 +8802,7 @@ mod tests {
     /// A pane the fixture reports with no agent, but whose label is a finished
     /// Pi session's title.
     fn latched_session_state() -> ObservationState {
-        let mut observation = decode_snapshot(REAL_SHAPED).expect("fixture decodes");
+        let mut observation = crate::model::testing::fleet();
         for pane in &mut observation.panes {
             if pane.location.pane_id == "wA:p1" {
                 pane.label = Some("π 01a0edc4".into());

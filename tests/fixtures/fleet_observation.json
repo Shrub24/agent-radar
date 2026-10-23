@@ -1,0 +1,284 @@
+{
+  "workspaces": [
+    {
+      "workspace_id": "wA",
+      "label": "main",
+      "number": 1
+    },
+    {
+      "workspace_id": "wB",
+      "label": "docs",
+      "number": 2
+    }
+  ],
+  "tabs": [
+    {
+      "tab_id": "wA:t1",
+      "workspace_id": "wA",
+      "label": "editor",
+      "number": 1
+    },
+    {
+      "tab_id": "wA:t2",
+      "workspace_id": "wA",
+      "label": "agent tab",
+      "number": 2
+    },
+    {
+      "tab_id": "wA:t3",
+      "workspace_id": "wA",
+      "label": "tests",
+      "number": 3
+    },
+    {
+      "tab_id": "wB:t1",
+      "workspace_id": "wB",
+      "label": "shell",
+      "number": 1
+    }
+  ],
+  "panes": [
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t1",
+        "pane_id": "wA:p1"
+      },
+      "label": "fleet owner task",
+      "title": "fleet owner task"
+    },
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t2",
+        "pane_id": "wA:p2"
+      },
+      "label": "worker task",
+      "title": "worker task"
+    },
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t1",
+        "pane_id": "wA:p3"
+      },
+      "label": null,
+      "title": "build log tail"
+    },
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t2",
+        "pane_id": "wA:p4"
+      },
+      "label": null,
+      "title": null
+    },
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t3",
+        "pane_id": "wA:p5"
+      },
+      "label": "monitor row",
+      "title": "monitor row"
+    },
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t3",
+        "pane_id": "wA:p6"
+      },
+      "label": "shell log",
+      "title": "shell log"
+    },
+    {
+      "location": {
+        "workspace_id": "wB",
+        "tab_id": "wB:t1",
+        "pane_id": "wB:p1"
+      },
+      "label": "review task",
+      "title": "review task"
+    }
+  ],
+  "agents": [
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t1",
+        "pane_id": "wA:p1"
+      },
+      "name": "pi",
+      "label": "fleet owner task",
+      "status": "idle",
+      "session": {
+        "kind": "reported",
+        "value": {
+          "source": "tmux:pi",
+          "value": "/home/dev/.pi/agent/sessions/--home-dev-projects-alpha--/2026-09-01T10-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl"
+        }
+      },
+      "lineage": {
+        "session": "11111111-1111-4111-8111-111111111111",
+        "parent": null
+      },
+      "facts": {
+        "role": null,
+        "name": null,
+        "definition": null,
+        "label": null,
+        "run": null,
+        "managed_metadata": true,
+        "request": null,
+        "ask": null,
+        "waiting_reason": null,
+        "last_outcome": null,
+        "assignment": null,
+        "assigned_started_unix_ms": null,
+        "assigned_for": null,
+        "state": null,
+        "model": "sample-model-1",
+        "provider": "sample-provider",
+        "thinking": null,
+        "context_usage": null,
+        "context_window": null,
+        "session_name": "fleet owner task",
+        "awaited": [],
+        "background_running": null,
+        "background_tasks": [],
+        "background_started": null
+      },
+      "registry": null
+    },
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t2",
+        "pane_id": "wA:p2"
+      },
+      "name": "pi",
+      "label": "worker task",
+      "status": "working",
+      "session": {
+        "kind": "reported",
+        "value": {
+          "source": "tmux:pi",
+          "value": "/home/dev/.pi/agent/sessions/--home-dev-projects-beta--/2026-09-02T11-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl"
+        }
+      },
+      "lineage": {
+        "session": "22222222-2222-4222-8222-222222222222",
+        "parent": "11111111-1111-4111-8111-111111111111"
+      },
+      "facts": {
+        "role": null,
+        "name": null,
+        "definition": null,
+        "label": null,
+        "run": null,
+        "managed_metadata": true,
+        "request": null,
+        "ask": null,
+        "waiting_reason": null,
+        "last_outcome": null,
+        "assignment": null,
+        "assigned_started_unix_ms": null,
+        "assigned_for": null,
+        "state": null,
+        "model": "sample-model-1",
+        "provider": null,
+        "thinking": null,
+        "context_usage": null,
+        "context_window": null,
+        "session_name": null,
+        "awaited": [],
+        "background_running": null,
+        "background_tasks": [],
+        "background_started": null
+      },
+      "registry": null
+    },
+    {
+      "location": {
+        "workspace_id": "wA",
+        "tab_id": "wA:t3",
+        "pane_id": "wA:p5"
+      },
+      "name": "radar-monitor",
+      "label": "monitor row",
+      "status": "done",
+      "session": null,
+      "lineage": null,
+      "facts": {
+        "role": null,
+        "name": null,
+        "definition": null,
+        "label": null,
+        "run": null,
+        "managed_metadata": false,
+        "request": null,
+        "ask": null,
+        "waiting_reason": null,
+        "last_outcome": null,
+        "assignment": null,
+        "assigned_started_unix_ms": null,
+        "assigned_for": null,
+        "state": null,
+        "model": null,
+        "provider": null,
+        "thinking": null,
+        "context_usage": null,
+        "context_window": null,
+        "session_name": null,
+        "awaited": [],
+        "background_running": null,
+        "background_tasks": [],
+        "background_started": null
+      },
+      "registry": null
+    },
+    {
+      "location": {
+        "workspace_id": "wB",
+        "tab_id": "wB:t1",
+        "pane_id": "wB:p1"
+      },
+      "name": "pi",
+      "label": "review task",
+      "status": "idle",
+      "session": {
+        "kind": "uuid",
+        "value": "55555555-5555-4555-8555-555555555555"
+      },
+      "lineage": null,
+      "facts": {
+        "role": null,
+        "name": null,
+        "definition": null,
+        "label": null,
+        "run": null,
+        "managed_metadata": true,
+        "request": null,
+        "ask": null,
+        "waiting_reason": null,
+        "last_outcome": null,
+        "assignment": null,
+        "assigned_started_unix_ms": null,
+        "assigned_for": null,
+        "state": null,
+        "model": "sample-model-2",
+        "provider": null,
+        "thinking": null,
+        "context_usage": null,
+        "context_window": null,
+        "session_name": null,
+        "awaited": [],
+        "background_running": null,
+        "background_tasks": [],
+        "background_started": null
+      },
+      "registry": null
+    }
+  ]
+}

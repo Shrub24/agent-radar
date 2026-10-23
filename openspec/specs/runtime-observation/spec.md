@@ -8,7 +8,7 @@ Observe a local terminal runtime and expose trustworthy agent and pane facts, in
 
 ### Requirement: Local runtime inventory
 
-Radar SHALL observe all workspaces, tabs, panes and reported agents from one local Herdr instance. A successful empty inventory SHALL be distinguishable from a failed collection.
+Radar SHALL observe all workspaces, tabs, panes and reported agents from the one local backend the daemon serves. A successful empty inventory SHALL be distinguishable from a failed collection.
 
 #### Scenario: Multiple workspaces
 - **WHEN** a successful collection reports panes and agents in multiple workspaces
@@ -23,7 +23,7 @@ Radar SHALL observe all workspaces, tabs, panes and reported agents from one loc
 Radar SHALL keep reported session identity, runtime location, lifecycle and optional semantic metadata distinct. It SHALL expose missing role, assignment, semantic state or ownership as unavailable and SHALL NOT infer them from cwd, pane placement or runtime lifecycle.
 
 #### Scenario: Runtime idle without semantic evidence
-- **WHEN** Herdr reports an idle agent without semantic control metadata
+- **WHEN** the backend reports an idle agent without semantic control metadata
 - **THEN** Radar exposes runtime idle without claiming assignment delivery, availability for new work or safe lifecycle actions
 
 #### Scenario: Explicit lineage
@@ -36,15 +36,15 @@ Radar SHALL keep reported session identity, runtime location, lifecycle and opti
 
 ### Requirement: Herdsman pane-metadata facts are kept distinct from runtime facts
 
-Radar SHALL read the Herdsman facts that Herdr republishes as pane-metadata tokens — the agent's role, a managed worker's runtime label, the owner's projected state, the active assignment with its display text and start time, the run, request and pending-ask identities, and a lead's published name — and SHALL keep them distinct from runtime facts.
+Radar SHALL read the Herdsman facts reported as pane metadata — the agent's role, a managed worker's runtime label, the owner's projected state, the active assignment with its display text and start time, the run, request and pending-ask identities, and a lead's published name — and SHALL keep them distinct from runtime facts.
 
 #### Scenario: An owner-projected state
-- **WHEN** the metadata carries `pi_herdsman_state` and Herdr reports its own lifecycle status for the same agent
+- **WHEN** the metadata carries `pi_herdsman_state` and the backend reports its own lifecycle status for the same agent
 - **THEN** Radar presents the state derived from the pane as the agent's state and the owner's projection as its assignment state, exposing both
 
 #### Scenario: A worker's runtime label
 - **WHEN** the metadata carries `pi_herdsman_label`
-- **THEN** Radar exposes it as the worker's name and does not read Herdr's own truncated agent name or its task-bearing title as a name
+- **THEN** Radar exposes it as the worker's name and does not read the backend's own truncated agent name or its task-bearing title as a name
 
 #### Scenario: Assignment facts
 - **WHEN** a worker's metadata carries an active assignment with its display text and a start time
@@ -76,7 +76,7 @@ Radar SHALL read what the pane is awaiting, the background tasks it reports, and
 
 ### Requirement: Unrecognised and absent metadata values
 
-A value this version does not recognise SHALL be preserved rather than dropped or coerced. A value absent from the metadata SHALL stay unavailable: Herdr's own agent name and title SHALL NOT be read as Herdsman facts.
+A value this version does not recognise SHALL be preserved rather than dropped or coerced. A value absent from the metadata SHALL stay unavailable: the backend's own agent name and title SHALL NOT be read as Herdsman facts.
 
 #### Scenario: An unrecognised state value
 - **WHEN** the metadata publishes a state value this version does not know
@@ -84,7 +84,7 @@ A value this version does not recognise SHALL be preserved rather than dropped o
 
 #### Scenario: A pane carrying no Herdsman facts
 - **WHEN** a pane's metadata carries no Herdsman fact at all
-- **THEN** its role, assignment, state and awaited set stay unavailable rather than being taken from Herdr's agent name or title
+- **THEN** its role, assignment, state and awaited set stay unavailable rather than being taken from the backend's agent name or title
 
 ### Requirement: Per-pane foreground evidence
 
@@ -106,7 +106,7 @@ Radar SHALL expose, per pane, what the runtime reports about the command in the 
 
 The daemon SHALL preserve the last successful inventory during collection failure, visibly mark it stale and report the failure. Failure SHALL NOT prove that panes or agents disappeared. A display's reading of a snapshot SHALL NOT block keyboard input or quitting, and successful recovery SHALL restore current observations.
 
-#### Scenario: Herdr unavailable after a successful refresh
+#### Scenario: The backend unavailable after a successful refresh
 - **WHEN** the next collection fails or times out
 - **THEN** the last inventory remains visible as stale and its retained associations are not removed as if the runtime were empty
 
@@ -159,7 +159,7 @@ The daemon SHALL discard a retained agent association when successful inventory 
 - **THEN** it receives the retained associations the daemon holds
 
 ### Requirement: Agent state comes from the registry
-When observing through the daemon, Radar SHALL source every displayed agent fact from the registry. Herdr agent records, display metadata and native agent status SHALL NOT supply display state or fill missing facts. Backend metadata MAY be retained solely for destructive-control protection, outside display continuity. Missing registry facts SHALL remain unavailable without source fallback.
+When observing through the daemon, Radar SHALL source every displayed agent fact from the registry. A backend's own agent records, display metadata and native agent status SHALL NOT supply display state or fill missing facts. Backend metadata MAY be retained solely for destructive-control protection, outside display continuity. Missing registry facts SHALL remain unavailable without source fallback.
 
 #### Scenario: Registered agent, no execution report
 - **WHEN** a registered agent has published no fresh execution snapshot
@@ -173,7 +173,7 @@ When observing through the daemon, Radar SHALL source every displayed agent fact
 A registry candidate at a pane SHALL protect that pane and its containing tab from generic unmanaged close, including ambiguous or unresolved joins. A bound spawn edge SHALL establish managed-close eligibility separately. Unsupported registered targets SHALL refuse rather than fall through to unmanaged close.
 
 #### Scenario: Unresolved registered occupant
-- **WHEN** Herdr metadata is absent and a registration at the target pane cannot be joined exactly
+- **WHEN** pane metadata is absent and a registration at the target pane cannot be joined exactly
 - **THEN** a generic unmanaged close is refused and no close is dispatched
 
 ### Requirement: Registry agents join locations by exact evidence

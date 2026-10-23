@@ -364,7 +364,7 @@ fn run() -> io::Result<()> {
             }
         }
         // A focus request is answered on its own thread; applying the outcome
-        // here is what puts a failure on the footer, and never waits on Herdr.
+        // here is what puts a failure on the footer, and never waits on the backend.
         if let Some(outcome) = focuser.poll() {
             let message = attach.answered(&outcome, &config.tui);
             app.set_focus_message(message.or_else(|| outcome.diagnostic().map(str::to_string)));

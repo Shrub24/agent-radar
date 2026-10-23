@@ -32,7 +32,7 @@ The daemon SHALL listen on a Unix socket in a directory owned by its user with m
 
 ### Requirement: A versioned line protocol
 
-Radar SHALL read one JSON object per line. The first message SHALL be a `hello` carrying the protocol version and the exact Pi session UUID, and optionally the Herdr pane id. A `tasks` message SHALL replace that session's complete list of unresolved tasks; a task that has resolved SHALL be absent from it, not reported in a final state. Radar SHALL ignore unknown fields and unknown message types on a valid connection.
+Radar SHALL read one JSON object per line. The first message SHALL be a `hello` carrying the protocol version and the exact Pi session UUID, and optionally the backend pane id. A `tasks` message SHALL replace that session's complete list of unresolved tasks; a task that has resolved SHALL be absent from it, not reported in a final state. Radar SHALL ignore unknown fields and unknown message types on a valid connection.
 
 #### Scenario: The last task resolves
 - **WHEN** a live connection sends an empty `tasks` list

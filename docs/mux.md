@@ -9,7 +9,7 @@ and token binding, use [agent registration](agent-registration.md). Start with
 ## Two interfaces, different consumers
 
 Extensions and dashboards use the daemon's Unix socket. They must not depend on
-Herdr command names, socket schemas, aliases or agent-kind tables.
+tmux command names, format strings or socket details.
 
 Backend implementations use the internal Rust `RuntimeProvider` trait in
 `src/runtime.rs`. This is the adapter seam, not another public protocol or a
@@ -18,11 +18,10 @@ spawn correlation and target admission; the adapter performs physical effects
 and reports their certainty. Assignment decisions remain outside the adapter.
 
 The daemon's physical adapter is tmux on the server named by `[daemon] tmux_server`
-(default `radar`); `RADAR_CONTROL_BACKEND` and `RADAR_TMUX_SERVER` override the file. Herdr is
-selected only with `RADAR_CONTROL_BACKEND=herdr`. An unknown backend or missing server name refuses
-startup, with no fallback. The adapter uses only `tmux -L <name>` and does not touch the
-default server. The server is started and verified by its own user unit. The
-dashboard has no direct mode and no Herdr fallback.
+(default `radar`); `RADAR_TMUX_SERVER` overrides the file. A missing server name
+refuses startup, with no fallback. The adapter uses only `tmux -L <name>` and does
+not touch the default server. The server is started and verified by its own user
+unit. The dashboard has no direct mode: it reads the daemon and nothing else.
 
 ## Physical operations
 
@@ -58,8 +57,8 @@ exit; absent that capability the field is `{"state":"unknown"}`. Tmux arms
 with Radar's observation time. This is tmux's retained pane-command status, not
 independent proof of the bound agent's process identity. A same-UID client can
 `respawn-pane` before Radar's first read and replace the retained status; direct
-out-of-band pane respawn is inside the existing same-UID trust boundary. Herdr
-reports unknown. A missing pane is not proof of exit, and exit observation does not change agent execution/assignment facts. It
+out-of-band pane respawn is inside the existing same-UID trust boundary. A pane
+that keeps no exit status reports unknown. A missing pane is not proof of exit, and exit observation does not change agent execution/assignment facts. It
 authorizes dead-pane cleanup only together with the edge's own recorded exit and
 the creating-instance fence.
 
@@ -123,11 +122,9 @@ Binding says which registered child belongs to this creation; it does not say
 that the application is ready to receive an assignment. Execution freshness,
 process verification and owner-assignment facts are separate evidence.
 
-Herdr transports a rigorously quoted single shell line in the created pane.
-Newlines/control values and over-limit lines refuse before creation. This is not
-a documented shell-ready acknowledgement. A future direct-argv adapter can use
-its native launch facility behind the same seam, but must prove that it preserves
-cwd, overlay values and literal argv and retains honest uncertain-effect handling.
+The adapter transports a rigorously quoted single shell line in the created pane.
+Newlines/control values and over-limit lines refuse before creation. This is not a
+documented shell-ready acknowledgement, so readiness is the child's own report.
 
 Environment values and tokens are redacted from public operation/topology
 readbacks and daemon launch diagnostics. That is not a sandbox or general output
@@ -145,47 +142,20 @@ retained-pane cleanup rather than proof about the registered process. Stored
 registration launch/resume specifications are not a
 promise that the daemon can execute them.
 
-The TUI-only lead-restart change is separately blocked on positive readiness for
-a fresh Herdr pane. Completing it is not a prerequisite for implementing a tmux
-adapter, and native tmux launch must not be disguised as a Herdr-ready guarantee.
-
-## Herdsman cutover checklist
-
-Direct registry publication has landed separately in pi-extensions. Its physical
-client still uses Herdr; replacing publication alone does not complete the cutover.
-The current callers are in `pi-extensions/pi-herdsman/extension/herdr.ts`, with
-retained-worker close/restart orchestration in `extension/index.ts`.
-
-| Remaining behavior | Required change |
-| --- | --- |
-| Launch, inspect, focus, input/output and eligible child pane close | Adopt daemon calls, exact binding and capabilities; stop invoking Herdr CLI or resolving aliases |
-| Agent-kind launcher | Resolve executable/argv and required environment in Herdsman; the daemon does not own agent-definition policy |
-| Startup readiness | Preserve an explicit Pi/Herdsman application-ready predicate; token binding alone is insufficient. A positive Herdr shell-ready contract is still absent |
-| Placement parity | Add managed-spawn placement where Herdsman actually requires new-tab/existing-pane/custom-anchor behavior; generic create is not a managed launch |
-| Loss/exit watching | Consume resumable daemon events and page spawn topology; typed pane exit is currently available only for tmux-backed v2 spawn edges, while Herdr and missing panes remain unknown |
-| Retained-worker stop/resume/restart | Specify and implement physical stop/exit verification and replacement/resume binding while Herdsman keeps run/result/mailbox policy |
-| Session facts (model, provider, thinking, context usage, session name, background tasks) | Publish to the `facts` channel after negotiating `registry.facts.v1`; which reporter writes it is pi-extensions' decision |
-| Backend detection and dashboard state | Done in Radar: daemon/server selection is explicit and the fleet view reads registry facts (see [dashboard consumption](daemon.md#dashboard-consumption)). What remains is Herdsman's own direct Herdr environment and alias assumptions in its launch and inspect paths |
-
-The first row can migrate now for the supported parent-split launch flow.
-Retained-worker resume and the other currently used behaviors are necessary for
-*full* Herdsman parity, but do not prevent starting the tmux adapter. A native
-backend can solve launch transport without waiting for a Herdr shell-ready API.
-Worktree/project choice remains caller policy; pass its selected cwd to spawn.
-Keep assignment/result guards and post-close reconciliation in Herdsman.
+A restart's readiness is positive evidence that the fresh process reported in, not
+that its pane was created. Binding says which child belongs to the creation and
+nothing about being ready for an assignment.
 
 ## Tmux backend status
 
-The daemon now supports explicit Herdr/tmux physical-backend selection, named
-server-scoped tmux handles, normalized observation and mux operations, direct-argv
-spawn launch, durable child binding, and typed one-shot exit observation on v2
-spawn edges. The adapter's launch requires `remain-on-exit` before dispatch;
+The daemon serves a named, server-scoped tmux handle with normalized observation
+and mux operations, direct-argv spawn launch, durable child binding, and typed
+one-shot exit observation on spawn edges. The adapter's launch requires `remain-on-exit` before dispatch;
 uncertain effects remain unknown. `spawn.close` closes a live child pane after the
 foreground-identity gate, and closes a retained dead pane as `already_exited`
 only when the edge recorded that exit and the tmux server serving now is the one
-that served the create; Herdr cannot name its serving process, so its dead panes
-are always refused. Herdr remains the default and reports unknown exit
-observations.
+that served the create. An edge whose creating instance cannot be named is
+unfenced, and its dead panes are refused rather than inferred.
 
 Record reads accept the raw separator byte observed on tmux 3.7c and the literal
 `\037` separator observed on Debian tmux 3.5a. Only field boundaries are decoded;
@@ -193,8 +163,7 @@ the final display field stays as tmux sent it, including literal backslashes.
 This avoids general escape decoding, which would alter display text. These checks
 establish record-format compatibility, not full lifecycle acceptance on 3.5a.
 
-The registry-backed dashboard and Herdr-free tmux acceptance are shipped. Full
-Herdsman cutover still needs its own consumer migration and real Pi/Herdsman
-acceptance with Herdr unavailable; dashboard acceptance does not establish it.
-Resume/recovery and richer placement remain separate contracts; do not claim
-them from a successful spawn.
+The registry-backed dashboard and tmux acceptance are shipped. A consumer's own
+migration and real Pi acceptance remain its work; dashboard acceptance does not
+establish them. Resume/recovery and richer placement remain separate contracts;
+do not claim them from a successful spawn.
