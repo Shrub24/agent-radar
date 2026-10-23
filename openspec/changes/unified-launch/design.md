@@ -14,8 +14,12 @@
 
 **7. Launch facts per launch.** A continue under a new run must not carry the old run, and editing the subject would erase what each launch was. Owner, run, label and role are recorded on the launch; reads show the current launch's. The parent link is lineage and stays on the subject.
 
+**8. The daemon owns the launch deadline.** A managed launch is ready when its first verified presence replaces the reservation with a granted claim. A launch that has not reached that point within a fixed ceiling is withdrawn by the daemon: the claim is revoked, the captured process is stopped through its scope, and the launch's own pane is closed, by the code `lifecycle.cancel` already runs. The ceiling is a constant (120 seconds) and is not on the wire; a configuration key can be added when someone needs to tighten it. It counts from the spawn edge's own `recorded_at`, which never changes, so it survives a daemon restart and applies equally to `L`, spawn, continue and restart. The check runs in the existing 2-second sweep, bounded per pass by a cursor like the others. Binding and withdrawal both take the registry transition lock, so a child that presents as the deadline fires either binds first (and is then stopped like any bound child) or is refused. The withdrawal is recorded on the edge as `withdrawn` with a reason, so a reader never infers failure from absence. pi-radar therefore only waits and reads: it polls until the edge is granted, or withdrawn, and reports `ready` or `failed` with the daemon's reason. It has no cancel call and no timeout of its own; its caller can abort the wait, which leaves the deadline to clean up. A failed continue or restart leaves the subject with no live claim, which is the state `continue` accepts.
+
 ## Risks
 
 - A nix store path recorded as the executable can be collected; a continue supplies its own program, and restart uses the running process's.
 - A session that never had a conversation may never have been written, so continuing it fails at `--session`. Documented.
 - Removing the bootstrap touches every tracked launch; the existing lifecycle and scope suites are the guard.
+- A launch that is slow for a good reason (a cold store path, a long extension load) inside the ceiling is unaffected; one beyond it is withdrawn, so the ceiling is deliberately high.
+- A child that presents but is refused (a duplicate) keeps its reservation until the ceiling, since an unverified report cannot free it.

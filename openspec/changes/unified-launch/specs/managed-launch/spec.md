@@ -65,3 +65,33 @@ Owner, run, label and role SHALL be recorded per launch, and the subject's paren
 #### Scenario: Continuing under a new run
 - **WHEN** a child is continued with a new run
 - **THEN** reads show the new run, and the earlier launch keeps its own
+
+### Requirement: The daemon withdraws a launch that never presents
+Radar SHALL withdraw a managed launch whose reservation has not been replaced by a granted claim within a fixed ceiling counted from its spawn edge's recorded time: revoke the claim, stop the captured process through its scope, close the launch's own pane, and record the withdrawal and its reason on the edge. The ceiling SHALL NOT be a request parameter. A launch that was withdrawn SHALL leave its subject free to be continued.
+
+#### Scenario: A child never presents
+- **WHEN** a launched process has not presented within the ceiling
+- **THEN** its claim is revoked, its process is stopped, its pane is closed and its edge reads as withdrawn with a reason
+
+#### Scenario: A child presents as the ceiling passes
+- **WHEN** a child's first report and the withdrawal arrive together
+- **THEN** exactly one wins: a bound child is stopped as a bound child, and a withdrawn launch refuses the late report
+
+#### Scenario: The daemon restarts during a launch
+- **WHEN** the daemon restarts before a launch presents
+- **THEN** the ceiling still counts from the edge's recorded time and the launch is withdrawn on schedule
+
+#### Scenario: A failed restart or continue
+- **WHEN** a restarted or continued child is withdrawn
+- **THEN** the subject has no live claim and a later continue is accepted
+
+### Requirement: A launch outcome is read from the edge
+pi-radar SHALL report a launch, continue or restart as ready once the edge shows a granted subject, and as failed with the daemon's reason once the edge shows it withdrawn. It SHALL NOT cancel a launch and SHALL NOT impose a timeout of its own.
+
+#### Scenario: A withdrawn launch
+- **WHEN** the edge reads as withdrawn
+- **THEN** the caller receives a failure naming the daemon's reason and may retry
+
+#### Scenario: The caller aborts its wait
+- **WHEN** the caller aborts while the launch is starting
+- **THEN** the wait ends and the daemon's ceiling still cleans the launch up
