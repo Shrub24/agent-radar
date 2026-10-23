@@ -586,14 +586,6 @@ pub fn create_with_intent(
             return Err("the subject's current claim changed; no launch was reserved".into());
         }
         let mut previous = read_recorded(registry, expected)?;
-        if previous
-            .process
-            .successor
-            .as_deref()
-            .is_some_and(|id| id != spawn_request_id)
-        {
-            return Err("a successor is already reserved for this claim".into());
-        }
         if previous.process.successor.is_none() {
             previous.process.successor = Some(spawn_request_id.into());
             previous.process.recorded_at = format_millis(now_ms);
@@ -1153,33 +1145,39 @@ pub fn release_if_gone(
 }
 
 /// How `registration_id` stands against `session`, read before any verification so a
-/// registration that cannot bind costs no process inspection.
+/// registration that cannot bind costs no process inspection. The session's subject
+/// has one authority pointer, so this is the only place that decides who holds it.
 pub fn attachment(
     registry: &Registry,
     registration_id: &str,
     session: &str,
     now_ms: i64,
 ) -> Result<Attachment, String> {
-    let mut after: Option<String> = None;
-    let mut found = Attachment::Free;
-    loop {
-        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
-        for subject in &page {
-            if subject.session.as_deref() != Some(session)
-                || !is_attached(registry, subject, now_ms)?
-            {
-                continue;
-            }
-            if subject.process.bound_registration_id.as_deref() == Some(registration_id) {
-                return Ok(Attachment::Own(Box::new(subject.clone())));
-            }
-            found = Attachment::Other(Box::new(subject.clone()));
-        }
-        match page.last() {
-            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.claim_id.clone()),
-            _ => return Ok(found),
-        }
+    let Some(record) = subject_record_for_session(registry, session)? else {
+        return Ok(Attachment::Free);
+    };
+    let Some(holder) = record
+        .current_claim
+        .as_deref()
+        .map(|claim_id| read(registry, claim_id))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(Attachment::Free);
+    };
+    if !is_attached(registry, &holder, now_ms)? {
+        return Ok(Attachment::Free);
     }
+    let process = &holder.process;
+    Ok(
+        if process.bound_registration_id.as_deref() == Some(registration_id)
+            || process.registration_id == registration_id
+        {
+            Attachment::Own(Box::new(holder))
+        } else {
+            Attachment::Other(Box::new(holder))
+        },
+    )
 }
 
 /// Binds a verified, unlaunched process to its registration's current Pi session.
@@ -1204,7 +1202,6 @@ pub fn enroll_subject(
     now_ms: i64,
 ) -> Result<String, String> {
     let _transition = registry.transition();
-    let mut prior: Option<Claim> = None;
     let execution = read_process(registry, registration_id)?;
     if execution
         .as_ref()
@@ -1212,61 +1209,28 @@ pub fn enroll_subject(
     {
         return Err("the registration's process birth identity changed".into());
     }
-    let mut after: Option<String> = None;
-    loop {
-        let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
-        for subject in &page {
-            if subject.session.as_deref() != Some(session) || subject.process.state != State::Bound
-            {
-                continue;
-            }
-            if is_attached(registry, subject, now_ms)? {
-                if subject.process.bound_registration_id.as_deref() != Some(registration_id) {
-                    return Err("the session is already attached to another live process".into());
-                }
-                if subject.claim_id == enrollment_id {
-                    return Ok(subject.claim_id.clone());
-                }
-            }
-            if prior
-                .as_ref()
-                .is_none_or(|p| p.process.recorded_at < subject.process.recorded_at)
-            {
-                prior = Some(subject.clone());
-            }
+    match attachment(registry, registration_id, session, now_ms)? {
+        Attachment::Other(_) => {
+            return Err("the session is already attached to another live process".into());
         }
-        match page.last() {
-            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.claim_id.clone()),
-            _ => break,
-        }
+        Attachment::Own(own) if own.claim_id == enrollment_id => return Ok(own.claim_id),
+        Attachment::Own(_) | Attachment::Free => {}
     }
-    // A reattachment continues the prior logical subject. The subject record is
-    // also sufficient after reset has deliberately removed every prior claim.
-    let retained = if prior.is_none() {
-        subject_record_for_session(registry, session)?
-    } else {
-        None
-    };
-    let (logical, managed) = match &prior {
-        Some(prior) if prior.identity_unresolved => {
-            return Err(
-                "the session's prior subject has unresolved identity; resolve it before reattaching"
-                    .into(),
-            );
+    // A reattachment continues the session's subject, so its children, inbox and
+    // managed metadata continue with it.
+    let (logical, managed) = match subject_record_for_session(registry, session)? {
+        Some(record) => {
+            if let Some(last) = record.last_claim.as_deref()
+                && read(registry, last)?.is_some_and(|claim| claim.identity_unresolved)
+            {
+                return Err(
+                    "the session's prior subject has unresolved identity; resolve it before reattaching"
+                        .into(),
+                );
+            }
+            (Some(record.subject_id), record.managed)
         }
-        Some(prior) => (
-            Some(
-                prior
-                    .subject_id
-                    .clone()
-                    .unwrap_or_else(|| prior.claim_id.clone()),
-            ),
-            prior.managed.clone(),
-        ),
-        None => match retained {
-            Some(record) => (Some(record.subject_id), record.managed),
-            None => (None, ManagedMetadata::default()),
-        },
+        None => (None, ManagedMetadata::default()),
     };
     let subject_id = enrollment_id.to_string();
     let logical = logical.unwrap_or_else(|| subject_id.clone());
@@ -2542,6 +2506,56 @@ mod tests {
         assert!(
             create_with_intent(&registry, &random_uuid(), launch(), None, None, invalid, 3,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_reservation_excludes_a_second_reservation_and_another_process_grant() {
+        let scratch = Scratch::new("one-live-claim");
+        let registry = scratch.registry();
+        let session = random_uuid();
+        let first = create_with_intent(
+            &registry,
+            SPAWN,
+            launch(),
+            Some(session.clone()),
+            None,
+            ManagedMetadata::default(),
+            1,
+        )
+        .expect("reservation");
+        // The session is held by the reservation's own process, not by another.
+        assert!(matches!(
+            attachment(&registry, &first.registration_id, &session, 2).expect("own"),
+            Attachment::Own(_)
+        ));
+        assert!(matches!(
+            attachment(&registry, &random_uuid(), &session, 2).expect("other"),
+            Attachment::Other(_)
+        ));
+        let named = Some((first.claim_id.clone(), first.claim_id.clone()));
+        create_with_intent(
+            &registry,
+            &random_uuid(),
+            launch(),
+            None,
+            named.clone(),
+            ManagedMetadata::default(),
+            3,
+        )
+        .expect("the named predecessor is replaced once");
+        assert!(
+            create_with_intent(
+                &registry,
+                &random_uuid(),
+                launch(),
+                None,
+                named,
+                ManagedMetadata::default(),
+                4,
+            )
+            .is_err(),
+            "a second reservation for the same predecessor is refused"
         );
     }
 

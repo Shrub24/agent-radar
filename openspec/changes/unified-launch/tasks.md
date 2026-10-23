@@ -22,7 +22,7 @@
 
 ## 5. Launch deadline
 
-- [ ] 5.0 Audit the claim transitions: successor reservation (`create_with_intent`, `set_successor`), fresh-launch reservation and the presence grant. Collapse them into one live-claim exclusion used by reserve and grant; no behaviour is added beyond what the requirement states.
+- [x] 5.0 One exclusion: the subject's authority pointer. Reserving compares it against the named predecessor; granting and the duplicate decision read it through `attachment`; the session-wide claim scans and the separate successor refusal are gone. `successor` stays only as display data.
 - [ ] 5.1 Confirm each launch path (L, spawn, continue, restart successor) has a spawn edge with a stable `recorded_at`; if the restart successor has none, record one.
 - [ ] 5.2 Withdrawal in the sweep: a bounded cursor pass over unpresented launches past the 30s ceiling runs the cancel path and records `withdrawn` with a reason on the edge (additive field; wire revision 8).
 - [ ] 5.3 One daemon test: a launch that never presents is withdrawn, a late presentation is refused, and the subject accepts a continue afterwards.
