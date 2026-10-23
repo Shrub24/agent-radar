@@ -18,10 +18,14 @@
 
 ## 2. Observer
 
+- [ ] 2.0 Add a coalesced "refresh now" request to the sampler (`Collector` clears `next_refresh`, bounded by `EVENT_WAKE_GAP`) and enable tokio's `process` feature. One test: a request pulls the next refresh forward, a burst yields one.
+
 - [ ] 2.1 Add a bounded notification parser that ignores unknown notifications and discards output notifications. Test known notifications, unknown ones, a malformed line and an over-long line.
 - [ ] 2.2 Run the observer, or observers, with `tokio::process` in the coverage shape from 1.1. Install Radar's monitors and hooks in appended slots and remove them by slot. Map notifications to sampler wake requests. Test a window add, a pane moved to another window, a layout burst coalescing into one sample, and a session created and destroyed.
 - [ ] 2.3 Fence observers to the verified serving process identity, and end and re-create them when it changes. Refuse a foreign server. Test a replaced server with reused ids and a foreign server on the configured name.
 - [ ] 2.4 Report observer health as a snapshot source with state, last notification time and loss reason. Keep the timer on loss and retry with bounded backoff. Test an observer that exits, one that cannot start, and an unobserved session being reported.
+
+> Stop point: after 0.x and 1.1. Build section 2 only if 1.1 shows the events reach a control client, and decide server-wide versus per-session there.
 
 ## 3. Documentation and acceptance
 

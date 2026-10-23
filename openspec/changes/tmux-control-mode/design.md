@@ -61,6 +61,17 @@ Exit evidence stays the typed `pane_dead_*` read over `remain-on-exit`. The per-
 
 On 3.8, `pane-command-finished` and `pane-shell-prompt` are useful wakes for shell panes: a foreground command ending changes what a delete would lose. Here they only request a sample. Typed shell-boundary facts are their own change, because they introduce new evidence with its own provenance. Pi panes emit no OSC 133, so Pi state stays with its publishers.
 
+## Audit against the current tree
+
+Checked after the launch chain, deadline sweep and reset landed.
+
+- **The floor is not implemented.** `ensure_tmux_server` checks only that the unit is active and the server answers. `tmuxPackage` defaults to `pkgs.tmux` with a description and no assertion, the flake has no 3.8 source, and the local server is 3.7c. Section 0 is entirely open.
+- **The wake seam does not exist.** The collector starts a refresh only when `next_refresh` (one second after the last) has passed. A committed event only shortens the sampler's sleep (`EVENT_WAKE_GAP`); it does not pull a refresh forward. An observer therefore needs one new primitive, a coalesced request that makes the next tick refresh now, subject to the same gap. Sampling stays demand-driven, so an idle daemon still reads nothing.
+- **Tokio lacks `process`.** `Cargo.toml` enables `rt-multi-thread`, `net`, `sync`, `time`, `io-util`, and the transport is the only user. Observers need the `process` feature and a handle to the transport's runtime.
+- **Other timers stay.** The two-second spawn sweep (pane evidence, the 30-second launch deadline) and the 60-second scope sweep are not observation latency problems and are outside this change. `radar reset` stops the daemon before it restarts tmux, so observers end with it and need no reset handling beyond the identity fence.
+- **Nothing in the launch chain changes.** `radar run --launch`, scopes, `remain-on-exit` and the `pane-died` wake are unaffected.
+- **The benefit is modest.** Today a topology change reaches a reader within about a second while it reads, and nothing is collected while idle. Control mode improves latency and avoids re-reading the inventory on a quiet server; it adds no new fact. It is worth doing for the sidebar's responsiveness, not as correctness work, and it is cheap to stop after the floor and the verification if 1.1 shows the events do not reach one client.
+
 ## Risks
 
 - **Observer attached to the wrong server.** Mitigated by the identity fence and a test that a foreign server on the configured name is refused.
