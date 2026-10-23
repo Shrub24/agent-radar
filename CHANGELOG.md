@@ -4,7 +4,7 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 ## pi-radar 0.10.1
 
-- Fixes `children.list`, `observe`, `inspect` and the assignment follow, which refused as unsupported against a matching daemon: `spawnList` pinned a `spawn.list.v1` contract that no daemon advertises. It now requires `registry.v1`, which serves `spawn.list`. 0.9.0 and 0.10.0 are affected; no daemon change.
+- Fixes `children.list`, `observe`, `inspect` and the assignment follow, which refused as unsupported: `spawnList` pinned a `spawn.list.v1` contract no daemon advertises. It now requires `registry.v1`, which serves `spawn.list`.
 
 ## 0.5.0
 
