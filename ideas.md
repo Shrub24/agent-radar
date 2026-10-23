@@ -141,26 +141,41 @@ remain, deliberately deferred rather than claimed:
   Schemars DTOs, so the public observation contract is not yet separated the way
   the rest of the protocol is. Small follow-up change.
 
-## One pi-radar surface for Herdsman, with no identifiers
+## One pi-radar surface for Herdsman: subject in, registration and claim out
 
-Herdsman still imports the raw `RadarClient` and stores `registration_id` in its
-spawn entries and provenance, so it knows process identity, which is the part of
-the model that changes most. `pi-radar` already ships a process-bound runtime
-(`RadarRuntimeServices`: `publication`, `communication`, `execution`). Extend it
-with the relational surface Herdsman actually calls, and let nothing else cross:
+Herdsman imports the raw `RadarClient` and keys every child on `registration_id`
+(about 21 uses in `index.ts` and `radar-handoff.ts`: assign and retire, handoff
+sender match, persisted spawn entries and provenance, observation evidence, the
+launch parent). It never uses `claim_id` outside its fake daemon. Registration and
+claim are the parts of the model that change most, and Herdsman owns no decision
+that needs them, so they leave its vocabulary.
 
-- launch a worker (the parent comes from the process's own publication), list,
-  inspect, observe, assign and retire children, and read the recorded parent,
-  each addressed by an **opaque child handle** the runtime mints;
-- Herdsman never sees `registration_id`, `subject_id`, `claim_id` or a wire type,
-  and fakes one port in tests instead of three;
-- the handle must be storable across restarts and resolve a restarted child, so
-  it should be backed by the durable subject, not the process registration.
+Decided: the child key is the **subject id**, passed through as an ordinary string.
+Herdsman does not need to know it is Radar's identity, and if it ever has to
+change, pi-radar can mint its own key and Herdsman keeps storing a string. No new
+identity layer now.
 
-Size it from Herdsman's real call sites (count them first) and keep the surface
-small. Peer messaging and general topology reads wait for a caller. It is a
-pi-radar minor release plus a Herdsman cutover; `/client` stays exported for
-tests and tools.
+- `launch` takes its parent from the process's own publication, so
+  `radarSpawnParent` stops reading `subject()`;
+- children are listed, inspected, observed, assigned and retired by subject id;
+  pi-radar resolves the subject to the child's current registration internally and
+  rebuilds that map after a restart from `spawnList`, which already returns each
+  edge's subject and bound registration;
+- the handoff sender is exposed as a subject id; the wire already carries it
+  beside `registration_id`, so no daemon change is needed;
+- Herdsman faking one port instead of three, with `support-radar.ts` deleted.
+
+Peer messaging and general topology reads wait for a caller. A pi-radar minor
+release (0.8.0) plus a Herdsman cutover; `/client` stays exported for tests and
+tools.
+
+The subject is the correct key, not just a convenient one. Herdsman restarts idle
+retained workers (`restartIdleManagedWorker`) and resumes saved sessions
+(`agent_continue`, by `--session` path), and each gives the child a new process and
+so a new registration and claim. Radar ties the subject to the Pi session, so the
+same session returns as the same subject, while a registration-keyed assignment or
+persisted spawn entry goes stale. Herdsman's own resume state stays keyed on the Pi
+session file and its label; only its Radar key changes.
 
 ## A managed shell is a managed command, not an agent
 
