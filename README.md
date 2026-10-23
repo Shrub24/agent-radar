@@ -173,9 +173,9 @@ radar.slice
     radar-<registration>-main.scope
 ```
 
-A reload or `/resume` replaces the session's claim and leaves that group alone.
+A reload or `/resume` replaces the session's claim and leaves that scope alone.
 
-Stopping is graceful only. Radar stops each group with one `systemctl --user
+Stopping is graceful only. Radar stops each scope with one `systemctl --user
 stop`; managed scopes set `SendSIGKILL=no` and `TimeoutStopSec=2s`, so a process
 that ignores TERM stays running and Radar reports it as a survivor rather than
 claiming an exit. Scope state is never an outcome: `success` covers a nonzero
@@ -185,10 +185,12 @@ agent — one started outside this path — keeps the signal path it already had
 A scoped row is a managed execution. An observed row keeps its subject, children
 and inbox and is marked as observed; the route to managed is a restart through
 `radar run`, not promotion in place. With Home Manager, list a program in
-`programs.radar.managedPrograms` (for example your Pi package) and it is
-installed under its own name as a wrapper that runs `radar run -- <original>`;
-without it, `lib.managedProgram pkgs program` from the flake builds the same
-wrapper. The wrapper names the original by store path, so it never resolves back
+`programs.radar.managedAgents` (for example your Pi package) and it is
+installed under its own name as a wrapper that runs
+`radar run --agent -- <original>`; without it, `lib.managedAgent pkgs program`
+from the flake builds the same wrapper. `radar run -- COMMAND` without `--agent`
+is a managed command: it gets a scope and nothing else, never reports in as an
+agent, and its children inherit no identity. The wrapper names the original by store path, so it never resolves back
 to itself.
 
 This needs a systemd user manager and cgroup v2. Without a manager, a launch

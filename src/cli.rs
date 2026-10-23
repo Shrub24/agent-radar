@@ -63,9 +63,13 @@ pub enum Invocation {
         /// The shell to generate a completion script for.
         shell: clap_complete::Shell,
     },
-    /// Run a command in this pane as a managed execution.
+    /// Run a program in this pane inside a managed scope.
     #[command(name = "run")]
     Run {
+        /// Run an agent: it will report in and be attached to a subject. Without
+        /// this the program is a managed command, kept in a scope and nothing more.
+        #[arg(long)]
+        agent: bool,
         /// The program and its arguments, after `--`.
         #[arg(last = true, required = true)]
         program: Vec<String>,

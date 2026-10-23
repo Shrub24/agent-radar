@@ -20,6 +20,17 @@ Run a managed agent in place, inside a physical resource group established befor
 - **WHEN** the pane cannot be verified as a Radar-managed pane under this daemon
 - **THEN** the launch is refused before anything executes and the reason is reported
 
+### Requirement: Agents and commands are separate admissions
+`radar run --agent -- PROGRAM` SHALL admit an agent: the launch's registration is exported to the program so its session can present it and be attached to a subject. `radar run -- COMMAND` SHALL admit a managed command: a registration and a scope and nothing else. A command SHALL NOT receive its registration or any identity in its environment, SHALL NOT be attached to a subject or claim, and a registration admitted as a command SHALL be refused when presented as an agent's.
+
+#### Scenario: A shell's children inherit no identity
+- **WHEN** a command is admitted and starts a Pi process from within it
+- **THEN** that Pi sees no launch registration, reports as an ordinary session, and is not confused with the command
+
+#### Scenario: A command cannot be attached as an agent
+- **WHEN** a process presents the registration of a managed command
+- **THEN** the daemon refuses it and the command gains no subject, claim or lifecycle authority
+
 ### Requirement: The physical group exists before the command executes
 Every managed launch SHALL create a transient systemd user scope in a Radar slice and admit the application into it before the command runs. A required setup failure SHALL refuse the launch before execution, and SHALL NOT launch unscoped. The scope SHALL be named from the process's registration id, never from argv, cwd, environment, prompt text or session identity.
 

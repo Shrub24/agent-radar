@@ -71,6 +71,11 @@ pub fn registration(
             super::spawn::heal_binding(registry, &existing.request, now_ms)?;
             return Ok(existing);
         }
+        if crate::control_plane::lifecycle::read_process(registry, id)?.is_some_and(|process| {
+            process.kind == crate::control_plane::lifecycle::ProcessKind::Command
+        }) {
+            return Err("a managed command is not an agent and cannot be attached".into());
+        }
         if super::spawn::launched_registration(registry, Some(id))?.as_deref() != Some(id) {
             return Err("registration was not admitted by a managed launch".into());
         }

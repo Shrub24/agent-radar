@@ -14,8 +14,10 @@ pub struct Scope {
     pub slice: String,
 }
 
+/// A scope whose membership has been established: the unit exists, and the
+/// recorded process is inside it. Only this can be stopped or inspected.
 #[derive(Clone, Debug)]
-pub struct Group {
+pub struct VerifiedScope {
     pub unit: String,
     path: String,
 }
@@ -68,7 +70,7 @@ impl Scope {
         id: &str,
         process: &ProcessIdentity,
         verifier: &dyn ProcessVerifier,
-    ) -> Result<Group, String> {
+    ) -> Result<VerifiedScope, String> {
         if self != &Self::for_registration(id)? {
             return Err("scope does not identify its registration".into());
         }
@@ -113,7 +115,7 @@ impl Scope {
         if verifier.inspect(process.pid)?.as_ref() != Some(process) {
             return Err("scope member birth identity changed".into());
         }
-        Ok(Group {
+        Ok(VerifiedScope {
             unit: self.unit.clone(),
             path,
         })
@@ -153,13 +155,13 @@ fn resolve_launcher_in(
 
 /// One manager transaction starts all stop jobs together. Timeout and TERM-only
 /// semantics are properties of the scopes, not a per-process polling loop.
-pub fn stop(groups: &[&Group]) -> Result<(), String> {
-    if groups.is_empty() {
+pub fn stop(scopes: &[&VerifiedScope]) -> Result<(), String> {
+    if scopes.is_empty() {
         return Ok(());
     }
     let out = Command::new(crate::service::program("RADAR_SYSTEMCTL", "systemctl"))
         .args(["--user", "stop"])
-        .args(groups.iter().map(|g| &g.unit))
+        .args(scopes.iter().map(|s| &s.unit))
         .output()
         .map_err(|e| format!("scope stop: {e}"))?;
     if out.status.success() {
@@ -172,7 +174,7 @@ pub fn stop(groups: &[&Group]) -> Result<(), String> {
     }
 }
 
-impl Group {
+impl VerifiedScope {
     pub fn remaining(&self) -> Result<Vec<String>, String> {
         let root = Path::new("/sys/fs/cgroup").join(self.path.trim_start_matches('/'));
         let mut pending = vec![root];

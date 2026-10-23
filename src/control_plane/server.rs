@@ -1840,22 +1840,22 @@ fn cleanup_unbound_pane(
     };
     // The first outcome is the one that stands, so a second cancel reports it
     // rather than closing anything again.
-    if let Some(recorded) = subject.execution.pane_cleanup.clone() {
+    if let Some(recorded) = subject.process.pane_cleanup.clone() {
         return Some(recorded);
     }
-    if subject.execution.state == subjects::State::Bound {
+    if subject.process.state == subjects::State::Bound {
         // A bound launch's pane belongs to its registered child, so no cancel
         // has anything to say about it.
         return None;
     }
-    if subject.execution.state != subjects::State::Revoked {
+    if subject.process.state != subjects::State::Revoked {
         return Some(PaneCleanup::Refused(
             "the launch is not a revoked one, so its pane is not this cancel's to remove".into(),
         ));
     }
     // A subject with no spawn edge never had a pane of this daemon's: an
     // enrolled lead's pane belongs to the operator who enrolled it.
-    let Ok(Some(edge)) = registry.spawn_edge(&subject.execution.spawn_request_id) else {
+    let Ok(Some(edge)) = registry.spawn_edge(&subject.process.spawn_request_id) else {
         return None;
     };
     if edge.version != registry::SPAWN_VERSION {
@@ -1896,7 +1896,7 @@ fn cleanup_unbound_pane(
             "this backend cannot report whether the pane's command has exited".into(),
         ));
     }
-    let exited = subject.execution.exited_at.is_some()
+    let exited = subject.process.exited_at.is_some()
         || (edge.exit.is_some()
             && matches!(
                 bounded_exit_observation(backend, &pane, stopping, budget),
@@ -5826,7 +5826,7 @@ fn spawn_child(
         let registry = Arc::clone(&locked(core).registry);
         match subjects::read_logical(&registry, parent_subject_id) {
             Ok(Some(parent_subject))
-                if parent_subject.execution.bound_registration_id.as_deref()
+                if parent_subject.process.bound_registration_id.as_deref()
                     == Some(params.parent.as_str()) => {}
             Ok(Some(_)) => {
                 return Response::refused(
@@ -6158,9 +6158,6 @@ fn track_launch(
     let ticket = subjects::create_with_intent(
         &registry, request_id, launch, session, identity, managed, now,
     )?;
-    // This is the path that wraps the launch into a group, so this is where the
-    // attempt records which group it runs in.
-    subjects::mark_scoped(&registry, &ticket.claim_id)?;
     registry.attach_subject(request_id, &ticket.claim_id, &ticket.registration_id)?;
     Ok((bootstrap, ticket))
 }
@@ -6227,16 +6224,15 @@ fn bootstrap_request(
     }
     let subject = match subjects::read(&registry, &params.subject_id) {
         Ok(Some(subject))
-            if subject.execution.state == subjects::State::Pending
-                && subject.execution.correlation.as_deref()
-                    == Some(params.correlation.as_str()) =>
+            if subject.process.state == subjects::State::Pending
+                && subject.process.correlation.as_deref() == Some(params.correlation.as_str()) =>
         {
             subject
         }
         Ok(_) => return not_awaiting(),
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    let edge = match registry.spawn_edge(&subject.execution.spawn_request_id) {
+    let edge = match registry.spawn_edge(&subject.process.spawn_request_id) {
         Ok(Some(edge)) => edge,
         Ok(None) => return not_awaiting(),
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
@@ -6327,6 +6323,7 @@ struct AdmitParams {
     argv: Vec<String>,
     #[serde(default)]
     cwd: Option<String>,
+    kind: subjects::ProcessKind,
 }
 
 /// Admits an in-place managed launch, then answers with the identity the caller
@@ -6422,13 +6419,18 @@ fn admit_request(
         cwd: params.cwd,
         env: std::collections::BTreeMap::new(),
     };
-    let process =
-        match subjects::create_process(&registry, &params.request_id, launch, store::now_ms()) {
-            Ok(process) => process,
-            Err(error) => {
-                return Response::refused(&request.id, &Refusal::new(Code::Refused, error));
-            }
-        };
+    let process = match subjects::create_process(
+        &registry,
+        &params.request_id,
+        launch,
+        params.kind,
+        store::now_ms(),
+    ) {
+        Ok(process) => process,
+        Err(error) => {
+            return Response::refused(&request.id, &Refusal::new(Code::Refused, error));
+        }
+    };
     let scope = match process.scope.clone() {
         Some(scope) => scope,
         None => {
@@ -6542,7 +6544,7 @@ fn execute_subject_control(
         Ok(target) => target,
         Err(refusal) => return Response::refused(&request.id, &refusal),
     };
-    let mut aliases = subjects::execution_ids_for_logical(&registry, &target);
+    let mut aliases = subjects::claim_ids_for_subject(&registry, &target);
     if !aliases.contains(&subject_id) {
         aliases.push(subject_id.clone());
     }
@@ -6927,7 +6929,7 @@ fn execute_restart(
         );
     }
     // A restart retains the lead's existing pane.
-    let anchor = match subject.execution.bound_registration_id.as_deref() {
+    let anchor = match subject.process.bound_registration_id.as_deref() {
         Some(agent) => match registry.get(agent) {
             Ok(Some(registration)) => registration
                 .request
@@ -6954,7 +6956,7 @@ fn execute_restart(
         .subject_id
         .clone()
         .unwrap_or_else(|| subject.claim_id.clone());
-    let mut aliases = subjects::execution_ids_for_logical(&registry, &logical_subject_id);
+    let mut aliases = subjects::claim_ids_for_subject(&registry, &logical_subject_id);
     if !aliases.contains(&subject.claim_id) {
         aliases.push(subject.claim_id.clone());
     }
@@ -7023,19 +7025,19 @@ fn restart_lead(
     let Some(backend) = backend else {
         return refusal_settlement("no backend is wired");
     };
-    if subject.execution.state != subjects::State::Bound {
+    if subject.process.state != subjects::State::Bound {
         return refusal_settlement("the subject is not bound to a live process");
     }
     if !current_presence_grant(&registry, subject).unwrap_or(false) {
         return refusal_settlement("the Pi session has no current granted presence claim");
     }
     let (Some(agent), Some(session)) = (
-        subject.execution.bound_registration_id.as_deref(),
+        subject.process.bound_registration_id.as_deref(),
         subject.session.as_deref(),
     ) else {
         return refusal_settlement("the subject has no session to resume; enroll it first");
     };
-    if let Some(successor) = &subject.execution.successor {
+    if let Some(successor) = &subject.process.successor {
         return refusal_settlement(format!(
             "this process is already superseded by spawn {successor}"
         ));
@@ -7069,7 +7071,7 @@ fn restart_lead(
         }
         Err(error) => return refusal_settlement(error),
     }
-    let resume = match subjects::resume_launch(&subject.execution.launch, session) {
+    let resume = match subjects::resume_launch(&subject.process.launch, session) {
         Ok(resume) => resume,
         Err(message) => return refusal_settlement(message),
     };
@@ -7239,7 +7241,7 @@ fn restart_lead(
 /// The subject a cancel or stop names and the target it is admitted under.
 fn current_presence_grant(registry: &Registry, subject: &subjects::Claim) -> Result<bool, String> {
     let (Some(registration_id), Some(session)) = (
-        subject.execution.bound_registration_id.as_deref(),
+        subject.process.bound_registration_id.as_deref(),
         subject.session.as_deref(),
     ) else {
         return Ok(true);
@@ -7283,7 +7285,7 @@ fn cancel_target(registry: &Registry, params: &SubjectParams) -> Result<(String,
             )
             .map_err(internal)?
             .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
-            if subject.execution.registration_id != launched.execution.registration_id {
+            if subject.process.registration_id != launched.process.registration_id {
                 return Err(Refusal::new(
                     Code::Refused,
                     "the spawn's process was replaced; nothing was signalled",
@@ -7677,7 +7679,7 @@ fn wake_request(
         }
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    let edge = match registry.spawn_edge(&subject.execution.spawn_request_id) {
+    let edge = match registry.spawn_edge(&subject.process.spawn_request_id) {
         Ok(Some(edge)) => edge,
         Ok(None) => {
             return Response::refused(

@@ -39,7 +39,7 @@
       # A consumer applies it to the real package, which is why it is a function
       # rather than a package here: the wrapper must name the original by store
       # path, and this flake does not know which Pi a consumer runs.
-      lib.managedProgram =
+      lib.managedAgent =
         pkgs: program:
         pkgs.callPackage ./nix/managed-program.nix {
           radar = self.packages.${pkgs.stdenv.hostPlatform.system}.radar;

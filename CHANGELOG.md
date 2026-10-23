@@ -6,7 +6,7 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 - A managed launch pre-mints its process identity: the launch passes `PI_RADAR_REGISTRATION_ID`, and its claim is `reserved` (no authority) until the first verified report replaces it with the session's own claim. Process evidence belongs to the registration. Wire revision 6 — restart the daemon with pi-radar 0.7.0.
 - Every tracked launch (`L`, restart, Herdsman) runs in a systemd user scope, and `radar run -- COMMAND` starts one in the current pane. Managed stops go through the scope, are graceful only (`SendSIGKILL=no`, 2s) and name survivors. Observed agents keep their controls and are marked.
-- Home Manager `programs.radar.managedPrograms` and `lib.managedProgram` wrap a program so it starts under `radar run`.
+- `radar run --agent -- PROGRAM` launches an agent; `radar run -- COMMAND` is a managed command (a scope, no subject, no identity in its environment). Home Manager `programs.radar.managedAgents` and `lib.managedAgent` wrap an agent so it starts under `radar run --agent`.
 
 ## 0.2.0
 

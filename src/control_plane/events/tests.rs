@@ -45,7 +45,14 @@ fn create(registry: &Registry) -> lifecycle::Ticket {
 fn a_process_can_be_recovered_without_fabricating_a_claim() {
     let fixture = Fixture::new();
     let registry = fixture.registry();
-    let process = lifecycle::create_process(&registry, &random_uuid(), launch(), 1000).unwrap();
+    let process = lifecycle::create_process(
+        &registry,
+        &random_uuid(),
+        launch(),
+        lifecycle::ProcessKind::Agent,
+        1000,
+    )
+    .unwrap();
     assert!(
         lifecycle::list_after(&registry, None, 10)
             .unwrap()
@@ -140,8 +147,8 @@ fn replay_restores_revocation_without_credentials_in_events() {
     let before = lifecycle::read(&registry, &ticket.claim_id)
         .unwrap()
         .unwrap();
-    assert_eq!(before.execution.state, State::Revoked);
-    assert!(before.execution.correlation.is_none());
+    assert_eq!(before.process.state, State::Revoked);
+    assert!(before.process.correlation.is_none());
     drop(registry);
     let restored = fixture.registry();
     let after = lifecycle::read(&restored, &ticket.claim_id)
@@ -183,7 +190,7 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
         lifecycle::read(&registry, &ticket.claim_id)
             .unwrap()
             .unwrap()
-            .execution
+            .process
             .state,
         State::Pending
     );
@@ -198,7 +205,7 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
         lifecycle::read(&restored, &ticket.claim_id)
             .unwrap()
             .unwrap()
-            .execution
+            .process
             .state,
         State::Pending
     );
@@ -274,7 +281,7 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
         lifecycle::read(&registry, &ticket.claim_id)
             .unwrap()
             .unwrap()
-            .execution
+            .process
             .state,
         State::Revoked
     );

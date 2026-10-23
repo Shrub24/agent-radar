@@ -29,7 +29,8 @@ Measured on this host (systemd 261.3, cgroup v2 user manager) with disposable un
 | Stop default | SIGTERM, then SIGKILL after `TimeoutStopSec`; zero survivors | Same |
 | Graceful-only stop (`SendSIGKILL=no`) | Stop returns 0, workload survives, unit → `failed`/`timeout` | Same |
 | Placement | `app.slice` by default; `--slice=X.slice` auto-creates the slice | Same |
-| Created from a service (daemon/tmux-like caller) | Works, including with `DBUS_SESSION_BUS_ADDRESS` removed; lands in `app.slice`, **not** inside the caller service's cgroup | n/a || Accounting | `MemoryCurrent`, `CPUUsageNSec`, `TasksCurrent` present | Same |
+| Created from a service (daemon/tmux-like caller) | Works, including with `DBUS_SESSION_BUS_ADDRESS` removed; lands in `app.slice`, **not** inside the caller service's cgroup | n/a |
+| Accounting | `MemoryCurrent`, `CPUUsageNSec`, `TasksCurrent` present | Same |
 | argv integrity | Environment expansion **on by default** — a literal `$HOME` argument became a path; `--expand-environment=no` preserves it | Same |
 | tmux `pane_dead_status` | `42` for a plain scope-wrapped command | n/a |
 | tmux pane PID | Equal to the workload PID for plain argv. A shell redirection or other metacharacter makes the shell fork, and `pane_pid` then stays the shell | n/a |

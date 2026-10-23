@@ -55,15 +55,15 @@ in
       '';
     };
 
-    managedPrograms = lib.mkOption {
+    managedAgents = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = [ ];
       example = lib.literalExpression "[ pkgs.pi ]";
       description = ''
-        Programs to start as Radar managed executions. Each one is installed
+        Agents to start as Radar managed launches. Each one is installed
         under its own name, ahead of the original, as a wrapper that runs
-        `radar run -- <the original program>`, so starting it from a pane
-        enters a managed scope. The wrapper names the original by store path,
+        `radar run --agent -- <the original program>`, so starting it from a
+        pane enters a managed scope and reports in as an agent. The wrapper names the original by store path,
         so it cannot resolve back to itself. A program started any other way
         stays observed and loses nothing.
       '';
@@ -91,7 +91,7 @@ in
         cfg.package
       ]
       ++ map (program: lib.hiPrio (pkgs.callPackage ./managed-program.nix { radar = cfg.package; inherit program; }))
-        cfg.managedPrograms;
+        cfg.managedAgents;
     }
 
     # `null` is install-only: Radar reads the user's own file, or its built-in

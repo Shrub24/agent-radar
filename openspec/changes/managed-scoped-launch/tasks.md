@@ -47,7 +47,7 @@ Consolidate the identity model first — the scope work names an attempt in ever
 - [x] 5.2 Refuse `radar run` on an unverified pane or an empty command before anything executes; verify both refusals
 - [x] 5.3 Route `L`, restart and Herdsman spawn through the same managed launch; verify the existing `L` targeting tests still pass and a scope failure refuses before the command runs
 - [ ] 5.4 Ship a `pi` launcher for Nix and Home Manager that prefixes `radar run`; verify the launcher runs a managed Pi and that a manually started Pi keeps its identity, children, inbox and controls
-  - Implemented as `lib.managedProgram` and `programs.radar.managedPrograms`: the wrapper takes the program's own name and names the original by store path, so it cannot resolve back to itself (the first `radar-pi` package could). Built against `pkgs.hello` and its script checked. The run of a real managed Pi is the operator's live acceptance.
+  - Implemented as `lib.managedAgent` and `programs.radar.managedAgents`: the wrapper takes the program's own name and names the original by store path, so it cannot resolve back to itself (the first `radar-pi` package could). Built against `pkgs.hello` and its script checked. The run of a real managed Pi is the operator's live acceptance.
 - [x] 5.5 Document `radar run`, the managed/observed distinction and the graceful-stop semantics in `docs/` and the README; verify the documented commands run as written
 
 ## 6. pi-radar and consumers
@@ -64,6 +64,18 @@ Consolidate the identity model first — the scope work names an attempt in ever
 
 - [x] 8.1 Prove end to end on a disposable tmux server and disposable daemon: the workload is a scope member before it runs, its exit status reaches the typed tmux observation while the scope reads `success`, a surviving process after a graceful stop is reported, and a daemon restart reattaches without signalling; verify each assertion from real command output
 - [x] 8.2 Run fmt, strict Clippy, locked Rust tests, pi-radar package and generated-contract checks, strict OpenSpec validation and the checked Nix build, recording actual exits
+
+## 9. Review follow-ups (2026-10-24)
+
+Found by reading the landed code at `6ca3a383` and the live user manager, not by running it. 5.1 and 5.4 cannot pass until 9.1 to 9.3 land. An uncommitted working-copy edit in progress at the time of writing (`ProcessKind`, `radar run --agent`, `VerifiedScope`, `execution` renamed to `process`) already drafts the scope from the registration id. Re-check each item against it when it lands.
+
+- [ ] 9.1 `launch.admit` drafts its process with `scope: None` and then refuses with "the admitted process has no scope", so `radar run` cannot succeed. The scope is a pure function of the registration id. Answer only `registration_id` with typed params and result, and have `run_managed` derive the scope with `Scope::for_registration`, removing the untyped `answer["scope"]` parsing. Verify that a verified pane descendant is admitted and enters the scope its registration names.
+- [ ] 9.2 Admission verifies the caller's birth identity and then drops it, so a non-Pi `radar run` command has no process identity and its stop settles `Unresolved` without stopping its scope. Record the admitted identity as the process's expected identity, which `systemd-run` and the program keep because each execs in place. Verify that a stop of an admitted process goes through its scope.
+- [ ] 9.3 Make the two launch chains agree. `L`, restart and spawn run `systemd-run` → `launch-bootstrap` (release) → program. `radar run` execs the program straight from `systemd-run`, so nothing honours a cancel between admission and exec, which `design.md` says goes through the bootstrap. Either route `radar run` through the same release gate or amend the design to state that it has no gate. Recommended: one gate.
+- [ ] 9.4 Managed launches leave units behind: every launch's `radar-<registration>.slice` stays active, and a graceful stop with survivors leaves its scope `failed`. Once an exit is recorded and the group is empty, stop the registration's slice and `reset-failed` its scope. Do not use `--collect`: an unloaded unit loses the `ControlGroup` lookup a later re-stop of survivors needs. Verify with a recording fake `systemctl`.
+- [ ] 9.5 Tests drive the real `systemd-run` on the developer's user manager (`scope_launcher()` in `tests/control_plane.rs`), which created most of the 337 slices and 22 failed scopes found on 2026-10-24, and is skipped in the Nix sandbox. Use a fake launcher that execs the argv after `--`. Verify a full test run leaves no `radar-*` unit behind.
+- [ ] 9.6 `cancel_many` discards the scope stop's error (`let _stop`). Report it in the outcome the same way a single stop does.
+- [ ] 9.7 Operator: once no managed agent is running, clear the leaked units with `systemctl --user stop 'radar-*.slice'` then `systemctl --user reset-failed 'radar-*'`. A slice stop ends anything inside it.
 
 ## Workflow follow-up
 

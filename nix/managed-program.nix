@@ -1,4 +1,4 @@
-# A program started as a Radar managed execution.
+# An agent started as a Radar managed launch.
 #
 # The wrapper takes the original's name and runs it through `radar run`, naming
 # the original by store path. A wrapper that named it by `PATH` lookup would
@@ -13,7 +13,7 @@
 writeShellApplication {
   name = program.meta.mainProgram or program.pname or (lib.getName program);
   text = ''
-    exec ${radar}/bin/radar run -- ${lib.getExe program} "$@"
+    exec ${radar}/bin/radar run --agent -- ${lib.getExe program} "$@"
   '';
-  meta.description = "${lib.getName program}, started as a Radar managed execution";
+  meta.description = "${lib.getName program}, started as a Radar managed agent";
 }

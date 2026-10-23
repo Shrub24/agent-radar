@@ -105,14 +105,14 @@ impl Facts {
     pub fn from_subject(subject: &Claim) -> Self {
         Self {
             attachment: AttachmentFacts {
-                registration_id: subject.execution.registration_id.clone(),
+                registration_id: subject.process.registration_id.clone(),
                 subject_id: subject.subject_id.clone(),
                 execution_generation: None,
                 identity_unresolved: subject.identity_unresolved,
                 managed: subject.managed.clone(),
                 session: subject.session.clone(),
             },
-            execution: ProcessFacts::from(&subject.execution),
+            execution: ProcessFacts::from(&subject.process),
         }
     }
 }
@@ -124,7 +124,7 @@ impl From<&ProcessRecord> for ProcessFacts {
             origin: process.origin,
             state: process.state,
             successor: process.successor.clone(),
-            process: process.process.clone(),
+            process: process.identity.clone(),
             observation: process.observation.clone(),
             pane_absence: process.pane_absence.clone(),
             ended_externally_at: process.ended_externally_at.clone(),
@@ -142,7 +142,7 @@ impl ProcessFacts {
     pub fn apply_to(&self, process: &mut ProcessRecord) {
         process.state = self.state;
         process.successor = self.successor.clone();
-        process.process = self.process.clone();
+        process.identity = self.process.clone();
         process.observation = self.observation.clone();
         process.pane_absence = self.pane_absence.clone();
         process.ended_externally_at = self.ended_externally_at.clone();
