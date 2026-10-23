@@ -6424,6 +6424,7 @@ fn admit_request(
         &params.request_id,
         launch,
         params.kind,
+        &params.process,
         store::now_ms(),
     ) {
         Ok(process) => process,

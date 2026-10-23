@@ -137,6 +137,8 @@ pub enum Origin {
     #[default]
     Spawned,
     Enrolled,
+    /// Admitted by `radar run --agent`: a launch with no spawn edge or parent.
+    Admitted,
 }
 
 /// What a managed process is for. An agent is a session that will present its
@@ -440,15 +442,66 @@ pub fn create_process(
     spawn_request_id: &str,
     launch: LaunchContext,
     kind: ProcessKind,
+    identity: &ProcessIdentity,
     now_ms: i64,
 ) -> Result<ProcessRecord, String> {
     check_bounds(&launch)?;
     let mut process = draft_process(spawn_request_id, launch, random_uuid(), now_ms);
     process.kind = kind;
+    process.origin = Origin::Admitted;
+    process.correlation = None;
     let _transition = registry.transition();
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
     ensure_process(registry, &mut log, &process)?;
+    // Captured here so the first presence fences its bind on the verified identity.
+    log.append(
+        &process.registration_id,
+        &format_millis(now_ms),
+        crate::control_plane::events::Source::Launch,
+        crate::control_plane::events::Transition::Captured(identity.clone()),
+    )?;
+    process.state = State::Captured;
+    process.identity = Some(identity.clone());
     Ok(process)
+}
+
+/// Whether this registration is an agent admitted by `radar run --agent`, which binds
+/// without a spawn edge.
+pub(crate) fn admitted_agent(registry: &Registry, registration_id: &str) -> Result<bool, String> {
+    Ok(
+        read_process(registry, registration_id)?.is_some_and(|process| {
+            process.origin == Origin::Admitted
+                && process.kind == ProcessKind::Agent
+                && matches!(process.state, State::Captured | State::Bound)
+        }),
+    )
+}
+
+/// Binds an admitted agent to its presented registration, fenced on the captured identity.
+pub(crate) fn bind_admitted(
+    registry: &Registry,
+    registration_id: &str,
+    process: Option<&ProcessIdentity>,
+    now_ms: i64,
+) -> Result<(), String> {
+    // Called under the caller's registry transition lock, as `bind_locked` is.
+    let record = read_process(registry, registration_id)?.ok_or("launch is not recorded")?;
+    if process.is_none() || record.identity.as_ref() != process {
+        return Err("registration does not match the launched process".into());
+    }
+    match record.state {
+        State::Captured => record_process_transition(
+            registry,
+            registration_id,
+            crate::control_plane::events::Source::Registration,
+            crate::control_plane::events::Transition::Bound {
+                registration_id: registration_id.to_string(),
+            },
+            now_ms,
+        ),
+        State::Bound if record.bound_registration_id.as_deref() == Some(registration_id) => Ok(()),
+        _ => Err("launch is already bound to another registration".into()),
+    }
 }
 
 /// Refuses a launch whose subject record would exceed its bound. The record is
@@ -2073,7 +2126,7 @@ fn ensure_process(
     log.append(
         &process.registration_id,
         &process.recorded_at,
-        if process.origin == Origin::Spawned {
+        if process.origin != Origin::Enrolled {
             crate::control_plane::events::Source::Launch
         } else {
             crate::control_plane::events::Source::Registration
@@ -2096,6 +2149,7 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
             let (source, transition) = match subject.process.origin {
                 Origin::Spawned => (Source::Launch, Transition::Created(facts)),
                 Origin::Enrolled => (Source::Registration, Transition::Enrolled(facts)),
+                Origin::Admitted => return Err("an admitted process has no subject".into()),
             };
             return log.append(
                 &subject.claim_id,
@@ -2460,6 +2514,54 @@ mod tests {
         let listed = list_logical_after(&registry, None, 10).expect("logical list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].claim_id, second.claim_id);
+    }
+
+    #[test]
+    fn an_admitted_agent_binds_only_its_own_launched_process() {
+        let scratch = Scratch::new("admitted-bind");
+        let registry = scratch.registry();
+        let identity = ProcessIdentity {
+            boot_id: "boot".into(),
+            pid: 4242,
+            start_ticks: 7,
+        };
+        let process = create_process(
+            &registry,
+            &random_uuid(),
+            launch(),
+            ProcessKind::Agent,
+            &identity,
+            1,
+        )
+        .expect("admitted process");
+        let admitted = process.registration_id.clone();
+        let presenting =
+            |identity: ProcessIdentity| crate::control_plane::registry::RegistrationRequest {
+                source: "pi".into(),
+                incarnation: random_uuid(),
+                session: None,
+                location: None,
+                process: Some(identity),
+                owner: None,
+                run: None,
+                label: None,
+                launch: None,
+                spawn_token: Some(admitted.clone()),
+            };
+
+        let registration = registry
+            .register(&presenting(identity.clone()), 2)
+            .expect("presence binds the admitted registration");
+        assert_eq!(registration.registration_id, admitted);
+
+        let other = ProcessIdentity {
+            pid: 4243,
+            ..identity
+        };
+        assert!(
+            registry.register(&presenting(other), 3).is_err(),
+            "a different process cannot bind the admitted registration"
+        );
     }
 
     #[test]
