@@ -5499,6 +5499,9 @@ struct SpawnParams {
     env: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     managed: subjects::ManagedMetadata,
+    /// Start this child agent again instead of a new one.
+    #[serde(default)]
+    continue_subject_id: Option<String>,
 }
 
 /// Asks the selected backend whether it can carry this launch, before any record
@@ -5780,6 +5783,10 @@ fn execute_spawn(
             }
         }
     };
+    let (params, lineage) = match continuation(core, params) {
+        Ok(continued) => continued,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
     spawn_child(
         request,
         core,
@@ -5787,8 +5794,62 @@ fn execute_spawn(
         &params,
         &intent,
         parent_pane,
-        SpawnLineage::default(),
+        lineage,
     )
+}
+
+/// What a spawn runs as: a new agent, or its own released child started again in
+/// the session the daemon recorded for it.
+///
+/// Refused before any effect unless the subject is the caller's child, has a
+/// session, and has no live claim. Only the daemon's record names the session, and
+/// the caller's argv has any session selector replaced; the same rule restart uses.
+fn continuation(
+    core: &Arc<Mutex<Core>>,
+    params: SpawnParams,
+) -> Result<(SpawnParams, SpawnLineage), Refusal> {
+    let Some(subject_id) = params.continue_subject_id.clone() else {
+        return Ok((params, SpawnLineage::default()));
+    };
+    let refuse = |message: &str| Refusal::new(Code::Refused, message.to_string());
+    let registry = Arc::clone(&locked(core).registry);
+    let internal = |error: String| Refusal::new(Code::Internal, error);
+    let record = subjects::read_subject_record(&registry, &subject_id)
+        .map_err(|error| Refusal::new(Code::BadParams, error))?
+        .ok_or_else(|| Refusal::new(Code::NotFound, "the subject to continue is not recorded"))?;
+    let (Some(session), Some(last)) = (record.session.as_deref(), record.last_claim.as_deref())
+    else {
+        return Err(refuse("the subject has no recorded session to continue"));
+    };
+    if record.current_claim.is_some() {
+        return Err(refuse("the subject is attached; nothing was started"));
+    }
+    let previous = subjects::read(&registry, last)
+        .map_err(internal)?
+        .ok_or_else(|| refuse("the subject's last attachment is unavailable"))?;
+    if previous.managed.parent_subject_id.is_none()
+        || previous.managed.parent_subject_id != params.managed.parent_subject_id
+    {
+        return Err(refuse("the subject is not this parent's child"));
+    }
+    let launch = subjects::resume_launch(&requested_launch(&params), session)
+        .map_err(|message| refuse(&message))?;
+    let lineage = SpawnLineage {
+        session: Some(session.to_string()),
+        identity: Some((subject_id, last.to_string())),
+        prepared: None,
+        in_place: false,
+    };
+    Ok((
+        SpawnParams {
+            executable: launch.executable,
+            argv: launch.argv,
+            cwd: launch.cwd,
+            env: launch.env,
+            ..params
+        },
+        lineage,
+    ))
 }
 
 #[derive(Default)]
@@ -5820,7 +5881,7 @@ fn spawn_child(
     {
         return spawn_answer(request, response, core);
     }
-    if lineage.identity.is_none()
+    if lineage.prepared.is_none()
         && let Some(parent_subject_id) = params.managed.parent_subject_id.as_deref()
     {
         let registry = Arc::clone(&locked(core).registry);
@@ -6860,7 +6921,36 @@ fn record_enrollment(
 #[serde(deny_unknown_fields)]
 struct RestartParams {
     subject_id: String,
-    claim_id: String,
+    /// The operator names the claim it saw, which fences the restart.
+    #[serde(default)]
+    claim_id: Option<String>,
+    /// A parent names itself instead and sends the program the child restarts as.
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    executable: Option<String>,
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
+}
+
+impl RestartParams {
+    /// The program a parent sends, or `None` for an operator restart.
+    fn parent_launch(&self) -> Result<Option<subjects::LaunchContext>, &'static str> {
+        match (&self.claim_id, &self.parent, &self.executable) {
+            (Some(_), None, None) => Ok(None),
+            (None, Some(_), Some(executable)) => Ok(Some(subjects::LaunchContext {
+                executable: executable.clone(),
+                argv: self.argv.clone(),
+                cwd: self.cwd.clone(),
+                env: self.env.clone(),
+            })),
+            _ => Err("a restart names a claim, or a parent with the program to restart as"),
+        }
+    }
 }
 
 /// Restarts an enrolled or tracked lead: stops its verified process, then launches a
@@ -6920,14 +7010,38 @@ fn execute_restart(
         }
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    if params.claim_id != subject.claim_id {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::Refused,
-                "the requested claim is not current; nothing was signalled",
-            ),
-        );
+    let replacement = match params.parent_launch() {
+        Ok(replacement) => replacement,
+        Err(message) => {
+            return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+        }
+    };
+    match (&params.claim_id, &params.parent) {
+        (Some(claim_id), _) if *claim_id != subject.claim_id => {
+            return Response::refused(
+                &request.id,
+                &Refusal::new(
+                    Code::Refused,
+                    "the requested claim is not current; nothing was signalled",
+                ),
+            );
+        }
+        (None, Some(parent)) => {
+            let owned = match subject.managed.parent_subject_id.as_deref() {
+                Some(parent_subject) => matches!(
+                    subjects::read_logical(&registry, parent_subject),
+                    Ok(Some(claim)) if claim.process.bound_registration_id.as_deref() == Some(parent.as_str())
+                ),
+                None => false,
+            };
+            if !owned {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::Refused, "the subject is not this parent's child"),
+                );
+            }
+        }
+        _ => {}
     }
     // A restart retains the lead's existing pane.
     let anchor = match subject.process.bound_registration_id.as_deref() {
@@ -6990,8 +7104,15 @@ fn execute_restart(
         now,
     )
     .with_params(request.params.clone());
-    let (outcome, category, message, effects) =
-        restart_lead(core, &subject, &anchor, &cancel, verification, now);
+    let (outcome, category, message, effects) = restart_lead(
+        core,
+        &subject,
+        replacement,
+        &anchor,
+        &cancel,
+        verification,
+        now,
+    );
     write_settled(
         request,
         record.complete(
@@ -7010,6 +7131,7 @@ fn execute_restart(
 fn restart_lead(
     core: &Arc<Mutex<Core>>,
     subject: &subjects::Claim,
+    replacement: Option<subjects::LaunchContext>,
     anchor: &str,
     cancel: &AtomicBool,
     verification: &Arc<VerificationBudget>,
@@ -7072,7 +7194,8 @@ fn restart_lead(
         }
         Err(error) => return refusal_settlement(error),
     }
-    let resume = match subjects::resume_launch(&subject.process.launch, session) {
+    let program = replacement.as_ref().unwrap_or(&subject.process.launch);
+    let resume = match subjects::resume_launch(program, session) {
         Ok(resume) => resume,
         Err(message) => return refusal_settlement(message),
     };
@@ -7084,6 +7207,7 @@ fn restart_lead(
         cwd: resume.cwd,
         env: resume.env,
         managed: subject.managed.clone(),
+        continue_subject_id: None,
     };
     if let Err(message) = validate_command(&params.executable, &params.argv) {
         return refusal_settlement(message);
@@ -7988,7 +8112,11 @@ mod tests {
         .expect("claim");
         let missing = json!({"subject_id": claim.subject_id});
         assert!(serde_json::from_value::<SubjectParams>(missing.clone()).is_err());
-        assert!(serde_json::from_value::<RestartParams>(missing).is_err());
+        let named = serde_json::from_value::<RestartParams>(missing).expect("shape");
+        assert!(
+            named.parent_launch().is_err(),
+            "a restart must be fenced or owned"
+        );
         let stale = SubjectParams {
             subject_id: Some(claim.claim_id.clone()),
             claim_id: crate::control_plane::random_uuid(),

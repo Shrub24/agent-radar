@@ -2,6 +2,11 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## 0.4.0
+
+- Every tracked launch (`L`, restart, spawn) starts `radar run --launch` in its pane; the daemon answers the claim with the program from its own record and the process enters its scope. `launch-bootstrap` and `spawn.bootstrap` are gone.
+- `spawn.create` accepts `continue_subject_id`: a parent starts its own released child again in the session the daemon recorded, with any session flag in the caller's argv replaced. `lifecycle.restart` also accepts a parent naming itself with the program to restart as, unfenced by claim; the operator's restart keeps its claim fence. Wire revision 7 — restart the daemon with pi-radar 0.9.0.
+
 ## 0.3.1
 
 - A spawn edge's `bound` record names the child's `subject_id` beside its registration, so a consumer can address a child by the agent that survives its restart. Additive: the wire revision stays 6. pi-radar 0.8.0 needs this daemon, since it refuses a launch whose edge binds without a subject.

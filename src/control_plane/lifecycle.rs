@@ -575,7 +575,14 @@ pub fn create_with_intent(
     let _transition = registry.transition();
     if let Some((subject_id, expected)) = &identity {
         let record = read_subject_record(registry, subject_id)?.ok_or("subject is not recorded")?;
-        if record.current_claim.as_deref() != Some(expected.as_str()) {
+        // A released subject has no current claim, so its last one is what a
+        // continuation succeeds.
+        if record
+            .current_claim
+            .as_deref()
+            .or(record.last_claim.as_deref())
+            != Some(expected.as_str())
+        {
             return Err("the subject's current claim changed; no launch was reserved".into());
         }
         let mut previous = read_recorded(registry, expected)?;

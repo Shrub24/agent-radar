@@ -34,15 +34,18 @@ import type {
 export const RADAR_PROTOCOL_VERSION = 2;
 /**
  * Revision 5 names attempts by claim_id and requires exact-claim controls.
+ * Revision 7 starts every managed launch through `radar run --launch` and lets a
+ * parent continue or restart its own child by subject.
  * Earlier daemons expose different identity fields; require a coordinated update.
  */
-export const RADAR_MINIMUM_REVISION = 6;
+export const RADAR_MINIMUM_REVISION = 7;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
 export const RADAR_SPAWN_CONTRACT = "spawn.v1";
 export const RADAR_SPAWN_LIST_CONTRACT = "spawn.list.v1";
 export const RADAR_SPAWN_CLOSE_CONTRACT = "spawn.close.v1";
+export const RADAR_LIFECYCLE_RESTART_CONTRACT = "lifecycle.restart.v1";
 export const RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT = "spawn.launch_context.v1";
 export const RADAR_EVENTS_CONTRACT = "events.v1";
 export const RADAR_COMMUNICATION_CONTRACT = "communication.handoff.v1";
@@ -961,9 +964,12 @@ function spawnRequestShape(request: {
 	cwd?: string;
 	env?: Record<string, string>;
 	managed?: RadarManagedLaunchMetadata;
+	continue_subject_id?: string;
 }): string | undefined {
 	if (!isUuid(request.request_id))
 		return "spawn requires a canonical request UUID";
+	if (request.continue_subject_id !== undefined && !isUuid(request.continue_subject_id))
+		return "continue_subject_id must be a canonical UUID";
 	if (!isUuid(request.parent))
 		return "spawn requires the parent's canonical agent UUID";
 	if (!isUuid(request.parent_session_id))
@@ -1102,7 +1108,23 @@ export type RadarClient = {
 		cwd?: string;
 		env?: Record<string, string>;
 		managed?: RadarManagedLaunchMetadata;
+		/** Start this released child agent again, in the session the daemon recorded for it. */
+		continue_subject_id?: string;
 	}): Promise<RadarResult<RadarSpawnEdge>>;
+	/**
+	 * Restart this caller's own live child under a new program. The daemon finds the
+	 * child's current process from the subject and replaces it in its own pane and
+	 * session; a program with a bare argument that may be a message is refused.
+	 */
+	restart(request: {
+		request_id: string;
+		parent: string;
+		subject_id: string;
+		executable: string;
+		argv: string[];
+		cwd?: string;
+		env?: Record<string, string>;
+	}): Promise<RadarResult<{ request_id: string }>>;
 	/** List launches owned by this client's registered process. */
 	spawnList(request: Pick<SpawnListParamsDeserialize, "after" | "limit">): Promise<RadarResult<SpawnListPageSerialize>>;
 	spawnGet(request_id: string): Promise<RadarResult<RadarSpawnTopology>>;
@@ -1673,6 +1695,9 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 								...(request.managed !== undefined
 									? { managed: request.managed }
 									: {}),
+								...(request.continue_subject_id !== undefined
+									? { continue_subject_id: request.continue_subject_id }
+									: {}),
 							},
 							requester,
 						},
@@ -1707,6 +1732,33 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					);
 				},
 			);
+		},
+		async restart(request) {
+			if (!isUuid(request.request_id) || !isUuid(request.parent) || !isUuid(request.subject_id))
+				return {
+					ok: false,
+					code: "bad_params",
+					message: "restart requires canonical request, parent and subject UUIDs",
+				};
+			return withContract(RADAR_LIFECYCLE_RESTART_CONTRACT, async () => {
+				const answer = await call(
+					"lifecycle.restart",
+					{
+						request: {
+							subject_id: request.subject_id,
+							parent: request.parent,
+							executable: request.executable,
+							argv: request.argv,
+							...(request.cwd !== undefined ? { cwd: request.cwd } : {}),
+							...(request.env !== undefined ? { env: request.env } : {}),
+						},
+						requester,
+					},
+					request.request_id,
+				);
+				if (answer.ok === false) return answer;
+				return focusOutcome(recordAt(answer.value, "request"), request.request_id);
+			});
 		},
 		async spawnList(request) {
 			const registrationId = processRegistrationId;

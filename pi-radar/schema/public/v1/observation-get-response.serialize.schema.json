@@ -2567,7 +2567,7 @@
         },
         {
           "const": "captured",
-          "description": "The bootstrap's process is captured and released to exec.",
+          "description": "The launch's process is captured and has been given its program.",
           "type": "string"
         },
         {

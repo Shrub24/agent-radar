@@ -72,6 +72,11 @@ export type RadarWorkerLaunch = {
 	/** The nonce the child must repeat in its startup acknowledgment. */
 	generation: string;
 	/**
+	 * Start this released child agent again rather than a new one. The daemon takes
+	 * the session from its own record, so no session id or path is sent.
+	 */
+	continues?: string;
+	/**
 	 * The pane this launch splits. The parent is the calling process itself, read
 	 * from its own publication, and must be registered on exactly this pane.
 	 */
@@ -421,6 +426,7 @@ export async function launchRadarWorker<State extends LaunchState>(
 		parent_session_id: launch.parent_session_id,
 		executable: launch.executable,
 		managed: { parent_subject_id: parent.subject_id },
+		...(launch.continues !== undefined ? { continue_subject_id: launch.continues } : {}),
 		argv: launch.argv,
 		...(launch.cwd !== "" ? { cwd: launch.cwd } : {}),
 		...(Object.keys(launch.env).length > 0 ? { env: launch.env } : {}),

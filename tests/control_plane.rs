@@ -2165,6 +2165,147 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
 }
 
 #[test]
+fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
+    let Some(server) = TmuxServer::start("managed-continue") else {
+        return;
+    };
+    let sandbox = Sandbox::new("managed-continue");
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    let backend = [
+        ("RADAR_CONTROL_BACKEND", "tmux"),
+        ("RADAR_TMUX_SERVER", server.name.as_str()),
+    ];
+    let mut daemon = DaemonChild::spawn_with(&socket, &state, &backend);
+    let mut lines = BufReader::new(daemon.process.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting line").expect("greeting");
+    let mut client = Client::dial(&socket);
+
+    let observed = client.call("mux.observe", json!({}));
+    let root_pane = observed["result"]["inventory"]["panes"][0]["location"]["pane_id"]
+        .as_str()
+        .expect("root pane")
+        .to_string();
+    let mut body = registration_body(PARENT_INCARNATION, None, None);
+    body["location"] = json!({"backend":"tmux", "pane":root_pane});
+    let root = registration_id(&client.call("agent.register", body));
+    let root_session = random_uuid();
+    publish_session_context(&mut client, &root, PARENT_INCARNATION, &root_session);
+
+    let grant = |client: &mut Client,
+                 agent: &str,
+                 incarnation: &str,
+                 session: &str,
+                 claim: &str,
+                 pane: &str| {
+        let mut report =
+            registration_body(incarnation, Some(captured_identity(&state, claim)), None);
+        report["location"] =
+            json!({"backend": "tmux", "pane": format!("tmux:{}:{pane}", server.name)});
+        report["registration_id"] = json!(agent);
+        report["session_id"] = json!(session);
+        let claim_id = random_uuid();
+        report["claim_id"] = json!(claim_id);
+        let granted = client.call("agent.presence", report);
+        assert_eq!(granted["result"]["standing"], "granted", "{granted}");
+        claim_id
+    };
+    let (parent_subject, parent_agent, parent_pane) =
+        spawned_live_tmux_child(&mut client, &state, &root, &root_session, Value::Null);
+    let parent_session = random_uuid();
+    grant(
+        &mut client,
+        &parent_agent,
+        OTHER_INCARNATION,
+        &parent_session,
+        &parent_subject,
+        &parent_pane,
+    );
+    let (worker_launch, worker_agent, worker_pane) = spawned_live_tmux_child(
+        &mut client,
+        &state,
+        &parent_agent,
+        &parent_session,
+        json!({"parent_subject_id": parent_subject}),
+    );
+    let worker_session = random_uuid();
+    let worker_claim = grant(
+        &mut client,
+        &worker_agent,
+        CHILD_INCARNATION,
+        &worker_session,
+        &worker_launch,
+        &worker_pane,
+    );
+    let worker = client.call("lifecycle.get", json!({"subject_id": worker_launch}))["result"]["subject"]
+        ["subject_id"]
+        .as_str()
+        .expect("the worker's agent")
+        .to_string();
+
+    let continue_as = |client: &mut Client, parent: &str, parent_session: &str, managed: Value| {
+        client.call_id(
+            &random_uuid(),
+            "spawn.create",
+            json!({"request": {
+                "parent": parent,
+                "parent_session_id": parent_session,
+                "executable": "/bin/sh",
+                "argv": ["--model", "m", "--session", "someone-elses"],
+                "managed": managed,
+                "continue_subject_id": worker,
+            }}),
+        )
+    };
+    let owned = json!({"parent_subject_id": parent_subject});
+    let attached = continue_as(&mut client, &parent_agent, &parent_session, owned.clone());
+    assert_eq!(
+        error_code(&attached),
+        "refused",
+        "a live child is not continued: {attached}"
+    );
+
+    let released = client.call(
+        "agent.release",
+        json!({"registration_id": worker_agent, "claim_id": worker_claim,
+               "process": captured_identity(&state, &worker_launch)}),
+    );
+    assert_eq!(released["result"]["standing"], "released", "{released}");
+
+    let foreign = continue_as(&mut client, &root, &root_session, json!({}));
+    assert_eq!(
+        error_code(&foreign),
+        "refused",
+        "another parent's child: {foreign}"
+    );
+
+    let continued = continue_as(&mut client, &parent_agent, &parent_session, owned);
+    assert!(continued["result"].is_object(), "{continued}");
+    let current = client.call("lifecycle.get", json!({"subject_id": worker}));
+    let successor = current["result"]["subject"]["claim_id"]
+        .as_str()
+        .expect("successor claim")
+        .to_string();
+    assert_ne!(successor, worker_claim);
+    let delivered = recorded_launch(&state, &successor);
+    assert_eq!(
+        delivered.argv,
+        ["--model", "m", "--session", worker_session.as_str()],
+        "the daemon, not the caller, names the session"
+    );
+
+    let foreign_restart = client.call_id(
+        &random_uuid(),
+        "lifecycle.restart",
+        json!({"request": {"subject_id": worker, "parent": root,
+                           "executable": "/bin/sh", "argv": []}}),
+    );
+    assert_eq!(error_code(&foreign_restart), "refused", "{foreign_restart}");
+    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[test]
 fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     const SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     const NEXT_SESSION: &str = "e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b";
