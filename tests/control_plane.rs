@@ -5409,7 +5409,7 @@ fn a_tracked_launch_runs_its_requested_program_and_keeps_its_secrets_private() {
         "{environment}"
     );
     assert!(
-        !environment.contains("PI_RADAR_LAUNCH_SUBJECT"),
+        !environment.contains("PI_RADAR_LAUNCH_CLAIM"),
         "{environment}"
     );
     let directory = fs::read_to_string(launch_dir.join("effective.cwd")).expect("directory");

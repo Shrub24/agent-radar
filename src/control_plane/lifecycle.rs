@@ -42,7 +42,7 @@ use crate::process_control::{self, Acquired, Effective};
 use crate::runtime::LaunchRequest;
 
 /// Environment variables `radar run --launch` reads and removes before the program runs.
-pub const SUBJECT_ENV: &str = "PI_RADAR_LAUNCH_SUBJECT";
+pub const CLAIM_ENV: &str = "PI_RADAR_LAUNCH_CLAIM";
 pub const CORRELATION_ENV: &str = "PI_RADAR_LAUNCH_CORRELATION";
 // Retired: the managed subject is the attached execution, not an injected identity.
 // These names are still dropped from recipes captured before that change.
@@ -1487,7 +1487,7 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
         .iter()
         .filter(|(name, _)| {
             ![
-                SUBJECT_ENV,
+                CLAIM_ENV,
                 CORRELATION_ENV,
                 MANAGED_SUBJECT_ENV,
                 MANAGED_LAUNCH_ENV,
@@ -1933,7 +1933,7 @@ pub fn wrap(
         mut env,
         ..
     } = target;
-    env.insert(SUBJECT_ENV.to_string(), ticket.claim_id.clone());
+    env.insert(CLAIM_ENV.to_string(), ticket.claim_id.clone());
     env.insert(CORRELATION_ENV.to_string(), ticket.correlation.clone());
     if let Some(parent_subject_id) = &ticket.parent_subject_id {
         env.insert(
@@ -2115,7 +2115,7 @@ fn enter_scope(
     let mut launch = Command::new(launcher);
     launch.args(&argv);
     if claimed {
-        launch.env_remove(SUBJECT_ENV).env_remove(CORRELATION_ENV);
+        launch.env_remove(CLAIM_ENV).env_remove(CORRELATION_ENV);
     }
     match kind {
         ProcessKind::Agent => {
@@ -2139,7 +2139,7 @@ struct Claimed {
 }
 
 fn claim(socket: &Path) -> Result<Claimed, String> {
-    let subject = std::env::var(SUBJECT_ENV).map_err(|_| "no launch subject".to_string())?;
+    let claim_id = std::env::var(CLAIM_ENV).map_err(|_| "no launch claim".to_string())?;
     let correlation =
         std::env::var(CORRELATION_ENV).map_err(|_| "no launch correlation".to_string())?;
     let process = LocalProcfsVerifier
@@ -2148,7 +2148,7 @@ fn claim(socket: &Path) -> Result<Claimed, String> {
     let result = exchange(
         socket,
         CLAIM_METHOD,
-        json!({"subject_id": subject, "correlation": correlation, "process": process}),
+        json!({"claim_id": claim_id, "correlation": correlation, "process": process}),
     )?;
     let text = |key: &str| {
         result[key]
@@ -3901,7 +3901,7 @@ mod resume_recipe_tests {
     #[test]
     fn captured_launch_drops_radar_launch_and_token_variables() {
         let mut env = BTreeMap::new();
-        env.insert(SUBJECT_ENV.to_string(), "s".to_string());
+        env.insert(CLAIM_ENV.to_string(), "s".to_string());
         env.insert(CORRELATION_ENV.to_string(), "c".to_string());
         env.insert(MANAGED_SUBJECT_ENV.to_string(), "logical".to_string());
         env.insert(MANAGED_LAUNCH_ENV.to_string(), "launch".to_string());
