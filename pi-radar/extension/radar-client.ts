@@ -304,7 +304,7 @@ export type RadarSpawnEdge = {
 	created: RadarEffectOutcome;
 	launched: RadarEffectOutcome;
 	location?: RadarLocation;
-	bound?: { source: string; incarnation: string; registration_id?: string };
+	bound?: { source: string; incarnation: string; registration_id?: string; subject_id?: string };
 	exit_observation?: RadarSpawnExitObservation;
 };
 
@@ -825,6 +825,7 @@ function spawnEdge(value: unknown): RadarResult<RadarSpawnEdge> {
 	const source = stringAt(bound, "source");
 	const incarnation = stringAt(bound, "incarnation");
 	const agentId = stringAt(bound, "registration_id");
+	const subjectId = stringAt(bound, "subject_id");
 	const exit = exitAt(recordAt(value, "exit_observation"));
 	return {
 		ok: true,
@@ -840,6 +841,7 @@ function spawnEdge(value: unknown): RadarResult<RadarSpawnEdge> {
 							source,
 							incarnation,
 							...(isUuid(agentId) ? { registration_id: agentId } : {}),
+							...(isUuid(subjectId) ? { subject_id: subjectId } : {}),
 						},
 					}
 				: {}),

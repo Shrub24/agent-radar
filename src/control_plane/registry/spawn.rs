@@ -99,6 +99,10 @@ pub struct BoundChild {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(alias = "agent_id")]
     pub registration_id: Option<String>,
+    /// The durable agent the bound child attaches as. Absent for an edge without
+    /// a tracked launch and in records written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
     /// When the edge bound to this incarnation.
     pub bound_at: String,
 }
@@ -676,8 +680,11 @@ fn bind_locked(
     // A tracked launch binds only to the process its daemon captured, and only
     // while its subject is still live. The subject is written first: an edge that
     // could not be written leaves the subject bound, which a same-content retry heals.
-    if let Some(subject_id) = &stored.claim_id {
-        lifecycle::fence_registration(registry, subject_id, process, registration_id, now_ms)?;
+    let mut subject = None;
+    if let Some(claim_id) = &stored.claim_id {
+        lifecycle::fence_registration(registry, claim_id, process, registration_id, now_ms)?;
+        subject = lifecycle::read(registry, claim_id)?
+            .map(|launch| launch.subject_id.unwrap_or(launch.claim_id));
     }
     if let Some(bound) = &stored.bound {
         if bound.source == request.source
@@ -695,6 +702,7 @@ fn bind_locked(
                 let edge = SpawnEdge {
                     bound: Some(BoundChild {
                         registration_id: Some(registration_id.to_string()),
+                        subject_id: subject,
                         ..bound.clone()
                     }),
                     ..stored
@@ -717,6 +725,7 @@ fn bind_locked(
             source: request.source.clone(),
             incarnation: request.incarnation.clone(),
             registration_id: registration_id.map(str::to_owned),
+            subject_id: subject,
             bound_at: format_millis(now_ms),
         }),
         ..stored

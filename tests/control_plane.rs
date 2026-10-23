@@ -4780,6 +4780,11 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         json!(child),
         "{spawn}"
     );
+    assert_eq!(
+        spawn["result"]["spawn"]["bound"]["subject_id"],
+        json!(subject),
+        "the bound edge names the agent, not only its process: {spawn}"
+    );
 
     let status = daemon.stop(libc::SIGTERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");

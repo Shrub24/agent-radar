@@ -1476,6 +1476,11 @@ export interface SpawnListPageSerializeBoundChild {
    */
   registration_id?: string | null;
   source: string;
+  /**
+   * The durable agent the bound child attaches as. Absent for an edge without
+   * a tracked launch and in records written before it was recorded.
+   */
+  subject_id?: string | null;
 }
 /**
  * Where an agent's incarnation lives on one backend, in that backend's own

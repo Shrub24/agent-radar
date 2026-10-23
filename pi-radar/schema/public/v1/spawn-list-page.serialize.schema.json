@@ -20,6 +20,13 @@
         },
         "source": {
           "type": "string"
+        },
+        "subject_id": {
+          "description": "The durable agent the bound child attaches as. Absent for an edge without\na tracked launch and in records written before it was recorded.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

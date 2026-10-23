@@ -1,7 +1,7 @@
 ## 1. Edge carries the child subject
 
-- [ ] 1.1 Confirm from the bind path that the subject is known when a managed child's edge binds (reserved attachment for the launched subject); if it is not, stop and revise decision 4.
-- [ ] 1.2 Add optional `subject_id` to `BoundChild`, write it at bind, expose it through the public spawn DTO and generated schemas, and decode it in the SDK. One test: a bound edge carries the subject that presence later grants.
+- [x] 1.1 Confirm from the bind path that the subject is known when a managed child's edge binds (reserved attachment for the launched subject); if it is not, stop and revise decision 4.
+- [x] 1.2 Add optional `subject_id` to `BoundChild`, write it at bind, expose it through the public spawn DTO and generated schemas, and decode it in the SDK. One test: a bound edge carries the subject that presence later grants.
 
 ## 2. Subject-addressed child surface
 
