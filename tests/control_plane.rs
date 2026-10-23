@@ -11286,6 +11286,132 @@ fn a_fresh_process_reclaims_the_existing_session_subject_after_release_and_resta
     previous.kill();
 }
 
+/// A session switch moves a process to another subject and frees the first; a
+/// duplicate stays a duplicate when its incumbent exits and when the daemon
+/// restarts, and takes the subject only by presenting a fresh claim.
+#[test]
+fn a_session_switch_frees_its_subject_and_a_duplicate_waits_for_a_fresh_claim() {
+    let sandbox = Sandbox::new("presence-switch");
+    let backend = |lead: &LeadProcess, panes: &[&str]| {
+        MuxBackend::new(LEAD_PRIMITIVES)
+            .observing(panes)
+            .with_foreground(ForegroundEvidence::command(
+                lead.pid,
+                Some("sh".into()),
+                None,
+            ))
+    };
+    let report = |lead: &LeadProcess, incarnation: &str, session: &str, claim: &str, pane: &str| {
+        json!({"source":"herdsman-pi", "incarnation":incarnation, "process":lead.identity,
+            "session_id":session, "claim_id":claim, "location":{"backend":"tmux","pane":pane}})
+    };
+    let other_session = random_uuid();
+
+    // One process holds a session, then opens another: the same registration
+    // moves to a different subject and the first session is free.
+    let switcher = LeadProcess::start();
+    let mut daemon = Daemon::bind_with_backend(
+        &sandbox.socket(),
+        &sandbox.state(),
+        Some(backend(&switcher, &["wA:p1"])),
+    )
+    .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let held = client.call(
+        "agent.presence",
+        report(
+            &switcher,
+            PARENT_INCARNATION,
+            TRACKED_SESSION,
+            &random_uuid(),
+            "wA:p1",
+        ),
+    );
+    assert_eq!(held["result"]["standing"], "granted", "{held}");
+    let subject = held["result"]["subject_id"].clone();
+    let switched = client.call(
+        "agent.presence",
+        report(
+            &switcher,
+            PARENT_INCARNATION,
+            &other_session,
+            &random_uuid(),
+            "wA:p1",
+        ),
+    );
+    assert_eq!(switched["result"]["standing"], "granted", "{switched}");
+    assert_eq!(
+        switched["result"]["registration_id"], held["result"]["registration_id"],
+        "a switch is the same process"
+    );
+    assert_ne!(switched["result"]["subject_id"], subject, "{switched}");
+    daemon.stop();
+
+    // A new process takes the freed session with the same subject; a second
+    // process opening it is a duplicate.
+    let incumbent = LeadProcess::start();
+    let duplicate = LeadProcess::start();
+    let mut daemon = Daemon::bind_with_backend(
+        &sandbox.socket(),
+        &sandbox.state(),
+        Some(backend(&incumbent, &["wA:p1", "wA:p2"])),
+    )
+    .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    let taken = client.call(
+        "agent.presence",
+        report(
+            &incumbent,
+            CHILD_INCARNATION,
+            TRACKED_SESSION,
+            &random_uuid(),
+            "wA:p1",
+        ),
+    );
+    assert_eq!(taken["result"]["subject_id"], subject, "{taken}");
+    let stale_claim = random_uuid();
+    let stale = report(
+        &duplicate,
+        &random_uuid(),
+        TRACKED_SESSION,
+        &stale_claim,
+        "wA:p2",
+    );
+    assert_eq!(
+        client.call("agent.presence", stale.clone())["result"]["standing"],
+        "duplicate"
+    );
+
+    // The incumbent exits and the daemon restarts: the duplicate's loaded state
+    // is still stale, so repeating its claim never promotes it.
+    incumbent.kill();
+    let gone = Instant::now() + DEADLINE;
+    while process_exists(incumbent.pid) && Instant::now() < gone {
+        thread::sleep(Duration::from_millis(10));
+    }
+    daemon.stop();
+    let mut daemon = Daemon::bind_with_backend(
+        &sandbox.socket(),
+        &sandbox.state(),
+        Some(backend(&duplicate, &["wA:p2"])),
+    )
+    .expect("daemon");
+    let mut client = Client::dial(daemon.path());
+    assert_eq!(
+        client.call("agent.presence", stale.clone())["result"]["standing"],
+        "duplicate"
+    );
+    // A fresh load presents a new claim, and only then takes the subject.
+    let mut fresh = stale;
+    fresh["claim_id"] = json!(random_uuid());
+    let promoted = client.call("agent.presence", fresh);
+    assert_eq!(promoted["result"]["standing"], "granted", "{promoted}");
+    assert_eq!(promoted["result"]["subject_id"], subject, "{promoted}");
+    daemon.stop();
+    duplicate.kill();
+    switcher.kill();
+}
+
 fn restart_lead_subject_with_id(client: &mut Client, request_id: &str, subject: &str) -> Value {
     client.call_id(
         request_id,
