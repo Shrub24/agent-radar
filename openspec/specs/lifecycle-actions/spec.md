@@ -188,17 +188,17 @@ The `a` action SHALL create an empty shell in the selected place for arbitrary i
 - **WHEN** the user wants an interactive command instead of the configured managed agent
 - **THEN** the user can create an empty shell with `a` and run the command there
 
-### Requirement: A launched or registered lead can be enrolled
-Radar SHALL enroll a lead started with `L` through `lifecycle.enroll` once it has registered a joined pane and a fresh session, once per launched place, and SHALL offer `E` on any joined registered agent that is not a lifecycle subject through the default-Cancel confirmation. Enrollment SHALL revalidate the same registration and session before sending, SHALL record no spawn edge, and SHALL signal nothing.
+### Requirement: The standing of a Pi session is readable in place
+Radar SHALL answer `E` on a selected Pi session with a one-line message naming its claim standing (granted, duplicate, reserved, pending or released), or stating that it is waiting for the next presence report when none is recorded. It SHALL send no request, open no dialog and change nothing.
 
-#### Scenario: A launched lead registers
-- **WHEN** a lead started with `L` registers a joined pane and a fresh session
-- **THEN** one enrollment is sent for it and the row becomes a lifecycle subject
+#### Scenario: A granted session
+- **WHEN** `E` is pressed on a Pi session whose claim is granted
+- **THEN** a message says it already has a Radar subject and nothing is sent
 
-#### Scenario: A lead started elsewhere
-- **WHEN** the user presses `E` on a joined registered agent that is not a subject
-- **THEN** a confirmation names the session and Cancel is selected
+#### Scenario: A rejected duplicate
+- **WHEN** `E` is pressed on a session whose claim was rejected as a duplicate
+- **THEN** the message says to reload or resume from its last live state
 
-#### Scenario: Nothing to enroll
-- **WHEN** `E` is pressed on a pane that is not a registered agent
-- **THEN** no dialog opens and a one-line message says so
+#### Scenario: Not a Pi session
+- **WHEN** `E` is pressed on a pane that is not a Pi session
+- **THEN** a one-line message says only a Pi session can be managed and nothing else happens
