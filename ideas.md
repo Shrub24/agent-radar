@@ -22,8 +22,9 @@ of the detail.
 | Native systemd ordering and switch behaviour | `radar-tmux@` carries `X-SwitchMethod = "keep-old"` (verified with `sd-switch --dry-run`: the default plans Stop/Start of the template instance, which kills the server and its panes; `keep-old` keeps it). The daemon unit deliberately keeps the default, so a switch that changes its `ExecStart` restarts it, and the socket unit is untouched, so the listening socket and its queue survive the gap. A stop drains first (3 s), refusing requests that arrive while stopping. Remaining: verify on a live switch, and add `Wants=`/`After=` for daemon edges | P1 | high | Live switch on a real machine |
 | Checked Home Manager evaluation (daemon-service 6.3) | (a) add a Home Manager input used only by a check; (b) rely on live acceptance (current choice) | P3 | medium | Module option wiring breaks unnoticed |
 | Non-Nix unit generation | (a) keep Nix as the only module (current); (b) generate FHS unit files from the flake in CI | P3 | medium | A non-Nix install is actually needed, or packaging diverges from the module |
-| tmux control mode observer | Read-only, output-free control-mode client per session as wake source for the sampler; verified on tmux 3.7c, no 3.8 needed. Change `tmux-control-mode` | P1 | high | After `shared-observation` |
-| Tmux 3.8 shell-boundary events | OSC 133 pane-command events and `set-hook -B` monitors as more wakes plus separate typed shell-boundary evidence; keep reconciliation as the recovery path; 3.8 required, no capability gate | P2 | medium (not testable locally, tmux 3.8 not installed) | tmux 3.8 available for isolated verification |
+| tmux control mode observer | Read-only, output-free control-mode observer as a wake source for the sampler, on a tmux 3.8 floor enforced at bind; coverage shape (server-wide monitors or per-session) verified on 3.8 first. Change `tmux-control-mode` | P1 | high | After `managed-scoped-launch` and the open closeouts |
+| Typed OSC 133 shell-boundary facts | `tmux-control-mode` uses tmux 3.8's `pane-command-*` and `pane-shell-prompt` events only as wakes; typed shell-boundary evidence with its own provenance is a separate change. Shell panes only, since Pi emits no OSC 133 | P2 | medium | Control-mode observer lands |
+| Retire the per-launch `pane-died` wake | Replace the `run-shell` wake with a 3.8 monitor only if it proves at least as timely and as reliable as the trigger for the verified exit read | P3 | medium | Control-mode observer lands |
 | Process evidence row | pidfd/procfs as a separate evidence lane beside tmux events | P2 | medium | Tmux 3.8 observation lands |
 | Shared daemon-owned sampled observation | Daemon sampler producing an immutable snapshot (revision, collection time, per-source freshness); `observation.get` with `since_revision` and "not modified"; sampling only while subscribed; tree, fold, selection and filter stay in the client; full snapshots first, deltas deferred. Slices: (1) sampler plus read, TUI switched with no fallback; (2) demand-driven, event-woken scheduling; (3) tmux 3.8 monitors feed the sampler. Open decisions: per-client foreground/focus evidence, wire size; measure registry-read cost at N agents first. Publisher ingest is daemon-owned through `tasks.list.v1`; the old publisher socket remains only as a temporary compatibility entry. | P1 | medium | Sidebar needs it; registry read re-verifies processes on every call |
 | Agent status surface for a lead | A bounded `status` read per agent for a lead to replace the pane-text `inspect`: state, context, run time, last N tool names and intents (no output), optional recent messages or recap. Needs a new producer-published channel, since no tool, intent or recap fact exists today; daemon composes it with lifecycle, execution, facts and assignment as a named view of the shared observation. Footguns: producer claims are not verified, privacy of intents and messages, bounded retention, who may inspect whom (same-UID trust today) | P2 | low | Shared observation lands and a lead needs to supervise children without reading panes |
@@ -139,3 +140,35 @@ remain, deliberately deferred rather than claimed:
   returns the observation snapshot directly instead of through dedicated
   Schemars DTOs, so the public observation contract is not yet separated the way
   the rest of the protocol is. Small follow-up change.
+
+## One pi-radar surface for Herdsman, with no identifiers
+
+Herdsman still imports the raw `RadarClient` and stores `registration_id` in its
+spawn entries and provenance, so it knows process identity, which is the part of
+the model that changes most. `pi-radar` already ships a process-bound runtime
+(`RadarRuntimeServices`: `publication`, `communication`, `execution`). Extend it
+with the relational surface Herdsman actually calls, and let nothing else cross:
+
+- launch a worker (the parent comes from the process's own publication), list,
+  inspect, observe, assign and retire children, and read the recorded parent,
+  each addressed by an **opaque child handle** the runtime mints;
+- Herdsman never sees `registration_id`, `subject_id`, `claim_id` or a wire type,
+  and fakes one port in tests instead of three;
+- the handle must be storable across restarts and resolve a restarted child, so
+  it should be backed by the durable subject, not the process registration.
+
+Size it from Herdsman's real call sites (count them first) and keep the surface
+small. Peer messaging and general topology reads wait for a caller. It is a
+pi-radar minor release plus a Herdsman cutover; `/client` stays exported for
+tests and tools.
+
+## A managed shell is a managed command, not an agent
+
+A pane's shell started under `radar run` gives plain panes one scope, a
+"what would be lost" answer from cgroup members, and a graceful scope stop. It
+needs the managed-command path (a registration and a scope, no subject, claim,
+parent edge or fenced controls), and the pane shell's launch wrapper
+(`default-command`) must not export a registration id its children could present.
+A `pi` started from that shell is its own agent launch under a sibling slice, so
+the "what would be lost" walk collects the shell's scope and every agent scope
+located in the pane.
