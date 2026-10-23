@@ -40,6 +40,7 @@ function runtime(_label: string): RadarRuntimeHandle {
 	const services: RadarRuntimeServices = {
 		publication,
 		communication: {} as RadarRuntimeServices["communication"],
+		children: {} as RadarRuntimeServices["children"],
 		execution: {
 			publication,
 			binding: () => undefined,
@@ -84,7 +85,7 @@ test("the handoff ignores incompatible request versions and malformed handles", 
 	provideRadarRuntime(events, runtime("baseline"));
 	let offered = 0;
 	events.emit("pi-radar/runtime-request", {
-		version: 2,
+		version: 3,
 		provide: () => offered++,
 	});
 	events.emit("pi-radar/runtime-request", {

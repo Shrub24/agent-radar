@@ -50,7 +50,7 @@ The daemon SHALL persist accepted registrations and snapshots before acknowledgi
 - **THEN** the last report is marked stale without claiming the agent exited or became idle
 
 ### Requirement: Launch specifications are explicit private records
-Radar SHALL retain a private executable, argv, cwd and environment restart recipe captured from the verified managed execution. Either launched or adopted sessions SHALL be eligible for the same lifecycle controls when their evidence requirements are met. Restart SHALL resume the selected subject's fresh current session without replaying an initial prompt or one-use launch credentials. Titles and scrollback SHALL NOT supply launch recipes. Public reads SHALL omit private launch material. Ordinary baseline reporting SHALL execute nothing.
+Radar SHALL retain a private executable, argv, cwd and environment restart recipe captured from the verified managed execution. Either launched or adopted sessions SHALL be eligible for the same lifecycle controls when their evidence requirements are met. Titles and scrollback SHALL NOT supply launch recipes. Public reads SHALL omit private launch material. Ordinary baseline reporting SHALL execute nothing.
 
 #### Scenario: Register saved-session launch
 - **WHEN** a trusted publisher supplies a launch specification
@@ -63,6 +63,9 @@ Radar SHALL retain a private executable, argv, cwd and environment restart recip
 #### Scenario: Adopt a running lead
 - **WHEN** Radar verifies an eligible Pi session's process and pane and captures its launch context
 - **THEN** it records a managed session subject with no parent if the session was untracked, without requiring prior launch intent
+
+### Requirement: Restart resumes the current session
+Restart SHALL resume the selected subject's fresh current session without replaying an initial prompt or one-use launch credentials.
 
 #### Scenario: Unsafe restart recipe
 - **WHEN** the captured recipe cannot safely resume the selected session without replaying a possible initial prompt
@@ -80,7 +83,7 @@ Registry reads and writes SHALL use the daemon's trusted socket and private stat
 - **THEN** its established Herdr-forwarding semantics remain unchanged
 
 ### Requirement: Current session context is mutable and fenced
-pi-radar SHALL report process birth identity, current location, session UUID and a session-load claim ID through one presence operation, with acknowledged `registration_id` and `subject_id` when known. Radar SHALL resolve internal process registration, mutable context and durable session subject separately. It SHALL return `registration_id`, claim ID and `granted`, `duplicate`, `pending` or `released` standing; only a grant includes `subject_id`. Retries SHALL reuse the claim ID. The public process identifier SHALL be `registration_id`, without an `agent_id` compatibility alias. Generic publisher registration/context operations SHALL NOT be pi-radar's session-management path.
+pi-radar SHALL report process birth identity, current location, session UUID and a session-load claim ID through one presence operation. Radar SHALL answer with `registration_id`, the claim ID and a `granted`, `duplicate`, `pending` or `released` standing; only a grant includes `subject_id`. Retries SHALL reuse the claim ID, and generic publisher operations SHALL NOT be the session-management path.
 
 #### Scenario: Reconnect reasserts a claim
 - **WHEN** pi-radar renews or reconnects for the same loaded session
@@ -101,6 +104,13 @@ pi-radar SHALL report process birth identity, current location, session UUID and
 #### Scenario: Process location changes
 - **WHEN** the same verified process reports a new pane
 - **THEN** Radar updates mutable location without changing process registration or subject identity solely because of placement
+
+### Requirement: The public process identifier is registration_id
+Radar SHALL publish a process incarnation only as `registration_id`, with no `agent_id` compatibility alias.
+
+#### Scenario: A client reads a process
+- **WHEN** a client reads a registration
+- **THEN** the process is named by `registration_id` and no `agent_id` field is present
 
 #### Scenario: Another process presents an acknowledged registration
 - **WHEN** the report's registration ID belongs to another process birth identity

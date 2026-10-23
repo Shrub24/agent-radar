@@ -3,7 +3,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Launch specifications are explicit private records
-Radar SHALL hold a private executable, argv, cwd and environment recipe for a managed execution, captured when the daemon admits its launch. It SHALL store this privately and SHALL NOT reconstruct it from titles, scrollback or process arguments. Public snapshot reads SHALL omit the executable arguments, environment and session paths. Registration and ordinary publication SHALL execute nothing.
+Radar SHALL hold a private executable, argv, cwd and environment recipe for a managed execution, captured when the daemon admits its launch, and SHALL NOT reconstruct it from titles, scrollback or process arguments. Public reads SHALL omit it. Registration and ordinary publication SHALL execute nothing.
 
 #### Scenario: Register saved-session launch
 - **WHEN** a trusted publisher supplies a launch specification
@@ -12,6 +12,10 @@ Radar SHALL hold a private executable, argv, cwd and environment recipe for a ma
 #### Scenario: Missing launch specification
 - **WHEN** an agent has no explicit launch specification
 - **THEN** its record states unavailable and no resume command is inferred
+
+#### Scenario: Adopt a running lead
+- **WHEN** Radar verifies an eligible Pi session's process and pane and captures its launch context
+- **THEN** it records a managed session subject with no parent if the session was untracked, without requiring prior launch intent
 
 #### Scenario: Recipe captured at managed launch
 - **WHEN** the daemon admits a managed launch

@@ -37,7 +37,13 @@ The handoff API stores immutable bounded content separately from the recipient r
 
 ## Launching a worker
 
-`launchRadarWorker` takes the parent from the caller's own `publication`, so a consumer passes the pane it splits and no registration or subject for the parent. The result names the child by its `subject_id`, the key that stays the same when the child restarts or resumes; keep that as the child's identifier. `registration_id` and `bound_process` are still returned because assignment and inspection are addressed by registration until child control is subject-addressed. A received handoff carries its sender's `subject_id`; match children by it. This version needs Radar 0.3.1 or newer.
+`launchRadarWorker` takes the parent from the caller's own `publication`, so a consumer passes the pane it splits and no registration or subject for the parent. The result names the child by its `subject_id`, the key that stays the same when the child restarts or resumes; keep that as the child's identifier. A received handoff carries its sender's `subject_id`; match children by it.
+
+To start a released child again, pass `continues: subject_id`: the daemon takes the session from its own record, so no session id or path is sent, and it refuses a child that is not yours or is still running. `client.restart` replaces your own live child under a new program. Both need Radar 0.4.0 or newer.
+
+## Addressing children by subject
+
+The runtime's `children` service (`RADAR_RUNTIME_VERSION` 3) is the surface for everything after a launch. `list()` returns the caller's children as `{ subject_id, request_id, pane_id, state, exited }`; `observe`, `inspect`, `assignment` and `retire` take the subject. pi-radar resolves a subject to its newest bound launch on every call and never remembers the process, so a child replaced under the same subject is reached by the same key. A held assignment is published again on the new process when you call `refresh()` after a replacement; nothing is published for a process the edge does not bind to that subject. An edge bound without a subject (a legacy record) is not listed. Consumers need no registration or claim id.
 
 ## Generated protocol contracts
 

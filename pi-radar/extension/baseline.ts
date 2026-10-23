@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createRadarClient } from "./radar-client.ts";
+import { createRadarChildren } from "./radar-children.ts";
 import { createRadarHandoffPort } from "./radar-communication.ts";
 import {
 	createRadarExecutionAdapter,
@@ -33,6 +34,7 @@ export default function registerPiRadar(pi: PiRadarHost): void {
 	const runtime = lazyRadarRuntime(async () => ({
 		publication: execution.publication,
 		communication: createRadarHandoffPort(client, execution.publication),
+		children: createRadarChildren(client, execution.publication),
 		execution,
 	}));
 	provideRadarRuntime(pi.events, runtime);
