@@ -27,4 +27,4 @@
 - [x] 5.2 Withdrawal in the sweep: a bounded cursor pass over unpresented launches past the 30s ceiling runs the cancel path and records `withdrawn` with a reason on the edge (additive field; wire revision 8).
 - [x] 5.3 One daemon test: a launch that never presents is withdrawn only after confirmed cleanup, a late bind is refused, and the subject accepts a fresh reservation.
 - [x] 5.4 pi-radar: `launchRadarWorker` waits on the edge for granted or withdrawn and drops `timeoutMs`; add `children.restart(subject, program)`; continue is `launchRadarWorker({ continues })` on the same wait; a held assignment follows. One SDK test for the failed outcome.
-- [ ] 5.5 Publish (requires tag approval): Radar 0.5.0, pi-radar 0.10.0, revision 8. Version bumps, changelog, README and the Herdsman brief are prepared; tags remain unpushed.
+- [x] 5.5 Published: Radar 0.5.0, pi-radar 0.10.0, revision 8. Both tags point to `059bdd5b`; release CI succeeded and npm's version document and `latest: 0.10.0` are confirmed. Changelog, README and the Herdsman brief are updated.
