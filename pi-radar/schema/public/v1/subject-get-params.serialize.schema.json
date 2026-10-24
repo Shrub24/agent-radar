@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "subject_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "subject_id"
+  ],
+  "title": "subject-get-params-serialize",
+  "type": "object"
+}

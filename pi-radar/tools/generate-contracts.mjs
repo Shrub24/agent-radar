@@ -42,6 +42,8 @@ try {
 	);
 
 	for (const file of [
+		...["subject-get-params", "subject-child-get-params", "subject-get-result", "subject-list-params", "subject-children-params", "subject-list-result"].flatMap((name) =>
+			[`${name}.serialize.schema.json`, `${name}.deserialize.schema.json`]),
 	"presence-report.serialize.schema.json",
 	"presence-report.deserialize.schema.json",
 	"presence-answer.serialize.schema.json",
@@ -78,6 +80,12 @@ try {
 	}
 
 	const types = [
+		["subject-get-params.deserialize.schema.json", "SubjectGetParams"],
+		["subject-child-get-params.deserialize.schema.json", "SubjectChildGetParams"],
+		["subject-get-result.serialize.schema.json", "SubjectGetResult"],
+		["subject-list-params.deserialize.schema.json", "SubjectListParams"],
+		["subject-children-params.deserialize.schema.json", "SubjectChildrenParams"],
+		["subject-list-result.serialize.schema.json", "SubjectListResult"],
 	["presence-report.deserialize.schema.json", "PresenceReport"],
 	["presence-answer.serialize.schema.json", "PresenceAnswer"],
 	["presence-release.deserialize.schema.json", "PresenceRelease"],
@@ -100,7 +108,8 @@ try {
 		// Some DTOs share internal definition names with others (a page names the
 		// freshness and state vocabularies observation also names); namespace their
 		// generated declarations rather than emitting a duplicate identifier.
-		if (file.startsWith("presence-") || file.startsWith("spawn-")) {
+		if (file.startsWith("subject-")) schema.title = typeName;
+		if (file.startsWith("presence-") || file.startsWith("spawn-") || file.startsWith("subject-")) {
 			for (const name of Object.keys(schema.$defs ?? {})) {
 				const qualified = `${typeName}${name}`;
 				schema.$defs[qualified] = schema.$defs[name];

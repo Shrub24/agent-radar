@@ -21,7 +21,7 @@ else `~/.config/radar/config.toml`. Radar draws without one.";
 /// The crate version and the control-plane wire revision this build speaks. The
 /// revision is the compatibility contract pi-radar checks; the version is for
 /// people. A test pins the literal to [`crate::control_plane::ops::PROTOCOL_REVISION`].
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (wire 8)");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (wire 9)");
 
 /// Everything Radar can be asked to do.
 #[derive(Debug, Parser)]

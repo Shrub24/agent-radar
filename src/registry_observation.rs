@@ -1029,7 +1029,6 @@ mod tests {
         let mut agent = registered("a", at("p1"), None);
         agent.execution = serde_json::from_value(json!({
             "version": 1,
-            "registration_id": "a",
             "channel": "execution",
             "writer": {"source": "herdsman", "incarnation": "11111111-1111-4111-8111-111111111111",
                        "generation": 1, "sequence": 3},

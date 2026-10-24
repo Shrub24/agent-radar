@@ -819,7 +819,7 @@ neither reads agent facts from the backend's own agent records:
 
 - **Through the daemon** (the default), every agent fact comes
   from the daemon's registry. One refresh reads the daemon's pane inventory,
-  every registered agent (`agent.list`, paged) and the spawn topology
+  every agent (`subject.list`, paged) and the spawn topology
   (`spawn.list`), and joins them in one pass, so a frame comes from one moment.
   A backend's own agent records, display metadata and native agent status are not
   read for anything the dashboard shows. A daemon that does not declare

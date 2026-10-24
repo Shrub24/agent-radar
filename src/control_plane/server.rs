@@ -67,6 +67,7 @@ mod places;
 mod reads;
 mod registration;
 mod subject_control;
+mod subject_reads;
 mod sweeper;
 mod verification;
 use admission::*;
@@ -884,22 +885,13 @@ fn handle_line(
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentGetParams {
+struct ProcessGetParams {
     registration_id: String,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TasksListParams {
-    #[serde(default)]
-    after: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentListParams {
     #[serde(default)]
     after: Option<String>,
     #[serde(default)]

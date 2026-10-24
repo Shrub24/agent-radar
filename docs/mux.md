@@ -117,7 +117,7 @@ child, and binds it when that exact child presents it. New bindings expose the
 actual registration `registration_id`; old bindings may lack that field.
 
 Use flat `spawn.get` readback: `result.spawn.bound.registration_id`, not
-`result.spawn.edge.bound.registration_id`. Then read `agent.get` for that exact ID.
+`result.spawn.edge.bound.subject_id`. Then read `subject.get` for that exact agent.
 Binding says which registered child belongs to this creation; it does not say
 that the application is ready to receive an assignment. Execution freshness,
 process verification and owner-assignment facts are separate evidence.

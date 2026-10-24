@@ -995,7 +995,7 @@ test("daemon.ping requires protocol 2, the minimum revision, and registry.v1", a
 		// would be accepted and then never gain a subject.
 		const presenceless = await client.ping();
 		assert.equal(presenceless.ok, false);
-		assert.match(presenceless.ok ? "" : presenceless.message, /revision 8/);
+		assert.match(presenceless.ok ? "" : presenceless.message, /revision 9/);
 		const capable = await client.ping();
 		assert.deepEqual(capable, {
 			ok: true,
@@ -1173,18 +1173,12 @@ test("facts and assignment writes require the facts contract before dispatch", a
 	try {
 		await listen(fixture);
 		const client = fixture.client();
-		const facts = await client.publish({
-			registration_id: UUID_A,
-			channel: "facts",
+		const facts = await client.publish({registration_id: UUID_A, channel: "facts",
 			writer_handle: FIXTURE_WRITER,
 			sequence: 1,
-			snapshot: { model: "model" },
-		});
-		const assignment = await client.acquire({
-			registration_id: UUID_A,
-			channel: "assignment",
-			publisher: { source: "pi-radar", incarnation: UUID_A },
-		});
+			snapshot: { model: "model" },});
+		const assignment = await client.acquire({registration_id: UUID_A, channel: "assignment",
+			publisher: { source: "pi-radar", incarnation: UUID_A },});
 		assert.equal(facts.ok ? "" : facts.code, "unsupported");
 		assert.equal(assignment.ok ? "" : assignment.code, "unsupported");
 		assert.deepEqual(fixture.requests.map((request) => request.method), ["daemon.ping"]);
@@ -1211,7 +1205,7 @@ test("facts publication requires registry.facts.v1 and preserves typed fields", 
 	try {
 		await listen(fixture);
 		const result = await fixture.client().publish({
-			registration_id: UUID_A,
+			target_id: UUID_A,
 			channel: "facts",
 			writer_handle: FIXTURE_WRITER,
 			sequence: 1,
@@ -1443,31 +1437,22 @@ test("registry calls put only the contract's own fields on the wire", async () =
 		});
 		assert.deepEqual(registered, { ok: true, value: { registration_id: UUID_A } });
 
-		const acquired = await client.acquire({
-			registration_id: UUID_A,
-			channel: "execution",
+		const acquired = await client.acquire({registration_id: UUID_A, channel: "execution",
 			publisher: {
 				source: "herdsman-pi",
 				incarnation: UUID_A,
 				reporting_owner: "owner",
-			},
-		});
+			},});
 		assert.equal(acquired.ok, true);
 		assert.equal(acquired.ok ? acquired.value.handle : "", UUID_B);
 
-		const published = await client.publish({
-			registration_id: UUID_A,
-			channel: "execution",
+		const published = await client.publish({registration_id: UUID_A, channel: "execution",
 			writer_handle: UUID_B,
 			sequence: 0,
-			snapshot: { activity: "working" },
-		});
+			snapshot: { activity: "working" },});
 		assert.deepEqual(published, { ok: true, value: { sequence: 7 } });
-		await client.retire({
-			registration_id: UUID_A,
-			channel: "execution",
-			writer_handle: UUID_B,
-		});
+		await client.retire({registration_id: UUID_A, channel: "execution",
+			writer_handle: UUID_B,});
 
 		assert.deepEqual(
 			fixture.requests.map(({ version, method }) => [version, method]),
@@ -1735,9 +1720,8 @@ test("the canonical daemon contract fixture round-trips through this client", as
 			ok: true,
 			value: {
 				handle: FIXTURE_WRITER,
-				source: "herdsman-owner",
-				incarnation: "9f8e7d6c-4321-4def-8abc-0123456789ab",
-				reporting_owner: "owner-1",
+				source: "pi",
+				incarnation: "5d6e7f80-1234-4abc-8def-0123456789ab",
 				generation: 1,
 				sequence: 0,
 			},
@@ -1828,12 +1812,6 @@ test("the canonical daemon contract fixture round-trips through this client", as
 			},
 		});
 
-		const retire = byMethod("agent.retire");
-		assert.deepEqual(await client.retire(retire), {
-			ok: true,
-			value: undefined,
-		});
-
 		assert.deepEqual(
 			fixture.requests.map((request) => [
 				request.version,
@@ -1850,7 +1828,6 @@ test("the canonical daemon contract fixture round-trips through this client", as
 				[2, "agent.context", switchedContext],
 				[2, "agent.context", nullContext],
 				[2, "agent.context", replacementContext],
-				[2, "agent.retire", retire],
 			],
 		);
 		// The vendor fixture's private-path sentinel never reaches the wire.

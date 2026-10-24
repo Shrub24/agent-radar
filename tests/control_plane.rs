@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use agent_radar::Daemon;
 use agent_radar::control_plane::ops::Operation;
-use agent_radar::control_plane::registry::{MAX_LISTED, MAX_TEXT_BYTES, ProcessVerifier};
+use agent_radar::control_plane::registry::{MAX_LISTED, ProcessVerifier};
 use agent_radar::control_plane::{
     Category, DaemonRuntime, Derived, MAX_LINE_BYTES, MAX_VERIFICATION_JOBS, PROTOCOL_VERSION,
     RecordState, RequestOutcome, RequestRecord, Store, connect_at, now_ms, random_uuid,
@@ -1397,14 +1397,14 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// One `agent.get` on its own connection, with a daemon-ended connection
+/// One `process.get` on its own connection, with a daemon-ended connection
 /// reported as an error rather than failing the read.
-fn socket_agent_get(path: &Path, registration_id: &str) -> Value {
+fn socket_process_get(path: &Path, registration_id: &str) -> Value {
     let mut client = Client::dial(path);
     let id = random_uuid();
     client.send(&request_line(
         &id,
-        "agent.get",
+        "process.get",
         json!({"registration_id":registration_id}),
     ));
     let mut line = String::new();
@@ -1414,47 +1414,6 @@ fn socket_agent_get(path: &Path, registration_id: &str) -> Value {
     } else {
         serde_json::from_str(&line).expect("daemon response")
     }
-}
-
-/// `agent.get` serves the claimed birth identity exactly, and no `claim` key at
-/// all when nothing was claimed. Pane matching depends on the exact tuple.
-#[test]
-fn agent_get_serves_the_claimed_birth_identity_only_when_claimed() {
-    let sandbox = Sandbox::new("agent-claim");
-    let mut daemon = sandbox.daemon();
-    let mut client = Client::dial(daemon.path());
-    let process = ProcessIdentity {
-        boot_id: "boot-claim".into(),
-        pid: 5151,
-        start_ticks: 77,
-    };
-    let claimed = client.call(
-        "agent.register",
-        registration_body(
-            "6a2f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
-            Some(process.clone()),
-            None,
-        ),
-    );
-    let claimed_id = registration_id(&claimed);
-    let unclaimed = client.call(
-        "agent.register",
-        registration_body("7b3f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
-    );
-    let unclaimed_id = registration_id(&unclaimed);
-
-    let served = client.call("agent.get", json!({"registration_id": claimed_id}));
-    assert_eq!(
-        served["result"]["agent"]["process"]["claim"],
-        json!({"boot_id": "boot-claim", "pid": 5151, "start_ticks": 77}),
-        "{served}"
-    );
-    let absent = client.call("agent.get", json!({"registration_id": unclaimed_id}));
-    assert!(
-        absent["result"]["agent"]["process"].get("claim").is_none(),
-        "{absent}"
-    );
-    daemon.stop();
 }
 
 #[test]
@@ -1487,7 +1446,7 @@ fn socket_verification_does_not_block_publication_and_shutdown_is_bounded() {
         let id = random_uuid();
         client.send(&request_line(
             &id,
-            "agent.get",
+            "process.get",
             json!({"registration_id":target_id}),
         ));
         let mut line = String::new();
@@ -1560,7 +1519,7 @@ fn socket_verifier_capacity_is_bounded_daemon_wide_and_released_by_completion() 
             .map(|_| {
                 let path = path.clone();
                 let target = target.clone();
-                thread::spawn(move || socket_agent_get(&path, &target))
+                thread::spawn(move || socket_process_get(&path, &target))
             })
             .collect::<Vec<_>>()
     };
@@ -1574,7 +1533,7 @@ fn socket_verifier_capacity_is_bounded_daemon_wide_and_released_by_completion() 
     for extra in getters(bound) {
         let answer = extra.join().unwrap();
         assert_eq!(
-            answer["result"]["agent"]["process"]["verification"], "unavailable",
+            answer["result"]["process"]["process"]["verification"], "unavailable",
             "{answer}"
         );
     }
@@ -1600,14 +1559,14 @@ fn socket_verifier_capacity_is_bounded_daemon_wide_and_released_by_completion() 
     for holder in holders {
         let answer = holder.join().unwrap();
         assert_eq!(
-            answer["result"]["agent"]["process"]["verification"], "unavailable",
+            answer["result"]["process"]["process"]["verification"], "unavailable",
             "{answer}"
         );
     }
     for late in getters(bound) {
         let answer = late.join().unwrap();
         assert_eq!(
-            answer["result"]["agent"]["process"]["verification"], "unavailable",
+            answer["result"]["process"]["process"]["verification"], "unavailable",
             "{answer}"
         );
     }
@@ -1623,9 +1582,9 @@ fn socket_verifier_capacity_is_bounded_daemon_wide_and_released_by_completion() 
     wait_for("the blocked verifications to return", || {
         verifier.finished() == bound
     });
-    let released = socket_agent_get(&path, &target);
+    let released = socket_process_get(&path, &target);
     assert_eq!(
-        released["result"]["agent"]["process"]["verification"], "absent",
+        released["result"]["process"]["process"]["verification"], "absent",
         "{released}"
     );
     assert_eq!(verifier.started(), bound + 1, "capacity was not restored");
@@ -1937,49 +1896,8 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
     assert!(replay["result"].is_object(), "equal replay: {replay}");
     assert_eq!(replay["result"]["channel"]["writer"]["handle"], handle);
     assert_eq!(replay["result"]["channel"]["snapshot"]["sequence"], 1);
-    let get = client.call("agent.get", json!({"registration_id":registration_id}));
-    assert_eq!(
-        get["result"]["agent"]["registration"]["launch"]["available"],
-        true
-    );
-    assert_eq!(
-        get["result"]["agent"]["execution"]["snapshot"]["snapshot"]["activity"],
-        "idle"
-    );
-    assert!(get["result"]["agent"]["execution"]["writer"]["handle"].is_null());
-    assert!(get["result"]["agent"]["context"].is_null());
-    no_secret(&get, launch_secret);
-    let list = client.call("agent.list", json!({"limit":1}));
-    assert_eq!(list["result"]["agents"].as_array().unwrap().len(), 1);
-    no_secret(&list, launch_secret);
-    // One agent record, whichever read serves it: a field one read carries and
-    // the other omits would make a client's second call a guess.
-    let mut got: Vec<&String> = get["result"]["agent"]
-        .as_object()
-        .expect("an agent object")
-        .keys()
-        .collect();
-    let mut listed: Vec<&String> = list["result"]["agents"][0]
-        .as_object()
-        .expect("an agent object")
-        .keys()
-        .collect();
-    got.sort();
-    listed.sort();
-    assert_eq!(
-        got, listed,
-        "agent.get and agent.list disagree on the record"
-    );
-    assert_eq!(
-        get["result"]["agent"]["claim_standing"],
-        list["result"]["agents"][0]["claim_standing"]
-    );
-    assert_eq!(
-        get["result"]["agent"]["scoped"],
-        list["result"]["agents"][0]["scoped"]
-    );
-    assert!(list["result"]["agents"][0]["execution"]["writer"]["handle"].is_null());
-    assert!(list["result"]["agents"][0]["context"].is_null());
+    // The record a reader gets is the subject contract's: it names no process
+    // and carries no private launch specification.
     let retired = client.call(
         "agent.retire",
         json!({"registration_id":registration_id,"channel":"execution","writer_handle":handle}),
@@ -2269,6 +2187,33 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
         .expect("the worker's agent")
         .to_string();
 
+    // Child reads are subject-addressed and answer to the caller's own
+    // attachment: the parent discovers its worker, and a process that is not
+    // the recorded parent sees neither the record nor the child.
+    let children = client.call("subject.children", json!({"registration_id": parent_agent}));
+    assert!(
+        children["result"]["subjects"]
+            .as_array()
+            .expect("subjects")
+            .iter()
+            .any(|subject| subject["subject_id"] == json!(worker)),
+        "{children}"
+    );
+    let child = client.call(
+        "subject.child.get",
+        json!({"registration_id": parent_agent, "subject_id": worker}),
+    );
+    assert_eq!(child["result"]["subject"]["subject_id"], json!(worker), "{child}");
+    assert!(
+        child["result"]["subject"].get("registration_id").is_none(),
+        "a child record names no process: {child}"
+    );
+    let stranger = client.call(
+        "subject.child.get",
+        json!({"registration_id": root, "subject_id": worker}),
+    );
+    assert_eq!(error_code(&stranger), "refused", "{stranger}");
+
     let continue_as = |client: &mut Client, parent: &str, parent_session: &str, managed: Value| {
         client.call_id(
             &random_uuid(),
@@ -2348,13 +2293,6 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
         ),
     );
     let id = registration_id(&registered);
-    let absent = client.call("agent.get", json!({"registration_id":id}));
-    assert!(absent["result"]["agent"]["context"].is_null(), "{absent}");
-    let list_absent = client.call("agent.list", json!({"limit":1}));
-    assert!(
-        list_absent["result"]["agents"][0]["context"].is_null(),
-        "{list_absent}"
-    );
 
     // First report implicitly binds a generation-1 writer. The live response is
     // a credential-free projection and retains explicit null distinctly from
@@ -2430,27 +2368,18 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
         cleared["result"]["context"]["context"]["session"].is_null(),
         "{cleared}"
     );
-    let get = client.call("agent.get", json!({"registration_id":id}));
-    assert!(get["result"]["agent"]["context"].is_object(), "{get}");
-    assert!(get["result"]["agent"]["context"]["context"]["session"].is_null());
-    assert!(get["result"]["agent"]["context"]["context"]["freshness"] == "fresh");
-    assert!(get["result"]["agent"]["context"]["writer"]["handle"].is_null());
-    let list = client.call("agent.list", json!({"limit":1}));
-    assert!(list["result"]["agents"][0]["context"].is_object(), "{list}");
-    assert!(list["result"]["agents"][0]["context"]["context"]["session"].is_null());
-    assert!(list["result"]["agents"][0]["context"]["writer"]["handle"].is_null());
-    no_secret(&get, launch_secret);
-    no_secret(&list, launch_secret);
-    for response in [&get, &list, &cleared["result"]["context"]] {
-        assert!(
-            !response.to_string().contains(&writer),
-            "writer handle leaked: {response}"
-        );
-        assert!(
-            !response.to_string().contains("serving_epoch"),
-            "{response}"
-        );
-    }
+    assert!(cleared["result"]["context"]["context"]["freshness"] == "fresh");
+    assert!(cleared["result"]["context"]["writer"]["handle"].is_null());
+    no_secret(&cleared, launch_secret);
+    let projection = &cleared["result"]["context"];
+    assert!(
+        !projection.to_string().contains(&writer),
+        "writer handle leaked: {projection}"
+    );
+    assert!(
+        !projection.to_string().contains("serving_epoch"),
+        "{projection}"
+    );
 
     // Restarting changes the serving epoch, making the restored context stale
     // while preserving the last explicit null.
@@ -2459,18 +2388,28 @@ fn agent_context_socket_publish_replace_replay_freshness_and_privacy() {
     let mut daemon =
         Daemon::bind_without_backend(&sandbox.socket(), &sandbox.state()).expect("restart daemon");
     let mut client = Client::dial(daemon.path());
-    let stale = client.call("agent.get", json!({"registration_id":id}));
+    let restored = client.call(
+        "agent.context",
+        json!({
+            "registration_id":id,
+            "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "writer_handle":writer,
+            "sequence":3,
+            "context":{"session":null}
+        }),
+    );
     assert_eq!(
-        stale["result"]["agent"]["context"]["context"]["freshness"],
-        "stale"
+        restored["result"]["context"]["context"]["freshness"], "stale",
+        "{restored}"
     );
     assert!(
-        stale["result"]["agent"]["context"]["context"]["restored"]
+        restored["result"]["context"]["context"]["restored"]
             .as_bool()
-            .unwrap()
+            .unwrap(),
+        "{restored}"
     );
-    assert!(stale["result"]["agent"]["context"]["context"]["session"].is_null());
-    no_secret(&stale, launch_secret);
+    assert!(restored["result"]["context"]["context"]["session"].is_null());
+    no_secret(&restored, launch_secret);
     daemon.stop();
 }
 
@@ -2499,15 +2438,20 @@ fn agent_context_socket_expiry_and_replacement_keep_writer_fenced() {
     // report but mark it stale; an explicit observed-generation replacement
     // advances the writer generation and fences the previous handle.
     thread::sleep(Duration::from_millis(1100));
-    let list_stale = client.call("agent.list", json!({"limit":1}));
-    assert_eq!(
-        list_stale["result"]["agents"][0]["context"]["context"]["freshness"],
-        "stale"
+    let expired = client.call(
+        "agent.context",
+        json!({
+            "registration_id":id,
+            "publisher":{"source":"herdsman","incarnation":"1c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "writer_handle":first["result"]["writer"]["handle"],
+            "sequence":1,
+            "lease_ms":1000,
+            "context":{"session":"c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}
+        }),
     );
-    let stale = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(
-        stale["result"]["agent"]["context"]["context"]["freshness"],
-        "stale"
+        expired["result"]["context"]["context"]["freshness"], "stale",
+        "{expired}"
     );
     let old = first["result"]["writer"].clone();
     let replacement = client.call(
@@ -2533,13 +2477,12 @@ fn agent_context_socket_expiry_and_replacement_keep_writer_fenced() {
         }),
     );
     assert_eq!(error_code(&fenced), "refused");
-    let accepted = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(
-        accepted["result"]["agent"]["context"]["writer"]["generation"],
-        2
+        replacement["result"]["writer"]["generation"], 2,
+        "the replacement kept the generation the fenced write could not reach"
     );
     assert_eq!(
-        accepted["result"]["agent"]["context"]["context"]["session"],
+        replacement["result"]["context"]["context"]["session"],
         "e7f8a9b0-c1d2-4e3f-8a4b-5c6d7e8f9a0b"
     );
     daemon.stop();
@@ -2555,34 +2498,40 @@ fn socket_registry_replace_restart_and_reconnect_keep_writer_provenance() {
         registration_body("8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22", None, None),
     );
     let id = registration_id(&registered);
-    let first = client.call("agent.acquire", json!({"registration_id":id,"channel":"assignment","publisher":{"source":"owner","incarnation":"3c2d3e4f-5678-4abc-9def-0123456789ab","reporting_owner":"owner-A"}}));
+    let first = client.call("agent.acquire", json!({"registration_id":id,"channel":"execution","publisher":{"source":"owner","incarnation":"3c2d3e4f-5678-4abc-9def-0123456789ab"}}));
     let old = first["result"]["writer"]["handle"]
         .as_str()
         .unwrap()
         .to_owned();
-    let report = client.call("agent.publish", json!({"registration_id":id,"channel":"assignment","writer_handle":old,"sequence":1,"snapshot":channel_snapshot("unsettled")}));
+    let report = client.call("agent.publish", json!({"registration_id":id,"channel":"execution","writer_handle":old,"sequence":1,"lease_ms":1000,"snapshot":channel_snapshot("unsettled")}));
     assert!(report["result"].is_object(), "{report}");
     let old_generation = first["result"]["writer"]["generation"].as_u64().unwrap();
-    let retired = client.call(
-        "agent.retire",
-        json!({"registration_id":id,"channel":"assignment","writer_handle":old}),
-    );
-    assert!(retired["result"].is_object(), "{retired}");
     daemon.stop();
     drop(client);
     let mut daemon =
         Daemon::bind_without_backend(&sandbox.socket(), &sandbox.state()).expect("restart daemon");
     let mut client = Client::dial(daemon.path());
-    let restored = client.call("agent.get", json!({"registration_id":id}));
-    assert_eq!(
-        restored["result"]["agent"]["assignment"]["snapshot"]["freshness"],
-        "stale"
+    // A live incumbent may not be taken over; the takeover is what an owner does
+    // once it has outlived the lease it published under.
+    let refused = client.call(
+        "agent.acquire",
+        json!({
+            "registration_id":id,"channel":"execution",
+            "publisher":{"source":"owner","incarnation":"4c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "replace":{"generation":old_generation,"handle":old}
+        }),
     );
-    let replacement = client.call("agent.acquire", json!({
-        "registration_id":id,"channel":"assignment",
-        "publisher":{"source":"owner","incarnation":"4c2d3e4f-5678-4abc-9def-0123456789ab","reporting_owner":"owner-A"},
-        "replace":{"generation":old_generation,"handle":old}
-    }));
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+    thread::sleep(Duration::from_millis(1100));
+    let replacement = client.call(
+        "agent.acquire",
+        json!({
+            "registration_id":id,"channel":"execution",
+            "publisher":{"source":"owner","incarnation":"4c2d3e4f-5678-4abc-9def-0123456789ab"},
+            "replace":{"generation":old_generation,"handle":old}
+        }),
+    );
+    assert!(replacement["result"].is_object(), "{replacement}");
     let new_handle = replacement["result"]["writer"]["handle"]
         .as_str()
         .expect("replacement handle")
@@ -2592,15 +2541,19 @@ fn socket_registry_replace_restart_and_reconnect_keep_writer_provenance() {
         replacement["result"]["writer"]["generation"],
         old_generation + 1
     );
-    let stale = client.call("agent.publish", json!({"registration_id":id,"channel":"assignment","writer_handle":old,"sequence":2,"snapshot":channel_snapshot("stale-writer")}));
+    let stale = client.call("agent.publish", json!({"registration_id":id,"channel":"execution","writer_handle":old,"sequence":2,"snapshot":channel_snapshot("stale-writer")}));
     assert_eq!(error_code(&stale), "refused");
-    let reconnect = client.call("agent.publish", json!({"registration_id":id,"channel":"assignment","writer_handle":new_handle,"sequence":1,"snapshot":channel_snapshot("owner-reconnected")}));
+    let reconnect = client.call("agent.publish", json!({"registration_id":id,"channel":"execution","writer_handle":new_handle,"sequence":1,"snapshot":channel_snapshot("owner-reconnected")}));
     assert!(reconnect["result"].is_object(), "{reconnect}");
-    let accepted = client.call("agent.get", json!({"registration_id":id}));
     assert_eq!(
-        accepted["result"]["agent"]["assignment"]["snapshot"]["snapshot"]["activity"],
-        "owner-reconnected"
+        reconnect["result"]["channel"]["snapshot"]["snapshot"]["activity"], "owner-reconnected",
+        "{reconnect}"
     );
+    let retired = client.call(
+        "agent.retire",
+        json!({"registration_id":id,"channel":"execution","writer_handle":new_handle}),
+    );
+    assert!(retired["result"].is_object(), "{retired}");
     daemon.stop();
 }
 
@@ -2625,60 +2578,16 @@ fn registry_socket_rejects_unknown_fields_and_surfaces_corrupt_records() {
     let mut daemon = Daemon::bind_without_backend(&sandbox.socket(), &sandbox.state())
         .expect("bind corrupt store for explicit read failure");
     let mut client = Client::dial(daemon.path());
-    let get = client.call("agent.get", json!({"registration_id":id}));
-    assert_eq!(error_code(&get), "refused");
-    let list = client.call("agent.list", json!({}));
-    assert_eq!(error_code(&list), "refused");
-    daemon.stop();
-}
-
-#[test]
-fn registry_list_pages_are_cursor_stable_and_response_byte_bounded() {
-    let sandbox = Sandbox::new("agent-pages");
-    let mut daemon = sandbox.daemon();
-    let mut client = Client::dial(daemon.path());
-    for n in 0..8 {
-        let incarnation = format!("00000000-0000-4000-8000-{n:012x}");
-        let mut request = registration_body(&incarnation, None, None);
-        // Quotes and backslashes escape, so the response carries the escaped
-        // text plus JSON framing, not the stored bytes.
-        request["label"] = json!("\\\"".repeat(MAX_TEXT_BYTES / 2));
-        let response = client.call("agent.register", request);
-        assert!(
-            response["result"]["registration"]["registration_id"].is_string(),
-            "{response}"
-        );
-    }
-    let mut cursor: Option<String> = None;
-    let mut observed = Vec::new();
-    loop {
-        let response = client.call("agent.list", json!({"limit":3,"after":cursor}));
-        // The whole line a client reads, envelope included, is what must fit.
-        let line = format!("{response}\n");
-        assert!(
-            line.len() < MAX_LINE_BYTES,
-            "oversized page response: {} bytes",
-            line.len()
-        );
-        assert!(response["result"]["agents"].as_array().unwrap().len() <= 3);
-        for entry in response["result"]["agents"].as_array().unwrap() {
-            observed.push(
-                entry["registration"]["registration_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            );
-        }
-        match response["result"]["next"].as_str() {
-            Some(next) => cursor = Some(next.to_owned()),
-            None => break,
-        }
-    }
-    let mut sorted = observed.clone();
-    sorted.sort();
-    sorted.dedup();
-    assert_eq!(observed, sorted);
-    assert_eq!(observed.len(), 8);
+    let corrupt = client.call(
+        "agent.presence",
+        json!({
+            "registration_id":id, "source":"test-publisher",
+            "incarnation":"8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22",
+            "session_id":"6d1e2f30-4a5b-4c6d-8e7f-8091a2b3c4d5",
+            "claim_id":random_uuid()
+        }),
+    );
+    assert_eq!(error_code(&corrupt), "refused", "{corrupt}");
     daemon.stop();
 }
 
@@ -4502,9 +4411,7 @@ fn refused_startup(name: &str, environment: &[(&str, &str)]) -> String {
 fn a_physical_backend_the_daemon_cannot_serve_refuses_startup() {
     let unknown = refused_startup("backend-unknown", &[("RADAR_CONTROL_BACKEND", "docker")]);
     assert!(unknown.contains("docker"), "{unknown}");
-    for supported in ["tmux"] {
-        assert!(unknown.contains(supported), "{unknown}");
-    }
+    assert!(unknown.contains("tmux"), "{unknown}");
 
     // The tmux adapter targets one named server and never tmux's default one,
     // so a configuration that names the default server refuses startup.
@@ -5561,7 +5468,7 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
         }),
     );
     assert!(context["result"].is_object(), "{context}");
-    let facts_before = client.call("agent.get", json!({"registration_id":parent}));
+    let facts_before = client.call("process.get", json!({"registration_id":parent}));
 
     let (spawn_id, raw_pane, child_agent) = spawned_exiting_tmux_child(
         &mut client,
@@ -5580,7 +5487,7 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
         .as_str()
         .expect("spawned pane")
         .to_string();
-    let child_facts_before = client.call("agent.get", json!({"registration_id":child_agent}));
+    let child_facts_before = client.call("process.get", json!({"registration_id":child_agent}));
     let listed = client.call("spawn.list", json!({"limit":10}));
     assert_eq!(
         listed["result"]["spawns"][0]["exit_observation"]["code"],
@@ -5597,14 +5504,14 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
             .is_some_and(|text| text.contains("Pane is dead (status 23")),
         "{output}"
     );
-    let facts_after = client.call("agent.get", json!({"registration_id":parent}));
+    let facts_after = client.call("process.get", json!({"registration_id":parent}));
     assert_eq!(
-        facts_after["result"]["agent"]["execution"],
-        facts_before["result"]["agent"]["execution"]
+        facts_after["result"]["process"]["execution"],
+        facts_before["result"]["process"]["execution"]
     );
     assert_eq!(
-        facts_after["result"]["agent"]["assignment"],
-        facts_before["result"]["agent"]["assignment"]
+        facts_after["result"]["process"]["assignment"],
+        facts_before["result"]["process"]["assignment"]
     );
 
     // A same-UID client can respawn a retained pane; while its command runs, there
@@ -5659,15 +5566,15 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
         "the retained pane is gone: {:?}",
         pane_ids(&server)
     );
-    let child_facts_after = client.call("agent.get", json!({"registration_id":child_agent}));
+    let child_facts_after = client.call("process.get", json!({"registration_id":child_agent}));
     assert_eq!(
-        child_facts_after["result"]["agent"]["execution"],
-        child_facts_before["result"]["agent"]["execution"],
+        child_facts_after["result"]["process"]["execution"],
+        child_facts_before["result"]["process"]["execution"],
         "a dead-pane close changes no execution fact"
     );
     assert_eq!(
-        child_facts_after["result"]["agent"]["assignment"],
-        child_facts_before["result"]["agent"]["assignment"],
+        child_facts_after["result"]["process"]["assignment"],
+        child_facts_before["result"]["process"]["assignment"],
         "a dead-pane close settles no assignment"
     );
 
@@ -7276,7 +7183,7 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
         .as_str()
         .expect("the child's registration")
         .to_owned();
-    let registration = client.call("agent.get", json!({"registration_id": &registration_id}));
+    let registration = client.call("process.get", json!({"registration_id": &registration_id}));
     let close_id = random_uuid();
     let selected =
         agent_radar::control_plane::client::connect_at(daemon.path()).expect("dashboard client");
@@ -7343,8 +7250,8 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
     assert_eq!(topology["result"]["spawn"]["created"], "completed");
     assert_eq!(topology["result"]["spawn"]["launched"], "completed");
     assert_eq!(
-        client.call("agent.get", json!({"registration_id": &registration_id}))["result"]["agent"],
-        registration["result"]["agent"],
+        client.call("process.get", json!({"registration_id": &registration_id}))["result"]["process"],
+        registration["result"]["process"],
         "a close rewrites no registration of the child it closed"
     );
     let ping = client.call("daemon.ping", json!({}));
@@ -9621,23 +9528,16 @@ fn socket_facts_and_owner_assignment_are_read_separately_with_identifier_only_po
     );
     assert!(published["result"].is_object(), "{published}");
 
-    let got = client.call("agent.get", json!({"registration_id":id}));
-    let facts = &got["result"]["agent"]["facts"];
+    let got =
+        client.call("process.get", json!({"registration_id":id}))["result"]["process"].clone();
+    let facts = &got["facts"];
     assert_eq!(facts["snapshot"]["freshness"], "fresh");
     assert_eq!(facts["snapshot"]["source"], "pi");
     assert_eq!(facts["snapshot"]["snapshot"]["model"], model);
     assert!(facts["writer"].get("handle").is_none(), "{facts}");
     assert!(facts["snapshot"].get("handle").is_none(), "{facts}");
-    assert!(got["result"]["agent"]["execution"].is_null());
+    assert!(got["execution"].is_null());
 
-    let listed = client.call("agent.list", json!({}));
-    let entry = listed["result"]["agents"]
-        .as_array()
-        .expect("agents")
-        .iter()
-        .find(|agent| agent["registration"]["registration_id"] == id)
-        .expect("the registered agent in the list");
-    assert_eq!(entry["facts"]["snapshot"]["snapshot"]["model"], model);
     daemon.stop();
 
     let journal: Value = serde_json::from_slice(
@@ -11482,11 +11382,6 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
     reassert["location"]["pane"] = json!("wA:p2");
     let moved = client.call("agent.presence", reassert.clone());
     assert_eq!(moved["result"]["subject_id"], subject, "{moved}");
-    let record = client.call("agent.get", json!({"registration_id": registration}));
-    assert_eq!(
-        record["result"]["agent"]["registration"]["location"]["pane"],
-        "wA:p2"
-    );
     let mut forged = reassert.clone();
     forged["subject_id"] = json!(random_uuid());
     assert!(client.call("agent.presence", forged)["error"].is_object());

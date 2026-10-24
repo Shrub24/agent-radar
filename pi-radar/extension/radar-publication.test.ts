@@ -81,7 +81,7 @@ function fakeDaemon(script: Script = {}) {
 				session_id: params.session_id, standing: "granted", subject_id: SESSION_A });
 		}),
 		releasePresence: async (params) => answer("agent.release", params, () => ok({ ...params, standing: "released" })),
-		acquire: async (params) => answer("agent.acquire", params, () => {
+		acquire: async (params) => answer(addressed("acquire", params), params, () => {
 			const handle = mint();
 			handles.push(handle);
 			return ok({
@@ -93,7 +93,7 @@ function fakeDaemon(script: Script = {}) {
 			});
 		}),
 		publish: async (params) =>
-			answer("agent.publish", params, () => ok({ sequence: params.sequence })),
+			answer(addressed("publish", params), params, () => ok({ sequence: params.sequence })),
 		context: async (params) =>
 			answer("agent.context", params, () => {
 				const handle = params.writer_handle ?? mint();
@@ -108,8 +108,14 @@ function fakeDaemon(script: Script = {}) {
 					},
 				});
 			}),
-		retire: async (params) => answer("agent.retire", params, () => ok(undefined)),
+		retire: async (params) => answer(addressed("retire", params), params, () => ok(undefined)),
 	};
+	/** An assignment names a child subject; every other channel names a process. */
+	function addressed(action: string, params: any): string {
+		return params.subject_id !== undefined
+			? `subject.assignment.${action}`
+			: `agent.${action}`;
+	}
 	function answer(
 		method: string,
 		params: unknown,
@@ -670,7 +676,7 @@ test("the owner publishes about a child's subject and retires only its own write
 	const { root, store, cleanup } = makeRoot();
 	try {
 		const daemon = fakeDaemon();
-		const { scheduler } = fakeScheduler();
+		const { scheduler, advance } = fakeScheduler();
 		const key = radarBindingKey("run-1", "owner-1", "worker");
 		const child = publicationFor(daemon, {
 			dataRoot: root,
@@ -697,34 +703,44 @@ test("the owner publishes about a child's subject and retires only its own write
 			scheduler,
 			slot: createRadarProcessSlot(),
 			incarnation: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+			registration: { source: "herdsman", owner: "owner-1" },
 		});
+		// An owner publishes about a child from its own registration: that is the
+		// authority the daemon checks the recorded parent against.
+		await owner.presence.ensure();
+		await settle();
 		const bound = owner.binding(key);
 		assert.equal(bound?.registration_id, daemon.agentIds[0]);
 		assert.equal(bound?.label, "worker");
 
-		const writer = owner.assignment(bound!.registration_id, "owner-1");
+		// The owner addresses the child by the subject Radar granted it, which the
+		// child learns from that grant rather than from its own process identity.
+		const writer = owner.assignment(SESSION_A, "owner-1");
 		writer.update({ activity: "waiting", waiting_reason: "background-work" });
+		await advance(1_000);
 		await settle();
-		const published = daemon.params("agent.publish", 1);
-		assert.equal(published.registration_id, daemon.agentIds[0]);
-		assert.equal(published.channel, "assignment");
+		const published = daemon.params("subject.assignment.publish", 0);
+		// The wire names the child subject; the caller's own registration is the
+		// transport's to attach, so the publication never supplies it.
+		assert.equal(published.subject_id, SESSION_A);
+		assert.equal(published.registration_id, undefined);
 		// The owner acquires it in its own name, reporting whose assignment it is.
-		assert.deepEqual(daemon.params("agent.acquire", 1).publisher, {
+		assert.deepEqual(daemon.params("subject.assignment.acquire", 0).publisher, {
 			source: "herdsman-owner",
 			incarnation: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
 			reporting_owner: "owner-1",
 		});
 
-		// An agent this process never published about is not retired.
+		// A subject this process never published about is not retired.
 		owner.retireAssignment("ffffffff-ffff-4fff-8fff-ffffffffffff");
 		await settle();
-		assert.equal(daemon.count("agent.retire"), 0);
+		assert.equal(daemon.count("subject.assignment.retire"), 0);
 
-		owner.retireAssignment(bound!.registration_id);
+		owner.retireAssignment(SESSION_A);
 		await settle();
-		assert.equal(daemon.count("agent.retire"), 1);
-		assert.equal(daemon.params("agent.retire").registration_id, daemon.agentIds[0]);
-		assert.equal(daemon.params("agent.retire").writer_handle, daemon.handles[1]);
+		assert.equal(daemon.count("subject.assignment.retire"), 1);
+		assert.equal(daemon.params("subject.assignment.retire").subject_id, SESSION_A);
+		assert.equal(daemon.params("subject.assignment.retire").writer_handle, daemon.handles[1]);
 	} finally {
 		cleanup();
 	}

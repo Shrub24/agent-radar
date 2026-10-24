@@ -1567,9 +1567,6 @@
         "channel": {
           "$ref": "#/$defs/Channel"
         },
-        "registration_id": {
-          "type": "string"
-        },
         "snapshot": {
           "anyOf": [
             {
@@ -1591,7 +1588,6 @@
       },
       "required": [
         "version",
-        "registration_id",
         "channel",
         "writer"
       ],

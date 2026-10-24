@@ -79,31 +79,6 @@ def register_spawned_child(path: Path, registration: dict, token: str) -> dict:
     return call(path, "agent.register", {**registration, "spawn_token": token})["registration"]
 
 
-def publish_assignment(path: Path, registration: dict, publisher: dict,
-                       snapshot: dict, sequence: int, *, lease_ms: int | None = None,
-                       replace: dict | None = None) -> tuple[dict, dict]:
-    """Idempotently register/acquire and publish one assignment snapshot.
-
-    Call this again after reconnect with the same immutable registration,
-    publisher identity, snapshot and sequence to retry a possibly lost response.
-    Only increment sequence for new content or a heartbeat; identical sequence
-    replay does not extend the lease.
-    """
-    registered = call(path, "agent.register", registration)["registration"]
-    acquire = {"registration_id": registered["registration_id"], "channel": "assignment",
-               "publisher": publisher}
-    if replace is not None:
-        acquire["replace"] = replace
-    binding = call(path, "agent.acquire", acquire)["writer"]
-    params = {"registration_id": registered["registration_id"], "channel": "assignment",
-              "writer_handle": binding["handle"], "sequence": sequence,
-              "snapshot": snapshot}
-    if lease_ms is not None:
-        params["lease_ms"] = lease_ms
-    channel = call(path, "agent.publish", params)["channel"]
-    return registered, channel
-
-
 def publish_facts(path: Path, registration_id: str, publisher: dict, snapshot: dict,
                   sequence: int, *, lease_ms: int | None = None) -> dict:
     """Acquire the facts writer and publish one complete facts snapshot.

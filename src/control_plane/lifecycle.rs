@@ -835,25 +835,63 @@ fn subject_record_path(registry: &Registry, subject_id: &str) -> PathBuf {
         .join(format!("{subject_id}.json"))
 }
 
+/// Durable subjects, including detached identities with no remaining claim.
+pub fn subject_records_after(
+    registry: &Registry,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<SubjectRecord>, String> {
+    let directory = registry.subjects().join("identity");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or("invalid subject filename")?;
+        if after.is_none_or(|cut| id > cut) {
+            ids.insert(id.to_owned());
+        }
+    }
+    ids.into_iter()
+        .take(limit)
+        .map(|id| {
+            read_subject_record(registry, &id)?
+                .ok_or_else(|| "subject disappeared during listing".into())
+        })
+        .collect()
+}
+
 /// Lists one current attachment per subject, ordered by subject id.
 pub fn list_subjects_after(
     registry: &Registry,
     after: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Claim>, String> {
-    let ids: BTreeSet<_> = registry
-        .events
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .all_facts()
-        .into_iter()
-        .map(|(id, facts)| facts.attachment.subject_id.unwrap_or(id))
-        .collect();
-    ids.into_iter()
-        .filter(|id| after.is_none_or(|cut| id.as_str() > cut))
-        .filter_map(|id| current_attachment(registry, &id).transpose())
-        .take(limit)
-        .collect()
+    let mut claims = Vec::new();
+    let mut after = after.map(str::to_owned);
+    while claims.len() < limit {
+        let page = subject_records_after(registry, after.as_deref(), limit - claims.len())?;
+        if page.is_empty() {
+            break;
+        }
+        for record in page {
+            after = Some(record.subject_id.clone());
+            if let Some(claim) = current_attachment(registry, &record.subject_id)? {
+                claims.push(claim);
+            }
+        }
+    }
+    Ok(claims)
 }
 
 /// Records what a cancel did about the launch's own pane. The first outcome is

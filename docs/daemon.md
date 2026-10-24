@@ -61,7 +61,7 @@ unrepresentable values before creation. Public operation readbacks omit
 environment values. The child captures/removes the exported
 `PI_RADAR_REGISTRATION_ID` and presents it as its registration; new bindings persist the returned
 `registration_id`. Read `result.spawn.bound.registration_id` from flat `spawn.get` and use that
-exact ID with `agent.get`, not aliases or a nonexistent `spawn.edge` object.
+exact ID with `process.get`, not aliases or a nonexistent `spawn.edge` object.
 Edges retain process and session parent identities. Topology also
 reports `exit_observation`: tmux can persist a typed pane-command exit after
 arming `remain-on-exit`; a backend without `mux.exit_observation` reports
@@ -212,7 +212,7 @@ processes running as the same user. Do not expose this socket remotely.
 | Publish/retire a channel | `agent.publish`, `agent.retire` | `registry.v1` |
 | Session facts and assignment extension | `agent.acquire`, `agent.publish` on channel `facts`, or extended assignment fields | `registry.v1`; negotiate `registry.facts.v1` |
 | Update current session context | `agent.context` | `registry.v1` |
-| Public registry reads | `agent.get`, `agent.list` | `registry.v1` |
+| Public registry reads | `subject.get`, `subject.list`, `subject.children`, `process.get` | `registry.v1` |
 | Spawn topology reads | `spawn.get`, `spawn.list` | `registry.v1`; location confirmation additionally uses `mux.observe` when available |
 | Close a daemon-created child pane | `spawn.close` | `spawn.close.v1` (`mux.observe` + `mux.close`); dead-pane cleanup additionally needs `mux.exit_observation` and a fenced edge |
 | Container reads | `topology.get`, `topology.list`, `topology.reconcile` | `topology.get.v1`/`topology.list.v1`; `topology.reconcile.v1` additionally needs `mux.observe` |
@@ -221,7 +221,7 @@ processes running as the same user. Do not expose this socket remotely.
 
 Use `communication.inbox` to recover pending handoffs independently of journal cursors; `communication.handoff_published` and `communication.handoff_acknowledged` events are small wake pointers, never the payload or the recovery source. The recipient must durably capture the content before acknowledging. A receipt does not settle Herdsman assignment or lifecycle state.
 
-Use `events.read` to resume ordered journal pointers with bounded long polling; it does not replace current-state reads. `cursor` is the position after the last delivered event, so following it never skips an event, while `tail` and `more` say whether a backlog remains: while `more` is true, read again immediately instead of waiting. On `cursor_expired`, resynchronise using paged `agent.list` and `spawn.list`, plus `mux.request.list` for operation records, then resume from the returned cursor. Events may be lost between fact durability and append, so an unclean restart changes the epoch. Absence of an event is not evidence of freshness or liveness.
+Use `events.read` to resume ordered journal pointers with bounded long polling; it does not replace current-state reads. `cursor` is the position after the last delivered event, so following it never skips an event, while `tail` and `more` say whether a backlog remains: while `more` is true, read again immediately instead of waiting. On `cursor_expired`, resynchronise using paged `subject.list` and `spawn.list`, plus `mux.request.list` for operation records, then resume from the returned cursor. Events may be lost between fact durability and append, so an unclean restart changes the epoch. Absence of an event is not evidence of freshness or liveness.
 
 Use the method references for parameter and result shapes rather than treating
 this table as a second schema. `mux.*` primitives are daemon-internal gates, not

@@ -740,7 +740,10 @@ mod tests {
         assert_eq!(lane(&request("agent.register", json!({}))), Lane::Ingest);
         assert_eq!(lane(&request("agent.presence", json!({}))), Lane::Ingest);
         assert_eq!(lane(&request("agent.release", json!({}))), Lane::Ingest);
-        assert_eq!(lane(&request("agent.get", json!({}))), Lane::Control);
+        assert_eq!(
+            lane(&request("process.get", json!({"registration_id":"x"}))),
+            Lane::Control
+        );
         assert_eq!(
             lane(&request("events.read", json!({"wait_ms":1}))),
             Lane::Waiting

@@ -318,7 +318,7 @@ type PendingPublish = {
 
 type ChannelRecord = {
 	version: typeof RADAR_PUBLICATION_VERSION;
-	registration_id: string;
+	target_id: string;
 	channel: RadarChannel;
 	publisher: RadarPublisherIdentity;
 	writer?: { handle: string; generation: number };
@@ -353,10 +353,11 @@ type ContextRecord = {
 	diagnostic?: string;
 };
 
-/** What a managed child tells its owner: which exact subject to publish about. */
+/** What a managed child tells its owner: which subject to address, once granted. */
 export type RadarChildBinding = {
 	version: typeof RADAR_PUBLICATION_VERSION;
 	registration_id: string;
+	subject_id?: string;
 	incarnation: string;
 	run: string;
 	owner: string;
@@ -622,16 +623,21 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 	function blank(agentId: string): ChannelRecord {
 		return {
 			version: RADAR_PUBLICATION_VERSION,
-			registration_id: agentId,
+			target_id: agentId,
 			channel,
 			publisher,
 			sequence: 0,
 		};
 	}
 
+	/** An assignment names a child subject; every other channel names a process. */
+	function addressed(target: string): { registration_id: string } | { subject_id: string } {
+		return channel === "assignment" ? { subject_id: target } : { registration_id: target };
+	}
+
 	function loadRecord(): ChannelRecord {
 		const value = store.read(recordName);
-		const agentId = textAt(value, "registration_id");
+		const agentId = textAt(value, "target_id");
 		const storedPublisher = recordAt(value, "publisher");
 		// A record written for another channel or publisher is not this writer's
 		// binding: adopting it would publish under someone else's identity.
@@ -659,7 +665,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 		const sentAt = numberAt(acceptedValue, "sent_at");
 		return {
 			version: RADAR_PUBLICATION_VERSION,
-			registration_id: agentId,
+			target_id: agentId,
 			channel,
 			publisher,
 			...(handle !== undefined && generation !== undefined
@@ -727,18 +733,14 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 		// identical immutable content that was persisted with it.
 		const agentId = await input.subject(recovering);
 		if (agentId === undefined) return false;
-		if (record.registration_id !== agentId) {
+		if (record.target_id !== agentId) {
 			// A different subject incarnation is a different channel: the previous
 			// binding, sequence and unresolved request do not apply to it, so the
 			// next drain publishes a complete snapshot instead of replaying one.
 			record = blank(agentId);
 			save();
 		}
-		const answer = await client.acquire({
-			registration_id: agentId,
-			channel,
-			publisher,
-		});
+		const answer = await client.acquire({...addressed(agentId), channel, publisher});
 		if (answer.ok === false) {
 			if (answer.code === "not_found") {
 				// The daemon has lost this subject. The identical immutable content is
@@ -775,15 +777,12 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 	async function send(pending: PendingPublish): Promise<void> {
 		const writer = record.writer;
 		if (writer === undefined) return;
-		const answer = await client.publish({
-			registration_id: record.registration_id,
-			channel,
+		const answer = await client.publish({...addressed(record.target_id), channel,
 			writer_handle: writer.handle,
 			sequence: pending.sequence,
 			lease_ms: pending.lease_ms,
 			observed_at: pending.observed_at,
-			snapshot: pending.snapshot,
-		});
+			snapshot: pending.snapshot,});
 		if (answer.ok === true) {
 			recovering = false;
 			record.sequence = Math.max(record.sequence, answer.value.sequence);
@@ -889,10 +888,9 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 			stopPump();
 			const writer = record.writer;
 			if (writer === undefined) return;
-			const agentId = record.registration_id;
+			const agentId = record.target_id;
 			try {
-				void client
-					.retire({ registration_id: agentId, channel, writer_handle: writer.handle })
+				void client.retire({...addressed(agentId), channel, writer_handle: writer.handle})
 					.then((answer) => {
 				if (answer.ok === true) {
 						try {
@@ -940,6 +938,8 @@ type PresenceReporterInput = {
 	scheduler: RadarScheduler;
 	recordName: string;
 	registration(): Promise<RadarRegistration | undefined>;
+	/** The subject Radar granted this process's session, when it granted one. */
+	granted?(subjectId: string): void;
 	heartbeatMs: number;
 };
 
@@ -1022,6 +1022,7 @@ function createPresenceReporter(input: PresenceReporterInput): RadarPresenceRepo
 			}
 			claim.registration_id = answer.value.registration_id;
 			claim.subject_id = answer.value.standing === "granted" ? answer.value.subject_id ?? undefined : undefined;
+			if (claim.subject_id !== undefined) input.granted?.(claim.subject_id);
 			standing = answer.value.standing === "granted"
 				? { state: "managed", subject_id: claim.subject_id! }
 				: answer.value.standing === "duplicate"
@@ -1335,7 +1336,7 @@ function createRadarPublicationInner(
 			agentId = registered;
 			processRecord = { ...record, registration_id: agentId };
 			store.write(registrationName, processRecord);
-			if (options.binding !== undefined) writeBinding(options.binding);
+			if (options.binding !== undefined) writeBinding(options.binding, grantedSubject());
 			return agentId;
 		})();
 		try {
@@ -1345,16 +1346,23 @@ function createRadarPublicationInner(
 		}
 	}
 
+	/** The subject Radar granted this process, once presence has been answered. */
+	function grantedSubject(): string | undefined {
+		const standing = presence.management();
+		return standing?.state === "managed" ? standing.subject_id : undefined;
+	}
+
 	function writeBinding(binding: {
 		key: string;
 		run: string;
 		owner: string;
 		label: string;
-	}): void {
+	}, subjectId?: string): void {
 		if (agentId === undefined) return;
 		store.write(`bindings/${binding.key}.json`, {
 			version: RADAR_PUBLICATION_VERSION,
 			registration_id: agentId,
+			...(subjectId !== undefined ? { subject_id: subjectId } : {}),
 			incarnation,
 			run: binding.run,
 			owner: binding.owner,
@@ -1396,6 +1404,9 @@ function createRadarPublicationInner(
 				...(launchRegistrationId ? { registration_id: launchRegistrationId } : {}),
 			};
 		},
+		granted: (subjectId) => {
+			if (options.binding !== undefined) writeBinding(options.binding, subjectId);
+		},
 		heartbeatMs: options.heartbeatMs ?? RADAR_HEARTBEAT_MS,
 	});
 
@@ -1430,8 +1441,7 @@ function createRadarPublicationInner(
 					channel: "assignment",
 					publisher: publisher("herdsman-owner", reportingOwner),
 					codec: assignmentCodec,
-					// The owner publishes about a subject it did not register: the exact
-					// registration_id from the child's sidecar is the whole correlation.
+					// Radar owns this assignment across the child's process replacements.
 					subject: async () => target,
 					leaseMs: options.leaseMs ?? RADAR_LEASE_MS,
 					heartbeatMs: options.heartbeatMs ?? RADAR_HEARTBEAT_MS,
@@ -1452,6 +1462,7 @@ function createRadarPublicationInner(
 				return undefined;
 			}
 			const bound = textAt(value, "registration_id");
+			const subjectId = textAt(value, "subject_id");
 			const boundIncarnation = textAt(value, "incarnation");
 			const run = textAt(value, "run");
 			const owner = textAt(value, "owner");
@@ -1461,6 +1472,7 @@ function createRadarPublicationInner(
 			// identity is ever used as a channel target.
 			if (
 				!isUuid(bound) ||
+				(subjectId !== undefined && !isUuid(subjectId)) ||
 				!isUuid(boundIncarnation) ||
 				run === undefined ||
 				owner === undefined ||
@@ -1471,6 +1483,7 @@ function createRadarPublicationInner(
 			return {
 				version: RADAR_PUBLICATION_VERSION,
 				registration_id: bound,
+				...(subjectId !== undefined ? { subject_id: subjectId } : {}),
 				incarnation: boundIncarnation,
 				run,
 				owner,

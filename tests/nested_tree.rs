@@ -1816,7 +1816,7 @@ fn registration(
 
 /// One channel's report at `freshness`. The owner publishes the assignment for
 /// its own owner; a session publishes its execution and facts itself.
-fn report(registration_id: &str, channel: &str, freshness: &str, snapshot: Value) -> Value {
+fn report(channel: &str, freshness: &str, snapshot: Value) -> Value {
     let (source, owner) = if channel == "assignment" {
         ("herdsman", Some("herdsman-owner"))
     } else {
@@ -1824,7 +1824,6 @@ fn report(registration_id: &str, channel: &str, freshness: &str, snapshot: Value
     };
     json!({
         "version": 1,
-        "registration_id": registration_id,
         "channel": channel,
         "writer": {"source": source, "incarnation": REGISTRY_INCARNATION, "generation": 1, "sequence": 3},
         "snapshot": {
@@ -2001,9 +2000,8 @@ fn each_authority_is_its_own_line_with_its_publisher_named() {
             at("wA:p1"),
             false,
             vec![
-                report("w", "execution", "fresh", json!({"activity": "idle"})),
+                report("execution", "fresh", json!({"activity": "idle"})),
                 report(
-                    "w",
                     "assignment",
                     "fresh",
                     json!({
@@ -2013,7 +2011,6 @@ fn each_authority_is_its_own_line_with_its_publisher_named() {
                     }),
                 ),
                 report(
-                    "w",
                     "facts",
                     "fresh",
                     json!({
@@ -2055,13 +2052,8 @@ fn execution_done_is_not_assignment_completion_and_silence_is_unknown() {
                 at("wA:p1"),
                 false,
                 vec![
-                    report("done", "execution", "fresh", json!({"activity": "done"})),
-                    report(
-                        "done",
-                        "assignment",
-                        "fresh",
-                        json!({"activity": "working"}),
-                    ),
+                    report("execution", "fresh", json!({"activity": "done"})),
+                    report("assignment", "fresh", json!({"activity": "working"})),
                 ],
             ),
             registration("silent", at("wA:p1"), false, Vec::new()),
@@ -2102,8 +2094,8 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
                 at("wA:p1"),
                 false,
                 vec![
-                    report("stale", "execution", "stale", json!({"activity": "idle"})),
-                    report("stale", "assignment", "fresh", json!({"activity": "lost"})),
+                    report("execution", "stale", json!({"activity": "idle"})),
+                    report("assignment", "fresh", json!({"activity": "lost"})),
                 ],
             ),
             registration(
@@ -2111,13 +2103,8 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
                 at("wA:p1"),
                 false,
                 vec![
-                    report("settles", "execution", "fresh", json!({"activity": "idle"})),
-                    report(
-                        "settles",
-                        "assignment",
-                        "fresh",
-                        json!({"activity": "settling"}),
-                    ),
+                    report("execution", "fresh", json!({"activity": "idle"})),
+                    report("assignment", "fresh", json!({"activity": "settling"})),
                 ],
             ),
         ],

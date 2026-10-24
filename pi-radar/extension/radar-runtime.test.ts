@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	RADAR_RUNTIME_VERSION,
 	lazyRadarRuntime,
 	provideRadarRuntime,
 	requestRadarRuntime,
@@ -84,8 +85,9 @@ test("the handoff ignores incompatible request versions and malformed handles", 
 	const events = new Events();
 	provideRadarRuntime(events, runtime("baseline"));
 	let offered = 0;
+	// The version a consumer offers must match this runtime's own.
 	events.emit("pi-radar/runtime-request", {
-		version: 4,
+		version: RADAR_RUNTIME_VERSION,
 		provide: () => offered++,
 	});
 	events.emit("pi-radar/runtime-request", {

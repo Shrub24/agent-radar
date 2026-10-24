@@ -165,7 +165,7 @@ impl Contract {
 /// Bumped 4 to 5 when lifecycle reads republished the agent as `subject_id` and
 /// the attempt as `claim_id`, and stopped publishing a generation. A revision-4
 /// client reads those names with the old meanings, so it must not connect.
-pub const PROTOCOL_REVISION: u32 = 8;
+pub const PROTOCOL_REVISION: u32 = 9;
 
 /// What the handshake advertises: the daemon contracts the backend's primitive set
 /// can serve, which is the list an external consumer pins. The backend's own
@@ -384,10 +384,22 @@ pub fn classify(method: &str) -> Option<Method> {
         | "communication.get"
         | "communication.ack" => Method::Communication,
         "tasks.list" => Method::Tasks,
-        "agent.presence" | "agent.release" | "agent.acquire" | "agent.register"
-        | "agent.publish" | "agent.retire" | "agent.context" | "agent.get" | "agent.list" => {
-            Method::Registry
-        }
+        "agent.presence"
+        | "agent.release"
+        | "agent.acquire"
+        | "agent.register"
+        | "agent.publish"
+        | "agent.retire"
+        | "agent.context"
+        | "process.get"
+        | "subject.get"
+        | "subject.list"
+        | "subject.children"
+        | "subject.child.get"
+        | "subject.child.inspect"
+        | "subject.assignment.acquire"
+        | "subject.assignment.publish"
+        | "subject.assignment.retire" => Method::Registry,
         // A spawn read reports the daemon's own edge records; whether the backend
         // still reports a recorded location changes its freshness, never whether
         // the read is served.

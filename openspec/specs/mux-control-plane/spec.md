@@ -187,7 +187,7 @@ When retention has dropped events after the caller's sequence, or the supplied e
 
 #### Scenario: Expired cursor
 - **WHEN** a consumer resumes from a dropped sequence
-- **THEN** it receives `cursor_expired` and resynchronises from full reads (`agent.list`, `spawn.list` and request listings), then resumes from the returned cursor as `after` and `epoch`
+- **THEN** it receives `cursor_expired` and resynchronises from full reads (`subject.list`, `spawn.list` and request listings), then resumes from the returned cursor as `after` and `epoch`
 
 #### Scenario: First read after retention dropped history
 - **WHEN** a consumer reads with `after` zero after older events were dropped

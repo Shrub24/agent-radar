@@ -367,9 +367,12 @@ test("a managed child registers its binding and hands the subject to its owner",
 		assert.equal(report.params.owner, "owner-1");
 		assert.equal(report.params.run, "run-1");
 		assert.equal(report.params.label, "worker");
+		// The owner is told the subject Radar granted, because that is the address
+		// it publishes the child's assignment to; the process id is provenance.
 		assert.deepEqual(h.adapter.binding(), {
 			version: 1,
 			registration_id: "00000000-0000-4000-8000-000000000001",
+			subject_id: "11111111-2222-4333-8444-555555555555",
 			incarnation: INCARNATION,
 			run: "run-1",
 			owner: "owner-1",

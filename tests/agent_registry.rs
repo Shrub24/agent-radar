@@ -12,6 +12,7 @@
 //! that is not whole fails explicitly. Every root is temporary and removed on the
 //! way out.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -612,7 +613,7 @@ fn acquire(
 ) -> Result<WriterBinding, String> {
     registry.acquire_writer(
         &AcquireRequest {
-            registration_id: registration_id.into(),
+            target_id: registration_id.into(),
             channel,
             publisher,
             replace: None,
@@ -631,7 +632,7 @@ fn replace(
 ) -> Result<WriterBinding, String> {
     registry.acquire_writer(
         &AcquireRequest {
-            registration_id: registration_id.into(),
+            target_id: registration_id.into(),
             channel,
             publisher,
             replace: Some(ExpectedWriter {
@@ -663,13 +664,15 @@ fn channel_request(
     snapshot: Snapshot,
 ) -> PublishRequest {
     PublishRequest {
-        registration_id: registration_id.into(),
+        target_id: registration_id.into(),
         channel,
-        writer_handle: handle.into(),
-        sequence,
-        lease_ms: Some(10_000),
-        observed_at: Some("2001-01-01T00:00:00.000Z".into()),
-        snapshot: Report::Execution(snapshot),
+        update: agent_radar::control_plane::registry::publication::PublicationUpdate {
+            writer_handle: handle.into(),
+            sequence,
+            lease_ms: Some(10_000),
+            observed_at: Some("2001-01-01T00:00:00.000Z".into()),
+            snapshot: Report::Execution(snapshot),
+        },
     }
 }
 
@@ -702,6 +705,20 @@ fn published(
         .expect("a channel")
 }
 
+/// Records one durable subject, which is what an owner assignment names.
+fn recorded_subject(registry: &Registry) -> String {
+    use agent_radar::control_plane::lifecycle::{self, LaunchContext};
+    let launch = LaunchContext {
+        executable: "/bin/true".into(),
+        argv: Vec::new(),
+        cwd: None,
+        env: BTreeMap::new(),
+    };
+    let ticket = lifecycle::create(registry, &random_uuid(), launch, None, 1_000)
+        .expect("a recorded subject");
+    ticket.subject_id
+}
+
 #[test]
 fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
     let root = temp_root("channels");
@@ -710,6 +727,8 @@ fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
     let mut child_request = request(OTHER_INCARNATION);
     child_request.owner = Some(owner.request.source.clone());
     let child = registry.register(&child_request, 1_000).expect("a child");
+    // An assignment belongs to the agent, not to the process reporting it.
+    let subject = recorded_subject(&registry);
 
     let execution_writer = acquire(
         &registry,
@@ -723,7 +742,7 @@ fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
     // no second registration: a publisher is not an agent record.
     let assignment_writer = acquire(
         &registry,
-        &child.registration_id,
+        &subject,
         Channel::Assignment,
         PublisherIdentity {
             source: "herdsman-owner".into(),
@@ -749,7 +768,7 @@ fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
     let assignment = registry
         .publish(
             &channel_request(
-                &child.registration_id,
+                &subject,
                 Channel::Assignment,
                 &assignment_writer.handle,
                 1,
@@ -769,12 +788,7 @@ fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
         "assignment-open"
     );
 
-    let view = published(
-        &registry,
-        &child.registration_id,
-        Channel::Assignment,
-        1_003,
-    );
+    let view = published(&registry, &subject, Channel::Assignment, 1_003);
     // Public provenance names the actual writer, not the target's registration
     // and not a copied source.
     assert_eq!(view.writer.source, "herdsman-owner");
@@ -783,8 +797,11 @@ fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
     assert_eq!(snapshot.source, "herdsman-owner");
     assert_eq!(snapshot.reporting_owner.as_deref(), Some("herdsman-owner"));
     assert_eq!(snapshot.freshness, Freshness::Fresh);
-    // The publisher created no agent registration: only the owner and the child.
-    assert_eq!(files(&registry).len(), 2);
+    // The owner assignment created no agent registration of its own.
+    assert_eq!(
+        registry.list_after(None, 10).expect("registrations").len(),
+        2
+    );
     drop_root(&root);
 }
 
@@ -857,7 +874,7 @@ fn sequence_replay_conflicts_and_daemon_clock_expiry_are_distinct() {
         "equal replay cannot refresh"
     );
     let mut conflict = first_request.clone();
-    conflict.snapshot = Report::Execution(channel_snapshot("idle", None));
+    conflict.update.snapshot = Report::Execution(channel_snapshot("idle", None));
     assert!(
         registry
             .publish(&conflict, 9_001)
@@ -4097,22 +4114,19 @@ fn owner_assignment_fields_extend_only_the_assignment_channel() {
         1_001,
     )
     .expect("execution report");
+    // An assignment belongs to the agent: the owner names its subject, and the
+    // reporting process only ever reports about itself.
+    let subject = recorded_subject(&registry);
     let owner = PublisherIdentity {
         source: "herdsman-owner".into(),
         incarnation: OWNER_INCARNATION.into(),
         reporting_owner: Some("lead-owner".into()),
     };
-    let assignment = acquire(
-        &registry,
-        &agent.registration_id,
-        Channel::Assignment,
-        owner,
-        1_000,
-    )
-    .expect("an owner assignment writer");
+    let assignment = acquire(&registry, &subject, Channel::Assignment, owner, 1_000)
+        .expect("an owner assignment writer");
     publish_wire(
         &registry,
-        json!({"registration_id": agent.registration_id, "channel": "assignment", "writer_handle": assignment.handle,
+        json!({"registration_id": subject, "channel": "assignment", "writer_handle": assignment.handle,
                "sequence": 1, "snapshot": {
                    "activity": "assignment-open", "role": "worker", "definition": "pi-worker",
                    "run": "run-7", "request": "req-3", "assignment": "Fix the parser",
@@ -4124,7 +4138,7 @@ fn owner_assignment_fields_extend_only_the_assignment_channel() {
     .expect("owner assignment with owner-only fields");
 
     let view = registry
-        .published(&agent.registration_id, Channel::Assignment, 1_003)
+        .published(&subject, Channel::Assignment, 1_003)
         .expect("a read")
         .expect("an assignment channel")
         .snapshot
@@ -4165,13 +4179,13 @@ fn owner_assignment_fields_extend_only_the_assignment_channel() {
 
     publish_wire(
         &registry,
-        json!({"registration_id": agent.registration_id, "channel": "assignment", "writer_handle": assignment.handle,
+        json!({"registration_id": subject, "channel": "assignment", "writer_handle": assignment.handle,
                "sequence": 2, "snapshot": {"activity": "settled"}}),
         1_006,
     )
     .expect("a plain assignment report");
     let plain = registry
-        .published(&agent.registration_id, Channel::Assignment, 1_007)
+        .published(&subject, Channel::Assignment, 1_007)
         .expect("a read")
         .expect("an assignment channel")
         .snapshot

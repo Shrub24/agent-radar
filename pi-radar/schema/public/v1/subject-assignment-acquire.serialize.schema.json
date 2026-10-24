@@ -1,0 +1,79 @@
+{
+  "$defs": {
+    "ExpectedWriter": {
+      "additionalProperties": false,
+      "description": "The incumbent a replacement is allowed to supersede.\n\nBinding the replacement to the exact generation and handle that were read\nmakes a replayed or delayed replacement harmless: once a newer writer exists,\nthe stale expectation no longer matches and is refused.",
+      "properties": {
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "handle": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "handle"
+      ],
+      "type": "object"
+    },
+    "PublisherIdentity": {
+      "additionalProperties": false,
+      "description": "The publisher presenting itself to acquire a channel writer.\n\nThis is a strict local identity, not a registration lookup: a publisher that\nrestarts presents a new incarnation UUID and needs no second agent record. The\nhandle it is issued fences same-user writers; it is not an authorization\nframework and proves nothing about assignment authority.",
+      "properties": {
+        "incarnation": {
+          "type": "string"
+        },
+        "reporting_owner": {
+          "description": "The owner this publisher reports as, when it is an owner projection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "incarnation"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "publisher": {
+      "$ref": "#/$defs/PublisherIdentity"
+    },
+    "registration_id": {
+      "type": "string"
+    },
+    "replace": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExpectedWriter"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "subject_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "registration_id",
+    "subject_id",
+    "publisher",
+    "replace"
+  ],
+  "title": "subject-assignment-acquire-serialize",
+  "type": "object"
+}

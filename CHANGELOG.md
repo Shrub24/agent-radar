@@ -2,6 +2,14 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## 0.6.0
+
+- Agents are read and controlled by subject, not by process. `agent.get`/`agent.list` are gone. `subject.get {subject_id}`, `subject.list {selection,after,limit}` and, for a parent, `subject.children {registration_id}` / `subject.child.get {registration_id,subject_id}` / `subject.child.inspect {registration_id,subject_id}` replace them; no subject record carries a registration or claim id.
+- `subject.list` distinguishes `live` (the default), `retained` (detached agents, kept for continue) and `all` (also `starting` and `unknown`). A verified end detaches an agent; it never deletes it. `subject.children` defaults to `all` so a parent can find a retained worker.
+- A child assignment belongs to the subject: `subject.assignment.acquire|publish|retire` name the child subject and take the caller's own registration as authority. The process-addressed `agent.acquire|publish|retire` refuse `channel: "assignment"`, and Radar carries a still-valid assignment to the replacement's granted attachment without a parent read.
+- `process.get {registration_id}` serves one registration's evidence and channels for diagnostics; it is not an agent record.
+- Wire revision 9 — restart the daemon with pi-radar 0.11.0.
+
 ## Unreleased
 
 - Removes every compatibility path for state written by earlier builds. A spawn edge must be version 2 with a session parent, an exit observation and a bound `registration_id`; the `agent_id` and `bound_agent_id` read aliases, the pre-migration `IdentityMapped` / `IdentityUnresolved` / `Imported` lifecycle transitions, `execution_generation`, `identity_unresolved`, fingerprint-only operation records, per-execution alias admission and the registration-less `bind_spawn` are gone. Run `radar reset --hard` once after installing; older state is refused rather than adapted.

@@ -310,7 +310,6 @@ fn registered_assignment(
         "facts": null,
         "assignment": {
             "version": 1,
-            "registration_id": registration_id,
             "channel": "assignment",
             "writer": {
                 "source": "herdsman-owner",

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { RadarInspection } from "./radar-inspection.ts";
 import { lstatSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
@@ -13,6 +14,10 @@ import type {
 	SpawnExitObservationSerialize,
 	SpawnListParamsDeserialize,
 	SpawnListPageSerialize,
+	SubjectChildGetParams,
+	SubjectChildrenParams,
+	SubjectGetResult,
+	SubjectListResult,
 } from "./generated-contracts.ts";
 
 /**
@@ -38,7 +43,7 @@ export const RADAR_PROTOCOL_VERSION = 2;
  * parent continue or restart its own child by subject.
  * Earlier daemons expose different identity fields; require a coordinated update.
  */
-export const RADAR_MINIMUM_REVISION = 8;
+export const RADAR_MINIMUM_REVISION = 9;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
@@ -875,6 +880,16 @@ const PROCESS_VERDICTS: readonly RadarProcessVerdict[] = [
 	"unavailable",
 ];
 
+function subjectAt(value: unknown): RadarResult<SubjectGetResult["subject"]> {
+	const subjectId = recordAt(value, "subject_id");
+	const session = recordAt(value, "session_id");
+	const state = recordAt(value, "state");
+	if (!isUuid(subjectId) || (session != null && !isUuid(session)) ||
+		!["starting", "live", "detached", "unknown"].includes(String(state)))
+		return protocol("subject read carries no valid identity or attachment state");
+	return { ok: true, value: value as SubjectGetResult["subject"] };
+}
+
 function agentProcessAt(agent: unknown): RadarResult<RadarAgentProcess> {
 	const process = recordAt(agent, "process");
 	const claimed = recordAt(process, "claimed");
@@ -1059,13 +1074,15 @@ export type RadarClient = {
 		registration: RadarRegistration,
 	): Promise<RadarResult<{ registration_id: string }>>;
 	acquire(request: {
-		registration_id: string;
+		registration_id?: string;
+		subject_id?: string;
 		channel: RadarChannel;
 		publisher: RadarPublisherIdentity;
 		replace?: { generation: number; handle: string };
 	}): Promise<RadarResult<RadarWriterBinding>>;
 	publish(request: {
-		registration_id: string;
+		registration_id?: string;
+		subject_id?: string;
 		channel: RadarChannel;
 		writer_handle: string;
 		sequence: number;
@@ -1086,7 +1103,8 @@ export type RadarClient = {
 		context: RadarContextValue;
 	}): Promise<RadarResult<{ writer: RadarWriterBinding; warning?: string; management?: RadarManagement }>>;
 	retire(request: {
-		registration_id: string;
+		registration_id?: string;
+		subject_id?: string;
 		channel: RadarChannel;
 		writer_handle: string;
 	}): Promise<RadarResult<void>>;
@@ -1136,6 +1154,9 @@ export type RadarClient = {
 	/** List launches owned by this client's registered process. */
 	spawnList(request: Pick<SpawnListParamsDeserialize, "after" | "limit">): Promise<RadarResult<SpawnListPageSerialize>>;
 	spawnGet(request_id: string): Promise<RadarResult<RadarSpawnTopology>>;
+	subjectChildren(request?: Omit<SubjectChildrenParams, "registration_id">): Promise<RadarResult<SubjectListResult>>;
+	childGet(subject_id: string): Promise<RadarResult<SubjectGetResult["subject"]>>;
+	childInspect(subject_id: string): Promise<RadarResult<RadarInspection>>;
 	/** The registered child's process verdict, read from its immutable claim. */
 	agentGet(registration_id: string): Promise<RadarResult<RadarAgentProcess>>;
 	observe(): Promise<RadarResult<RadarInventory>>;
@@ -1549,7 +1570,11 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 			return withRegistry(async () => {
 				const answer = await call("agent.presence", { ...request });
 				if (!answer.ok) return answer;
-				return decodePresenceAnswer(answer.value);
+				const decoded = decodePresenceAnswer(answer.value);
+				// Presence names the caller's own registration, which is the
+				// authority every subject-addressed child call is checked against.
+				if (decoded.ok) processRegistrationId = decoded.value.registration_id;
+				return decoded;
 			});
 		},
 		async releasePresence(request) {
@@ -1590,9 +1615,13 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 		},
 		async acquire(request) {
 			return withRegistryChannel(request.channel, async () => {
-				const answer = await call("agent.acquire", {
-					registration_id: request.registration_id,
-					channel: request.channel,
+				const assignment = request.channel === "assignment";
+				if (assignment && processRegistrationId === undefined)
+					return { ok: false, code: "refused", message: "assignment requires a granted parent" };
+				if (assignment && request.subject_id === undefined)
+					return { ok: false, code: "bad_params", message: "an assignment names a child subject" };
+				const answer = await call(assignment ? "subject.assignment.acquire" : "agent.acquire", {
+					...(assignment ? { registration_id: processRegistrationId, subject_id: request.subject_id } : { registration_id: request.registration_id, channel: request.channel }),
 					publisher: request.publisher,
 					...(request.replace !== undefined ? { replace: request.replace } : {}),
 				});
@@ -1619,15 +1648,21 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				}
 			}
 			return withRegistryChannel(request.channel, async () => {
-				const answer = await call("agent.publish", {
-					registration_id: request.registration_id,
-					channel: request.channel,
+				const update = {
 					writer_handle: request.writer_handle,
 					sequence: request.sequence,
 					...(request.lease_ms !== undefined ? { lease_ms: request.lease_ms } : {}),
 					...(request.observed_at !== undefined ? { observed_at: request.observed_at } : {}),
 					snapshot,
-				});
+				};
+				const assignment = request.channel === "assignment";
+				if (assignment && processRegistrationId === undefined)
+					return { ok: false, code: "refused", message: "assignment requires a granted parent" };
+				if (assignment && request.subject_id === undefined)
+					return { ok: false, code: "bad_params", message: "an assignment names a child subject" };
+				const answer = await call(assignment ? "subject.assignment.publish" : "agent.publish", assignment
+					? { registration_id: processRegistrationId, subject_id: request.subject_id, update }
+					: { registration_id: request.registration_id, channel: request.channel, ...update });
 				if (answer.ok === false) return answer;
 				const channel = (answer.value as { channel?: unknown }).channel;
 				const writer = (channel as { writer?: unknown } | undefined)?.writer;
@@ -1672,7 +1707,17 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 		},
 		async retire(request) {
 			return withRegistryChannel(request.channel, async () => {
-				const answer = await call("agent.retire", request);
+				const assignment = request.channel === "assignment";
+				if (assignment && processRegistrationId === undefined)
+					return { ok: false, code: "refused", message: "assignment requires a granted parent" };
+				if (assignment && request.subject_id === undefined)
+					return { ok: false, code: "bad_params", message: "an assignment names a child subject" };
+				const answer = await call(assignment ? "subject.assignment.retire" : "agent.retire", {
+					...(assignment
+						? { registration_id: processRegistrationId, subject_id: request.subject_id }
+						: { registration_id: request.registration_id, channel: request.channel }),
+					writer_handle: request.writer_handle,
+				});
 				return answer.ok === true ? { ok: true, value: undefined } : answer;
 			});
 		},
@@ -1770,6 +1815,60 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				const launch = recordAt(recordAt(answer.value, "request"), "launch_request_id");
 				if (!isUuid(launch)) return protocol("lifecycle.restart reply names no launch");
 				return { ok: true, value: { ...settled.value, launch_request_id: launch } };
+			});
+		},
+		async subjectChildren(request = {}) {
+			const registrationId = processRegistrationId;
+			if (registrationId === undefined)
+				return { ok: false, code: "refused", message: "this process has no Radar registration" };
+			return withRegistry(async () => {
+				const params: SubjectChildrenParams = { ...request, registration_id: registrationId };
+				const answer = await call("subject.children", { ...params });
+				if (!answer.ok) return answer;
+				const subjects = recordAt(answer.value, "subjects");
+				const next = recordAt(answer.value, "next");
+				if (!Array.isArray(subjects) || (next != null && !isUuid(next)))
+					return protocol("subject.children reply carries no valid page");
+				for (const subject of subjects) {
+					const decoded = subjectAt(subject);
+					if (!decoded.ok) return decoded;
+				}
+				return { ok: true, value: answer.value as SubjectListResult };
+			});
+		},
+		async childGet(subject_id) {
+			const registrationId = processRegistrationId;
+			if (registrationId === undefined)
+				return { ok: false, code: "refused", message: "this process has no Radar registration" };
+			if (!isUuid(subject_id))
+				return { ok: false, code: "bad_params", message: "child requires a subject UUID" };
+			return withRegistry(async () => {
+				const params: SubjectChildGetParams = { registration_id: registrationId, subject_id };
+				const answer = await call("subject.child.get", { ...params });
+				return answer.ok ? subjectAt(recordAt(answer.value, "subject")) : answer;
+			});
+		},
+		async childInspect(subject_id) {
+			const registration_id = processRegistrationId;
+			if (registration_id === undefined)
+				return { ok: false, code: "refused", message: "this process has no Radar registration" };
+			return withRegistry(async () => {
+				const answer = await call("subject.child.inspect", { registration_id, subject_id });
+				if (!answer.ok) return answer;
+				const subject = subjectAt(recordAt(answer.value, "subject"));
+				if (!subject.ok) return subject;
+				const output = recordAt(answer.value, "output");
+				const text = stringAt(output, "text");
+				if (text === undefined || typeof recordAt(output, "truncated") !== "boolean")
+					return protocol("child inspection has no output evidence");
+				const foreground = recordAt(answer.value, "foreground");
+				const activity = subject.value.execution?.snapshot?.snapshot;
+				return { ok: true, value: {
+					capturedAt: Date.now(), recentOutputTruncated: recordAt(output, "truncated") as boolean,
+					...(text ? { recentOutput: text } : {}),
+					...(foreground ? { foreground: foreground as RadarForeground } : {}),
+					...(activity && "activity" in activity ? { activity: activity.activity } : {}),
+				} };
 			});
 		},
 		async spawnList(request) {

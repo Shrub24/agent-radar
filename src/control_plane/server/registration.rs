@@ -185,6 +185,16 @@ pub(super) fn registry_request(
 ) -> Response {
     match request.method.as_str() {
         "agent.presence" | "agent.release" => presence_request(core, request, verification),
+        "subject.get"
+        | "subject.list"
+        | "subject.children"
+        | "subject.child.get"
+        | "subject.child.inspect" => {
+            super::subject_reads::subject_read_request(core, request, verification)
+        }
+        "subject.assignment.acquire"
+        | "subject.assignment.publish"
+        | "subject.assignment.retire" => super::subject_reads::assignment_request(core, request),
         "agent.register" => {
             let registration: RegistrationRequest = match decode_params(request) {
                 Ok(value) => value,
@@ -202,6 +212,12 @@ pub(super) fn registry_request(
                 Err(response) => return response,
             };
             let core = locked(core);
+            if acquire.channel == Channel::Assignment {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::BadParams, "assignments are subject-addressed"),
+                );
+            }
             match core.registry.acquire_writer(&acquire, store::now_ms()) {
                 Ok(binding) => Response::ok(&request.id, json!({"writer": binding})),
                 Err(error) => registry_error(request, error),
@@ -213,6 +229,12 @@ pub(super) fn registry_request(
                 Err(response) => return response,
             };
             let core = locked(core);
+            if publish.channel == Channel::Assignment {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::BadParams, "assignments are subject-addressed"),
+                );
+            }
             match core.registry.publish(&publish, store::now_ms()) {
                 Ok(record) => Response::ok(
                     &request.id,
@@ -264,6 +286,12 @@ pub(super) fn registry_request(
                 Err(response) => return response,
             };
             let core = locked(core);
+            if params.channel == Channel::Assignment {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::BadParams, "assignments are subject-addressed"),
+                );
+            }
             match core.registry.retire(
                 &params.registration_id,
                 params.channel,
@@ -277,8 +305,8 @@ pub(super) fn registry_request(
                 Err(error) => registry_error(request, error),
             }
         }
-        "agent.get" => {
-            let params: AgentGetParams = match decode_params(request) {
+        "process.get" => {
+            let params: ProcessGetParams = match decode_params(request) {
                 Ok(value) => value,
                 Err(response) => return response,
             };
@@ -295,7 +323,7 @@ pub(super) fn registry_request(
                 Ok(None) => {
                     return Response::refused(
                         &request.id,
-                        &Refusal::new(Code::NotFound, "agent is not registered"),
+                        &Refusal::new(Code::NotFound, "process is not registered"),
                     );
                 }
                 Err(error) => return registry_error(request, error),
@@ -312,9 +340,6 @@ pub(super) fn registry_request(
                     &Refusal::new(Code::Busy, "daemon is stopping"),
                 );
             }
-            // One agent record, built once: a single read and a page of a list
-            // answer with the same shape, so a client never has to guess which
-            // field a second call would have added.
             let entry = match crate::control_plane::registry_read::agent_entry(
                 &registry,
                 &registration,
@@ -324,95 +349,7 @@ pub(super) fn registry_request(
                 Ok(entry) => entry,
                 Err(error) => return registry_error(request, error),
             };
-            Response::ok(&request.id, json!({"agent": entry}))
-        }
-        "agent.list" => {
-            let params: AgentListParams = match decode_params(request) {
-                Ok(value) => value,
-                Err(response) => return response,
-            };
-            match params.limit {
-                Some(0) => {
-                    return Response::refused(
-                        &request.id,
-                        &Refusal::new(Code::BadParams, "`limit` must be positive"),
-                    );
-                }
-                Some(limit) if limit > MAX_REGISTRY_PAGE => {
-                    return Response::refused(
-                        &request.id,
-                        &Refusal::new(
-                            Code::BadParams,
-                            format!("`limit` must be at most {MAX_REGISTRY_PAGE}"),
-                        ),
-                    );
-                }
-                _ => {}
-            }
-            let (registry, verifier, stopping) = {
-                let core = locked(core);
-                (
-                    Arc::clone(&core.registry),
-                    Arc::clone(&core.verifier),
-                    Arc::clone(&core.stopping),
-                )
-            };
-            let limit = params.limit.unwrap_or(50).min(MAX_REGISTRY_PAGE);
-            // One page reads its registry entries once, then verifies each with a
-            // single shared deadline so a page of blocked verifiers cannot hold
-            // the worker, or the shutdown that joins it, without bound.
-            let deadline = Instant::now() + VERIFICATION_TIMEOUT;
-            // One record beyond the page tells whether a continuation exists,
-            // without reading the whole fleet to page a bounded answer.
-            let read = match registry.list_after(params.after.as_deref(), limit + 1) {
-                Ok(records) => records,
-                Err(error) => return registry_error(request, error),
-            };
-            let has_more = read.len() > limit;
-            let candidates: Vec<_> = read.into_iter().take(limit).collect();
-            let now_ms = store::now_ms();
-            let mut entries = Vec::new();
-            let mut used = 0usize;
-            for registration in &candidates {
-                let process = registration.request.process.clone();
-                let verified =
-                    verify_bounded(process, &verifier, &stopping, verification, deadline);
-                let entry = match crate::control_plane::registry_read::agent_entry(
-                    &registry,
-                    registration,
-                    verified,
-                    now_ms,
-                ) {
-                    Ok(entry) => entry,
-                    Err(error) => return registry_error(request, error),
-                };
-                let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
-                if used + size > MAX_LIST_RESPONSE_BYTES {
-                    if entries.is_empty() {
-                        return Response::refused(
-                            &request.id,
-                            &Refusal::new(
-                                Code::Refused,
-                                "one agent record exceeds the registry response byte bound",
-                            ),
-                        );
-                    }
-                    break;
-                }
-                used += size;
-                entries.push(entry);
-            }
-            // The continuation follows the last key actually returned, so a page
-            // cut short by the byte bound resumes without skipping a record.
-            let next = (entries.len() < candidates.len() || has_more).then(|| {
-                entries
-                    .last()
-                    .expect("a continuation has a returned record")["registration"]["registration_id"]
-                    .as_str()
-                    .expect("public registration id")
-                    .to_owned()
-            });
-            Response::ok(&request.id, json!({"agents": entries, "next": next}))
+            Response::ok(&request.id, json!({"process": entry}))
         }
         "spawn.get" => {
             let params: SpawnGetParams = match decode_params(request) {

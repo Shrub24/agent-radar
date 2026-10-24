@@ -1,5 +1,348 @@
 // Generated from the checked-in Rust-derived JSON Schemas. Do not edit.
 
+export interface SubjectGetParams {
+  subject_id: string;
+}
+export interface SubjectChildGetParams {
+  registration_id: string;
+  subject_id: string;
+}
+/**
+ * Freshness is independent of process identity or completion.
+ */
+export type SubjectGetResultFreshness = "fresh" | "stale";
+/**
+ * One complete accepted snapshot, typed by the channel that carries it. Each
+ * variant is strict about its own fields, so a field from another channel is
+ * refused rather than silently dropped.
+ */
+export type SubjectGetResultReport =
+  SubjectGetResultSnapshot | SubjectGetResultAssignmentSnapshot | SubjectGetResultFactsSnapshot;
+export type SubjectGetResultAttachmentState = "starting" | "live" | "detached" | "unknown";
+
+export interface SubjectGetResult {
+  subject: SubjectGetResultSubject;
+}
+export interface SubjectGetResultSubject {
+  assignment: SubjectGetResultChannelFacts | null;
+  execution: SubjectGetResultChannelFacts | null;
+  facts: SubjectGetResultChannelFacts | null;
+  location: SubjectGetResultRegistryLocation | null;
+  managed: SubjectGetResultManagedMetadata;
+  /**
+   * Recorded scope ownership, not proof of current cgroup membership.
+   */
+  scoped: boolean | null;
+  session_id: string | null;
+  state: SubjectGetResultAttachmentState;
+  subject_id: string;
+}
+export interface SubjectGetResultChannelFacts {
+  snapshot: SubjectGetResultPublicSnapshotFacts | null;
+  writer: SubjectGetResultPublicWriterFacts;
+}
+/**
+ * The last accepted report as an unrelated reader may see it, leaving out the
+ * handle that fences further writes.
+ */
+export interface SubjectGetResultPublicSnapshotFacts {
+  expires_at: string;
+  freshness: SubjectGetResultFreshness;
+  generation: number;
+  incarnation: string;
+  lease_ms: number;
+  observed_at?: string | null;
+  received_at: string;
+  reporting_owner?: string | null;
+  restored: boolean;
+  sequence: number;
+  snapshot: SubjectGetResultReport;
+  source: string;
+}
+/**
+ * One complete snapshot for one channel. Vocabulary is free-form; shape is
+ * strict. Unknown state/reason/action words survive, unknown fields do not.
+ */
+export interface SubjectGetResultSnapshot {
+  actions?: string[];
+  activity: string;
+  last_outcome?: SubjectGetResultOutcome | null;
+  waiting_reason?: string | null;
+}
+/**
+ * A turn outcome kept distinct from current activity.
+ */
+export interface SubjectGetResultOutcome {
+  detail?: string | null;
+  /**
+   * Producer vocabulary is deliberately free-form.
+   */
+  result: string;
+}
+/**
+ * The owner's complete assignment snapshot: the shared base plus facts only an
+ * owner knows. It is authored by the owner's writer and is never derived from
+ * execution activity; the owner's identity is provenance, not authority.
+ */
+export interface SubjectGetResultAssignmentSnapshot {
+  actions?: string[];
+  activity: string;
+  ask?: string | null;
+  assigned_started_unix_ms?: number | null;
+  assignment?: string | null;
+  awaited?: string[];
+  definition?: string | null;
+  last_outcome?: SubjectGetResultOutcome | null;
+  request?: string | null;
+  role?: string | null;
+  run?: string | null;
+  waiting_reason?: string | null;
+}
+/**
+ * The agent's own process facts. Self-authored by any Pi session, with no owner
+ * or assignment, and kept separate from execution and assignment. Every field
+ * is optional and a published snapshot replaces the whole value, so omission
+ * withdraws a fact. `context_window` is counts; a display derives the percentage.
+ */
+export interface SubjectGetResultFactsSnapshot {
+  background_started_unix_ms?: number | null;
+  background_tasks?: SubjectGetResultBackgroundTask[];
+  context_window?: SubjectGetResultContextWindow | null;
+  model?: string | null;
+  provider?: string | null;
+  session_name?: string | null;
+  thinking?: string | null;
+}
+/**
+ * One background task the agent process reports as unresolved.
+ */
+export interface SubjectGetResultBackgroundTask {
+  id: string;
+  phase: string;
+}
+/**
+ * How much of a model's context window a session has used, as counts.
+ *
+ * `window` is positive and `tokens` does not exceed it; the percentage a display
+ * shows is derived from these and never published. Wire counts stay exact in JS.
+ */
+export interface SubjectGetResultContextWindow {
+  tokens: number;
+  window: number;
+}
+/**
+ * The current writer as an unrelated reader may see it: provenance and
+ * generation, without the opaque handle an update must present.
+ */
+export interface SubjectGetResultPublicWriterFacts {
+  generation: number;
+  incarnation: string;
+  reporting_owner?: string | null;
+  retired_at?: string | null;
+  sequence: number;
+  source: string;
+}
+/**
+ * Where an agent's incarnation lives on one backend, in that backend's own
+ * coordinates.
+ *
+ * The backend name is free-form so a source Radar does not ship yet is
+ * preserved rather than rejected; the rest are the coordinates as reported, and
+ * each is optional because a backend need not name every level.
+ */
+export interface SubjectGetResultRegistryLocation {
+  backend: string;
+  instance?: string | null;
+  pane?: string | null;
+  tab?: string | null;
+  workspace?: string | null;
+}
+/**
+ * One durable launch subject. The correlation is a private credential and is
+ * spent at capture; no public read returns it.
+ */
+export interface SubjectGetResultManagedMetadata {
+  label?: string | null;
+  owner?: string | null;
+  parent_subject_id?: string | null;
+  role?: string | null;
+  run?: string | null;
+}
+export interface SubjectListParams {
+  after?: string | null;
+  limit?: number | null;
+  selection?: "live" | "retained" | "all";
+}
+export type SubjectChildrenParamsSelection = "live" | "retained" | "all";
+
+export interface SubjectChildrenParams {
+  after?: string | null;
+  limit?: number | null;
+  registration_id: string;
+  selection?: SubjectChildrenParamsSelection | null;
+}
+/**
+ * Freshness is independent of process identity or completion.
+ */
+export type SubjectListResultFreshness = "fresh" | "stale";
+/**
+ * One complete accepted snapshot, typed by the channel that carries it. Each
+ * variant is strict about its own fields, so a field from another channel is
+ * refused rather than silently dropped.
+ */
+export type SubjectListResultReport =
+  SubjectListResultSnapshot | SubjectListResultAssignmentSnapshot | SubjectListResultFactsSnapshot;
+export type SubjectListResultAttachmentState = "starting" | "live" | "detached" | "unknown";
+
+export interface SubjectListResult {
+  next: string | null;
+  subjects: SubjectListResultSubject[];
+}
+export interface SubjectListResultSubject {
+  assignment: SubjectListResultChannelFacts | null;
+  execution: SubjectListResultChannelFacts | null;
+  facts: SubjectListResultChannelFacts | null;
+  location: SubjectListResultRegistryLocation | null;
+  managed: SubjectListResultManagedMetadata;
+  /**
+   * Recorded scope ownership, not proof of current cgroup membership.
+   */
+  scoped: boolean | null;
+  session_id: string | null;
+  state: SubjectListResultAttachmentState;
+  subject_id: string;
+}
+export interface SubjectListResultChannelFacts {
+  snapshot: SubjectListResultPublicSnapshotFacts | null;
+  writer: SubjectListResultPublicWriterFacts;
+}
+/**
+ * The last accepted report as an unrelated reader may see it, leaving out the
+ * handle that fences further writes.
+ */
+export interface SubjectListResultPublicSnapshotFacts {
+  expires_at: string;
+  freshness: SubjectListResultFreshness;
+  generation: number;
+  incarnation: string;
+  lease_ms: number;
+  observed_at?: string | null;
+  received_at: string;
+  reporting_owner?: string | null;
+  restored: boolean;
+  sequence: number;
+  snapshot: SubjectListResultReport;
+  source: string;
+}
+/**
+ * One complete snapshot for one channel. Vocabulary is free-form; shape is
+ * strict. Unknown state/reason/action words survive, unknown fields do not.
+ */
+export interface SubjectListResultSnapshot {
+  actions?: string[];
+  activity: string;
+  last_outcome?: SubjectListResultOutcome | null;
+  waiting_reason?: string | null;
+}
+/**
+ * A turn outcome kept distinct from current activity.
+ */
+export interface SubjectListResultOutcome {
+  detail?: string | null;
+  /**
+   * Producer vocabulary is deliberately free-form.
+   */
+  result: string;
+}
+/**
+ * The owner's complete assignment snapshot: the shared base plus facts only an
+ * owner knows. It is authored by the owner's writer and is never derived from
+ * execution activity; the owner's identity is provenance, not authority.
+ */
+export interface SubjectListResultAssignmentSnapshot {
+  actions?: string[];
+  activity: string;
+  ask?: string | null;
+  assigned_started_unix_ms?: number | null;
+  assignment?: string | null;
+  awaited?: string[];
+  definition?: string | null;
+  last_outcome?: SubjectListResultOutcome | null;
+  request?: string | null;
+  role?: string | null;
+  run?: string | null;
+  waiting_reason?: string | null;
+}
+/**
+ * The agent's own process facts. Self-authored by any Pi session, with no owner
+ * or assignment, and kept separate from execution and assignment. Every field
+ * is optional and a published snapshot replaces the whole value, so omission
+ * withdraws a fact. `context_window` is counts; a display derives the percentage.
+ */
+export interface SubjectListResultFactsSnapshot {
+  background_started_unix_ms?: number | null;
+  background_tasks?: SubjectListResultBackgroundTask[];
+  context_window?: SubjectListResultContextWindow | null;
+  model?: string | null;
+  provider?: string | null;
+  session_name?: string | null;
+  thinking?: string | null;
+}
+/**
+ * One background task the agent process reports as unresolved.
+ */
+export interface SubjectListResultBackgroundTask {
+  id: string;
+  phase: string;
+}
+/**
+ * How much of a model's context window a session has used, as counts.
+ *
+ * `window` is positive and `tokens` does not exceed it; the percentage a display
+ * shows is derived from these and never published. Wire counts stay exact in JS.
+ */
+export interface SubjectListResultContextWindow {
+  tokens: number;
+  window: number;
+}
+/**
+ * The current writer as an unrelated reader may see it: provenance and
+ * generation, without the opaque handle an update must present.
+ */
+export interface SubjectListResultPublicWriterFacts {
+  generation: number;
+  incarnation: string;
+  reporting_owner?: string | null;
+  retired_at?: string | null;
+  sequence: number;
+  source: string;
+}
+/**
+ * Where an agent's incarnation lives on one backend, in that backend's own
+ * coordinates.
+ *
+ * The backend name is free-form so a source Radar does not ship yet is
+ * preserved rather than rejected; the rest are the coordinates as reported, and
+ * each is optional because a backend need not name every level.
+ */
+export interface SubjectListResultRegistryLocation {
+  backend: string;
+  instance?: string | null;
+  pane?: string | null;
+  tab?: string | null;
+  workspace?: string | null;
+}
+/**
+ * One durable launch subject. The correlation is a private credential and is
+ * spent at capture; no public read returns it.
+ */
+export interface SubjectListResultManagedMetadata {
+  label?: string | null;
+  owner?: string | null;
+  parent_subject_id?: string | null;
+  role?: string | null;
+  run?: string | null;
+}
 export interface PresenceReportDeserialize {
   claim_id: string;
   incarnation: string;
@@ -687,7 +1030,6 @@ export interface RegistryAgent {
  */
 export interface PublicChannelFacts {
   channel: Channel;
-  registration_id: string;
   snapshot?: PublicSnapshotFacts | null;
   version: number;
   writer: PublicWriterFacts;

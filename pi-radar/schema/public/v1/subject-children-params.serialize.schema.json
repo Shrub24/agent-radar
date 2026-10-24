@@ -1,0 +1,54 @@
+{
+  "$defs": {
+    "Selection": {
+      "enum": [
+        "live",
+        "retained",
+        "all"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "after": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "limit": {
+      "default": null,
+      "format": "uint",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "registration_id": {
+      "type": "string"
+    },
+    "selection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Selection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "registration_id",
+    "selection",
+    "after",
+    "limit"
+  ],
+  "title": "subject-children-params-serialize",
+  "type": "object"
+}

@@ -154,6 +154,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     fs::create_dir_all(&output)?;
     write_pair::<PingResult>(&output, "daemon-ping")?;
+    use agent_radar::control_plane::public_contracts::subject;
+    write_pair::<subject::GetParams>(&output, "subject-get-params")?;
+    write_pair::<subject::ChildGetParams>(&output, "subject-child-get-params")?;
+    write_pair::<subject::GetResult>(&output, "subject-get-result")?;
+    write_pair::<subject::ListParams>(&output, "subject-list-params")?;
+    write_pair::<subject::ChildrenParams>(&output, "subject-children-params")?;
+    write_pair::<subject::ListResult>(&output, "subject-list-result")?;
+    write_pair::<subject::AssignmentAcquire>(&output, "subject-assignment-acquire")?;
+    write_pair::<subject::AssignmentPublish>(&output, "subject-assignment-publish")?;
+    write_pair::<subject::AssignmentRetire>(&output, "subject-assignment-retire")?;
     write_pair::<agent_radar::control_plane::registry::presence::Report>(
         &output,
         "presence-report",

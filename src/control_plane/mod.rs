@@ -24,6 +24,7 @@ pub mod registry;
 pub mod registry_read;
 pub mod server;
 pub mod store;
+mod subject_read;
 pub mod transport;
 
 pub use crate::runtime::{RuntimeProvider, Target};

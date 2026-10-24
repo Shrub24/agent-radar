@@ -1,0 +1,310 @@
+{
+  "$defs": {
+    "AssignmentSnapshot": {
+      "additionalProperties": false,
+      "description": "The owner's complete assignment snapshot: the shared base plus facts only an\nowner knows. It is authored by the owner's writer and is never derived from\nexecution activity; the owner's identity is provenance, not authority.",
+      "properties": {
+        "actions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "activity": {
+          "type": "string"
+        },
+        "ask": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assigned_started_unix_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "assignment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "awaited": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "definition": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Outcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "waiting_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "activity"
+      ],
+      "type": "object"
+    },
+    "BackgroundTask": {
+      "additionalProperties": false,
+      "description": "One background task the agent process reports as unresolved.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "phase": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "ContextWindow": {
+      "additionalProperties": false,
+      "description": "How much of a model's context window a session has used, as counts.\n\n`window` is positive and `tokens` does not exceed it; the percentage a display\nshows is derived from these and never published. Wire counts stay exact in JS.",
+      "properties": {
+        "tokens": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tokens",
+        "window"
+      ],
+      "type": "object"
+    },
+    "FactsSnapshot": {
+      "additionalProperties": false,
+      "description": "The agent's own process facts. Self-authored by any Pi session, with no owner\nor assignment, and kept separate from execution and assignment. Every field\nis optional and a published snapshot replaces the whole value, so omission\nwithdraws a fact. `context_window` is counts; a display derives the percentage.",
+      "properties": {
+        "background_started_unix_ms": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "background_tasks": {
+          "items": {
+            "$ref": "#/$defs/BackgroundTask"
+          },
+          "type": "array"
+        },
+        "context_window": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContextWindow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thinking": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Outcome": {
+      "additionalProperties": false,
+      "description": "A turn outcome kept distinct from current activity.",
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "description": "Producer vocabulary is deliberately free-form.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    },
+    "PublicationUpdate": {
+      "additionalProperties": false,
+      "description": "A writer update independent of the process or subject that owns the channel.",
+      "properties": {
+        "lease_ms": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "observed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/Report"
+        },
+        "writer_handle": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "writer_handle",
+        "sequence",
+        "snapshot"
+      ],
+      "type": "object"
+    },
+    "Report": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Snapshot"
+        },
+        {
+          "$ref": "#/$defs/AssignmentSnapshot"
+        },
+        {
+          "$ref": "#/$defs/FactsSnapshot"
+        }
+      ],
+      "description": "One complete accepted snapshot, typed by the channel that carries it. Each\nvariant is strict about its own fields, so a field from another channel is\nrefused rather than silently dropped."
+    },
+    "Snapshot": {
+      "additionalProperties": false,
+      "description": "One complete snapshot for one channel. Vocabulary is free-form; shape is\nstrict. Unknown state/reason/action words survive, unknown fields do not.",
+      "properties": {
+        "actions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "activity": {
+          "type": "string"
+        },
+        "last_outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Outcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "waiting_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "activity"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "registration_id": {
+      "type": "string"
+    },
+    "subject_id": {
+      "type": "string"
+    },
+    "update": {
+      "$ref": "#/$defs/PublicationUpdate"
+    }
+  },
+  "required": [
+    "registration_id",
+    "subject_id",
+    "update"
+  ],
+  "title": "subject-assignment-publish-deserialize",
+  "type": "object"
+}

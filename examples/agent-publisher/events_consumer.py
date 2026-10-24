@@ -36,8 +36,8 @@ def full_read(path: Path) -> None:
         params = {"limit": 100}
         if after is not None:
             params["after"] = after
-        page = call(path, "agent.list", params)
-        for agent in page["agents"]:
+        page = call(path, "subject.list", {**params, "selection": "all"})
+        for agent in page["subjects"]:
             print(json.dumps({"kind": "agent", "value": agent}, separators=(",", ":")), flush=True)
         after = page["next"]
         if after is None:
@@ -77,8 +77,8 @@ def consume(path: Path) -> None:
         epoch = result["epoch"]
         for event in result["events"]:
             if event.get("registration_id") is not None:
-                value = call(path, "agent.get", {"registration_id": event["registration_id"]})
-                print(json.dumps({"event": event, "agent": value.get("agent")}, separators=(",", ":")), flush=True)
+                value = call(path, "process.get", {"registration_id": event["registration_id"]})
+                print(json.dumps({"event": event, "process": value.get("process")}, separators=(",", ":")), flush=True)
             elif event.get("spawn") is not None:
                 value = call(path, "spawn.get", {"request_id": event["spawn"]})
                 print(json.dumps({"event": event, "spawn": value.get("spawn")}, separators=(",", ":")), flush=True)

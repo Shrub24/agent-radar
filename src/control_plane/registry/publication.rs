@@ -340,7 +340,7 @@ impl Report {
 /// restarts presents a new incarnation UUID and needs no second agent record. The
 /// handle it is issued fences same-user writers; it is not an authorization
 /// framework and proves nothing about assignment authority.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublisherIdentity {
     pub source: String,
@@ -368,7 +368,7 @@ impl PublisherIdentity {
 /// Binding the replacement to the exact generation and handle that were read
 /// makes a replayed or delayed replacement harmless: once a newer writer exists,
 /// the stale expectation no longer matches and is refused.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedWriter {
     pub generation: u64,
@@ -388,8 +388,10 @@ impl ExpectedWriter {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcquireRequest {
-    /// The target agent incarnation the channel reports about.
-    pub registration_id: String,
+    /// The channel target: a process registration for self channels, and the
+    /// subject for an assignment, which is the only channel keyed by an agent.
+    #[serde(rename = "registration_id")]
+    pub target_id: String,
     pub channel: Channel,
     pub publisher: PublisherIdentity,
     /// Absent acquires only a channel with no writer. Present replaces exactly
@@ -400,7 +402,7 @@ pub struct AcquireRequest {
 
 impl AcquireRequest {
     pub fn validate(&self) -> Result<(), String> {
-        validate_registration_id(&self.registration_id)?;
+        validate_registration_id(&self.target_id)?;
         self.publisher.validate()?;
         if let Some(expected) = &self.replace {
             expected.validate()?;
@@ -462,8 +464,8 @@ pub struct AcceptedSnapshot {
 
 impl AcceptedSnapshot {
     fn repeats(&self, request: &PublishRequest, report: &Report) -> bool {
-        self.lease_ms == request.lease_ms()
-            && self.observed_at == request.observed_at
+        self.lease_ms == request.update.lease_ms()
+            && self.observed_at == request.update.observed_at
             && self.snapshot == *report
     }
 
@@ -496,7 +498,8 @@ impl AcceptedSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct ChannelRecord {
     pub version: u32,
-    pub registration_id: String,
+    /// Subject for assignment; process registration for execution and facts.
+    pub target_id: String,
     pub channel: Channel,
     pub writer: WriterBinding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -530,7 +533,6 @@ impl ChannelRecord {
         let view = self.view(now_ms, serving_epoch);
         PublicChannelFacts {
             version: view.version,
-            registration_id: view.registration_id,
             channel: view.channel,
             writer: PublicWriterFacts {
                 source: view.writer.source,
@@ -560,7 +562,6 @@ impl ChannelRecord {
     pub fn view(&self, now_ms: i64, serving_epoch: &str) -> PublicChannel {
         PublicChannel {
             version: self.version,
-            registration_id: self.registration_id.clone(),
             channel: self.channel,
             writer: PublicWriter {
                 handle: self.writer.handle.clone(),
@@ -735,7 +736,6 @@ pub struct PublicSnapshotFacts {
 #[serde(deny_unknown_fields)]
 pub struct PublicChannelFacts {
     pub version: u32,
-    pub registration_id: String,
     pub channel: Channel,
     pub writer: PublicWriterFacts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -747,7 +747,6 @@ pub struct PublicChannelFacts {
 #[serde(deny_unknown_fields)]
 pub struct PublicChannel {
     pub version: u32,
-    pub registration_id: String,
     pub channel: Channel,
     pub writer: PublicWriter,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -758,8 +757,17 @@ pub struct PublicChannel {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishRequest {
-    pub registration_id: String,
+    #[serde(rename = "registration_id")]
+    pub target_id: String,
     pub channel: Channel,
+    #[serde(flatten)]
+    pub update: PublicationUpdate,
+}
+
+/// A writer update independent of the process or subject that owns the channel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationUpdate {
     pub writer_handle: String,
     pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -770,10 +778,15 @@ pub struct PublishRequest {
 }
 
 impl PublishRequest {
-    /// Checks the envelope and the snapshot against this request's channel, and
-    /// returns the snapshot as that channel's schema.
     pub fn validate(&self) -> Result<Report, String> {
-        validate_registration_id(&self.registration_id)?;
+        validate_registration_id(&self.target_id)?;
+        self.update.validate(self.channel)
+    }
+}
+
+impl PublicationUpdate {
+    /// Validate once at the publication boundary for the channel's report type.
+    pub fn validate(&self, channel: Channel) -> Result<Report, String> {
         validate_registration_id(&self.writer_handle)?;
         if self.sequence == 0 {
             return Err("`sequence` must be at least 1".into());
@@ -791,7 +804,7 @@ impl PublishRequest {
                 return Err("`observed_at` is not a timestamp".into());
             }
         }
-        let report = self.snapshot.for_channel(self.channel)?;
+        let report = self.snapshot.for_channel(channel)?;
         report.validate()?;
         Ok(report)
     }
@@ -814,19 +827,20 @@ pub fn acquire_writer(
 ) -> Result<WriterBinding, String> {
     request.validate()?;
     let _transition = registry.transition();
-    // The subject must be a registered agent incarnation. The publisher is not
-    // looked up: a publisher restart is a new incarnation UUID, not a second
-    // registration, and its identity is recorded as provenance rather than
-    // admitted against an agent record.
-    registry
-        .get(&request.registration_id)?
-        .ok_or_else(|| format!("agent {} is not registered", request.registration_id))?;
-    let existing = read_record(registry, &request.registration_id, request.channel)?;
+    if request.channel == Channel::Assignment {
+        crate::control_plane::lifecycle::read_subject_record(registry, &request.target_id)?
+            .ok_or("assignment subject is not recorded")?;
+    } else {
+        registry
+            .get(&request.target_id)?
+            .ok_or("process is not registered")?;
+    }
+    let existing = read_record(registry, &request.target_id, request.channel)?;
     let is_new = existing.is_none();
     let record = match (existing, &request.replace) {
         (None, None) => ChannelRecord {
             version: PUBLICATION_VERSION,
-            registration_id: request.registration_id.clone(),
+            target_id: request.target_id.clone(),
             channel: request.channel,
             writer: new_binding(&request.publisher, 1),
             snapshot: None,
@@ -862,7 +876,7 @@ pub fn acquire_writer(
         } else {
             "publication.writer_replaced"
         },
-        Some(&request.registration_id),
+        Some(&request.target_id),
         None,
         None,
     );
@@ -875,6 +889,8 @@ pub fn channel(
     registration_id: &str,
     channel: Channel,
 ) -> Result<Option<ChannelRecord>, String> {
+    // An assignment is stored under its subject; every other channel under the
+    // process registration that publishes it.
     read_record(registry, registration_id, channel)
 }
 
@@ -885,7 +901,7 @@ pub fn published(
     channel: Channel,
     now_ms: i64,
 ) -> Result<Option<PublicChannel>, String> {
-    Ok(read_record(registry, registration_id, channel)?
+    Ok(self::channel(registry, registration_id, channel)?
         .map(|record| record.view(now_ms, registry.serving_epoch())))
 }
 
@@ -896,7 +912,7 @@ pub fn published_facts(
     channel: Channel,
     now_ms: i64,
 ) -> Result<Option<PublicChannelFacts>, String> {
-    Ok(read_record(registry, registration_id, channel)?
+    Ok(self::channel(registry, registration_id, channel)?
         .map(|record| record.facts(now_ms, registry.serving_epoch())))
 }
 
@@ -914,18 +930,18 @@ pub fn publish(
 ) -> Result<ChannelRecord, String> {
     let report = request.validate()?;
     let _transition = registry.transition();
-    let record = read_record(registry, &request.registration_id, request.channel)?
+    let record = read_record(registry, &request.target_id, request.channel)?
         .ok_or_else(|| "channel has no writer".to_string())?;
-    if record.writer.handle != request.writer_handle {
+    if record.writer.handle != request.update.writer_handle {
         return Err("writer handle is stale or belongs to another channel generation".into());
     }
     if record.writer.retired_at.is_some() {
         return Err("writer is retired".into());
     }
-    if request.sequence < record.writer.sequence {
+    if request.update.sequence < record.writer.sequence {
         return Err("sequence is older than stored sequence".into());
     }
-    if request.sequence == record.writer.sequence {
+    if request.update.sequence == record.writer.sequence {
         let replay = record
             .snapshot
             .as_ref()
@@ -935,14 +951,14 @@ pub fn publish(
         }
         return Err("equal sequence has conflicting content".into());
     }
-    let lease = request.lease_ms();
+    let lease = request.update.lease_ms();
     let writer = &record.writer;
     let updated = ChannelRecord {
         version: record.version,
-        registration_id: record.registration_id.clone(),
+        target_id: record.target_id.clone(),
         channel: record.channel,
         writer: WriterBinding {
-            sequence: request.sequence,
+            sequence: request.update.sequence,
             ..writer.clone()
         },
         snapshot: Some(AcceptedSnapshot {
@@ -951,12 +967,12 @@ pub fn publish(
             reporting_owner: writer.reporting_owner.clone(),
             handle: writer.handle.clone(),
             generation: writer.generation,
-            sequence: request.sequence,
+            sequence: request.update.sequence,
             lease_ms: lease,
             received_at: format_millis(now_ms),
             expires_at: format_millis(now_ms + lease),
             serving_epoch: registry.serving_epoch().into(),
-            observed_at: request.observed_at.clone(),
+            observed_at: request.update.observed_at.clone(),
             snapshot: report,
         }),
     };
@@ -967,7 +983,7 @@ pub fn publish(
             Channel::Assignment => "assignment.published",
             Channel::Facts => "facts.published",
         },
-        Some(&request.registration_id),
+        Some(&request.target_id),
         None,
         None,
     );
@@ -1025,6 +1041,16 @@ pub(crate) fn new_binding(publisher: &PublisherIdentity, generation: u64) -> Wri
     }
 }
 
+/// Assignment reads use the subject record directly, even while detached.
+pub fn assignment_facts(
+    registry: &Registry,
+    subject_id: &str,
+    now_ms: i64,
+) -> Result<Option<PublicChannelFacts>, String> {
+    Ok(read_record(registry, subject_id, Channel::Assignment)?
+        .map(|record| record.facts(now_ms, registry.serving_epoch())))
+}
+
 fn read_record(
     registry: &Registry,
     registration_id: &str,
@@ -1040,7 +1066,7 @@ fn read_record(
     let mut record: ChannelRecord =
         serde_json::from_slice(&bytes).map_err(|error| format!("not a channel record: {error}"))?;
     if record.version != PUBLICATION_VERSION
-        || record.registration_id != registration_id
+        || record.target_id != registration_id
         || record.channel != channel
     {
         return Err("channel record has invalid version, target or channel".into());
@@ -1074,7 +1100,7 @@ fn write_record(registry: &Registry, record: &ChannelRecord) -> Result<(), Strin
     write_record_at(
         registry,
         record,
-        &record_path(registry, &record.registration_id, record.channel),
+        &record_path(registry, &record.target_id, record.channel),
     )
 }
 
@@ -1084,7 +1110,7 @@ fn write_record_with_failure(
     record: &ChannelRecord,
     fail_before_rename: bool,
 ) -> Result<(), String> {
-    let path = record_path(registry, &record.registration_id, record.channel);
+    let path = record_path(registry, &record.target_id, record.channel);
     write_record_at_inner(registry, record, &path, fail_before_rename)
 }
 
@@ -1246,7 +1272,7 @@ mod tests {
         let writer = registry
             .acquire_writer(
                 &AcquireRequest {
-                    registration_id: agent.registration_id.clone(),
+                    target_id: agent.registration_id.clone(),
                     channel: Channel::Execution,
                     publisher,
                     replace: None,
@@ -1255,18 +1281,20 @@ mod tests {
             )
             .expect("acquire");
         let make_request = |sequence| PublishRequest {
-            registration_id: agent.registration_id.clone(),
+            target_id: agent.registration_id.clone(),
             channel: Channel::Execution,
-            writer_handle: writer.handle.clone(),
-            sequence,
-            lease_ms: Some(10_000),
-            observed_at: None,
-            snapshot: Report::Execution(Snapshot {
-                activity: "working".into(),
-                waiting_reason: None,
-                last_outcome: None,
-                actions: Vec::new(),
-            }),
+            update: PublicationUpdate {
+                writer_handle: writer.handle.clone(),
+                sequence,
+                lease_ms: Some(10_000),
+                observed_at: None,
+                snapshot: Report::Execution(Snapshot {
+                    activity: "working".into(),
+                    waiting_reason: None,
+                    last_outcome: None,
+                    actions: Vec::new(),
+                }),
+            },
         };
         registry
             .publish(&make_request(1), 1_000)
@@ -1294,7 +1322,7 @@ mod tests {
                 expires_at: format_millis(12_000),
                 serving_epoch: registry.serving_epoch().into(),
                 observed_at: None,
-                snapshot: make_request(2).snapshot,
+                snapshot: make_request(2).update.snapshot,
             }),
             ..old_record.clone()
         };

@@ -36,11 +36,9 @@ against a scripted backend that cannot name its serving process — such an edge
 never fenced — so it is covered by the isolated disposable-tmux tests instead.
 The smoke publishes
 both child channels first and asserts those publications and the spawn edge are
-unchanged afterwards. The `agent.list` entry is a shape reference, compared
-against the validated `agent.get` template. `agent.get` and `agent.list`
-differ intentionally: writer-facing channel/context replies return the writer
-binding to the publisher, whereas public get/list projections omit writer handles (and
-channel accepted-snapshot handles).
+unchanged afterwards. Channel writes return the writer binding to the publisher,
+whereas the public `process.get` and `subject.get` projections omit writer
+handles and channel accepted-snapshot handles.
 
 This documents the durable agent-registration records and direct publication
 channels served on the trusted control socket. They are a **foundation**: private
@@ -111,7 +109,10 @@ root are unsupported for concurrent writes.
 The Pi baseline uses `agent.presence` and `agent.release` for identity; generic
 publisher clients may still use `agent.register` and `agent.context`. The trusted
 control socket also serves `agent.acquire`, `agent.publish`, `agent.retire`,
-`agent.get`, `agent.list`, `spawn.create`, `spawn.get`, `spawn.list` and
+`subject.get`, `subject.list`, `subject.children`, `subject.child.get`,
+`subject.child.inspect`, `subject.assignment.acquire`, `subject.assignment.publish`,
+`subject.assignment.retire`, `process.get`, `spawn.create`, `spawn.get`,
+`spawn.list` and
 `spawn.close`, plus the journal read `events.read`. `daemon.ping` advertises `registry.v1`, `registry.facts.v1` and `events.v1`
 regardless of mux backend. `registry.facts.v1` is served whenever `registry.v1`
 is, and names the facts channel and the assignment extension below; an older
@@ -154,8 +155,9 @@ value, removes it from its process environment, and presents it as its
 `registration_id` in its own `agent.presence` request. Keep the captured value
 only in bootstrap memory while an acknowledgement is uncertain; retry with
 identical source, incarnation, process claim and registration id. The returned `registration.registration_id` is the exact child
-identity. A parent obtains the same identity from `spawn.get`/`spawn.list` at
-`spawn.bound.registration_id`, then calls `agent.get` with that value. The token is
+identity. A parent addresses the child by the durable subject it obtains from
+`spawn.get`/`spawn.list` at `spawn.bound.subject_id`, never by its registration
+id. The token is
 private, stored
 only with the durable edge and consumed on binding; never return or publish it.
 
@@ -333,16 +335,40 @@ another's state:
 A Pi session is attached to a managed subject by Radar's attachment rules, which
 are evidence-based and never create authority from a session entry alone.
 
+### Subject discovery
+
+`subject.get {subject_id}` reads one durable agent. `subject.list` pages those
+agents by subject id, not by process registration. Its `selection` is `live`
+(the default), `retained` (detached subjects), or `all` (also starting and unknown
+attachments). `after` is the last returned subject id and `limit` is 1–100;
+`next: null` ends the scan. Filtering happens before the page cut.
+
+`subject.children {registration_id}` takes only the caller's own process id,
+derives its granted subject, and lists its recorded children. It uses the same
+paging and selection fields but defaults to `all`, so a parent can find retained
+workers for continue. `subject.child.get {registration_id, subject_id}` reads one
+child after checking the same granted-caller and recorded-parent relationship.
+A duplicate, pending or released caller has no child authority.
+
+Every subject record names the durable subject, session, managed metadata,
+attachment state, current location when verified, scope ownership and channel
+facts. It carries no child registration or claim id. States are `starting`,
+`live`, `detached` and `unknown`; stale publication or unreadable process evidence
+never proves exit. A session switch or verified end retains the agent's identity
+without presenting its former location or process reports as current.
+
 ### Public discovery and pagination
 
-`agent.get` takes `{"registration_id":"<registered UUID>"}`. `agent.list` takes
-`{"limit":50,"after":"<last returned registration_id>"}`; both fields are optional.
-The default limit is 50; accepted limits are 1–100. Listing returns
-`{"agents":[...],"next":"<continuation UUID>"}` or `"next": null` when complete.
-Pass `next` as `after` for the next page. Responses are also byte-bounded and may
-contain fewer entries than requested: completion is determined by `next`, not
-the number of entries. Ordering is lexical by stable agent UUID, not receipt
-time. Pages are current reads, not a frozen fleet snapshot; concurrent insertion
+`process.get` takes `{"registration_id":"<registered UUID>"}` and serves one
+registration's evidence for diagnostics; it is not the agent record.
+`subject.list` takes
+`{"selection":"live","limit":50,"after":"<last returned subject_id>"}`; all three
+fields are optional. The default limit is 50; accepted limits are 1–100. Listing
+returns `{"subjects":[...],"next":"<continuation UUID>"}` or `"next": null` when
+complete. Pass `next` as `after` for the next page. Responses are also
+byte-bounded and may contain fewer entries than requested: completion is
+determined by `next`, not the number of entries. Ordering is lexical by durable
+subject UUID, not receipt time. Pages are current reads, not a frozen fleet snapshot; concurrent insertion
 before a cursor can be seen on a subsequent full scan. Corrupt records fail the
 read explicitly. Retirement does not prune registrations.
 
@@ -464,21 +490,20 @@ appends `facts.retired`. Execution and assignment append their own
 `execution.*` and `assignment.*` pointers. Pointers carry `registration_id` and time
 only, never snapshot values.
 
-`agent.get` and every `agent.list` entry are the same record, built once: the
-registration, its verified process, its `execution`, `assignment` and `facts`
-channels, its `context`, its `claim_standing` and whether its process is
-`scoped`. A `facts` key is `null` when no facts writer was ever acquired,
+A `subject` record carries the durable agent: its subject id, the session it
+publishes, its managed metadata, its attachment state, its current location when
+verified, and its `execution`, `assignment` and `facts` channels. It names no
+registration or claim, because those identify one process incarnation of the
+agent. A `facts` key is `null` when no facts writer was ever acquired,
 otherwise the public channel projection with its provenance, freshness and no
 fencing handle.
 
-`claim_standing` is the claim decision behind the registration — `reserved`,
-`pending`, `granted`, `duplicate` or `released`, and `null` when the registration
-never claimed a session. `scoped` is `true` when the process runs in a managed
-scope, `false` when Radar did not admit it, and `null` when its process record is
-unreadable. `agent.list` pages every registration the daemon holds, not only
-those with a live claim, so a list entry may carry no standing at all. A list
-page verifies no process (`process.verification` is `unavailable`); a single
-`agent.get` verifies the one it serves.
+`scoped` is `true` when the recording says the process runs in a managed scope,
+`false` when Radar did not admit it, and `null` when its process record is
+unreadable. `subject.list` defaults to `live` and can select `retained`
+(detached agents, kept for continue) or `all`, which also includes `starting` and
+`unknown` attachments. A duplicate or refused process never becomes a subject;
+its standing stays visible in the fleet projection for diagnostics.
 
 ### Presence, claims and release
 
@@ -486,7 +511,7 @@ page verifies no process (`process.verification` is `unavailable`); a single
 
 On graceful `session_shutdown`, pi-radar calls `agent.release` with the exact `registration_id`, `claim_id` and process birth identity. The daemon acknowledges release of that attachment; the process registration and session subject persist. A late release is fenced to its old claim. If the shutdown reply is lost, a new claim from the same verified process can supersede its previous attachment. Process death is independently established from birth identity; missing pane, expired heartbeat and silence are not proof of death.
 
-The daemon stores the grant/decision and projects its current standing through `agent.get`/`agent.list` and observation snapshots. Clients do not persist subject authority in Pi transcript entries or infer it from pane/session contents. Mutable location changes update process context without creating another registration.
+The daemon stores the grant/decision and projects its current standing through `subject.get`/`subject.list` and observation snapshots. Clients do not persist subject authority in Pi transcript entries or infer it from pane/session contents. Mutable location changes update process context without creating another registration.
 
 #### Pi session contract surface
 
@@ -494,15 +519,19 @@ The JSON Schemas under `pi-radar/schema/public/v1/` are the machine-readable con
 
 | Call | Gate | Schemas | pi-radar SDK |
 | --- | --- | --- | --- |
+| `subject.get` / `subject.list` | `registry.v1` | `subject-get-params.*`, `subject-get-result.*`, `subject-list-params.*`, `subject-list-result.*` | — (operator discovery) |
+| `subject.children` / `subject.child.get` / `subject.child.inspect` | `registry.v1` | `subject-children-params.*`, `subject-child-get-params.*`, `subject-get-result.*`, `subject-list-result.*` | `runtime.children.list`, `observe`, `inspect` |
+| `subject.assignment.acquire/publish/retire` | `registry.v1` | `subject-assignment-acquire.*`, `subject-assignment-publish.*`, `subject-assignment-retire.*` | `runtime.children.assignment`, `retire` |
+| `process.get` | `registry.v1` | — | — (diagnostics) |
 | `agent.presence` | `registry.v1` | `presence-report.*`, `presence-answer.*` | `publication.presence.report(session)` |
 | `agent.release` | `registry.v1` | `presence-release.*`, `presence-answer.*` | `publication.presence.release()` |
 | `communication.handoff` publish/read/ack | `communication.handoff.v1` | `handoff-publish-params.*`, `handoff.*`, `handoff-inbox.*`, `handoff-receipt.*` | `createRadarHandoffPort(client, publication)` |
 | `spawn.create` with managed metadata, optionally `continue_subject_id` | `spawn.v1` | `managed-launch-metadata.*` | `launchRadarWorker` |
-| `spawn.list` (the caller's own children) | `registry.v1` | `spawn-list-params.*`, `spawn-list-page.*` | `runtime.children.list`, `observe`, `inspect` |
+| `spawn.list` (launch topology) | `registry.v1` | `spawn-list-params.*`, `spawn-list-page.*` | `spawnGet`/launch readiness |
 | `lifecycle.restart` by the recorded parent | `lifecycle.restart.v1` | — | `runtime.children.restart` |
 | `observation.get` | `registry.v1` | `observation-get-response.*`, `observation-snapshot.*` | `client.observe()` |
 
-The public process identifier is `registration_id`. Durable agent identity is `subject_id`, and `HandoffIdentity` carries both plus the execution it names.
+The public process identifier is `registration_id`; durable agent identity is `subject_id`. Consumer child operations name only the subject: a child record, a child assignment and a child inspection never carry a registration or claim id. `HandoffIdentity` still carries both plus the execution it names, because a handoff is between processes.
 
 ### Sequences, leases and freshness
 
@@ -549,8 +578,8 @@ owning daemon, with no cross-process locking or cross-user authorization system.
 
 ## Process identity verification
 
-`agent.get` and `agent.list` read the immutable registration claim, then invoke
-the verifier outside registry/store locks. A claimed birth identity is also
+`process.get` reads the immutable registration claim, and `subject.get` reads the
+agent's current attachment, then invokes the verifier outside registry/store locks. A claimed birth identity is also
 served as `process.claim` (`boot_id`, `pid`, `start_ticks`), present only when
 claimed. It is same-UID process evidence for matching a live pane, not a
 credential, and it never carries launch, argv, cwd or environment data. Verification is bounded by a worker
