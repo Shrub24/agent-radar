@@ -756,12 +756,7 @@ function unresolvedOperation(requestId: string, detail: string): RadarResult<nev
 }
 
 export const RADAR_REGISTRATION_ENV = "PI_RADAR_REGISTRATION_ID";
-const RADAR_MANAGED_IDENTITY_ENV = new Set([
-	"PI_RADAR_MANAGED_SUBJECT_ID",
-	"PI_RADAR_MANAGED_LAUNCH_ID",
-	"PI_RADAR_MANAGED_EXECUTION_GENERATION",
-	"PI_RADAR_MANAGED_PARENT_SUBJECT_ID",
-]);
+const RADAR_MANAGED_IDENTITY_ENV = new Set(["PI_RADAR_MANAGED_PARENT_SUBJECT_ID"]);
 
 /**
  * A spawn this process may still have caused.

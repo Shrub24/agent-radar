@@ -48,18 +48,12 @@ pub(super) fn preflight_command(
     cwd: Option<&str>,
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), Refusal> {
-    for name in [
-        subjects::MANAGED_SUBJECT_ENV,
-        subjects::MANAGED_LAUNCH_ENV,
-        subjects::MANAGED_GENERATION_ENV,
-        subjects::MANAGED_PARENT_SUBJECT_ENV,
-    ] {
-        if env.contains_key(name) {
-            return Err(Refusal::new(
-                Code::BadParams,
-                format!("launch env cannot set Radar-issued identity variable {name}"),
-            ));
-        }
+    let name = subjects::MANAGED_PARENT_SUBJECT_ENV;
+    if env.contains_key(name) {
+        return Err(Refusal::new(
+            Code::BadParams,
+            format!("launch env cannot set Radar-issued identity variable {name}"),
+        ));
     }
     let launch_context = LaunchRequest {
         pane_id: pane_id.to_string(),

@@ -44,11 +44,6 @@ use crate::runtime::LaunchRequest;
 /// Environment variables `radar run --launch` reads and removes before the program runs.
 pub const CLAIM_ENV: &str = "PI_RADAR_LAUNCH_CLAIM";
 pub const CORRELATION_ENV: &str = "PI_RADAR_LAUNCH_CORRELATION";
-// Retired: the managed subject is the attached execution, not an injected identity.
-// These names are still dropped from recipes captured before that change.
-pub const MANAGED_SUBJECT_ENV: &str = "PI_RADAR_MANAGED_SUBJECT_ID";
-pub const MANAGED_LAUNCH_ENV: &str = "PI_RADAR_MANAGED_LAUNCH_ID";
-pub const MANAGED_GENERATION_ENV: &str = "PI_RADAR_MANAGED_EXECUTION_GENERATION";
 pub const MANAGED_PARENT_SUBJECT_ENV: &str = "PI_RADAR_MANAGED_PARENT_SUBJECT_ID";
 
 /// The internal method `radar run --launch` calls to claim its recorded launch.
@@ -1493,9 +1488,6 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
             ![
                 CLAIM_ENV,
                 CORRELATION_ENV,
-                MANAGED_SUBJECT_ENV,
-                MANAGED_LAUNCH_ENV,
-                MANAGED_GENERATION_ENV,
                 MANAGED_PARENT_SUBJECT_ENV,
                 crate::runtime::LAUNCH_TOKEN_ENV,
             ]
@@ -3906,9 +3898,6 @@ mod resume_recipe_tests {
         let mut env = BTreeMap::new();
         env.insert(CLAIM_ENV.to_string(), "s".to_string());
         env.insert(CORRELATION_ENV.to_string(), "c".to_string());
-        env.insert(MANAGED_SUBJECT_ENV.to_string(), "logical".to_string());
-        env.insert(MANAGED_LAUNCH_ENV.to_string(), "launch".to_string());
-        env.insert(MANAGED_GENERATION_ENV.to_string(), "2".to_string());
         env.insert(MANAGED_PARENT_SUBJECT_ENV.to_string(), "parent".to_string());
         env.insert(
             crate::runtime::LAUNCH_TOKEN_ENV.to_string(),

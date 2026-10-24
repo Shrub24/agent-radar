@@ -746,10 +746,7 @@ fn socket_dir() -> Option<PathBuf> {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from("/tmp"),
     };
-    let uid = unsafe {
-        // SAFETY: `getuid` takes no arguments and cannot fail.
-        libc::getuid()
-    };
+    let uid = rustix::process::getuid().as_raw();
     Some(parent.join(format!("tmux-{uid}")))
 }
 

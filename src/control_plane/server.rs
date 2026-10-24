@@ -21,7 +21,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,49 +137,32 @@ const POLL_MS: i32 = 200;
 
 /// Set by a signal handler, read by the accept loop.
 ///
-/// A signal handler may only touch memory that needs no allocation, so the
-/// handler sets this and the loop — which is at most one poll away — acts on it.
-/// Only the daemon process installs handlers; a library user that never calls
+/// Set by the signal handlers [`install_signal_handlers`] registers, and read by
+/// the serve loop, which is at most one poll away from noticing. Only the daemon
+/// process installs handlers; a library user that never calls
 /// [`install_signal_handlers`] is never interrupted by this.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static INTERRUPTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 /// Asks the daemon to stop. The signal is the operator's; this is the same
 /// request from inside the process, and it is what [`install_signal_handlers`]
 /// sets from the signal handler.
 pub fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
+    INTERRUPTED
+        .get()
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
 }
 
-extern "C" fn handle_signal(_signal: libc::c_int) {
-    INTERRUPTED.store(true, Ordering::SeqCst);
-}
-
-/// Arranges for `SIGINT` and `SIGTERM` to stop the daemon, and for `SIGPIPE` to
-/// be ignored.
+/// Arranges for `SIGINT` and `SIGTERM` to stop the daemon.
 ///
 /// Called by the `daemon` subcommand and by nothing else: a process that has not
-/// asked for this must not have its signals hijacked. `SA_RESTART` is left off
-/// deliberately, so an interrupted poll returns and the loop notices the flag at
-/// once rather than after its timeout. Ignoring `SIGPIPE` is what keeps a client
-/// that hung up mid-response from killing the daemon.
+/// asked for this must not have its signals hijacked. A client that hung up
+/// mid-response cannot kill the daemon with `SIGPIPE`, because the Rust runtime
+/// already ignores it.
 pub fn install_signal_handlers() -> Result<(), String> {
-    // SAFETY: `sigaction` is initialized to zero and then filled in field by
-    // field; the handler is a plain `extern "C"` function that only stores to an
-    // atomic, which is all a signal handler may do.
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = handle_signal as *const () as usize;
-        action.sa_flags = 0;
-        libc::sigemptyset(&mut action.sa_mask);
-        for signal in [libc::SIGINT, libc::SIGTERM] {
-            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
-                return Err(format!(
-                    "cannot handle signal {signal}: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    let flag = INTERRUPTED.get_or_init(Arc::default);
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(flag))
+            .map_err(|error| format!("cannot handle signal {signal}: {error}"))?;
     }
     Ok(())
 }

@@ -47,7 +47,15 @@ use agent_radar::runtime::{
     PaneExitObservation, Primitives, ReportOutcome, ReportRequest, ReportedState, RuntimeProvider,
     SplitDirection, StateReport, Target,
 };
+use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
 use serde_json::{Value, json};
+
+/// Signals a pid this test started; a gone pid is refused by the kernel.
+fn kill_pid(pid: i32, signal: Signal) {
+    if let Some(pid) = Pid::from_raw(pid) {
+        let _ = kill_process(pid, signal);
+    }
+}
 
 /// What a fake backend answers to a focus request.
 #[derive(Clone)]
@@ -2104,7 +2112,7 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         }}),
     );
     assert_eq!(result_record(&stopped)["outcome"], "completed", "{stopped}");
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -2276,7 +2284,7 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
                            "executable": "/bin/sh", "argv": []}}),
     );
     assert_eq!(error_code(&foreign_restart), "refused", "{foreign_restart}");
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -4300,7 +4308,7 @@ fn a_state_root_that_is_not_ours_is_refused() {
 /// socket file nor a lost record behind when it is signalled.
 #[test]
 fn the_daemon_subcommand_serves_prints_and_stops_cleanly_on_a_signal() {
-    for (name, signal) in [("sigint", libc::SIGINT), ("sigterm", libc::SIGTERM)] {
+    for (name, signal) in [("sigint", Signal::INT), ("sigterm", Signal::TERM)] {
         let sandbox = Sandbox::new(name);
         let socket = sandbox.socket();
         let state = sandbox.state();
@@ -4751,7 +4759,7 @@ fn a_tmux_backend_observes_the_server_it_was_given() {
     );
     assert_eq!(inventory["agents"], json!([]), "{observed}");
 
-    let status = child.stop(libc::SIGTERM, DEADLINE);
+    let status = child.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -4863,7 +4871,7 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         "a same-ID cancel replays without a second signal"
     );
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5038,7 +5046,7 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         "the bound edge names the agent, not only its process: {spawn}"
     );
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5083,7 +5091,7 @@ fn a_registration_after_cancel_is_refused_and_the_launch_stays_revoked() {
     let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
     assert!(spawn["result"]["spawn"]["bound"].is_null(), "{spawn}");
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5129,7 +5137,7 @@ fn lifecycle_get_reports_a_subject_without_its_private_launch_data() {
     let malformed = client.call("lifecycle.get", json!({"subject_id": "not-a-uuid"}));
     assert_eq!(error_code(&malformed), "bad_params", "{malformed}");
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5155,7 +5163,7 @@ fn a_revoked_launch_stays_revoked_and_unsignalled_across_a_daemon_restart() {
     let first = cancel_subject(&mut client, &cancel_id, &subject);
     assert_eq!(result_record(&first)["outcome"], "completed", "{first}");
     let before = subject_record(&state, &subject);
-    assert_eq!(daemon.stop(libc::SIGTERM, DEADLINE).code(), Some(0));
+    assert_eq!(daemon.stop(Signal::TERM, DEADLINE).code(), Some(0));
 
     let mut daemon = tmux_daemon(&socket, &state, &server);
     let mut client = Client::dial(&socket);
@@ -5175,7 +5183,7 @@ fn a_revoked_launch_stays_revoked_and_unsignalled_across_a_daemon_restart() {
     );
     assert_eq!(error_code(&late), "refused", "{late}");
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5218,7 +5226,7 @@ fn a_cancel_request_id_cannot_be_reused_for_another_launch() {
     assert_eq!(result_record(&cleanup)["outcome"], "completed", "{cleanup}");
     await_gone(second_pid);
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5263,7 +5271,7 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
     assert_eq!(subject["state"], "revoked");
     assert_eq!(subject["signalled_at"], Value::Null, "{subject}");
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5293,7 +5301,7 @@ fn a_launch_that_exits_at_once_is_observable_without_a_registration() {
     let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
     assert!(spawn["result"]["spawn"]["bound"].is_null(), "{spawn}");
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5386,7 +5394,7 @@ fn a_tracked_launch_runs_its_requested_program_and_keeps_its_secrets_private() {
     assert_eq!(result_record(&cleanup)["outcome"], "completed", "{cleanup}");
     await_gone(pid);
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5420,7 +5428,7 @@ fn a_refused_spawn_does_not_echo_its_arguments_or_environment() {
         );
     }
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5583,7 +5591,7 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
     );
 
     drop(client);
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 
     let mut daemon = DaemonChild::spawn_with(&socket, &state, &backend);
@@ -5605,7 +5613,7 @@ fn tmux_spawn_exit_persists_and_a_retained_child_pane_closes_once() {
         "{restored}"
     );
     drop(client);
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5749,7 +5757,7 @@ fn a_tmux_pane_from_another_server_generation_is_never_closed() {
     );
 
     drop(client);
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -5914,8 +5922,7 @@ fn tmux_socket(name: &str) -> PathBuf {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from("/tmp"),
     };
-    // SAFETY: `getuid` takes no arguments and cannot fail.
-    let uid = unsafe { libc::getuid() };
+    let uid = rustix::process::getuid().as_raw();
     parent.join(format!("tmux-{uid}")).join(name)
 }
 
@@ -6550,7 +6557,6 @@ fn spawn_refuses_caller_supplied_radar_identity_environment_before_any_effect() 
     let parent = registered_parent(&mut client, PARENT_INCARNATION, "wA:p1");
     let mut params = spawn_params(&parent, "/usr/bin/pi", &[]);
     params["request"]["env"] = json!({
-        "PI_RADAR_MANAGED_SUBJECT_ID": "11111111-1111-4111-8111-111111111111",
         "PI_RADAR_MANAGED_PARENT_SUBJECT_ID": "22222222-2222-4222-8222-222222222222"
     });
 
@@ -6678,17 +6684,6 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
         "tracked launches start Radar's launch chain"
     );
     assert_eq!(&launches[0].argv[..3], ["run", "--launch", "--socket"]);
-    // Identity is the attached execution, never an injected variable.
-    for retired in [
-        agent_radar::control_plane::lifecycle::MANAGED_SUBJECT_ENV,
-        agent_radar::control_plane::lifecycle::MANAGED_LAUNCH_ENV,
-        agent_radar::control_plane::lifecycle::MANAGED_GENERATION_ENV,
-    ] {
-        assert!(
-            !launches[0].env.contains_key(retired),
-            "{retired} is injected"
-        );
-    }
     assert_eq!(launches[0].cwd.as_deref(), Some("/work dir"));
     assert_eq!(launches[0].env["SECRET"], "PRIVATE_ENV_SENTINEL_8812");
     let token = recorded_edge(&sandbox.state(), &id)["token"]
@@ -8670,10 +8665,8 @@ impl DaemonChild {
     }
 
     /// Signals the daemon and waits for it to go, under a deadline.
-    fn stop(&mut self, signal: i32, deadline: Duration) -> ExitStatus {
-        // SAFETY: `kill` takes the pid of a child this process started and a
-        // signal number.
-        unsafe { libc::kill(self.process.id() as i32, signal) };
+    fn stop(&mut self, signal: Signal, deadline: Duration) -> ExitStatus {
+        let _ = kill_process(Pid::from_child(&self.process), signal);
         self.wait(deadline)
     }
 }
@@ -9381,7 +9374,7 @@ fn the_real_daemon_passes_the_clients_handshake() {
             .contains(DaemonRuntime::REQUIRED)
     );
 
-    let status = child.stop(libc::SIGTERM, DEADLINE);
+    let status = child.stop(Signal::TERM, DEADLINE);
     assert!(status.success(), "{status:?}");
 }
 
@@ -9665,7 +9658,7 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
     let cleanup = cancel_subject(&mut client, &random_uuid(), &other);
     assert_eq!(result_record(&cleanup)["outcome"], "completed", "{cleanup}");
     await_gone(other_pid);
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -9735,10 +9728,9 @@ fn a_process_ignoring_sigterm_stops_uncertainly_and_is_not_signalled_again() {
         "{second}"
     );
 
-    // SAFETY: the pid is this test's own process, the one it just launched.
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    kill_pid(pid, Signal::KILL);
     await_gone(pid);
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -9811,7 +9803,7 @@ fn an_unbound_launch_whose_process_exited_has_its_pane_cleaned_up_once() {
     );
 
     drop(client);
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -9868,8 +9860,7 @@ fn an_unbound_launch_whose_process_may_still_be_live_keeps_its_pane() {
     );
     assert!(process_exists(pid), "the process ignored SIGTERM");
 
-    // SAFETY: the pid is this test's own process, the one it just launched.
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    kill_pid(pid, Signal::KILL);
     await_gone(pid);
 
     // The unresolved cancel keeps its target suppressed, so the process that
@@ -9878,7 +9869,7 @@ fn an_unbound_launch_whose_process_may_still_be_live_keeps_its_pane() {
     assert_eq!(error_code(&after), "refused", "{after}");
     assert!(pane_ids(&server).contains(&pane), "{after}");
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -9907,7 +9898,7 @@ fn a_pane_death_wakes_the_daemon_and_keeps_the_users_hook() {
         json!({"subject_id": subject, "server": instance}),
     );
     assert_eq!(duplicate["result"]["exited"], json!(true), "{duplicate}");
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -9945,7 +9936,7 @@ fn a_wake_from_a_replaced_server_generation_is_refused() {
     await_gone(pid);
     let stopped = stop_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(result_record(&stopped)["outcome"], "completed", "{stopped}");
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -9971,7 +9962,7 @@ fn a_revocation_survives_a_crash_without_a_clean_shutdown() {
     let first = cancel_subject(&mut client, &cancel_id, &subject);
     assert_eq!(result_record(&first)["outcome"], "completed", "{first}");
     let before = subject_record(&state, &subject);
-    assert_eq!(daemon.stop(libc::SIGKILL, DEADLINE).code(), None);
+    assert_eq!(daemon.stop(Signal::KILL, DEADLINE).code(), None);
 
     let mut daemon = tmux_daemon(&socket, &state, &server);
     let mut client = Client::dial(&socket);
@@ -9984,7 +9975,7 @@ fn a_revocation_survives_a_crash_without_a_clean_shutdown() {
     let after = subject_record(&state, &subject);
     assert_eq!(after["state"], "revoked");
     assert_eq!(after["signalled_at"], before["signalled_at"]);
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -10028,7 +10019,7 @@ fn a_launch_too_large_to_track_is_refused_before_any_effect() {
     );
     assert_eq!(entries(), before);
     assert!(!edge_path(&state, &spawn_id).exists());
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -10745,8 +10736,8 @@ fn a_topology_recipe_cannot_set_radar_identity_environment_variables() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let mut params = recipe_creation();
-    params["recipe"]["env"]["PI_RADAR_MANAGED_SUBJECT_ID"] =
-        json!("11111111-1111-4111-8111-111111111111");
+    params["recipe"]["env"]["PI_RADAR_MANAGED_PARENT_SUBJECT_ID"] =
+        json!("22222222-2222-4222-8222-222222222222");
 
     let refused = client.call("topology.create", params);
     assert_eq!(error_code(&refused), "bad_params", "{refused}");
@@ -11282,20 +11273,13 @@ impl LeadProcess {
         // so the reaper waits on the pid while it keeps the stdin open.
         thread::spawn(move || {
             let _stdin_kept_open = child;
-            let mut status = 0;
-            // SAFETY: reaping the pid this test spawned.
-            unsafe {
-                libc::waitpid(pid, &mut status, 0);
-            }
+            let _ = waitpid(Pid::from_raw(pid), WaitOptions::empty());
         });
         Self { pid, identity }
     }
 
     fn kill(&self) {
-        // SAFETY: signalling a pid this test started; a gone pid is refused by the kernel.
-        unsafe {
-            libc::kill(self.pid, libc::SIGKILL);
-        }
+        kill_pid(self.pid, Signal::KILL);
     }
 }
 
@@ -12040,7 +12024,7 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
 
     // A restart re-reads the same launch and signals nothing.
     let pid = captured_identity(&state, &subject).pid;
-    assert_eq!(daemon.stop(libc::SIGTERM, DEADLINE).code(), Some(0));
+    assert_eq!(daemon.stop(Signal::TERM, DEADLINE).code(), Some(0));
     let mut daemon = tmux_daemon(&socket, &state, &server);
     let mut client = Client::dial(&socket);
     let listed = client.call("lifecycle.get", json!({"subject_id": subject}));
@@ -12054,7 +12038,7 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
     assert_eq!(subject_view["signalled_at"], json!(null), "{listed}");
     assert!(process_exists(pid), "the restart signalled the workload");
 
-    let status = daemon.stop(libc::SIGTERM, DEADLINE);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 

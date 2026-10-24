@@ -29,6 +29,7 @@ rustix = { version = "1", features = ["process", "fs", "termios", "event", "para
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "=1.2.3"
+signal-hook = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util"] }
 toml = "1.1.6"
 # Domain errors state their own message and source rather than a hand-written
@@ -36,6 +37,3 @@ toml = "1.1.6"
 thiserror = "2"
 # The frame vocabulary for a working mark: one-character animation presets.
 tui-spinner = "0.4"
-
-[target."cfg(unix)".dependencies]
-libc = "0.2.190"

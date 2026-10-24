@@ -782,7 +782,6 @@ test("spawn carries validated Radar-owned launch metadata in the durable request
 			executable: "/nix/store/pi/bin/pi",
 			argv: [],
 			env: {
-				PI_RADAR_MANAGED_SUBJECT_ID: UUID_A,
 				PI_RADAR_MANAGED_PARENT_SUBJECT_ID: UUID_B,
 			},
 		});
