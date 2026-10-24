@@ -418,3 +418,19 @@ fn replay_restores_a_container_without_rewriting_it() {
         1
     );
 }
+
+#[test]
+fn a_journal_from_another_build_is_named_and_classified() {
+    let fixture = Fixture::new();
+    let registry = fixture.registry();
+    create(&registry);
+    drop(registry);
+    // The same entry, rewritten as a build before this one would have stored it.
+    let entry = fixture.directory().join("00000000000000000001.json");
+    let stored = fs::read_to_string(&entry).expect("a journal entry");
+    fs::write(&entry, stored.replacen("\"version\":2", "\"version\":1", 1)).expect("an old entry");
+    let error = Log::open(&fixture.directory()).expect_err("another build's journal is refused");
+    assert!(is_unreadable_state(&error), "{error}");
+    assert!(error.contains("00000000000000000001.json"), "{error}");
+    assert!(error.contains("event version 1"), "{error}");
+}

@@ -132,6 +132,10 @@ in
           # its panes: only the main process is signalled.
           KillMode = "process";
           Restart = "on-failure";
+          # A state root this build cannot read is never repaired by restarting:
+          # radar daemon exits with EX_CONFIG (78), so record one failure with the
+          # explanation instead of looping. `radar reset --hard --yes` clears it.
+          RestartPreventExitStatus = 78;
           # The daemon names `tmux` and `systemctl` by absolute path and carries no
           # `PATH` of its own. tmux gives a new session the creating client's
           # `PATH`, so a `PATH` set here would be the `PATH` of every pane. Left

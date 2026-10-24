@@ -151,6 +151,11 @@ fn run_lifecycle_command(action: agent_radar::cli::LifecycleAction) -> i32 {
     }
 }
 
+/// Exit status for state this build cannot read. It is `EX_CONFIG` from
+/// `sysexits.h`, and the unit's `RestartPreventExitStatus` names it so a broken
+/// journal produces one explained failure instead of a restart loop.
+const UNUSABLE_STATE_EXIT: i32 = 78;
+
 /// Serves the control plane until the process is signalled, and reports the
 /// socket it is on before it starts waiting.
 ///
@@ -168,6 +173,13 @@ fn serve_daemon() -> i32 {
         Ok(daemon) => daemon,
         Err(diagnostic) => {
             eprintln!("radar daemon: {diagnostic}");
+            if agent_radar::control_plane::events::is_unreadable_state(&diagnostic) {
+                eprintln!(
+                    "radar daemon: this state is not repairable by a restart; run \
+                     `radar reset --hard --yes` to discard it"
+                );
+                return UNUSABLE_STATE_EXIT;
+            }
             return 1;
         }
     };

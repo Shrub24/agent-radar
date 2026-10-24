@@ -2203,7 +2203,11 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
         "subject.child.get",
         json!({"registration_id": parent_agent, "subject_id": worker}),
     );
-    assert_eq!(child["result"]["subject"]["subject_id"], json!(worker), "{child}");
+    assert_eq!(
+        child["result"]["subject"]["subject_id"],
+        json!(worker),
+        "{child}"
+    );
     assert!(
         child["result"]["subject"].get("registration_id").is_none(),
         "a child record names no process: {child}"

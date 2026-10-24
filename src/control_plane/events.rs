@@ -44,6 +44,18 @@ pub fn shared(directory: &Path) -> Result<Arc<Mutex<Log>>, String> {
 #[cfg(test)]
 mod tests;
 
+/// A journal this build cannot replay is not an operational hiccup: no restart
+/// repairs it, so the daemon refuses the state and stops instead of looping.
+/// Every such refusal starts with this prefix, which the daemon entry point
+/// turns into a distinct exit status.
+pub const UNREADABLE_STATE: &str = "saved state cannot be read:";
+
+/// Whether a diagnostic means the state root holds a journal this build cannot
+/// read, as opposed to a socket, permission or backend failure.
+pub fn is_unreadable_state(diagnostic: &str) -> bool {
+    diagnostic.starts_with(UNREADABLE_STATE)
+}
+
 const VERSION: u32 = 2;
 const MAX_EVENT_BYTES: usize = 16 * 1024;
 
@@ -262,14 +274,24 @@ impl Log {
         for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name();
-            let name = name.to_str().ok_or("invalid event filename")?;
+            let name = name.to_str().ok_or_else(|| {
+                format!(
+                    "{UNREADABLE_STATE} {} has a file name that is not UTF-8",
+                    entry.path().display()
+                )
+            })?;
             if name.starts_with(".tmp-") {
                 continue;
             }
             let seq = name
                 .strip_suffix(".json")
                 .and_then(|s| s.parse::<u64>().ok())
-                .ok_or("invalid event filename")?;
+                .ok_or_else(|| {
+                    format!(
+                        "{UNREADABLE_STATE} {} is not a numbered journal entry",
+                        entry.path().display()
+                    )
+                })?;
             files.push((seq, entry.path()));
         }
         files.sort_by_key(|(seq, _)| *seq);
@@ -286,17 +308,41 @@ impl Log {
         };
         for (seq, path) in files {
             let bytes = read_record_file(&path, MAX_EVENT_BYTES)?;
-            let event: Event = serde_json::from_slice(&bytes).map_err(|_| "invalid event")?;
-            if seq != log.next_seq
-                || event.seq != seq
-                || event.version != VERSION
-                || event
-                    .subject_id
-                    .as_deref()
-                    .is_some_and(|id| SessionUuid::parse(id).is_none())
-                || SessionUuid::parse(&event.event_id).is_none()
+            let event: Event = serde_json::from_slice(&bytes).map_err(|error| {
+                format!(
+                    "{UNREADABLE_STATE} {} is not a Radar event ({error})",
+                    path.display()
+                )
+            })?;
+            if event.version != VERSION {
+                return Err(format!(
+                    "{UNREADABLE_STATE} {} was written by another Radar build (event version {}, this build reads {VERSION})",
+                    path.display(),
+                    event.version
+                ));
+            }
+            if seq != log.next_seq || event.seq != seq {
+                return Err(format!(
+                    "{UNREADABLE_STATE} {} breaks the journal sequence (entry {seq} of {}, event {})",
+                    path.display(),
+                    log.next_seq - 1,
+                    event.seq
+                ));
+            }
+            if let Some(id) = event.subject_id.as_deref()
+                && SessionUuid::parse(id).is_none()
             {
-                return Err("event sequence or identity is invalid".into());
+                return Err(format!(
+                    "{UNREADABLE_STATE} {} names subject `{id}`, which is not a session UUID",
+                    path.display()
+                ));
+            }
+            if SessionUuid::parse(&event.event_id).is_none() {
+                return Err(format!(
+                    "{UNREADABLE_STATE} {} has no session-UUID event id (`{}`)",
+                    path.display(),
+                    event.event_id
+                ));
             }
             log.replay(&event)?;
             log.next_seq += 1;

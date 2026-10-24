@@ -16,6 +16,7 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 - Serves tmux only. The Herdr backend, its adapter, its config value and `RADAR_CONTROL_BACKEND=herdr` are gone, so a config naming `herdr` now refuses startup; `[daemon] backend` accepts `tmux` alone. The daemon's inventory now comes from the tmux server it owns. `tests/terminal_smoke.py` was the fake-backend PTY smoke and is gone with it; `tests/tmux_acceptance.py` is the dashboard acceptance.
 - `agent.get` serves the same record `agent.list` entries are: it gained `claim_standing` (the claim decision behind the registration, `null` when it never claimed a session) and `scoped` (whether its process runs in a managed scope). Additive; the wire revision stays 8.
 - Renames the stored claim keys: a claim is stored under `claim_id` and its durable agent under `subject_id`, where they were `subject_id` and `logical_subject_id`. `lifecycle::read_logical` and `list_logical_after` are now `current_attachment` and `list_subjects_after`.
+- A state root this build cannot replay is refused with a message naming the file and the mismatch, and the daemon exits `78` (`EX_CONFIG`), which the unit lists in `RestartPreventExitStatus`: journald records one explained failure instead of a restart loop. `radar reset --hard --yes` is the recovery path and now clears such a root too, managing any active scope by unit name when the process records in it cannot be read.
 
 ## pi-radar 0.10.1
 

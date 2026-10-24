@@ -139,6 +139,15 @@ Known limit: an operation whose record never completes, for example after a
 daemon crash, keeps the server refused while the daemon listens. The unfinished
 records are readable with `mux.request.list` and `"unfinished": true`. No command clears them yet.
 
+A state root the running build cannot replay is refused, never repaired: the
+journal is versioned, and an entry from another build, a broken sequence or an
+identifier that is not a session UUID stops startup with a message naming the
+file and the mismatch. That failure exits with status 78 (`EX_CONFIG`), which the
+unit lists in `RestartPreventExitStatus`, so journald records one explained
+failure instead of a restart loop. `radar reset --hard --yes` discards the state
+and is the recovery path; it clears the journal even when nothing in it can be
+read, and it is the only reset that needs no readable records.
+
 ## Dashboard consumption
 
 The Radar TUI is an optional display client, and it collects nothing itself. The

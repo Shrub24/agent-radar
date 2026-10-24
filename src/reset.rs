@@ -33,21 +33,21 @@ pub fn run(server_name: &str, hard: bool, yes: bool) -> i32 {
         return 1;
     }
 
-    let registry = match Registry::open(&root) {
+    // Reset is the recovery path for state a build cannot read, so a hard reset
+    // must not depend on reading it. Without process records a managed scope is
+    // stopped by its unit name, and every record is discarded anyway.
+    let registry = match open_records(&root, hard) {
         Ok(registry) => registry,
         Err(error) => {
-            eprintln!(
-                "radar reset: {}",
-                restore_daemon(&format!("cannot read saved process state: {error}"))
-            );
+            eprintln!("radar reset: {}", restore_daemon(&error));
             return 1;
         }
     };
-    if let Err(error) = stop_scopes(&registry) {
+    if let Err(error) = stop_scopes(registry.as_ref()) {
         eprintln!("radar reset: {}", restore_daemon(&error));
         return 1;
     }
-    if let Err(error) = clear_state(&root, hard, &registry) {
+    if let Err(error) = clear_state(&root, hard, registry.as_ref()) {
         eprintln!(
             "radar reset: state cleanup failed and the daemon remains stopped; rerun reset to finish: {error}"
         );
@@ -159,7 +159,25 @@ fn count_files(path: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
-fn stop_scopes(registry: &Registry) -> Result<(), String> {
+/// Read the saved records. A hard reset is the recovery path for state a build
+/// cannot read, so it proceeds without them; a preserving reset needs them to
+/// detach subjects from claims it is about to purge.
+fn open_records(root: &Path, hard: bool) -> Result<Option<Registry>, String> {
+    match Registry::open(root) {
+        Ok(registry) => Ok(Some(registry)),
+        Err(error) if hard => {
+            println!(
+                "radar reset: saved process state is unreadable ({error}); managing scopes by unit name and clearing every record"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(format!(
+            "cannot read saved process state: {error}; rerun with --hard to discard it"
+        )),
+    }
+}
+
+fn stop_scopes(registry: Option<&Registry>) -> Result<(), String> {
     let output = service::systemctl(&[
         "list-units",
         "--type=scope",
@@ -196,6 +214,12 @@ fn stop_scopes(registry: &Registry) -> Result<(), String> {
         }
         let registration_id = registration_from_unit(unit)
             .ok_or_else(|| format!("active scope `{unit}` has an unrecognized name"))?;
+        let Some(registry) = registry else {
+            // No readable process records: the unit name is the only evidence
+            // left, and the unit is being discarded either way.
+            scopes.push(Scope::for_registration(&registration_id)?.verify_unit(&registration_id)?);
+            continue;
+        };
         let process = lifecycle::read_process(registry, &registration_id)?
             .ok_or_else(|| format!("active scope `{unit}` has no Radar process record"))?;
         verify_recorded_scope(&process, &registration_id)?;
@@ -276,12 +300,13 @@ fn registration_from_unit(unit: &str) -> Option<String> {
     SessionUuid::parse(&id).map(|_| id)
 }
 
-fn clear_state(root: &Path, hard: bool, registry: &Registry) -> Result<(), String> {
+fn clear_state(root: &Path, hard: bool, registry: Option<&Registry>) -> Result<(), String> {
     if !entry_exists(root)? {
         fs::create_dir_all(root).map_err(|error| format!("{}: {error}", root.display()))?;
     }
     ensure_real_directory(root)?;
     if !hard {
+        let registry = registry.ok_or("subject records are unreadable; rerun with --hard")?;
         lifecycle::clear_subject_attachments(registry)?;
     }
 
@@ -459,8 +484,8 @@ mod tests {
         let handoff = communications.join("handoff");
         fs::write(&handoff, b"durable communication").unwrap();
 
-        clear_state(&scratch.0, false, &registry).unwrap();
-        clear_state(&scratch.0, false, &registry).unwrap();
+        clear_state(&scratch.0, false, Some(&registry)).unwrap();
+        clear_state(&scratch.0, false, Some(&registry)).unwrap();
 
         let path = scratch
             .0
@@ -485,12 +510,34 @@ mod tests {
     }
 
     #[test]
+    fn a_hard_reset_discards_state_this_build_cannot_read() {
+        let scratch = Scratch::new();
+        let events = scratch.0.join("events");
+        fs::create_dir_all(&events).expect("events");
+        fs::set_permissions(&events, fs::Permissions::from_mode(0o700)).expect("permissions");
+        fs::write(
+            events.join("00000000000000000001.json"),
+            r#"{"version":1,"seq":1,"event_id":"cbeebeac-a0a5-4c36-91b5-9f34bb13b5f0"}"#,
+        )
+        .expect("an unreadable event");
+        let error = open_records(&scratch.0, false).expect_err("a preserving reset needs records");
+        assert!(error.contains("cannot read saved process state"), "{error}");
+        assert!(error.contains("--hard"), "{error}");
+        assert!(
+            open_records(&scratch.0, true)
+                .expect("a hard reset proceeds")
+                .is_none(),
+            "no records survive an unreadable journal"
+        );
+    }
+
+    #[test]
     fn hard_reset_removes_subjects_and_communications() {
         let scratch = Scratch::new();
         fixture(&scratch.0);
         let registry = Registry::open(&scratch.0).expect("registry");
-        clear_state(&scratch.0, true, &registry).unwrap();
-        clear_state(&scratch.0, true, &registry).unwrap();
+        clear_state(&scratch.0, true, Some(&registry)).unwrap();
+        clear_state(&scratch.0, true, Some(&registry)).unwrap();
         assert!(!scratch.0.join("lifecycle").exists());
         assert!(!scratch.0.join("communications").exists());
         assert!(fs::read_dir(&scratch.0).unwrap().next().is_none());
