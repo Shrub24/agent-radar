@@ -56,9 +56,19 @@ pub(crate) fn agent_entry(
         registry.published_facts(&registration.registration_id, Channel::Assignment, now_ms)?;
     let facts = registry.published_facts(&registration.registration_id, Channel::Facts, now_ms)?;
     let context = registry.context(&registration.registration_id, now_ms)?;
+    let attachment =
+        crate::control_plane::registry::presence::current(registry, &registration.registration_id)?;
+    // The attachment's location is the one presence verified against the live
+    // pane; the registration's own is whatever it supplied when it registered.
+    // Without this an agent that only ever reported through presence names no
+    // place, and the observation cannot join it to the pane it occupies.
+    let mut public = registration.public();
+    if let Some(location) = attachment.as_ref().and_then(|claim| claim.location.clone()) {
+        public.location = Some(location);
+    }
     Ok(json!({
-        "registration": registration.public(),
-        "claim_standing": crate::control_plane::registry::presence::current(registry, &registration.registration_id)?.map(|claim| claim.standing),
+        "registration": public,
+        "claim_standing": attachment.map(|claim| claim.standing),
         "scoped": match crate::control_plane::lifecycle::read_process(registry, &registration.registration_id) {
             Ok(Some(process)) => Some(process.scope.is_some()),
             // A process Radar did not admit has no scope to state.

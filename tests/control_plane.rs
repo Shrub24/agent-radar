@@ -11386,6 +11386,17 @@ fn presence_claims_survive_reconnect_and_old_releases_cannot_revoke_a_new_grant(
     reassert["location"]["pane"] = json!("wA:p2");
     let moved = client.call("agent.presence", reassert.clone());
     assert_eq!(moved["result"]["subject_id"], subject, "{moved}");
+    // The registration never named a place; the attachment presence verified
+    // does, and the served record reports that one.
+    let record = client.call(
+        "process.get",
+        json!({"registration_id": registration.clone()}),
+    );
+    assert_eq!(
+        record["result"]["process"]["registration"]["location"]["pane"],
+        json!("wA:p2"),
+        "{record}"
+    );
     let mut forged = reassert.clone();
     forged["subject_id"] = json!(random_uuid());
     assert!(client.call("agent.presence", forged)["error"].is_object());
