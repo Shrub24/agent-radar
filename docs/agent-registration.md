@@ -464,9 +464,21 @@ appends `facts.retired`. Execution and assignment append their own
 `execution.*` and `assignment.*` pointers. Pointers carry `registration_id` and time
 only, never snapshot values.
 
-`agent.get` and every `agent.list` entry carry a `facts` key: `null` when no
-facts writer was ever acquired, otherwise the public channel projection with its
-provenance, freshness and no fencing handle.
+`agent.get` and every `agent.list` entry are the same record, built once: the
+registration, its verified process, its `execution`, `assignment` and `facts`
+channels, its `context`, its `claim_standing` and whether its process is
+`scoped`. A `facts` key is `null` when no facts writer was ever acquired,
+otherwise the public channel projection with its provenance, freshness and no
+fencing handle.
+
+`claim_standing` is the claim decision behind the registration — `reserved`,
+`pending`, `granted`, `duplicate` or `released`, and `null` when the registration
+never claimed a session. `scoped` is `true` when the process runs in a managed
+scope, `false` when Radar did not admit it, and `null` when its process record is
+unreadable. `agent.list` pages every registration the daemon holds, not only
+those with a live claim, so a list entry may carry no standing at all. A list
+page verifies no process (`process.verification` is `unavailable`); a single
+`agent.get` verifies the one it serves.
 
 ### Presence, claims and release
 

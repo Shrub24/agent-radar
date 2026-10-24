@@ -205,12 +205,6 @@ def validate_fixture(path):
             expected_agent["facts"]["snapshot"]["received_at"] = actual["agents"][0]["facts"]["snapshot"]["received_at"]
             expected_agent["facts"]["snapshot"]["expires_at"] = actual["agents"][0]["facts"]["snapshot"]["expires_at"]
             expected_agent["context"]["registration_id"] = registration_id
-            # A list entry carries the agent's own standing and scope facts, which
-            # the single-agent read does not; this registration is neither.
-            check(actual["agents"][0]["claim_standing"] is None, str(actual["agents"][0]))
-            check(actual["agents"][0]["scoped"] is False, str(actual["agents"][0]))
-            expected_agent["claim_standing"] = None
-            expected_agent["scoped"] = False
             check(actual["agents"] == [expected_agent], f"fixture agent.list mismatch: {actual}")
             check(actual["next"] is None, str(actual))
             continue

@@ -1952,6 +1952,32 @@ fn socket_registration_acquire_publish_get_and_retire_are_private_and_independen
     let list = client.call("agent.list", json!({"limit":1}));
     assert_eq!(list["result"]["agents"].as_array().unwrap().len(), 1);
     no_secret(&list, launch_secret);
+    // One agent record, whichever read serves it: a field one read carries and
+    // the other omits would make a client's second call a guess.
+    let mut got: Vec<&String> = get["result"]["agent"]
+        .as_object()
+        .expect("an agent object")
+        .keys()
+        .collect();
+    let mut listed: Vec<&String> = list["result"]["agents"][0]
+        .as_object()
+        .expect("an agent object")
+        .keys()
+        .collect();
+    got.sort();
+    listed.sort();
+    assert_eq!(
+        got, listed,
+        "agent.get and agent.list disagree on the record"
+    );
+    assert_eq!(
+        get["result"]["agent"]["claim_standing"],
+        list["result"]["agents"][0]["claim_standing"]
+    );
+    assert_eq!(
+        get["result"]["agent"]["scoped"],
+        list["result"]["agents"][0]["scoped"]
+    );
     assert!(list["result"]["agents"][0]["execution"]["writer"]["handle"].is_null());
     assert!(list["result"]["agents"][0]["context"].is_null());
     let retired = client.call(

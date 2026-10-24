@@ -312,42 +312,19 @@ pub(super) fn registry_request(
                     &Refusal::new(Code::Busy, "daemon is stopping"),
                 );
             }
-            let now_ms = store::now_ms();
-            let execution =
-                match registry.published_facts(&params.registration_id, Channel::Execution, now_ms)
-                {
-                    Ok(value) => value,
-                    Err(error) => return registry_error(request, error),
-                };
-            let assignment = match registry.published_facts(
-                &params.registration_id,
-                Channel::Assignment,
-                now_ms,
+            // One agent record, built once: a single read and a page of a list
+            // answer with the same shape, so a client never has to guess which
+            // field a second call would have added.
+            let entry = match crate::control_plane::registry_read::agent_entry(
+                &registry,
+                &registration,
+                verified,
+                store::now_ms(),
             ) {
-                Ok(value) => value,
+                Ok(entry) => entry,
                 Err(error) => return registry_error(request, error),
             };
-            let facts =
-                match registry.published_facts(&params.registration_id, Channel::Facts, now_ms) {
-                    Ok(value) => value,
-                    Err(error) => return registry_error(request, error),
-                };
-            let context = match registry.context(&params.registration_id, now_ms) {
-                Ok(value) => value,
-                Err(error) => return registry_error(request, error),
-            };
-            Response::ok(
-                &request.id,
-                json!({"agent": {
-                    "registration": registration.public(),
-                    "process": crate::control_plane::registry_read::process_evidence(
-                        &registration,
-                        verified,
-                    ),
-                    "execution": execution, "assignment": assignment, "facts": facts,
-                    "context": context,
-                }}),
-            )
+            Response::ok(&request.id, json!({"agent": entry}))
         }
         "agent.list" => {
             let params: AgentListParams = match decode_params(request) {
