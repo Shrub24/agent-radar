@@ -21,22 +21,25 @@ impl Command {
         self.key == KeyCode::Char('B')
     }
 
-    /// Whether this command is offered by a view. The sidebar omits the
-    /// lifecycle actions and everything that needs a details panel, because it
-    /// draws neither.
-    pub fn offered(&self, sidebar: bool) -> bool {
+    /// Whether this command is offered by a view. The sidebar manages nothing,
+    /// so the lifecycle actions are absent from it at any width; a compressed
+    /// sidebar draws no details panel either, so those keys are absent too.
+    pub fn offered(&self, sidebar: bool, compact: bool) -> bool {
         if self.sidebar_only() {
             return sidebar;
         }
-        if !sidebar {
-            return true;
+        if sidebar
+            && matches!(
+                self.key,
+                KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R')
+            )
+        {
+            return false;
         }
-        !matches!(
-            self.key,
-            KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R' | 'd')
-                | KeyCode::Tab
-                | KeyCode::BackTab
-        )
+        if sidebar && compact && matches!(self.key, KeyCode::Char('d') | KeyCode::Tab) {
+            return false;
+        }
+        true
     }
 }
 
@@ -166,10 +169,10 @@ pub const COMMANDS: &[Command] = &[
 
 /// The commands a picker offers, in its own order. Filtering and ranking are the
 /// picker's; this only decides what is on offer where.
-pub fn items(sidebar: bool) -> Vec<Item<KeyCode>> {
+pub fn items(sidebar: bool, compact: bool) -> Vec<Item<KeyCode>> {
     COMMANDS
         .iter()
-        .filter(|command| command.offered(sidebar))
+        .filter(|command| command.offered(sidebar, compact))
         .map(|command| Item::new(command.label, Some(command.keys), command.key))
         .collect()
 }
@@ -181,7 +184,11 @@ mod tests {
     use crossterm::event::{KeyEvent, KeyModifiers};
 
     fn offered(sidebar: bool, query: &str) -> Vec<String> {
-        let mut picker = Picker::new("Commands", "", items(sidebar));
+        offered_at(sidebar, true, query)
+    }
+
+    fn offered_at(sidebar: bool, compact: bool, query: &str) -> Vec<String> {
+        let mut picker = Picker::new("Commands", "", items(sidebar, compact));
         for ch in query.chars() {
             picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
@@ -207,6 +214,12 @@ mod tests {
         assert!(sidebar.contains(&"Hide or unhide the sidebar".to_string()));
         assert!(!sidebar.iter().any(|label| label.contains("Restart")));
         assert!(!sidebar.iter().any(|label| label.contains("details panel")));
+        // Zoomed, the details panel comes back with its key, and management
+        // still does not.
+        let zoomed = offered_at(true, false, "");
+        assert!(zoomed.iter().any(|label| label.contains("details panel")));
+        assert!(!zoomed.iter().any(|label| label.contains("Restart")));
+        assert!(!zoomed.iter().any(|label| label.contains("workspace")));
         assert_eq!(
             offered(true, "restart"),
             Vec::<String>::new(),
@@ -224,7 +237,7 @@ mod tests {
 
     #[test]
     fn choosing_a_command_answers_with_its_key() {
-        let mut picker = Picker::new("Commands", "", items(false));
+        let mut picker = Picker::new("Commands", "", items(false, false));
         for ch in "fold".chars() {
             picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }

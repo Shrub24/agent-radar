@@ -16,6 +16,21 @@ sidebar. Use the full dashboard for those.
 
 ## Kitty setup
 
+### Beside the window you are already in
+
+One key, from any Kitty window — a tmux client, a shell, pi:
+
+```conf
+map ctrl+shift+s launch --location=vsplit --bias=25 --allow-remote-control sh -c "radar sidebar; kitten @ close-window --self"
+```
+
+The sidebar takes a 25% split of that window and the tmux client keeps the rest.
+`q` in the sidebar quits it and the wrapper closes the split. `Ctrl+Shift+Left`
+moves focus to it, `B` hides it, `Z` zooms it. Add `map ctrl+shift+left
+neighboring_window left` if you do not have it already.
+
+### A tab of its own
+
 Start the daemon and ensure its tmux server has a session, then launch Kitty with
 the session file only, so your own `kitty.conf` still applies:
 

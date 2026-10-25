@@ -1260,15 +1260,18 @@ impl App {
                 KeyCode::Char('Z') => return Some(Action::ToggleZoom),
                 _ => {}
             }
-            // Compressed, it has no details and no room for a confirmation, so
-            // the keys that open either do nothing.
-            if self.sidebar_compact()
+            // The sidebar manages nothing: restart, containers, new workspaces,
+            // launches, presence and deletes stay in the full dashboard, zoomed
+            // or not. Compressed, it also has no details panel and no room for a
+            // confirmation, so the keys that open either do nothing.
+            if matches!(
+                key.code,
+                KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R')
+            ) || (self.sidebar_compact()
                 && matches!(
                     key.code,
-                    KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R' | 'd')
-                        | KeyCode::Tab
-                        | KeyCode::BackTab
-                )
+                    KeyCode::Char('d') | KeyCode::Tab | KeyCode::BackTab
+                ))
             {
                 return None;
             }
@@ -1310,7 +1313,7 @@ impl App {
                 self.palette = Some(Picker::new(
                     "Commands",
                     "enter run · esc close",
-                    commands::items(self.sidebar),
+                    commands::items(self.sidebar, self.sidebar_compact()),
                 ))
             }
             KeyCode::Char('/') => self.filter_editing = true,

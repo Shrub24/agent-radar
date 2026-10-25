@@ -1771,10 +1771,17 @@ mod tests {
         app.note_width(120);
         assert!(app.shows_details(), "a zoomed sidebar draws the dashboard");
         assert_eq!(
-            press(&mut app, 'r'),
-            Some(crate::app::Action::BeginAction(Operation::Restart)),
-            "and offers the lifecycle keys again"
+            press(&mut app, 'd'),
+            None,
+            "the details are already drawn, and d toggles them"
         );
+        for destructive in ['r', 'a', 'A', 'L', 'E', 'D', 'R'] {
+            assert_eq!(
+                press(&mut app, destructive),
+                None,
+                "{destructive} manages nothing even zoomed"
+            );
+        }
         assert_eq!(press(&mut app, 'Z'), Some(crate::app::Action::ToggleZoom));
 
         let mut full = App::new();
