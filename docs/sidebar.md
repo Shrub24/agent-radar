@@ -6,7 +6,8 @@ keep state marks, names and exceptional state labels, but omit ages and model
 metadata. There is no details panel.
 
 Navigation, folds, filters, jumps, `p` (pane view), `e` (finished) and `b` (tasks)
-work as in the dashboard. `Enter` focuses the selected pane through the daemon.
+work as in the dashboard, and `?` opens the command palette, which lists every
+command with the key that runs it. `Enter` focuses the selected pane through the daemon.
 On a workspace it switches to that session, preserving its active window and
 pane. One view is supported.
 
@@ -45,6 +46,17 @@ The restore command sets a proportion rather than adding a fixed number of
 columns, so repeated toggles do not accumulate resize drift. Manual resizing is
 also supported; the rail follows the actual width.
 
+`Z` zooms the sidebar: it runs `zoom_command` and, from 100 columns up, the
+whole dashboard is drawn in the same window instead of the compressed tree, so
+every key and the details panel work as usual. Pressing `Z` again runs
+`unzoom_command`:
+
+```toml
+[sidebar]
+zoom_command = ["kitten", "@", "action", "--self", "layout_action bias 100"]
+unzoom_command = ["kitten", "@", "action", "--self", "layout_action bias 25"]
+```
+
 The example bindings are:
 
 - `Ctrl+Shift+Left/Right`: move keyboard focus between splits.
@@ -64,7 +76,9 @@ With the example layout open:
 4. Use `B` to hide/unhide repeatedly, then manually resize and repeat. Check
    that hide reaches the rail and restore returns to the configured proportion.
 5. From the right split, use `Ctrl+Shift+B` to restore and focus the sidebar.
-6. Close the sidebar; verify agent processes and their tmux sessions remain.
+6. Press `Z`; verify the dashboard fills the window, the details panel and
+   lifecycle keys work, and `Z` returns it to the split.
+7. Close the sidebar; verify agent processes and their tmux sessions remain.
 
 These desktop checks are performed by the operator. Command syntax has been
 checked against Kitty's documentation and the installed CLI help, not by

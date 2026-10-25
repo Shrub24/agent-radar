@@ -64,16 +64,6 @@ const SIDE_BY_SIDE_MIN_WIDTH: u16 = 80;
 const DETAIL_MIN_WIDTH: u16 = 30;
 const DETAIL_MAX_WIDTH: u16 = 60;
 
-/// Below this width `radar sidebar` draws a one-column rail of state marks
-/// instead of the tree; the host terminal sets the width, so it is the width
-/// that says whether the sidebar is hidden.
-const SIDEBAR_RAIL_BELOW: u16 = 16;
-
-/// Whether a sidebar given `width` columns is drawn as the collapsed rail.
-pub fn sidebar_collapsed(width: u16) -> bool {
-    width < SIDEBAR_RAIL_BELOW
-}
-
 /// Renders the whole overview into `frame`.
 ///
 /// `tick` is the animation frame a working mark is drawn on. The caller owns it,
@@ -86,9 +76,9 @@ pub fn render(
     list_state: &mut ListState,
     tick: usize,
 ) -> Geometry {
-    let sidebar = app.is_sidebar();
-    let rail = sidebar && sidebar_collapsed(frame.area().width);
-    let area = if sidebar {
+    let compact = app.sidebar_compact();
+    let rail = app.sidebar_railed();
+    let area = if compact {
         frame.area()
     } else {
         content_column(frame.area())
@@ -119,7 +109,7 @@ pub fn render(
     );
 
     let rows = app.visible_rows();
-    let block = if sidebar {
+    let block = if compact {
         Block::new()
     } else {
         Block::bordered()
@@ -146,7 +136,7 @@ pub fn render(
                         tick,
                         tree_content.width as usize,
                         matches!(state.source_freshness(), SourceFreshness::Current),
-                        sidebar,
+                        compact,
                     )
                 }
             })
@@ -258,6 +248,7 @@ pub fn render(
     }
 
     let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
+    draw_palette(frame, app);
     draw_outcomes(frame, app);
 
     Geometry {
@@ -509,6 +500,74 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         rows.push(row);
     }
     rows
+}
+
+/// The command palette: the query being typed and the commands it selects, each
+/// with the key that runs it.
+fn draw_palette(frame: &mut Frame, app: &App) {
+    let Some(palette) = app.palette() else {
+        return;
+    };
+    let palette_theme = theme::palette();
+    let commands = app.palette_commands();
+    let screen = frame.area();
+    let popup = centered(
+        screen,
+        screen.width.saturating_sub(8).min(72),
+        screen
+            .height
+            .saturating_sub(4)
+            .min(commands.len() as u16 + 4),
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(palette_theme.border))
+        .title("Commands")
+        .title_bottom(Line::from(Span::styled(
+            " Enter run  ·  Esc close ",
+            Style::new().fg(palette_theme.muted),
+        )));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("/", Style::new().fg(palette_theme.muted)),
+            Span::styled(
+                palette.query().to_string(),
+                Style::new().fg(palette_theme.heading),
+            ),
+        ])),
+        query_area,
+    );
+    let rows = commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let selected = index == palette.index();
+            let ink = if selected {
+                palette_theme.heading
+            } else {
+                palette_theme.muted
+            };
+            let keys = command.keys.to_string();
+            let pad = (list_area.width as usize)
+                .saturating_sub(command.label.chars().count() + keys.chars().count());
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::new().fg(palette_theme.heading),
+                ),
+                Span::styled(command.label.to_string(), Style::new().fg(ink)),
+                Span::raw(" ".repeat(pad.saturating_sub(2))),
+                Span::styled(keys, Style::new().fg(palette_theme.muted)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    state.select(Some(palette.index()));
+    frame.render_stateful_widget(List::new(rows), list_area, &mut state);
 }
 
 fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect>) {
@@ -818,6 +877,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
             ("Enter", "focus".to_string()),
             ("/", "filter".to_string()),
             ("p", app.pane_view().label().to_string()),
+            ("?", "commands".to_string()),
             ("B", "hide".to_string()),
         ];
         return wrap_hints(&pairs, width);
@@ -855,6 +915,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("d", toggle_label(app.shows_details(), "details")),
         ("e", toggle_label(app.shows_finished(), "finished")),
         ("b", tasks.clone()),
+        ("?", "commands".to_string()),
         ("q", "quit".to_string()),
     ];
     let terse = vec![
@@ -1699,12 +1760,41 @@ mod tests {
     }
 
     #[test]
+    fn the_palette_draws_its_commands_with_their_keys() {
+        let state = fixture_state();
+        let mut app = app_for(&state);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let screen = render_text(&state, &app, 120, 32);
+        let first = app.palette_commands()[0];
+        assert!(screen.contains("Commands"), "{screen}");
+        assert!(screen.contains(first.label), "{screen}");
+        assert!(screen.contains(first.keys), "{screen}");
+
+        // Typing narrows it, and a narrow terminal still draws without panicking.
+        for ch in "fold".chars() {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        let narrowed = render_text(&state, &app, 120, 32);
+        assert!(narrowed.contains("Fold or unfold the selected row"), "{narrowed}");
+        assert!(!narrowed.contains("New workspace"), "{narrowed}");
+        let tiny = render_text(&state, &app, 24, 8);
+        assert!(!tiny.is_empty());
+    }
+
+    #[test]
     fn the_sidebar_is_a_compressed_tree_that_collapses_to_a_rail_and_acts_on_nothing() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let state = fixture_state();
         let mut app = App::sidebar();
         app.refresh(&state);
 
+        app.note_width(30);
         let tree = render_text(&state, &app, 30, 20);
         assert!(!tree.contains("Details"), "no details panel:\n{tree}");
         assert!(
@@ -1712,7 +1802,9 @@ mod tests {
             "the tree is drawn:\n{tree}"
         );
 
+        app.note_width(10);
         let rail = render_text(&state, &app, 10, 20);
+        assert!(app.sidebar_railed(), "the rail follows the width");
         assert!(
             rail.lines().all(|line| line.chars().count() <= 1),
             "the rail is one mark per row:\n{rail}"
@@ -1728,10 +1820,21 @@ mod tests {
                 "{destructive} must do nothing"
             );
         }
+        app.note_width(30);
         assert_eq!(
             press(&mut app, 'B'),
             Some(crate::app::Action::ToggleSidebar)
         );
+        assert_eq!(press(&mut app, 'Z'), Some(crate::app::Action::ToggleZoom));
+        assert!(!app.shows_details(), "a compact sidebar draws no details");
+        app.note_width(120);
+        assert!(app.shows_details(), "a zoomed sidebar draws the dashboard");
+        assert_eq!(
+            press(&mut app, 'r'),
+            Some(crate::app::Action::BeginAction(Operation::Restart)),
+            "and offers the lifecycle keys again"
+        );
+        assert_eq!(press(&mut app, 'Z'), Some(crate::app::Action::ToggleZoom));
 
         let mut full = App::new();
         full.refresh(&state);
@@ -2426,17 +2529,17 @@ mod tests {
     fn the_footer_names_the_background_task_toggle_in_both_states() {
         let state = fixture_state();
         let mut app = app_for(&state);
-        // Agents view starts with task rows hidden, so the hint says what
-        // pressing `b` would do.
+        // The running view lists task rows, so the hint says what pressing `b`
+        // would do.
         let screen = render_text(&state, &app, 120, 24);
-        assert!(screen.contains("b show tasks"), "{screen}");
+        assert!(screen.contains("b hide tasks"), "{screen}");
 
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('b'),
             crossterm::event::KeyModifiers::NONE,
         ));
         let screen = render_text(&state, &app, 120, 24);
-        assert!(screen.contains("b hide tasks"), "{screen}");
+        assert!(screen.contains("b show tasks"), "{screen}");
 
         // A narrow terminal that falls back to the terse wording still names
         // the toggle rather than dropping it.

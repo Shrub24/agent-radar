@@ -254,6 +254,8 @@ pub enum ProjectFilter {
 pub struct SidebarConfig {
     pub hide_command: Option<Vec<String>>,
     pub show_command: Option<Vec<String>>,
+    pub zoom_command: Option<Vec<String>>,
+    pub unzoom_command: Option<Vec<String>>,
 }
 
 /// The loaded configuration: defaults with any file's choices applied.
@@ -476,6 +478,16 @@ impl Config {
                 sidebar.show_command,
                 &mut config.sidebar.show_command,
             ),
+            (
+                "sidebar.zoom_command",
+                sidebar.zoom_command,
+                &mut config.sidebar.zoom_command,
+            ),
+            (
+                "sidebar.unzoom_command",
+                sidebar.unzoom_command,
+                &mut config.sidebar.unzoom_command,
+            ),
         ] {
             if let Some(command) = command {
                 if command
@@ -637,11 +649,17 @@ impl Config {
              # `radar sidebar` runs these, without a shell, to hide and unhide itself: the\n\
              # terminal owns the split's width. Unset, the toggle key says so and runs nothing.\n\
              # hide_command = [\"kitten\", \"@\", \"resize-window\", \"--self\", \"--axis=horizontal\", \"--increment=-10000\"]\n\
-             # show_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 25\"]\n",
+             # show_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 25\"]\n\
+             # `Z` zooms the sidebar to the whole window and back, drawing the full\n\
+             # dashboard from 100 columns up.\n\
+             # zoom_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 100\"]\n\
+             # unzoom_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 25\"]\n",
         );
         for (name, command) in [
             ("hide_command", &self.sidebar.hide_command),
             ("show_command", &self.sidebar.show_command),
+            ("zoom_command", &self.sidebar.zoom_command),
+            ("unzoom_command", &self.sidebar.unzoom_command),
         ] {
             if let Some(command) = command {
                 let quoted: Vec<String> = command.iter().map(|word| format!("{word:?}")).collect();
@@ -820,6 +838,8 @@ struct FileConfig {
 struct FileSidebar {
     hide_command: Option<Vec<String>>,
     show_command: Option<Vec<String>>,
+    zoom_command: Option<Vec<String>>,
+    unzoom_command: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]

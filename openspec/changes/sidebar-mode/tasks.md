@@ -12,6 +12,7 @@
 ## 3. Launchers and documentation
 
 - [x] 3.1 Add a Kitty launcher under `examples/` (a layout with the sidebar on the left and `tmux attach` on the right; focus moves with Kitty's `neighboring_window`), taking the commands from Kitty's documentation. Document it, and the sidebar, in `docs/`.
+- [x] 3.3 Add `Z` and `[sidebar] zoom_command` / `unzoom_command`, drawing the whole dashboard from `SIDEBAR_FULL_AT` columns up.
 - [x] 3.2 Record follow mode and the multi-view focus argument in `ideas.md`, and add the WezTerm launcher as a follow-up row.
 
 ## 4. Gate and acceptance

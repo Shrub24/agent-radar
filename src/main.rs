@@ -104,22 +104,41 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
 }
 
 /// Runs the host command that hides the sidebar, or unhides it while the rail is
-/// drawn. The terminal owns the split, so a missing or failing command is only
-/// reported.
-fn toggle_sidebar(config: &Config, app: &mut App, pending: &mut Option<std::process::Child>) {
+/// drawn, or zooms it to the window. The terminal owns the split, so a missing or
+/// failing command is only reported.
+/// Which host command hides or unhides the sidebar now: the terminal's own width
+/// decides, because it owns the split and the rail is what a narrow one draws.
+fn sidebar_resize<'a>(config: &'a Config, app: &App) -> (&'static str, &'a Option<Vec<String>>) {
+    if app.is_sidebar() && app.sidebar_railed() {
+        ("show_command", &config.sidebar.show_command)
+    } else {
+        ("hide_command", &config.sidebar.hide_command)
+    }
+}
+
+/// Which host command zooms the sidebar to the window or back: the width that
+/// decides when it is drawn as the whole dashboard.
+fn sidebar_zoom<'a>(config: &'a Config, app: &App) -> (&'static str, &'a Option<Vec<String>>) {
+    let full = app.is_sidebar() && !app.sidebar_compact();
+    if full {
+        ("unzoom_command", &config.sidebar.unzoom_command)
+    } else {
+        ("zoom_command", &config.sidebar.zoom_command)
+    }
+}
+
+fn run_host_command(
+    key: &str,
+    command: &Option<Vec<String>>,
+    app: &mut App,
+    pending: &mut Option<std::process::Child>,
+) {
     if pending.is_some() {
         app.set_focus_message(Some("sidebar resize is still running".into()));
         return;
     }
-    let collapsed =
-        crossterm::terminal::size().is_ok_and(|(width, _)| ui::sidebar_collapsed(width));
-    let (key, command) = if collapsed {
-        ("show_command", &config.sidebar.show_command)
-    } else {
-        ("hide_command", &config.sidebar.hide_command)
-    };
     let Some(command) = command else {
-        app.set_focus_message(Some(format!("set [sidebar] {key} to hide or unhide")));
+        app.set_focus_message(Some(format!("set [sidebar] {key}")));
         return;
     };
     let result = std::process::Command::new(&command[0])
@@ -157,21 +176,61 @@ mod sidebar_tests {
         let mut app = App::sidebar();
         let mut pending = None;
         let mut config = Config::default();
-        toggle_sidebar(&config, &mut app, &mut pending);
+        run_host_command(
+            "hide_command",
+            &config.sidebar.hide_command,
+            &mut app,
+            &mut pending,
+        );
         assert!(pending.is_none());
-        assert!(app.focus_message().unwrap().contains("[sidebar]"));
+        assert!(
+            app.focus_message()
+                .unwrap()
+                .contains("[sidebar] hide_command")
+        );
 
         let command = vec!["sh".into(), "-c".into(), "exit 7".into()];
         config.sidebar.hide_command = Some(command.clone());
-        config.sidebar.show_command = Some(command);
-        toggle_sidebar(&config, &mut app, &mut pending);
+        config.sidebar.zoom_command = Some(command);
+        run_host_command(
+            "hide_command",
+            &config.sidebar.hide_command,
+            &mut app,
+            &mut pending,
+        );
         assert!(pending.is_some(), "the UI receives a child, not its exit");
-        toggle_sidebar(&config, &mut app, &mut pending);
+        run_host_command(
+            "hide_command",
+            &config.sidebar.hide_command,
+            &mut app,
+            &mut pending,
+        );
         assert!(app.focus_message().unwrap().contains("still running"));
         pending.as_mut().unwrap().wait().unwrap();
         assert!(poll_sidebar_command(&mut pending, &mut app));
         assert!(pending.is_none());
         assert!(app.focus_message().unwrap().contains("exited"));
+    }
+
+    #[test]
+    fn the_width_chooses_hide_show_zoom_or_unzoom() {
+        let config = Config::default();
+        let mut app = App::sidebar();
+        app.note_width(30);
+        assert_eq!(sidebar_resize(&config, &app).0, "hide_command");
+        app.note_width(10);
+        assert_eq!(sidebar_resize(&config, &app).0, "show_command");
+
+        app.note_width(140);
+        assert_eq!(sidebar_zoom(&config, &app).0, "unzoom_command");
+        assert!(
+            !app.sidebar_compact(),
+            "a zoomed sidebar draws the dashboard"
+        );
+        app.note_width(30);
+        assert!(app.sidebar_compact());
+        assert_eq!(sidebar_zoom(&config, &app).0, "zoom_command");
+        assert!(!App::new().sidebar_compact(), "the dashboard never is");
     }
 }
 
@@ -507,6 +566,7 @@ fn run(sidebar: bool) -> io::Result<()> {
         }
         if dirty {
             let mut geometry = Geometry::default();
+            app.note_width(terminal.size()?.width);
             terminal.draw(|frame| {
                 geometry = ui::render(frame, &state, &app, &mut list, phase);
             })?;
@@ -528,14 +588,26 @@ fn run(sidebar: bool) -> io::Result<()> {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if (key.code == KeyCode::Char('q')
                     && !app.is_filter_editing()
+                    && app.palette().is_none()
                     && app.confirmation().is_none())
                     || (key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
                     break;
                 }
-                if let Some(action) = app.handle_key(key) {
+                // A palette choice runs the key it names, so a command and its
+                // hotkey share one implementation.
+                let mut pressing = vec![key];
+                while let Some(key) = pressing.pop() {
+                    let Some(action) = app.handle_key(key) else {
+                        break;
+                    };
+                    if let Action::Replay(code) = action {
+                        pressing.push(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE));
+                        continue;
+                    }
                     match action {
+                        Action::Replay(_) => {}
                         Action::Focus(target) => {
                             attach.ask(&target);
                             focuser.start(target);
@@ -548,7 +620,12 @@ fn run(sidebar: bool) -> io::Result<()> {
                             &mut containers,
                         ),
                         Action::ToggleSidebar => {
-                            toggle_sidebar(&config, &mut app, &mut sidebar_command)
+                            let (key, command) = sidebar_resize(&config, &app);
+                            run_host_command(key, command, &mut app, &mut sidebar_command)
+                        }
+                        Action::ToggleZoom => {
+                            let (key, command) = sidebar_zoom(&config, &app);
+                            run_host_command(key, command, &mut app, &mut sidebar_command)
                         }
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
@@ -594,6 +671,8 @@ fn run(sidebar: bool) -> io::Result<()> {
             Event::Mouse(mouse) => {
                 if let Some(action) = app.handle_mouse(mouse) {
                     match action {
+                        // Only the palette chooses commands, and it takes keys.
+                        Action::Replay(_) => {}
                         Action::Focus(target) => {
                             attach.ask(&target);
                             focuser.start(target);
@@ -606,7 +685,12 @@ fn run(sidebar: bool) -> io::Result<()> {
                             &mut containers,
                         ),
                         Action::ToggleSidebar => {
-                            toggle_sidebar(&config, &mut app, &mut sidebar_command)
+                            let (key, command) = sidebar_resize(&config, &app);
+                            run_host_command(key, command, &mut app, &mut sidebar_command)
+                        }
+                        Action::ToggleZoom => {
+                            let (key, command) = sidebar_zoom(&config, &app);
+                            run_host_command(key, command, &mut app, &mut sidebar_command)
                         }
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();

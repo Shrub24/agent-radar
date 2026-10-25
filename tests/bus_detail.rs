@@ -587,8 +587,8 @@ fn the_token_count_is_compared_on_running_tasks_only() {
 fn bus_data_survives_a_refresh_and_is_rebuilt_from_the_bus() {
     let state = fleet(&[("wH:p1", Some(SESSION), Some(1))]);
     let mut app = app_for(&state);
-    // The subject is task rows, hidden by default in agents view.
-    app.toggle_tasks();
+    // The subject is task rows, which the default running view lists.
+    assert!(app.shows_tasks());
     // The pane's own id is the baseline, held without any connection.
     let rows: Vec<_> = app
         .visible_rows()
@@ -655,7 +655,10 @@ fn task_with_text(id: &str, command: &str, cwd: &str) -> Task {
 fn a_task_processes_page_names_its_published_pid_and_borrows_no_metrics() {
     let state = fleet(&[("wH:p1", Some(SESSION), Some(1))]);
     let mut app = app_for(&state);
-    app.toggle_tasks();
+    assert!(
+        app.shows_tasks(),
+        "the default running view lists task rows"
+    );
     let mut running = task("bg-1", TaskState::Running);
     running.pid = Some(4242);
     publish(&mut app, SESSION, vec![running]);
@@ -690,7 +693,10 @@ fn a_disclosure_target_follows_wrapped_rows_and_the_scroll() {
     let pane = "wH:p1-with-a-long-identifier-tail";
     let state = fleet(&[(pane, Some(SESSION), Some(1))]);
     let mut app = app_for(&state);
-    app.toggle_tasks();
+    assert!(
+        app.shows_tasks(),
+        "the default running view lists task rows"
+    );
     // A command long enough that the panel collapses it: the block carries a
     // marker, and its command wraps over several rows once it is opened.
     let command = format!("nix build .#radar {}", "--verbose ".repeat(12));

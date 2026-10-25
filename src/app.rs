@@ -16,6 +16,7 @@
 //! rows remain.
 
 mod actions;
+mod commands;
 mod details;
 mod mouse;
 mod process;
@@ -23,7 +24,9 @@ mod process;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::control_plane::client::{
     ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
@@ -74,6 +77,10 @@ pub enum Action {
     LaunchConfigured,
     /// The sidebar's hide/unhide key; the caller owns the host commands.
     ToggleSidebar,
+    /// The palette chose a command: run this key and use whatever it returns.
+    Replay(KeyCode),
+    /// The sidebar's zoom key; the caller owns the host commands.
+    ToggleZoom,
 }
 
 /// Which page of the selected row's details the panel shows.
@@ -473,14 +480,16 @@ fn child_connectors(
 /// Which ordinary panes the fleet tree lists.
 ///
 /// Agents are the fleet; panes are the places work is happening without one.
-/// `Running` is the middle answer: the panes with a command actually in the
-/// foreground, which is where a build, an editor or a merge tool is.
+/// The fleet starts at `Running`: a pane with a command in the foreground is
+/// where a build, an editor or a merge tool is, and an exited pane is history
+/// rather than part of it. `All` is the explicit answer, and `Hidden` the quiet
+/// one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PaneView {
     /// Agents only.
-    #[default]
     Hidden,
     /// Panes with a command in the foreground.
+    #[default]
     Running,
     /// Every pane, whatever it is doing.
     All,
@@ -525,12 +534,15 @@ impl Visibility {
             RowKind::Task(_) => self.tasks,
             RowKind::Pane(pane) => match self.view {
                 // A finished session is history rather than fleet, so only the
-                // explicit toggle brings it into a view without panes — and
-                // only while the pane is not in use again.
+                // explicit toggle brings it into a view — and only while the
+                // pane is not in use again.
                 PaneView::Hidden => {
                     self.finished && pane.exited.is_some() && pane.command().is_none()
                 }
-                PaneView::Running => pane.command().is_some(),
+                PaneView::Running => {
+                    pane.command().is_some()
+                        || (self.finished && pane.exited.is_some() && pane.command().is_none())
+                }
                 PaneView::All => true,
             },
             RowKind::Workspace { .. } | RowKind::Agent(_) | RowKind::Lifecycle(_) => true,
@@ -580,6 +592,35 @@ impl TaskRows {
     }
 }
 
+/// The command palette: the query typed into it and the highlighted entry.
+#[derive(Debug, Default)]
+pub struct Palette {
+    query: String,
+    index: usize,
+}
+
+impl Palette {
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+}
+
+/// Below this width the sidebar is drawn as a one-column rail of state marks.
+pub const SIDEBAR_RAIL_BELOW: u16 = 16;
+
+/// At this width a zoomed sidebar is drawn as the whole dashboard. The host
+/// terminal sets the split, so the width is the sidebar's only layout state.
+pub const SIDEBAR_FULL_AT: u16 = 100;
+
+/// Whether a sidebar given `width` columns is drawn as the collapsed rail.
+pub fn sidebar_collapsed(width: u16) -> bool {
+    width < SIDEBAR_RAIL_BELOW
+}
+
 /// The fleet-overview view state: tree, selection, folds, filter and which
 /// panes are listed.
 #[derive(Debug, Default)]
@@ -593,8 +634,14 @@ pub struct App {
     /// Whether the details panel is hidden. Stored inverted so `Default` — the
     /// state a run starts in — is "details shown".
     details_hidden: bool,
-    /// Drawn as `radar sidebar`: compressed rows, no details, no lifecycle actions.
+    /// Drawn as `radar sidebar`: compressed rows while the split is narrow, and
+    /// the whole dashboard once the host has zoomed it.
     sidebar: bool,
+    /// The width the last draw was given. The sidebar's own layout follows it:
+    /// the host terminal owns the split, so its width is the state.
+    width: u16,
+    /// The command palette, open with its query and highlighted entry.
+    palette: Option<Palette>,
     /// Whether finished sessions are listed while ordinary panes are hidden.
     /// Off by default: the agents view is the live fleet, and a fleet with its
     /// history in it stops being an overview.
@@ -842,6 +889,24 @@ impl App {
         self.sidebar
     }
 
+    /// Records the width this draw was given, so the sidebar's layout can follow
+    /// the split the host terminal owns.
+    pub fn note_width(&mut self, width: u16) {
+        self.width = width;
+    }
+
+    /// Whether the sidebar is drawn compressed: narrow rows, no details and no
+    /// lifecycle actions. False for the dashboard, and false for a sidebar the
+    /// host has zoomed to the full width.
+    pub fn sidebar_compact(&self) -> bool {
+        self.sidebar && self.width < SIDEBAR_FULL_AT
+    }
+
+    /// Whether the sidebar is drawn as the collapsed rail.
+    pub fn sidebar_railed(&self) -> bool {
+        self.sidebar && sidebar_collapsed(self.width)
+    }
+
     /// Rebuilds the projected tree and re-validates selection.
     ///
     /// Fold state is kept for every row identity that survives; the selection
@@ -992,7 +1057,7 @@ impl App {
             })
     }
 
-    /// Which ordinary panes are listed. Agents only by default.
+    /// Which ordinary panes are listed. Running panes by default.
     pub fn pane_view(&self) -> PaneView {
         self.view
     }
@@ -1000,7 +1065,7 @@ impl App {
     /// Whether the details panel is shown. Shown by default, and toggleable
     /// because a small terminal or a glance at the tree alone wants the width.
     pub fn shows_details(&self) -> bool {
-        !self.sidebar && !self.details_hidden
+        !self.sidebar_compact() && !self.details_hidden
     }
 
     /// Whether panes whose label is a finished session are listed even while
@@ -1087,6 +1152,55 @@ impl App {
         self.filter_editing
     }
 
+    /// The open command palette, if any.
+    pub fn palette(&self) -> Option<&Palette> {
+        self.palette.as_ref()
+    }
+
+    /// The commands the palette is offering for its query, best first.
+    pub fn palette_commands(&self) -> Vec<&'static self::commands::Command> {
+        let query = self.palette.as_ref().map(|palette| palette.query.clone());
+        commands::matching(query.as_deref().unwrap_or_default(), self.sidebar)
+    }
+
+    /// One palette key. While the palette is open it owns the keyboard: letters
+    /// edit the query, `Up`/`Down` (and `j`/`k` with Control) move the highlight,
+    /// and `Enter` answers with the chosen command's key for the caller to run.
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let palette = self.palette.as_mut()?;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') => self.palette = None,
+            KeyCode::Enter => {
+                let index = palette.index;
+                let chosen = self.palette_commands().get(index).copied()?;
+                self.palette = None;
+                return Some(Action::Replay(chosen.key));
+            }
+            KeyCode::Up | KeyCode::BackTab => palette.index = palette.index.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => palette.index += 1,
+            KeyCode::Backspace => {
+                palette.query.pop();
+                palette.index = 0;
+            }
+            KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if ch == 'n' {
+                    palette.index += 1;
+                } else if ch == 'p' {
+                    palette.index = palette.index.saturating_sub(1);
+                }
+            }
+            KeyCode::Char(ch) => {
+                palette.query.push(ch);
+                palette.index = 0;
+            }
+            _ => {}
+        }
+        let last = self.palette_commands().len().saturating_sub(1);
+        let palette = self.palette.as_mut()?;
+        palette.index = palette.index.min(last);
+        None
+    }
+
     /// Applies one key event, answering with what the main loop has to do.
     ///
     /// Bindings: `j`/Down and `k`/Up move the selection; `Tab`/`Shift-Tab` hand
@@ -1116,6 +1230,11 @@ impl App {
             return self.handle_confirmation_key(key);
         }
         self.focus_message = None;
+        // The command palette is modal: it owns the keyboard until it closes,
+        // so its letters filter commands rather than moving the tree.
+        if self.palette.is_some() {
+            return self.handle_palette_key(key);
+        }
         // The outcomes panel is modal: it shows what was reported and acts on
         // nothing, so while it is open no other key reaches the tree.
         if self.notices_open {
@@ -1143,15 +1262,25 @@ impl App {
         if self.details_focused && self.handle_details_key(key) {
             return None;
         }
-        // The sidebar has no details and no room for a confirmation, so the keys
-        // that open either do nothing; its own key asks the host to resize it.
+        // The sidebar's own keys ask the host to resize the split it lives in,
+        // whether it is compressed or zoomed.
         if self.sidebar {
             match key.code {
                 KeyCode::Char('B') => return Some(Action::ToggleSidebar),
-                KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R' | 'd')
-                | KeyCode::Tab
-                | KeyCode::BackTab => return None,
+                KeyCode::Char('Z') => return Some(Action::ToggleZoom),
                 _ => {}
+            }
+            // Compressed, it has no details and no room for a confirmation, so
+            // the keys that open either do nothing.
+            if self.sidebar_compact()
+                && matches!(
+                    key.code,
+                    KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R' | 'd')
+                        | KeyCode::Tab
+                        | KeyCode::BackTab
+                )
+            {
+                return None;
             }
         }
         match key.code {
@@ -1187,6 +1316,7 @@ impl App {
             KeyCode::Char('d') => self.toggle_details(),
             KeyCode::Char('e') => self.toggle_finished(),
             KeyCode::Char('b') => self.toggle_tasks(),
+            KeyCode::Char('?') => self.palette = Some(Palette::default()),
             KeyCode::Char('/') => self.filter_editing = true,
             KeyCode::Esc => {
                 self.filter.clear();
@@ -2426,21 +2556,17 @@ mod tests {
     }
 
     #[test]
-    fn pane_view_cycles_from_agents_to_running_to_all() {
+    fn pane_view_starts_at_running_and_cycles_to_all_then_agents() {
         let mut app = app_with_fixture();
-        assert_eq!(app.pane_view(), PaneView::Hidden);
+        // The fixture reports no foreground process, so the default running view
+        // lists the agents but no ordinary pane.
+        assert_eq!(app.pane_view(), PaneView::Running);
         for row in row_ids(&app) {
             assert!(
                 !matches!(row, RowId::Pane(_)),
                 "no ordinary pane row before toggling: {row:?}"
             );
         }
-
-        // The fixture reports no foreground process, so `running` has nothing
-        // to list yet and `all` lists the panes.
-        app.handle_key(key(KeyCode::Char('p')));
-        assert_eq!(app.pane_view(), PaneView::Running);
-        assert!(!row_ids(&app).iter().any(|id| matches!(id, RowId::Pane(_))));
 
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.pane_view(), PaneView::All);
@@ -2451,6 +2577,9 @@ mod tests {
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.pane_view(), PaneView::Hidden);
         assert!(!row_ids(&app).iter().any(|id| matches!(id, RowId::Pane(_))));
+
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.pane_view(), PaneView::Running);
     }
 
     #[test]
@@ -2627,7 +2756,6 @@ mod tests {
         );
         let mut app = App::new();
         app.refresh(&state);
-        app.cycle_panes();
         assert_eq!(app.pane_view(), PaneView::Running);
 
         let ids = row_ids(&app);
@@ -2938,9 +3066,8 @@ mod tests {
         state.apply_success(observation);
         let mut app = App::new();
         app.refresh(&state);
-        // The subject is task behavior, so the agents view's default-hidden task
-        // rows are explicitly listed.
-        app.toggle_tasks();
+        // The subject is task behavior, and the default running view lists them.
+        assert!(app.shows_tasks());
 
         // A task is read through the pane its owner row names: `Enter` focuses
         // that pane and sends no task-consumption request.
@@ -3733,7 +3860,7 @@ mod tests {
         state.apply_success(observation);
         let mut app = App::new();
         app.refresh(&state);
-        app.toggle_tasks();
+        assert!(app.shows_tasks(), "the default running view lists tasks");
         let task = RowId::Task(crate::tree::TaskId {
             owner: "wX:p1".into(),
             session: None,
@@ -4158,6 +4285,57 @@ mod tests {
         assert!(!app.expire_focus_message(Instant::now() + NOTICE_TTL * 10));
         app.dismiss_notices();
         assert!(app.lifecycle_notices().is_empty());
+    }
+
+    #[test]
+    fn the_palette_filters_commands_and_runs_the_chosen_one_by_its_key() {
+        let (_, mut app) = fixture();
+        assert_eq!(press(&mut app, KeyCode::Char('?')), None);
+        assert!(app.palette().is_some(), "? opens the palette");
+
+        // Keys reach the query, not the tree: `e` would otherwise show finished
+        // sessions, and `q` would be a quit the main loop must not see.
+        let selected = app.selected_index();
+        for ch in "finished".chars() {
+            assert_eq!(press(&mut app, KeyCode::Char(ch)), None);
+        }
+        assert_eq!(app.selected_index(), selected);
+        assert_eq!(app.palette().expect("open").query(), "finished");
+        assert_eq!(
+            app.palette_commands()
+                .iter()
+                .map(|command| command.label)
+                .collect::<Vec<_>>(),
+            ["Show or hide finished sessions"],
+            "only the matching command is offered"
+        );
+
+        // Enter answers with that command's key, which does what the key does.
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        let mut offering = app.palette_commands();
+        while offering[0].label != "Show or hide finished sessions" {
+            press(&mut app, KeyCode::Down);
+            offering = app.palette_commands();
+            if app.palette().expect("open").index() + 1 >= offering.len() {
+                break;
+            }
+        }
+        let chosen = offering[app.palette().expect("open").index()].key;
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Replay(chosen))
+        );
+        assert!(app.palette().is_none(), "choosing closes the palette");
+
+        // The caller replays the key; here that lands on the real binding.
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.shows_finished());
+
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.palette().is_none(), "Escape closes it");
     }
 
     #[test]

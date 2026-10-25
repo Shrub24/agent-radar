@@ -36,6 +36,21 @@ Pressing the focus key on an agent in the sidebar SHALL send the existing focus 
 - **WHEN** the observation is stale
 - **THEN** the sidebar does not send a focus and says why, as the full dashboard does
 
+### Requirement: Zooming swaps the projection for the dashboard
+
+The sidebar SHALL run `[sidebar] zoom_command` or `unzoom_command` on its zoom key.
+From `SIDEBAR_FULL_AT` columns it SHALL draw the whole dashboard in place of the
+compressed tree, with the details panel and every key available again.
+
+#### Scenario: Zoomed
+- **WHEN** the host has widened the sidebar to the full window
+- **THEN** the dashboard is drawn in it, with compressed rows, the omitted
+  actions and the rail no longer applied
+
+#### Scenario: Zoom and unzoom
+- **WHEN** the zoom key is pressed in a narrow sidebar and again once it is wide
+- **THEN** `zoom_command` runs first and `unzoom_command` second
+
 ### Requirement: Hide and unhide are host commands
 
 The sidebar SHALL run `[sidebar] hide_command` or `show_command` on its toggle key, each an argv with no shell parsing. Below a minimum width it SHALL draw a collapsed rail instead of the tree. When the command for the requested direction is not configured, it SHALL say so and change nothing.

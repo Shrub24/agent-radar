@@ -271,13 +271,11 @@ fn app_for(state: &ObservationState) -> App {
     app
 }
 
-/// The app with background-task rows explicitly listed. The agents view hides
-/// them by default, so the tests whose subject is a task row's identity,
-/// rendering, selection or focus use this rather than relying on the old
-/// always-visible default.
+/// The app with background-task rows listed, which the default running view
+/// does; the helper names the tests' subject rather than a toggle they need.
 fn app_with_tasks(state: &ObservationState) -> App {
-    let mut app = app_for(state);
-    app.toggle_tasks();
+    let app = app_for(state);
+    assert!(app.shows_tasks());
     app
 }
 
@@ -858,7 +856,7 @@ fn metadata_only(metadata: Vec<AgentObservation>, panes: &[&str]) -> FleetObserv
 fn vanished_metadata_shows_no_row_and_its_pane_refuses_a_direct_close() {
     let mut state = ObservationState::new();
     state.apply_success(metadata_only(vec![owner_metadata("wH:p1")], &["wH:p1"]));
-    assert!(agent_node(&app_for(&state).tree().roots, "wH:p1").is_none());
+    assert!(agent_node(&agents_view(&state).tree().roots, "wH:p1").is_none());
 
     state.apply_success(metadata_only(Vec::new(), &["wH:p1"]));
     assert!(
@@ -870,9 +868,9 @@ fn vanished_metadata_shows_no_row_and_its_pane_refuses_a_direct_close() {
     let mut app = app_for(&state);
     assert!(agent_node(&app.tree().roots, "wH:p1").is_none());
     // Every pane shows, so the pane row is the close target.
-    app.cycle_panes();
-    app.cycle_panes();
-    assert_eq!(app.pane_view(), PaneView::All);
+    while app.pane_view() != PaneView::All {
+        app.cycle_panes();
+    }
     select(&mut app, &RowId::Pane("wH:p1".into()));
     // Nothing is reported running, so no question is drawn; the close itself is
     // refused because the pane's occupant cannot be verified as anyone's.
@@ -1528,7 +1526,7 @@ fn agent_jumps_ignore_task_rows() {
 #[test]
 fn task_rows_start_hidden_in_agents_view_and_shown_in_the_process_views() {
     let state = fleet(&[Agent::new("wH:p1").session(session('1'))]);
-    let mut app = app_for(&state);
+    let mut app = agents_view(&state);
     publish(
         &mut app,
         session('1'),
@@ -1575,6 +1573,16 @@ fn task_rows_start_hidden_in_agents_view_and_shown_in_the_process_views() {
     assert_eq!(task_ids(&app).len(), 4);
 }
 
+/// The app in the agents view. The dashboard now starts in the running view, so
+/// the tests whose subject is that view's own choice enter it by name.
+fn agents_view(state: &ObservationState) -> App {
+    let mut app = app_for(state);
+    while app.pane_view() != PaneView::Hidden {
+        app.handle_key(key(KeyCode::Char('p')));
+    }
+    app
+}
+
 #[test]
 fn a_token_only_task_is_hidden_in_agents_view_too() {
     // The fallback rows the pane's own tokens name follow the same view choice
@@ -1582,7 +1590,7 @@ fn a_token_only_task_is_hidden_in_agents_view_too() {
     let state = fleet(&[Agent::new("wH:p1")
         .session(session('1'))
         .tokens(&["bg-1:review"])]);
-    let app = app_for(&state);
+    let app = agents_view(&state);
     assert!(!app.shows_tasks());
     assert!(
         !visible_ids(&app)
@@ -1594,7 +1602,7 @@ fn a_token_only_task_is_hidden_in_agents_view_too() {
 #[test]
 fn b_toggles_task_rows_in_the_current_view_and_each_view_keeps_its_choice() {
     let state = fleet(&[Agent::new("wH:p1").session(session('1'))]);
-    let mut app = app_for(&state);
+    let mut app = agents_view(&state);
     publish(
         &mut app,
         session('1'),
@@ -1692,7 +1700,7 @@ fn a_hidden_task_leaves_no_rows_filter_matches_or_pointer_targets() {
 #[test]
 fn parent_facts_stay_current_while_task_rows_are_hidden() {
     let state = fleet(&[Agent::new("wH:p1").session(session('1'))]);
-    let mut app = app_for(&state);
+    let mut app = agents_view(&state);
     publish(
         &mut app,
         session('1'),
@@ -1754,7 +1762,7 @@ fn revealing_task_rows_does_not_unfold_an_agent() {
 #[test]
 fn b_while_entering_filter_text_is_filter_text() {
     let state = fleet(&[Agent::new("wH:p1").session(session('1'))]);
-    let mut app = app_for(&state);
+    let mut app = agents_view(&state);
     publish(
         &mut app,
         session('1'),
