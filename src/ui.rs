@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
 use crate::app::{
@@ -508,66 +508,91 @@ fn draw_palette(frame: &mut Frame, app: &App) {
     let Some(palette) = app.palette() else {
         return;
     };
-    let palette_theme = theme::palette();
+    let ink = theme::palette();
     let commands = app.palette_commands();
     let screen = frame.area();
+    // A picker, not a panel: it stays a comfortable block in the middle of the
+    // screen however many commands the query selects, and scrolls inside itself
+    // rather than growing to the edges.
     let popup = centered(
         screen,
         screen.width.saturating_sub(8).min(72),
-        screen
-            .height
-            .saturating_sub(4)
-            .min(commands.len() as u16 + 4),
+        (commands.len() as u16 + 6)
+            .min(screen.height.saturating_mul(3) / 5)
+            .clamp(6, screen.height),
     );
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
-        .border_style(Style::new().fg(palette_theme.border))
-        .title("Commands")
+        .border_style(Style::new().fg(ink.border))
+        .title(Span::styled(
+            " Commands ",
+            Style::new().fg(ink.heading).add_modifier(Modifier::BOLD),
+        ))
         .title_bottom(Line::from(Span::styled(
-            " Enter run  ·  Esc close ",
-            Style::new().fg(palette_theme.muted),
-        )));
+            " enter run · esc close ",
+            Style::new().fg(ink.subtle),
+        )))
+        .padding(Padding::horizontal(1));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let [query_area, list_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    let [query_area, rule_area, list_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("/", Style::new().fg(palette_theme.muted)),
-            Span::styled(
-                palette.query().to_string(),
-                Style::new().fg(palette_theme.heading),
-            ),
+            Span::styled("> ", Style::new().fg(ink.heading)),
+            Span::styled(palette.query().to_string(), Style::new().fg(ink.heading)),
+            Span::styled("▏", Style::new().fg(ink.border)),
         ])),
         query_area,
     );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(rule_area.width as usize),
+            Style::new().fg(ink.border),
+        ))),
+        rule_area,
+    );
+    if commands.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no command matches",
+                Style::new().fg(ink.subtle),
+            ))),
+            list_area,
+        );
+        return;
+    }
     let rows = commands
         .iter()
-        .enumerate()
-        .map(|(index, command)| {
-            let selected = index == palette.index();
-            let ink = if selected {
-                palette_theme.heading
-            } else {
-                palette_theme.muted
-            };
+        .map(|command| {
             let keys = command.keys.to_string();
+            // The key sits against the right edge, so the labels read as one
+            // column however long they are.
             let pad = (list_area.width as usize)
-                .saturating_sub(command.label.chars().count() + keys.chars().count());
+                .saturating_sub(command.label.chars().count() + keys.chars().count() + 1);
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::new().fg(palette_theme.heading),
-                ),
-                Span::styled(command.label.to_string(), Style::new().fg(ink)),
-                Span::raw(" ".repeat(pad.saturating_sub(2))),
-                Span::styled(keys, Style::new().fg(palette_theme.muted)),
+                Span::styled(command.label.to_string(), Style::new().fg(ink.muted)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(keys, Style::new().fg(ink.subtle)),
             ]))
         })
         .collect::<Vec<_>>();
     let mut state = ListState::default();
     state.select(Some(palette.index()));
-    frame.render_stateful_widget(List::new(rows), list_area, &mut state);
+    frame.render_stateful_widget(
+        List::new(rows).highlight_style(
+            Style::new()
+                .bg(ink.selection)
+                .fg(ink.heading)
+                .add_modifier(Modifier::BOLD),
+        ),
+        list_area,
+        &mut state,
+    );
 }
 
 fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect>) {
@@ -1781,7 +1806,10 @@ mod tests {
             ));
         }
         let narrowed = render_text(&state, &app, 120, 32);
-        assert!(narrowed.contains("Fold or unfold the selected row"), "{narrowed}");
+        assert!(
+            narrowed.contains("Fold or unfold the selected row"),
+            "{narrowed}"
+        );
         assert!(!narrowed.contains("New workspace"), "{narrowed}");
         let tiny = render_text(&state, &app, 24, 8);
         assert!(!tiny.is_empty());
