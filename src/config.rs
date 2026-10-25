@@ -636,8 +636,8 @@ impl Config {
             "\n[sidebar]\n\
              # `radar sidebar` runs these, without a shell, to hide and unhide itself: the\n\
              # terminal owns the split's width. Unset, the toggle key says so and runs nothing.\n\
-             # hide_command = [\"kitten\", \"@\", \"resize-window\", \"--self\", \"--axis=horizontal\", \"--increment=-20\"]\n\
-             # show_command = [\"kitten\", \"@\", \"resize-window\", \"--self\", \"--axis=horizontal\", \"--increment=20\"]\n",
+             # hide_command = [\"kitten\", \"@\", \"resize-window\", \"--self\", \"--axis=horizontal\", \"--increment=-10000\"]\n\
+             # show_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 25\"]\n",
         );
         for (name, command) in [
             ("hide_command", &self.sidebar.hide_command),

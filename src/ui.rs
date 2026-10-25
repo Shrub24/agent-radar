@@ -93,7 +93,7 @@ pub fn render(
     } else {
         content_column(frame.area())
     };
-    let hints = if rail {
+    let hints = if rail && app.focus_message().is_none() {
         Vec::new()
     } else {
         footer(app, area.width as usize)
@@ -1132,7 +1132,12 @@ fn row_item(
                     }
                 }),
             ];
-            for part in tail.into_iter().flatten().filter(|_| !compact) {
+            for part in tail
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !compact || *index < 2)
+                .filter_map(|(_, part)| part)
+            {
                 spans.push(Span::styled(
                     format!(" · {part}"),
                     Style::new().fg(palette.subtle),
@@ -1262,7 +1267,7 @@ fn row_item(
                 sanitize(row.node.row.title()),
                 Style::new().fg(palette.muted),
             ));
-            if let Some(phase) = task.phase.as_deref().filter(|_| !compact) {
+            if let Some(phase) = task.phase.as_deref() {
                 spans.push(Span::styled(
                     format!(" · {}", sanitize(phase)),
                     Style::new().fg(palette.subtle),
@@ -1726,6 +1731,24 @@ mod tests {
         assert_eq!(
             press(&mut app, 'B'),
             Some(crate::app::Action::ToggleSidebar)
+        );
+
+        let mut full = App::new();
+        full.refresh(&state);
+        let initial = full.visible_rows().len();
+        for ch in ['j', 'z', 'p', 'p'] {
+            assert_eq!(press(&mut app, ch), press(&mut full, ch));
+            assert_eq!(drawn_titles(&app), drawn_titles(&full));
+            assert_eq!(app.selected_index(), full.selected_index());
+            assert_eq!(app.pane_view(), full.pane_view());
+        }
+        for ch in ['/', 'r', 'a'] {
+            assert_eq!(press(&mut app, ch), press(&mut full, ch));
+        }
+        assert_eq!(app.visible_rows().len(), full.visible_rows().len());
+        assert!(
+            app.visible_rows().len() < initial,
+            "the filter narrowed both trees"
         );
     }
 

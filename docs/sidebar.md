@@ -1,45 +1,78 @@
 # Sidebar
 
-`radar sidebar` runs the dashboard as a narrow tree for a split beside the tmux
-client you work in. It is its own process on the daemon's shared observation, so
-its selection, folds and filter are its own. It draws compressed rows (state
-mark and name, no columns, no details panel) and answers to the dashboard's
-navigation, filter, fold, `p` (pane view), `e` and `b` keys. `Enter` focuses the
-selected agent through the daemon's ordinary focus, which moves the one tmux
-client attached to the served server; one view is supported.
+`radar sidebar` runs the dashboard as a narrow tree beside the tmux client you
+work in. Selection, folds and filters belong to that dashboard process. Rows
+keep state marks, names and exceptional state labels, but omit ages and model
+metadata. There is no details panel.
 
-The sidebar offers none of the dashboard's lifecycle actions (`r`, `a`, `A`,
-`L`, `E`, `D`, `R`) and no details; use the full dashboard for those.
+Navigation, folds, filters, jumps, `p` (pane view), `e` (finished) and `b` (tasks)
+work as in the dashboard. `Enter` focuses the selected pane through the daemon.
+On a workspace it switches to that session, preserving its active window and
+pane. One view is supported.
 
-## Hide and unhide
+Lifecycle actions (`r`, `a`, `A`, `L`, `E`, `D`, `R`) are unavailable in the
+sidebar. Use the full dashboard for those.
 
-The terminal owns the split, so Radar only runs the commands you configure,
-without a shell, to resize it:
+## Kitty setup
+
+Start the daemon and ensure its tmux server has a session before attaching.
+From the repository root:
+
+```sh
+kitty --config examples/kitty/sidebar.conf --session examples/kitty/radar-sidebar.session
+```
+
+The example uses Kitty's splits layout: the sidebar gets 25% of the width and
+the tmux client gets 75%. To keep your usual Kitty settings, put the mappings
+from `examples/kitty/sidebar.conf` in your own configuration and omit the
+`--config` argument. If you changed `[daemon] tmux_server`, change `-L radar` in
+the session file to match.
+
+The sidebar is launched with `--allow-remote-control`; global remote control
+need not be enabled. A window variable identifies it independently of its title.
+
+Add these commands to Radar's configuration:
 
 ```toml
 [sidebar]
-hide_command = ["kitten", "@", "resize-window", "--self", "--axis=horizontal", "--increment=-20"]
-show_command = ["kitten", "@", "resize-window", "--self", "--axis=horizontal", "--increment=20"]
+hide_command = ["kitten", "@", "resize-window", "--self", "--axis=horizontal", "--increment=-10000"]
+show_command = ["kitten", "@", "action", "--self", "layout_action bias 25"]
 ```
 
-`B` runs `show_command` while the terminal gives the sidebar fewer than 16
-columns (it then draws a one-column rail of state marks) and `hide_command`
-otherwise. With the command for that direction unset, the footer names the
-missing setting and nothing runs. A command that cannot start or exits non-zero
-is reported in the footer.
+`B` hides the sidebar by shrinking it to Kitty's minimum width. Below 16 columns
+Radar draws a rail of state marks. Pressing `B` in the rail restores 25% width.
+The restore command sets a proportion rather than adding a fixed number of
+columns, so repeated toggles do not accumulate resize drift. Manual resizing is
+also supported; the rail follows the actual width.
 
-## Kitty
+The example bindings are:
 
-`examples/kitty/radar-sidebar.session` lays out the sidebar and a
-`tmux -L radar attach` client side by side. The sidebar window is launched with
-`--allow-remote-control`, so the `kitten @` commands above work from it without
-enabling remote control for every window. Start it with
-`kitty --session examples/kitty/radar-sidebar.session`. To move focus between the
-splits, bind `neighboring_window left` and `neighboring_window right` in
-`kitty.conf`; `B` works from the sidebar while it holds focus, including on the
-rail.
+- `Ctrl+Shift+Left/Right`: move keyboard focus between splits.
+- `Ctrl+Shift+B`: restore and focus the sidebar, including from the tmux split.
 
-Whether `resize_window` and `kitten @ resize-window` shrink the sidebar to a rail
-as intended in Kitty's tall layout is part of the live acceptance. Other
-terminals need only their own launcher and resize commands; Radar does not know
-which terminal hosts it.
+Commands are argv, not shell text. They run without blocking the dashboard.
+Unset commands, start failures and unsuccessful exits produce a diagnostic.
+A second resize is refused until the first command finishes.
+
+## Operator acceptance
+
+With the example layout open:
+
+1. Check Pi rendering, resize, paste, mouse and clipboard in the right split.
+2. Focus an agent with `Enter`; verify the right client shows that pane.
+3. Focus a workspace; verify it opens at its last active window and pane.
+4. Use `B` to hide/unhide repeatedly, then manually resize and repeat. Check
+   that hide reaches the rail and restore returns to the configured proportion.
+5. From the right split, use `Ctrl+Shift+B` to restore and focus the sidebar.
+6. Close the sidebar; verify agent processes and their tmux sessions remain.
+
+These desktop checks are performed by the operator. Command syntax has been
+checked against Kitty's documentation and the installed CLI help, not by
+running a live desktop acceptance session.
+
+Other terminals need their own launcher and host commands; Radar does not know
+which terminal hosts it. The WezTerm launcher is a follow-up.
+
+References: [Kitty sessions](https://sw.kovidgoyal.net/kitty/sessions/),
+[splits layout](https://sw.kovidgoyal.net/kitty/layouts/#the-splits-layout),
+[remote control](https://sw.kovidgoyal.net/kitty/remote-control/).

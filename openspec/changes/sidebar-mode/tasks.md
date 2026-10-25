@@ -16,5 +16,5 @@
 
 ## 4. Gate and acceptance
 
-- [ ] 4.1 Run fmt, strict Clippy, the Rust test suites, strict OpenSpec validation and the Nix build. Record real exit codes.
+- [ ] 4.1 Run fmt, strict Clippy, the Rust test suites, strict OpenSpec validation and the Nix build. Record real exit codes. Blocker: `tests/cli.rs` fails on `radar 0.6.0 (wire 9)` versus the working tree's uncommitted `PROTOCOL_REVISION = 10`, which is another change's in-flight work; every other suite passes.
 - [ ] 4.2 Hand the operator the live acceptance: in the Kitty layout, check that Pi renders correctly beside the sidebar, mouse and clipboard work in both splits, focusing an agent moves the right-hand client, hide and unhide work from both the sidebar key and the host binding, and closing the sidebar leaves the agents running.

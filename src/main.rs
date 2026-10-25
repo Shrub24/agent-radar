@@ -106,7 +106,11 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
 /// Runs the host command that hides the sidebar, or unhides it while the rail is
 /// drawn. The terminal owns the split, so a missing or failing command is only
 /// reported.
-fn toggle_sidebar(config: &Config, app: &mut App) {
+fn toggle_sidebar(config: &Config, app: &mut App, pending: &mut Option<std::process::Child>) {
+    if pending.is_some() {
+        app.set_focus_message(Some("sidebar resize is still running".into()));
+        return;
+    }
     let collapsed =
         crossterm::terminal::size().is_ok_and(|(width, _)| ui::sidebar_collapsed(width));
     let (key, command) = if collapsed {
@@ -123,11 +127,51 @@ fn toggle_sidebar(config: &Config, app: &mut App) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .spawn();
     match result {
-        Ok(status) if status.success() => {}
-        Ok(status) => app.set_focus_message(Some(format!("sidebar {key} exited {status}"))),
+        Ok(child) => *pending = Some(child),
         Err(error) => app.set_focus_message(Some(format!("sidebar {key}: {error}"))),
+    }
+}
+
+fn poll_sidebar_command(pending: &mut Option<std::process::Child>, app: &mut App) -> bool {
+    let Some(child) = pending.as_mut() else {
+        return false;
+    };
+    match child.try_wait() {
+        Ok(None) => return false,
+        Ok(Some(status)) if status.success() => {}
+        Ok(Some(status)) => app.set_focus_message(Some(format!("sidebar resize exited {status}"))),
+        Err(error) => app.set_focus_message(Some(format!("sidebar resize: {error}"))),
+    }
+    *pending = None;
+    true
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::*;
+
+    #[test]
+    fn host_commands_report_failure_without_blocking_the_dashboard() {
+        let mut app = App::sidebar();
+        let mut pending = None;
+        let mut config = Config::default();
+        toggle_sidebar(&config, &mut app, &mut pending);
+        assert!(pending.is_none());
+        assert!(app.focus_message().unwrap().contains("[sidebar]"));
+
+        let command = vec!["sh".into(), "-c".into(), "exit 7".into()];
+        config.sidebar.hide_command = Some(command.clone());
+        config.sidebar.show_command = Some(command);
+        toggle_sidebar(&config, &mut app, &mut pending);
+        assert!(pending.is_some(), "the UI receives a child, not its exit");
+        toggle_sidebar(&config, &mut app, &mut pending);
+        assert!(app.focus_message().unwrap().contains("still running"));
+        pending.as_mut().unwrap().wait().unwrap();
+        assert!(poll_sidebar_command(&mut pending, &mut app));
+        assert!(pending.is_none());
+        assert!(app.focus_message().unwrap().contains("exited"));
     }
 }
 
@@ -378,8 +422,10 @@ fn run(sidebar: bool) -> io::Result<()> {
     // A focus with no client attached opens a terminal and asks again, because a
     // client has to exist before a focus can show anything.
     let mut attach = Attach::default();
+    let mut sidebar_command = None;
 
     loop {
+        dirty |= poll_sidebar_command(&mut sidebar_command, &mut app);
         // Foreground evidence is swept while a pane view is showing panes, and
         // while finished sessions are listed: telling a session that has gone
         // from a pane in use again needs the foreground either way.
@@ -501,7 +547,9 @@ fn run(sidebar: bool) -> io::Result<()> {
                             &mut managed,
                             &mut containers,
                         ),
-                        Action::ToggleSidebar => toggle_sidebar(&config, &mut app),
+                        Action::ToggleSidebar => {
+                            toggle_sidebar(&config, &mut app, &mut sidebar_command)
+                        }
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
                             let path = std::env::var_os("PATH");
@@ -557,7 +605,9 @@ fn run(sidebar: bool) -> io::Result<()> {
                             &mut managed,
                             &mut containers,
                         ),
-                        Action::ToggleSidebar => toggle_sidebar(&config, &mut app),
+                        Action::ToggleSidebar => {
+                            toggle_sidebar(&config, &mut app, &mut sidebar_command)
+                        }
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
                             let path = std::env::var_os("PATH");

@@ -19,15 +19,15 @@ See proposal.md for the motivation. The sidebar adds no daemon behaviour. The TU
 
 **The rail follows the width, not a stored hidden flag.** Below a minimum width (tuned on the prototype, starting at 16 columns) the sidebar draws a vertical strip of state marks, one per visible row. A stored `hidden` flag would drift from the terminal's real size, for instance after a manual resize. The toggle key therefore runs `show_command` when the rail is drawn and `hide_command` otherwise, with no state of its own.
 
-**Hide and unhide are argv commands run without a shell.** The terminal owns the split's width, so the only portable thing Radar can do is run a command the user configured, as it does for `[tui] terminal`. The command runs to completion, since a host resize returns at once, and a start failure or non-zero exit is reported in the footer. Alternative: a `kitten`-aware implementation in Radar, rejected because it ties Radar to one terminal.
+**Hide and unhide are argv commands run without a shell.** The terminal owns the split's width, so the only portable thing Radar can do is run a command the user configured, as it does for `[tui] terminal`. The dashboard spawns the command and polls its exit without blocking input or drawing. It permits one host command at a time and reports a start failure or non-zero exit in the footer. Alternative: a `kitten`-aware implementation in Radar, rejected because it ties Radar to one terminal.
 
-**Unhide is the sidebar's key.** `B` runs `show_command` while the rail is drawn, so unhide needs the sidebar to hold focus, which a `neighboring_window` binding gives. A separate host binding that unhides without focus is not built.
+**Unhide works from either split.** `B` runs `show_command` while the sidebar rail has focus. The Kitty launcher also supplies `Ctrl+Shift+B` to restore and focus the marked sidebar window from the tmux split. A stable window variable avoids depending on a mutable title.
 
 **Destructive actions are omitted by presentation, not by dialog.** The sidebar does not bind them and the footer does not list them. A dialog does not fit in about 30 columns, and the full TUI already has them. Alternative: hand the confirmation to a `tmux display-popup`, deferred until someone needs it.
 
 **Focus is unchanged.** The sidebar sends the same focus action as the full TUI. With one view and one attached client, the daemon's clientless `select-window` and `select-pane` move the client the user is looking at.
 
-**Launchers are configuration.** A Kitty session layout with a left split running `radar sidebar` and a right split running `tmux attach`, plus the unhide host binding, ship under `examples/` and are documented in `docs/`. A WezTerm launcher follows with no Radar change. Exact Kitty and WezTerm commands are taken from their documentation and verified on the prototype, not assumed here.
+**Launchers are configuration.** A Kitty splits layout with a left split running `radar sidebar` and a right split running `tmux attach`, plus focus and unhide host bindings, ship under `examples/` and are documented in `docs/`. The right split starts at 75% width. Hide clamps the sidebar to the terminal's minimum; restore sets its bias to 25%, rather than accumulating relative resize increments. A WezTerm launcher follows with no Radar change. Exact Kitty and WezTerm commands are taken from their documentation and verified on the prototype, not assumed here.
 
 ## Risks / Trade-offs
 
