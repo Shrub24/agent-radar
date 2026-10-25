@@ -13,6 +13,7 @@
 //! for the lifetime of the view.
 
 mod details;
+pub mod picker;
 
 use details::*;
 use ratatui::{
@@ -20,7 +21,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::app::{
@@ -248,7 +249,12 @@ pub fn render(
     }
 
     let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
-    draw_palette(frame, app);
+    if let Some(picker) = app.palette() {
+        picker::draw(frame, picker);
+    }
+    if let Some(picker) = app.workspace_picker() {
+        picker::draw(frame, picker);
+    }
     draw_outcomes(frame, app);
 
     Geometry {
@@ -502,99 +508,6 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// The command palette: the query being typed and the commands it selects, each
-/// with the key that runs it.
-fn draw_palette(frame: &mut Frame, app: &App) {
-    let Some(palette) = app.palette() else {
-        return;
-    };
-    let ink = theme::palette();
-    let commands = app.palette_commands();
-    let screen = frame.area();
-    // A picker, not a panel: it stays a comfortable block in the middle of the
-    // screen however many commands the query selects, and scrolls inside itself
-    // rather than growing to the edges.
-    let popup = centered(
-        screen,
-        screen.width.saturating_sub(8).min(72),
-        (commands.len() as u16 + 6)
-            .min(screen.height.saturating_mul(3) / 5)
-            .clamp(6, screen.height),
-    );
-    frame.render_widget(Clear, popup);
-    let block = Block::bordered()
-        .border_style(Style::new().fg(ink.border))
-        .title(Span::styled(
-            " Commands ",
-            Style::new().fg(ink.heading).add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(Line::from(Span::styled(
-            " enter run · esc close ",
-            Style::new().fg(ink.subtle),
-        )))
-        .padding(Padding::horizontal(1));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    let [query_area, rule_area, list_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(inner);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("> ", Style::new().fg(ink.heading)),
-            Span::styled(palette.query().to_string(), Style::new().fg(ink.heading)),
-            Span::styled("▏", Style::new().fg(ink.border)),
-        ])),
-        query_area,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(rule_area.width as usize),
-            Style::new().fg(ink.border),
-        ))),
-        rule_area,
-    );
-    if commands.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "no command matches",
-                Style::new().fg(ink.subtle),
-            ))),
-            list_area,
-        );
-        return;
-    }
-    let rows = commands
-        .iter()
-        .map(|command| {
-            let keys = command.keys.to_string();
-            // The key sits against the right edge, so the labels read as one
-            // column however long they are.
-            let pad = (list_area.width as usize)
-                .saturating_sub(command.label.chars().count() + keys.chars().count() + 1);
-            ListItem::new(Line::from(vec![
-                Span::styled(command.label.to_string(), Style::new().fg(ink.muted)),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(keys, Style::new().fg(ink.subtle)),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    let mut state = ListState::default();
-    state.select(Some(palette.index()));
-    frame.render_stateful_widget(
-        List::new(rows).highlight_style(
-            Style::new()
-                .bg(ink.selection)
-                .fg(ink.heading)
-                .add_modifier(Modifier::BOLD),
-        ),
-        list_area,
-        &mut state,
-    );
-}
-
 fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect>) {
     let Some(confirmation) = app.confirmation() else {
         return (None, None);
@@ -686,7 +599,7 @@ fn button_style(selected: bool) -> Style {
 }
 
 /// A rectangle of at most `width` by `height`, centred in `area`.
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -1793,10 +1706,10 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         let screen = render_text(&state, &app, 120, 32);
-        let first = app.palette_commands()[0];
+        let (first, keys) = app.palette().expect("open").rows()[0];
         assert!(screen.contains("Commands"), "{screen}");
-        assert!(screen.contains(first.label), "{screen}");
-        assert!(screen.contains(first.keys), "{screen}");
+        assert!(screen.contains(first), "{screen}");
+        assert!(screen.contains(keys.expect("a key")), "{screen}");
 
         // Typing narrows it, and a narrow terminal still draws without panicking.
         for ch in "fold".chars() {

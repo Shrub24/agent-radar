@@ -6,6 +6,8 @@
 
 use crossterm::event::KeyCode;
 
+use crate::picker::Item;
+
 /// One command: what it does, the key that does it, and how that key is written.
 pub struct Command {
     pub label: &'static str,
@@ -162,99 +164,73 @@ pub const COMMANDS: &[Command] = &[
     },
 ];
 
-/// The commands a query selects, best first: a label whose words start with the
-/// query ranks above one that merely contains its letters in order.
-pub fn matching(query: &str, sidebar: bool) -> Vec<&'static Command> {
-    let query = query.to_lowercase();
-    if query.is_empty() {
-        return COMMANDS
-            .iter()
-            .filter(|command| command.offered(sidebar))
-            .collect();
-    }
-    let mut scored: Vec<(u8, &'static Command)> = COMMANDS
+/// The commands a picker offers, in its own order. Filtering and ranking are the
+/// picker's; this only decides what is on offer where.
+pub fn items(sidebar: bool) -> Vec<Item<KeyCode>> {
+    COMMANDS
         .iter()
         .filter(|command| command.offered(sidebar))
-        .filter_map(|command| score(command.label, &query).map(|score| (score, command)))
-        .collect();
-    // Stable, so commands matching equally well keep the table's order.
-    scored.sort_by_key(|(score, _)| *score);
-    scored.into_iter().map(|(_, command)| command).collect()
-}
-
-/// How well `label` answers `query`, lower being better: 0 for a prefix, 1 when
-/// every word start in the query's letters line up, and the matched position
-/// otherwise. `None` when the letters do not appear in order.
-fn score(label: &str, query: &str) -> Option<u8> {
-    if query.is_empty() {
-        return Some(0);
-    }
-    let label = label.to_lowercase();
-    if label.starts_with(query) {
-        return Some(0);
-    }
-    let mut letters = query.chars();
-    let mut wanted = letters.next()?;
-    let mut words = 0;
-    for (at, ch) in label.chars().enumerate() {
-        if ch == wanted {
-            if at == 0 || label.as_bytes()[at - 1] == b' ' || label.as_bytes()[at - 1] == b'-' {
-                words += 1;
-            }
-            match letters.next() {
-                Some(next) => wanted = next,
-                None => return Some(if words == query.chars().count() { 1 } else { 2 }),
-            }
-        }
-    }
-    None
+        .map(|command| Item::new(command.label, Some(command.keys), command.key))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::picker::{Picker, Step};
+    use crossterm::event::{KeyEvent, KeyModifiers};
 
-    #[test]
-    fn a_query_selects_its_commands_in_order_of_match_and_sidebar_commands_stay_apart() {
-        let labels = |query: &str| -> Vec<&'static str> {
-            matching(query, false)
-                .into_iter()
-                .map(|command| command.label)
-                .collect()
-        };
-        assert_eq!(labels("")[0], "Focus the selected row", "the table order");
-        assert_eq!(labels("fold")[0], "Fold or unfold the selected row");
-        assert_eq!(
-            labels("attention"),
-            ["Next needing attention", "Previous needing attention"]
-        );
-        assert!(
-            !labels("").contains(&"Hide or unhide the sidebar"),
-            "sidebar-only commands are absent outside the sidebar"
-        );
-        let sidebar = |query: &str| -> Vec<&'static str> {
-            matching(query, true)
-                .into_iter()
-                .map(|command| command.label)
-                .collect()
-        };
-        assert!(sidebar("").contains(&"Hide or unhide the sidebar"));
-        assert_eq!(sidebar("restart"), Vec::<&str>::new(), "no lifecycle");
-        assert_eq!(sidebar("workspace"), Vec::<&str>::new(), "no new workspace");
-        assert_eq!(sidebar("details"), Vec::<&str>::new(), "no details panel");
-        assert!(
-            !labels("restart").is_empty(),
-            "the dashboard still offers it"
-        );
-        assert!(!labels("zzz").iter().any(|label| label.contains("zzz")));
-        assert_eq!(matching("zzz", false).len(), 0);
+    fn offered(sidebar: bool, query: &str) -> Vec<String> {
+        let mut picker = Picker::new("Commands", "", items(sidebar));
+        for ch in query.chars() {
+            picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        picker
+            .rows()
+            .into_iter()
+            .map(|(label, _)| label.to_string())
+            .collect()
     }
 
     #[test]
-    fn every_command_names_the_key_it_runs() {
+    fn every_command_names_the_key_it_runs_and_the_table_order_survives_an_empty_query() {
         for command in COMMANDS {
             assert!(!command.label.is_empty());
             assert!(!command.keys.is_empty());
         }
+        assert_eq!(offered(false, "")[0], "Focus the selected row");
+    }
+
+    #[test]
+    fn the_sidebar_offers_only_what_it_draws() {
+        let sidebar = offered(true, "");
+        assert!(sidebar.contains(&"Hide or unhide the sidebar".to_string()));
+        assert!(!sidebar.iter().any(|label| label.contains("Restart")));
+        assert!(!sidebar.iter().any(|label| label.contains("details panel")));
+        assert_eq!(
+            offered(true, "restart"),
+            Vec::<String>::new(),
+            "no lifecycle action in the sidebar"
+        );
+        assert!(
+            !offered(false, "").contains(&"Hide or unhide the sidebar".to_string()),
+            "and no sidebar command outside it"
+        );
+        assert!(
+            !offered(false, "restart").is_empty(),
+            "the dashboard keeps them"
+        );
+    }
+
+    #[test]
+    fn choosing_a_command_answers_with_its_key() {
+        let mut picker = Picker::new("Commands", "", items(false));
+        for ch in "fold".chars() {
+            picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Step::Choose(KeyCode::Char(' '))
+        );
     }
 }

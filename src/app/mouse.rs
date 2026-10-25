@@ -14,6 +14,11 @@ impl App {
     /// nothing.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<Action> {
         let at = (event.column, event.row);
+        // A picker is modal for the pointer too: a click behind it reaches
+        // nothing.
+        if self.picker_open() {
+            return None;
+        }
         if self.confirmation.is_some() {
             // The dialog is modal: the tree behind it answers no pointer event.
             return match event.kind {

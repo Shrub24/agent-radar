@@ -17,7 +17,6 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crossterm = "0.29"
-nucleo-picker = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 unicode-width = "0.2"

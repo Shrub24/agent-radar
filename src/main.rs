@@ -588,7 +588,7 @@ fn run(sidebar: bool) -> io::Result<()> {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if (key.code == KeyCode::Char('q')
                     && !app.is_filter_editing()
-                    && app.palette().is_none()
+                    && !app.picker_open()
                     && app.confirmation().is_none())
                     || (key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -644,8 +644,9 @@ fn run(sidebar: bool) -> io::Result<()> {
                                 &mut containers,
                             );
                         }
-                        Action::NewWorkspace => {
-                            let control = choose_project(&mut terminal, &config.tui, &mut app)?;
+                        Action::NewWorkspace => open_workspace_picker(&config.tui, &mut app)?,
+                        Action::NewWorkspaceIn(directory) => {
+                            let control = Some(app.new_workspace(Some(&directory)));
                             dispatch(
                                 control,
                                 &mut app,
@@ -709,8 +710,9 @@ fn run(sidebar: bool) -> io::Result<()> {
                                 &mut containers,
                             );
                         }
-                        Action::NewWorkspace => {
-                            let control = choose_project(&mut terminal, &config.tui, &mut app)?;
+                        Action::NewWorkspace => open_workspace_picker(&config.tui, &mut app)?,
+                        Action::NewWorkspaceIn(directory) => {
+                            let control = Some(app.new_workspace(Some(&directory)));
                             dispatch(
                                 control,
                                 &mut app,
@@ -802,24 +804,18 @@ fn dispatch(
 /// creation for it. The picker draws its own screen, so the dashboard gives the
 /// terminal back first and takes it again after, whatever the picker answered.
 /// Cancelling creates nothing.
-fn choose_project(
-    terminal: &mut ratatui::DefaultTerminal,
-    tui: &agent_radar::config::TuiConfig,
-    app: &mut App,
-) -> io::Result<Option<Confirmed>> {
+/// Opens the workspace chooser over the directories a new workspace may start
+/// in. It draws inside the dashboard rather than taking the terminal over, so the
+/// fleet stays visible and `Esc` costs nothing.
+fn open_workspace_picker(tui: &agent_radar::config::TuiConfig, app: &mut App) -> io::Result<()> {
     let cwd = std::env::current_dir()?;
     let found =
         agent_radar::project::candidates(tui.project_source.as_deref(), tui.project_filter, &cwd);
-    disable_mouse_capture();
-    ratatui::try_restore()?;
-    let chosen = agent_radar::project::pick(&found.directories);
-    *terminal = ratatui::try_init()?;
-    enable_mouse_capture();
-    terminal.clear()?;
     if let Some(note) = found.note {
         app.set_focus_message(Some(note));
     }
-    Ok(chosen?.map(|directory| app.new_workspace(Some(&directory))))
+    app.open_workspace_picker(found.directories);
+    Ok(())
 }
 
 /// Turns mouse capture on. A wheel turn and a click only arrive while it is on,

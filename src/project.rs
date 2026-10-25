@@ -3,17 +3,15 @@
 //! Candidates come from a configurable command that prints one directory per
 //! line (by default `zoxide query -l`), filtered to git projects unless the
 //! operator turns that off. The directory Radar was started in is always the
-//! first entry, so the picker works with nothing installed. The command runs in
+//! first entry, so the chooser works with nothing installed. The command runs in
 //! the dashboard, never in the daemon, and its output is only ever a list of
 //! paths to choose from: nothing it prints is run.
 
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
-
-use nucleo_picker::{Picker, render::StrRenderer};
 
 use crate::config::ProjectFilter;
 
@@ -117,18 +115,6 @@ pub fn project_name(directory: &Path) -> String {
         .or_else(|| directory.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".to_string())
-}
-
-/// Lets the operator choose one of `directories`. The caller must have given the
-/// terminal back first: the picker draws and reads keys itself. `None` is a
-/// cancelled picker.
-pub fn pick(directories: &[PathBuf]) -> io::Result<Option<PathBuf>> {
-    let mut picker = Picker::new(StrRenderer);
-    let injector = picker.injector();
-    for directory in directories {
-        injector.push(directory.to_string_lossy().into_owned());
-    }
-    Ok(picker.pick()?.map(PathBuf::from))
 }
 
 #[cfg(test)]

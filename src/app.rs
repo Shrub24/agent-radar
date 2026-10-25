@@ -22,17 +22,17 @@ mod mouse;
 mod process;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::control_plane::client::{
     ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
 };
 use crate::lifecycle::{self, CloseRequest, Containment, TargetIdentity};
 use crate::observation::{ObservationState, SourceFreshness};
+use crate::picker::{Item, Picker, Step};
 use crate::runtime::{CloseTarget, Target};
 use crate::tasks::{Task, TaskBoard, TaskEvent};
 use crate::theme;
@@ -81,6 +81,8 @@ pub enum Action {
     Replay(KeyCode),
     /// The sidebar's zoom key; the caller owns the host commands.
     ToggleZoom,
+    /// The workspace chooser took this directory; open a workspace there.
+    NewWorkspaceIn(PathBuf),
 }
 
 /// Which page of the selected row's details the panel shows.
@@ -592,23 +594,6 @@ impl TaskRows {
     }
 }
 
-/// The command palette: the query typed into it and the highlighted entry.
-#[derive(Debug, Default)]
-pub struct Palette {
-    query: String,
-    index: usize,
-}
-
-impl Palette {
-    pub fn query(&self) -> &str {
-        &self.query
-    }
-
-    pub fn index(&self) -> usize {
-        self.index
-    }
-}
-
 /// Below this width the sidebar is drawn as a one-column rail of state marks.
 pub const SIDEBAR_RAIL_BELOW: u16 = 16;
 
@@ -640,8 +625,10 @@ pub struct App {
     /// The width the last draw was given. The sidebar's own layout follows it:
     /// the host terminal owns the split, so its width is the state.
     width: u16,
-    /// The command palette, open with its query and highlighted entry.
-    palette: Option<Palette>,
+    /// The command palette.
+    palette: Option<Picker<KeyCode>>,
+    /// The workspace chooser, open while a new workspace waits for its directory.
+    workspace_picker: Option<Picker<PathBuf>>,
     /// Whether finished sessions are listed while ordinary panes are hidden.
     /// Off by default: the agents view is the live fleet, and a fleet with its
     /// history in it stops being an overview.
@@ -1153,52 +1140,55 @@ impl App {
     }
 
     /// The open command palette, if any.
-    pub fn palette(&self) -> Option<&Palette> {
+    pub fn palette(&self) -> Option<&Picker<KeyCode>> {
         self.palette.as_ref()
     }
 
-    /// The commands the palette is offering for its query, best first.
-    pub fn palette_commands(&self) -> Vec<&'static self::commands::Command> {
-        let query = self.palette.as_ref().map(|palette| palette.query.clone());
-        commands::matching(query.as_deref().unwrap_or_default(), self.sidebar)
+    /// The open workspace chooser, if any.
+    pub fn workspace_picker(&self) -> Option<&Picker<PathBuf>> {
+        self.workspace_picker.as_ref()
     }
 
-    /// One palette key. While the palette is open it owns the keyboard: letters
-    /// edit the query, `Up`/`Down` (and `j`/`k` with Control) move the highlight,
-    /// and `Enter` answers with the chosen command's key for the caller to run.
-    fn handle_palette_key(&mut self, key: KeyEvent) -> Option<Action> {
-        let palette = self.palette.as_mut()?;
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('?') => self.palette = None,
-            KeyCode::Enter => {
-                let index = palette.index;
-                let chosen = self.palette_commands().get(index).copied()?;
-                self.palette = None;
-                return Some(Action::Replay(chosen.key));
-            }
-            KeyCode::Up | KeyCode::BackTab => palette.index = palette.index.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => palette.index += 1,
-            KeyCode::Backspace => {
-                palette.query.pop();
-                palette.index = 0;
-            }
-            KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if ch == 'n' {
-                    palette.index += 1;
-                } else if ch == 'p' {
-                    palette.index = palette.index.saturating_sub(1);
+    /// Whether a picker holds the keyboard.
+    pub fn picker_open(&self) -> bool {
+        self.palette.is_some() || self.workspace_picker.is_some()
+    }
+
+    /// Opens the workspace chooser over `directories`. The first entry starts as
+    /// the highlight, so a bare `Enter` takes the directory Radar was started in.
+    pub fn open_workspace_picker(&mut self, directories: Vec<PathBuf>) {
+        let items = directories
+            .into_iter()
+            .map(|directory| {
+                let label = directory.to_string_lossy().into_owned();
+                Item::new(label, None::<String>, directory)
+            })
+            .collect();
+        self.workspace_picker = Some(Picker::new("Workspace", "enter open · esc cancel", items));
+    }
+
+    /// One picker key. Answers with the replay of a chosen command, or with the
+    /// chosen workspace, so the caller keeps the effect.
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if let Some(mut picker) = self.palette.take() {
+            return match picker.handle_key(key) {
+                Step::Continue => {
+                    self.palette = Some(picker);
+                    None
                 }
-            }
-            KeyCode::Char(ch) => {
-                palette.query.push(ch);
-                palette.index = 0;
-            }
-            _ => {}
+                Step::Close => None,
+                Step::Choose(code) => Some(Action::Replay(code)),
+            };
         }
-        let last = self.palette_commands().len().saturating_sub(1);
-        let palette = self.palette.as_mut()?;
-        palette.index = palette.index.min(last);
-        None
+        let mut picker = self.workspace_picker.take()?;
+        match picker.handle_key(key) {
+            Step::Continue => {
+                self.workspace_picker = Some(picker);
+                None
+            }
+            Step::Close => None,
+            Step::Choose(directory) => Some(Action::NewWorkspaceIn(directory)),
+        }
     }
 
     /// Applies one key event, answering with what the main loop has to do.
@@ -1232,8 +1222,8 @@ impl App {
         self.focus_message = None;
         // The command palette is modal: it owns the keyboard until it closes,
         // so its letters filter commands rather than moving the tree.
-        if self.palette.is_some() {
-            return self.handle_palette_key(key);
+        if self.picker_open() {
+            return self.handle_picker_key(key);
         }
         // The outcomes panel is modal: it shows what was reported and acts on
         // nothing, so while it is open no other key reaches the tree.
@@ -1316,7 +1306,13 @@ impl App {
             KeyCode::Char('d') => self.toggle_details(),
             KeyCode::Char('e') => self.toggle_finished(),
             KeyCode::Char('b') => self.toggle_tasks(),
-            KeyCode::Char('?') => self.palette = Some(Palette::default()),
+            KeyCode::Char('?') => {
+                self.palette = Some(Picker::new(
+                    "Commands",
+                    "enter run · esc close",
+                    commands::items(self.sidebar),
+                ))
+            }
             KeyCode::Char('/') => self.filter_editing = true,
             KeyCode::Esc => {
                 self.filter.clear();
@@ -4296,36 +4292,22 @@ mod tests {
         // Keys reach the query, not the tree: `e` would otherwise show finished
         // sessions, and `q` would be a quit the main loop must not see.
         let selected = app.selected_index();
-        for ch in "finished".chars() {
-            assert_eq!(press(&mut app, KeyCode::Char(ch)), None);
+        for ch in "show or hide finished".chars() {
+            press(&mut app, KeyCode::Char(ch));
         }
         assert_eq!(app.selected_index(), selected);
-        assert_eq!(app.palette().expect("open").query(), "finished");
+        let palette = app.palette().expect("open");
+        assert_eq!(palette.query(), "show or hide finished");
         assert_eq!(
-            app.palette_commands()
-                .iter()
-                .map(|command| command.label)
-                .collect::<Vec<_>>(),
-            ["Show or hide finished sessions"],
+            palette.rows(),
+            [("Show or hide finished sessions", Some("e"))],
             "only the matching command is offered"
         );
 
         // Enter answers with that command's key, which does what the key does.
-        for _ in 0..8 {
-            press(&mut app, KeyCode::Backspace);
-        }
-        let mut offering = app.palette_commands();
-        while offering[0].label != "Show or hide finished sessions" {
-            press(&mut app, KeyCode::Down);
-            offering = app.palette_commands();
-            if app.palette().expect("open").index() + 1 >= offering.len() {
-                break;
-            }
-        }
-        let chosen = offering[app.palette().expect("open").index()].key;
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            Some(Action::Replay(chosen))
+            Some(Action::Replay(KeyCode::Char('e')))
         );
         assert!(app.palette().is_none(), "choosing closes the palette");
 
@@ -4336,6 +4318,37 @@ mod tests {
         press(&mut app, KeyCode::Char('?'));
         assert_eq!(press(&mut app, KeyCode::Esc), None);
         assert!(app.palette().is_none(), "Escape closes it");
+    }
+
+    #[test]
+    fn the_workspace_picker_answers_with_its_directory() {
+        let (_, mut app) = fixture();
+        let directories = vec![
+            std::path::PathBuf::from("/home/one/agent-radar"),
+            std::path::PathBuf::from("/home/one/notes"),
+        ];
+        app.open_workspace_picker(directories.clone());
+        let picker = app.workspace_picker().expect("open");
+        assert_eq!(picker.rows().len(), 2);
+        assert!(
+            picker.rows()[0].0.contains("agent-radar"),
+            "the paths are what a query matches"
+        );
+
+        // A query narrows it, and Enter answers with the highlighted directory.
+        for ch in "notes".chars() {
+            assert_eq!(press(&mut app, KeyCode::Char(ch)), None);
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::NewWorkspaceIn(PathBuf::from("/home/one/notes")))
+        );
+        assert!(app.workspace_picker().is_none());
+
+        app.open_workspace_picker(directories);
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.workspace_picker().is_none(), "Escape cancels");
+        assert!(app.focus_message().is_none());
     }
 
     #[test]
