@@ -55,7 +55,7 @@ pub const CLOSES: &str = "closes";
 /// It is an audit label only. The daemon records it and decides nothing from it:
 /// whether an assignment is complete or cancelled stays the assignment owner's
 /// call, and no execution report is written from a close.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CloseIntent {
     Complete,

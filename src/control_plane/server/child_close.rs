@@ -194,6 +194,107 @@ pub(super) fn execute_child_close(
     close_response(request, &recorded)
 }
 
+/// Closes the pane of a caller's own child, named by subject.
+///
+/// Radar resolves what the caller does not hold: the launch edge that bound the
+/// child's current process, and from it the exact child the close verifies. The
+/// target is then closed by `execute_child_close`, so a subject close is never
+/// looser than a spawn close. A retry resolves to the target its first
+/// admission recorded, even when the subject has since been relaunched.
+pub(super) fn subject_child_close(
+    core: &Arc<Mutex<Core>>,
+    request: &Request,
+    verification: &Arc<VerificationBudget>,
+) -> Response {
+    use crate::control_plane::public_contracts::subject::ChildCloseParams;
+    let params: ChildCloseParams = match decode_params(request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let registry = Arc::clone(&locked(core).registry);
+    let record = match super::subject_reads::child_record(
+        &registry,
+        &params.registration_id,
+        &params.subject_id,
+    ) {
+        Ok(record) => record,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let close = match registry.child_close(&request.id) {
+        Ok(Some(recorded)) => registry::ChildCloseRequest {
+            request_id: request.id.clone(),
+            spawn_request_id: recorded.spawn_request_id,
+            source: recorded.source,
+            incarnation: recorded.incarnation,
+            intent: params.intent,
+        },
+        Ok(None) => {
+            let Some(parent) = record.managed.parent_subject_id.as_deref() else {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(Code::Refused, "subject has no recorded parent"),
+                );
+            };
+            match current_edge(&registry, parent, &params.subject_id) {
+                Ok(Some(edge)) => {
+                    let bound = edge.bound.expect("a current edge is bound");
+                    registry::ChildCloseRequest {
+                        request_id: request.id.clone(),
+                        spawn_request_id: edge.request_id,
+                        source: bound.source,
+                        incarnation: bound.incarnation,
+                        intent: params.intent,
+                    }
+                }
+                Ok(None) => {
+                    return Response::refused(
+                        &request.id,
+                        &Refusal::new(Code::Refused, "child has no launch to close"),
+                    );
+                }
+                Err(error) => return registry_error(request, error),
+            }
+        }
+        Err(error) => return registry_error(request, error),
+    };
+    if let Err(error) = close.validate() {
+        return Response::refused(&request.id, &Refusal::new(Code::BadParams, error));
+    }
+    execute_child_close(&close, request, core, verification)
+}
+
+/// The newest bound, unwithdrawn launch of one child subject.
+fn current_edge(
+    registry: &Registry,
+    parent_subject: &str,
+    subject: &str,
+) -> Result<Option<registry::SpawnEdge>, String> {
+    let mut newest: Option<registry::SpawnEdge> = None;
+    let mut after: Option<String> = None;
+    loop {
+        let page = registry.spawn_edges_for_subject_after(parent_subject, after.as_deref(), 100)?;
+        let last = page.last().map(|edge| edge.request_id.clone());
+        for edge in page.iter() {
+            let Some(bound) = edge.bound.as_ref() else {
+                continue;
+            };
+            if bound.subject_id.as_deref() != Some(subject) || edge.withdrawn.is_some() {
+                continue;
+            }
+            let later = newest.as_ref().is_none_or(|current| {
+                current.bound.as_ref().map(|b| b.bound_at.as_str()) < Some(bound.bound_at.as_str())
+            });
+            if later {
+                newest = Some(edge.clone());
+            }
+        }
+        match last {
+            Some(last) if page.len() >= 100 => after = Some(last),
+            _ => return Ok(newest),
+        }
+    }
+}
+
 /// The daemon's answer for one recorded close.
 ///
 /// The durable outcome decides the shape, so a replay — including one after a

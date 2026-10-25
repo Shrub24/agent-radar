@@ -15,6 +15,7 @@ import type {
 	SpawnListParamsDeserialize,
 	SpawnListPageSerialize,
 	SubjectChildGetParams,
+	SubjectChildCloseParams,
 	SubjectChildrenParams,
 	SubjectGetResult,
 	SubjectListResult,
@@ -43,7 +44,7 @@ export const RADAR_PROTOCOL_VERSION = 2;
  * parent continue or restart its own child by subject.
  * Earlier daemons expose different identity fields; require a coordinated update.
  */
-export const RADAR_MINIMUM_REVISION = 9;
+export const RADAR_MINIMUM_REVISION = 10;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
@@ -1104,15 +1105,14 @@ export type RadarClient = {
 		writer_handle: string;
 	}): Promise<RadarResult<void>>;
 	/**
-	 * Close the exact pane a daemon-authored spawn edge created for one bound
-	 * child. `request_id` is this close's own durable key: a lost reply is
-	 * reconciled by resending the identical request, never by a new key.
+	 * Close the pane of one of this process's own children, named by subject.
+	 * Radar resolves the launch and the occupying process. `request_id` is this
+	 * close's own durable key: a lost reply is reconciled by resending the
+	 * identical request, never by a new key.
 	 */
 	childClose(request: {
 		request_id: string;
-		spawn_request_id: string;
-		source: string;
-		incarnation: string;
+		subject_id: string;
 		intent: "complete" | "cancel";
 	}): Promise<RadarResult<RadarCloseOutcome>>;
 	/**
@@ -1919,31 +1919,17 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 			});
 		},
 		async childClose(request) {
-			if (
-				!isUuid(request.request_id) ||
-				!isUuid(request.spawn_request_id) ||
-				!isUuid(request.incarnation)
-			)
-				return {
-					ok: false,
-					code: "bad_params",
-					message:
-						"spawn.close requires canonical request, spawn and incarnation UUIDs",
-				};
+			const registration_id = processRegistrationId;
+			if (registration_id === undefined)
+				return { ok: false, code: "refused", message: "this process has no Radar registration" };
+			if (!isUuid(request.request_id) || !isUuid(request.subject_id))
+				return { ok: false, code: "bad_params", message: "child close requires canonical request and subject UUIDs" };
 			return withContract(RADAR_SPAWN_CLOSE_CONTRACT, async (): Promise<RadarResult<RadarCloseOutcome>> => {
 				// The caller's UUID is the envelope id: it is the durable record this
 				// close is reconciled with, so a replayed call must carry it unchanged
 				// rather than asking for a second close.
-				const answer = await call(
-					"spawn.close",
-					{
-						spawn_request_id: request.spawn_request_id,
-						source: request.source,
-						incarnation: request.incarnation,
-						intent: request.intent,
-					},
-					request.request_id,
-				);
+				const params: SubjectChildCloseParams = { registration_id, subject_id: request.subject_id, intent: request.intent };
+				const answer = await call("subject.child.close", { ...params }, request.request_id);
 				if (answer.ok === false) return answer;
 				const close = recordAt(answer.value, "close");
 				const outcome = stringAt(close, "outcome");
@@ -1952,7 +1938,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				if (outcome === "completed")
 					return pane !== undefined
 						? { ok: true, value: { outcome, pane } }
-						: protocol("spawn.close reply does not name the closed pane");
+						: protocol("child close reply does not name the closed pane");
 				if (outcome === "already_exited") {
 					const exit = exitAt(recordAt(close, "exit_observation"));
 					return pane !== undefined && exit !== undefined
@@ -1961,7 +1947,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 								value: { outcome, pane, exit_observation: exit },
 							}
 						: protocol(
-								"spawn.close reply does not report the exit it cleaned up",
+								"child close reply does not report the exit it cleaned up",
 							);
 				}
 				if (outcome === "refused" || outcome === "unknown")
@@ -1973,7 +1959,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 							...(detail !== undefined ? { message: detail } : {}),
 						},
 					};
-				return protocol("spawn.close reply carries no close outcome");
+				return protocol("child close reply carries no close outcome");
 			});
 		},
 		async communicationPublish(request) {

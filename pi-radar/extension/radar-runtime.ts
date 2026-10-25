@@ -5,7 +5,7 @@ import type { RadarPublication } from "./radar-publication.ts";
 
 /** The event channel through which Pi extensions obtain the baseline runtime. */
 export const RADAR_RUNTIME_REQUEST = "pi-radar/runtime-request";
-export const RADAR_RUNTIME_VERSION = 5 as const;
+export const RADAR_RUNTIME_VERSION = 6 as const;
 
 /** The sole baseline publisher's session-scoped runtime, shared with consumers. */
 export type RadarRuntimeServices = {

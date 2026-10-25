@@ -2,6 +2,12 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## 0.7.0
+
+- `subject.child.close {registration_id,subject_id,intent}` closes a child's pane by subject. The recorded parent names only the subject; Radar resolves the child's current launch and verifies the pane's occupant by birth identity, exactly as `spawn.close` does, and answers `completed`, `already_exited`, `refused` or `unknown`. A retry under the same request id settles against the target its first admission recorded. The agent stays retained for continue.
+- pi-radar: `children.close(subject, intent, requestId?)`; `client.childClose` takes a subject, not a spawn edge and a bound `source`/`incarnation`.
+- Wire revision 10, pi-radar 0.12.0, runtime 6: restart the daemon with the pin.
+
 ## 0.6.0
 
 - Agents are read and controlled by subject, not by process. `agent.get`/`agent.list` are gone. `subject.get {subject_id}`, `subject.list {selection,after,limit}` and, for a parent, `subject.children {registration_id}` / `subject.child.get {registration_id,subject_id}` / `subject.child.inspect {registration_id,subject_id}` replace them; no subject record carries a registration or claim id.

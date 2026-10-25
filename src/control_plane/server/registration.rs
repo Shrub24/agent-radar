@@ -192,6 +192,9 @@ pub(super) fn registry_request(
         | "subject.child.inspect" => {
             super::subject_reads::subject_read_request(core, request, verification)
         }
+        "subject.child.close" => {
+            super::child_close::subject_child_close(core, request, verification)
+        }
         "subject.assignment.acquire"
         | "subject.assignment.publish"
         | "subject.assignment.retire" => super::subject_reads::assignment_request(core, request),

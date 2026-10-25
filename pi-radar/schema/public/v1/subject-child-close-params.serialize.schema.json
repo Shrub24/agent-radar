@@ -1,0 +1,33 @@
+{
+  "$defs": {
+    "CloseIntent": {
+      "description": "The caller's reason for closing a managed child's pane.\n\nIt is an audit label only. The daemon records it and decides nothing from it:\nwhether an assignment is complete or cancelled stays the assignment owner's\ncall, and no execution report is written from a close.",
+      "enum": [
+        "complete",
+        "cancel"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Closes a child's pane. The caller names the child by subject; Radar resolves\nthe launch, the pane and the process that occupies it.",
+  "properties": {
+    "intent": {
+      "$ref": "#/$defs/CloseIntent"
+    },
+    "registration_id": {
+      "type": "string"
+    },
+    "subject_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "registration_id",
+    "subject_id",
+    "intent"
+  ],
+  "title": "subject-child-close-params-serialize",
+  "type": "object"
+}

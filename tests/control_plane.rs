@@ -2225,6 +2225,18 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
         json!({"registration_id": root, "subject_id": worker}),
     );
     assert_eq!(error_code(&stranger), "refused", "{stranger}");
+    let close = |client: &mut Client, caller: &str| {
+        client.call(
+            "subject.child.close",
+            json!({"registration_id": caller, "subject_id": worker, "intent": "cancel"}),
+        )
+    };
+    let refused = close(&mut client, &root);
+    assert_eq!(
+        error_code(&refused),
+        "refused",
+        "only the recorded parent closes a child: {refused}"
+    );
 
     let continue_as = |client: &mut Client, parent: &str, parent_session: &str, managed: Value| {
         client.call_id(
@@ -2284,6 +2296,14 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
                            "executable": "/bin/sh", "argv": []}}),
     );
     assert_eq!(error_code(&foreign_restart), "refused", "{foreign_restart}");
+
+    // The parent closes its child's pane by subject alone; Radar resolves the
+    // launch and verifies the occupant.
+    let closed = close(&mut client, &parent_agent);
+    assert_eq!(
+        closed["result"]["close"]["outcome"], "completed",
+        "{closed}"
+    );
     let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }

@@ -792,34 +792,6 @@ test("spawn carries validated Radar-owned launch metadata in the durable request
 	}
 });
 
-test("child.close sends the exact spawn edge and accepts only confirmed pane closure", async () => {
-	const fixture = makeFixture((request) => {
-		if (request.method === "daemon.ping")
-			return reply(request, {
-				protocol: 2,
-				revision: 1, contracts: ["registry.v1", "spawn.close.v1"],
-			});
-		assert.equal(request.method, "spawn.close");
-		assert.deepEqual(request.params, {
-			spawn_request_id: UUID_A,
-			source: "herdsman-child",
-			incarnation: UUID_B,
-			intent: "complete",
-		});
-		return reply(request, { close: { outcome: "completed", intent: "complete", pane: "wA:p2" } });
-	});
-	try {
-		await listen(fixture);
-		assert.deepEqual(await fixture.client().childClose({
-			request_id: UUID_B,
-			spawn_request_id: UUID_A,
-			source: "herdsman-child",
-			incarnation: UUID_B,
-			intent: "complete",
-		}), { ok: true, value: { outcome: "completed", pane: "wA:p2" } });
-	} finally { cleanup(fixture); }
-});
-
 test("agent.get decodes each process verdict exactly as the daemon names it", async () => {
 	for (const verification of ["verified", "absent", "mismatched", "unavailable"]) {
 		const fixture = makeFixture((request) =>
@@ -915,21 +887,6 @@ test("agent.get refuses a reply with no known verdict and passes not_found throu
 	} finally { cleanup(malformed); cleanup(missing); }
 });
 
-test("child.close unknown outcome is preserved as failure", async () => {
-	const fixture = makeFixture((request) => request.method === "daemon.ping"
-		? reply(request, { protocol: 2, revision: 1, contracts: ["registry.v1", "spawn.close.v1"] })
-		: refuse(request, "backend_unavailable", "managed child close outcome is unknown"));
-	try {
-		await listen(fixture);
-		const result = await fixture.client().childClose({
-			request_id: UUID_B, spawn_request_id: UUID_A, source: "herdsman-child",
-			incarnation: UUID_B, intent: "cancel",
-		});
-		assert.equal(result.ok, false);
-		assert.equal(result.ok ? "" : result.code, "backend_unavailable");
-	} finally { cleanup(fixture); }
-});
-
 test("an untrusted control socket is refused without dialling", async () => {
 	const fixture = makeFixture(() => undefined);
 	try {
@@ -994,7 +951,7 @@ test("daemon.ping requires protocol 2, the minimum revision, and registry.v1", a
 		// would be accepted and then never gain a subject.
 		const presenceless = await client.ping();
 		assert.equal(presenceless.ok, false);
-		assert.match(presenceless.ok ? "" : presenceless.message, /revision 9/);
+		assert.match(presenceless.ok ? "" : presenceless.message, /revision 10/);
 		const capable = await client.ping();
 		assert.deepEqual(capable, {
 			ok: true,

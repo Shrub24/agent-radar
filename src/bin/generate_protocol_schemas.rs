@@ -157,6 +157,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     use agent_radar::control_plane::public_contracts::subject;
     write_pair::<subject::GetParams>(&output, "subject-get-params")?;
     write_pair::<subject::ChildGetParams>(&output, "subject-child-get-params")?;
+    write_pair::<subject::ChildCloseParams>(&output, "subject-child-close-params")?;
     write_pair::<subject::GetResult>(&output, "subject-get-result")?;
     write_pair::<subject::ListParams>(&output, "subject-list-params")?;
     write_pair::<subject::ChildrenParams>(&output, "subject-children-params")?;

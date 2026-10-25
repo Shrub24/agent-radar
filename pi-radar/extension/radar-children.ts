@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { RadarClient, RadarChannelSnapshot, RadarResult } from "./radar-client.ts";
+import type { RadarClient, RadarChannelSnapshot, RadarCloseOutcome, RadarResult } from "./radar-client.ts";
 import type { SubjectGetResult, SubjectChildrenParams } from "./generated-contracts.ts";
 import type { RadarInspection } from "./radar-inspection.ts";
 import { waitForChild, launchFailure, type RadarLaunchOutcome } from "./radar-launch.ts";
@@ -26,13 +26,18 @@ export type RadarChildren = {
 	restart(subject: string, program: RadarChildProgram, options?: { pollMs?: number; signal?: AbortSignal }): Promise<RadarLaunchOutcome>;
 	assignment(subject: string, owner: string): RadarChildAssignment;
 	retire(subject: string): void;
+	/**
+	 * Close the child's pane. Reuse `requestId` to settle a lost reply; a new key
+	 * is a second close.
+	 */
+	close(subject: string, intent: "complete" | "cancel", requestId?: string): Promise<RadarCloseOutcome>;
 	observe(subject: string): Promise<RadarChildObservation>;
 	inspect(subject: string): Promise<RadarInspection>;
 };
 
 /** All child lifecycle resolution and assignment ownership belong to Radar. */
 export function createRadarChildren(
-	client: Pick<RadarClient, "subjectChildren" | "childGet" | "childInspect" | "spawnGet" | "restart">,
+	client: Pick<RadarClient, "subjectChildren" | "childGet" | "childInspect" | "childClose" | "spawnGet" | "restart">,
 	publication: Pick<RadarPublication, "assignment" | "retireAssignment" | "subject">,
 ): RadarChildren {
 	return {
@@ -65,6 +70,14 @@ export function createRadarChildren(
 		},
 		assignment: (subject, owner) => publication.assignment(subject, owner),
 		retire: (subject) => publication.retireAssignment(subject),
+		async close(subject, intent, requestId) {
+			const closed = await client.childClose({ request_id: requestId ?? randomUUID(), subject_id: subject, intent });
+			if (closed.ok) return closed.value;
+			// Only the daemon's own refusal proves no pane was touched; a lost or
+			// unreadable answer may have reached it, so the same key must settle it.
+			const message = `${closed.code}: ${closed.message}`;
+			return { outcome: ["refused", "not_found", "bad_params"].includes(closed.code) ? "refused" : "unknown", message };
+		},
 		async observe(subject) {
 			const read = await client.childGet(subject);
 			if (!read.ok) return { kind: "unknown", diagnostic: `${read.code}: ${read.message}` };

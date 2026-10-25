@@ -8,6 +8,24 @@ export interface SubjectChildGetParams {
   subject_id: string;
 }
 /**
+ * The caller's reason for closing a managed child's pane.
+ *
+ * It is an audit label only. The daemon records it and decides nothing from it:
+ * whether an assignment is complete or cancelled stays the assignment owner's
+ * call, and no execution report is written from a close.
+ */
+export type SubjectChildCloseParamsCloseIntent = "complete" | "cancel";
+
+/**
+ * Closes a child's pane. The caller names the child by subject; Radar resolves
+ * the launch, the pane and the process that occupies it.
+ */
+export interface SubjectChildCloseParams {
+  intent: SubjectChildCloseParamsCloseIntent;
+  registration_id: string;
+  subject_id: string;
+}
+/**
  * Freshness is independent of process identity or completion.
  */
 export type SubjectGetResultFreshness = "fresh" | "stale";

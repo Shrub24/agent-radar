@@ -78,6 +78,16 @@ pub struct ChildGetParams {
     pub subject_id: String,
 }
 
+/// Closes a child's pane. The caller names the child by subject; Radar resolves
+/// the launch, the pane and the process that occupies it.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChildCloseParams {
+    pub registration_id: String,
+    pub subject_id: String,
+    pub intent: crate::control_plane::registry::CloseIntent,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListParams {

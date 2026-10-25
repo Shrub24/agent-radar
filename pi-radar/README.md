@@ -37,7 +37,7 @@ The handoff API stores immutable bounded content separately from the recipient r
 
 To start a released child again, pass `continues: subject_id`: the daemon takes the session from its own record, so no session id or path is sent, and it refuses a child that is not yours or is still running. `client.restart` replaces your own live child under a new program. Both need Radar 0.4.0 or newer.
 
-A launch is ready when the daemon grants the child's first presence, and `failed` when the daemon withdraws it. The daemon owns a 30-second deadline and records the withdrawal on the launch, so `failed` means the launch is already cleaned up and a retry is safe. `launchRadarWorker` has no timeout of its own; pass a `signal` to stop waiting. `unresolved` is left for a launch whose outcome cannot be read at all. `children.restart(subject, program)` replaces a live child in its own pane and waits on the same outcome.
+A launch is ready when the daemon grants the child's first presence, and `failed` when the daemon withdraws it. The daemon owns a 30-second deadline and records the withdrawal on the launch, so `failed` means the launch is already cleaned up and a retry is safe. `launchRadarWorker` has no timeout of its own; pass a `signal` to stop waiting. `unresolved` is left for a launch whose outcome cannot be read at all. `children.restart(subject, program)` replaces a live child in its own pane and waits on the same outcome. `children.close(subject, intent, requestId?)` closes the child's pane by subject: `completed`, `already_exited`, `refused` (nothing was touched) or `unknown` (the answer was lost; resend with the same `requestId`). The agent stays retained, so it can be continued.
 
 ## Addressing children by subject
 

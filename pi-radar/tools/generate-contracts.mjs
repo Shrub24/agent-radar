@@ -42,7 +42,7 @@ try {
 	);
 
 	for (const file of [
-		...["subject-get-params", "subject-child-get-params", "subject-get-result", "subject-list-params", "subject-children-params", "subject-list-result"].flatMap((name) =>
+		...["subject-get-params", "subject-child-get-params", "subject-child-close-params", "subject-get-result", "subject-list-params", "subject-children-params", "subject-list-result"].flatMap((name) =>
 			[`${name}.serialize.schema.json`, `${name}.deserialize.schema.json`]),
 	"presence-report.serialize.schema.json",
 	"presence-report.deserialize.schema.json",
@@ -82,6 +82,7 @@ try {
 	const types = [
 		["subject-get-params.deserialize.schema.json", "SubjectGetParams"],
 		["subject-child-get-params.deserialize.schema.json", "SubjectChildGetParams"],
+		["subject-child-close-params.deserialize.schema.json", "SubjectChildCloseParams"],
 		["subject-get-result.serialize.schema.json", "SubjectGetResult"],
 		["subject-list-params.deserialize.schema.json", "SubjectListParams"],
 		["subject-children-params.deserialize.schema.json", "SubjectChildrenParams"],

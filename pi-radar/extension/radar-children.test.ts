@@ -56,3 +56,25 @@ test("an assignment is published for the subject Radar resolves, never for a chi
 	h.children.retire(subject);
 	assert.deepEqual(h.retired, [subject]);
 });
+
+test("closing a child names only its subject and reports what Radar did", async () => {
+	const sent: object[] = [];
+	const h = createRadarChildren({
+		childClose: async (request: object) => { sent.push(request); return { ok: true as const, value: { outcome: "completed" as const, pane: "p" } }; },
+	} as never, {} as never);
+	const id = randomUUID();
+	assert.deepEqual(await h.close(subject, "complete", id), { outcome: "completed", pane: "p" });
+	assert.deepEqual(sent, [{ request_id: id, subject_id: subject, intent: "complete" }]);
+
+	const refused = createRadarChildren({
+		childClose: async () => ({ ok: false as const, code: "refused", message: "subject is not this caller's child" }),
+	} as never, {} as never);
+	assert.equal((await refused.close(subject, "cancel")).outcome, "refused");
+});
+
+test("a close whose answer was lost is unknown, never refused", async () => {
+	const lost = createRadarChildren({
+		childClose: async () => ({ ok: false as const, code: "absent", message: "socket gone" }),
+	} as never, {} as never);
+	assert.equal((await lost.close(subject, "cancel")).outcome, "unknown");
+});

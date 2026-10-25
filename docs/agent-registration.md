@@ -529,6 +529,7 @@ The JSON Schemas under `pi-radar/schema/public/v1/` are the machine-readable con
 | `spawn.create` with managed metadata, optionally `continue_subject_id` | `spawn.v1` | `managed-launch-metadata.*` | `launchRadarWorker` |
 | `spawn.list` (launch topology) | `registry.v1` | `spawn-list-params.*`, `spawn-list-page.*` | `spawnGet`/launch readiness |
 | `lifecycle.restart` by the recorded parent | `lifecycle.restart.v1` | — | `runtime.children.restart` |
+| `subject.child.close` by the recorded parent | `spawn.close.v1` | `subject-child-close-params.*` | `runtime.children.close` |
 | `observation.get` | `registry.v1` | `observation-get-response.*`, `observation-snapshot.*` | `client.observe()` |
 
 The public process identifier is `registration_id`; durable agent identity is `subject_id`. Consumer child operations name only the subject: a child record, a child assignment and a child inspection never carry a registration or claim id. `HandoffIdentity` still carries both plus the execution it names, because a handoff is between processes.
