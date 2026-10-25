@@ -22,12 +22,18 @@ fn main() -> io::Result<()> {
         print!("{}", load_config().to_document());
         return Ok(());
     }
-    let Some(invocation) = cli.invocation else {
-        let result = run();
+    let dashboard = match cli.invocation {
+        None => Some(false),
+        Some(agent_radar::cli::Invocation::Sidebar) => Some(true),
+        Some(_) => None,
+    };
+    if let Some(sidebar) = dashboard {
+        let result = run(sidebar);
         disable_mouse_capture();
         let restored = ratatui::try_restore();
         return result.and(restored);
-    };
+    }
+    let invocation = cli.invocation.expect("a non-dashboard invocation");
     std::process::exit(invoke(invocation))
 }
 
@@ -43,6 +49,7 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
             }
             None => serve_daemon(),
         },
+        Invocation::Sidebar => unreachable!("the sidebar is the dashboard, not a printing command"),
         Invocation::Server(action) => {
             let (verb, name) = action.parts();
             let name = match name {
@@ -93,6 +100,34 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
             subject,
             server,
         } => control_plane::lifecycle::run_wake(&socket, &subject, &server),
+    }
+}
+
+/// Runs the host command that hides the sidebar, or unhides it while the rail is
+/// drawn. The terminal owns the split, so a missing or failing command is only
+/// reported.
+fn toggle_sidebar(config: &Config, app: &mut App) {
+    let collapsed =
+        crossterm::terminal::size().is_ok_and(|(width, _)| ui::sidebar_collapsed(width));
+    let (key, command) = if collapsed {
+        ("show_command", &config.sidebar.show_command)
+    } else {
+        ("hide_command", &config.sidebar.hide_command)
+    };
+    let Some(command) = command else {
+        app.set_focus_message(Some(format!("set [sidebar] {key} to hide or unhide")));
+        return;
+    };
+    let result = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => app.set_focus_message(Some(format!("sidebar {key} exited {status}"))),
+        Err(error) => app.set_focus_message(Some(format!("sidebar {key}: {error}"))),
     }
 }
 
@@ -290,7 +325,7 @@ fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
     );
 }
 
-fn run() -> io::Result<()> {
+fn run(sidebar: bool) -> io::Result<()> {
     let config = load_config();
     theme::install(config.clone());
     // The dashboard owns the terminal, so its diagnostics go to a file.
@@ -325,7 +360,7 @@ fn run() -> io::Result<()> {
     // UI thread. A run without a daemon has no container to act on and says so.
     let mut containers = ContainerControl::new(container_controls);
     let mut state = ObservationState::new();
-    let mut app = App::new();
+    let mut app = if sidebar { App::sidebar() } else { App::new() };
     if let Some(reason) = log_note {
         app.set_focus_message(Some(format!("no dashboard log: {reason}")));
     }
@@ -466,6 +501,7 @@ fn run() -> io::Result<()> {
                             &mut managed,
                             &mut containers,
                         ),
+                        Action::ToggleSidebar => toggle_sidebar(&config, &mut app),
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
                             let path = std::env::var_os("PATH");
@@ -521,6 +557,7 @@ fn run() -> io::Result<()> {
                             &mut managed,
                             &mut containers,
                         ),
+                        Action::ToggleSidebar => toggle_sidebar(&config, &mut app),
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
                             let path = std::env::var_os("PATH");

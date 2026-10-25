@@ -64,6 +64,16 @@ const SIDE_BY_SIDE_MIN_WIDTH: u16 = 80;
 const DETAIL_MIN_WIDTH: u16 = 30;
 const DETAIL_MAX_WIDTH: u16 = 60;
 
+/// Below this width `radar sidebar` draws a one-column rail of state marks
+/// instead of the tree; the host terminal sets the width, so it is the width
+/// that says whether the sidebar is hidden.
+const SIDEBAR_RAIL_BELOW: u16 = 16;
+
+/// Whether a sidebar given `width` columns is drawn as the collapsed rail.
+pub fn sidebar_collapsed(width: u16) -> bool {
+    width < SIDEBAR_RAIL_BELOW
+}
+
 /// Renders the whole overview into `frame`.
 ///
 /// `tick` is the animation frame a working mark is drawn on. The caller owns it,
@@ -76,8 +86,18 @@ pub fn render(
     list_state: &mut ListState,
     tick: usize,
 ) -> Geometry {
-    let area = content_column(frame.area());
-    let hints = footer(app, area.width as usize);
+    let sidebar = app.is_sidebar();
+    let rail = sidebar && sidebar_collapsed(frame.area().width);
+    let area = if sidebar {
+        frame.area()
+    } else {
+        content_column(frame.area())
+    };
+    let hints = if rail {
+        Vec::new()
+    } else {
+        footer(app, area.width as usize)
+    };
     let (body, hint_area) = regions(area, hints.len() as u16);
     if hint_area.height > 0 {
         frame.render_widget(Paragraph::new(hints), hint_area);
@@ -99,9 +119,13 @@ pub fn render(
     );
 
     let rows = app.visible_rows();
-    let block = Block::bordered()
-        .border_style(Style::new().fg(panel_border(!app.details_focused())))
-        .title(tree_title(state, app));
+    let block = if sidebar {
+        Block::new()
+    } else {
+        Block::bordered()
+            .border_style(Style::new().fg(panel_border(!app.details_focused())))
+            .title(tree_title(state, app))
+    };
     let tree_content = block.inner(tree_area);
     if rows.is_empty() {
         frame.render_widget(
@@ -114,12 +138,17 @@ pub fn render(
         let items: Vec<ListItem> = rows
             .iter()
             .map(|row| {
-                row_item(
-                    row,
-                    tick,
-                    tree_area.width.saturating_sub(2) as usize,
-                    matches!(state.source_freshness(), SourceFreshness::Current),
-                )
+                if rail {
+                    rail_item(row, tick)
+                } else {
+                    row_item(
+                        row,
+                        tick,
+                        tree_content.width as usize,
+                        matches!(state.source_freshness(), SourceFreshness::Current),
+                        sidebar,
+                    )
+                }
             })
             .collect();
         list_state.select(app.selected_index());
@@ -783,6 +812,16 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ];
         return wrap_hints(&pairs, width);
     }
+    if app.is_sidebar() {
+        let pairs = vec![
+            ("j/k", String::new()),
+            ("Enter", "focus".to_string()),
+            ("/", "filter".to_string()),
+            ("p", app.pane_view().label().to_string()),
+            ("B", "hide".to_string()),
+        ];
+        return wrap_hints(&pairs, width);
+    }
     // The panel that has the keyboard says so by naming its own keys: the
     // details answer to a different set from the tree, and a reader who has just
     // tabbed into them needs that set rather than the tree's.
@@ -963,6 +1002,7 @@ fn row_item(
     tick: usize,
     width: usize,
     source_current: bool,
+    compact: bool,
 ) -> ListItem<'static> {
     let palette = theme::palette();
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1092,13 +1132,13 @@ fn row_item(
                     }
                 }),
             ];
-            for part in tail.into_iter().flatten() {
+            for part in tail.into_iter().flatten().filter(|_| !compact) {
                 spans.push(Span::styled(
                     format!(" · {part}"),
                     Style::new().fg(palette.subtle),
                 ));
             }
-            if let Some(basis) = &agent.retained {
+            if let Some(basis) = agent.retained.as_ref().filter(|_| !compact) {
                 spans.push(Span::styled(
                     format!(" · retained ({})", basis_label(basis)),
                     Style::new().fg(palette.retained),
@@ -1141,7 +1181,7 @@ fn row_item(
                 }
                 flex = Some(spans.len());
                 spans.push(Span::styled(sanitize(&process), Style::new().fg(ink)));
-                if let Some(running) = pane.running_for() {
+                if let Some(running) = pane.running_for().filter(|_| !compact) {
                     spans.push(Span::styled(
                         format!(" · {}", duration(running)),
                         Style::new().fg(palette.subtle),
@@ -1222,7 +1262,7 @@ fn row_item(
                 sanitize(row.node.row.title()),
                 Style::new().fg(palette.muted),
             ));
-            if let Some(phase) = task.phase.as_deref() {
+            if let Some(phase) = task.phase.as_deref().filter(|_| !compact) {
                 spans.push(Span::styled(
                     format!(" · {}", sanitize(phase)),
                     Style::new().fg(palette.subtle),
@@ -1230,7 +1270,10 @@ fn row_item(
             }
             // An age only where the publisher reports a start: absent is not a
             // zero, and a `tokens` task has neither.
-            if let Some(started) = published.and_then(|published| published.started_at) {
+            if let Some(started) = published
+                .and_then(|published| published.started_at)
+                .filter(|_| !compact)
+            {
                 spans.push(Span::styled(
                     format!(" · {}", duration(elapsed(started, now_unix_ms()))),
                     Style::new().fg(palette.subtle),
@@ -1238,7 +1281,7 @@ fn row_item(
             }
             // Where the facts came from is part of the row: the same id can be
             // a live publisher's task or the pane's last-observed report of it.
-            if task.source == TaskSource::Tokens {
+            if task.source == TaskSource::Tokens && !compact {
                 spans.push(Span::styled(
                     format!(" · {}", task.basis()),
                     Style::new().fg(palette.retained),
@@ -1247,6 +1290,23 @@ fn row_item(
         }
     }
     ListItem::new(Line::from(fit(spans, flex, width)))
+}
+
+/// The collapsed sidebar: one state mark per row, in the tree's own order so the
+/// selection still lands on its row.
+fn rail_item(row: &VisibleRow<'_>, tick: usize) -> ListItem<'static> {
+    let palette = theme::palette();
+    let (mark, ink) = match &row.node.row.kind {
+        RowKind::Agent(agent) => {
+            let name = agent.name.as_deref();
+            let (mark, ink) =
+                theme::agent_state(&agent.state, name, agent.retained.is_some(), tick);
+            (mark.to_string(), ink)
+        }
+        RowKind::Workspace { .. } => ("▪".to_string(), palette.heading),
+        _ => ("·".to_string(), palette.subtle),
+    };
+    ListItem::new(Line::from(Span::styled(mark, Style::new().fg(ink))))
 }
 
 /// The program a foreground command runs: the first word of the line, without
@@ -1631,6 +1691,42 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (screen, geometry)
+    }
+
+    #[test]
+    fn the_sidebar_is_a_compressed_tree_that_collapses_to_a_rail_and_acts_on_nothing() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let state = fixture_state();
+        let mut app = App::sidebar();
+        app.refresh(&state);
+
+        let tree = render_text(&state, &app, 30, 20);
+        assert!(!tree.contains("Details"), "no details panel:\n{tree}");
+        assert!(
+            tree.contains(&drawn_titles(&app)[0]),
+            "the tree is drawn:\n{tree}"
+        );
+
+        let rail = render_text(&state, &app, 10, 20);
+        assert!(
+            rail.lines().all(|line| line.chars().count() <= 1),
+            "the rail is one mark per row:\n{rail}"
+        );
+
+        let press = |app: &mut App, ch| {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+        };
+        for destructive in ['D', 'r', 'a', 'A', 'L', 'E', 'R', 'd'] {
+            assert_eq!(
+                press(&mut app, destructive),
+                None,
+                "{destructive} must do nothing"
+            );
+        }
+        assert_eq!(
+            press(&mut app, 'B'),
+            Some(crate::app::Action::ToggleSidebar)
+        );
     }
 
     fn row_text(buffer: &Buffer, y: u16) -> String {

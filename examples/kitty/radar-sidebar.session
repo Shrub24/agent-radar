@@ -1,0 +1,9 @@
+# kitty --session examples/kitty/radar-sidebar.session
+#
+# The sidebar on the left, the tmux client Radar serves on the right. Adjust the
+# 20 below to the width you want; `[sidebar] hide_command` / `show_command` use
+# the same increment (see docs/sidebar.md).
+layout tall
+launch --title radar --allow-remote-control radar sidebar
+resize_window narrower 20
+launch --title agents tmux -L radar attach

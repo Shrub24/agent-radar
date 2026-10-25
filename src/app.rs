@@ -72,6 +72,8 @@ pub enum Action {
     ConfirmAction,
     /// Immediately create a managed-agent pane using `[tui].launch_command`.
     LaunchConfigured,
+    /// The sidebar's hide/unhide key; the caller owns the host commands.
+    ToggleSidebar,
 }
 
 /// Which page of the selected row's details the panel shows.
@@ -591,6 +593,8 @@ pub struct App {
     /// Whether the details panel is hidden. Stored inverted so `Default` — the
     /// state a run starts in — is "details shown".
     details_hidden: bool,
+    /// Drawn as `radar sidebar`: compressed rows, no details, no lifecycle actions.
+    sidebar: bool,
     /// Whether finished sessions are listed while ordinary panes are hidden.
     /// Off by default: the agents view is the live fleet, and a fleet with its
     /// history in it stops being an overview.
@@ -826,6 +830,18 @@ impl App {
         Self::default()
     }
 
+    /// A view for `radar sidebar`.
+    pub fn sidebar() -> Self {
+        Self {
+            sidebar: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_sidebar(&self) -> bool {
+        self.sidebar
+    }
+
     /// Rebuilds the projected tree and re-validates selection.
     ///
     /// Fold state is kept for every row identity that survives; the selection
@@ -984,7 +1000,7 @@ impl App {
     /// Whether the details panel is shown. Shown by default, and toggleable
     /// because a small terminal or a glance at the tree alone wants the width.
     pub fn shows_details(&self) -> bool {
-        !self.details_hidden
+        !self.sidebar && !self.details_hidden
     }
 
     /// Whether panes whose label is a finished session are listed even while
@@ -1126,6 +1142,17 @@ impl App {
         }
         if self.details_focused && self.handle_details_key(key) {
             return None;
+        }
+        // The sidebar has no details and no room for a confirmation, so the keys
+        // that open either do nothing; its own key asks the host to resize it.
+        if self.sidebar {
+            match key.code {
+                KeyCode::Char('B') => return Some(Action::ToggleSidebar),
+                KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R' | 'd')
+                | KeyCode::Tab
+                | KeyCode::BackTab => return None,
+                _ => {}
+            }
         }
         match key.code {
             KeyCode::Char('r') => return Some(Action::BeginAction(Operation::Restart)),

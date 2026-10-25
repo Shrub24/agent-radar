@@ -248,6 +248,14 @@ pub enum ProjectFilter {
     None,
 }
 
+/// The host commands `radar sidebar` runs to hide and unhide itself. The terminal
+/// owns the split's width, so Radar only runs what the user configured.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SidebarConfig {
+    pub hide_command: Option<Vec<String>>,
+    pub show_command: Option<Vec<String>>,
+}
+
 /// The loaded configuration: defaults with any file's choices applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -261,6 +269,8 @@ pub struct Config {
     pub daemon: DaemonConfig,
     /// What the dashboard does on the desktop.
     pub tui: TuiConfig,
+    /// How `radar sidebar` asks its host terminal to hide and unhide it.
+    pub sidebar: SidebarConfig,
 }
 
 impl Default for Config {
@@ -272,6 +282,7 @@ impl Default for Config {
             processes: default_processes(),
             daemon: DaemonConfig::default(),
             tui: TuiConfig::default(),
+            sidebar: SidebarConfig::default(),
         }
     }
 }
@@ -453,6 +464,31 @@ impl Config {
             }
             config.tui.terminal = Some(terminal);
         }
+        let sidebar = file.sidebar.unwrap_or_default();
+        for (name, command, slot) in [
+            (
+                "sidebar.hide_command",
+                sidebar.hide_command,
+                &mut config.sidebar.hide_command,
+            ),
+            (
+                "sidebar.show_command",
+                sidebar.show_command,
+                &mut config.sidebar.show_command,
+            ),
+        ] {
+            if let Some(command) = command {
+                if command
+                    .first()
+                    .is_none_or(|program| program.trim().is_empty())
+                {
+                    return Err(format!(
+                        "{name}: name a program, for example [\"kitten\", \"@\"]"
+                    ));
+                }
+                *slot = Some(command);
+            }
+        }
         Ok(config)
     }
 
@@ -595,6 +631,22 @@ impl Config {
         if let Some(terminal) = &self.tui.terminal {
             let quoted: Vec<String> = terminal.iter().map(|word| format!("{word:?}")).collect();
             out.push_str(&format!("terminal = [{}]\n", quoted.join(", ")));
+        }
+        out.push_str(
+            "\n[sidebar]\n\
+             # `radar sidebar` runs these, without a shell, to hide and unhide itself: the\n\
+             # terminal owns the split's width. Unset, the toggle key says so and runs nothing.\n\
+             # hide_command = [\"kitten\", \"@\", \"resize-window\", \"--self\", \"--axis=horizontal\", \"--increment=-20\"]\n\
+             # show_command = [\"kitten\", \"@\", \"resize-window\", \"--self\", \"--axis=horizontal\", \"--increment=20\"]\n",
+        );
+        for (name, command) in [
+            ("hide_command", &self.sidebar.hide_command),
+            ("show_command", &self.sidebar.show_command),
+        ] {
+            if let Some(command) = command {
+                let quoted: Vec<String> = command.iter().map(|word| format!("{word:?}")).collect();
+                out.push_str(&format!("{name} = [{}]\n", quoted.join(", ")));
+            }
         }
         out
     }
@@ -760,6 +812,14 @@ struct FileConfig {
     processes: Option<BTreeMap<String, String>>,
     daemon: Option<FileDaemon>,
     tui: Option<FileTui>,
+    sidebar: Option<FileSidebar>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileSidebar {
+    hide_command: Option<Vec<String>>,
+    show_command: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1064,6 +1124,24 @@ htop = "none"
             Config::parse(&printed).expect("round trips"),
             Config::default()
         );
+    }
+
+    #[test]
+    fn the_sidebar_host_commands_are_configurable_and_round_trip() {
+        let config = Config::parse(
+            "[sidebar]\nhide_command = [\"hide\", \"-n\"]\nshow_command = [\"show\"]\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            config.sidebar.hide_command.as_deref(),
+            Some(&["hide".to_string(), "-n".to_string()][..])
+        );
+        assert_eq!(
+            Config::parse(&config.to_document()).expect("round trip"),
+            config
+        );
+        assert_eq!(Config::default().sidebar, SidebarConfig::default());
+        assert!(Config::parse("[sidebar]\nhide_command = [\" \"]\n").is_err());
     }
 
     #[test]

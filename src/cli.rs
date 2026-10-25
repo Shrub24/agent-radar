@@ -47,6 +47,8 @@ pub struct Cli {
 /// One top-level command. No invocation runs the dashboard.
 #[derive(Debug, Subcommand)]
 pub enum Invocation {
+    /// Run the dashboard as a narrow tree for a split beside an agent's tmux client.
+    Sidebar,
     /// Control the daemon's user units; with no action, serve in the foreground.
     Daemon {
         #[command(subcommand)]
