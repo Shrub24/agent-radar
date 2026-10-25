@@ -16,18 +16,17 @@ sidebar. Use the full dashboard for those.
 
 ## Kitty setup
 
-Start the daemon and ensure its tmux server has a session before attaching.
-From the repository root:
+Start the daemon and ensure its tmux server has a session, then launch Kitty with
+the session file only, so your own `kitty.conf` still applies:
 
 ```sh
-kitty --config examples/kitty/sidebar.conf --session examples/kitty/radar-sidebar.session
+kitty --session /path/to/examples/kitty/radar-sidebar.session
 ```
 
-The example uses Kitty's splits layout: the sidebar gets 25% of the width and
-the tmux client gets 75%. To keep your usual Kitty settings, put the mappings
-from `examples/kitty/sidebar.conf` in your own configuration and omit the
-`--config` argument. If you changed `[daemon] tmux_server`, change `-L radar` in
-the session file to match.
+The session uses Kitty's splits layout: the sidebar gets 25% of the width and the
+tmux client gets 75%, and focus starts on the tmux side. If you changed
+`[daemon] tmux_server`, change `-L radar` in the session file to match. Copy the
+session file anywhere you like.
 
 The sidebar is launched with `--allow-remote-control`; global remote control
 need not be enabled. A window variable identifies it independently of its title.
@@ -42,8 +41,9 @@ show_command = ["kitten", "@", "action", "--self", "layout_action bias 25"]
 
 `B` hides the sidebar by shrinking it to Kitty's minimum width. Below 16 columns
 Radar draws a rail of state marks. Pressing `B` in the rail restores 25% width.
-The restore command sets a proportion rather than adding a fixed number of
-columns, so repeated toggles do not accumulate resize drift. Manual resizing is
+The restore command sets the split's bias — the sidebar's share of the tab — so
+repeated toggles cannot accumulate resize drift. `--self` makes both commands act
+on the sidebar's own split rather than whichever window has focus. Manual resizing is
 also supported; the rail follows the actual width.
 
 `Z` zooms the sidebar: it runs `zoom_command` and, from 100 columns up, the
@@ -57,10 +57,17 @@ zoom_command = ["kitten", "@", "action", "--self", "layout_action bias 100"]
 unzoom_command = ["kitten", "@", "action", "--self", "layout_action bias 25"]
 ```
 
-The example bindings are:
+Each `action` argument is one argv element (`"layout_action bias 25"`), which is
+how `kitten @ action` expects an action and its arguments.
+
+Optional host keys, from `examples/kitty/sidebar.conf`, pasted into your own
+`kitty.conf` or home-manager's `programs.kitty.extraConfig` — without them, click
+the sidebar to focus it and `B` and `Z` work from there:
 
 - `Ctrl+Shift+Left/Right`: move keyboard focus between splits.
 - `Ctrl+Shift+B`: restore and focus the sidebar, including from the tmux split.
+  It needs remote control, so if it does nothing, set `allow_remote_control
+  socket-only`.
 
 Commands are argv, not shell text. They run without blocking the dashboard.
 Unset commands, start failures and unsuccessful exits produce a diagnostic.
