@@ -26,7 +26,6 @@ use crate::app::{
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::bus::Task;
 use crate::control_plane::registry::{Freshness, PublicChannelFacts};
 use crate::model::{
     AgentObservation, AgentState, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent,
@@ -37,6 +36,7 @@ use crate::observation::{ObservationState, RetentionBasis, SourceFreshness};
 use crate::registry_observation::{
     Binding, RegistryView, SpawnBinding, Unjoined, channel_freshness,
 };
+use crate::tasks::Task;
 use crate::theme;
 use crate::tree::{AgentRow, RowKind, TaskRow, TaskSource};
 
@@ -925,7 +925,7 @@ fn tree_title(state: &ObservationState, app: &App) -> Line<'static> {
             Style::new().fg(palette.muted),
         ));
     }
-    if app.bus_diagnostic().is_some() {
+    if app.task_diagnostic().is_some() {
         // Attention rather than failure: the fleet is observed as usual and the
         // bus alone is off. What went wrong is written in the details.
         spans.push(Span::styled(
@@ -1942,7 +1942,7 @@ fn detail_page_lines(
     // The bus is a subsystem beside the source rather than part of it, so its
     // failure is written on every page: nothing here depends on it, and a
     // reader should not have to find a page to learn it is down.
-    if let Some(line) = bus_diagnostic(app) {
+    if let Some(line) = task_diagnostic(app) {
         page_lines.push(line);
     }
     page_lines
@@ -3626,8 +3626,8 @@ fn bound_text(text: &str) -> String {
 /// The bus's own diagnostic, when the listener is not running. The bus is a
 /// subsystem beside the source rather than part of it, so its failure is
 /// written on a line of its own.
-fn bus_diagnostic(app: &App) -> Option<Line<'static>> {
-    let diagnostic = app.bus_diagnostic()?;
+fn task_diagnostic(app: &App) -> Option<Line<'static>> {
+    let diagnostic = app.task_diagnostic()?;
     Some(field(
         "bus",
         format!("unavailable — {}", sanitize(diagnostic)),

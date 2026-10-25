@@ -1,19 +1,19 @@
 //! Bus consumer tests: what the details show for a publisher's tasks, which
 //! row they attach to, and what the panel says when the bus is not running.
 //!
-//! These drive the same path the executable does — [`App::apply_bus_event`]
+//! These drive the same path the executable does — [`App::apply_task_event`]
 //! feeding the join that [`ui::render`] draws — over a real observation rather
 //! than a hand-built row, so a change to either half of the join fails here.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_radar::app::DetailPage;
-use agent_radar::bus::{BusEvent, Task, TaskState};
 use agent_radar::model::{
     AgentObservation, FleetObservation, HerdsmanFacts, Lineage, Location, Pane, RuntimeStatus,
     SessionIdentity, SessionUuid, Tab, Workspace,
 };
 use agent_radar::registry_observation::{self, RegistryAgent, RegistryView};
+use agent_radar::tasks::{Task, TaskEvent, TaskState};
 use agent_radar::{App, ObservationState, RowId, ui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -164,11 +164,11 @@ fn task(id: &str, state: TaskState) -> Task {
 
 /// Connects `session` with its full list, as the listener would report it.
 fn publish(app: &mut App, session: &str, tasks: Vec<Task>) {
-    app.apply_bus_event(BusEvent::Connected {
+    app.apply_task_event(TaskEvent::Connected {
         session: session.into(),
         pane: None,
     });
-    app.apply_bus_event(BusEvent::Tasks {
+    app.apply_task_event(TaskEvent::Tasks {
         session: session.into(),
         tasks,
     });
@@ -351,11 +351,11 @@ fn a_row_with_its_own_session_uuid_never_falls_back_to_the_pane() {
     let mut app = app_for(&state);
     // The publisher names this very pane, but for a different session: the row
     // publishes a UUID of its own, so its tasks are not this publisher's.
-    app.apply_bus_event(BusEvent::Connected {
+    app.apply_task_event(TaskEvent::Connected {
         session: OTHER_SESSION.into(),
         pane: Some("wH:p1".into()),
     });
-    app.apply_bus_event(BusEvent::Tasks {
+    app.apply_task_event(TaskEvent::Tasks {
         session: OTHER_SESSION.into(),
         tasks: vec![task("bg-1", TaskState::Running)],
     });
@@ -369,11 +369,11 @@ fn a_row_with_its_own_session_uuid_never_falls_back_to_the_pane() {
 fn a_row_without_a_session_uuid_does_not_join_by_the_hello_pane() {
     let state = fleet(&[("wH:p1", None, None)]);
     let mut app = app_for(&state);
-    app.apply_bus_event(BusEvent::Connected {
+    app.apply_task_event(TaskEvent::Connected {
         session: SESSION.into(),
         pane: Some("wH:p1".into()),
     });
-    app.apply_bus_event(BusEvent::Tasks {
+    app.apply_task_event(TaskEvent::Tasks {
         session: SESSION.into(),
         tasks: vec![task("bg-1", TaskState::Running)],
     });
@@ -526,7 +526,7 @@ fn a_disconnect_restores_the_token_baseline() {
     select_agent(&mut app, "wH:p1");
     assert!(pages(&state, &mut app).contains("task: bg-1"));
 
-    app.apply_bus_event(BusEvent::Disconnected {
+    app.apply_task_event(TaskEvent::Disconnected {
         session: SESSION.into(),
     });
     let screen = pages(&state, &mut app);
@@ -618,10 +618,10 @@ fn bus_data_survives_a_refresh_and_is_rebuilt_from_the_bus() {
 }
 
 #[test]
-fn a_bus_diagnostic_is_stated_beside_source_freshness() {
+fn a_task_diagnostic_is_stated_beside_source_freshness() {
     let state = fleet(&[("wH:p1", Some(SESSION), None)]);
     let mut app = app_for(&state);
-    app.set_bus_diagnostic(Some(
+    app.set_task_diagnostic(Some(
         "bus socket /run/user/1000/agent-radar/radar.sock: another Radar owns it".into(),
     ));
     select_agent(&mut app, "wH:p1");
@@ -898,7 +898,7 @@ fn an_opened_task_block_survives_its_task_and_leaves_with_it() {
     // The publisher publishes its list again with the same task in it, and the
     // next poll refreshes against the same observation: the task is the same
     // one, so the block the reader opened is still theirs.
-    app.apply_bus_event(BusEvent::Tasks {
+    app.apply_task_event(TaskEvent::Tasks {
         session: SESSION.into(),
         tasks: vec![task_with_text("bg-1", "nix build", "/home/x")],
     });

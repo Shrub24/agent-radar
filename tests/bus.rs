@@ -1,4 +1,5 @@
-use agent_radar::bus::{BusEvent, BusState, Connection, Message, Task, TaskState, socket_path_in};
+use agent_radar::bus::{Connection, Message, socket_path_in};
+use agent_radar::tasks::{Task, TaskBoard, TaskEvent, TaskState};
 
 #[test]
 fn publisher_protocol_decodes_a_session_and_task_snapshot() {
@@ -24,12 +25,12 @@ fn publisher_protocol_decodes_a_session_and_task_snapshot() {
 
 #[test]
 fn task_projection_removes_a_session_when_its_connection_ends() {
-    let mut state = BusState::new();
-    state.apply(BusEvent::Connected {
+    let mut state = TaskBoard::new();
+    state.apply(TaskEvent::Connected {
         session: "pi-session-a".to_string(),
         pane: Some("%8".to_string()),
     });
-    state.apply(BusEvent::Tasks {
+    state.apply(TaskEvent::Tasks {
         session: "pi-session-a".to_string(),
         tasks: vec![Task {
             id: "task-1".to_string(),
@@ -44,7 +45,7 @@ fn task_projection_removes_a_session_when_its_connection_ends() {
         }],
     });
     assert_eq!(state.get("pi-session-a").unwrap().running(), 1);
-    state.apply(BusEvent::Disconnected {
+    state.apply(TaskEvent::Disconnected {
         session: "pi-session-a".to_string(),
     });
     assert!(state.get("pi-session-a").is_none());

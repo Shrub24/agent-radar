@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 
-use crate::bus::{BusEvent, BusState, Task};
 use crate::control_plane::client::{
     ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
 };
 use crate::lifecycle::{self, CloseRequest, Containment, TargetIdentity};
 use crate::observation::{ObservationState, SourceFreshness};
 use crate::runtime::{CloseTarget, Target};
+use crate::tasks::{Task, TaskBoard, TaskEvent};
 use crate::theme;
 use ratatui::layout::Rect;
 
@@ -600,11 +600,11 @@ pub struct App {
     /// drawn. It sits beside the tree rather than inside it: bus facts are true
     /// only while their connection is open, so a refresh must never be able to
     /// change them or keep them alive.
-    bus: BusState,
+    bus: TaskBoard,
     /// Why the bus is not running, when the listener could not bind. Kept
     /// apart from source freshness: a bus that never bound says nothing about
     /// the fleet Radar observes.
-    bus_diagnostic: Option<String>,
+    task_diagnostic: Option<String>,
     /// Focus target per row, for the rows the displayed observation proves. A
     /// row missing here is one `Enter` must refuse and explain.
     focus_targets: HashMap<RowId, Target>,
@@ -1601,15 +1601,15 @@ impl App {
     /// rebuilt, because a publisher's list is not an observation fact. Nothing
     /// waits for the next poll — the rows and the selection are reconciled here
     /// and now.
-    pub fn apply_bus_event(&mut self, event: BusEvent) {
+    pub fn apply_task_event(&mut self, event: TaskEvent) {
         self.bus.apply(event);
         self.tree.attach_tasks(&self.bus);
         self.reconcile_selection();
         self.prune_disclosures();
     }
 
-    pub fn replace_bus_snapshot(&mut self, events: Vec<BusEvent>) {
-        let mut bus = BusState::default();
+    pub fn replace_task_snapshot(&mut self, events: Vec<TaskEvent>) {
+        let mut bus = TaskBoard::default();
         for event in events {
             bus.apply(event);
         }
@@ -1620,13 +1620,13 @@ impl App {
     }
 
     /// Records why the bus is not running, or clears it.
-    pub fn set_bus_diagnostic(&mut self, diagnostic: Option<String>) {
-        self.bus_diagnostic = diagnostic;
+    pub fn set_task_diagnostic(&mut self, diagnostic: Option<String>) {
+        self.task_diagnostic = diagnostic;
     }
 
     /// Why the bus is not running, when it is not.
-    pub fn bus_diagnostic(&self) -> Option<&str> {
-        self.bus_diagnostic.as_deref()
+    pub fn task_diagnostic(&self) -> Option<&str> {
+        self.task_diagnostic.as_deref()
     }
 
     /// Lists or hides finished sessions.
@@ -3807,7 +3807,7 @@ mod tests {
     fn task_with_command(id: &str, command: &str) -> Task {
         Task {
             id: id.into(),
-            state: crate::bus::TaskState::Running,
+            state: crate::tasks::TaskState::Running,
             command: Some(command.into()),
             cwd: None,
             pid: None,
@@ -3821,11 +3821,11 @@ mod tests {
     /// Connects `session` and publishes `tasks` as its complete list, as the
     /// listener would report it.
     fn publish_tasks(app: &mut App, session: &str, tasks: Vec<Task>) {
-        app.apply_bus_event(BusEvent::Connected {
+        app.apply_task_event(TaskEvent::Connected {
             session: session.into(),
             pane: None,
         });
-        app.apply_bus_event(BusEvent::Tasks {
+        app.apply_task_event(TaskEvent::Tasks {
             session: session.into(),
             tasks,
         });

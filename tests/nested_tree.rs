@@ -4,12 +4,11 @@
 //!
 //! These drive the real path — [`FleetTree::build`] plus
 //! [`FleetTree::attach_tasks`] through [`App::refresh`] and
-//! [`App::apply_bus_event`] — so the join, the child rows, the parent badge and
+//! [`App::apply_task_event`] — so the join, the child rows, the parent badge and
 //! the detail summary are exercised together rather than asserted apart.
 
 use agent_radar::Target;
 use agent_radar::app::DetailPage;
-use agent_radar::bus::{BusEvent, Task, TaskState};
 use agent_radar::config::Config;
 use agent_radar::control_plane::registry::PublicSpawnTopology;
 use agent_radar::focus;
@@ -19,6 +18,7 @@ use agent_radar::model::{
 };
 use agent_radar::registry_observation::{self, RegistryAgent, RegistryRead, RegistryView};
 use agent_radar::runtime::BackendIdentity;
+use agent_radar::tasks::{Task, TaskEvent, TaskState};
 use agent_radar::tree::{RowKind, TaskId, TaskProjection, TaskRow, TaskSource, TreeNode};
 use agent_radar::{Action, App, Geometry, ObservationState, Operation, PaneView, RowId, theme, ui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -236,7 +236,7 @@ fn task(id: &str, state: TaskState) -> Task {
 
 /// Connects `session` with its full list, as the listener would report it.
 fn publish(app: &mut App, session: &str, pane: Option<&str>, tasks: Vec<Task>) {
-    app.apply_bus_event(BusEvent::Connected {
+    app.apply_task_event(TaskEvent::Connected {
         session: session.into(),
         pane: pane.map(str::to_string),
     });
@@ -245,7 +245,7 @@ fn publish(app: &mut App, session: &str, pane: Option<&str>, tasks: Vec<Task>) {
 
 /// A replacement on a live connection: one full list per change, no `hello`.
 fn publish_list(app: &mut App, session: &str, tasks: Vec<Task>) {
-    app.apply_bus_event(BusEvent::Tasks {
+    app.apply_task_event(TaskEvent::Tasks {
         session: session.into(),
         tasks,
     });
@@ -501,7 +501,7 @@ fn a_disconnect_returns_the_row_to_its_token_ids() {
     );
     assert_eq!(ids(&tasks(&app, "wH:p1")), ["bg-1"]);
 
-    app.apply_bus_event(BusEvent::Disconnected {
+    app.apply_task_event(TaskEvent::Disconnected {
         session: session('1').into(),
     });
     let rows = tasks(&app, "wH:p1");

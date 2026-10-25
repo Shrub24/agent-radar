@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::bus::{BusEvent, BusState, Connection, Message};
+use crate::bus::{Connection, Message};
+use crate::tasks::{TaskBoard, TaskEvent};
 
 use super::transport::IngestResult;
 
@@ -19,7 +20,7 @@ struct Client {
 struct State {
     clients: HashMap<u64, Client>,
     owners: HashMap<String, u64>,
-    sessions: BusState,
+    sessions: TaskBoard,
     updated_at: BTreeMap<String, u64>,
     revision: u64,
 }
@@ -69,7 +70,7 @@ impl TaskIngest {
                 if let Some(client) = state.clients.get_mut(&connection_id) {
                     client.session = Some(session.clone());
                 }
-                state.sessions.apply(BusEvent::Connected {
+                state.sessions.apply(TaskEvent::Connected {
                     session: session.clone(),
                     pane: hello.pane,
                 });
@@ -100,7 +101,7 @@ impl TaskIngest {
                         close_connections: Vec::new(),
                     };
                 }
-                state.sessions.apply(BusEvent::Tasks {
+                state.sessions.apply(TaskEvent::Tasks {
                     session: session.clone(),
                     tasks,
                 });
@@ -128,7 +129,7 @@ impl TaskIngest {
             && state.owners.get(&session) == Some(&connection_id)
         {
             state.owners.remove(&session);
-            state.sessions.apply(BusEvent::Disconnected {
+            state.sessions.apply(TaskEvent::Disconnected {
                 session: session.clone(),
             });
             state.updated_at.remove(&session);

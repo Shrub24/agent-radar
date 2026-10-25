@@ -25,6 +25,7 @@ pub mod reset;
 pub mod runtime;
 pub mod service;
 pub mod snapshot_fetch;
+pub mod tasks;
 pub mod theme;
 pub mod title;
 pub mod tmux;

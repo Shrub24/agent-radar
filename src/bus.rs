@@ -1,4 +1,8 @@
-//! Radar bus line protocol — the only module that sees raw publisher bytes.
+//! The temporary publisher bridge: the line protocol `pi-bash-processes` speaks on
+//! `radar.sock`, and the only module that sees raw publisher bytes.
+//!
+//! This is deleted, with no replacement lane, when Radar launches background
+//! tasks itself. The task model it fills lives in [`crate::tasks`].
 //!
 //! Publishers dial Radar over a Unix socket and write one JSON object per line
 //! (`docs/radar-bus.md`). [`Connection::ingest`] decodes a line into a typed
@@ -6,11 +10,12 @@
 //! the line it read and close on `Err`. Unknown message types and unknown
 //! fields are not errors: a newer publisher must not break an older Radar.
 
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::tasks::{Task, TaskState};
 
 /// The only protocol version this Radar accepts.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -28,48 +33,6 @@ pub struct Hello {
     pub session: String,
     /// Optional publisher hint; never used as task identity or a join key.
     pub pane: Option<String>,
-}
-
-/// A publisher's task state word.
-///
-/// The three known words are the publisher's vocabulary; any other word is a
-/// newer publisher's and is kept verbatim.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TaskState {
-    Running,
-    Flushing,
-    Review,
-    Unknown(String),
-}
-
-impl std::fmt::Display for TaskState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Running => "running",
-            Self::Flushing => "flushing",
-            Self::Review => "review",
-            Self::Unknown(word) => word,
-        })
-    }
-}
-
-/// One unresolved task as published. Every field except `id` and `state` is
-/// optional, and absent is not the same as a zero value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Task {
-    pub id: String,
-    pub state: TaskState,
-    /// Sensitive: written only to the terminal, never to a file or a log.
-    pub command: Option<String>,
-    /// Sensitive, as `command`.
-    pub cwd: Option<String>,
-    pub pid: Option<u32>,
-    /// Unix milliseconds.
-    pub started_at: Option<u64>,
-    /// Unix milliseconds of the last output.
-    pub last_output_at: Option<u64>,
-    pub output_bytes: Option<u64>,
-    pub exit_code: Option<i32>,
 }
 
 /// A decoded message. `Tasks` replaces the session's list; an empty list is a
@@ -227,93 +190,6 @@ impl From<TaskWire> for Task {
             output_bytes: wire.output_bytes,
             exit_code: wire.exit_code,
         }
-    }
-}
-
-/// One session's live bus data.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BusSession {
-    /// The pane the publisher named, where it had one; never used for joining.
-    pub pane: Option<String>,
-    /// The session's complete unresolved list as last published. An empty list
-    /// is a published "nothing unresolved", not silence.
-    pub tasks: Vec<Task>,
-}
-
-impl BusSession {
-    /// How many of the session's tasks are `running`. The `pi_bg_running` pane
-    /// token counts nothing else, so a comparison against the tokens is made
-    /// on this and not on the whole list.
-    pub fn running(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter(|task| task.state == TaskState::Running)
-            .count()
-    }
-}
-
-/// One item in the daemon task snapshot projected for the TUI.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BusEvent {
-    /// The daemon reports a connected publisher for this session.
-    Connected {
-        session: String,
-        pane: Option<String>,
-    },
-    /// The session's full replacement list.
-    Tasks { session: String, tasks: Vec<Task> },
-    /// No connected publisher remains for this session.
-    Disconnected { session: String },
-}
-
-/// Client-side projection of the daemon's volatile task snapshot.
-#[derive(Clone, Debug, Default)]
-pub struct BusState {
-    sessions: BTreeMap<String, BusSession>,
-}
-
-impl BusState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Applies one item from a fetched daemon task snapshot.
-    ///
-    /// A session's data exists only while its connection does: a disconnect
-    /// drops it entirely rather than leaving a last known list behind, so a
-    /// vanished publisher is never read as its tasks having ended.
-    pub fn apply(&mut self, event: BusEvent) {
-        match event {
-            BusEvent::Connected { session, pane } => {
-                self.sessions.insert(
-                    session,
-                    BusSession {
-                        pane,
-                        tasks: Vec::new(),
-                    },
-                );
-            }
-            BusEvent::Tasks { session, tasks } => {
-                if let Some(held) = self.sessions.get_mut(&session) {
-                    held.tasks = tasks;
-                }
-            }
-            BusEvent::Disconnected { session } => {
-                self.sessions.remove(&session);
-            }
-        }
-    }
-
-    /// The session's bus data, where a publisher is connected for it.
-    pub fn get(&self, session: &str) -> Option<&BusSession> {
-        self.sessions.get(session)
-    }
-
-    /// Every held session, for rendering beside the observation.
-    pub fn sessions(&self) -> impl Iterator<Item = (&str, &BusSession)> {
-        self.sessions
-            .iter()
-            .map(|(session, held)| (session.as_str(), held))
     }
 }
 

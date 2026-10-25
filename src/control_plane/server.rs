@@ -1664,7 +1664,7 @@ mod tests {
         let snapshot = client.task_snapshot().expect("dashboard task snapshot");
         assert!(snapshot.revision > 0);
         assert!(
-            matches!(snapshot.events.first(), Some(crate::bus::BusEvent::Connected { session, .. }) if session == "pi-session-a")
+            matches!(snapshot.events.first(), Some(crate::tasks::TaskEvent::Connected { session, .. }) if session == "pi-session-a")
         );
 
         publisher_stream

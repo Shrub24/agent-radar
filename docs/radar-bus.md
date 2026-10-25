@@ -9,11 +9,11 @@ background task's output.
 
 Radar's daemon now owns ingest and task state. The TUI is only a client of
 `tasks.list.v1`; it does not bind a publisher socket or apply publisher messages.
-For compatibility, the daemon temporarily accepts publishers on the existing
-bus socket path as a second socket entry into the same bounded Tokio transport.
-The versioned control socket and this compatibility entry share transport,
-trust checks, runtime, shutdown and lane admission. This temporary entry can be
-removed after the publisher migrates to the control socket's ingest lane.
+The daemon temporarily accepts publishers on the existing bus socket path as a
+second socket entry into the same bounded Tokio transport. The versioned control
+socket and this entry share transport, trust checks, runtime, shutdown and lane
+admission. The entry is a bridge, not a contract to migrate: it is removed, with
+no replacement lane, when Radar launches and owns background tasks itself.
 
 Task state is volatile, in-memory and connection-scoped. It is not written to
 the durable event log or operation store. A daemon restart loses the current

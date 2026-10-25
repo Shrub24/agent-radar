@@ -330,7 +330,7 @@ fn run() -> io::Result<()> {
         app.set_focus_message(Some(format!("no dashboard log: {reason}")));
     }
     let mut list = ListState::default();
-    app.set_bus_diagnostic(task_diagnostic);
+    app.set_task_diagnostic(task_diagnostic);
     // The daemon samples for every display; this fetcher is how the dashboard
     // reads what it published, and it is absent only from a daemon that does not
     // serve the observation contract, which the diagnostic screen refuses.
@@ -357,11 +357,11 @@ fn run() -> io::Result<()> {
                     // the dashboard no longer reads them separately.
                     if let Some(tasks) = snapshot.tasks.as_ref() {
                         match control_plane::client::tasks_from_snapshot(tasks) {
-                            Ok(events) => app.replace_bus_snapshot(events),
-                            Err(problem) => app.set_bus_diagnostic(Some(problem)),
+                            Ok(events) => app.replace_task_snapshot(events),
+                            Err(problem) => app.set_task_diagnostic(Some(problem)),
                         }
                     }
-                    app.set_bus_diagnostic(source_diagnostic(&snapshot, "tasks"));
+                    app.set_task_diagnostic(source_diagnostic(&snapshot, "tasks"));
                     state = snapshot.observation.clone();
                     app.refresh(&state);
                     dirty = true;

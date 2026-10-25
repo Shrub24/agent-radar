@@ -39,7 +39,6 @@ use serde_json::{Value, json};
 
 use super::ops;
 use super::{PROTOCOL_VERSION, socket_path, trusted_socket};
-use crate::bus::{BusEvent, Task, TaskState};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::runtime::{
@@ -47,6 +46,7 @@ use crate::runtime::{
     CreatedKind, CreatedLocation, FocusOutcome, InputOutcome, InputRequest, OutputOutcome,
     OutputRead, OutputRequest, ReportOutcome, ReportRequest, RuntimeProvider, Target,
 };
+use crate::tasks::{Task, TaskEvent, TaskState};
 
 /// How long one exchange with the daemon may take before it is treated as not
 /// answering.
@@ -94,7 +94,7 @@ struct TaskValue {
 #[derive(Clone, Debug)]
 pub struct TaskSnapshot {
     pub revision: u64,
-    pub events: Vec<BusEvent>,
+    pub events: Vec<TaskEvent>,
 }
 
 /// The label this caller's records carry, so an operator reading the store knows
@@ -560,18 +560,18 @@ pub fn connect_at(socket: &Path) -> Result<Selected, String> {
 /// A session that is not connected is not presented: the ingest keeps a
 /// disconnected session's last tasks for its own bookkeeping, and a display must
 /// not show work it can no longer see.
-fn bus_events(sessions: Vec<TaskSession>) -> Vec<BusEvent> {
+fn bus_events(sessions: Vec<TaskSession>) -> Vec<TaskEvent> {
     let mut events = Vec::new();
     for session in sessions {
         if !session.connected {
             continue;
         }
         let session_id = session.session;
-        events.push(BusEvent::Connected {
+        events.push(TaskEvent::Connected {
             session: session_id.clone(),
             pane: None,
         });
-        events.push(BusEvent::Tasks {
+        events.push(TaskEvent::Tasks {
             session: session_id,
             tasks: session
                 .tasks
@@ -602,7 +602,7 @@ fn bus_events(sessions: Vec<TaskSession>) -> Vec<BusEvent> {
 ///
 /// The snapshot's task source is the same `tasks.list` page the standalone read
 /// returns, so both paths present one shape.
-pub fn tasks_from_snapshot(tasks: &Value) -> Result<Vec<BusEvent>, String> {
+pub fn tasks_from_snapshot(tasks: &Value) -> Result<Vec<TaskEvent>, String> {
     let page: TasksPage = serde_json::from_value(tasks.clone())
         .map_err(|error| format!("the snapshot's task source is unreadable: {error}"))?;
     Ok(bus_events(page.sessions))

@@ -14,7 +14,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::bus::{BusSession, BusState, Task};
 use crate::control_plane::containers::Kind;
 use crate::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, LifecycleObservation,
@@ -22,6 +21,7 @@ use crate::model::{
 };
 use crate::observation::{ObservationState, RetentionBasis};
 use crate::registry_observation::{Binding, RegistryView};
+use crate::tasks::{SessionTasks, Task, TaskBoard};
 
 /// A finished session, as its title survives on a pane's label.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -656,7 +656,7 @@ impl FleetTree {
     /// which is why this is separate from [`Self::build`] and why the app calls
     /// it on a bus event as well as on a refresh. Nothing else is touched:
     /// folds and selection are keyed by [`RowId`] and survive either way.
-    pub fn attach_tasks(&mut self, bus: &BusState) {
+    pub fn attach_tasks(&mut self, bus: &TaskBoard) {
         for node in &mut self.roots {
             attach_node_tasks(node, bus);
         }
@@ -792,7 +792,7 @@ fn agent_node(
 }
 
 /// Recomputes one node's task children and every node's beneath it.
-fn attach_node_tasks(node: &mut TreeNode, bus: &BusState) {
+fn attach_node_tasks(node: &mut TreeNode, bus: &TaskBoard) {
     // Children first: a worker agent nested under this row owns its own tasks.
     for child in &mut node.children {
         attach_node_tasks(child, bus);
@@ -850,7 +850,7 @@ fn project_tasks(
     session_uuid: Option<&str>,
     facts: &HerdsmanFacts,
     last_observed: bool,
-    bus: &BusState,
+    bus: &TaskBoard,
 ) -> TaskProjection {
     if let Some((session, held)) = matched_session(session_uuid, bus) {
         return TaskProjection {
@@ -889,8 +889,8 @@ fn project_tasks(
 /// one pane are an ambiguity, not a coin toss.
 fn matched_session<'a>(
     session_uuid: Option<&'a str>,
-    bus: &'a BusState,
-) -> Option<(&'a str, &'a BusSession)> {
+    bus: &'a TaskBoard,
+) -> Option<(&'a str, &'a SessionTasks)> {
     let session = session_uuid?;
     bus.get(session).map(|held| (session, held))
 }
