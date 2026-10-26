@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use super::gate::{Completion, Gate};
 use super::navigation::{self, NavState, NavStep, Navigation, PaneView, RowOrder, TaskRows};
 use crate::control_plane::public_contracts::ui_session as dto;
 use crate::model::AgentState;
@@ -65,6 +66,7 @@ pub struct Session {
     bus: TaskBoard,
     attachments: HashMap<String, Attachment>,
     editor: Option<String>,
+    gate: Gate,
     current: Published,
     retained: VecDeque<(String, Arc<Vec<dto::TreeRow>>)>,
 }
@@ -82,6 +84,7 @@ impl Session {
             bus: TaskBoard::default(),
             attachments: HashMap::new(),
             editor: None,
+            gate: Gate::default(),
             current: Published {
                 update_id: 0,
                 tree_hash: String::new(),
@@ -143,8 +146,11 @@ impl Session {
     /// Releases an attachment and its editor ownership; the accepted query stays.
     pub fn detach(&mut self, id: &str) -> bool {
         let known = self.attachments.remove(id).is_some();
-        if self.editor.as_deref() == Some(id) {
+        let released = self.editor.as_deref() == Some(id);
+        if released {
             self.editor = None;
+        }
+        if self.gate.attachment_lost(id) || released {
             self.project();
         }
         known
@@ -162,6 +168,20 @@ impl Session {
 
     /// Applies action `action_id` of attachment `id` once and in order.
     pub fn act(&mut self, id: &str, action_id: u64, action: dto::UiAction) -> dto::ActionOutcome {
+        self.act_stamped(id, action_id, None, action)
+    }
+
+    /// As [`Self::act`] for input interpreted under gate generation `gate`.
+    /// Ordinary input from before the gate last changed is refused, so a key
+    /// typed for one screen cannot land on another. Interaction actions name
+    /// their interaction and are not stamped.
+    pub fn act_stamped(
+        &mut self,
+        id: &str,
+        action_id: u64,
+        gate: Option<u64>,
+        action: dto::UiAction,
+    ) -> dto::ActionOutcome {
         use dto::ActionOutcome as Out;
         let fingerprint = serde_json::to_string(&action).unwrap_or_default();
         let Some(attachment) = self.attachments.get(id) else {
@@ -179,9 +199,12 @@ impl Session {
                     message: format!("action {action_id} was already used for another action"),
                 },
                 Some(receipt) => match &receipt.outcome {
-                    Out::Applied { update_id } => Out::Replayed {
+                    Out::Applied {
+                        update_id,
+                        interaction_id,
+                    } => Out::Replayed {
                         update_id: *update_id,
-                        interaction_id: None,
+                        interaction_id: interaction_id.clone(),
                         request_id: None,
                     },
                     other => other.clone(),
@@ -194,9 +217,26 @@ impl Session {
             };
         }
         let role = attachment.role;
-        let outcome = match self.apply(id, role, action) {
-            Ok(()) => Out::Applied {
+        let interaction = !matches!(
+            action,
+            dto::UiAction::RunCommand { .. }
+                | dto::UiAction::ResolveInteraction { .. }
+                | dto::UiAction::CancelInteraction { .. }
+                | dto::UiAction::ProvideChoices { .. }
+                | dto::UiAction::ClaimPresentation { .. }
+                | dto::UiAction::AcknowledgePresentation { .. }
+        );
+        let outcome = match if interaction && gate.is_some_and(|g| g != self.gate.generation()) {
+            Err((
+                dto::RefusalCode::StaleGate,
+                "the screen changed under that input".to_string(),
+            ))
+        } else {
+            self.apply(id, role, action)
+        } {
+            Ok(interaction_id) => Out::Applied {
                 update_id: self.current.update_id,
+                interaction_id,
             },
             Err((code, message)) => Out::Refused { code, message },
         };
@@ -221,7 +261,7 @@ impl Session {
         id: &str,
         role: dto::AttachmentRole,
         action: dto::UiAction,
-    ) -> Result<(), (dto::RefusalCode, String)> {
+    ) -> Result<Option<String>, (dto::RefusalCode, String)> {
         use dto::UiAction as A;
         let refuse = |code, message: &str| Err((code, message.to_string()));
         if role == dto::AttachmentRole::Presenter
@@ -237,6 +277,20 @@ impl Session {
                 dto::RefusalCode::Role,
                 "a presenter only resolves its interaction",
             );
+        }
+        // One shared interaction at a time, and while it is open nothing else
+        // changes what the screens agree on.
+        if self.gate.is_open()
+            && !matches!(
+                action,
+                A::ResolveInteraction { .. }
+                    | A::CancelInteraction { .. }
+                    | A::ProvideChoices { .. }
+                    | A::ClaimPresentation { .. }
+                    | A::AcknowledgePresentation { .. }
+            )
+        {
+            return refuse(dto::RefusalCode::Blocked, "an interaction is open");
         }
         let owns = self.editor.as_deref() == Some(id);
         let foreign = self.editor.is_some() && !owns;
@@ -294,19 +348,42 @@ impl Session {
                 }
                 self.nav.apply(&NavStep::ClearFilter);
             }
-            A::RunCommand { .. }
-            | A::ResolveInteraction { .. }
-            | A::CancelInteraction { .. }
-            | A::ClaimPresentation { .. }
-            | A::AcknowledgePresentation { .. } => {
+            A::RunCommand {
+                command: dto::SharedCommand::NewWorkspace,
+                row,
+            } => {
+                let interaction = self.gate.begin(id, dto::SharedCommand::NewWorkspace, row)?;
+                // Starting a blocking interaction ends editing: the query stays.
+                self.editor = None;
+                self.project();
+                return Ok(Some(interaction));
+            }
+            A::ProvideChoices {
+                interaction_id,
+                choices,
+            } => self.gate.provide_choices(id, &interaction_id, choices)?,
+            A::ClaimPresentation { interaction_id } => self.gate.claim(id, &interaction_id)?,
+            A::ResolveInteraction {
+                interaction_id,
+                result,
+            } => self.gate.resolve(&interaction_id, result)?,
+            A::CancelInteraction { interaction_id } => self.gate.cancel(&interaction_id)?,
+            // Delivery tracking arrives with addressed presentation effects.
+            A::AcknowledgePresentation { .. } => {}
+            A::RunCommand { .. } => {
                 return refuse(
                     dto::RefusalCode::Unavailable,
-                    "interactions are not served yet",
+                    "that command is not served by the session yet",
                 );
             }
         }
         self.project();
-        Ok(())
+        Ok(None)
+    }
+
+    /// What accepted interactions have set in motion, for the actor to dispatch.
+    pub fn take_completions(&mut self) -> Vec<Completion> {
+        self.gate.take_completions()
     }
 
     fn step(&mut self, step: NavStep) {
@@ -372,6 +449,8 @@ impl Session {
                 all: nav.task_rows.all,
             },
             collapsed: nav.collapsed.iter().map(ui_row_id).collect(),
+            gate: self.gate.generation(),
+            blocking: self.gate.blocking(),
             filter: dto::FilterState {
                 query: nav.filter,
                 editor: self.editor.clone(),
@@ -562,7 +641,7 @@ mod tests {
         let mut session = seeded();
         assert_eq!(session.act("a", 2, A::CycleOrder), Out::Gap { expected: 1 });
         let first = session.act("a", 1, A::CycleOrder);
-        let Out::Applied { update_id } = first else {
+        let Out::Applied { update_id, .. } = first else {
             panic!("applied, got {first:?}");
         };
         // A retry returns the original acceptance and does not cycle again.
@@ -783,5 +862,236 @@ mod tests {
             "{:?}",
             worst(&filters)
         );
+    }
+
+    fn open_gate(session: &mut Session, by: &str, number: u64) -> String {
+        let Out::Applied {
+            interaction_id: Some(interaction),
+            ..
+        } = session.act(
+            by,
+            number,
+            A::RunCommand {
+                command: dto::SharedCommand::NewWorkspace,
+                row: None,
+            },
+        )
+        else {
+            panic!("the command should open an interaction");
+        };
+        interaction
+    }
+
+    fn offer(session: &mut Session, by: &str, number: u64, interaction: &str) {
+        let offered = session.act(
+            by,
+            number,
+            A::ProvideChoices {
+                interaction_id: interaction.into(),
+                choices: vec!["/p/one".into(), "/p/two".into(), "/p/one".into()],
+            },
+        );
+        assert!(matches!(offered, Out::Applied { .. }), "{offered:?}");
+    }
+
+    fn refused_with(outcome: Out) -> RefusalCode {
+        match outcome {
+            Out::Refused { code, .. } => code,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_open_interaction_blocks_the_session_until_one_result_wins() {
+        let mut session = seeded();
+        // Editing ends when an interaction begins, and the query is kept.
+        session.act("a", 1, A::BeginFilterEdit);
+        session.act("a", 2, A::SetFilterQuery { query: "ag".into() });
+        let interaction = open_gate(&mut session, "a", 3);
+        assert_eq!(session.current().state.filter.editor, None);
+        assert_eq!(session.current().state.filter.query, "ag");
+        let blocking = session.current().state.blocking.clone().unwrap();
+        assert_eq!(blocking.stage, dto::InteractionStage::Preparing);
+
+        // Nothing the screens agree on changes while it is open, for anyone.
+        for (by, number) in [("a", 4), ("b", 1)] {
+            assert_eq!(
+                refused_with(session.act(by, number, A::CycleOrder)),
+                RefusalCode::Blocked
+            );
+        }
+        // Another interaction cannot open beside it.
+        assert_eq!(
+            refused_with(session.act(
+                "b",
+                2,
+                A::RunCommand {
+                    command: dto::SharedCommand::NewWorkspace,
+                    row: None
+                }
+            )),
+            RefusalCode::Blocked
+        );
+
+        // A result before the choices exist, from the wrong view, or outside
+        // the choices does not close it.
+        let project = |path: &str| A::ResolveInteraction {
+            interaction_id: interaction.clone(),
+            result: dto::InteractionResult::Project { path: path.into() },
+        };
+        assert_eq!(
+            refused_with(session.act("b", 3, project("/p/one"))),
+            RefusalCode::Conflict
+        );
+        assert_eq!(
+            refused_with(session.act(
+                "b",
+                4,
+                A::ProvideChoices {
+                    interaction_id: interaction.clone(),
+                    choices: vec![]
+                }
+            )),
+            RefusalCode::Role
+        );
+        offer(&mut session, "a", 5, &interaction);
+        assert_eq!(
+            session.current().state.blocking.as_ref().unwrap().stage,
+            dto::InteractionStage::AwaitingResult
+        );
+        assert_eq!(
+            refused_with(session.act("b", 5, project("/elsewhere"))),
+            RefusalCode::BadResult
+        );
+
+        // The first valid result wins; the cancel that follows finds nothing.
+        assert!(matches!(
+            session.act("b", 6, project("/p/two")),
+            Out::Applied { .. }
+        ));
+        assert_eq!(session.current().state.blocking, None);
+        assert_eq!(
+            refused_with(session.act(
+                "a",
+                6,
+                A::CancelInteraction {
+                    interaction_id: interaction.clone()
+                }
+            )),
+            RefusalCode::NoInteraction
+        );
+        let done = session.take_completions();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].interaction_id, interaction);
+        assert_eq!(
+            done[0].result,
+            dto::InteractionResult::Project {
+                path: "/p/two".into()
+            }
+        );
+        // The session navigates again.
+        assert!(matches!(
+            session.act("b", 7, A::CycleOrder),
+            Out::Applied { .. }
+        ));
+    }
+
+    #[test]
+    fn any_view_can_cancel_and_a_cancelled_result_never_dispatches() {
+        let mut session = seeded();
+        let interaction = open_gate(&mut session, "a", 1);
+        offer(&mut session, "a", 2, &interaction);
+        let cancel = A::CancelInteraction {
+            interaction_id: interaction.clone(),
+        };
+        assert!(matches!(session.act("b", 1, cancel), Out::Applied { .. }));
+        let late = session.act(
+            "a",
+            3,
+            A::ResolveInteraction {
+                interaction_id: interaction,
+                result: dto::InteractionResult::Project {
+                    path: "/p/one".into(),
+                },
+            },
+        );
+        assert_eq!(refused_with(late), RefusalCode::NoInteraction);
+        assert!(session.take_completions().is_empty());
+    }
+
+    #[test]
+    fn input_from_before_the_gate_changed_is_refused_but_current_input_is_not() {
+        let mut session = seeded();
+        let before = session.current().state.gate;
+        let interaction = open_gate(&mut session, "a", 1);
+        session.act(
+            "a",
+            2,
+            A::CancelInteraction {
+                interaction_id: interaction,
+            },
+        );
+        assert!(session.current().state.gate > before);
+        let stale = session.act_stamped("a", 3, Some(before), A::CycleOrder);
+        assert_eq!(refused_with(stale), RefusalCode::StaleGate);
+        let current = session.current().state.gate;
+        assert!(matches!(
+            session.act_stamped("a", 4, Some(current), A::CycleOrder),
+            Out::Applied { .. }
+        ));
+    }
+
+    #[test]
+    fn one_presenter_holds_the_claim_and_losing_the_invoker_or_presenter_cannot_wedge_the_gate() {
+        let mut session = seeded();
+        session
+            .attach("p1", dto::AttachmentRole::Presenter)
+            .unwrap();
+        session
+            .attach("p2", dto::AttachmentRole::Presenter)
+            .unwrap();
+        let interaction = open_gate(&mut session, "a", 1);
+        let claim = || A::ClaimPresentation {
+            interaction_id: interaction.clone(),
+        };
+        // Nothing to present while the invoker is still preparing.
+        assert_eq!(
+            refused_with(session.act("p1", 1, claim())),
+            RefusalCode::Conflict
+        );
+        offer(&mut session, "a", 2, &interaction);
+        assert!(matches!(session.act("p1", 2, claim()), Out::Applied { .. }));
+        assert_eq!(
+            refused_with(session.act("p2", 1, claim())),
+            RefusalCode::Conflict
+        );
+        assert!(session.current().state.blocking.as_ref().unwrap().claimed);
+
+        // The presenter leaves: another may take over; the gate is not stuck.
+        session.detach("p1");
+        assert!(!session.current().state.blocking.as_ref().unwrap().claimed);
+        assert!(matches!(session.act("p2", 2, claim()), Out::Applied { .. }));
+
+        // An invoker lost while still preparing ends its interaction.
+        session.act(
+            "p2",
+            3,
+            A::CancelInteraction {
+                interaction_id: interaction,
+            },
+        );
+        let second = open_gate(&mut session, "a", 3);
+        assert_eq!(
+            session
+                .current()
+                .state
+                .blocking
+                .as_ref()
+                .unwrap()
+                .interaction_id,
+            second
+        );
+        session.detach("a");
+        assert_eq!(session.current().state.blocking, None);
     }
 }

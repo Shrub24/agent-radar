@@ -60,7 +60,12 @@ pub(super) fn request(handle: Option<&UiHandle>, request: &Request) -> Response 
                 Ok(params) => params,
                 Err(response) => return response,
             };
-            match handle.act(&params.attachment_id, params.action_id, params.action) {
+            match handle.act(
+                &params.attachment_id,
+                params.action_id,
+                params.gate,
+                params.action,
+            ) {
                 Ok(outcome) => Response::ok(&request.id, json!(outcome)),
                 Err(error) => refusal(request, error),
             }

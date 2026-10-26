@@ -48,7 +48,13 @@ enum Msg {
         Reply<Result<(), dto::RefusalCode>>,
     ),
     Detach(String),
-    Act(String, u64, dto::UiAction, Reply<dto::ActionOutcome>),
+    Act(
+        String,
+        u64,
+        Option<u64>,
+        dto::UiAction,
+        Reply<dto::ActionOutcome>,
+    ),
     Content(String, Reply<Option<Arc<Vec<dto::TreeRow>>>>),
     Subscribe(String, Reply<Result<(), dto::RefusalCode>>),
     Stop,
@@ -152,8 +158,8 @@ fn run(
                     unsubscribed.remove(&id);
                     session.detach(&id);
                 }
-                Msg::Act(id, number, action, reply) => {
-                    let _ = reply.send(session.act(&id, number, action));
+                Msg::Act(id, number, gate, action, reply) => {
+                    let _ = reply.send(session.act_stamped(&id, number, gate, action));
                 }
                 Msg::Content(hash, reply) => {
                     let _ = reply.send(session.content(&hash));
@@ -240,9 +246,10 @@ impl UiHandle {
         &self,
         id: &str,
         number: u64,
+        gate: Option<u64>,
         action: dto::UiAction,
     ) -> Result<dto::ActionOutcome, UiError> {
-        match self.ask(|reply| Msg::Act(id.to_string(), number, action, reply)) {
+        match self.ask(|reply| Msg::Act(id.to_string(), number, gate, action, reply)) {
             Err(UiError::Busy) => Ok(dto::ActionOutcome::Busy),
             other => other,
         }
@@ -361,7 +368,7 @@ mod tests {
 
         // Actions travel a different path from the stream and never wait on it.
         assert!(matches!(
-            handle.act("a", 1, A::Move { delta: 1 }).unwrap(),
+            handle.act("a", 1, None, A::Move { delta: 1 }).unwrap(),
             Out::Applied { .. }
         ));
         let moved = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -390,6 +397,9 @@ mod tests {
             handle.attachments() == 0
         });
         assert!(released, "losing the subscription detaches its attachment");
-        assert_eq!(handle.act("a", 1, A::CycleOrder).unwrap(), Out::Detached);
+        assert_eq!(
+            handle.act("a", 1, None, A::CycleOrder).unwrap(),
+            Out::Detached
+        );
     }
 }

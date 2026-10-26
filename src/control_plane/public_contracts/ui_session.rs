@@ -131,6 +131,32 @@ pub struct SessionState {
     /// Folded branches, sorted.
     pub collapsed: Vec<UiRowId>,
     pub filter: FilterState,
+    /// Advances every time the interaction gate opens or closes. Input is
+    /// stamped with the generation it was interpreted under.
+    pub gate: u64,
+    /// The one shared interaction that currently blocks the session, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking: Option<Blocking>,
+}
+
+/// A shared interaction in progress, as every view sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Blocking {
+    pub interaction_id: String,
+    pub command: SharedCommand,
+    pub stage: InteractionStage,
+    /// Whether a presenter holds the claim.
+    pub claimed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionStage {
+    /// The invoking frontend is gathering what the interaction offers.
+    Preparing,
+    /// The choices are fixed and a presenter is to answer.
+    AwaitingResult,
 }
 
 /// Whether background tasks are listed, remembered separately for each pane view.
@@ -214,6 +240,11 @@ pub enum UiAction {
         interaction_id: String,
         result: InteractionResult,
     },
+    /// The invoking frontend's gathered choices, which fix what a result may be.
+    ProvideChoices {
+        interaction_id: String,
+        choices: Vec<String>,
+    },
     CancelInteraction {
         interaction_id: String,
     },
@@ -245,6 +276,10 @@ pub enum RefusalCode {
     Role,
     /// The session cannot serve this action yet.
     Unavailable,
+    /// The input was interpreted under an earlier interaction gate.
+    StaleGate,
+    /// The result is not one of the choices the interaction offered.
+    BadResult,
 }
 
 /// The outcome of one action. A retry of an identical action returns the
@@ -254,6 +289,9 @@ pub enum RefusalCode {
 pub enum ActionOutcome {
     Applied {
         update_id: u64,
+        /// The interaction this action opened, when it opened one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interaction_id: Option<String>,
     },
     Refused {
         code: RefusalCode,
@@ -343,6 +381,11 @@ pub struct ContentGetResult {
 pub struct ActionParams {
     pub attachment_id: String,
     pub action_id: u64,
+    /// The gate generation the input was interpreted under. Navigation stamped
+    /// with an earlier generation is refused; interaction actions are named by
+    /// interaction id instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<u64>,
     pub action: UiAction,
 }
 

@@ -7,3 +7,4 @@ pub mod session;
 pub use session::Session;
 pub mod actor;
 pub mod client;
+pub mod gate;

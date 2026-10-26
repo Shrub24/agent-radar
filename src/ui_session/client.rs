@@ -391,17 +391,22 @@ fn send(inner: &Inner, action: dto::UiAction) {
     };
     let number = link.next_action;
     link.next_action += 1;
+    // Interpreted against the newest state this client holds, so input typed
+    // for a screen the gate has since replaced is refused, not applied.
+    let gate = locked(&inner.latest)
+        .as_ref()
+        .map(|mirror| mirror.state.gate);
     let outcome = exchange(
         &mut link.action,
         &mut link.reader,
         "ui.action",
-        json!({"attachment_id": link.attachment, "action_id": number, "action": action}),
+        json!({"attachment_id": link.attachment, "action_id": number, "gate": gate, "action": action}),
     )
     .and_then(|value| {
         serde_json::from_value::<dto::ActionOutcome>(value).map_err(|error| error.to_string())
     });
     match outcome {
-        Ok(dto::ActionOutcome::Applied { update_id })
+        Ok(dto::ActionOutcome::Applied { update_id, .. })
         | Ok(dto::ActionOutcome::Replayed { update_id, .. }) => {
             inner.floor.fetch_max(update_id, Ordering::SeqCst);
         }
