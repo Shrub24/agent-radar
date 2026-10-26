@@ -100,8 +100,7 @@ impl App {
         let (id, disclosure) = self.row_under(at)?;
         if matches!(id, RowId::Workspace(_)) {
             self.select(Some(id));
-            self.toggle_fold();
-            return None;
+            return self.run(CommandId::Fold);
         }
         if disclosure {
             // The pointer said where, not which row to act on: the disclosure
@@ -112,7 +111,7 @@ impl App {
         let already = self.nav.selected_id() == Some(&id);
         self.select(Some(id));
         if already {
-            return self.focus_selected();
+            return self.run(CommandId::Focus);
         }
         None
     }

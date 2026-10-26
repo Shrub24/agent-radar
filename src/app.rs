@@ -1896,6 +1896,25 @@ mod tests {
             Some(owner_row)
         );
 
+        // A task its publisher stops reporting hands the selection to the agent
+        // it hung under, not to whichever row now sits at its position.
+        let task = app
+            .visible_rows()
+            .into_iter()
+            .map(|row| row.id.clone())
+            .find(|id| matches!(id, RowId::Task(task) if task.id == "bg-1"))
+            .expect("bg-1 is listed");
+        select_row(&mut app, &task);
+        app.apply_task_event(TaskEvent::Tasks {
+            session: session.clone(),
+            tasks: vec![task_with_command("bg-2", "nix build .#radar")],
+        });
+        assert_eq!(
+            app.selected_row().map(|row| row.id.clone()),
+            Some(RowId::Agent("wA:p1".into())),
+            "a vanished task falls back to its owner"
+        );
+
         // Back on a page with one block, the keyboard is on that block rather
         // than at a position the page does not have, so the marker drawn is the
         // one Enter would open.
