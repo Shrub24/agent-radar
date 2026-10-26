@@ -49,7 +49,7 @@ pub struct Cli {
 pub enum Invocation {
     /// Run the dashboard as a narrow tree for a split beside an agent's tmux client.
     Sidebar,
-    /// Experimental tmux-hosted workspace with a sidebar and a dashboard popup.
+    /// Experimental tmux-hosted workspace: the sidebar beside an attachment to the agents' server.
     Workspace {
         /// Existing session on the daemon's tmux server; omit for tmux's default.
         #[arg(long)]
