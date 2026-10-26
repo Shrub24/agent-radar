@@ -149,6 +149,21 @@ impl Navigation {
         self.collapsed.contains(id)
     }
 
+    /// The projected node for a row identity, whatever the current view shows.
+    /// A captured target is looked up by identity, never by position.
+    pub fn node(&self, id: &RowId) -> Option<&TreeNode> {
+        fn find<'a>(nodes: &'a [TreeNode], id: &RowId) -> Option<&'a TreeNode> {
+            nodes.iter().find_map(|node| {
+                if &node.row.id == id {
+                    Some(node)
+                } else {
+                    find(&node.children, id)
+                }
+            })
+        }
+        find(&self.tree.roots, id)
+    }
+
     /// Rows currently displayed, in source order, honouring folds, the
     /// ordinary-pane toggle and the filter.
     pub fn visible_rows(&self) -> Vec<VisibleRow<'_>> {
@@ -558,6 +573,131 @@ pub struct Connectors {
     pub has_following_sibling: bool,
 }
 
+/// One row of the tree as drawn.
+///
+/// The session's projection decides which rows exist and in what order; this
+/// view's own observation explains them. A projected row it cannot explain is
+/// still drawn, because the session says the row is there — it is only without
+/// the detail that lives on this side of the wire.
+pub enum DrawRow<'a> {
+    Known(VisibleRow<'a>),
+    Structure {
+        /// This view's own row identity for the projected row. Owned, because a
+        /// row the local tree does not hold has nothing to borrow it from.
+        id: RowId,
+        /// The projected row, for the little this side of the wire can say.
+        row: &'a crate::control_plane::public_contracts::ui_session::TreeRow,
+        connectors: Connectors,
+    },
+}
+
+impl<'a> DrawRow<'a> {
+    pub fn id(&self) -> &RowId {
+        match self {
+            Self::Known(row) => row.id,
+            Self::Structure { id, .. } => id,
+        }
+    }
+
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::Known(row) => row.depth,
+            Self::Structure { row, .. } => row.depth as usize,
+        }
+    }
+
+    /// Whether the row has children this view can show.
+    pub fn has_children(&self) -> bool {
+        match self {
+            Self::Known(row) => row.has_children,
+            Self::Structure { row, .. } => row.has_children,
+        }
+    }
+
+    /// Where the disclosure marker begins, in cells from the panel's left edge.
+    pub fn marker_column(&self) -> u16 {
+        match self {
+            Self::Known(row) => row.marker_column(),
+            Self::Structure { connectors, .. } => {
+                (connectors.continuation.len() as u16 + u16::from(self.depth() > 0)) * 2
+            }
+        }
+    }
+}
+
+/// The session's ordered rows, joined to the local tree for everything the wire
+/// does not carry.
+///
+/// The join is by row identity, never by position: a row the local observation
+/// lacks is drawn from the projection alone, and one the projection dropped is
+/// not drawn at all, however this view's tree happens to look.
+pub fn projected<'a>(
+    rows: &'a [crate::control_plane::public_contracts::ui_session::TreeRow],
+    nav: &'a Navigation,
+) -> Vec<DrawRow<'a>> {
+    let depths: Vec<usize> = rows.iter().map(|row| row.depth as usize).collect();
+    let ids: Vec<RowId> = rows
+        .iter()
+        .map(|row| super::session::row_id(&row.id))
+        .collect();
+    let mut drawn = Vec::with_capacity(rows.len());
+    for (index, wire) in rows.iter().enumerate() {
+        let connectors = flat_connectors(&depths, index);
+        match nav.node(&ids[index]) {
+            Some(node) => drawn.push(DrawRow::Known(VisibleRow {
+                id: &node.row.id,
+                depth: depths[index],
+                node,
+                has_children: wire.has_children,
+                collapsed: wire.collapsed,
+                connectors,
+            })),
+            None => drawn.push(DrawRow::Structure {
+                id: ids[index].clone(),
+                row: wire,
+                connectors,
+            }),
+        }
+    }
+    drawn
+}
+
+/// The branch prefix of one row of a flat, depth-annotated listing.
+///
+/// A row's own connector and each ancestor's continuation are read from the
+/// depths around it: a sibling follows when the next row of the same depth comes
+/// before any shallower one, and an ancestor's line continues when that ancestor
+/// has a following sibling of its own.
+fn flat_connectors(depths: &[usize], index: usize) -> Connectors {
+    fn sibling_follows(depths: &[usize], from: usize, depth: usize) -> bool {
+        for &next in depths.iter().skip(from) {
+            if next < depth {
+                return false;
+            }
+            if next == depth {
+                return true;
+            }
+        }
+        false
+    }
+    let depth = depths[index];
+    let mut continuation = Vec::new();
+    // Each ancestor column, outermost first: find that ancestor by walking back.
+    for level in 1..depth {
+        let mut ancestor = index;
+        while ancestor > 0 && depths[ancestor] > level {
+            ancestor -= 1;
+        }
+        continuation.push(
+            depths[ancestor] >= level && sibling_follows(depths, index.min(ancestor) + 1, level),
+        );
+    }
+    Connectors {
+        continuation,
+        has_following_sibling: sibling_follows(depths, index + 1, depth),
+    }
+}
+
 /// The prefix a child row draws: its parent's continuation columns, then the
 /// parent's own column when the parent is itself nested. A workspace root draws
 /// no connector, so its children start with an empty prefix and it leaves no
@@ -940,5 +1080,115 @@ fn collect_filtered<'a>(
             child_connectors(&connectors, depth, index + 1 < count),
             out,
         );
+    }
+}
+
+#[cfg(test)]
+mod projected_tests {
+    use super::*;
+    use crate::control_plane::public_contracts::ui_session as dto;
+
+    fn wire(id: dto::UiRowId, depth: u32, has_children: bool) -> dto::TreeRow {
+        dto::TreeRow {
+            id,
+            depth,
+            label: "row".into(),
+            state: None,
+            has_children,
+            collapsed: false,
+            needs_attention: false,
+            working: false,
+        }
+    }
+
+    fn nav_with_fixture() -> Navigation {
+        let mut state = crate::observation::ObservationState::new();
+        state.apply_success(crate::model::testing::fleet());
+        let mut nav = Navigation::default();
+        nav.replace_tree(FleetTree::build(&state));
+        nav
+    }
+
+    #[test]
+    fn the_projection_decides_order_and_nesting_and_the_tree_only_explains_it() {
+        let nav = nav_with_fixture();
+        let local: Vec<dto::UiRowId> = nav
+            .visible_rows()
+            .iter()
+            .take(3)
+            .map(|row| crate::ui_session::session::ui_row_id(row.id))
+            .collect();
+        assert_eq!(local.len(), 3, "the fixture has rows");
+        let mut rows: Vec<dto::TreeRow> =
+            local.iter().cloned().map(|id| wire(id, 0, false)).collect();
+        // A row this view's observation does not hold: the session says it is
+        // there, so it is drawn as structure.
+        let stranger = dto::UiRowId::Pane {
+            pane_id: "gone:p9".into(),
+        };
+        rows.push(wire(stranger, 0, false));
+        // A nested row, to read the branch prefix from the flat listing.
+        rows.push(wire(local[0].clone(), 1, false));
+
+        let drawn = super::projected(&rows, &nav);
+        assert_eq!(drawn.len(), rows.len(), "every projected row is drawn");
+        match &drawn[0] {
+            // The next row is at the same depth, so this branch continues.
+            DrawRow::Known(row) => assert!(row.connectors.has_following_sibling),
+            DrawRow::Structure { .. } => panic!("a fixture row is in this view's tree"),
+        }
+        assert_eq!(
+            drawn[0].id(),
+            &crate::ui_session::session::row_id(&local[0]),
+            "order is the projection's"
+        );
+        match &drawn[3] {
+            DrawRow::Structure { id, .. } => {
+                assert_eq!(id, &RowId::Pane("gone:p9".into()), "drawn by identity");
+            }
+            DrawRow::Known(_) => panic!("a row the tree lacks must not borrow detail"),
+        }
+        match &drawn[4] {
+            DrawRow::Known(row) => {
+                assert_eq!(row.depth, 1, "nesting comes from the projection");
+                assert!(
+                    row.connectors.continuation.is_empty(),
+                    "a child of a root draws no continuation column"
+                );
+            }
+            DrawRow::Structure { .. } => panic!("a fixture row is in this view's tree"),
+        }
+    }
+
+    #[test]
+    fn a_deeper_row_keeps_the_ancestor_column_that_continues_past_it() {
+        let nav = nav_with_fixture();
+        let local =
+            |index: usize| crate::ui_session::session::ui_row_id(nav.visible_rows()[index].id);
+        // root, child, grandchild, then another child: the first child's line
+        // continues past the grandchild.
+        let rows = vec![
+            wire(local(0), 0, true),
+            wire(local(0), 1, true),
+            wire(local(0), 2, false),
+            wire(local(1), 1, false),
+        ];
+        let drawn = super::projected(&rows, &nav);
+        match &drawn[2] {
+            DrawRow::Known(row) => {
+                assert_eq!(row.connectors.continuation, vec![true]);
+                assert!(!row.connectors.has_following_sibling);
+            }
+            DrawRow::Structure { .. } => panic!("a fixture row is in this view's tree"),
+        }
+    }
+
+    #[test]
+    fn a_row_the_projection_dropped_is_not_drawn() {
+        let nav = nav_with_fixture();
+        let first = crate::ui_session::session::ui_row_id(nav.visible_rows()[0].id);
+        let rows = vec![wire(first, 0, false)];
+        let drawn = super::projected(&rows, &nav);
+        assert_eq!(drawn.len(), 1, "the tree's extra rows are not drawn");
     }
 }

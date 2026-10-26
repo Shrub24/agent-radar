@@ -1688,7 +1688,18 @@ mod tests {
             .write_all(b"{\"type\":\"tasks\",\"tasks\":[]}\n")
             .expect("publish task snapshot");
 
-        let page = call(&control, "tasks.list", json!({"limit": 10}));
+        // The publisher's snapshot is ingested asynchronously off its own
+        // connection: the read below waits for the session to appear with it
+        // rather than assuming the write and the ingest are the same instant.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let page = loop {
+            let page = call(&control, "tasks.list", json!({"limit": 10}));
+            let ingested = page["result"]["sessions"][0]["tasks"].is_array();
+            if ingested || std::time::Instant::now() > deadline {
+                break page;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert!(page["result"]["revision"].as_u64().is_some());
         assert_eq!(page["result"]["sessions"][0]["session"], "pi-session-a");
         assert_eq!(page["result"]["sessions"][0]["connected"], true);

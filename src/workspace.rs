@@ -231,23 +231,6 @@ fn commands(tmux: &str, host: &str, pane: &str) -> SidebarConfig {
     }
 }
 
-/// The tmux command that floats `radar modal` over the whole workspace: the
-/// outer client, so the sidebar and the agent area both lie behind it. A picker
-/// is a list and gets the larger block; a confirmation is a few lines.
-pub fn popup_command(radar: &str, key: char, row: Option<&str>) -> Option<Vec<String>> {
-    let host = std::env::var("RADAR_WORKSPACE_SERVER").ok()?;
-    let pane = std::env::var("RADAR_WORKSPACE_SIDEBAR").ok()?;
-    let tmux = crate::service::program("RADAR_TMUX", "tmux");
-    Some(popup(
-        &tmux.to_string_lossy(),
-        &host,
-        &pane,
-        radar,
-        key,
-        row,
-    ))
-}
-
 /// Launches a presenter addressed by interaction identity, never by a synthetic key.
 pub fn presenter_command(radar: &str, interaction: &str) -> Option<Vec<String>> {
     let host = std::env::var("RADAR_WORKSPACE_SERVER").ok()?;

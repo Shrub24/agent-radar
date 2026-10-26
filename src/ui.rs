@@ -24,9 +24,7 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{
-    App, DetailPage, Disclosure, Geometry, Operation, ProcessRow, ProcessTable, VisibleRow,
-};
+use crate::app::{App, DetailPage, Disclosure, Geometry, ProcessRow, ProcessTable, VisibleRow};
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -77,9 +75,6 @@ pub fn render(
     list_state: &mut ListState,
     tick: usize,
 ) -> Geometry {
-    if app.is_modal_only() {
-        return render_modal(frame, app);
-    }
     let compact = app.sidebar_compact();
     let rail = app.sidebar_railed();
     let area = if compact {
@@ -112,7 +107,7 @@ pub fn render(
         app,
     );
 
-    let rows = app.visible_rows();
+    let rows = app.draw_rows();
     let block = if compact {
         Block::new()
     } else {
@@ -129,20 +124,22 @@ pub fn render(
             tree_area,
         );
     } else {
+        let current = matches!(state.source_freshness(), SourceFreshness::Current);
         let items: Vec<ListItem> = rows
             .iter()
-            .map(|row| {
-                if rail {
-                    rail_item(row, tick)
-                } else {
-                    row_item(
-                        row,
-                        tick,
-                        tree_content.width as usize,
-                        matches!(state.source_freshness(), SourceFreshness::Current),
-                        compact,
-                    )
+            .map(|row| match row {
+                crate::ui_session::navigation::DrawRow::Known(row) => {
+                    if rail {
+                        rail_item(row, tick)
+                    } else {
+                        row_item(row, tick, tree_content.width as usize, current, compact)
+                    }
                 }
+                crate::ui_session::navigation::DrawRow::Structure {
+                    row: wire,
+                    connectors,
+                    ..
+                } => structure_item(wire, connectors, tree_content.width as usize, compact),
             })
             .collect();
         list_state.select(app.selected_index());
@@ -414,7 +411,7 @@ fn draw_outcomes(frame: &mut Frame, app: &App) {
         .border_style(Style::new().fg(palette.border))
         .title("Outcomes")
         .title_bottom(Line::from(Span::styled(
-            " j/k scroll  ·  c dismiss  ·  Esc close ",
+            " j/k scroll  ·  Esc close ",
             Style::new().fg(palette.muted),
         )));
     let inner = block.inner(popup);
@@ -437,30 +434,40 @@ fn draw_outcomes(frame: &mut Frame, app: &App) {
         }
         lines.push(Line::raw(""));
     }
-    if app.lifecycle_notices().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no outcomes yet",
-            Style::new().fg(palette.subtle),
-        )));
-    }
-    for notice in app.lifecycle_notices().iter().rev() {
-        let style = if notice.failed {
-            Style::new().fg(palette.failed)
-        } else {
-            Style::new().fg(palette.done)
+    if let Some(outcome) = app.session_outcome() {
+        let (status, style) = match outcome.status {
+            crate::control_plane::public_contracts::ui_session::CommandStatus::Completed => {
+                ("completed", Style::new().fg(palette.done))
+            }
+            crate::control_plane::public_contracts::ui_session::CommandStatus::Admitted
+            | crate::control_plane::public_contracts::ui_session::CommandStatus::DispatcherAccepted => {
+                ("pending", Style::new().fg(palette.muted))
+            }
+            _ => ("failed", Style::new().fg(palette.failed)),
         };
         lines.push(Line::from(vec![
-            Span::styled(
-                if notice.failed { "failed" } else { "completed" },
-                style.add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(status, style.add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(sanitize(&notice.id), Style::new().fg(palette.subtle)),
+            Span::styled(
+                sanitize(&outcome.request_id),
+                Style::new().fg(palette.subtle),
+            ),
         ]));
-        for row in wrap(&sanitize(&notice.text), width) {
-            lines.push(Line::from(Span::styled(row, style)));
+        // The answer whole, as the daemon recorded it: this panel is where a
+        // refusal that names a method, a code and a reason becomes readable.
+        if let Some(answer) = &outcome.answer {
+            let rendered =
+                serde_json::to_string_pretty(answer).unwrap_or_else(|_| answer.to_string());
+            for row in wrap(&sanitize(&rendered), width) {
+                lines.push(Line::from(Span::styled(row, style)));
+            }
         }
         lines.push(Line::raw(""));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "no outcome yet",
+            Style::new().fg(palette.subtle),
+        )));
     }
 
     // Scrolled in rows, clamped to what was drawn: an offset past the end shows
@@ -511,55 +518,20 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// The popup behind a sidebar's picker or confirmation: only that modal, filling
-/// the popup the host floated over the workspace, or the answer it ended with.
-fn render_modal(frame: &mut Frame, app: &App) -> Geometry {
-    let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
-    if let Some(picker) = app.palette() {
-        picker::draw(frame, picker, true);
-    }
-    if let Some(picker) = app.workspace_picker() {
-        picker::draw(frame, picker, true);
-    }
-    let held = "held by a living agent: D repeats it with force, q closes";
-    if app.confirmation().is_none()
-        && !app.picker_open()
-        && let Some(message) = app
-            .focus_message()
-            .or_else(|| app.holds_deletion().then_some(held))
-    {
-        let palette = theme::palette();
-        let block = Block::bordered()
-            .border_style(Style::new().fg(palette.border))
-            .title(" Radar ")
-            .padding(ratatui::widgets::Padding::horizontal(1));
-        frame.render_widget(
-            Paragraph::new(sanitize(message))
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .block(block),
-            frame.area(),
-        );
-    }
-    Geometry {
-        confirm_cancel,
-        confirm_confirm,
-        ..Geometry::default()
-    }
-}
-
 fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect>) {
-    let Some(confirmation) = app.confirmation() else {
-        return (None, None);
+    // A shared confirmation and a local one draw the same way: the question, what
+    // answering loses, and two buttons. Only where the answer goes differs.
+    let (title, detail, losses, confirm_selected) = match app.session_confirm() {
+        Some(confirm) => (
+            confirm.title,
+            confirm.prompt.clone(),
+            confirm.losses.clone(),
+            confirm.confirm_selected,
+        ),
+        None => return (None, None),
     };
     let palette = theme::palette();
     let screen = frame.area();
-    let title = match confirmation.operation {
-        Operation::Delete => "Delete",
-        Operation::Restart => "Restart worker",
-        Operation::CreateContainer => "Add to container",
-        Operation::ReloadContainer => "Reload pane",
-        Operation::PresenceStatus => "Pi presence",
-    };
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
             Span::styled(
@@ -569,17 +541,14 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(
-                sanitize(&confirmation.target.description()),
-                Style::new().fg(palette.subtle),
-            ),
+            Span::styled(sanitize(&detail), Style::new().fg(palette.subtle)),
         ]),
         Line::from(Span::styled(
             "This may lose:",
             Style::new().fg(palette.subtle),
         )),
     ];
-    for loss in &confirmation.losses {
+    for loss in &losses {
         lines.push(Line::from(Span::styled(
             format!("  {}", sanitize(loss)),
             Style::new().fg(palette.muted),
@@ -591,21 +560,17 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
     // time the dialog opens, and the default selection is Cancel.
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("[ Cancel ]", button_style(!confirmation.confirm_selected)),
+        Span::styled("[ Cancel ]", button_style(!confirm_selected)),
         Span::raw("   "),
-        Span::styled("[ Confirm ]", button_style(confirmation.confirm_selected)),
+        Span::styled("[ Confirm ]", button_style(confirm_selected)),
     ]));
 
     let inner_width = lines.iter().map(Line::width).max().unwrap_or(16) as u16;
-    let popup = if app.is_modal_only() {
-        screen
-    } else {
-        centered(
-            screen,
-            (inner_width + 4).min(screen.width),
-            (lines.len() as u16 + 2).min(screen.height),
-        )
-    };
+    let popup = centered(
+        screen,
+        (inner_width + 4).min(screen.width),
+        (lines.len() as u16 + 2).min(screen.height),
+    );
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_style(Style::new().fg(palette.border))
@@ -801,7 +766,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
             width,
         ))];
     }
-    if app.confirmation().is_some() {
+    if app.session_confirm().is_some() {
         let pairs = vec![
             ("tab", "select".to_string()),
             ("Enter", "confirm".to_string()),
@@ -809,52 +774,33 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ];
         return wrap_hints(&pairs, width);
     }
-    // Lifecycle outcomes are kept until dismissed and shown here, apart from the
-    // source freshness drawn with the tree: an owner's answer says nothing about
-    // whether the fleet is being observed.
+    // The session's current outcome is shown here, apart from the source freshness
+    // drawn with the tree: an effect's answer says nothing about whether the fleet
+    // is being observed. A footer row holds one clipped line; `!` shows it whole.
     let mut action_lines: Vec<Line<'static>> = Vec::new();
-    // One line each, cut with an ellipsis rather than clipped mid-word; the whole
-    // text is in the dashboard's log.
     if let Some(message) = app.focus_message() {
         action_lines.push(Line::from(Span::styled(
             elide(&first_line(&sanitize(message)), width),
             Style::new().fg(palette.failed),
         )));
     }
-    let notices = app.lifecycle_notices();
-    let shown: Vec<&crate::app::Notice> = notices
-        .iter()
-        .rev()
-        .take(2usize.saturating_sub(action_lines.len()))
-        .collect();
-    let count = shown.len();
-    let any_failed = shown.iter().any(|notice| notice.failed);
-    for (index, notice) in shown.iter().enumerate() {
-        let style = if notice.failed {
-            Style::new().fg(palette.failed)
-        } else {
-            Style::new().fg(palette.done)
-        };
-        let dismiss = if index + 1 == count {
-            // A clipped line is all a footer can hold, so a failure advertises the
-            // panel that shows it whole alongside the key that clears it.
-            if any_failed {
-                "  ·  ! full  ·  c dismiss"
-            } else {
-                "  ·  c dismiss"
+    if let Some(outcome) = app.session_outcome() {
+        use crate::control_plane::public_contracts::ui_session::CommandStatus;
+        let (text, style) = match outcome.status {
+            CommandStatus::Completed => ("completed", Style::new().fg(palette.done)),
+            CommandStatus::Admitted | CommandStatus::DispatcherAccepted => {
+                ("pending", Style::new().fg(palette.muted))
             }
-        } else {
-            ""
+            other => (other.as_str(), Style::new().fg(palette.failed)),
         };
-        let room = width.saturating_sub(dismiss.chars().count());
-        let mut spans = vec![Span::styled(
-            elide(&first_line(&sanitize(&notice.text)), room),
-            style,
-        )];
-        if !dismiss.is_empty() {
-            spans.push(Span::styled(dismiss, Style::new().fg(palette.muted)));
-        }
-        action_lines.push(Line::from(spans));
+        let room = width.saturating_sub(text.len() + 1);
+        action_lines.push(Line::from(vec![
+            Span::styled(format!("{text} "), style),
+            Span::styled(
+                elide(&sanitize(&outcome.request_id), room),
+                Style::new().fg(palette.subtle),
+            ),
+        ]));
     }
     if !action_lines.is_empty() {
         return action_lines;
@@ -1047,7 +993,7 @@ fn tree_title(state: &ObservationState, app: &App) -> Line<'static> {
 }
 
 fn empty_message(state: &ObservationState, app: &App) -> String {
-    if app.visible_rows().is_empty()
+    if app.draw_rows().is_empty()
         && app.filter_query().is_empty()
         && state
             .inventory()
@@ -1063,6 +1009,54 @@ fn empty_message(state: &ObservationState, app: &App) -> String {
         _ if !app.filter_query().is_empty() => "no rows match the filter".to_string(),
         _ => "no visible rows".to_string(),
     }
+}
+
+/// A row the session projects but this view cannot explain yet.
+///
+/// It is drawn where the projection puts it, with the label and marks the wire
+/// carries, so a row cannot vanish because this process is a frame behind.
+fn structure_item(
+    wire: &crate::control_plane::public_contracts::ui_session::TreeRow,
+    connectors: &crate::ui_session::navigation::Connectors,
+    width: usize,
+    compact: bool,
+) -> ListItem<'static> {
+    let palette = theme::palette();
+    let connector = Style::new().fg(palette.subtle);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !compact {
+        for continues in &connectors.continuation {
+            spans.push(Span::styled(
+                if *continues { "│ " } else { "  " },
+                connector,
+            ));
+        }
+        if wire.depth > 0 {
+            spans.push(Span::styled(
+                if connectors.has_following_sibling {
+                    "├─"
+                } else {
+                    "└─"
+                },
+                connector,
+            ));
+        }
+    }
+    let mark = if wire.has_children {
+        if wire.collapsed { "▸" } else { "▾" }
+    } else {
+        " "
+    };
+    spans.push(Span::styled(format!("{mark} "), connector));
+    let ink = if wire.needs_attention {
+        palette.failed
+    } else if wire.working {
+        palette.done
+    } else {
+        palette.muted
+    };
+    spans.push(Span::styled(sanitize(&wire.label), Style::new().fg(ink)));
+    ListItem::new(Line::from(fit(spans, None, width)))
 }
 
 fn row_item(
@@ -1502,7 +1496,6 @@ mod tests {
         LocalFacts, Location, Pane, ProcessIdentity, ProcessResources, ProcessState, RuntimeStatus,
         SemanticState, Tab, TerminalMode, Total, Workspace,
     };
-    use crate::runtime::Target;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
 
     /// The fixture with a command in a pane's foreground: what a close is asked
@@ -1826,10 +1819,10 @@ mod tests {
         for layout in ['d', 'S'] {
             assert_eq!(press(&mut app, layout), None, "{layout} has no panel here");
         }
-        assert_eq!(
-            press(&mut app, 'r'),
-            Some(crate::app::Action::BeginAction(Operation::Restart))
-        );
+        // A command's target belongs to the shared session: without one the view
+        // refuses, and the key reaches no local action.
+        assert_eq!(press(&mut app, 'r'), None);
+        assert!(app.focus_message().unwrap().contains("shared UI session"));
         assert_eq!(
             press(&mut app, 'L'),
             Some(crate::app::Action::LaunchConfigured)
@@ -1853,10 +1846,10 @@ mod tests {
             None,
             "the details are already drawn, and d toggles them"
         );
-        assert_eq!(
-            press(&mut app, 'r'),
-            Some(crate::app::Action::BeginAction(Operation::Restart))
-        );
+        // A command's target belongs to the shared session: without one the view
+        // refuses, and the key reaches no local action.
+        assert_eq!(press(&mut app, 'r'), None);
+        assert!(app.focus_message().unwrap().contains("shared UI session"));
         assert_eq!(
             press(&mut app, 'L'),
             Some(crate::app::Action::LaunchConfigured)
@@ -3027,81 +3020,6 @@ mod tests {
     }
 
     #[test]
-    fn the_outcomes_panel_shows_a_refusal_whole_where_the_footer_cannot() {
-        let state = fixture_state();
-        let mut app = app_for(&state);
-        // A real refusal: the client names the daemon and the method, and the
-        // daemon names the code and the reason, which no footer line holds.
-        let refusal = "the control daemon at /run/user/1000/agent-radar/control.sock \
-             refused `topology.create` (bad_params): a recipe runs in a pane slot: \
-             a pane split or a tab creation carries one";
-        app.apply_container_outcome(crate::topology::Finished {
-            verb: "create",
-            container_id: None,
-            request_id: "7b5a6cd8-a22a-44f6-9159-2bfce42a8499".to_string(),
-            result: Err(refusal.to_string()),
-        });
-
-        // Closed: the footer clips it, which is what the panel is for.
-        let footer = render_text(&state, &app, 120, 30);
-        assert!(footer.contains('…'), "the footer elides a long line");
-        assert!(
-            !footer.contains("a pane split or a tab creation carries one"),
-            "a footer line cannot hold the whole refusal: {footer}"
-        );
-        assert!(
-            footer.contains("! full"),
-            "a failure advertises the panel that shows it: {footer}"
-        );
-
-        // Open: every word of it is on screen, wrapped rather than cut.
-        app.toggle_notices();
-        let panel = render_text(&state, &app, 120, 30);
-        assert!(panel.contains("Outcomes"), "{panel}");
-        assert!(panel.contains("failed"), "{panel}");
-        assert!(panel.contains("bad_params"), "{panel}");
-        assert!(
-            panel.contains("a pane split or a tab creation carries one"),
-            "the panel shows the whole refusal: {panel}"
-        );
-    }
-
-    #[test]
-    fn the_outcomes_panel_scrolls_to_the_end_of_a_long_outcome() {
-        let state = fixture_state();
-        let mut app = app_for(&state);
-        for index in 0..8 {
-            app.apply_container_outcome(crate::topology::Finished {
-                verb: "create",
-                container_id: None,
-                request_id: format!("request-{index}"),
-                result: Err(format!("refusal number {index}")),
-            });
-        }
-        app.toggle_notices();
-        let top = render_text(&state, &app, 100, 20);
-        assert!(
-            top.contains("request-7"),
-            "the newest outcome is first: {top}"
-        );
-        assert!(
-            !top.contains("request-0"),
-            "the oldest is below the fold: {top}"
-        );
-
-        app.scroll_notices(60);
-        let bottom = render_text(&state, &app, 100, 20);
-        assert!(
-            bottom.contains("request-0"),
-            "scrolling reaches the oldest outcome: {bottom}"
-        );
-        // Past the end it stays at the end rather than showing nothing.
-        app.scroll_notices(60);
-        let past = render_text(&state, &app, 100, 20);
-        assert!(past.contains("request-0"), "{past}");
-    }
-
-    #[test]
     fn a_workspace_heading_is_drawn_as_a_heading() {
         let state = fixture_state();
         let app = app_for(&state);
@@ -3271,7 +3189,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_selects_the_row_it_lands_on_and_a_second_click_focuses_it() {
+    fn a_click_selects_the_row_it_lands_on_and_a_second_click_asks_for_focus() {
         let state = state_of(&[
             ("wA:p1", "wA", "idle", "first", json!({})),
             ("wA:p2", "wA", "idle", "second", json!({})),
@@ -3289,11 +3207,9 @@ mod tests {
             Some("first".to_string())
         );
 
-        // The row is selected now, so the next click is the one that acts.
-        assert!(
-            matches!(click_at(&mut app, (x, first_child)), Some(Action::Focus(_))),
-            "a click on the already-selected row focuses its pane"
-        );
+        // The row is selected now, so the next click is the one that acts: it
+        // asks the session to focus, and answers with no local action.
+        assert!(click_at(&mut app, (x, first_child)).is_none());
     }
 
     #[test]
@@ -3785,28 +3701,6 @@ mod tests {
     }
 
     #[test]
-    fn a_retained_row_focuses_the_pane_it_was_last_seen_on() {
-        let state = retained_working_state();
-        let mut app = app_for(&state);
-        let geometry = geometry_of(&app);
-        app.note_layout(geometry.clone());
-        let index = app
-            .visible_rows()
-            .iter()
-            .position(|row| row.id == &crate::tree::RowId::Agent("wA:p2".to_string()))
-            .expect("the retained row is drawn");
-
-        click_row(&mut app, &geometry, index);
-        assert!(
-            matches!(
-                click_row(&mut app, &geometry, index),
-                Some(Action::Focus(Target::Pane(pane))) if pane == "wA:p2"
-            ),
-            "a retained row's pane is the useful thing to focus"
-        );
-    }
-
-    #[test]
     fn a_click_with_a_stale_inventory_answers_with_a_message_not_a_request() {
         let mut state = state_of(&[("wA:p1", "wA", "idle", "alpha", json!({}))]);
         let mut app = app_for(&state);
@@ -3817,10 +3711,9 @@ mod tests {
         // acts.
         let child = 1;
         click_row(&mut app, &geometry, child);
-        assert!(matches!(
-            click_row(&mut app, &geometry, child),
-            Some(Action::Focus(_))
-        ));
+        // The second click asks the session to focus; the frontend answers with
+        // no local action of its own.
+        assert!(click_row(&mut app, &geometry, child).is_none());
 
         state.apply_failure("tmux exited with status 1");
         app.refresh(&state);
@@ -5621,7 +5514,7 @@ mod tests {
         for code in [KeyCode::Char('D'), KeyCode::Char('D'), KeyCode::Char('r')] {
             assert_eq!(press_key(&mut app, code), None, "{code:?} is the panel's");
         }
-        assert!(app.confirmation().is_none());
+        assert!(app.session_confirm().is_none());
         assert_eq!(selected_id(&app), fleet, "no key moved the fleet");
         assert!(app.details_focused(), "the panel kept the keyboard");
     }
@@ -6813,48 +6706,38 @@ mod tests {
         assert!(!panes.contains("· exited"), "{panes}");
     }
 
-    #[test]
-    fn the_workspace_popup_is_only_the_modal_filling_its_frame_and_then_the_answer() {
-        let state = with_running_pane(fixture_state(), "wA:p3");
-        let mut popup = App::modal();
-        popup.refresh(&state);
-        popup.show_everything();
-        assert!(popup.select_exact(&crate::tree::RowId::Pane("wA:p3".into())));
-        popup.begin_action(crate::app::Operation::Delete, &state);
-        assert!(popup.confirmation().is_some());
+    /// The blocking interaction a confirm presents: the same shape the session
+    /// publishes, so the view is drawn from production state.
+    fn confirming(
+        prompt: &str,
+        losses: &[&str],
+    ) -> crate::control_plane::public_contracts::ui_session::Blocking {
+        with_command(
+            crate::control_plane::public_contracts::ui_session::SharedCommand::Delete,
+            prompt,
+            losses,
+        )
+    }
 
-        let mut terminal = Terminal::new(TestBackend::new(68, 16)).expect("infallible");
-        let mut geometry = Geometry::default();
-        terminal
-            .draw(|frame| {
-                geometry = render(frame, &state, &popup, &mut ListState::default(), 0);
-            })
-            .expect("draw");
-        let screen = render_text(&state, &popup, 68, 16);
-        assert!(
-            screen.lines().next().unwrap().starts_with('┌'),
-            "the dialog is the frame:\n{screen}"
-        );
-        assert!(
-            screen.contains("Confirm") && screen.contains("Cancel"),
-            "{screen}"
-        );
-        assert!(
-            !screen.contains("Details"),
-            "no dashboard behind it:\n{screen}"
-        );
-        assert!(
-            geometry.confirm_cancel.is_some(),
-            "its buttons answer the pointer"
-        );
-
-        // Answered, it shows the outcome in the same frame rather than a dashboard.
-        popup.set_focus_message(Some("that row is gone; nothing was changed".into()));
-        let _ = popup.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        popup.set_focus_message(Some("that row is gone; nothing was changed".into()));
-        let screen = render_text(&state, &popup, 68, 16);
-        assert!(screen.contains("that row is gone"), "{screen}");
-        assert!(!screen.contains("Details"), "{screen}");
+    fn with_command(
+        command: crate::control_plane::public_contracts::ui_session::SharedCommand,
+        prompt: &str,
+        losses: &[&str],
+    ) -> crate::control_plane::public_contracts::ui_session::Blocking {
+        use crate::control_plane::public_contracts::ui_session as dto;
+        dto::Blocking {
+            interaction_id: "interaction-1".into(),
+            command,
+            stage: dto::InteractionStage::AwaitingResult,
+            owner: "view-a".into(),
+            presenter: Some("view-a".into()),
+            choices: Vec::new(),
+            note: None,
+            host_accepted: true,
+            kind: dto::InteractionKind::Confirm,
+            prompt: Some(prompt.into()),
+            losses: losses.iter().map(|loss| loss.to_string()).collect(),
+        }
     }
 
     #[test]
@@ -6863,9 +6746,10 @@ mod tests {
         let mut app = app_for(&state);
         show_all_panes(&mut app);
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
-        app.begin_action(crate::app::Operation::Delete, &state);
+        // The question comes from the session; this is the state it presents.
+        app.present_session_confirm(&confirming("Delete wA:p3", &["nvim is running"]));
         assert!(
-            app.confirmation().is_some(),
+            app.session_confirm().is_some(),
             "an unmanaged pane is eligible"
         );
 
@@ -6917,11 +6801,10 @@ mod tests {
         };
         let mut app = app_for(&state);
         select_agent(&mut app, "wA:p1");
-        app.begin_action(crate::app::Operation::Delete, &state);
+        app.present_session_confirm(&confirming("Delete wA:p1", &["agent: one (working)"]));
         assert!(
-            app.confirmation().is_some(),
-            "an agent row ends through a question: {:?}",
-            app.focus_message()
+            app.session_confirm().is_some(),
+            "an agent row ends through a question"
         );
 
         let screen = render_text(&state, &app, 100, 30);
@@ -6935,7 +6818,7 @@ mod tests {
         let mut app = app_for(&state);
         show_all_panes(&mut app);
         select_row(&mut app, crate::tree::RowId::Pane("wA:p3".into()));
-        app.begin_action(crate::app::Operation::Delete, &state);
+        app.present_session_confirm(&confirming("Delete wA:p3", &["nvim is running"]));
         for (width, height) in [(20u16, 6u16), (40, 10), (200, 60)] {
             let _ = render_text(&state, &app, width, height);
         }
@@ -7030,46 +6913,18 @@ mod tests {
         let state = managed_state();
         let mut app = app_for(&state);
         select_agent(&mut app, "wM:p1");
-        app.begin_action(crate::app::Operation::Restart, &state);
-        assert!(app.confirmation().is_some(), "an idle worker is eligible");
+        app.present_session_confirm(&with_command(
+            crate::control_plane::public_contracts::ui_session::SharedCommand::Restart,
+            "Restart implementer-1",
+            &["the verified process is stopped and resumed in its recorded session"],
+        ));
+        assert!(
+            app.session_confirm().is_some(),
+            "an idle worker is eligible"
+        );
         let screen = render_text(&state, &app, 100, 30);
         assert!(screen.contains("Restart worker"), "{screen}");
         assert!(screen.contains("implementer-1"), "{screen}");
         assert!(screen.contains("[ Cancel ]"), "{screen}");
-    }
-
-    #[test]
-    fn lifecycle_outcomes_render_on_the_footer_apart_from_the_source() {
-        let state = fixture_state();
-        let mut app = app_for(&state);
-        app.apply_subject_outcome(crate::managed_control::Finished {
-            operation: crate::managed_control::Operation::Stop,
-            request_id: "r1".into(),
-            subject_id: "subject-1".into(),
-            result: Ok(crate::control_plane::client::LifecycleAnswer {
-                request: serde_json::json!({"outcome":"completed"}),
-            }),
-            close_request_id: None,
-            close_result: None,
-        });
-        let screen = render_text(&state, &app, 120, 30);
-        assert!(screen.contains("subject-1"), "{screen}");
-        assert!(screen.contains("completed"), "{screen}");
-        assert!(screen.contains("c dismiss"), "{screen}");
-        let notice = screen
-            .lines()
-            .find(|line| line.contains("completed"))
-            .expect("a lifecycle line");
-        assert!(
-            !notice.contains("source:"),
-            "kept apart from the source diagnostic: {notice}"
-        );
-
-        // `c` dismisses the outcome and the key hints return.
-        press(&mut app, 'c');
-        assert!(app.lifecycle_notices().is_empty());
-        let screen = render_text(&state, &app, 120, 30);
-        assert!(!screen.contains("completed"), "{screen}");
-        assert!(screen.contains("focus"), "{screen}");
     }
 }

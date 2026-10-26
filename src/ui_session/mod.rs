@@ -7,5 +7,7 @@ pub mod session;
 pub use session::Session;
 pub mod actor;
 pub mod client;
+pub mod confirm;
 pub mod gate;
 pub mod presentation;
+pub mod targets;

@@ -203,7 +203,7 @@ preserving durable subjects and handoffs.
 | `j` / `↓`, `k` / `↑` | Select the next / previous visible row |
 | `space` or `←` / `→` | Fold or unfold the selected branch |
 | `/` | Enter a case-insensitive filter; Backspace edits |
-| `Enter` | Focus the selected row's pane (or workspace) in the backend; while entering filter text, keeps the filter instead |
+| `Enter` | Ask the session to focus the selected row's pane (or workspace); the daemon moves the client attached to it, and with none attached the dashboard opens a terminal for that place and asks again; while entering filter text, keeps the filter instead |
 | `Escape` | Clear the filter and leave text entry |
 | `p` | Cycle the pane view: agents → running → all |
 | `s` | Cycle the order: source → state → name |
@@ -217,7 +217,7 @@ preserving durable subjects and handoffs.
 | `R` | Reload the selected container's recorded recipe |
 | `L` | Launch the configured managed agent in a new tab or pane |
 | `E` | Report the selected Pi session's claim standing (granted, duplicate, reserved, pending or released); sends nothing |
-| `!` | Open the full text of what was last reported; `c` dismisses it |
+| `!` | Open the full text of the last outcome and the last message |
 | `c` | Dismiss the lifecycle outcome lines |
 | `e` | Show or hide finished sessions (panes whose label is a session that has gone) |
 | `b` | Show or hide background-task children in the current view |
@@ -548,7 +548,9 @@ Radar never retries a request, never treats its own timeout as a verdict, and
 never cancels one on quitting. Outcomes derive from the owner's files, and a
 request already written stays executable whether or not Radar is still running.
 Results are shown on the footer's lifecycle line, kept apart from the source
-freshness, until `c` dismisses them. A row is never removed optimistically, and a
+freshness, and `!` shows the current one whole. A view keeps no history of its
+own: the daemon retains every request, readable by the id the line names. A row
+is never removed optimistically, and a
 `closed` result reports the effects the owner actually applied — a lost
 generation's close names `process_ended` and leaves its surviving shell pane, so
 Radar never infers a pane close from the outcome alone.

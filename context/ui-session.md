@@ -341,3 +341,83 @@ tui-actions gives the chord grammar, conflict detection at bind time, and statel
 **Reason:** this is why tui-actions was chosen over crossterm-keybind, which resolves one event at a time. The stateless queries are the part the crate can prove; the state machine is application behaviour that has no consumer until a multi-key binding exists.
 
 **Consequence:** Slice A task 1.2 stays open. Its gg, leader, timeout, Escape and gate-reset checks move to the first sequence binding, where they can be tested against real behaviour.
+
+## Command targets are derived and frozen in the session, not in the frontend
+
+**Id:** abd5d0fc-46f8-42f9-bc42-26aa36898ee0
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer instruction to complete Milestone D with one writer per command, 2026-10-27
+**Verification:** corroborated — `src/ui_session/targets.rs` is the only implementation of selection, containment, losses and subject routing; `App::begin_action`, `confirm`, `Confirmed` and the frontend `Closer`/`ContainerControl`/`LifecycleControl` controllers were deleted; `a_destructive_command_acts_on_the_row_its_view_displayed` fails if the frozen request follows the shared selection instead of the displayed row
+**Revisit when:** a command appears whose target genuinely cannot be derived from the observation the daemon already publishes
+**See:** ui-session.md#canonical-interaction-authority-not-synchronized-apps — 3abf8b19-768b-495f-8097-3566d4228855 — as of 2026-10-27
+
+A destructive command carries the row identity its view displayed. The session looks that row up by identity, decides what the command acts on from the observation it already holds, and freezes the request — method, parameters, request identity, prompt and losses — before anything is asked or sent. Keys, the palette and the pointer all submit the same semantic command; none of them derives a target.
+
+A confirmation is therefore a question whose answer cannot retarget it: the answer names the interaction, and the effect the session already froze is what the daemon dispatches. A deletion that loses nothing skips the question but is still one frozen effect.
+
+**Reason:** a target derived from `App`'s cursor is only correct in the view that pressed the key. Once several views share one session, the same key in a second view would act on that view's selection while a dialog opened elsewhere still named the first. Freezing identity at invocation is what makes the shared session safe for commands that cannot be undone.
+
+**Rejected alternative:** have the frontend build the request and submit it for dispatch. It keeps one code path per command in the frontend, which is exactly the duplication being removed, and it would leave eligibility — stale inventory, managed routing, unresolved containers — split across two implementations that can disagree.
+
+**Rejected alternative:** keep `App`'s eligibility helpers and let the session call them. They read `App` state (cursor, geometry, local flags); the parts that are pure over the observation were moved into the session instead, and `App` now calls the same functions so its remaining paths cannot drift.
+
+**Consequence:** a command that needs what only the invoking frontend knows is prepared, not dispatched: a configured launch submits its shell, `PATH` and command, and the session derives the place, the directory and the recipe. That is the only use of `Preparing` left besides project discovery.
+
+**Consequence:** the effect runs through the same admission path a client request reaches, under the frozen request identity, so a retried acknowledgement cannot become a second effect.
+
+**Open:** the forced repeat of a deletion the daemon held back now lives in the session, keyed by the container the refusal named; it is carried on the plan rather than in frontend state.
+
+## Focus is decided by the session and performed by the daemon
+
+**Id:** 5e31bdb0-5694-4f48-884d-d9a1c1182cb3
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer instruction that focus be abstracted away from the frontend, 2026-10-27
+**Verification:** corroborated — `ui_session::targets::focus` derives the target from the session's own tree and observation; `SharedCommand::Focus` produces one frozen effect with `confirms: false`; `server::ui` executes a focus plan through `core.backend.focus_outcome`; the tmux adapter names the client with `switch-client -c` instead of relying on the caller's environment; `App::focus_targets` and `focus_selected` no longer exist
+**Revisit when:** a workspace can be focused with no client attached, or a second client per server becomes supported
+**See:** ui-session.md#command-targets-are-derived-and-frozen-in-the-session-not-in-the-frontend — abd5d0fc-46f8-42f9-bc42-26aa36898ee0 — as of 2026-10-27
+
+`Enter` submits the row it is on. The session derives where that row focuses from the tree and observation it already publishes, freezes one effect, and the daemon performs it: it resolves the client attached to the target's session and switches that client. The frontend holds no focus targets and names no client.
+
+**Reason:** focusability is a fact about the observation — is the row placed, is the location still there — and deriving it per frontend meant one view could allow what another refused, with the derivation written twice. Moving the effect too removes the last dependency on the calling process's environment: a daemon has no `$TMUX`, so `switch-client` without a named client would refuse or move the wrong terminal.
+
+**Rejected alternative:** keep the effect in the frontend and share only the decision. It preserves instant feedback and the local "open a terminal when nothing is attached" recovery, but it keeps two implementations of the same tmux call and leaves the client implicit.
+
+**Rejected alternative:** keep the derivation in the frontend and let the session dispatch. The frontend would still need the whole map to say which row it wants, which is the duplication being removed.
+
+**Consequence:** staleness stays local. Whether the snapshot a view drew is current is its own reading, so a view refuses before it asks; the daemon does not re-derive it.
+
+**Consequence:** a focus with no client attached is refused with `no_client` and the target it could not show, and the view that asked opens a terminal for that place and re-asks the same session command for the same row. The daemon cannot spawn a terminal, so the process that can is the one that asked, and it stays one command: the retry is a re-submission, not a second implementation of the decision.
+
+**Rejected alternative:** accept the refusal and require a client to exist beforehand. It removes the recovery but loses the behaviour operators relied on, where focusing a workspace with no terminal opened one.
+
+**Rejected alternative:** address a presentation effect to the attachment that asked, so the session drives the recovery. It is the general answer and it will be needed if a second client ever exists; today it buys nothing over the requester reacting to a refusal it already understands, and it needs addressing machinery the one-view model does not yet justify.
+
+**Consequence:** one client per tmux server is now an explicit assumption in the adapter rather than an accident of environment inheritance.
+
+## The session owns which rows exist; the view only explains them
+
+**Id:** 1716cef7-0e2d-4868-94a5-9a31a31ac0a5
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** external implementation review, 2026-10-27, accepted as a slice of its own
+**Verification:** corroborated — `Navigation::projected` joins the publication's rows to the local tree by identity and the tests pin both directions of authority: a projected row the tree lacks is drawn as structure, and a tree row the projection omits is not drawn at all; the renderer, selection index, pointer hit test and scroll extent all read `App::draw_rows`
+**Revisit when:** the frontend needs row data the projection does not carry, or two views must render different row sets
+**See:** ui-session.md#navigation-is-the-shared-model-geometry-details-and-process-reading-stay-local — 3c9a7e41-6d0b-4f58-9b1e-2a5c8f7d4e10 — as of 2026-10-27
+
+The session's tree projection is the canonical row set, order and nesting. Every frontend draws those rows and hit-tests those rows. The local observation explains a row — its kind, marks, details, process facts — and never decides whether it exists. A row this view cannot explain is still drawn, from the label and marks the wire carries; a row the projection does not name is not drawn.
+
+**Reason:** a locally rebuilt tree is a second projection, and two projections disagree about order, membership and folds exactly when it matters — a filter change, a fold, a task appearing, a row disappearing. The session exists to remove that class of divergence; leaving the draw path on a local tree left it intact.
+
+**Rejected alternative:** send the rich row detail over the wire so the frontend needs nothing local. That makes the publication large and the session responsible for presentation facts it has no business owning, when a join by identity is already exact.
+
+**Rejected alternative:** keep drawing from the local tree and reconcile the two with a third cache. The reconciliation would itself need a rule for which side wins, which is the decision this entry makes once.
+
+**Consequence:** a projected row with no local detail is drawn plainly rather than richly. That is the honest rendering of "the session says this row is here and this process does not know it yet", and it is visible rather than silently dropped.
+
+**Consequence:** details, fold markers and process panels still read the local tree by identity, so a row that exists only in the projection selects but shows no detail until the next observation.
+

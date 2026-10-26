@@ -148,13 +148,16 @@ pub struct Blocking {
     pub interaction_id: String,
     pub command: SharedCommand,
     pub stage: InteractionStage,
-    /// Whether a presenter holds the claim.
-    pub claimed: bool,
     pub owner: String,
     pub presenter: Option<String>,
     pub choices: Vec<String>,
     pub note: Option<String>,
     pub host_accepted: bool,
+    /// What the presenter asks. A project picker lists choices; a confirmation
+    /// shows the question and what answering it loses.
+    pub kind: InteractionKind,
+    pub prompt: Option<String>,
+    pub losses: Vec<String>,
 }
 
 /// Retained command outcome, correlated by the frozen domain request id.
@@ -178,6 +181,21 @@ pub enum CommandStatus {
     Unknown,
 }
 
+impl CommandStatus {
+    /// The word this status is drawn and logged with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DispatcherAccepted => "dispatcher accepted",
+            Self::DispatchRefused => "dispatch refused",
+            Self::SubmissionUncertain => "submission uncertain",
+            Self::Admitted => "admitted",
+            Self::Completed => "completed",
+            Self::Refused => "refused",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InteractionStage {
@@ -185,6 +203,14 @@ pub enum InteractionStage {
     Preparing,
     /// The choices are fixed and a presenter is to answer.
     AwaitingResult,
+}
+
+/// How a presenter asks: choose a project, or agree to a frozen effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionKind {
+    Project,
+    Confirm,
 }
 
 /// Whether background tasks are listed, remembered separately for each pane view.
@@ -217,6 +243,19 @@ pub enum SharedCommand {
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InteractionResult {
     Project { path: String },
+    Confirm { accepted: bool },
+}
+
+/// What a frontend supplies for a configured launch: its own environment, which
+/// the daemon does not share. Everything else about the launch is derived from
+/// the shared inventory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchSpec {
+    pub command: Vec<String>,
+    pub shell: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// One action a frontend submits. Each variant is a semantic request, not a key
@@ -263,6 +302,11 @@ pub enum UiAction {
     RunCommand {
         command: SharedCommand,
         row: Option<UiRowId>,
+    },
+    /// A command that needs what only the invoking frontend knows. The session
+    /// derives its target from the shared inventory and dispatches it.
+    PrepareLaunch {
+        spec: LaunchSpec,
     },
     ResolveInteraction {
         interaction_id: String,

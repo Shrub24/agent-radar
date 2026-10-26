@@ -37,3 +37,27 @@ Record which case, origin/presenter/host process lost (if any), observed UI and
 backend effect, and any request ID. Do not infer successful creation from popup
 exit or infer no effect from a connection failure. Leave integrated acceptance
 task 5.2 unchecked until these observations are supplied.
+
+## Destructive commands are the session's (milestone D)
+
+Run these in a dashboard and a compact sidebar attached to the same daemon.
+
+1. In the dashboard, move the selection to an agent that is working. In the
+   sidebar, move it to a different agent. In the dashboard press `D`.
+   Expect: a question naming the dashboard's row, in both views' session.
+2. Move the sidebar's selection while the question is up. Answer Confirm.
+   Expect: the dashboard's row is what closes; the sidebar's selection never
+   became the target.
+3. With a detached popup instead of the inline question (compact sidebar), press
+   `D` again and answer in the popup. Expect: one close, one outcome, and the
+   popup exits after the session acknowledges the result.
+4. Delete an idle pane with no agent and nothing running. Expect: no question,
+   one close, and an outcome recorded in `!` with its request id.
+5. Delete a container whose agent is still alive. Expect: the daemon holds it,
+   the refusal is published, and repeating `D` on that container sends the
+   forced deletion.
+6. Press `L` on a selected workspace. Expect: a new tab in that workspace running
+   the configured command, with no question asked.
+7. Detach the dashboard while a close is in flight. Expect: the operation still
+   completes, and the daemon keeps the outcome readable by its request id.
+

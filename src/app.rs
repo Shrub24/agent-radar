@@ -28,34 +28,24 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 
 use self::commands::CommandId;
-use crate::control_plane::client::{
-    ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
-};
+use crate::control_plane::public_contracts::ui_session::SharedCommand;
 use crate::control_plane::public_contracts::ui_session::UiAction;
-use crate::lifecycle::{self, CloseRequest, Containment, TargetIdentity};
 use crate::observation::{ObservationState, SourceFreshness};
 use crate::picker::{Item, Picker, Step};
-use crate::runtime::{CloseTarget, Target};
 use crate::tasks::{Task, TaskBoard, TaskEvent};
 use crate::theme;
 use crate::ui_session::client::UiClient;
 pub use crate::ui_session::navigation::{Connectors, PaneView, RowOrder, VisibleRow};
-use crate::ui_session::{NavState, NavStep, Navigation};
+use crate::ui_session::{NavStep, Navigation};
 use ratatui::layout::Rect;
 
 use crate::model::{
-    CpuPercent, DescendantSample, FleetObservation, ForegroundEvidence, ProcessIdentity,
-    ProcessResources,
+    CpuPercent, DescendantSample, ForegroundEvidence, ProcessIdentity, ProcessResources,
 };
-use crate::tree::{
-    AgentRow, ContainerRef, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskRow, TaskSource,
-};
+use crate::tree::{ContainerRef, FleetTree, RowId, RowKind, TaskId, TaskRow, TaskSource};
 
 /// How long a focus message stays up when no key clears it first.
 const FOCUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
-
-/// How long a completed outcome stays in the footer. A failure is kept until `c`.
-const NOTICE_TTL: Duration = Duration::from_secs(8);
 
 /// The width of a row's disclosure marker in cells: `ui::fold_marker` draws it,
 /// and a leaf keeps the same two blank columns, so the hit cell is the same
@@ -66,30 +56,21 @@ const DISCLOSURE_WIDTH: u16 = 2;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Ask the backend to focus this location.
-    Focus(Target),
-    /// `x`/`X`/`r` asked for confirmation of a lifecycle action. The caller
-    /// opens it against the current observation, because eligibility is a
-    /// property of the evidence, not of the cursor.
-    BeginAction(Operation),
-    /// Create a new workspace. It needs no selected row, so it works when every
-    /// row on screen is unresolved.
-    NewWorkspace,
-    /// Confirm was activated; the caller revalidates the frozen target and
-    /// starts the close or manages the request when it still holds.
+    /// Confirm was activated on the session's question; the answer names the
+    /// interaction, whose effect the session already froze.
     ConfirmAction,
-    /// Immediately create a managed-agent pane using `[tui].launch_command`.
+    /// `L` launches the configured managed agent: the caller supplies its own
+    /// shell and `PATH`, and the session derives the place.
     LaunchConfigured,
+    /// `E` shows Radar's automatic Pi presence standing. An informational
+    /// overlay: it asks nothing and gates nothing.
+    PresenceStatus,
     /// The sidebar's hide/unhide key; the caller owns the host commands.
     ToggleSidebar,
     /// The sidebar's zoom key; the caller owns the host commands.
     ToggleZoom,
     /// Open a sidebar beside this dashboard; the caller owns the host command.
     LaunchSidebar,
-    /// Open this key's picker or confirmation in the workspace popup, over the
-    /// row that was selected here.
-    Modal { key: KeyCode, row: Option<RowId> },
-    /// The workspace chooser took this directory; open a workspace there.
-    NewWorkspaceIn(PathBuf),
 }
 
 /// Which page of the selected row's details the panel shows.
@@ -441,7 +422,6 @@ pub fn sidebar_collapsed(width: u16) -> bool {
 /// from it.
 struct SessionLink {
     client: UiClient,
-    adopted: Option<NavState>,
     mirror: Option<std::sync::Arc<crate::ui_session::client::Mirror>>,
 }
 
@@ -467,12 +447,6 @@ pub struct App {
     /// Drawn as `radar sidebar`: compressed rows while the split is narrow, and
     /// the whole dashboard once the host has zoomed it.
     sidebar: bool,
-    /// Drawn as the popup behind a sidebar's picker or confirmation: only that
-    /// modal, over a row chosen by identity, and gone once it is answered.
-    modal_only: bool,
-    /// A host can show a popup over the whole workspace, so a sidebar's pickers
-    /// and confirmations go there instead of into its narrow pane.
-    modal_host: bool,
     /// The sidebar has been expanded into the whole dashboard. An explicit mode,
     /// not a width: the toggle asks the host to give it the window, and the host
     /// cannot take the mode back by resizing.
@@ -485,6 +459,16 @@ pub struct App {
     /// The workspace chooser, open while a new workspace waits for its directory.
     workspace_picker: Option<Picker<PathBuf>>,
     interaction_picker: Option<String>,
+    /// The question a shared confirmation asks, when one is presented here.
+    session_confirm: Option<crate::ui_session::confirm::Confirm>,
+    /// The row the last focus asked for, so a server with no client attached can
+    /// open a terminal for that place and ask again.
+    focus_request: Option<crate::control_plane::public_contracts::ui_session::UiRowId>,
+    /// A focus that failed for want of a client, with the place to open one for.
+    focus_recovery: Option<(
+        crate::control_plane::public_contracts::ui_session::UiRowId,
+        crate::runtime::Target,
+    )>,
     /// Bus data pushed by connected extensions, joined to rows when they are
     /// drawn. It sits beside the tree rather than inside it: bus facts are true
     /// only while their connection is open, so a refresh must never be able to
@@ -496,7 +480,6 @@ pub struct App {
     task_diagnostic: Option<String>,
     /// Focus target per row, for the rows the displayed observation proves. A
     /// row missing here is one `Enter` must refuse and explain.
-    focus_targets: HashMap<RowId, Target>,
     /// Whether the displayed inventory came from a successful collection. A
     /// stale inventory is last-good rather than current, so `Enter` refuses on
     /// every row of it.
@@ -504,7 +487,6 @@ pub struct App {
     /// Containers whose deletion was held back because an agent inside them did
     /// not exit. The next `D` on one of them asks the daemon to close anyway, so
     /// a wedged agent cannot make a place undeletable for good.
-    deletion_held: HashSet<String>,
     /// One line about the last action Radar took or refused — a focus or a
     /// lifecycle close — and when it was set. It clears on the next key press or
     /// after [`FOCUS_MESSAGE_TTL`].
@@ -532,13 +514,6 @@ pub struct App {
     /// A wheel turn over the tree, waiting for the main loop to apply it to the
     /// list state it owns.
     scroll_request: Option<usize>,
-    /// The open lifecycle confirmation, if any. Its target is frozen at the
-    /// moment it opened; nothing is sent until it is revalidated and confirmed.
-    confirmation: Option<Confirmation>,
-    /// Lifecycle action outcomes, kept until dismissed. Separate from the
-    /// transient focus message and from the source diagnostics, so an owner's
-    /// answer cannot be mistaken for the fleet's freshness.
-    notices: Vec<Notice>,
     /// Whether the outcomes panel is open, and how far it is scrolled. The footer
     /// shows one clipped line per outcome; this is where the whole text of a
     /// refusal is readable, since a daemon's answer names the method, the code and
@@ -568,61 +543,6 @@ struct ProcessCursor {
     /// to scroll to is the one the *next* draw reports, not the one the last
     /// layout still describes.
     reveal: bool,
-}
-
-/// A lifecycle confirmation, frozen at the moment it opened.
-///
-/// The operation and target identity are held here, not read from the cursor:
-/// moving the selection while the dialog is up must not retarget it.
-#[derive(Clone, Debug)]
-pub struct Confirmation {
-    pub operation: Operation,
-    pub target: CloseTarget,
-    /// The observed target identity frozen when the dialog opened. Confirm
-    /// revalidates against it, so a target replaced while the dialog is up is
-    /// never acted on even when the replacement is equally eligible.
-    pub identity: TargetIdentity,
-    /// What the operator may lose, one short line each. Text from the pane,
-    /// sanitized when it is drawn like every other runtime string.
-    pub losses: Vec<String>,
-    /// Whether Confirm is selected. Cancel is the default.
-    pub confirm_selected: bool,
-    /// Daemon-owned subject target for a managed lifecycle operation.
-    pub subject: Option<crate::registry_observation::ManagedSubject>,
-    /// The container this confirmation acts on, when it is a container control:
-    /// the daemon revalidates that exact record before it changes anything.
-    pub container_id: Option<String>,
-}
-
-/// A confirmed action ready to run: direct unmanaged close, daemon lifecycle
-/// operation, or daemon topology control.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Confirmed {
-    Direct(CloseRequest),
-    /// A daemon-owned lifecycle control, targeted by stable subject id.
-    Subject {
-        operation: Operation,
-        request_id: String,
-        subject_id: String,
-        claim_id: String,
-        child_close: Option<crate::registry_observation::ChildCloseTarget>,
-        close_request_id: Option<String>,
-    },
-    /// A container control, dispatched to the daemon under its own request id.
-    Container(crate::topology::Control),
-}
-
-/// One lifecycle outcome, kept visible until it is dismissed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Notice {
-    /// When this line was recorded or last refined, so a success can age out.
-    pub at: Instant,
-    /// The request id, or the exact target key before one was minted. A later
-    /// update with the same id refines this line rather than adding another.
-    pub id: String,
-    pub text: String,
-    /// A refusal or invalid evidence, drawn as a failure rather than a result.
-    pub failed: bool,
 }
 
 /// Where the last draw put the panels, so a mouse event can be mapped back to
@@ -686,23 +606,6 @@ impl App {
         self.sidebar
     }
 
-    /// A view for the workspace popup behind a sidebar's picker or confirmation.
-    pub fn modal() -> Self {
-        Self {
-            modal_only: true,
-            ..Self::default()
-        }
-    }
-
-    pub fn is_modal_only(&self) -> bool {
-        self.modal_only
-    }
-
-    /// Records that a workspace popup is available to this sidebar.
-    pub fn set_modal_host(&mut self, available: bool) {
-        self.modal_host = available;
-    }
-
     /// The selected row's identity, which a popup selects again by value.
     pub fn selected_id(&self) -> Option<RowId> {
         self.nav.selected_id().cloned()
@@ -711,11 +614,6 @@ impl App {
     /// Lists every row, so a row another view could see is one this can select.
     pub fn show_everything(&mut self) {
         self.step(NavStep::ShowEverything);
-    }
-
-    /// Whether a refused deletion is armed to be repeated with force.
-    pub fn holds_deletion(&self) -> bool {
-        !self.deletion_held.is_empty()
     }
 
     /// Selects `id` exactly, or nothing: a row that is gone is not replaced by a
@@ -763,11 +661,6 @@ impl App {
         self.navigate(|nav| nav.replace_tree(tree));
         self.readopt_session_state();
         self.source_current = matches!(state.source_freshness(), SourceFreshness::Current);
-        self.focus_targets = if self.source_current {
-            crate::focus::targets(self.nav.tree(), state)
-        } else {
-            HashMap::new()
-        };
         self.prune_disclosures();
         self.reconcile_process();
     }
@@ -781,6 +674,37 @@ impl App {
     /// ordinary-pane toggle and the filter.
     pub fn visible_rows(&self) -> Vec<VisibleRow<'_>> {
         self.nav.visible_rows()
+    }
+
+    /// The rows to draw: the session's projection when this view is attached, its
+    /// own navigation otherwise.
+    ///
+    /// The projection decides which rows exist and in what order; this view's
+    /// observation only explains them. A row it cannot explain is still drawn,
+    /// because the session says the row is there.
+    pub fn draw_rows(&self) -> Vec<crate::ui_session::navigation::DrawRow<'_>> {
+        match self.mirror_ref() {
+            Some(mirror) if !mirror.rows.is_empty() => {
+                crate::ui_session::navigation::projected(&mirror.rows, &self.nav)
+            }
+            _ => self
+                .nav
+                .visible_rows()
+                .into_iter()
+                .map(crate::ui_session::navigation::DrawRow::Known)
+                .collect(),
+        }
+    }
+
+    /// Index of the selected row within [`Self::draw_rows`].
+    pub fn draw_selected_index(&self) -> Option<usize> {
+        let selected = self.nav.selected_id()?;
+        self.draw_rows().iter().position(|row| row.id() == selected)
+    }
+
+    /// The shared state this view has adopted, if it is attached.
+    fn mirror_ref(&self) -> Option<&std::sync::Arc<crate::ui_session::client::Mirror>> {
+        self.session.as_ref()?.mirror.as_ref()
     }
 
     /// Records where the draw just put the panels, and keeps the page on screen
@@ -827,11 +751,26 @@ impl App {
         found
     }
 
+    /// Submits a command whose target and question belong to the shared session.
+    /// The row this view shows travels with it, so the session freezes what the
+    /// operator was looking at rather than whatever is selected later.
+    fn shared_command(&mut self, command: SharedCommand) -> Option<Action> {
+        if self.session.is_none() {
+            self.set_focus_message(Some("this command requires the shared UI session".into()));
+            return None;
+        }
+        let row = self
+            .nav
+            .selected_id()
+            .map(crate::ui_session::session::ui_row_id);
+        self.submit_session(UiAction::RunCommand { command, row });
+        None
+    }
+
     /// Joins the shared session through `client`.
     pub fn attach_session(&mut self, client: UiClient) {
         self.session = Some(SessionLink {
             client,
-            adopted: None,
             mirror: None,
         });
     }
@@ -858,18 +797,27 @@ impl App {
             .as_ref()
             .is_none_or(|last| last.state.operation != mirror.state.operation);
         let state = crate::ui_session::session::nav_state(&mirror.state);
-        link.adopted = Some(state.clone());
         link.mirror = Some(std::sync::Arc::clone(&mirror));
         if gate_changed {
             self.filter_editing = false;
-            self.confirmation = None;
             self.palette = None;
             self.workspace_picker = None;
             self.interaction_picker = None;
         }
+        // The editor is the session's to grant: a view that asked while another
+        // holds it must not stay in an editor it does not own.
+        if self.session_editing_allowed() {
+            self.filter_editing =
+                mirror.state.filter.editor.as_deref() == Some(&mirror.attachment_id);
+        }
         let blocking = mirror.state.blocking.as_ref();
         let presented = blocking.filter(|b| b.presenter.as_deref() == Some(&mirror.attachment_id));
-        if let Some(b) = presented {
+        if let Some(b) = presented
+            && b.kind
+                == crate::control_plane::public_contracts::ui_session::InteractionKind::Confirm
+        {
+            self.present_session_confirm(b);
+        } else if let Some(b) = presented {
             if self.interaction_picker.as_deref() != Some(&b.interaction_id) {
                 self.open_workspace_picker(b.choices.iter().map(PathBuf::from).collect());
                 if let Some(note) = &b.note {
@@ -886,9 +834,10 @@ impl App {
                 }
                 self.interaction_picker = Some(b.interaction_id.clone());
             }
-        } else if self.interaction_picker.is_some() {
+        } else if self.interaction_picker.is_some() || self.session_confirm.is_some() {
             self.workspace_picker = None;
             self.interaction_picker = None;
+            self.session_confirm = None;
         }
         let before = self.nav.selected_id().cloned();
         self.nav.adopt(state);
@@ -897,12 +846,48 @@ impl App {
             self.set_focus_message(Some(note.clone()));
         }
         if changed_operation && let Some(op) = &mirror.state.operation {
-            self.set_focus_message(Some(format!(
-                "workspace {} · request {}",
-                op.status, op.request_id
-            )));
+            // The session publishes the effect it dispatched and its answer; this
+            // view shows that one, and keeps no record of its own: the daemon
+            // already retains every request, readable by the id named here.
+            let failed = !matches!(
+                op.status,
+                crate::control_plane::public_contracts::ui_session::CommandStatus::Completed
+            );
+            if failed {
+                tracing::warn!(request = %op.request_id, "{}", op.status);
+            } else {
+                tracing::info!(request = %op.request_id, "{}", op.status);
+            }
+            self.set_focus_message(Some(format!("{} · request {}", op.status, op.request_id)));
+            // A focus with no client attached names the place: this view opens a
+            // terminal for it and asks the session again once one is attached.
+            let no_client = op.status
+                == crate::control_plane::public_contracts::ui_session::CommandStatus::Refused
+                && op
+                    .answer
+                    .as_ref()
+                    .and_then(|answer| answer.pointer("/error/code"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("no_client");
+            if no_client
+                && let Some(row) = self.focus_request.clone()
+                && let Some(target) = op
+                    .answer
+                    .as_ref()
+                    .and_then(|answer| answer.pointer("/error/target"))
+                    .and_then(|target| serde_json::from_value(target.clone()).ok())
+            {
+                self.focus_recovery = Some((row, target));
+            }
         }
         true
+    }
+
+    /// Whether this view may believe the published editor owner: only when
+    /// nothing of its own is in flight, so an answer still on its way is not
+    /// mistaken for a refusal.
+    fn session_editing_allowed(&self) -> bool {
+        self.session.as_ref().is_some_and(|link| link.client.idle())
     }
 
     /// Re-takes the last adopted state after the local tree changed, so a
@@ -913,22 +898,118 @@ impl App {
             return;
         };
         if link.client.idle()
-            && let Some(state) = link.adopted.clone()
+            && let Some(mirror) = &link.mirror
         {
             let before = self.nav.selected_id().cloned();
-            self.nav.adopt(state);
+            self.nav
+                .adopt(crate::ui_session::session::nav_state(&mirror.state));
             self.reset_reading_if_moved(before);
         }
     }
 
     pub fn session_mirror(&self) -> Option<std::sync::Arc<crate::ui_session::client::Mirror>> {
-        self.session.as_ref()?.mirror.clone()
+        self.mirror_ref().cloned()
     }
 
     pub fn submit_session(&self, action: UiAction) {
         if let Some(link) = &self.session {
             link.client.submit(action);
         }
+    }
+
+    /// Asks the session to focus `row`, whatever this view's freshness.
+    pub fn submit_focus_row(
+        &self,
+        row: crate::control_plane::public_contracts::ui_session::UiRowId,
+    ) {
+        self.submit_session(
+            crate::control_plane::public_contracts::ui_session::UiAction::RunCommand {
+                command: crate::control_plane::public_contracts::ui_session::SharedCommand::Focus,
+                row: Some(row),
+            },
+        );
+    }
+
+    /// A focus that failed because no client was attached: the place to open a
+    /// terminal for, and the row to ask again once one is.
+    pub fn take_focus_recovery(
+        &mut self,
+    ) -> Option<(
+        crate::control_plane::public_contracts::ui_session::UiRowId,
+        crate::runtime::Target,
+    )> {
+        self.focus_recovery.take()
+    }
+
+    /// The effect the session last dispatched and the answer it has, if any.
+    /// This view keeps no record of its own: the daemon retains every request.
+    pub fn session_outcome(
+        &self,
+    ) -> Option<&crate::control_plane::public_contracts::ui_session::CommandOutcome> {
+        self.session
+            .as_ref()
+            .and_then(|link| link.mirror.as_ref())
+            .and_then(|mirror| mirror.state.operation.as_ref())
+    }
+
+    /// Presents the question a shared interaction asks here. The highlighted
+    /// button survives a republication of the same question.
+    pub(crate) fn present_session_confirm(
+        &mut self,
+        blocking: &crate::control_plane::public_contracts::ui_session::Blocking,
+    ) {
+        // A republication of the same question carries what this view already
+        // did with it: the highlighted button, and whether it was answered.
+        let carried = self
+            .session_confirm
+            .as_ref()
+            .filter(|confirm| confirm.interaction_id == blocking.interaction_id)
+            .cloned();
+        let mut confirm = crate::ui_session::confirm::Confirm::new(
+            blocking.interaction_id.clone(),
+            title_of(blocking.command),
+            blocking.prompt.clone().unwrap_or_default(),
+            blocking.losses.clone(),
+        );
+        if let Some(carried) = carried {
+            confirm.confirm_selected = carried.confirm_selected;
+            confirm.answered = carried.answered;
+        }
+        self.session_confirm = Some(confirm);
+        self.workspace_picker = None;
+        self.interaction_picker = None;
+    }
+
+    /// Submits the operator's answer to the session that asked the question.
+    pub fn answer_session_confirm(&mut self, answer: crate::ui_session::confirm::Answer) {
+        use crate::ui_session::confirm::Answer;
+        let Some(confirm) = self.session_confirm.as_mut() else {
+            return;
+        };
+        if confirm.answered {
+            return;
+        }
+        // The question stays up, inert, until the session reports it settled: a
+        // publication arriving before then must not re-ask it.
+        confirm.answered = true;
+        let action = match answer {
+            Answer::Confirm => UiAction::ResolveInteraction {
+                interaction_id: confirm.interaction_id.clone(),
+                result:
+                    crate::control_plane::public_contracts::ui_session::InteractionResult::Confirm {
+                        accepted: true,
+                    },
+            },
+            Answer::Cancel => UiAction::CancelInteraction {
+                interaction_id: confirm.interaction_id.clone(),
+            },
+        };
+        self.submit_session(action);
+    }
+
+    /// The question a shared confirmation asks, when one is presented here.
+    pub fn session_confirm(&self) -> Option<&crate::ui_session::confirm::Confirm> {
+        self.session_confirm.as_ref()
     }
 
     pub fn shared_blocking(&self) -> bool {
@@ -985,8 +1066,11 @@ impl App {
     }
 
     /// Index of the selected row within [`Self::visible_rows`], if any.
+    /// Index of the selected row in the drawn list: the list the pointer maps
+    /// onto and the list the highlight is placed in.
     pub fn selected_index(&self) -> Option<usize> {
-        self.nav.selected_index()
+        let selected = self.nav.selected_id()?;
+        self.draw_rows().iter().position(|row| row.id() == selected)
     }
 
     /// The selected row, if the selection still resolves to a visible row.
@@ -1175,7 +1259,9 @@ impl App {
                     });
                     None
                 } else {
-                    Some(Action::NewWorkspaceIn(directory))
+                    // The picker only exists for a shared interaction; without
+                    // one there is nothing to answer.
+                    None
                 }
             }
         }
@@ -1206,8 +1292,8 @@ impl App {
         }
         // A confirmation is modal: its keys never move the tree selection, and
         // the view's own action message is not cleared out from under it.
-        if self.confirmation.is_some() {
-            return self.handle_confirmation_key(key);
+        if self.session_confirm().is_some() {
+            return self.handle_session_confirm_key(key);
         }
         self.focus_message = None;
         // The command palette is modal: it owns the keyboard until it closes,
@@ -1215,14 +1301,11 @@ impl App {
         if self.picker_open() {
             return self.handle_picker_key(key);
         }
-        // The outcomes panel is modal: it shows what was reported and acts on
-        // nothing, so while it is open no other key reaches the tree.
+        // The outcomes panel is modal: it shows what the session last reported and
+        // acts on nothing, so while it is open no other key reaches the tree.
         if self.notices_open {
             match key.code {
                 KeyCode::Char('!') | KeyCode::Esc | KeyCode::Char('c') => {
-                    if key.code == KeyCode::Char('c') {
-                        self.dismiss_notices();
-                    }
                     self.notices_open = false;
                 }
                 KeyCode::Char('j') | KeyCode::Down => self.scroll_notices(1),
@@ -1233,6 +1316,12 @@ impl App {
                 KeyCode::End => self.scroll_notices(isize::MAX / 2),
                 _ => {}
             }
+            return None;
+        }
+        if let Some(confirm) = self.session_confirm.as_mut()
+            && let Some(answer) = confirm.handle_key(key)
+        {
+            self.answer_session_confirm(answer);
             return None;
         }
         if self.shared_blocking() {
@@ -1257,25 +1346,6 @@ impl App {
         // whether it is compressed or zoomed.
         if self.sidebar {
             match key.code {
-                // Where the host can float a popup over the whole workspace, the
-                // pickers and confirmations go there; this pane is too narrow.
-                KeyCode::Char(ch @ ('r' | 'a' | 'A' | 'E' | 'D' | 'R' | '?'))
-                    if self.modal_host
-                        && self.sidebar_compact()
-                        && (ch != 'A' || self.session.is_none())
-                        && (ch == 'A' || self.nav.selected_id().is_some()) =>
-                {
-                    // With nothing selected, a key that needs a row is handled
-                    // here, where it says so: the popup would otherwise pick its
-                    // own default row and act on that.
-                    let row = (ch != 'A')
-                        .then(|| self.nav.selected_id().cloned())
-                        .flatten();
-                    return Some(Action::Modal {
-                        key: KeyCode::Char(ch),
-                        row,
-                    });
-                }
                 KeyCode::Char('B') => return Some(Action::ToggleSidebar),
                 KeyCode::Char('Z') => return Some(Action::ToggleZoom),
                 _ => {}
@@ -1296,14 +1366,13 @@ impl App {
             return self.run(command);
         }
         match key.code {
-            KeyCode::Char('c') => self.dismiss_notices(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('?') => {
                 self.palette = Some(Picker::new(
                     "Commands",
                     "enter run · esc close",
-                    commands::items(self.sidebar, self.sidebar_compact(), self.modal_only),
+                    commands::items(self.sidebar, self.sidebar_compact()),
                 ))
             }
             KeyCode::Esc => {
@@ -1318,7 +1387,30 @@ impl App {
     /// here, so a command means the same wherever it was chosen.
     fn run(&mut self, command: CommandId) -> Option<Action> {
         match command {
-            CommandId::Focus => return self.focus_selected(),
+            // Focus is the session's: the frontend says which row, the session
+            // decides where that lands and the daemon moves the client.
+            CommandId::Focus => {
+                let Some(row) = self.selected_row() else {
+                    self.set_focus_message(Some("nothing selected: nothing to focus".into()));
+                    return None;
+                };
+                // Staleness is this view's own reading of the observation it drew;
+                // where the row focuses is the session's decision.
+                if !self.source_current {
+                    self.set_focus_message(Some("the fleet is stale: not focusing".into()));
+                    return None;
+                }
+                let row = crate::ui_session::session::ui_row_id(&row.id.clone());
+                self.focus_request = Some(row.clone());
+                self.submit_session(
+                    crate::control_plane::public_contracts::ui_session::UiAction::RunCommand {
+                        command:
+                            crate::control_plane::public_contracts::ui_session::SharedCommand::Focus,
+                        row: Some(row),
+                    },
+                );
+                return None;
+            }
             CommandId::Filter => self.begin_filter_edit(),
             CommandId::NextAttention => {
                 self.step(NavStep::JumpAttention(true));
@@ -1364,20 +1456,22 @@ impl App {
             }
             // `L` launches the configured managed agent in a new tab or pane.
             CommandId::LaunchConfigured => return Some(Action::LaunchConfigured),
-            CommandId::Restart => return Some(Action::BeginAction(Operation::Restart)),
+            CommandId::Restart => {
+                return self.shared_command(SharedCommand::Restart);
+            }
             // Container controls act on a container Radar records rather than on an
             // owner: `a` adds a place inside it, `D` deletes it, `R` reloads its slot.
             CommandId::CreateContainer => {
-                return Some(Action::BeginAction(Operation::CreateContainer));
+                return self.shared_command(SharedCommand::CreateContainer);
             }
             CommandId::ReloadContainer => {
-                return Some(Action::BeginAction(Operation::ReloadContainer));
+                return self.shared_command(SharedCommand::ReloadContainer);
             }
             // `E` reports Radar's automatic Pi presence standing.
             CommandId::PresenceStatus => {
-                return Some(Action::BeginAction(Operation::PresenceStatus));
+                return Some(Action::PresenceStatus);
             }
-            CommandId::Delete => return Some(Action::BeginAction(Operation::Delete)),
+            CommandId::Delete => return self.shared_command(SharedCommand::Delete),
         }
         None
     }
@@ -1460,45 +1554,6 @@ impl App {
         true
     }
 
-    /// `Enter`: the action that focuses the selected row, or a one-line message
-    /// saying why it cannot be done.
-    ///
-    /// Nothing is sent for a row the observation does not place, and nothing is
-    /// sent at all while the displayed inventory is last-good rather than
-    /// current: a focus request moves the user's terminal, so it is only worth
-    /// sending for a location Radar can still see.
-    fn focus_selected(&mut self) -> Option<Action> {
-        let id = self.selected_row()?.id.clone();
-        if !self.source_current {
-            self.set_focus_message(Some("the fleet is stale: not focusing".to_string()));
-            return None;
-        }
-        // A task is not a location of its own: what to focus is the pane its
-        // owner agent row names, and only while that row is still placed by
-        // this observation. The owner row is already projected, so a task the
-        // bus created focuses its parent without another runtime refresh.
-        let target_id = match &id {
-            RowId::Task(task) => RowId::Agent(task.owner.clone()),
-            other => other.clone(),
-        };
-        match self.focus_targets.get(&target_id) {
-            Some(target) => Some(Action::Focus(target.clone())),
-            None => {
-                let described = match &target_id {
-                    RowId::Workspace(workspace_id) => format!("workspace {workspace_id}"),
-                    RowId::Agent(pane_id) | RowId::Pane(pane_id) => format!("pane {pane_id}"),
-                    RowId::Registered(registration_id) => {
-                        format!("unresolved agent {registration_id}")
-                    }
-                    RowId::Task(_) => unreachable!("a task is looked up through its owner row"),
-                    RowId::Lifecycle(subject_id) => format!("lifecycle subject {subject_id}"),
-                };
-                self.set_focus_message(Some(format!("{described} is not observed")));
-                None
-            }
-        }
-    }
-
     /// The one-line action message while one is up.
     pub fn focus_message(&self) -> Option<&str> {
         self.focus_message
@@ -1517,18 +1572,15 @@ impl App {
     /// whether anything changed, so the caller can skip a redraw.
     ///
     /// A completed outcome ages out with it, because the result was the operator's
-    /// own action and the tree already shows it. A failure stays until dismissed.
+    /// own action and the tree already shows it. Nothing is retained beyond it: a
+    /// longer record is the daemon's, read by the request id the line names.
     pub fn expire_focus_message(&mut self, now: Instant) -> bool {
-        let before = self.notices.len();
-        self.notices
-            .retain(|notice| notice.failed || now.duration_since(notice.at) < NOTICE_TTL);
-        let aged = self.notices.len() != before;
         match &self.focus_message {
             Some((_, set)) if now.duration_since(*set) >= FOCUS_MESSAGE_TTL => {
                 self.focus_message = None;
                 true
             }
-            _ => aged,
+            _ => false,
         }
     }
 
@@ -1601,246 +1653,6 @@ impl App {
     }
 }
 
-/// A close target's containment in the current observation, retained
-/// associations included.
-fn containment_of(
-    inventory: &FleetObservation,
-    state: &ObservationState,
-    target: &CloseTarget,
-) -> Containment {
-    match target {
-        CloseTarget::Pane(pane_id) => {
-            lifecycle::pane(inventory, state.retained_containment(), pane_id)
-        }
-        CloseTarget::Tab(tab_id) => lifecycle::tab(inventory, state.retained_containment(), tab_id),
-        CloseTarget::Workspace(workspace_id) => {
-            lifecycle::workspace(inventory, state.retained_containment(), workspace_id)
-        }
-    }
-}
-
-/// Why a target cannot be closed directly, when it cannot.
-/// A container named for a person: its label, or what the place is called. Its
-/// record id is never shown, because it names nothing an operator recognises.
-fn container_name(inventory: &crate::model::FleetObservation, container: &ContainerRef) -> String {
-    let kind = match container.kind {
-        crate::control_plane::containers::Kind::Workspace => "workspace",
-        crate::control_plane::containers::Kind::Tab => "tab",
-        crate::control_plane::containers::Kind::Pane => "pane",
-    };
-    let place = match container.kind {
-        crate::control_plane::containers::Kind::Workspace => inventory
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == container.handle)
-            .and_then(|workspace| workspace.label.clone()),
-        crate::control_plane::containers::Kind::Tab => inventory
-            .tabs
-            .iter()
-            .find(|tab| tab.tab_id == container.handle)
-            .and_then(|tab| tab.label.clone()),
-        crate::control_plane::containers::Kind::Pane => inventory
-            .pane(&container.handle)
-            .and_then(|pane| pane.display_name().map(str::to_string)),
-    };
-    match place.filter(|place| !place.is_empty()) {
-        Some(place) => format!("{kind} {place}"),
-        None => format!("this {kind}"),
-    }
-}
-
-/// Everything ending this target would take with it, walked down from the level
-/// asked about so one rule applies at every level and the answer is collated
-/// there: an agent mid-task, a non-shell command in a pane, a running background
-/// task. Idle shells, idle agents and finished work are not losses.
-fn losses_under(
-    inventory: &crate::model::FleetObservation,
-    state: &ObservationState,
-    target: &CloseTarget,
-) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for pane in panes_in_scope(inventory, target) {
-        let pane_id = pane.location.pane_id.as_str();
-        if let Some(agent) = inventory
-            .agents
-            .iter()
-            .find(|agent| agent.location.pane_id == pane_id)
-        {
-            if agent_busy(agent) {
-                let name = agent
-                    .label
-                    .as_deref()
-                    .or(agent.name.as_deref())
-                    .unwrap_or("an agent");
-                let state = agent
-                    .status
-                    .as_ref()
-                    .map(|status| format!("{status:?}").to_lowercase())
-                    .unwrap_or_else(|| "unknown".to_string());
-                lines.push(format!("{name} is {state}"));
-            }
-            continue;
-        }
-        if let Some(crate::model::ForegroundEvidence::NonShell { name, command, .. }) =
-            state.foreground(pane_id)
-        {
-            let what = name
-                .as_deref()
-                .or(command.as_deref())
-                .unwrap_or("a command");
-            lines.push(format!("{what} is running"));
-        }
-    }
-    lines.extend(task_losses(inventory, target));
-    lines.sort();
-    lines.dedup();
-    lines
-}
-
-/// Whether an agent is in the middle of work its row's end would lose. Only a
-/// reported idle or finished agent holds nothing: a source that reported no state
-/// has not said the work is done, so it is asked about.
-fn agent_busy(agent: &crate::model::AgentObservation) -> bool {
-    !matches!(
-        agent.status,
-        Some(crate::model::RuntimeStatus::Idle) | Some(crate::model::RuntimeStatus::Done)
-    )
-}
-
-/// Background work still running in the target's panes: those processes go with
-/// the place, so they are named in the same question. The count is the pane's own
-/// publisher's, and it speaks only for the running ones.
-fn task_losses(inventory: &crate::model::FleetObservation, target: &CloseTarget) -> Vec<String> {
-    let panes: Vec<&str> = panes_in_scope(inventory, target)
-        .into_iter()
-        .map(|pane| pane.location.pane_id.as_str())
-        .collect();
-    inventory
-        .agents
-        .iter()
-        .filter(|agent| panes.contains(&agent.location.pane_id.as_str()))
-        .filter_map(|agent| {
-            let running = agent.facts.background_running.filter(|count| *count > 0)?;
-            let name = agent
-                .label
-                .as_deref()
-                .or(agent.name.as_deref())
-                .unwrap_or("an agent");
-            Some(format!("{name} has {running} background task(s) running"))
-        })
-        .collect()
-}
-
-/// The panes a target covers, at whatever depth they sit.
-fn panes_in_scope<'a>(
-    inventory: &'a crate::model::FleetObservation,
-    target: &CloseTarget,
-) -> Vec<&'a crate::model::Pane> {
-    inventory
-        .panes
-        .iter()
-        .filter(|pane| match target {
-            CloseTarget::Pane(pane_id) => pane.location.pane_id == *pane_id,
-            CloseTarget::Tab(tab_id) => pane.location.tab_id == *tab_id,
-            CloseTarget::Workspace(workspace_id) => pane.location.workspace_id == *workspace_id,
-        })
-        .collect()
-}
-
-/// The refusal a containment state gives a direct close, when it gives one.
-fn containment_refusal(containment: Containment, target: &CloseTarget) -> Option<String> {
-    let described = target.description();
-    match containment {
-        Containment::Unmanaged => None,
-        Containment::Managed => Some(format!(
-            "{described} is managed by its owner: direct close is not available"
-        )),
-        Containment::Uncertain => Some(format!(
-            "{described} cannot be verified as unmanaged: not closing"
-        )),
-    }
-}
-
-/// The selected row as a lifecycle target: its pane and tab plus what acting on
-/// it may lose, or the reason the row is not an action target.
-enum Selected {
-    Agent {
-        pane_id: String,
-        /// The tab the row is the root of, when it is: `D` on that row ends the
-        /// whole tab, because the row stands for it.
-        tab: Option<String>,
-        losses: Vec<String>,
-        subject: Option<Box<crate::registry_observation::ManagedSubject>>,
-    },
-    Pane {
-        pane_id: String,
-        /// The tab this row stands for, when it is the row's root.
-        tab: Option<String>,
-        losses: Vec<String>,
-    },
-    Refused(&'static str),
-}
-
-/// Whether the target still exists in this inventory.
-fn target_present(inventory: &FleetObservation, target: &CloseTarget) -> bool {
-    match target {
-        CloseTarget::Pane(pane_id) => inventory.pane(pane_id).is_some(),
-        CloseTarget::Tab(tab_id) => inventory.tabs.iter().any(|tab| tab.tab_id == *tab_id),
-        CloseTarget::Workspace(workspace_id) => inventory
-            .workspaces
-            .iter()
-            .any(|workspace| workspace.workspace_id == *workspace_id),
-    }
-}
-
-/// What closing an agent's pane may lose: the agent, its assignment and any
-/// outstanding background work.
-fn agent_losses(agent: &AgentRow) -> Vec<String> {
-    let mut lines = vec![format!("agent: {} ({})", agent.title, agent.state.word())];
-    if let Some(assignment) = agent.facts.assignment.as_deref() {
-        lines.push(format!("assignment: {assignment}"));
-    }
-    if !agent.tasks.tasks.is_empty() {
-        lines.push(format!(
-            "outstanding: {} background task(s)",
-            agent.tasks.tasks.len()
-        ));
-    }
-    lines
-}
-
-/// What closing a pane row may lose: its foreground process or finished
-/// session, as the row reports it.
-fn pane_losses(pane: &PaneRow) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(exited) = &pane.exited {
-        lines.push(format!("finished session: {}", exited.title));
-    }
-    match pane.command() {
-        Some(command) => lines.push(format!("process: {command}")),
-        None if pane.exited.is_none() => {
-            lines.push("no process in the foreground".to_string());
-        }
-        None => {}
-    }
-    lines
-}
-
-/// Every pane a tab close would take with it, so nothing closed is unnamed.
-fn tab_losses(inventory: &FleetObservation, tab_id: &str) -> Vec<String> {
-    inventory
-        .panes
-        .iter()
-        .filter(|pane| pane.location.tab_id == tab_id)
-        .map(|pane| {
-            let name = pane
-                .display_name()
-                .unwrap_or(pane.location.pane_id.as_str());
-            format!("pane {} — {name}", pane.location.pane_id)
-        })
-        .collect()
-}
-
 /// Whether a position falls inside an area. Radar's areas are half-open, as the
 /// terminal's are: the edge cell belongs to the next panel.
 fn inside(area: Option<Rect>, at: (u16, u16)) -> bool {
@@ -1848,14 +1660,21 @@ fn inside(area: Option<Rect>, at: (u16, u16)) -> bool {
         at.0 >= area.x && at.0 < area.right() && at.1 >= area.y && at.1 < area.bottom()
     })
 }
+/// The dialog title for a shared command.
+fn title_of(command: SharedCommand) -> &'static str {
+    match command {
+        SharedCommand::Delete => "Delete",
+        SharedCommand::Restart => "Restart worker",
+        SharedCommand::CreateContainer => "Add to container",
+        SharedCommand::ReloadContainer => "Reload pane",
+        SharedCommand::NewWorkspace => "New workspace",
+        SharedCommand::Focus | SharedCommand::LaunchConfigured => "Confirm",
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::containers::{
-        Binding as ContainerBinding, Kind as ContainerKind, Provenance as ContainerProvenance,
-        PublicContainer,
-    };
     use crate::model::{
         AgentObservation, FleetObservation, Location, Pane, RuntimeStatus, SessionIdentity, Tab,
         Workspace,
@@ -1945,247 +1764,6 @@ mod tests {
     }
 
     #[test]
-    fn the_details_issue_no_lifecycle_or_focus_action() {
-        let (state, mut app) = fixture();
-        show_all_panes(&mut app);
-        let pane = RowId::Pane("wA:p3".into());
-        select_row(&mut app, &pane);
-        press(&mut app, KeyCode::Tab);
-        assert!(app.details_focused());
-
-        // Enter focuses a pane and x, X and r open lifecycle confirmations; from
-        // a page they are the panel's keys and do nothing at all.
-        for code in [
-            KeyCode::Enter,
-            KeyCode::Char('D'),
-            KeyCode::Char('D'),
-            KeyCode::Char('r'),
-        ] {
-            assert_eq!(press(&mut app, code), None, "{code:?} is the panel's");
-            assert!(app.confirmation().is_none(), "{code:?} opened a dialog");
-        }
-        assert_eq!(
-            app.selected_row().map(|row| row.id.clone()),
-            Some(pane),
-            "the selected row is the same one"
-        );
-        assert!(app.details_focused(), "the panel still has the keyboard");
-
-        // Back in the tree the same keys act again, so the panel is what
-        // suppressed them.
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(
-            press(&mut app, KeyCode::Char('D')),
-            Some(Action::BeginAction(Operation::Delete))
-        );
-        // The pane is idle, so the action is handed back rather than drawn.
-        assert!(matches!(
-            app.begin_action(Operation::Delete, &state),
-            Some(Confirmed::Direct(_))
-        ));
-    }
-
-    #[test]
-    fn space_picks_the_pages_next_block_and_enter_opens_only_that_one() {
-        let mut observation = crate::model::testing::fleet();
-        let owner = observation
-            .agents
-            .iter_mut()
-            .find(|agent| agent.location.pane_id == "wA:p1")
-            .expect("owner");
-        // The session the fixture owner was launched in, which is what its
-        // published tasks must name to join to it.
-        let session = owner
-            .lineage
-            .as_ref()
-            .expect("the owner publishes its session")
-            .session
-            .as_str()
-            .to_string();
-        // Publisher task snapshots join by fresh registry context, not by the
-        // legacy lineage fact in this fixture.
-        let registration_id = "task-owner";
-        let mut registry_agent: crate::registry_observation::RegistryAgent =
-            serde_json::from_value(serde_json::json!({
-                "registration": {
-                    "version": 1,
-                    "registration_id": registration_id,
-                    "registered_at": "2026-01-01T00:00:00Z",
-                    "source": "herdsman",
-                    "incarnation": "11111111-1111-4111-8111-111111111111",
-                    "session": session,
-                    "label": "owner",
-                    "location": {"backend":"test", "workspace":"wA", "tab":"wA:t1", "pane":"wA:p1"},
-                    "process_claimed": false,
-                    "launch": {"available":false}
-                },
-                "process": {"claimed":false,"claim":null,"verification":"unavailable"},
-                "execution": null,
-                "assignment": null,
-                "facts": null
-            }))
-            .expect("task owner registration fixture");
-        registry_agent.context = Some(
-            serde_json::from_value(serde_json::json!({
-                "version": 1,
-                "registration_id": registration_id,
-                "writer": {
-                    "source":"herdsman",
-                    "incarnation":"22222222-2222-4222-8222-222222222222",
-                    "generation":1,
-                    "sequence":1
-                },
-                "context": {
-                    "source":"herdsman",
-                    "incarnation":"22222222-2222-4222-8222-222222222222",
-                    "generation":1,
-                    "sequence":1,
-                    "lease_ms":30000,
-                    "received_at":"2026-01-01T00:00:00Z",
-                    "expires_at":"2026-01-01T00:00:30Z",
-                    "restored":false,
-                    "freshness":"fresh",
-                    "session":session
-                }
-            }))
-            .expect("fresh task session context fixture"),
-        );
-        owner.registry = Some(crate::registry_observation::RegistryView {
-            agent: registry_agent,
-            binding: crate::registry_observation::Binding::Joined,
-            spawn: None,
-            managed: None,
-        });
-        // Long enough that the panel puts it behind a marker rather than
-        // drawing it over everything below it.
-        owner.facts.assignment = Some("x".repeat(200));
-        let mut state = ObservationState::new();
-        state.apply_success(observation);
-        let mut app = App::new();
-        app.refresh(&state);
-        publish_tasks(
-            &mut app,
-            &session,
-            ["bg-1", "bg-2"]
-                .iter()
-                .map(|id| task_with_command(id, "nix build .#radar"))
-                .collect(),
-        );
-        let owner_row = RowId::Agent("wA:p1".into());
-        select_row(&mut app, &owner_row);
-        press(&mut app, KeyCode::Tab);
-
-        // Overview's one block is the long assignment, and Enter opens it
-        // without focusing a pane or raising a dialog.
-        assert_eq!(app.disclosures(), vec![Disclosure::Assignment]);
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert!(app.disclosure_open(&Disclosure::Assignment));
-        assert!(app.confirmation().is_none());
-        assert_eq!(
-            app.selected_row().map(|row| row.id.clone()),
-            Some(owner_row.clone())
-        );
-
-        // Processes has nothing to open, so its keys move nothing at all.
-        press(&mut app, KeyCode::Right);
-        assert_eq!(app.detail_page(), DetailPage::Processes);
-        assert!(app.disclosures().is_empty());
-        assert_eq!(press(&mut app, KeyCode::Char(' ')), None);
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert!(app.disclosure_open(&Disclosure::Assignment));
-
-        // Tasks offers one block per task with text behind it. Space cycles
-        // them, and Enter opens the one the keyboard is on — the other task's
-        // block and the assignment stay as they were.
-        press(&mut app, KeyCode::Right);
-        assert_eq!(app.detail_page(), DetailPage::Tasks);
-        let blocks = app.disclosures();
-        assert_eq!(blocks.len(), 2, "one block per task: {blocks:?}");
-        assert_eq!(app.disclosure_target().as_ref(), Some(&blocks[0]));
-        press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.disclosure_target().as_ref(), Some(&blocks[1]));
-        press(&mut app, KeyCode::Char(' '));
-        assert_eq!(
-            app.disclosure_target().as_ref(),
-            Some(&blocks[0]),
-            "Space wraps"
-        );
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert!(app.disclosure_open(&blocks[0]));
-        assert!(!app.disclosure_open(&blocks[1]));
-        assert!(app.disclosure_open(&Disclosure::Assignment));
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.details_focused(),
-            "opening a block is not leaving the panel"
-        );
-        assert_eq!(
-            app.selected_row().map(|row| row.id.clone()),
-            Some(owner_row)
-        );
-
-        // A task its publisher stops reporting hands the selection to the agent
-        // it hung under, not to whichever row now sits at its position.
-        let task = app
-            .visible_rows()
-            .into_iter()
-            .map(|row| row.id.clone())
-            .find(|id| matches!(id, RowId::Task(task) if task.id == "bg-1"))
-            .expect("bg-1 is listed");
-        select_row(&mut app, &task);
-        app.apply_task_event(TaskEvent::Tasks {
-            session: session.clone(),
-            tasks: vec![task_with_command("bg-2", "nix build .#radar")],
-        });
-        assert_eq!(
-            app.selected_row().map(|row| row.id.clone()),
-            Some(RowId::Agent("wA:p1".into())),
-            "a vanished task falls back to its owner"
-        );
-
-        // Back on a page with one block, the keyboard is on that block rather
-        // than at a position the page does not have, so the marker drawn is the
-        // one Enter would open.
-        press(&mut app, KeyCode::Left);
-        press(&mut app, KeyCode::Left);
-        assert_eq!(app.detail_page(), DetailPage::Overview);
-        assert_eq!(
-            app.disclosure_target().as_ref(),
-            Some(&Disclosure::Assignment)
-        );
-    }
-
-    #[test]
-    fn a_confirmation_keeps_precedence_over_the_details_keys() {
-        let (state, _) = fixture();
-        let state = with_running_pane(state, "wA:p3");
-        let mut app = App::new();
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Right);
-        let page = app.detail_page();
-        app.begin_action(Operation::Delete, &state);
-
-        // The dialog answers the navigation keys: Right moves the dialog's
-        // cursor rather than the panel's page, and Enter activates the button
-        // the cursor is on.
-        assert_eq!(press(&mut app, KeyCode::Right), None);
-        assert_eq!(app.detail_page(), page, "the page did not move");
-        assert!(app.confirmation().expect("open").confirm_selected);
-        assert_eq!(press(&mut app, KeyCode::Left), None);
-        assert!(
-            !app.confirmation().expect("open").confirm_selected,
-            "and back to Cancel"
-        );
-        assert_eq!(app.detail_page(), page);
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert!(app.confirmation().is_none(), "Cancel is the default");
-        assert!(app.details_focused(), "the panel kept the keyboard");
-    }
-
-    #[test]
     fn filter_entry_keeps_its_keys_while_the_details_are_focused() {
         let (_state, mut app) = fixture();
         press(&mut app, KeyCode::Tab);
@@ -2221,34 +1799,7 @@ mod tests {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
 
-    /// A running task carrying the long text a disclosure holds.
-    fn task_with_command(id: &str, command: &str) -> Task {
-        Task {
-            id: id.into(),
-            state: crate::tasks::TaskState::Running,
-            command: Some(command.into()),
-            cwd: None,
-            pid: None,
-            started_at: None,
-            last_output_at: None,
-            output_bytes: None,
-            exit_code: None,
-        }
-    }
-
     /// Connects `session` and publishes `tasks` as its complete list, as the
-    /// listener would report it.
-    fn publish_tasks(app: &mut App, session: &str, tasks: Vec<Task>) {
-        app.apply_task_event(TaskEvent::Connected {
-            session: session.into(),
-            pane: None,
-        });
-        app.apply_task_event(TaskEvent::Tasks {
-            session: session.into(),
-            tasks,
-        });
-    }
-
     fn app_with_fixture() -> App {
         fixture().1
     }
@@ -2271,62 +1822,13 @@ mod tests {
 
     /// The fixture observation and a view refreshed against it, for tests that
     /// need to revalidate against the same state the view drew.
-    /// The fixture with an agent reported mid-task: work its row's end would lose.
-    fn with_busy_agent(mut state: ObservationState, pane_id: &str) -> ObservationState {
-        let mut observation = state.inventory().expect("current inventory").clone();
-        for agent in &mut observation.agents {
-            if agent.location.pane_id == pane_id {
-                agent.status = Some(crate::model::RuntimeStatus::Working);
-            }
-        }
-        state.apply_success(observation);
-        state
-    }
-
     /// The fixture with a command in a pane's foreground: the case that loses
-    /// work, so the case that is asked about before it ends.
-    fn with_running_pane(mut state: ObservationState, pane_id: &str) -> ObservationState {
-        state.apply_evidence(
-            pane_id,
-            crate::model::ForegroundEvidence::NonShell {
-                pid: 4242,
-                name: Some("nvim".to_string()),
-                command: Some("nvim src/main.rs".to_string()),
-                local: crate::model::LocalFacts::default(),
-            },
-        );
-        state
-    }
-
     fn fixture() -> (ObservationState, App) {
         let mut state = ObservationState::new();
         state.apply_success(crate::model::testing::fleet());
         let mut app = App::new();
         app.refresh(&state);
         (state, app)
-    }
-
-    /// Cycles to the view that lists every pane, for tests about pane rows.
-    #[test]
-    fn a_new_workspace_needs_no_selected_container() {
-        // A plain pane row records no container, so `a` has nothing to act on, but
-        // `A` still asks for a workspace.
-        let (_state, mut app) = fixture();
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        assert!(app.selected_container().is_none());
-        assert_eq!(press(&mut app, KeyCode::Char('A')), None);
-        assert!(app.focus_message().unwrap().contains("shared UI session"));
-        match app.new_workspace(None) {
-            Confirmed::Container(crate::topology::Control::Create(create)) => {
-                assert_eq!(
-                    create.kind,
-                    ContainerCreateKind::Workspace { directory: None }
-                );
-                assert!(create.recipe.is_none());
-            }
-            _ => panic!("a workspace creation"),
-        }
     }
 
     fn show_all_panes(app: &mut App) {
@@ -2688,16 +2190,7 @@ mod tests {
         app.handle_key(key(code))
     }
 
-    /// Unwraps a confirmed direct close, panicking on a managed one.
-    fn direct(confirmed: Confirmed) -> CloseRequest {
-        match confirmed {
-            Confirmed::Direct(request) => request,
-            Confirmed::Subject { .. } | Confirmed::Container(_) => {
-                panic!("expected a direct close")
-            }
-        }
-    }
-
+    /// A destructive command's target belongs to the shared session now. Without
     fn select_row(app: &mut App, row: &RowId) {
         let index = app
             .visible_rows()
@@ -2706,152 +2199,6 @@ mod tests {
             .expect("row visible");
         app.move_selection(index as i32 - app.selected_index().unwrap_or(0) as i32);
         assert_eq!(app.selected_row().expect("selection").id, row);
-    }
-
-    #[test]
-    fn a_workspace_sidebar_sends_its_modals_to_the_popup_with_the_exact_row() {
-        let (state, _) = fixture();
-        let row = RowId::Agent("wA:p1".into());
-        let mut sidebar = App::sidebar();
-        sidebar.refresh(&state);
-        sidebar.show_everything();
-        select_row(&mut sidebar, &row);
-
-        // Without a host that can float a popup, the sidebar handles the key itself.
-        assert!(matches!(
-            press(&mut sidebar, KeyCode::Char('D')),
-            Some(Action::BeginAction(Operation::Delete))
-        ));
-
-        sidebar.set_modal_host(true);
-        // Expanded, the pane is the whole window, so its dialogs are drawn in it.
-        sidebar.toggle_expanded();
-        assert!(matches!(
-            press(&mut sidebar, KeyCode::Char('D')),
-            Some(Action::BeginAction(Operation::Delete))
-        ));
-        sidebar.toggle_expanded();
-        for ch in ['r', 'D', '?'] {
-            assert_eq!(
-                press(&mut sidebar, KeyCode::Char(ch)),
-                Some(Action::Modal {
-                    key: KeyCode::Char(ch),
-                    row: Some(row.clone())
-                }),
-                "{ch} opens in the popup, over the row selected here"
-            );
-        }
-        assert_eq!(
-            press(&mut sidebar, KeyCode::Char('A')),
-            Some(Action::Modal {
-                key: KeyCode::Char('A'),
-                row: None
-            }),
-            "a new workspace belongs to no row"
-        );
-        assert!(sidebar.confirmation().is_none() && !sidebar.picker_open());
-    }
-
-    #[test]
-    fn a_workspace_sidebar_with_nothing_selected_does_not_send_a_row_key_to_the_popup() {
-        let mut sidebar = App::sidebar();
-        sidebar.set_modal_host(true);
-        assert!(sidebar.selected_id().is_none());
-        assert!(
-            matches!(
-                press(&mut sidebar, KeyCode::Char('A')),
-                Some(Action::Modal { row: None, .. })
-            ),
-            "a new workspace needs no row"
-        );
-        // The popup would pick its own default row, so the key stays here, where
-        // the dashboard's own "nothing selected" answer applies.
-        for ch in ['r', 'D', 'E', 'R', '?'] {
-            assert!(
-                !matches!(
-                    press(&mut sidebar, KeyCode::Char(ch)),
-                    Some(Action::Modal { .. })
-                ),
-                "{ch} must not reach the popup without a row"
-            );
-        }
-    }
-
-    #[test]
-    fn the_popup_selects_by_identity_in_any_view_and_refuses_a_row_that_is_gone() {
-        let (state, _) = fixture();
-        let mut popup = App::modal();
-        popup.refresh(&state);
-        popup.show_everything();
-        let row = RowId::Agent("wA:p1".into());
-        assert!(popup.select_exact(&row));
-        assert_eq!(popup.selected_id(), Some(row));
-
-        let gone = RowId::Agent("wZ:gone".into());
-        assert!(!popup.select_exact(&gone));
-        assert_ne!(
-            popup.selected_id(),
-            Some(gone),
-            "no neighbour stands in for it"
-        );
-        assert!(matches!(
-            press(&mut popup, KeyCode::Char('D')),
-            Some(Action::BeginAction(Operation::Delete))
-        ));
-        assert_eq!(
-            serde_json::from_str::<RowId>(
-                &serde_json::to_string(&RowId::Agent("x".into())).unwrap()
-            )
-            .unwrap(),
-            RowId::Agent("x".into()),
-            "the identity survives the argument it travels in"
-        );
-    }
-
-    #[test]
-    fn enter_on_an_agent_row_asks_to_focus_its_pane() {
-        let mut app = app_with_fixture();
-        select_row(&mut app, &RowId::Agent("wA:p1".into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::Focus(Target::Pane("wA:p1".into())))
-        );
-        assert_eq!(app.focus_message(), None);
-    }
-
-    #[test]
-    fn enter_on_a_workspace_row_asks_to_focus_the_workspace() {
-        let mut app = app_with_fixture();
-        select_row(&mut app, &RowId::Workspace("wA".into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::Focus(Target::Workspace("wA".into())))
-        );
-    }
-
-    #[test]
-    fn enter_on_a_retained_row_focuses_the_pane_it_was_last_seen_on() {
-        let mut state = ObservationState::new();
-        state.apply_success(crate::model::testing::fleet());
-        // The owner stops being reported while its pane stays reported.
-        let mut without_owner = crate::model::testing::fleet();
-        without_owner
-            .agents
-            .retain(|agent| agent.location.pane_id != "wA:p1");
-        state.apply_success(without_owner);
-
-        let mut app = App::new();
-        app.refresh(&state);
-        select_row(&mut app, &RowId::Agent("wA:p1".into()));
-        let retained = match &app.selected_row().expect("row").node.row.kind {
-            RowKind::Agent(agent) => agent.retained.is_some(),
-            other => panic!("expected a retained agent row, got {other:?}"),
-        };
-        assert!(retained, "the row is the retained one");
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::Focus(Target::Pane("wA:p1".into())))
-        );
     }
 
     #[test]
@@ -2884,950 +2231,12 @@ mod tests {
     }
 
     #[test]
-    fn a_row_the_observation_cannot_place_refuses_with_a_message() {
-        let mut app = app_with_fixture();
-        select_row(&mut app, &RowId::Agent("wA:p1".into()));
-        // The state the rule guards against: a row kept on screen whose location
-        // the current observation no longer reports.
-        app.focus_targets.clear();
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert_eq!(app.focus_message(), Some("pane wA:p1 is not observed"));
-    }
-
-    #[test]
-    fn enter_on_a_task_focuses_its_owners_pane_or_refuses_with_that_pane() {
-        // One agent whose pane tokens name a task: the task row exists from the
-        // projection alone, with no publisher and no second refresh.
-        let observation = FleetObservation {
-            metadata_agents: Vec::new(),
-            containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
-            workspaces: vec![Workspace {
-                workspace_id: "wX".into(),
-                label: Some("solo".into()),
-                number: None,
-                session_path: None,
-            }],
-            tabs: vec![Tab {
-                tab_id: "wX:t1".into(),
-                workspace_id: "wX".into(),
-                label: None,
-                number: None,
-            }],
-            panes: vec![Pane {
-                location: Location {
-                    workspace_id: "wX".into(),
-                    tab_id: "wX:t1".into(),
-                    pane_id: "wX:p1".into(),
-                },
-                label: None,
-                title: None,
-                current_path: None,
-            }],
-            agents: vec![AgentObservation {
-                location: Location {
-                    workspace_id: "wX".into(),
-                    tab_id: "wX:t1".into(),
-                    pane_id: "wX:p1".into(),
-                },
-                name: Some("pi".into()),
-                label: Some("owner".into()),
-                status: Some(RuntimeStatus::Working),
-                session: None,
-                lineage: None,
-                facts: crate::model::HerdsmanFacts {
-                    background_tasks: vec!["bg-1:review".into()],
-                    ..Default::default()
-                },
-                registry: None,
-            }],
-        };
-        let mut state = ObservationState::new();
-        state.apply_success(observation);
-        let mut app = App::new();
-        app.refresh(&state);
-        // The subject is task behavior, and the default running view lists them.
-        assert!(app.shows_tasks());
-
-        // A task is read through the pane its owner row names: `Enter` focuses
-        // that pane and sends no task-consumption request.
-        let task = RowId::Task(crate::tree::TaskId {
-            owner: "wX:p1".into(),
-            session: None,
-            id: "bg-1".into(),
-        });
-        select_row(&mut app, &task);
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::Focus(Target::Pane("wX:p1".into())))
-        );
-        assert_eq!(app.focus_message(), None);
-
-        // The owner row still on screen with no location this observation
-        // places: the refusal names the pane the task would be read through.
-        app.focus_targets.clear();
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert_eq!(app.focus_message(), Some("pane wX:p1 is not observed"));
-    }
-
-    #[test]
     fn a_focus_message_expires_on_its_own() {
         let mut app = app_with_fixture();
         app.set_focus_message(Some("tmux refused to focus: pane_not_found".into()));
         assert!(!app.expire_focus_message(Instant::now()));
         assert!(app.expire_focus_message(Instant::now() + FOCUS_MESSAGE_TTL));
         assert_eq!(app.focus_message(), None);
-    }
-
-    fn mouse_at(at: (u16, u16)) -> MouseEvent {
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: at.0,
-            row: at.1,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        }
-    }
-
-    #[test]
-    fn an_idle_pane_ends_without_a_question_and_a_running_one_asks() {
-        let (state, mut app) = fixture();
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('D')),
-            Some(Action::BeginAction(Operation::Delete))
-        );
-        // An idle shell holds nothing, so the standard case is not a question:
-        // the same key hands the close straight back for dispatch.
-        let dismissed = app.begin_action(Operation::Delete, &state);
-        assert!(app.confirmation().is_none(), "nothing to ask about");
-        assert!(
-            matches!(dismissed, Some(Confirmed::Direct(_))),
-            "{dismissed:?}"
-        );
-
-        // A pane with a command in the foreground is asked about, and the
-        // question starts on Cancel.
-        let mut state = state;
-        state.apply_evidence(
-            "wA:p3",
-            crate::model::ForegroundEvidence::NonShell {
-                pid: 4242,
-                name: Some("nvim".to_string()),
-                command: Some("nvim src/main.rs".to_string()),
-                local: crate::model::LocalFacts::default(),
-            },
-        );
-        app.begin_action(Operation::Delete, &state);
-        let confirmation = app.confirmation().expect("a confirmation");
-        assert_eq!(confirmation.target, CloseTarget::Pane("wA:p3".into()));
-        assert!(!confirmation.confirm_selected, "Cancel is the default");
-        assert!(
-            confirmation
-                .losses
-                .iter()
-                .any(|line| line == "nvim is running"),
-            "{:?}",
-            confirmation.losses
-        );
-
-        // Enter activates the selected button, so the default Cancel cancels.
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert!(app.confirmation().is_none());
-
-        // Move to Confirm and Enter hands the frozen target back for
-        // revalidation rather than closing here.
-        app.begin_action(Operation::Delete, &state);
-        assert_eq!(press(&mut app, KeyCode::Tab), None);
-        assert!(app.confirmation().expect("open").confirm_selected);
-        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::ConfirmAction));
-    }
-
-    /// A container as the daemon reads one out: a pane Radar created, with the
-    /// command its slot runs held privately.
-    fn pane_container(id: &str, handle: &str, removed: Option<&str>) -> PublicContainer {
-        PublicContainer {
-            container_id: id.to_string(),
-            kind: ContainerKind::Pane,
-            parent: None,
-            label: Some("work".to_string()),
-            created_by: None,
-            recipe: true,
-            provenance: ContainerProvenance::Created,
-            binding: Some(ContainerBinding {
-                backend: "fake".into(),
-                incarnation: None,
-                handle: handle.to_string(),
-            }),
-            created_at: "2026-01-01T00:00:00.000Z".into(),
-            observed_at: None,
-            unresolved: None,
-            removed_at: removed.map(str::to_string),
-        }
-    }
-
-    /// The fixture with one container Radar created for a pane, every pane listed,
-    /// and that pane's row selected.
-    fn fixture_with_container(removed: Option<&str>) -> (ObservationState, App) {
-        let mut observation = crate::model::testing::fleet();
-        observation.containers = vec![pane_container("c1", "wA:p3", removed)];
-        if let Some(workspace) = observation.workspaces.first_mut() {
-            workspace.session_path = Some("/home/saurabhj/Projects/dev/agent-radar".into());
-        }
-        if let Some(pane) = observation
-            .panes
-            .iter_mut()
-            .find(|pane| pane.location.pane_id == "wA:p3")
-        {
-            pane.current_path = Some("/home/saurabhj/Projects/dev/agent-radar".into());
-        }
-        let mut state = ObservationState::new();
-        state.apply_success(observation);
-        let mut app = App::new();
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        (state, app)
-    }
-
-    #[test]
-    fn a_container_row_offers_a_container_control_and_a_plain_pane_does_not() {
-        // A creation is always a question: it makes a place rather than ending one.
-        let (state, mut app) = fixture_with_container(None);
-        app.begin_action(Operation::CreateContainer, &state);
-        let confirmation = app.confirmation().expect("a container confirmation");
-        assert_eq!(confirmation.container_id.as_deref(), Some("c1"));
-        assert_eq!(confirmation.target, CloseTarget::Pane("wA:p3".into()));
-        assert!(!confirmation.confirm_selected, "Cancel is the default");
-        app.cancel_confirmation();
-
-        // A pane Radar records nothing for has no container to address, and none is
-        // invented from the handle the backend knows the pane by.
-        let (plain, mut app) = fixture();
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        // The same key on a pane Radar records nothing for ends that pane: there
-        // is no container to address and none is invented from its handle. An idle
-        // pane is not a question, so the close is handed straight back.
-        match app.begin_action(Operation::Delete, &plain) {
-            Some(Confirmed::Direct(request)) => {
-                assert_eq!(request.target, CloseTarget::Pane("wA:p3".into()))
-            }
-            other => panic!("a pane close, not a container control: {other:?}"),
-        }
-
-        // A reload of a pane with no recipe refuses for the same reason: there is
-        // nothing recorded to run again.
-        let (no_recipe, mut app) = fixture();
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::ReloadContainer, &no_recipe);
-        assert!(app.confirmation().is_none());
-    }
-
-    /// Deleting a container something is running in is a question, and the
-    /// question names what would die rather than the record that holds it.
-    #[test]
-    fn deleting_a_running_container_asks_first_and_names_what_is_running() {
-        let (mut state, mut app) = fixture_with_container(None);
-        state.apply_evidence(
-            "wA:p3",
-            crate::model::ForegroundEvidence::NonShell {
-                pid: 4242,
-                name: Some("nvim".to_string()),
-                command: Some("nvim src/main.rs".to_string()),
-                local: crate::model::LocalFacts::default(),
-            },
-        );
-        assert!(app.begin_action(Operation::Delete, &state).is_none());
-        let confirmation = app.confirmation().expect("a confirmation");
-        assert!(
-            confirmation
-                .losses
-                .iter()
-                .any(|line| line == "nvim is running"),
-            "the losses name the command: {:?}",
-            confirmation.losses
-        );
-        assert!(
-            confirmation
-                .losses
-                .iter()
-                .all(|line| !line.contains("c1") && !line.contains("wA:p3")),
-            "no record id or pane handle is shown: {:?}",
-            confirmation.losses
-        );
-    }
-
-    /// A container whose handle no backend reports has no place to freeze, so its
-    /// deletion is the record going — and the TUI must not refuse it before the
-    /// daemon can decide.
-    #[test]
-    fn an_unresolved_container_can_be_forgotten_but_not_otherwise_acted_on() {
-        let mut observation = crate::model::testing::fleet();
-        let mut container = pane_container("c1", "wA:p3", None);
-        container.unresolved = Some("no backend reports this container's handle".to_string());
-        observation.containers = vec![container];
-        let mut state = ObservationState::new();
-        state.apply_success(observation);
-        let mut app = App::new();
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-
-        // A reload needs a place to run in, so it still refuses.
-        assert!(
-            app.begin_action(Operation::ReloadContainer, &state)
-                .is_none()
-        );
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message()
-                .is_some_and(|message| message.contains("is unresolved")),
-            "{:?}",
-            app.focus_message()
-        );
-
-        // A deletion freezes nothing and asks nothing: it is the record's removal.
-        match app.begin_action(Operation::Delete, &state) {
-            Some(Confirmed::Container(crate::topology::Control::Delete(request))) => {
-                assert_eq!(request.container_id, "c1");
-                assert_eq!(request.frozen, serde_json::Value::Null);
-            }
-            other => panic!("a records-only deletion: {other:?}"),
-        }
-        assert!(app.confirmation().is_none(), "nothing to ask");
-    }
-
-    /// Nothing running is the standard case: it loses no work, so it is not asked
-    /// about.
-    #[test]
-    fn deleting_an_idle_container_asks_nothing() {
-        let (state, mut app) = fixture_with_container(None);
-        let confirmed = app.begin_action(Operation::Delete, &state);
-        assert!(app.confirmation().is_none(), "no question to ask");
-        assert!(matches!(
-            confirmed,
-            Some(Confirmed::Container(crate::topology::Control::Delete(_)))
-        ));
-    }
-
-    fn launch_test_shell(name: &str) -> (std::path::PathBuf, std::ffi::OsString) {
-        use std::os::unix::fs::PermissionsExt;
-        let root =
-            std::env::temp_dir().join(format!("radar-app-launch-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let shell = root.join("bash");
-        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = std::env::join_paths([&root]).unwrap();
-        (root, path)
-    }
-
-    #[test]
-    fn l_launches_the_configured_agent_immediately_in_the_selected_pane_directory() {
-        let (state, mut app) = fixture_with_container(None);
-        let (root, path) = launch_test_shell("pane");
-        let shell = root.join("bash").to_string_lossy().into_owned();
-        assert_eq!(
-            press(&mut app, KeyCode::Char('L')),
-            Some(Action::LaunchConfigured)
-        );
-        assert!(
-            app.confirmation().is_none(),
-            "L has no prompt or confirmation"
-        );
-
-        let confirmed = app
-            .launch_configured(
-                &state,
-                &["pi".into(), "an argument with spaces".into()],
-                Some("bash"),
-                Some(path.as_os_str()),
-            )
-            .unwrap_or_else(|| panic!("launch refused: {:?}", app.focus_message()));
-        match confirmed {
-            Confirmed::Container(crate::topology::Control::Create(request)) => {
-                // A launch from a pane opens its own window in that pane's
-                // workspace, rather than a pane beside what already runs there.
-                assert_eq!(
-                    request.kind,
-                    ContainerCreateKind::Tab {
-                        workspace_id: "wA".to_string()
-                    }
-                );
-                let recipe = request.recipe.expect("launch uses a private recipe");
-                assert_eq!(
-                    recipe.cwd.as_deref(),
-                    Some("/home/saurabhj/Projects/dev/agent-radar")
-                );
-                assert_eq!(recipe.executable, shell);
-                assert_eq!(recipe.argv[0], "-ilc");
-                assert!(recipe.argv[1].contains("exec \"$@\""));
-                assert_eq!(recipe.argv[3], "pi");
-                assert_eq!(recipe.argv[4], "an argument with spaces");
-                assert!(recipe.env.is_empty(), "TUI environment is not copied");
-            }
-            other => panic!("a launch: {other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn l_on_a_workspace_uses_its_recorded_directory_and_creates_a_tab() {
-        let (mut state, mut app) = fixture_with_container(None);
-        let (root, path) = launch_test_shell("workspace");
-        let shell = root.join("bash").to_string_lossy().into_owned();
-        let mut observation = state.inventory().expect("inventory").clone();
-        let mut workspace = pane_container("c2", "wA", None);
-        workspace.kind = ContainerKind::Workspace;
-        workspace.recipe = false;
-        observation.containers.push(workspace);
-        state.apply_success(observation);
-        app.refresh(&state);
-        select_row(&mut app, &RowId::Workspace("wA".into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('L')),
-            Some(Action::LaunchConfigured)
-        );
-        let confirmed = app
-            .launch_configured(&state, &["pi".into()], Some("bash"), Some(path.as_os_str()))
-            .expect("workspace launch");
-        match confirmed {
-            Confirmed::Container(crate::topology::Control::Create(request)) => {
-                assert!(matches!(request.kind, ContainerCreateKind::Tab { .. }));
-                let recipe = request.recipe.unwrap();
-                assert_eq!(recipe.executable, shell);
-                assert_eq!(
-                    recipe.cwd.as_deref(),
-                    Some("/home/saurabhj/Projects/dev/agent-radar")
-                );
-            }
-            other => panic!("workspace launch: {other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn an_empty_configured_launch_command_refuses_before_creating_a_pane() {
-        let (state, mut app) = fixture_with_container(None);
-        assert!(
-            app.launch_configured(
-                &state,
-                &[],
-                Some("/bin/bash"),
-                Some(std::ffi::OsStr::new("/bin:/usr/bin")),
-            )
-            .is_none()
-        );
-        assert!(
-            app.focus_message()
-                .is_some_and(|message| message.contains("configured launch command is empty"))
-        );
-    }
-
-    #[test]
-    fn presence_status_action_does_not_dispatch_enrollment() {
-        // The key reports the daemon's current standing; the presence reporter owns
-        // admission and session changes.
-        let (state, mut app) = fixture();
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('E')),
-            Some(Action::BeginAction(Operation::PresenceStatus))
-        );
-        app.begin_action(Operation::PresenceStatus, &state);
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message()
-                .is_some_and(|message| message.contains("only a Pi session can be managed")),
-            "{:?}",
-            app.focus_message()
-        );
-    }
-
-    #[test]
-    fn a_container_control_freezes_its_place_and_occupant_at_confirm() {
-        let (state, mut app) = fixture_with_container(None);
-        // Nothing runs in this container, so the deletion is not a question: the
-        // frozen control comes straight back.
-        let confirmed = app.begin_action(Operation::Delete, &state);
-        assert!(app.confirmation().is_none(), "nothing to ask");
-        match confirmed.expect("the container still holds") {
-            Confirmed::Container(crate::topology::Control::Delete(request)) => {
-                assert_eq!(request.container_id, "c1");
-                assert_eq!(
-                    request.frozen["target"],
-                    serde_json::json!({"pane": "wA:p3"}),
-                    "{}",
-                    request.frozen
-                );
-                assert_eq!(
-                    request.frozen["identity"]["pane"]["pane_id"],
-                    serde_json::json!("wA:p3"),
-                    "{}",
-                    request.frozen
-                );
-                // The caller's own id is the operation's key: a lost answer is read
-                // back under it rather than sent again.
-                assert!(
-                    crate::model::SessionUuid::parse(&request.request_id).is_some(),
-                    "{}",
-                    request.request_id
-                );
-            }
-            other => panic!("a container deletion: {other:?}"),
-        }
-
-        // A reload needs the recipe the record says is held, and hands back a
-        // control naming the container rather than the place.
-        app.begin_action(Operation::ReloadContainer, &state);
-        match app.confirm(&state).expect("the container still holds") {
-            Confirmed::Container(crate::topology::Control::Reload(request)) => {
-                assert_eq!(request.container_id, "c1")
-            }
-            other => panic!("a container reload: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_container_changed_before_confirm_is_not_acted_on() {
-        let (mut state, mut app) = fixture_with_container(None);
-        app.begin_action(Operation::ReloadContainer, &state);
-        assert!(app.confirmation().is_some());
-
-        // The container is removed while the dialog is up: the place may now belong
-        // to whatever the backend put there, so nothing is sent.
-        let mut observation = crate::model::testing::fleet();
-        observation.containers = vec![pane_container(
-            "c1",
-            "wA:p3",
-            Some("2026-01-01T00:00:02.000Z"),
-        )];
-        state.apply_success(observation);
-        assert!(app.confirm(&state).is_none(), "nothing was sent");
-        assert!(
-            app.focus_message()
-                .is_some_and(|message| message.contains("is gone")),
-            "{:?}",
-            app.focus_message()
-        );
-    }
-
-    #[test]
-    fn confirm_revalidates_against_the_latest_observation() {
-        let (state, _) = fixture();
-        let state = with_running_pane(state, "wA:p3");
-        let mut app = App::new();
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::Delete, &state);
-        let request = direct(app.confirm(&state).expect("an unchanged target confirms"));
-        assert_eq!(request.target, CloseTarget::Pane("wA:p3".into()));
-        assert_eq!(
-            request.identity,
-            lifecycle::identity(
-                state.inventory().expect("current inventory"),
-                &request.target
-            ),
-            "the frozen identity is the observed one"
-        );
-
-        // A stale source cancels: the last-good inventory is not current
-        // evidence, so nothing is closed on it.
-        app.begin_action(Operation::Delete, &state);
-        let mut stale = ObservationState::new();
-        stale.apply_success(crate::model::testing::fleet());
-        stale.apply_failure("tmux exited with status 1");
-        assert_eq!(app.confirm(&stale), None);
-        assert!(app.focus_message().expect("a reason").contains("stale"));
-    }
-
-    /// A deletion the daemon held because an agent inside the place did not exit
-    /// is the operator's to repeat: the next `D` asks for the place to close.
-    #[test]
-    fn a_deletion_held_by_a_living_agent_is_repeated_with_force() {
-        let mut observation = crate::model::testing::fleet();
-        let mut container = pane_container("c1", "wA:p3", None);
-        container.unresolved = Some("no backend reports this container's handle".to_string());
-        observation.containers = vec![container];
-        let mut state = ObservationState::new();
-        state.apply_success(observation);
-        let mut app = App::new();
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-
-        let answer = crate::control_plane::client::ContainerAnswer {
-            request: serde_json::json!({
-                "request_id": "held",
-                "outcome": "refused",
-                "category": crate::control_plane::store::Category::AGENTS_ALIVE,
-                "message": "1 agent(s) inside pane wA:p3 did not exit",
-            }),
-            container: None,
-            removed: Vec::new(),
-        };
-        app.apply_container_outcome(crate::topology::Finished {
-            verb: "delete",
-            container_id: Some("c1".to_string()),
-            request_id: "held".to_string(),
-            result: Ok(answer),
-        });
-
-        match app.begin_action(Operation::Delete, &state) {
-            Some(Confirmed::Container(crate::topology::Control::Delete(request))) => {
-                assert!(request.force, "the repeat closes anyway")
-            }
-            other => panic!("a delete control: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn moving_the_selection_does_not_redirect_the_frozen_target() {
-        // A command in the pane makes the close a question, which is what the
-        // frozen target belongs to.
-        let (state, _) = fixture();
-        let state = with_running_pane(state, "wA:p3");
-        let mut app = App::new();
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::Delete, &state);
-
-        // The cursor moves to the managed owner while the dialog is up.
-        select_row(&mut app, &RowId::Agent("wA:p1".into()));
-        let request = direct(
-            app.confirm(&state)
-                .expect("the frozen target still confirms"),
-        );
-        assert_eq!(
-            request.target,
-            CloseTarget::Pane("wA:p3".into()),
-            "Confirm closes the reviewed target, not the current selection"
-        );
-    }
-
-    #[test]
-    fn confirm_refuses_a_replaced_unmanaged_occupant_on_the_same_pane() {
-        // Same pane id, same agent kind, same containment — only the session
-        // identity changed. The operator confirmed the first occupant, so
-        // closing the second would act on something they never reviewed.
-        let observation = |session: &str| FleetObservation {
-            metadata_agents: Vec::new(),
-            containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
-            workspaces: vec![Workspace {
-                workspace_id: "wX".into(),
-                label: Some("solo".into()),
-                number: None,
-                session_path: None,
-            }],
-            tabs: vec![Tab {
-                tab_id: "wX:t1".into(),
-                workspace_id: "wX".into(),
-                label: None,
-                number: None,
-            }],
-            panes: vec![Pane {
-                location: Location {
-                    workspace_id: "wX".into(),
-                    tab_id: "wX:t1".into(),
-                    pane_id: "wX:p1".into(),
-                },
-                label: None,
-                title: None,
-                current_path: None,
-            }],
-            agents: vec![AgentObservation {
-                location: Location {
-                    workspace_id: "wX".into(),
-                    tab_id: "wX:t1".into(),
-                    pane_id: "wX:p1".into(),
-                },
-                name: Some("claude".into()),
-                label: None,
-                status: Some(RuntimeStatus::Working),
-                session: Some(SessionIdentity::Reported {
-                    source: None,
-                    value: session.into(),
-                }),
-                lineage: None,
-                facts: crate::model::HerdsmanFacts::default(),
-                registry: None,
-            }],
-        };
-        let mut state = ObservationState::new();
-        state.apply_success(observation("s1"));
-        let mut app = App::new();
-        app.refresh(&state);
-        select_row(&mut app, &RowId::Agent("wX:p1".into()));
-        app.begin_action(Operation::Delete, &state);
-        assert!(app.confirmation().is_some(), "an unmanaged pane confirms");
-
-        let mut replaced = ObservationState::new();
-        replaced.apply_success(observation("s2"));
-        assert_eq!(
-            app.confirm(&replaced),
-            None,
-            "a replaced occupant is not the confirmed target"
-        );
-        assert!(
-            app.focus_message().expect("a reason").contains("changed"),
-            "{:?}",
-            app.focus_message()
-        );
-    }
-
-    #[test]
-    fn a_target_that_became_managed_before_confirm_is_not_closed() {
-        // The pane holds a command, so the close is a question worth asking.
-        let (state, _) = fixture();
-        let state = with_running_pane(state, "wA:p3");
-        let mut app = App::new();
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::Delete, &state);
-
-        // A managed worker appears on the frozen pane before Confirm.
-        let mut observation = crate::model::testing::fleet();
-        observation.agents.push(AgentObservation {
-            location: Location {
-                workspace_id: "wA".into(),
-                tab_id: "wA:t1".into(),
-                pane_id: "wA:p3".into(),
-            },
-            name: Some("pi".into()),
-            label: None,
-            status: None,
-            session: None,
-            lineage: None,
-            facts: crate::model::HerdsmanFacts {
-                managed_metadata: true,
-                ..Default::default()
-            },
-            registry: None,
-        });
-        let mut changed = ObservationState::new();
-        changed.apply_success(observation);
-
-        assert_eq!(app.confirm(&changed), None);
-        assert!(
-            app.focus_message().expect("a reason").contains("managed"),
-            "{:?}",
-            app.focus_message()
-        );
-    }
-
-    #[test]
-    fn the_row_standing_for_a_tab_ends_the_tab_and_a_nested_row_ends_its_pane() {
-        let (state, mut app) = fixture();
-        show_all_panes(&mut app);
-
-        // The row a tab is drawn as stands for the whole tab, so ending it ends
-        // every pane inside — including one whose owner holds a subject there.
-        let root = app
-            .visible_rows()
-            .into_iter()
-            .find(|row| {
-                matches!(
-                    &row.node.row.kind,
-                    RowKind::Pane(pane) if pane.represents_tab
-                )
-            })
-            .map(|row| row.id.clone());
-        let Some(root) = root else {
-            // The fixture draws its tab as an agent row instead, mid-task.
-            let state = with_busy_agent(state, "wA:p1");
-            app.refresh(&state);
-            show_all_panes(&mut app);
-            select_row(&mut app, &RowId::Agent("wA:p1".into()));
-            app.begin_action(Operation::Delete, &state);
-            let confirmation = app.confirmation().expect("a confirmation");
-            // The fixture gives this row no owner-held subject, so it is its own
-            // pane rather than the tab.
-            assert_eq!(confirmation.target, CloseTarget::Pane("wA:p1".into()));
-            return;
-        };
-        // The tab's own pane holds the work, so the tab is asked about.
-        let pane_of_root = match &root {
-            RowId::Pane(pane) => Some(pane.clone()),
-            RowId::Agent(pane) | RowId::Registered(pane) => Some(pane.clone()),
-            _ => None,
-        }
-        .expect("a pane row");
-        let state = with_running_pane(state, &pane_of_root);
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &root);
-        app.begin_action(Operation::Delete, &state);
-        let confirmation = app.confirmation().expect("a confirmation");
-        assert!(
-            matches!(confirmation.target, CloseTarget::Tab(_)),
-            "{:?}",
-            confirmation.target
-        );
-        assert!(confirmation.subject.is_none(), "a tab is not one subject");
-        assert!(
-            confirmation
-                .losses
-                .iter()
-                .any(|line| line == "nvim is running"),
-            "{:?}",
-            confirmation.losses
-        );
-    }
-
-    #[test]
-    fn a_workspace_row_does_not_redirect_a_close_to_its_panes() {
-        let (state, mut app) = fixture();
-        select_row(&mut app, &RowId::Workspace("wA".into()));
-        app.begin_action(Operation::Delete, &state);
-        assert!(app.confirmation().is_none());
-        assert!(app.focus_message().expect("a reason").contains("workspace"));
-    }
-
-    #[test]
-    fn a_task_row_does_not_redirect_a_close_to_its_owner() {
-        let observation = FleetObservation {
-            metadata_agents: Vec::new(),
-            containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
-            workspaces: vec![Workspace {
-                workspace_id: "wX".into(),
-                label: Some("solo".into()),
-                number: None,
-                session_path: None,
-            }],
-            tabs: vec![Tab {
-                tab_id: "wX:t1".into(),
-                workspace_id: "wX".into(),
-                label: None,
-                number: None,
-            }],
-            panes: vec![Pane {
-                location: Location {
-                    workspace_id: "wX".into(),
-                    tab_id: "wX:t1".into(),
-                    pane_id: "wX:p1".into(),
-                },
-                label: None,
-                title: None,
-                current_path: None,
-            }],
-            agents: vec![AgentObservation {
-                location: Location {
-                    workspace_id: "wX".into(),
-                    tab_id: "wX:t1".into(),
-                    pane_id: "wX:p1".into(),
-                },
-                name: Some("claude".into()),
-                label: Some("worker".into()),
-                status: Some(RuntimeStatus::Working),
-                session: None,
-                lineage: None,
-                facts: crate::model::HerdsmanFacts {
-                    background_tasks: vec!["bg-1:review".into()],
-                    ..Default::default()
-                },
-                registry: None,
-            }],
-        };
-        let mut state = ObservationState::new();
-        state.apply_success(observation);
-        let mut app = App::new();
-        app.refresh(&state);
-        assert!(app.shows_tasks(), "the default running view lists tasks");
-        let task = RowId::Task(crate::tree::TaskId {
-            owner: "wX:p1".into(),
-            session: None,
-            id: "bg-1".into(),
-        });
-        select_row(&mut app, &task);
-        app.begin_action(Operation::Delete, &state);
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message()
-                .expect("a reason")
-                .contains("background task")
-        );
-    }
-
-    #[test]
-    fn a_retained_managed_association_is_ended_like_any_other_row() {
-        let mut state = ObservationState::new();
-        state.apply_success(crate::model::testing::fleet());
-        let mut without = crate::model::testing::fleet();
-        // The managed owner stops being reported while its pane stays.
-        without
-            .agents
-            .retain(|agent| agent.location.pane_id != "wA:p1");
-        state.apply_success(without);
-        let mut app = App::new();
-        app.refresh(&state);
-
-        select_row(&mut app, &RowId::Agent("wA:p1".into()));
-        // The pane is kept alive by a retained association, so Radar cannot verify
-        // its occupant and has no owner to ask: the direct close is refused with
-        // that reason rather than acted on behind an owner's back.
-        assert!(app.begin_action(Operation::Delete, &state).is_none());
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message()
-                .is_some_and(|message| message.contains("managed by its owner")),
-            "{:?}",
-            app.focus_message()
-        );
-    }
-
-    #[test]
-    fn lifecycle_keys_typed_in_filter_entry_are_text() {
-        let (_, mut app) = fixture();
-        press(&mut app, KeyCode::Char('/'));
-        assert_eq!(press(&mut app, KeyCode::Char('D')), None);
-        assert_eq!(press(&mut app, KeyCode::Char('D')), None);
-        assert_eq!(press(&mut app, KeyCode::Char('r')), None);
-        assert!(app.is_filter_editing());
-        assert_eq!(app.filter_query(), "DDr");
-        assert!(app.confirmation().is_none());
-    }
-
-    #[test]
-    fn mouse_only_the_drawn_buttons_answer_a_confirmation() {
-        let (state, _) = fixture();
-        let state = with_running_pane(state, "wA:p3");
-        let mut app = App::new();
-        app.refresh(&state);
-        show_all_panes(&mut app);
-        select_row(&mut app, &RowId::Pane("wA:p3".into()));
-        app.begin_action(Operation::Delete, &state);
-        let cancel = Rect::new(20, 10, 10, 1);
-        let confirm = Rect::new(34, 10, 11, 1);
-        app.note_layout(Geometry {
-            confirm_cancel: Some(cancel),
-            confirm_confirm: Some(confirm),
-            ..Geometry::default()
-        });
-
-        // A click on a tree row — even a second click that would focus it — is
-        // not confirmation.
-        assert_eq!(app.handle_mouse(mouse_at((5, 3))), None);
-        assert!(app.confirmation().is_some());
-
-        // The drawn Confirm button is.
-        assert_eq!(
-            app.handle_mouse(mouse_at((40, 10))),
-            Some(Action::ConfirmAction)
-        );
-
-        // The drawn Cancel button closes without acting.
-        app.cancel_confirmation();
-        app.begin_action(Operation::Delete, &state);
-        assert_eq!(app.handle_mouse(mouse_at((25, 10))), None);
-        assert!(app.confirmation().is_none());
     }
 
     const MANAGED_OWNER: &str = "01a10c77-8a6b-7035-8a0e-b1fa607bb507";
@@ -3995,248 +2404,6 @@ mod tests {
     }
 
     #[test]
-    fn a_managed_worker_opens_a_daemon_subject_confirmation() {
-        let mut state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
-        let mut observation = state.inventory().expect("current inventory").clone();
-        observation.agents[0]
-            .registry
-            .as_mut()
-            .and_then(|view| view.managed.as_mut())
-            .expect("managed subject")
-            .child_close = Some(crate::registry_observation::ChildCloseTarget {
-            spawn_request_id: "spawn-edge".into(),
-            source: "worker".into(),
-            incarnation: "11111111-1111-4111-8111-111111111111".into(),
-        });
-        state.apply_success(observation);
-        let mut app = App::new();
-        app.refresh(&state);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::Delete, &state);
-        let confirmation = app.confirmation().expect("a managed close confirmation");
-        assert!(!confirmation.confirm_selected, "Cancel is the default");
-        assert_eq!(
-            confirmation
-                .subject
-                .as_ref()
-                .map(|subject| subject.subject_id.as_str()),
-            Some("subject-managed")
-        );
-        match app.confirm(&state).expect("unchanged") {
-            Confirmed::Subject {
-                operation: Operation::Delete,
-                subject_id,
-                child_close,
-                close_request_id,
-                ..
-            } => {
-                assert_eq!(subject_id, "subject-managed");
-                assert_eq!(
-                    child_close,
-                    Some(crate::registry_observation::ChildCloseTarget {
-                        spawn_request_id: "spawn-edge".into(),
-                        source: "worker".into(),
-                        incarnation: "11111111-1111-4111-8111-111111111111".into(),
-                    })
-                );
-                assert!(close_request_id.is_some(), "pane cleanup has its own id");
-            }
-            Confirmed::Direct(_) | Confirmed::Container(_) | Confirmed::Subject { .. } => {
-                panic!("managed control must target its daemon subject")
-            }
-        }
-    }
-
-    #[test]
-    fn restart_is_offered_for_a_bound_daemon_subject_with_a_session() {
-        let state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
-        let mut app = App::new();
-        app.refresh(&state);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        assert_eq!(
-            press(&mut app, KeyCode::Char('r')),
-            Some(Action::BeginAction(Operation::Restart))
-        );
-        app.begin_action(Operation::Restart, &state);
-        let subject = app
-            .confirmation()
-            .expect("a restart confirmation")
-            .subject
-            .as_ref()
-            .expect("daemon subject");
-        assert_eq!(subject.subject_id, "subject-managed");
-
-        // The daemon, not owner projection or locally inferred status, decides
-        // whether the exact process can be restarted.
-        let mut busy = managed_facts();
-        busy.state = Some(crate::model::SemanticState::Working);
-        let busy = managed_state(busy, RuntimeStatus::Working, Some(MANAGED_OWNER));
-        let mut app = App::new();
-        app.refresh(&busy);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::Restart, &busy);
-        assert!(app.confirmation().is_some());
-
-        // An enrolled lead's session does not require a parent owner.
-        let orphan = managed_state(managed_facts(), RuntimeStatus::Idle, None);
-        let mut app = App::new();
-        app.refresh(&orphan);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::Restart, &orphan);
-        assert!(app.confirmation().is_some());
-        app.handle_key(key(KeyCode::Esc));
-
-        // A workspace or task row never infers a process to signal.
-        select_row(&mut app, &RowId::Workspace("wM".into()));
-        app.begin_action(Operation::Restart, &orphan);
-        assert!(app.confirmation().is_none());
-        assert!(
-            app.focus_message()
-                .expect("a reason")
-                .contains("managed worker")
-        );
-    }
-
-    #[test]
-    fn confirm_refuses_a_managed_target_when_process_generation_changes() {
-        let mut state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
-        let mut app = App::new();
-        app.refresh(&state);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::Delete, &state);
-        assert!(app.confirmation().is_some());
-
-        let mut replacement = state.inventory().expect("current inventory").clone();
-        replacement.agents[0]
-            .registry
-            .as_mut()
-            .and_then(|view| view.managed.as_mut())
-            .expect("managed subject")
-            .process
-            .start_ticks += 1;
-        state.apply_success(replacement);
-        assert!(app.confirm(&state).is_none());
-        assert!(
-            app.focus_message()
-                .expect("refusal")
-                .contains("binding changed")
-        );
-    }
-
-    #[test]
-    fn confirm_refuses_a_managed_target_whose_run_changed() {
-        let state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
-        let mut app = App::new();
-        app.refresh(&state);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::Delete, &state);
-
-        let mut replaced = managed_facts();
-        replaced.run = Some("7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918".into());
-        let replaced = managed_state(replaced, RuntimeStatus::Idle, Some(MANAGED_OWNER));
-        assert_eq!(app.confirm(&replaced), None);
-        assert!(
-            app.focus_message().expect("a reason").contains("changed"),
-            "{:?}",
-            app.focus_message()
-        );
-    }
-
-    #[test]
-    fn a_busy_worker_is_still_subject_targeted_for_daemon_refusal() {
-        let state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
-        let mut app = App::new();
-        app.refresh(&state);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::Restart, &state);
-        assert!(app.confirmation().is_some());
-
-        let mut busy = managed_facts();
-        busy.state = Some(crate::model::SemanticState::Working);
-        let busy = managed_state(busy, RuntimeStatus::Working, Some(MANAGED_OWNER));
-        assert!(matches!(
-            app.confirm(&busy),
-            Some(Confirmed::Subject { .. })
-        ));
-        assert!(app.focus_message().is_none());
-    }
-
-    #[test]
-    fn unknown_runtime_state_does_not_change_the_daemon_subject_target() {
-        // Process eligibility belongs to the daemon's exact subject contract,
-        // not to a local reconstruction of owner state.
-        let unknown = managed_state(managed_facts(), RuntimeStatus::Unknown, Some(MANAGED_OWNER));
-        let mut app = App::new();
-        app.refresh(&unknown);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::Restart, &unknown);
-        assert!(app.confirmation().is_some());
-
-        // The same subject still targets the same daemon record at confirmation.
-        let idle = managed_state(managed_facts(), RuntimeStatus::Idle, Some(MANAGED_OWNER));
-        let mut app = App::new();
-        app.refresh(&idle);
-        select_row(&mut app, &RowId::Agent("wM:p1".into()));
-        app.begin_action(Operation::Restart, &idle);
-        assert!(app.confirmation().is_some());
-
-        assert!(matches!(
-            app.confirm(&unknown),
-            Some(Confirmed::Subject { .. })
-        ));
-    }
-
-    #[test]
-    fn the_outcomes_panel_is_modal_and_shows_what_was_reported() {
-        let (state, mut app) = fixture_with_container(None);
-        app.record_notice("bad".into(), "delete refused: something long".into(), true);
-
-        assert_eq!(press(&mut app, KeyCode::Char('!')), None);
-        assert!(app.notices_open());
-
-        // While it is open nothing reaches the tree: `d` would toggle the details
-        // panel and `j` would move the selection, and neither happens.
-        let selected = app.selected_index();
-        let details = app.shows_details();
-        assert_eq!(press(&mut app, KeyCode::Char('d')), None);
-        assert_eq!(press(&mut app, KeyCode::Char('j')), None);
-        assert_eq!(app.shows_details(), details, "the tree kept its keys");
-        assert_eq!(app.selected_index(), selected);
-        assert_eq!(app.notice_scroll(), 1, "the panel took the key");
-
-        // Escape closes it and leaves the outcome to be read again.
-        assert_eq!(press(&mut app, KeyCode::Esc), None);
-        assert!(!app.notices_open());
-        assert_eq!(app.lifecycle_notices().len(), 1);
-
-        // `c` in the panel clears the outcomes and closes it.
-        assert_eq!(press(&mut app, KeyCode::Char('!')), None);
-        assert_eq!(press(&mut app, KeyCode::Char('c')), None);
-        assert!(!app.notices_open());
-        assert!(app.lifecycle_notices().is_empty());
-        let _ = state;
-    }
-
-    #[test]
-    fn a_completed_outcome_ages_out_and_a_failure_stays_until_dismissed() {
-        let mut app = App::new();
-        app.record_notice("ok".into(), "create completed".into(), false);
-        app.record_notice("bad".into(), "delete refused".into(), true);
-        assert!(!app.expire_focus_message(Instant::now()));
-        assert_eq!(app.lifecycle_notices().len(), 2);
-        assert!(app.expire_focus_message(Instant::now() + NOTICE_TTL));
-        let left: Vec<_> = app
-            .lifecycle_notices()
-            .iter()
-            .map(|n| n.id.as_str())
-            .collect();
-        assert_eq!(left, ["bad"]);
-        assert!(!app.expire_focus_message(Instant::now() + NOTICE_TTL * 10));
-        app.dismiss_notices();
-        assert!(app.lifecycle_notices().is_empty());
-    }
-
-    #[test]
     fn a_palette_choice_is_a_tree_command_even_while_details_hold_the_keyboard() {
         let (_, mut app) = fixture();
         press(&mut app, KeyCode::Tab);
@@ -4250,8 +2417,13 @@ mod tests {
         }
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            Some(Action::BeginAction(Operation::Restart)),
+            None,
             "the palette runs Restart on the tree, not through the details panel"
+        );
+        assert!(
+            app.focus_message()
+                .is_some_and(|message| message.contains("shared UI session")),
+            "the palette's command reached the tree"
         );
     }
 
@@ -4308,80 +2480,12 @@ mod tests {
         for ch in "notes".chars() {
             assert_eq!(press(&mut app, KeyCode::Char(ch)), None);
         }
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::NewWorkspaceIn(PathBuf::from("/home/one/notes")))
-        );
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
         assert!(app.workspace_picker().is_none());
 
         app.open_workspace_picker(directories);
         assert_eq!(press(&mut app, KeyCode::Esc), None);
         assert!(app.workspace_picker().is_none(), "Escape cancels");
         assert!(app.focus_message().is_none());
-    }
-
-    #[test]
-    fn managed_cancel_and_spawn_close_are_separate_operation_notices() {
-        let (_, mut app) = fixture();
-        app.apply_subject_outcome(crate::managed_control::Finished {
-            operation: crate::managed_control::Operation::Cancel,
-            request_id: "cancel-id".into(),
-            subject_id: "subject-1".into(),
-            result: Ok(crate::control_plane::client::LifecycleAnswer {
-                request: serde_json::json!({"outcome":"completed"}),
-            }),
-            close_request_id: Some("close-id".into()),
-            close_result: Some(Ok(crate::control_plane::client::LifecycleAnswer {
-                request: serde_json::json!({"outcome":"refused", "message":"pane generation changed"}),
-            })),
-        });
-        assert_eq!(app.lifecycle_notices().len(), 2);
-        assert!(app.lifecycle_notices()[0].text.contains("cancel completed"));
-        assert!(
-            app.lifecycle_notices()[1]
-                .text
-                .contains("pane cleanup refused")
-        );
-        assert!(app.lifecycle_notices()[1].text.contains("close-id"));
-        assert!(app.lifecycle_notices()[1].failed);
-    }
-
-    #[test]
-    fn lifecycle_outcomes_are_kept_separately_and_dismissed() {
-        let (_, mut app) = fixture();
-        let id = "a0000000-0000-4000-8000-000000000001".to_string();
-        let finished = |outcome: &str, message: Option<&str>| crate::managed_control::Finished {
-            operation: crate::managed_control::Operation::Stop,
-            request_id: id.clone(),
-            subject_id: "subject-1".into(),
-            result: Ok(crate::control_plane::client::LifecycleAnswer {
-                request: serde_json::json!({"outcome": outcome, "message": message}),
-            }),
-            close_request_id: None,
-            close_result: None,
-        };
-        app.apply_subject_outcome(finished("completed", None));
-        assert_eq!(app.lifecycle_notices().len(), 1);
-        assert!(app.lifecycle_notices()[0].text.contains("completed"));
-        assert!(
-            app.focus_message().is_none(),
-            "kept apart from source/focus"
-        );
-
-        app.apply_subject_outcome(finished("refused", Some("process identity changed")));
-        assert_eq!(
-            app.lifecycle_notices().len(),
-            1,
-            "same request refines its notice"
-        );
-        assert!(app.lifecycle_notices()[0].failed);
-        assert!(
-            app.lifecycle_notices()[0]
-                .text
-                .contains("process identity changed")
-        );
-
-        press(&mut app, KeyCode::Char('c'));
-        assert!(app.lifecycle_notices().is_empty(), "dismissed");
     }
 }

@@ -55,17 +55,6 @@ pub enum Invocation {
         #[arg(long)]
         session: Option<String>,
     },
-    /// The popup behind a sidebar's picker or confirmation. Started by the
-    /// sidebar, not by hand.
-    #[command(hide = true)]
-    Modal {
-        /// The key whose picker or confirmation to open.
-        #[arg(long)]
-        key: char,
-        /// The selected row's identity, as JSON.
-        #[arg(long)]
-        row: Option<String>,
-    },
     /// Present one daemon-owned interaction in a detached terminal.
     #[command(hide = true)]
     Present {

@@ -344,7 +344,28 @@ fn session(inner: &Inner) -> Result<(), String> {
         json!({"attachment_id": attachment, "known_tree_hash": baseline}),
     );
     stream.write_all(&line).map_err(|error| error.to_string())?;
-    *locked(&inner.subscription) = Some(stream.try_clone().map_err(|error| error.to_string())?);
+    // The subscription's first answer is the readiness barrier: the daemon has
+    // accepted it and this attachment owns a stream. Reading it through the same
+    // buffered reader the push loop uses keeps read-ahead with the frame stream.
+    let mut frames = BufReader::new(stream);
+    let mut accepted = String::new();
+    if frames
+        .read_line(&mut accepted)
+        .map_err(|error| error.to_string())?
+        == 0
+    {
+        return Err("the subscription closed before it was accepted".to_string());
+    }
+    let result = answered(&id, &accepted)?;
+    let publication: dto::Publication =
+        serde_json::from_value(result).map_err(|error| error.to_string())?;
+    publish(inner, &attachment, &mut cache, publication)?;
+    *locked(&inner.subscription) = Some(
+        frames
+            .get_ref()
+            .try_clone()
+            .map_err(|error| error.to_string())?,
+    );
     *locked(&inner.link) = Some(Link {
         action,
         reader,
@@ -359,7 +380,6 @@ fn session(inner: &Inner) -> Result<(), String> {
     inner.connected.store(true, Ordering::SeqCst);
     inner.wake.notify();
 
-    let mut frames = BufReader::new(stream);
     loop {
         let mut line = String::new();
         let read = frames

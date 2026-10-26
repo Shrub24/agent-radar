@@ -17,6 +17,8 @@ See `proposal.md` for motivation and capability scope. The current seams are con
 
 **Goals:** one owner per migrated field/workflow; deterministic shared transitions; no terminal types in the session contract; independent local panels; one valid blocking presenter; replay-safe domain handoff; a host-neutral UI protocol.
 
+**One projection, one owner.** The session's tree projection is the canonical row set, order and nesting: every frontend draws those rows and hit-tests those rows. Local observation explains a row (its kind, marks, details and process facts) and never decides whether it exists. A projected row this view cannot explain is still drawn, from the label and marks the wire carries; a row the projection does not name is not drawn at all, however this view's own tree looks. The join is by row identity, never position. Rendering from a locally rebuilt tree would be a second projection that can disagree with the canonical one about order, membership and folds — the exact divergence the shared session exists to remove.
+
 **Non-Goals:** another daemon/socket/database, lifecycle event reinterpretation, persisted UI workflow replay, multi-user editing, general actor frameworks, independent multi-host physical focus, a mux/terminal engine, full Vim operator grammar, or a wholesale widget-stack replacement.
 
 ## Decisions

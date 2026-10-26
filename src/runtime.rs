@@ -63,12 +63,23 @@ impl FocusOutcome {
 
 /// Where `Enter` wants a runtime's focus moved: an existing normalized
 /// location the view already produces.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Target {
     /// A pane row: its workspace, tab and pane in one request.
     Pane(String),
     /// A workspace row.
     Workspace(String),
+}
+
+impl Target {
+    /// What the target is, for a one-line message: `pane wA:p1`.
+    pub fn description(&self) -> String {
+        match self {
+            Self::Pane(pane_id) => format!("pane {pane_id}"),
+            Self::Workspace(workspace_id) => format!("workspace {workspace_id}"),
+        }
+    }
 }
 
 /// Where a lifecycle action asks a runtime to close: an existing normalized

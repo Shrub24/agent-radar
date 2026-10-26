@@ -1,6 +1,7 @@
 //! One shared interaction, addressed to its preparing host and claimed presenter.
 use crate::control_plane::public_contracts::ui_session::{
-    Blocking, InteractionResult, InteractionStage, RefusalCode, SharedCommand, UiRowId,
+    Blocking, InteractionKind, InteractionResult, InteractionStage, RefusalCode, SharedCommand,
+    UiRowId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10,6 +11,8 @@ pub struct Completion {
     pub command: SharedCommand,
     pub captured: Option<UiRowId>,
     pub result: InteractionResult,
+    /// The frozen effect an accepted confirmation dispatches.
+    pub plan: Option<super::targets::Plan>,
 }
 
 #[derive(Debug)]
@@ -17,6 +20,7 @@ struct Open {
     view: Blocking,
     captured: Option<UiRowId>,
     age: u64,
+    plan: Option<super::targets::Plan>,
 }
 type Refused = (RefusalCode, String);
 fn refused<T>(code: RefusalCode, message: &str) -> Result<T, Refused> {
@@ -47,6 +51,32 @@ impl Gate {
         command: SharedCommand,
         captured: Option<UiRowId>,
     ) -> Result<String, Refused> {
+        self.begin_at(
+            owner,
+            command,
+            captured,
+            InteractionKind::Project,
+            None,
+            Vec::new(),
+            None,
+            InteractionStage::Preparing,
+        )
+    }
+
+    /// Opens an interaction in a given stage: a confirmation has nothing to
+    /// prepare, so it starts awaiting an answer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_at(
+        &mut self,
+        owner: &str,
+        command: SharedCommand,
+        captured: Option<UiRowId>,
+        kind: InteractionKind,
+        prompt: Option<String>,
+        losses: Vec<String>,
+        plan: Option<super::targets::Plan>,
+        stage: InteractionStage,
+    ) -> Result<String, Refused> {
         if self.open.is_some() {
             return refused(RefusalCode::Blocked, "another interaction is open");
         }
@@ -57,8 +87,10 @@ impl Gate {
                 interaction_id: interaction_id.clone(),
                 command,
                 owner: owner.into(),
-                stage: InteractionStage::Preparing,
-                claimed: false,
+                stage,
+                kind,
+                prompt,
+                losses,
                 presenter: None,
                 choices: Vec::new(),
                 note: None,
@@ -66,6 +98,7 @@ impl Gate {
             },
             captured,
             age: 0,
+            plan,
         });
         Ok(interaction_id)
     }
@@ -119,7 +152,6 @@ impl Gate {
             Some(held) if held != by => refused(RefusalCode::Conflict, "already presented"),
             _ => {
                 o.view.presenter = Some(by.into());
-                o.view.claimed = true;
                 Ok(())
             }
         }
@@ -137,21 +169,59 @@ impl Gate {
         if o.view.presenter.as_deref() != Some(by) {
             return refused(RefusalCode::Role, "only the claimed presenter resolves it");
         }
-        let InteractionResult::Project { path } = &result;
-        if !o.view.choices.contains(path) {
-            return refused(RefusalCode::BadResult, "that was not one of the choices");
+        match (&o.view.kind, &result) {
+            (InteractionKind::Project, InteractionResult::Project { path }) => {
+                if !o.view.choices.contains(path) {
+                    return refused(RefusalCode::BadResult, "that was not one of the choices");
+                }
+            }
+            (InteractionKind::Confirm, InteractionResult::Confirm { accepted: false }) => {
+                self.open = None;
+                self.generation += 1;
+                return Ok(());
+            }
+            (InteractionKind::Confirm, InteractionResult::Confirm { accepted: true })
+                if o.plan.is_some() => {}
+            _ => {
+                return refused(
+                    RefusalCode::BadResult,
+                    "that answer does not fit this interaction",
+                );
+            }
         }
         let o = self.open.take().expect("named interaction");
         self.generation += 1;
+        // The request identity was frozen with the effect. Minting another here
+        // would run the operation under an id nothing correlates it with.
+        let request_id = o
+            .plan
+            .as_ref()
+            .map_or_else(crate::control_plane::random_uuid, |plan| {
+                plan.request_id.clone()
+            });
         self.completions.push(Completion {
-            request_id: crate::control_plane::random_uuid(),
+            request_id,
             interaction_id: o.view.interaction_id,
             command: o.view.command,
             captured: o.captured,
             result,
+            plan: o.plan,
         });
         Ok(())
     }
+    /// Files an accepted effect that had nothing to ask first.
+    pub fn enqueue(&mut self, plan: super::targets::Plan, command: SharedCommand) {
+        let request_id = plan.request_id.clone();
+        self.completions.push(Completion {
+            interaction_id: request_id.clone(),
+            request_id,
+            command,
+            captured: None,
+            result: InteractionResult::Confirm { accepted: true },
+            plan: Some(plan),
+        });
+    }
+
     pub fn cancel(&mut self, id: &str) -> Result<(), Refused> {
         self.named(id)?;
         self.open = None;

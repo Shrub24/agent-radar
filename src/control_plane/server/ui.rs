@@ -112,7 +112,7 @@ pub(super) fn execute(
     verification: &std::sync::Arc<super::VerificationBudget>,
 ) -> dto::CommandOutcome {
     let job = match effect {
-        crate::ui_session::actor::Effect::Dispatch(job) => job,
+        crate::ui_session::actor::Effect::Dispatch(job) => *job,
         crate::ui_session::actor::Effect::Reconcile(id) => {
             let record = core
                 .upgrade()
@@ -135,15 +135,80 @@ pub(super) fn execute(
             };
         }
     };
-    let dto::InteractionResult::Project { path } = job.result;
+    // A focus plan names a runtime location, not a request record: the daemon
+    // moves the client serving that location, which is the one place the target
+    // is known without asking the frontend.
+    if let Some(target) = job.plan.as_ref().and_then(|plan| plan.focus.clone()) {
+        let Some(core) = core.upgrade() else {
+            return dto::CommandOutcome {
+                request_id: job.request_id,
+                status: dto::CommandStatus::DispatchRefused,
+                answer: None,
+            };
+        };
+        let Some(backend) = super::locked(&core).backend.clone() else {
+            return dto::CommandOutcome {
+                request_id: job.request_id,
+                status: dto::CommandStatus::Refused,
+                answer: Some(json!({"error": {"code": "backend_unavailable",
+                    "message": "this daemon has no runtime to move focus on"}})),
+            };
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (status, answer) = match backend.focus_outcome(&target, &cancel) {
+            crate::runtime::FocusOutcome::Completed => (dto::CommandStatus::Completed, None),
+            crate::runtime::FocusOutcome::Refused(message) => {
+                // A server with nothing attached is answered with the place that
+                // could not be shown: the frontend can open a terminal for it.
+                let code = if message == crate::runtime::NO_CLIENT {
+                    "no_client"
+                } else {
+                    "refused"
+                };
+                (
+                    dto::CommandStatus::Refused,
+                    Some(json!({"error": {"code": code, "message": message,
+                        "target": target}})),
+                )
+            }
+            crate::runtime::FocusOutcome::Unknown(message) => (
+                dto::CommandStatus::Unknown,
+                Some(json!({"error": {"code": "unknown", "message": message}})),
+            ),
+        };
+        return dto::CommandOutcome {
+            request_id: job.request_id,
+            status,
+            answer,
+        };
+    }
+    // A frozen plan carries the request a client would have sent, under the
+    // identity it was frozen with; a project answer names the directory the
+    // daemon creates a workspace in.
+    let (method, params) = match &job.plan {
+        Some(plan) => (plan.method.to_string(), plan.params.clone()),
+        None => {
+            let dto::InteractionResult::Project { path } = &job.result else {
+                return dto::CommandOutcome {
+                    request_id: job.request_id,
+                    status: dto::CommandStatus::Refused,
+                    answer: None,
+                };
+            };
+            (
+                "topology.create".to_string(),
+                json!({
+                    "request": { "kind": "workspace", "directory": path, "focus": false },
+                    "label": crate::project::project_name(std::path::Path::new(path)),
+                    "requester": "radar-ui",
+                }),
+            )
+        }
+    };
     let request = Request {
         id: job.request_id.clone(),
-        method: "topology.create".into(),
-        params: json!({
-            "request": { "kind": "workspace", "directory": path, "focus": false },
-            "label": crate::project::project_name(std::path::Path::new(&path)),
-            "requester": "radar-ui",
-        }),
+        method,
+        params,
     };
     let Some(core) = core.upgrade() else {
         return dto::CommandOutcome {
@@ -152,7 +217,18 @@ pub(super) fn execute(
             answer: None,
         };
     };
-    let response = super::places::execute_container_create(&request, &core, verification);
+    let response = match super::ops::classify(&request.method) {
+        Some(super::ops::Method::Operation(operation)) => {
+            super::execute(operation, &request, &core, verification)
+        }
+        _ => {
+            return dto::CommandOutcome {
+                request_id: job.request_id,
+                status: dto::CommandStatus::Refused,
+                answer: None,
+            };
+        }
+    };
     let answer = serde_json::to_value(response).expect("serialize domain response");
     let status = outcome_status(&answer);
     dto::CommandOutcome {

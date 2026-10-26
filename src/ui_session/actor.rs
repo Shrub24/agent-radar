@@ -39,7 +39,7 @@ pub enum UiError {
 }
 
 pub enum Effect {
-    Dispatch(super::gate::Completion),
+    Dispatch(Box<super::gate::Completion>),
     Reconcile(String),
 }
 
@@ -250,7 +250,7 @@ fn run(
             let id = job.request_id.clone();
             let status = if work
                 .as_ref()
-                .is_some_and(|work| work.try_send(Effect::Dispatch(job)).is_ok())
+                .is_some_and(|work| work.try_send(Effect::Dispatch(Box::new(job))).is_ok())
             {
                 pending.insert(id.clone(), Instant::now());
                 dto::CommandStatus::DispatcherAccepted

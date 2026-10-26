@@ -69,6 +69,14 @@ pub struct Session {
     gate: Gate,
     operation: Option<dto::CommandOutcome>,
     interaction_notice: Option<String>,
+    /// The inventory a command's target is derived from, as last observed. Kept
+    /// so the session decides what a command acts on, not the calling frontend.
+    state: Option<ObservationState>,
+    /// Containers whose deletion the daemon held back: a repeat asks it to close
+    /// anyway. A plain deletion never carries force.
+    deletions_held: std::collections::HashSet<String>,
+    /// The held key of each effect this session dispatched, by request id.
+    held: HashMap<String, String>,
     current: Published,
     retained: VecDeque<(String, Arc<Vec<dto::TreeRow>>)>,
 }
@@ -89,6 +97,9 @@ impl Session {
             gate: Gate::default(),
             operation: None,
             interaction_notice: None,
+            state: None,
+            deletions_held: std::collections::HashSet::new(),
+            held: HashMap::new(),
             current: Published {
                 update_id: 0,
                 tree_hash: String::new(),
@@ -136,6 +147,7 @@ impl Session {
             }
             self.bus = bus;
         }
+        self.state = Some(state.clone());
         let mut tree = FleetTree::build(state);
         tree.attach_tasks(&self.bus);
         self.nav.replace_tree(tree);
@@ -396,6 +408,40 @@ impl Session {
                 self.gate.cancel(&interaction_id)?;
                 self.interaction_notice = Some(message);
             }
+            A::RunCommand { command, row }
+                if matches!(
+                    command,
+                    dto::SharedCommand::Focus
+                        | dto::SharedCommand::Delete
+                        | dto::SharedCommand::Restart
+                        | dto::SharedCommand::CreateContainer
+                        | dto::SharedCommand::ReloadContainer
+                ) =>
+            {
+                return self.begin_frozen_command(id, command, row);
+            }
+            // A configured launch is the one command that needs the invoking
+            // frontend's environment; the session derives the rest.
+            A::PrepareLaunch { spec } => {
+                let Some(state) = self.state.as_ref() else {
+                    self.interaction_notice = Some("no fleet inventory: nothing was sent".into());
+                    return Ok(None);
+                };
+                let container = self
+                    .nav
+                    .selected_id()
+                    .and_then(|id| self.nav.node(id))
+                    .and_then(|node| super::targets::selected_container(&node.row.kind))
+                    .cloned();
+                let request_id = crate::control_plane::random_uuid();
+                match super::targets::launch_plan(container.as_ref(), &spec, state, &request_id) {
+                    Ok(plan) => self
+                        .gate
+                        .enqueue(plan, dto::SharedCommand::LaunchConfigured),
+                    Err(message) => self.interaction_notice = Some(message),
+                }
+                self.project();
+            }
             A::RunCommand { .. } => {
                 return refuse(
                     dto::RefusalCode::Unavailable,
@@ -405,6 +451,106 @@ impl Session {
         }
         self.project();
         Ok(None)
+    }
+
+    /// Opens the question a destructive command asks, or files the effect it
+    /// needs no agreement for. The target is the row the invoking view displayed,
+    /// looked up by identity, and it is frozen here: another view's selection
+    /// cannot retarget it, and a row that is gone refuses instead of moving on.
+    fn begin_frozen_command(
+        &mut self,
+        id: &str,
+        command: dto::SharedCommand,
+        row: Option<dto::UiRowId>,
+    ) -> Result<Option<String>, (dto::RefusalCode, String)> {
+        let Some(state) = self.state.as_ref() else {
+            self.interaction_notice = Some("no fleet inventory: nothing was sent".into());
+            return Ok(None);
+        };
+        let captured = row.or_else(|| self.nav.selected_id().map(super::session::ui_row_id));
+        let Some(captured) = captured else {
+            self.interaction_notice = Some("nothing selected: no action target".into());
+            return Ok(None);
+        };
+        let Some(node) = self.nav.node(&super::session::row_id(&captured)) else {
+            self.interaction_notice = Some("that row is gone; nothing was changed".into());
+            return Ok(None);
+        };
+        if command == dto::SharedCommand::Focus {
+            let row_id = super::session::row_id(&captured);
+            let Some(target) = super::targets::focus(self.nav.tree(), state, &row_id) else {
+                self.interaction_notice = Some(format!(
+                    "{} is not observed: nothing to focus",
+                    super::targets::describe(&row_id)
+                ));
+                return Ok(None);
+            };
+            // No question: moving a terminal takes nothing away. The session owns
+            // where focus goes, so the frontend asks for a row and no more.
+            self.gate.enqueue(
+                super::targets::focus_plan(target, crate::control_plane::random_uuid()),
+                command,
+            );
+            self.project();
+            return Ok(None);
+        }
+        let operation = match command {
+            dto::SharedCommand::Delete => crate::app::Operation::Delete,
+            dto::SharedCommand::Restart => crate::app::Operation::Restart,
+            dto::SharedCommand::CreateContainer => crate::app::Operation::CreateContainer,
+            dto::SharedCommand::ReloadContainer => crate::app::Operation::ReloadContainer,
+            _ => return Ok(None),
+        };
+        let kind = &node.row.kind;
+        let container = super::targets::selected_container(kind).cloned();
+        let frozen = super::targets::plan(
+            operation,
+            super::targets::selection(kind, super::targets::represents_tab(kind)),
+            state,
+            container.as_ref(),
+            container
+                .as_ref()
+                .is_some_and(|container| self.deletions_held.contains(&container.container_id)),
+            &crate::control_plane::random_uuid(),
+        );
+        match frozen {
+            // Nothing to ask: the command goes ahead and is still one frozen effect.
+            Ok(plan) if !plan.confirms => {
+                self.remember(&plan);
+                self.gate.enqueue(plan, command);
+                self.project();
+                Ok(None)
+            }
+            Ok(plan) => {
+                self.remember(&plan);
+                let interaction = self.gate.begin_at(
+                    id,
+                    command,
+                    Some(captured),
+                    dto::InteractionKind::Confirm,
+                    Some(plan.prompt.clone()),
+                    plan.losses.clone(),
+                    Some(plan),
+                    dto::InteractionStage::AwaitingResult,
+                )?;
+                // Opening the question is a published change: the other views have
+                // to see that the session is blocked.
+                self.project();
+                Ok(Some(interaction))
+            }
+            Err(message) => {
+                self.interaction_notice = Some(message);
+                self.project();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Records which target an effect may hold a repeat of.
+    fn remember(&mut self, plan: &super::targets::Plan) {
+        if let Some(key) = &plan.held_key {
+            self.held.insert(plan.request_id.clone(), key.clone());
+        }
     }
 
     /// What accepted interactions have set in motion, for the actor to dispatch.
@@ -421,6 +567,24 @@ impl Session {
     }
 
     pub fn operation(&mut self, outcome: dto::CommandOutcome) {
+        use dto::CommandStatus as S;
+        // Acceptance is not an answer: a dispatched deletion is still on its way
+        // to the verdict that decides whether a repeat may force it.
+        let terminal = matches!(outcome.status, S::Completed | S::Refused | S::Unknown);
+        if terminal && let Some(key) = self.held.remove(&outcome.request_id) {
+            let held = outcome.status == S::Refused
+                && outcome
+                    .answer
+                    .as_ref()
+                    .and_then(|answer| answer.pointer("/result/request/category"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("agents_alive");
+            if held {
+                self.deletions_held.insert(key);
+            } else if outcome.status == S::Completed {
+                self.deletions_held.remove(&key);
+            }
+        }
         self.operation = Some(outcome);
         self.project();
     }
@@ -763,6 +927,240 @@ mod tests {
         // Returning to earlier content reuses its payload and hash.
         assert!(session.content(&first).is_some());
         assert!(session.content("unknown").is_none());
+    }
+
+    #[test]
+    fn a_destructive_command_acts_on_the_row_its_view_displayed() {
+        let mut session = seeded();
+        // Every pane, every workspace: the shared action the dashboard uses.
+        session.act("a", 1, A::ShowEverything);
+        let panes: Vec<dto::UiRowId> = session
+            .current()
+            .rows
+            .iter()
+            .filter_map(|row| match &row.id {
+                dto::UiRowId::Pane { pane_id } => Some(dto::UiRowId::Pane {
+                    pane_id: pane_id.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let (shown, other) = (panes[0].clone(), panes[1].clone());
+        let mut id = 2;
+        // The shared selection is elsewhere when the command is ordered: the row
+        // the invoking view displayed is what it acts on, never this one.
+        session.act("a", id, A::SelectRow { row: other.clone() });
+        assert_eq!(
+            session.current().state.selected.clone(),
+            Some(other.clone())
+        );
+        id += 1;
+        let out = session.act(
+            "a",
+            id,
+            A::RunCommand {
+                command: dto::SharedCommand::Delete,
+                row: Some(shown.clone()),
+            },
+        );
+        id += 1;
+        let Out::Applied {
+            interaction_id: Some(interaction),
+            ..
+        } = out
+        else {
+            panic!("a deletion asks first: {out:?}");
+        };
+        let blocking = session.current().state.blocking.clone().expect("blocking");
+        assert_eq!(blocking.kind, dto::InteractionKind::Confirm);
+        assert_eq!(blocking.stage, dto::InteractionStage::AwaitingResult);
+        // The gate holds the session, so the other view cannot move the selection.
+        assert!(matches!(
+            session.act("b", 1, A::Move { delta: 1 }),
+            Out::Refused {
+                code: RefusalCode::Blocked,
+                ..
+            }
+        ));
+        session.act(
+            "a",
+            id,
+            A::ClaimPresentation {
+                interaction_id: interaction.clone(),
+            },
+        );
+        id += 1;
+        session.act(
+            "a",
+            id,
+            A::ResolveInteraction {
+                interaction_id: interaction,
+                result: dto::InteractionResult::Confirm { accepted: true },
+            },
+        );
+        let jobs = session.take_completions();
+        let plan = jobs[0].plan.as_ref().expect("a frozen effect");
+        let frozen = serde_json::to_string(&plan.params).unwrap();
+        let (dto::UiRowId::Pane { pane_id: shown }, dto::UiRowId::Pane { pane_id: other }) =
+            (&shown, &other)
+        else {
+            unreachable!("panes were selected")
+        };
+        assert!(frozen.contains(shown.as_str()), "{frozen}");
+        assert!(!frozen.contains(other.as_str()), "{frozen}");
+        assert_eq!(plan.method, "mux.close");
+    }
+
+    #[test]
+    fn a_held_deletion_is_settled_by_its_verdict_not_by_its_acceptance() {
+        let mut session = Session::new();
+        // The correlation a container deletion records when it is frozen.
+        session.held.insert("request-1".into(), "c1".into());
+        session.operation(dto::CommandOutcome {
+            request_id: "request-1".into(),
+            status: dto::CommandStatus::DispatcherAccepted,
+            answer: None,
+        });
+        assert!(
+            !session.deletions_held.contains("c1"),
+            "an accepted dispatch has not said why a deletion was refused"
+        );
+        assert!(session.held.contains_key("request-1"), "the answer is owed");
+        session.operation(dto::CommandOutcome {
+            request_id: "request-1".into(),
+            status: dto::CommandStatus::Refused,
+            answer: Some(serde_json::json!({
+                "result": {"request": {"category": "agents_alive"}}
+            })),
+        });
+        assert!(
+            session.deletions_held.contains("c1"),
+            "the refusal arms the forced repeat"
+        );
+        assert!(
+            !session.held.contains_key("request-1"),
+            "the answer settled it"
+        );
+    }
+
+    #[test]
+    fn an_answered_confirmation_keeps_the_request_it_froze() {
+        let mut session = seeded();
+        session.act("a", 1, A::ShowEverything);
+        let pane = session
+            .current()
+            .rows
+            .iter()
+            .find_map(|row| match &row.id {
+                dto::UiRowId::Pane { pane_id } => Some(dto::UiRowId::Pane {
+                    pane_id: pane_id.clone(),
+                }),
+                _ => None,
+            })
+            .expect("the fixture shows a pane");
+        let out = session.act(
+            "a",
+            2,
+            A::RunCommand {
+                command: dto::SharedCommand::Delete,
+                row: Some(pane),
+            },
+        );
+        let Out::Applied {
+            interaction_id: Some(interaction),
+            ..
+        } = out
+        else {
+            panic!("a deletion that loses work asks first: {out:?}");
+        };
+        // The view that presents it claims it, then answers: only the claimed
+        // presenter resolves an interaction.
+        session.act(
+            "a",
+            3,
+            A::ClaimPresentation {
+                interaction_id: interaction.clone(),
+            },
+        );
+        session.act(
+            "a",
+            4,
+            A::ResolveInteraction {
+                interaction_id: interaction,
+                result: dto::InteractionResult::Confirm { accepted: true },
+            },
+        );
+        let jobs = session.take_completions();
+        let frozen = jobs[0].plan.as_ref().expect("a frozen effect");
+        // The answer runs the operation under the identity it was frozen with, so
+        // its result correlates with the request it is recorded against.
+        assert_eq!(jobs[0].request_id, frozen.request_id);
+    }
+
+    #[test]
+    fn a_focus_asks_no_question_and_names_the_place_the_row_shows() {
+        let mut session = seeded();
+        session.act("a", 1, A::ShowEverything);
+        let pane = session
+            .current()
+            .rows
+            .iter()
+            .find_map(|row| match &row.id {
+                dto::UiRowId::Pane { pane_id } => Some(pane_id.clone()),
+                _ => None,
+            })
+            .expect("the fixture shows a pane");
+        let out = session.act(
+            "a",
+            2,
+            A::RunCommand {
+                command: dto::SharedCommand::Focus,
+                row: Some(dto::UiRowId::Pane {
+                    pane_id: pane.clone(),
+                }),
+            },
+        );
+        // Moving a terminal takes nothing away, so focus never opens a gate.
+        assert!(
+            matches!(
+                out,
+                Out::Applied {
+                    interaction_id: None,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert!(session.current().state.blocking.is_none());
+        let jobs = session.take_completions();
+        assert_eq!(
+            jobs[0].plan.as_ref().expect("a frozen effect").focus,
+            Some(crate::runtime::Target::Pane(pane))
+        );
+    }
+
+    #[test]
+    fn an_answer_that_removes_no_row_is_still_published() {
+        let mut session = seeded();
+        let before = session.current().clone();
+        // A refused effect changes no row, and must still reach every view: the
+        // answer is what tells the operator nothing happened.
+        session.operation(dto::CommandOutcome {
+            request_id: "request-1".into(),
+            status: dto::CommandStatus::Refused,
+            answer: Some(serde_json::json!({
+                "error": {"code": "agents_alive", "message": "an agent inside did not exit"}
+            })),
+        });
+        let after = session.current();
+        assert_eq!(after.tree_hash, before.tree_hash, "no row moved");
+        assert!(
+            after.update_id > before.update_id,
+            "the answer was published"
+        );
+        let outcome = after.state.operation.clone().expect("the answer");
+        assert_eq!(outcome.request_id, "request-1");
+        assert_eq!(outcome.status, dto::CommandStatus::Refused);
     }
 
     #[test]
@@ -1118,7 +1516,16 @@ mod tests {
             refused_with(session.act("p2", 1, claim())),
             RefusalCode::Conflict
         );
-        assert!(session.current().state.blocking.as_ref().unwrap().claimed);
+        assert!(
+            session
+                .current()
+                .state
+                .blocking
+                .as_ref()
+                .unwrap()
+                .presenter
+                .is_some()
+        );
 
         // Presenter loss abandons the interaction rather than wedging the gate.
         session.detach("p1");
@@ -1164,6 +1571,15 @@ mod tests {
         offer(&mut session, "a", 4, &id);
         session.act("b", 1, A::ClaimPresentation { interaction_id: id });
         session.tick(120);
-        assert!(session.current().state.blocking.as_ref().unwrap().claimed);
+        assert!(
+            session
+                .current()
+                .state
+                .blocking
+                .as_ref()
+                .unwrap()
+                .presenter
+                .is_some()
+        );
     }
 }

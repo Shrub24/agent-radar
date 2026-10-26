@@ -226,9 +226,9 @@ The durable record stores the request ID, edge, bound child, recorded pane and i
 
 **Content.** `ui.content.get {hash}` returns the rows for a hash among the most recent 16 trees. An older hash is refused `not_found` (`content_expired`); the caller then attaches again.
 
-#### Workspace interactions
+#### Shared command interactions
 
-Workspace creation is the first migrated shared command; the other command workflows migrate in milestone D. An action such as:
+A command that changes the world is a session command: the frontend sends what the operator asked for and which row they were looking at, and never the target. `delete`, `restart`, `create_container` and `reload_container` run this way, as does `new_workspace`. An action such as:
 
 ```json
 {"attachment_id":"<origin UUID>","action_id":1,"gate":0,"action":{"action":"run_command","command":"new_workspace","row":null}}
@@ -245,6 +245,22 @@ Ordinary input without a gate stamp is refused as bad parameters. Input is stamp
 An accepted project result freezes a domain request UUID, returned in its receipt and reused by duplicate receipts. A bounded daemon worker invokes the existing `topology.create` admission service, never a self-RPC. `session.operation` distinguishes `dispatcher_accepted`, `dispatch_refused`, `submission_uncertain`, `admitted`, and authoritative `completed`/`refused`/`unknown`, carrying the original response when established. A missing completion is queried by the same request ID every five seconds, not re-executed. Queue rejection claims no admission; a daemon restart loses volatile UI state but preserves whatever the domain service durably recorded.
 
 Project candidates keep source order, validation and deduplication. The invoking frontend supplies its own configured source/environment; no source process runs in the daemon. `[tui] project_base` must be absolute and defaults to `$HOME`; it is offered only if no source directory passes the filter. A missing/unusable base yields an empty picker and a diagnostic. No invoking start-directory entry is prepended.
+
+#### Focus
+
+`run_command` with `focus` names the row the operator wants moved to, and nothing else. The session derives the target from the tree and observation it holds — a task row is read through its owner's pane — and freezes one effect. No question is asked, because moving a terminal takes nothing away. The daemon executes that effect on its runtime backend: it resolves the client attached to the target's session and switches that client, so focus does not depend on the environment of the process that asked. A session with no client attached is a definite refusal, not an effect that may have happened: it answers `no_client` with the `target` it could not show, and the frontend that asked opens a terminal for that place and re-asks the same command for the same row. A row the observation no longer places is refused before anything is sent, naming the row.
+
+Whether the observation a view last drew is current stays that view's own reading: it refuses to ask for a focus it cannot trust, and the daemon never re-derives it.
+
+#### Frozen command targets
+
+A destructive command carries `row`, the identity the invoking view displayed. The session looks it up in the tree it already holds, decides what the command acts on from the observation it publishes, and freezes the request — method, parameters, request identity, question and losses — before anything is asked or sent. Another view's selection cannot retarget it, and a row that is gone is refused rather than replaced.
+
+Eligibility is evidence, not the cursor: a stale inventory, a target that has disappeared, a managed location (routed to its owner) and an unresolved container each refuse or redirect before a question is opened. A deletion that loses nothing — an idle shell, a container with nothing running — is dispatched without asking; anything else opens a `confirm` interaction whose prompt names the exact target and whose losses list what goes with it.
+
+A confirmation is presented by whichever view claims it: the dashboard inline, or `radar present` in a detached terminal. It answers `resolve_interaction` with `{"result":"confirm","accepted":true}`, or `cancel_interaction`. The session dispatches the effect it already froze, through the same admission path a client request reaches, under the same request identity; a retried acknowledgement cannot become a second effect. A deletion the daemon held back because an agent inside it did not exit is repeated with `force` by the next attempt on that container, which the session remembers rather than the frontend.
+
+`run_command` for `launch_configured` is the one command the frontend prepares: the shell, `PATH` and command line are its own environment, so it submits `prepare_launch` with them and the session derives the workspace, directory and recipe. No prepared launch asks a question, because it adds a place instead of taking one away.
 
 User-run checks are in [UI-session acceptance](ui-session-acceptance.md). This A–C interface milestone makes the dependent UX work possible; it is not completion of the remaining command migration or a claim of live tmux acceptance.
 
