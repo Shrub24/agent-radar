@@ -280,3 +280,43 @@ A palette choice runs its command by identity on the selected tree row, whicheve
 **Rejected alternative:** Strum alone, or crossterm-keybind. Strum does not resolve keys; crossterm-keybind resolves single key events and has no multi-step chord model for the leader-style bindings planned later.
 
 **Consequence:** pending-chord timeout, Escape cancellation, and clearing pending sequences at gate transitions remain application work and are not yet proven. Slice A's tui-actions task stays open until they are.
+
+## Navigation is the shared model; geometry, details and process reading stay local
+
+**Id:** 3c9a7e41-6d0b-4f58-9b1e-2a5c8f7d4e10
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer approval of the field list during Slice A3, 2026-10-26
+**Verification:** corroborated — `src/ui_session/navigation.rs` holds the tree, folds, filter, pane view, task and finished toggles, order, selection and anchor with no terminal, geometry or details types; App delegates through one `navigate` step; the bus-task test fails when the owner fallback is removed
+**Revisit when:** the session needs to own filter editing, or a frontend needs a reading position that must survive selection changes
+**See:** ui-session.md#canonical-interaction-authority-not-synchronized-apps — 3abf8b19-768b-495f-8097-3566d4228855 — as of 2026-10-26
+
+Selection, folds, filter, pane view, task and finished toggles, order and the selection anchor are shared. Terminal geometry, details page and scroll, opened blocks, the process cursor, filter editing mode, confirmations, notices and focus targets stay local to the frontend.
+
+Moving the selection resets the local reading state (scroll, opened blocks, process cursor). Those belong to the row they were made in, so the reset is part of the selection step, not a separate call.
+
+**Reason:** the shared fields are what two presentations must agree on, and the local ones depend on a particular frame's size or on what one reader has opened. Keeping geometry out makes the model testable without a terminal.
+
+**Rejected alternative:** share the details page and scroll as well, so every frontend shows the same page. The sidebar and dashboard lay the panel out differently, so a shared scroll position would be wrong in one of them.
+
+**Rejected alternative:** keep navigation inside App and extract only the projection. The projection is the easy half; selection, folds and the filter change together and would still need App's geometry to be correct.
+
+**Borderline, kept local for now:** `focus_targets` and `source_current` are derived from observation and could move with the session in Slice B. `filter_editing` becomes the editor-owner state in Slice B, so it moves then rather than now.
+
+## Chord resolution: what tui-actions provides and what the application owns
+
+**Id:** 7f2e0b93-1d4a-4c6e-8a57-b0d9e3f61c24
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer question about pending-chord capabilities during Slice A, 2026-10-26
+**Verification:** corroborated — read in tui-actions 0.1.1 `keymap.rs`: `is_prefix`, `complete` and `is_unbound` are stateless queries over a sequence of events; no pending buffer, timeout or Escape handling exists in the crate. crossterm-keybind 0.4.4's public `match_any` takes one `KeyEvent` and has no sequence model.
+**Revisit when:** the first multi-key binding (gg, leader) is added, or tui-actions gains pending-state support
+**See:** ui-session.md#dashboard-keys-resolve-through-a-typed-command-table-on-tui-actions — e956f22c-f814-4061-a4d0-cc58aeef9897 — as of 2026-10-26
+
+tui-actions gives the chord grammar, conflict detection at bind time, and stateless queries: whether an event starts a multi-step binding, whether a full sequence completes one, and whether a sequence is unbound. The application owns the pending buffer, the sequence timeout, Escape cancellation, and clearing pending input when a modal gate changes.
+
+**Reason:** this is why tui-actions was chosen over crossterm-keybind, which resolves one event at a time. The stateless queries are the part the crate can prove; the state machine is application behaviour that has no consumer until a multi-key binding exists.
+
+**Consequence:** Slice A task 1.2 stays open. Its gg, leader, timeout, Escape and gate-reset checks move to the first sequence binding, where they can be tested against real behaviour.
