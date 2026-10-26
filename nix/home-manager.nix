@@ -105,6 +105,9 @@ in
         type = lib.types.lines;
         default = ''
           set -g extended-keys on
+          # csi-u is what Pi reads modified keys from; tmux's default format
+          # reports them the older xterm way.
+          set -g extended-keys-format csi-u
         '';
         description = ''
           tmux commands run after {option}`configFile`. The default turns on

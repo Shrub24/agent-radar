@@ -73,6 +73,7 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             ["set-option", "-g", "mouse", "on"],
             ["set-option", "-g", "set-clipboard", "on"],
             ["set-option", "-g", "extended-keys", "on"],
+            ["set-option", "-g", "extended-keys-format", "csi-u"],
             ["set-option", "-g", "allow-passthrough", "on"],
             // An inert host: it adds no latency and says nothing. Every key
             // reaches the pane under it except the few bound below.
@@ -162,6 +163,9 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
     // This is a private, per-launch UI server. Killing it closes only the
     // sidebar and the inner attach client, not the inner server or its agents.
     let cleanup = run(&["kill-server"]);
+    // tmux leaves its socket behind when the server exits, so the file goes with
+    // it: one launch, one name, and nothing left in the socket directory.
+    let _ = std::fs::remove_file(crate::service::server_socket(&host));
     result.and(cleanup)
 }
 

@@ -18,6 +18,32 @@ pub fn tmux_unit(server: &str) -> String {
     format!("radar-tmux@{server}.service")
 }
 
+/// Where tmux keeps a named server's socket.
+///
+/// tmux reads `TMUX_TMPDIR` and falls back to the temporary directory, so this
+/// follows the same order: a throwaway server a test started with its own
+/// `TMUX_TMPDIR` is looked for where that test put it.
+pub fn server_socket(server: &str) -> std::path::PathBuf {
+    let base = std::env::var_os("TMUX_TMPDIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("tmux-{}", rustix::process::getuid().as_raw()))
+        .join(server)
+}
+
+/// Stops a throwaway server and removes the socket it leaves behind.
+///
+/// tmux does not unlink its socket when the server exits, so every name a test
+/// or a launcher ever started keeps a file in the socket directory. This is
+/// only for servers nothing else owns: Radar's own server is the unit's.
+pub fn discard_server(server: &str) {
+    let _ = Command::new(program("RADAR_TMUX", "tmux"))
+        .args(["-L", server, "kill-server"])
+        .output();
+    let _ = std::fs::remove_file(server_socket(server));
+}
+
 /// Runs `systemctl --user` with `arguments`.
 /// The executable the daemon runs for a tool.
 ///
@@ -488,9 +514,7 @@ mod tests {
             "tmux could not start a probe server"
         );
         let refused = stop_tmux_server(&server);
-        let _ = Command::new("tmux")
-            .args(["-L", &server, "kill-server"])
-            .output();
+        discard_server(&server);
         let problem = refused.expect_err("a pane refuses the stop");
         assert!(problem.contains("holds 1 pane"), "{problem}");
         assert!(problem.contains("not stopped"), "{problem}");
@@ -515,7 +539,7 @@ mod tests {
         run(&["set-option", "-g", "exit-empty", "off"]);
         run(&["kill-session", "-t", "probe"]);
         let panes = server_panes(&server);
-        let _ = run(&["kill-server"]);
+        discard_server(&server);
         assert_eq!(
             panes.expect("an empty server is readable"),
             Some(Vec::new()),

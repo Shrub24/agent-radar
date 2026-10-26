@@ -4474,7 +4474,7 @@ fn a_tmux_daemon_whose_server_unit_cannot_start_refuses_startup() {
         return;
     }
     let name = format!("radar-test-absent-{}", std::process::id());
-    let socket_file = tmux_socket(&name);
+    let socket_file = agent_radar::service::server_socket(&name);
     let sandbox = Sandbox::new("backend-tmux-refused");
     let socket = sandbox.socket();
     let state = sandbox.state();
@@ -4551,10 +4551,7 @@ fn a_foreign_tmux_server_is_refused_and_not_adopted() {
     assert_eq!(status.code(), Some(1), "{status:?}");
     assert!(stderr.contains("did not start it"), "{stderr}");
     assert!(!socket.exists(), "a refused daemon bound its socket");
-    let _ = Command::new("tmux")
-        .args(["-L", &name, "kill-server"])
-        .env_remove("TMUX")
-        .status();
+    agent_radar::service::discard_server(&name);
 }
 
 /// Whether this user's systemd already defines `radar-tmux@.service`, as the
@@ -4621,7 +4618,7 @@ impl TmuxServer {
         };
         assert!(started.success(), "the tmux unit did not start for {name}");
         let server = Self {
-            socket: tmux_socket(&name),
+            socket: agent_radar::service::server_socket(&name),
             name,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -5952,15 +5949,6 @@ fn wait_until_pane_dead(server: &TmuxServer, raw_pane: &str) {
 }
 
 /// Where tmux keeps the socket of a server of `name`.
-fn tmux_socket(name: &str) -> PathBuf {
-    let parent = match std::env::var_os("TMUX_TMPDIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from("/tmp"),
-    };
-    let uid = rustix::process::getuid().as_raw();
-    parent.join(format!("tmux-{uid}")).join(name)
-}
-
 /// An uncertain outcome is not a licence to retry: the record stays `unknown` and
 /// a same-ID retry returns it without a second dispatch. A focus changes nothing
 /// durable, so unlike a mutation it never holds its target against another
