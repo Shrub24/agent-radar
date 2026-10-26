@@ -42,7 +42,7 @@ pub(super) fn request(handle: Option<&UiHandle>, request: &Request) -> Response 
                 Ok(params) => params,
                 Err(response) => return response,
             };
-            match handle.attach(&params.attachment_id, params.role) {
+            match handle.attach_for(&params.attachment_id, params.role, params.interaction_id) {
                 Ok(result) => Response::ok(&request.id, json!(result)),
                 Err(error) => refusal(request, error),
             }
@@ -60,6 +60,15 @@ pub(super) fn request(handle: Option<&UiHandle>, request: &Request) -> Response 
                 Ok(params) => params,
                 Err(response) => return response,
             };
+            if params.action.is_ordinary() && params.gate.is_none() {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(
+                        Code::BadParams,
+                        "ordinary UI input requires its displayed gate generation",
+                    ),
+                );
+            }
             match handle.act(
                 &params.attachment_id,
                 params.action_id,
@@ -93,6 +102,83 @@ pub(super) fn request(handle: Option<&UiHandle>, request: &Request) -> Response 
             &request.id,
             &Refusal::new(Code::UnknownMethod, format!("unknown method `{other}`")),
         ),
+    }
+}
+
+/// Reuses domain admission directly, not a self-RPC or a second creation path.
+pub(super) fn execute(
+    effect: crate::ui_session::actor::Effect,
+    core: &std::sync::Weak<std::sync::Mutex<super::Core>>,
+    verification: &std::sync::Arc<super::VerificationBudget>,
+) -> dto::CommandOutcome {
+    let job = match effect {
+        crate::ui_session::actor::Effect::Dispatch(job) => job,
+        crate::ui_session::actor::Effect::Reconcile(id) => {
+            let record = core
+                .upgrade()
+                .and_then(|core| super::locked(&core).store.get(&id).ok().flatten());
+            return match record {
+                Some(record) => {
+                    let answer = json!({"result": { "request": super::public_record(record) }});
+                    let status = outcome_status(&answer);
+                    dto::CommandOutcome {
+                        request_id: id,
+                        status,
+                        answer: Some(answer),
+                    }
+                }
+                None => dto::CommandOutcome {
+                    request_id: id,
+                    status: dto::CommandStatus::SubmissionUncertain,
+                    answer: None,
+                },
+            };
+        }
+    };
+    let dto::InteractionResult::Project { path } = job.result;
+    let request = Request {
+        id: job.request_id.clone(),
+        method: "topology.create".into(),
+        params: json!({
+            "request": { "kind": "workspace", "directory": path, "focus": false },
+            "label": crate::project::project_name(std::path::Path::new(&path)),
+            "requester": "radar-ui",
+        }),
+    };
+    let Some(core) = core.upgrade() else {
+        return dto::CommandOutcome {
+            request_id: job.request_id,
+            status: dto::CommandStatus::DispatchRefused,
+            answer: None,
+        };
+    };
+    let response = super::places::execute_container_create(&request, &core, verification);
+    let answer = serde_json::to_value(response).expect("serialize domain response");
+    let status = outcome_status(&answer);
+    dto::CommandOutcome {
+        request_id: job.request_id,
+        status,
+        answer: Some(answer),
+    }
+}
+
+fn outcome_status(answer: &serde_json::Value) -> dto::CommandStatus {
+    use dto::CommandStatus as S;
+    match answer
+        .pointer("/result/request/outcome")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("completed") => S::Completed,
+        Some("refused") => S::Refused,
+        Some("unknown") => S::Unknown,
+        _ if answer.pointer("/result/request").is_some() => S::Admitted,
+        _ => match answer
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("bad_params" | "refused" | "busy" | "backend_unavailable") => S::Refused,
+            _ => S::SubmissionUncertain,
+        },
     }
 }
 

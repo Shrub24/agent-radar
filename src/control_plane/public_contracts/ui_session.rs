@@ -137,6 +137,8 @@ pub struct SessionState {
     /// The one shared interaction that currently blocks the session, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocking: Option<Blocking>,
+    pub operation: Option<CommandOutcome>,
+    pub interaction_notice: Option<String>,
 }
 
 /// A shared interaction in progress, as every view sees it.
@@ -148,6 +150,32 @@ pub struct Blocking {
     pub stage: InteractionStage,
     /// Whether a presenter holds the claim.
     pub claimed: bool,
+    pub owner: String,
+    pub presenter: Option<String>,
+    pub choices: Vec<String>,
+    pub note: Option<String>,
+    pub host_accepted: bool,
+}
+
+/// Retained command outcome, correlated by the frozen domain request id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CommandOutcome {
+    pub request_id: String,
+    pub status: CommandStatus,
+    pub answer: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CommandStatus {
+    DispatcherAccepted,
+    DispatchRefused,
+    SubmissionUncertain,
+    Admitted,
+    Completed,
+    Refused,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -244,6 +272,8 @@ pub enum UiAction {
     ProvideChoices {
         interaction_id: String,
         choices: Vec<String>,
+        #[serde(default)]
+        note: Option<String>,
     },
     CancelInteraction {
         interaction_id: String,
@@ -254,6 +284,25 @@ pub enum UiAction {
     AcknowledgePresentation {
         effect_id: String,
     },
+    PresentationFailed {
+        interaction_id: String,
+        message: String,
+    },
+}
+
+impl UiAction {
+    /// Main-tree input must identify the gate under which it was interpreted.
+    pub fn is_ordinary(&self) -> bool {
+        !matches!(
+            self,
+            Self::ResolveInteraction { .. }
+                | Self::CancelInteraction { .. }
+                | Self::ProvideChoices { .. }
+                | Self::ClaimPresentation { .. }
+                | Self::AcknowledgePresentation { .. }
+                | Self::PresentationFailed { .. }
+        )
+    }
 }
 
 /// Why the session refused an action that it could otherwise have accepted.
@@ -292,6 +341,8 @@ pub enum ActionOutcome {
         /// The interaction this action opened, when it opened one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interaction_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     Refused {
         code: RefusalCode,

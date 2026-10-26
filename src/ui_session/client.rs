@@ -48,6 +48,7 @@ impl Wake {
 /// One published state as a frontend holds it.
 #[derive(Clone, Debug)]
 pub struct Mirror {
+    pub attachment_id: String,
     pub update_id: u64,
     pub state: dto::SessionState,
     pub rows: Arc<Vec<dto::TreeRow>>,
@@ -63,6 +64,9 @@ struct Link {
 struct Inner {
     socket: PathBuf,
     role: dto::AttachmentRole,
+    interaction: Option<String>,
+    incarnation: AtomicU64,
+    displayed_gate: AtomicU64,
     wake: Wake,
     stop: AtomicBool,
     /// Actions queued or in flight.
@@ -86,15 +90,42 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct UiClient {
     inner: Arc<Inner>,
-    outbox: mpsc::Sender<dto::UiAction>,
+    outbox: mpsc::SyncSender<Pending>,
     threads: Vec<JoinHandle<()>>,
+}
+
+struct Pending {
+    action: dto::UiAction,
+    gate: u64,
+    incarnation: u64,
 }
 
 impl UiClient {
     pub fn start(socket: PathBuf, role: dto::AttachmentRole, wake: Wake) -> Self {
+        Self::connect(socket, role, None, wake)
+    }
+
+    pub fn presenter(socket: PathBuf, interaction: String, wake: Wake) -> Self {
+        Self::connect(
+            socket,
+            dto::AttachmentRole::Presenter,
+            Some(interaction),
+            wake,
+        )
+    }
+
+    fn connect(
+        socket: PathBuf,
+        role: dto::AttachmentRole,
+        interaction: Option<String>,
+        wake: Wake,
+    ) -> Self {
         let inner = Arc::new(Inner {
             socket,
             role,
+            interaction,
+            incarnation: AtomicU64::new(0),
+            displayed_gate: AtomicU64::new(0),
             wake,
             stop: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
@@ -106,7 +137,7 @@ impl UiClient {
             subscription: Mutex::new(None),
             connected: AtomicBool::new(false),
         });
-        let (outbox, queue) = mpsc::channel();
+        let (outbox, queue) = mpsc::sync_channel(256);
         let mut threads = Vec::new();
         {
             let inner = Arc::clone(&inner);
@@ -136,8 +167,15 @@ impl UiClient {
     /// Queues an action behind every earlier one. Never blocks.
     pub fn submit(&self, action: dto::UiAction) {
         self.inner.pending.fetch_add(1, Ordering::SeqCst);
-        if self.outbox.send(action).is_err() {
+        let pending = Pending {
+            action,
+            gate: self.inner.displayed_gate.load(Ordering::SeqCst),
+            incarnation: self.inner.incarnation.load(Ordering::SeqCst),
+        };
+        if self.outbox.try_send(pending).is_err() {
             self.inner.pending.fetch_sub(1, Ordering::SeqCst);
+            self.inner.resync.store(true, Ordering::SeqCst);
+            cut(&self.inner);
         }
     }
 
@@ -173,6 +211,9 @@ impl UiClient {
         self.inner
             .delivered
             .store(latest.update_id, Ordering::SeqCst);
+        self.inner
+            .displayed_gate
+            .store(latest.state.gate, Ordering::SeqCst);
         Some(latest)
     }
 }
@@ -278,6 +319,7 @@ fn attach_loop(inner: &Inner) {
 /// One attachment: attach, subscribe, and publish until the stream ends.
 fn session(inner: &Inner) -> Result<(), String> {
     let attachment = random_uuid();
+    inner.incarnation.fetch_add(1, Ordering::SeqCst);
     let (mut action, mut reader) = dial(inner)?;
     // Update ids belong to one daemon's counter; a new attachment starts over.
     inner.floor.store(0, Ordering::SeqCst);
@@ -287,12 +329,12 @@ fn session(inner: &Inner) -> Result<(), String> {
         &mut action,
         &mut reader,
         "ui.attach",
-        json!({"attachment_id": attachment, "role": inner.role}),
+        json!({"attachment_id": attachment, "role": inner.role, "interaction_id": inner.interaction}),
     )?;
     let attached: dto::AttachResult =
         serde_json::from_value(attached).map_err(|error| error.to_string())?;
     let mut cache: Option<(String, Arc<Vec<dto::TreeRow>>)> = None;
-    let baseline = publish(inner, &mut cache, attached.publication)?;
+    let baseline = publish(inner, &attachment, &mut cache, attached.publication)?;
 
     let (mut stream, _) = dial(inner)?;
     // The subscription outlives a quiet fleet: only the attach loop's cut ends it.
@@ -306,7 +348,7 @@ fn session(inner: &Inner) -> Result<(), String> {
     *locked(&inner.link) = Some(Link {
         action,
         reader,
-        attachment,
+        attachment: attachment.clone(),
         next_action: 1,
     });
     // A stop requested while this attachment was being made found no stream to
@@ -329,13 +371,14 @@ fn session(inner: &Inner) -> Result<(), String> {
         let result = answered(&id, &line)?;
         let publication: dto::Publication =
             serde_json::from_value(result).map_err(|error| error.to_string())?;
-        publish(inner, &mut cache, publication)?;
+        publish(inner, &attachment, &mut cache, publication)?;
     }
 }
 
 /// Resolves the rows a publication names and stores it as the newest state.
 fn publish(
     inner: &Inner,
+    attachment: &str,
     cache: &mut Option<(String, Arc<Vec<dto::TreeRow>>)>,
     publication: dto::Publication,
 ) -> Result<String, String> {
@@ -360,6 +403,7 @@ fn publish(
     };
     *cache = Some((hash.clone(), Arc::clone(&rows)));
     *locked(&inner.latest) = Some(Arc::new(Mirror {
+        attachment_id: attachment.into(),
         update_id: publication.update_id,
         state: publication.session,
         rows,
@@ -368,7 +412,7 @@ fn publish(
     Ok(hash)
 }
 
-fn action_loop(inner: &Inner, queue: &mpsc::Receiver<dto::UiAction>) {
+fn action_loop(inner: &Inner, queue: &mpsc::Receiver<Pending>) {
     loop {
         let action = match queue.recv_timeout(Duration::from_millis(250)) {
             Ok(action) => action,
@@ -381,7 +425,11 @@ fn action_loop(inner: &Inner, queue: &mpsc::Receiver<dto::UiAction>) {
     }
 }
 
-fn send(inner: &Inner, action: dto::UiAction) {
+fn send(inner: &Inner, pending: Pending) {
+    if pending.incarnation != inner.incarnation.load(Ordering::SeqCst) {
+        return;
+    }
+    let action = pending.action;
     let mut link = locked(&inner.link);
     let Some(link) = link.as_mut() else {
         // Not attached: the action cannot be ordered, so it is not sent. The
@@ -389,13 +437,18 @@ fn send(inner: &Inner, action: dto::UiAction) {
         inner.resync.store(true, Ordering::SeqCst);
         return;
     };
+    // Flushing unnumbered input never creates action-number gaps.
+    let ordinary = action.is_ordinary();
+    if ordinary
+        && locked(&inner.latest)
+            .as_ref()
+            .is_some_and(|m| m.state.gate != pending.gate)
+    {
+        return;
+    }
     let number = link.next_action;
     link.next_action += 1;
-    // Interpreted against the newest state this client holds, so input typed
-    // for a screen the gate has since replaced is refused, not applied.
-    let gate = locked(&inner.latest)
-        .as_ref()
-        .map(|mirror| mirror.state.gate);
+    let gate = Some(pending.gate);
     let outcome = exchange(
         &mut link.action,
         &mut link.reader,
@@ -410,7 +463,11 @@ fn send(inner: &Inner, action: dto::UiAction) {
         | Ok(dto::ActionOutcome::Replayed { update_id, .. }) => {
             inner.floor.fetch_max(update_id, Ordering::SeqCst);
         }
-        Ok(dto::ActionOutcome::Refused { .. } | dto::ActionOutcome::Busy) => {
+        Ok(dto::ActionOutcome::Refused { .. }) => {
+            inner.resync.store(true, Ordering::SeqCst);
+        }
+        Ok(dto::ActionOutcome::Busy) => {
+            link.next_action -= 1;
             inner.resync.store(true, Ordering::SeqCst);
         }
         // The ordering scope is broken or the result is unknown: a new

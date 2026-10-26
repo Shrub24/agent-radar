@@ -13,6 +13,9 @@ impl App {
     /// focuses a row that was already selected. A position holding no row does
     /// nothing.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<Action> {
+        if self.shared_blocking() {
+            return None;
+        }
         let at = (event.column, event.row);
         // A picker is modal for the pointer too: a click behind it reaches
         // nothing.

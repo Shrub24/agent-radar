@@ -221,8 +221,10 @@ pub struct TuiConfig {
     pub terminal: Option<Vec<String>>,
     /// The command that prints candidate project directories, one per line, for
     /// a new workspace. Unset runs `zoxide query -l`; a program that is missing
-    /// or fails leaves only the directory Radar was started in.
+    /// or fails offers only project_base (default home).
     pub project_source: Option<Vec<String>>,
+    /// Empty-source fallback. Relative paths are rejected.
+    pub project_base: Option<std::path::PathBuf>,
     /// Which of the source's directories are offered.
     pub project_filter: ProjectFilter,
 }
@@ -233,6 +235,7 @@ impl Default for TuiConfig {
             launch_command: vec!["pi".into()],
             terminal: None,
             project_source: None,
+            project_base: None,
             project_filter: ProjectFilter::default(),
         }
     }
@@ -447,6 +450,12 @@ impl Config {
             }
             config.tui.project_source = Some(source);
         }
+        if let Some(base) = tui.project_base {
+            if !base.is_absolute() {
+                return Err("tui.project_base must be absolute".into());
+            }
+            config.tui.project_base = Some(base);
+        }
         match tui.project_filter.as_deref() {
             None => {}
             Some("git") => config.tui.project_filter = ProjectFilter::Git,
@@ -629,7 +638,9 @@ impl Config {
              # per line. Unset runs `zoxide query -l`.\n\
              # project_source = [\"zoxide\", \"query\", \"-l\"]\n\
              # `git` offers only directories containing `.git`; `none` offers every directory.\n\
-             # project_filter = \"git\"\n",
+             # project_filter = \"git\"\n\
+             # Empty-source fallback; unset uses $HOME. Must be absolute.\n\
+             # project_base = \"/home/you\"\n",
         );
         out.push_str("# `L` launches this argv as a managed agent; unset defaults to `pi`. Use `a` for an empty shell.\n# launch_command = [\"pi\"]\n");
         if self.tui.launch_command != ["pi"] {
@@ -644,6 +655,9 @@ impl Config {
         if let Some(source) = &self.tui.project_source {
             let quoted: Vec<String> = source.iter().map(|word| format!("{word:?}")).collect();
             out.push_str(&format!("project_source = [{}]\n", quoted.join(", ")));
+        }
+        if let Some(base) = &self.tui.project_base {
+            out.push_str(&format!("project_base = {:?}\n", base.to_string_lossy()));
         }
         if self.tui.project_filter == ProjectFilter::None {
             out.push_str("project_filter = \"none\"\n");
@@ -859,6 +873,7 @@ struct FileTui {
     launch_command: Option<Vec<String>>,
     terminal: Option<Vec<String>>,
     project_source: Option<Vec<String>>,
+    project_base: Option<std::path::PathBuf>,
     project_filter: Option<String>,
 }
 

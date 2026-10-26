@@ -67,6 +67,8 @@ pub struct Session {
     attachments: HashMap<String, Attachment>,
     editor: Option<String>,
     gate: Gate,
+    operation: Option<dto::CommandOutcome>,
+    interaction_notice: Option<String>,
     current: Published,
     retained: VecDeque<(String, Arc<Vec<dto::TreeRow>>)>,
 }
@@ -85,6 +87,8 @@ impl Session {
             attachments: HashMap::new(),
             editor: None,
             gate: Gate::default(),
+            operation: None,
+            interaction_notice: None,
             current: Published {
                 update_id: 0,
                 tree_hash: String::new(),
@@ -100,6 +104,16 @@ impl Session {
 
     pub fn current(&self) -> &Published {
         &self.current
+    }
+
+    pub fn claim_attachment(
+        &mut self,
+        id: &str,
+        interaction: &str,
+    ) -> Result<(), dto::RefusalCode> {
+        self.gate.claim(id, interaction).map_err(|(code, _)| code)?;
+        self.project();
+        Ok(())
     }
 
     pub fn attachments_contain(&self, id: &str) -> bool {
@@ -183,7 +197,8 @@ impl Session {
         action: dto::UiAction,
     ) -> dto::ActionOutcome {
         use dto::ActionOutcome as Out;
-        let fingerprint = serde_json::to_string(&action).unwrap_or_default();
+        let fingerprint =
+            serde_json::to_string(&(gate, &action)).expect("serialize action receipt");
         let Some(attachment) = self.attachments.get(id) else {
             return Out::Detached;
         };
@@ -202,10 +217,11 @@ impl Session {
                     Out::Applied {
                         update_id,
                         interaction_id,
+                        request_id,
                     } => Out::Replayed {
                         update_id: *update_id,
                         interaction_id: interaction_id.clone(),
-                        request_id: None,
+                        request_id: request_id.clone(),
                     },
                     other => other.clone(),
                 },
@@ -217,16 +233,9 @@ impl Session {
             };
         }
         let role = attachment.role;
-        let interaction = !matches!(
-            action,
-            dto::UiAction::RunCommand { .. }
-                | dto::UiAction::ResolveInteraction { .. }
-                | dto::UiAction::CancelInteraction { .. }
-                | dto::UiAction::ProvideChoices { .. }
-                | dto::UiAction::ClaimPresentation { .. }
-                | dto::UiAction::AcknowledgePresentation { .. }
-        );
-        let outcome = match if interaction && gate.is_some_and(|g| g != self.gate.generation()) {
+        let resolving = matches!(action, dto::UiAction::ResolveInteraction { .. });
+        let ordinary = action.is_ordinary();
+        let outcome = match if ordinary && gate.is_some_and(|g| g != self.gate.generation()) {
             Err((
                 dto::RefusalCode::StaleGate,
                 "the screen changed under that input".to_string(),
@@ -237,6 +246,11 @@ impl Session {
             Ok(interaction_id) => Out::Applied {
                 update_id: self.current.update_id,
                 interaction_id,
+                request_id: if resolving {
+                    self.gate.request_id()
+                } else {
+                    None
+                },
             },
             Err((code, message)) => Out::Refused { code, message },
         };
@@ -288,6 +302,7 @@ impl Session {
                     | A::ProvideChoices { .. }
                     | A::ClaimPresentation { .. }
                     | A::AcknowledgePresentation { .. }
+                    | A::PresentationFailed { .. }
             )
         {
             return refuse(dto::RefusalCode::Blocked, "an interaction is open");
@@ -355,21 +370,32 @@ impl Session {
                 let interaction = self.gate.begin(id, dto::SharedCommand::NewWorkspace, row)?;
                 // Starting a blocking interaction ends editing: the query stays.
                 self.editor = None;
+                self.interaction_notice = None;
                 self.project();
                 return Ok(Some(interaction));
             }
             A::ProvideChoices {
                 interaction_id,
                 choices,
-            } => self.gate.provide_choices(id, &interaction_id, choices)?,
+                note,
+            } => self
+                .gate
+                .provide_choices(id, &interaction_id, choices, note)?,
             A::ClaimPresentation { interaction_id } => self.gate.claim(id, &interaction_id)?,
             A::ResolveInteraction {
                 interaction_id,
                 result,
-            } => self.gate.resolve(&interaction_id, result)?,
+            } => self.gate.resolve(id, &interaction_id, result)?,
             A::CancelInteraction { interaction_id } => self.gate.cancel(&interaction_id)?,
-            // Delivery tracking arrives with addressed presentation effects.
-            A::AcknowledgePresentation { .. } => {}
+            A::AcknowledgePresentation { effect_id } => self.gate.acknowledge(id, &effect_id)?,
+            A::PresentationFailed {
+                interaction_id,
+                message,
+            } => {
+                self.gate.acknowledge(id, &interaction_id)?;
+                self.gate.cancel(&interaction_id)?;
+                self.interaction_notice = Some(message);
+            }
             A::RunCommand { .. } => {
                 return refuse(
                     dto::RefusalCode::Unavailable,
@@ -384,6 +410,19 @@ impl Session {
     /// What accepted interactions have set in motion, for the actor to dispatch.
     pub fn take_completions(&mut self) -> Vec<Completion> {
         self.gate.take_completions()
+    }
+
+    pub fn tick(&mut self, seconds: u64) {
+        if self.gate.tick(seconds) {
+            self.interaction_notice =
+                Some("project picker abandoned: no presenter claimed within 30 seconds".into());
+            self.project();
+        }
+    }
+
+    pub fn operation(&mut self, outcome: dto::CommandOutcome) {
+        self.operation = Some(outcome);
+        self.project();
     }
 
     fn step(&mut self, step: NavStep) {
@@ -451,6 +490,8 @@ impl Session {
             collapsed: nav.collapsed.iter().map(ui_row_id).collect(),
             gate: self.gate.generation(),
             blocking: self.gate.blocking(),
+            operation: self.operation.clone(),
+            interaction_notice: self.interaction_notice.clone(),
             filter: dto::FilterState {
                 query: nav.filter,
                 editor: self.editor.clone(),
@@ -889,6 +930,7 @@ mod tests {
             A::ProvideChoices {
                 interaction_id: interaction.into(),
                 choices: vec!["/p/one".into(), "/p/two".into(), "/p/one".into()],
+                note: None,
             },
         );
         assert!(matches!(offered, Out::Applied { .. }), "{offered:?}");
@@ -949,7 +991,8 @@ mod tests {
                 4,
                 A::ProvideChoices {
                     interaction_id: interaction.clone(),
-                    choices: vec![]
+                    choices: vec![],
+                    note: None,
                 }
             )),
             RefusalCode::Role
@@ -959,14 +1002,24 @@ mod tests {
             session.current().state.blocking.as_ref().unwrap().stage,
             dto::InteractionStage::AwaitingResult
         );
+        assert!(matches!(
+            session.act(
+                "b",
+                5,
+                A::ClaimPresentation {
+                    interaction_id: interaction.clone()
+                }
+            ),
+            Out::Applied { .. }
+        ));
         assert_eq!(
-            refused_with(session.act("b", 5, project("/elsewhere"))),
+            refused_with(session.act("b", 6, project("/elsewhere"))),
             RefusalCode::BadResult
         );
 
         // The first valid result wins; the cancel that follows finds nothing.
         assert!(matches!(
-            session.act("b", 6, project("/p/two")),
+            session.act("b", 7, project("/p/two")),
             Out::Applied { .. }
         ));
         assert_eq!(session.current().state.blocking, None);
@@ -991,7 +1044,7 @@ mod tests {
         );
         // The session navigates again.
         assert!(matches!(
-            session.act("b", 7, A::CycleOrder),
+            session.act("b", 8, A::CycleOrder),
             Out::Applied { .. }
         ));
     }
@@ -1067,10 +1120,13 @@ mod tests {
         );
         assert!(session.current().state.blocking.as_ref().unwrap().claimed);
 
-        // The presenter leaves: another may take over; the gate is not stuck.
+        // Presenter loss abandons the interaction rather than wedging the gate.
         session.detach("p1");
-        assert!(!session.current().state.blocking.as_ref().unwrap().claimed);
-        assert!(matches!(session.act("p2", 2, claim()), Out::Applied { .. }));
+        assert!(session.current().state.blocking.is_none());
+        assert_eq!(
+            refused_with(session.act("p2", 2, claim())),
+            RefusalCode::NoInteraction
+        );
 
         // An invoker lost while still preparing ends its interaction.
         session.act(
@@ -1093,5 +1149,21 @@ mod tests {
         );
         session.detach("a");
         assert_eq!(session.current().state.blocking, None);
+    }
+
+    #[test]
+    fn an_unclaimed_presentation_expires_without_cancelling_a_claimed_one() {
+        let mut session = seeded();
+        let id = open_gate(&mut session, "a", 1);
+        offer(&mut session, "a", 2, &id);
+        session.tick(29);
+        assert!(session.current().state.blocking.is_some());
+        session.tick(1);
+        assert!(session.current().state.blocking.is_none());
+        let id = open_gate(&mut session, "a", 3);
+        offer(&mut session, "a", 4, &id);
+        session.act("b", 1, A::ClaimPresentation { interaction_id: id });
+        session.tick(120);
+        assert!(session.current().state.blocking.as_ref().unwrap().claimed);
     }
 }

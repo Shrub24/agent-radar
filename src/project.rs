@@ -2,8 +2,8 @@
 //!
 //! Candidates come from a configurable command that prints one directory per
 //! line (by default `zoxide query -l`), filtered to git projects unless the
-//! operator turns that off. The directory Radar was started in is always the
-//! first entry, so the chooser works with nothing installed. The command runs in
+//! operator turns that off. A configured base directory is offered only when
+//! the source yields nothing. The command runs in
 //! the dashboard, never in the daemon, and its output is only ever a list of
 //! paths to choose from: nothing it prints is run.
 
@@ -29,25 +29,39 @@ pub struct Candidates {
     pub note: Option<String>,
 }
 
-/// The directories to offer: `cwd` first, then the source's own that are
-/// existing absolute directories passing `filter`, each once.
-pub fn candidates(source: Option<&[String]>, filter: ProjectFilter, cwd: &Path) -> Candidates {
+/// Source-ordered absolute directories, with `base` as the empty-source fallback.
+pub fn candidates(source: Option<&[String]>, filter: ProjectFilter, base: &Path) -> Candidates {
     let default: Vec<String> = DEFAULT_SOURCE.iter().map(|word| word.to_string()).collect();
     let source = source.unwrap_or(&default);
-    let (lines, note) = match run_source(source) {
+    let (lines, mut note) = match run_source(source) {
         Ok(lines) => (lines, None),
         Err(message) => (Vec::new(), Some(message)),
     };
-    Candidates {
-        directories: select(cwd, &lines, filter),
-        note,
+    let mut directories = select(&lines, filter);
+    if directories.is_empty() {
+        if note.is_none() {
+            note = Some("project source yielded no accepted directories".into());
+        }
+        if base.is_absolute() && base.is_dir() {
+            directories.push(base.to_path_buf());
+        }
     }
+    let note = if directories.is_empty() {
+        Some(format!(
+            "{}; project base {} is not an absolute directory",
+            note.as_deref()
+                .unwrap_or("project source yielded no directories"),
+            base.display()
+        ))
+    } else {
+        note
+    };
+    Candidates { directories, note }
 }
 
-/// The pure part of [`candidates`]: the start directory, then each line that is
-/// an existing absolute directory the filter accepts, with repeats dropped.
-fn select(cwd: &Path, lines: &[String], filter: ProjectFilter) -> Vec<PathBuf> {
-    let mut directories = vec![cwd.to_path_buf()];
+/// Keeps source order and removes duplicates; the fallback bypasses the git filter.
+fn select(lines: &[String], filter: ProjectFilter) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
     for line in lines {
         let path = PathBuf::from(line.trim());
         if !path.is_absolute() || !path.is_dir() || directories.contains(&path) {
@@ -131,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn the_start_directory_leads_and_the_filter_keeps_only_git_projects() {
+    fn source_order_is_cwd_independent_and_the_filter_keeps_only_git_projects() {
         let root = scratch("select");
         let repo = root.join("repo");
         let plain = root.join("plain");
@@ -146,16 +160,12 @@ mod tests {
         ]
         .map(str::to_string)
         .to_vec();
-        let cwd = plain.clone();
         assert_eq!(
-            select(&cwd, &lines, ProjectFilter::Git),
-            [plain.clone(), repo.clone()],
-            "cwd first and unfiltered; a repeat, a relative path and a missing one are dropped"
+            select(&lines, ProjectFilter::Git),
+            std::slice::from_ref(&repo),
+            "no leading cwd; repeats, relative paths and missing directories are dropped"
         );
-        assert_eq!(
-            select(&root, &lines, ProjectFilter::None),
-            [root.clone(), repo, plain]
-        );
+        assert_eq!(select(&lines, ProjectFilter::None), [repo, plain]);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -175,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_failing_source_leaves_the_start_directory_and_says_why() {
+    fn a_missing_or_failing_source_uses_the_base_and_says_why() {
         let cwd = scratch("source");
         let missing = ["radar-no-such-program-xyz".to_string()];
         let found = candidates(Some(&missing), ProjectFilter::Git, &cwd);
@@ -194,9 +204,14 @@ mod tests {
         assert_eq!(
             found.directories,
             std::slice::from_ref(&cwd),
-            "the start directory is not repeated"
+            "a source result is not repeated as a fallback"
         );
         assert!(found.note.is_none());
+        let unusable = cwd.join("missing");
+        let found = candidates(Some(&failing), ProjectFilter::Git, &unusable);
+        assert!(found.directories.is_empty());
+        assert!(found.note.unwrap().contains("project base"));
+        assert!(select(&[], ProjectFilter::Git).is_empty());
         fs::remove_dir_all(&cwd).unwrap();
     }
 }

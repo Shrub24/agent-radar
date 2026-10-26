@@ -786,6 +786,21 @@ fn elide(text: &str, width: usize) -> String {
 /// tree heading and the details.
 fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     let palette = theme::palette();
+    if let Some(m) = app.session_mirror()
+        && let Some(b) = &m.state.blocking
+    {
+        return vec![Line::raw(elide(
+            &format!(
+                "Workspace {:?} · Esc cancels{}",
+                b.stage,
+                b.note
+                    .as_ref()
+                    .map(|n| format!(" · {n}"))
+                    .unwrap_or_default()
+            ),
+            width,
+        ))];
+    }
     if app.confirmation().is_some() {
         let pairs = vec![
             ("tab", "select".to_string()),
@@ -1819,7 +1834,8 @@ mod tests {
             press(&mut app, 'L'),
             Some(crate::app::Action::LaunchConfigured)
         );
-        assert_eq!(press(&mut app, 'A'), Some(crate::app::Action::NewWorkspace));
+        assert_eq!(press(&mut app, 'A'), None);
+        assert!(app.focus_message().unwrap().contains("shared UI session"));
         app.note_width(30);
         assert_eq!(
             press(&mut app, 'B'),

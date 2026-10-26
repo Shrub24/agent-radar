@@ -442,6 +442,7 @@ pub fn sidebar_collapsed(width: u16) -> bool {
 struct SessionLink {
     client: UiClient,
     adopted: Option<NavState>,
+    mirror: Option<std::sync::Arc<crate::ui_session::client::Mirror>>,
 }
 
 impl std::fmt::Debug for SessionLink {
@@ -483,6 +484,7 @@ pub struct App {
     palette: Option<Picker<CommandId>>,
     /// The workspace chooser, open while a new workspace waits for its directory.
     workspace_picker: Option<Picker<PathBuf>>,
+    interaction_picker: Option<String>,
     /// Bus data pushed by connected extensions, joined to rows when they are
     /// drawn. It sits beside the tree rather than inside it: bus facts are true
     /// only while their connection is open, so a refresh must never be able to
@@ -813,6 +815,9 @@ impl App {
     /// replaces this view's copy, so both run [`Navigation::apply`] and agree.
     /// Returns whether a selection step found its row.
     fn step(&mut self, step: NavStep) -> bool {
+        if self.shared_blocking() {
+            return false;
+        }
         let found = self.navigate(|nav| nav.apply(&step));
         // A step that found nothing changed nothing, and is not worth ordering.
         if found && let Some(link) = &self.session {
@@ -827,6 +832,7 @@ impl App {
         self.session = Some(SessionLink {
             client,
             adopted: None,
+            mirror: None,
         });
     }
 
@@ -839,11 +845,63 @@ impl App {
         let Some(mirror) = link.client.poll() else {
             return false;
         };
+        let gate_changed = link
+            .mirror
+            .as_ref()
+            .is_some_and(|last| last.state.gate != mirror.state.gate);
+        let changed_notice = link
+            .mirror
+            .as_ref()
+            .is_none_or(|last| last.state.interaction_notice != mirror.state.interaction_notice);
+        let changed_operation = link
+            .mirror
+            .as_ref()
+            .is_none_or(|last| last.state.operation != mirror.state.operation);
         let state = crate::ui_session::session::nav_state(&mirror.state);
         link.adopted = Some(state.clone());
+        link.mirror = Some(std::sync::Arc::clone(&mirror));
+        if gate_changed {
+            self.filter_editing = false;
+            self.confirmation = None;
+            self.palette = None;
+            self.workspace_picker = None;
+            self.interaction_picker = None;
+        }
+        let blocking = mirror.state.blocking.as_ref();
+        let presented = blocking.filter(|b| b.presenter.as_deref() == Some(&mirror.attachment_id));
+        if let Some(b) = presented {
+            if self.interaction_picker.as_deref() != Some(&b.interaction_id) {
+                self.open_workspace_picker(b.choices.iter().map(PathBuf::from).collect());
+                if let Some(note) = &b.note {
+                    let items = b
+                        .choices
+                        .iter()
+                        .map(|p| Item::new(p.clone(), None::<String>, PathBuf::from(p)))
+                        .collect();
+                    self.workspace_picker = Some(Picker::new(
+                        "Workspace",
+                        format!("{note} · enter open · esc cancel"),
+                        items,
+                    ));
+                }
+                self.interaction_picker = Some(b.interaction_id.clone());
+            }
+        } else if self.interaction_picker.is_some() {
+            self.workspace_picker = None;
+            self.interaction_picker = None;
+        }
         let before = self.nav.selected_id().cloned();
         self.nav.adopt(state);
         self.reset_reading_if_moved(before);
+        if changed_notice && let Some(note) = &mirror.state.interaction_notice {
+            self.set_focus_message(Some(note.clone()));
+        }
+        if changed_operation && let Some(op) = &mirror.state.operation {
+            self.set_focus_message(Some(format!(
+                "workspace {} · request {}",
+                op.status, op.request_id
+            )));
+        }
         true
     }
 
@@ -861,6 +919,21 @@ impl App {
             self.nav.adopt(state);
             self.reset_reading_if_moved(before);
         }
+    }
+
+    pub fn session_mirror(&self) -> Option<std::sync::Arc<crate::ui_session::client::Mirror>> {
+        self.session.as_ref()?.mirror.clone()
+    }
+
+    pub fn submit_session(&self, action: UiAction) {
+        if let Some(link) = &self.session {
+            link.client.submit(action);
+        }
+    }
+
+    pub fn shared_blocking(&self) -> bool {
+        self.session_mirror()
+            .is_some_and(|m| m.state.blocking.is_some())
     }
 
     /// Whether the shared session is attached.
@@ -1055,7 +1128,7 @@ impl App {
     }
 
     /// Opens the workspace chooser over `directories`. The first entry starts as
-    /// the highlight, so a bare `Enter` takes the directory Radar was started in.
+    /// the highlight, so a bare `Enter` takes the source's first directory.
     pub fn open_workspace_picker(&mut self, directories: Vec<PathBuf>) {
         let items = directories
             .into_iter()
@@ -1086,8 +1159,25 @@ impl App {
                 self.workspace_picker = Some(picker);
                 None
             }
-            Step::Close => None,
-            Step::Choose(directory) => Some(Action::NewWorkspaceIn(directory)),
+            Step::Close => {
+                if let Some(id) = &self.interaction_picker {
+                    self.submit_session(UiAction::CancelInteraction {
+                        interaction_id: id.clone(),
+                    });
+                }
+                None
+            }
+            Step::Choose(directory) => {
+                if let Some(id) = &self.interaction_picker {
+                    self.submit_session(UiAction::ResolveInteraction {
+                        interaction_id: id.clone(),
+                        result: crate::control_plane::public_contracts::ui_session::InteractionResult::Project { path: directory.to_string_lossy().into_owned() },
+                    });
+                    None
+                } else {
+                    Some(Action::NewWorkspaceIn(directory))
+                }
+            }
         }
     }
 
@@ -1145,6 +1235,17 @@ impl App {
             }
             return None;
         }
+        if self.shared_blocking() {
+            if key.code == KeyCode::Esc
+                && let Some(m) = self.session_mirror()
+                && let Some(b) = &m.state.blocking
+            {
+                self.submit_session(UiAction::CancelInteraction {
+                    interaction_id: b.interaction_id.clone(),
+                });
+            }
+            return None;
+        }
         if self.filter_editing {
             self.handle_filter_key(key);
             return None;
@@ -1161,6 +1262,7 @@ impl App {
                 KeyCode::Char(ch @ ('r' | 'a' | 'A' | 'E' | 'D' | 'R' | '?'))
                     if self.modal_host
                         && self.sidebar_compact()
+                        && (ch != 'A' || self.session.is_none())
                         && (ch == 'A' || self.nav.selected_id().is_some()) =>
                 {
                     // With nothing selected, a key that needs a row is handled
@@ -1248,7 +1350,18 @@ impl App {
             CommandId::HideSidebar => return self.sidebar.then_some(Action::ToggleSidebar),
             // `A` starts a workspace from nowhere: nothing is selected, replaced or
             // confirmed, because an addition cannot take anything away.
-            CommandId::NewWorkspace => return Some(Action::NewWorkspace),
+            CommandId::NewWorkspace => {
+                if self.session.is_some() {
+                    self.submit_session(UiAction::RunCommand {
+                        command: crate::control_plane::public_contracts::ui_session::SharedCommand::NewWorkspace,
+                        row: None,
+                    });
+                } else {
+                    self.set_focus_message(Some(
+                        "workspace creation requires the shared UI session".into(),
+                    ));
+                }
+            }
             // `L` launches the configured managed agent in a new tab or pane.
             CommandId::LaunchConfigured => return Some(Action::LaunchConfigured),
             CommandId::Restart => return Some(Action::BeginAction(Operation::Restart)),
@@ -2202,10 +2315,8 @@ mod tests {
         show_all_panes(&mut app);
         select_row(&mut app, &RowId::Pane("wA:p3".into()));
         assert!(app.selected_container().is_none());
-        assert_eq!(
-            press(&mut app, KeyCode::Char('A')),
-            Some(Action::NewWorkspace)
-        );
+        assert_eq!(press(&mut app, KeyCode::Char('A')), None);
+        assert!(app.focus_message().unwrap().contains("shared UI session"));
         match app.new_workspace(None) {
             Confirmed::Container(crate::topology::Control::Create(create)) => {
                 assert_eq!(

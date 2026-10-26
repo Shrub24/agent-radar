@@ -12144,10 +12144,16 @@ fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
         "{baseline}"
     );
 
+    // Missing provenance is rejected before allocating an action number.
+    let unstamped = client.call(
+        "ui.action",
+        json!({"attachment_id": attachment, "action_id": 1, "action": {"action": "cycle_order"}}),
+    );
+    assert_eq!(error_code(&unstamped), "bad_params", "{unstamped}");
     // The action travels the other connection while the stream sits idle.
     let moved = client.call(
         "ui.action",
-        json!({"attachment_id": attachment, "action_id": 1, "action": {"action": "cycle_order"}}),
+        json!({"attachment_id": attachment, "action_id": 1, "gate": 0, "action": {"action": "cycle_order"}}),
     );
     assert_eq!(moved["result"]["outcome"], "applied", "{moved}");
     let pushed = next();
@@ -12165,7 +12171,7 @@ fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
     loop {
         let outcome = client.call(
             "ui.action",
-            json!({"attachment_id": attachment, "action_id": 2, "action": {"action": "cycle_order"}}),
+            json!({"attachment_id": attachment, "action_id": 2, "gate": 0, "action": {"action": "cycle_order"}}),
         );
         if outcome["result"]["outcome"] == "detached" {
             break;
@@ -12365,5 +12371,269 @@ fn ui_subscriptions_are_bounded_and_a_released_slot_is_reusable() {
         thread::sleep(Duration::from_millis(25));
     }
     drop(open);
+    daemon.stop();
+}
+
+/// A detached claim survives its invoker, returns its result directly, and a
+/// lost answer is recovered from the original receipt without a second effect.
+#[test]
+fn a_claimed_ui_project_result_survives_its_origin_and_admits_one_workspace() {
+    let sandbox = Sandbox::new("ui-project-admission");
+    let backend = MuxBackend::new(MUX_PRIMITIVES).naming(CreatedLocation {
+        workspace_id: Some("wA".into()),
+        tab_id: Some("wA:t2".into()),
+        pane_id: Some("wA:p2".into()),
+    });
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut host = Client::dial(daemon.path());
+    let owner = random_uuid();
+    host.call(
+        "ui.attach",
+        json!({"attachment_id": owner, "role": "sidebar"}),
+    );
+    let start = host.call(
+        "ui.action",
+        json!({
+            "attachment_id": owner, "action_id": 1, "gate": 0,
+            "action": {"action": "run_command", "command": "new_workspace", "row": null}
+        }),
+    );
+    let interaction = start["result"]["interaction_id"]
+        .as_str()
+        .expect("interaction")
+        .to_string();
+    let path = sandbox.root.to_string_lossy().into_owned();
+    let offered = host.call("ui.action", json!({
+        "attachment_id": owner, "action_id": 2,
+        "action": {"action": "provide_choices", "interaction_id": interaction, "choices": [path]}
+    }));
+    assert_eq!(offered["result"]["outcome"], "applied", "{offered}");
+    let presenter = random_uuid();
+    let mut popup = Client::dial(daemon.path());
+    let claim = popup.call(
+        "ui.attach",
+        json!({
+            "attachment_id": presenter, "role": "presenter", "interaction_id": interaction
+        }),
+    );
+    assert!(claim["result"].is_object(), "{claim}");
+    // Host acceptance is independent of the claim and may arrive afterwards.
+    let ack = host.call(
+        "ui.action",
+        json!({
+            "attachment_id": owner, "action_id": 3,
+            "action": {"action": "acknowledge_presentation", "effect_id": interaction}
+        }),
+    );
+    assert_eq!(ack["result"]["outcome"], "applied", "{ack}");
+    host.call("ui.detach", json!({"attachment_id": owner}));
+    drop(host);
+
+    let result = json!({
+        "attachment_id": presenter, "action_id": 1,
+        "action": {"action": "resolve_interaction", "interaction_id": interaction, "result": {"result": "project", "path": path}}
+    });
+    // Discard the first answer, then retry the exact action id and payload.
+    popup.call("ui.action", result.clone());
+    let retried = popup.call("ui.action", result);
+    assert_eq!(retried["result"]["outcome"], "replayed", "{retried}");
+    let request = retried["result"]["request_id"]
+        .as_str()
+        .expect("stable domain request id");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let observer = random_uuid();
+    let mut reader = Client::dial(daemon.path());
+    loop {
+        let view = reader.call(
+            "ui.attach",
+            json!({"attachment_id": observer, "role": "dashboard"}),
+        );
+        reader.call("ui.detach", json!({"attachment_id": observer}));
+        if view["result"]["publication"]["session"]["operation"]["answer"]["result"]["request"]["outcome"]
+            == "completed"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no completed outcome for {request}: {view}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(backend.creates().len(), 1);
+    // A duplicate under a new action number is a late result, not another create.
+    let late = popup.call("ui.action", json!({
+        "attachment_id": presenter, "action_id": 2,
+        "action": {"action": "resolve_interaction", "interaction_id": interaction, "result": {"result": "project", "path": path}}
+    }));
+    assert_eq!(late["result"]["code"], "no_interaction", "{late}");
+    assert_eq!(backend.creates().len(), 1);
+    daemon.stop();
+}
+
+/// Exercise the real frontend adapter, generic picker and daemon service. The
+/// typed result does not become a legacy NewWorkspaceIn frontend operation.
+#[test]
+fn the_inline_project_picker_creates_through_the_session_and_can_be_cancelled_remotely() {
+    use agent_radar::control_plane::public_contracts::ui_session::{AttachmentRole, UiAction};
+    use agent_radar::ui_session::{
+        client::{UiClient, Wake},
+        presentation::Presentation,
+    };
+    use agent_radar::{App, config::TuiConfig};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let sandbox = Sandbox::new("ui-inline-project");
+    let backend = MuxBackend::new(MUX_PRIMITIVES).naming(CreatedLocation {
+        workspace_id: Some("wA".into()),
+        tab_id: Some("wA:t2".into()),
+        pane_id: Some("wA:p2".into()),
+    });
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let wake = Wake::default();
+    let mut app = App::new();
+    app.attach_session(UiClient::start(
+        daemon.path().into(),
+        AttachmentRole::Dashboard,
+        wake.clone(),
+    ));
+    let mut host = Presentation::default();
+    let config = TuiConfig {
+        project_source: Some(vec![
+            "printf".into(),
+            "%s\n".into(),
+            sandbox.root.to_string_lossy().into_owned(),
+        ]),
+        project_filter: agent_radar::config::ProjectFilter::None,
+        ..TuiConfig::default()
+    };
+    let until = |app: &mut App, host: &mut Presentation, predicate: &dyn Fn(&App) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.apply_session_update();
+            host.poll(app, &config, false, &wake);
+            if predicate(app) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "frontend interaction did not progress: {:?}",
+                app.session_mirror()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    until(&mut app, &mut host, &|app| app.session_connected());
+    assert!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE))
+            .is_none()
+    );
+    until(&mut app, &mut host, &|app| app.workspace_picker().is_some());
+    assert!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none()
+    );
+    until(&mut app, &mut host, &|app| {
+        app.session_mirror().is_some_and(|m| {
+            m.state
+                .operation
+                .as_ref()
+                .is_some_and(|o| o.status == agent_radar::control_plane::public_contracts::ui_session::CommandStatus::Completed)
+        })
+    });
+    assert_eq!(backend.creates().len(), 1);
+
+    // Open again, then cancel from another dashboard. The inline picker closes.
+    app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+    until(&mut app, &mut host, &|app| app.workspace_picker().is_some());
+    let id = app
+        .session_mirror()
+        .unwrap()
+        .state
+        .blocking
+        .as_ref()
+        .unwrap()
+        .interaction_id
+        .clone();
+    let mut other = Client::dial(daemon.path());
+    let observer = random_uuid();
+    other.call(
+        "ui.attach",
+        json!({"attachment_id": observer, "role": "dashboard"}),
+    );
+    let cancel = other.call("ui.action", json!({"attachment_id": observer, "action_id": 1, "action": serde_json::to_value(UiAction::CancelInteraction { interaction_id: id }).unwrap()}));
+    assert_eq!(cancel["result"]["outcome"], "applied", "{cancel}");
+    until(&mut app, &mut host, &|app| !app.shared_blocking());
+    assert!(app.workspace_picker().is_none());
+    assert_eq!(backend.creates().len(), 1);
+    drop(app);
+    daemon.stop();
+}
+
+#[test]
+fn losing_a_detached_presenters_primary_stream_releases_the_shared_gate() {
+    use agent_radar::ui_session::client::{UiClient, Wake};
+    let sandbox = Sandbox::new("ui-presenter-loss");
+    let mut daemon = sandbox.daemon();
+    let mut host = Client::dial(daemon.path());
+    let owner = random_uuid();
+    host.call(
+        "ui.attach",
+        json!({"attachment_id": owner, "role": "sidebar"}),
+    );
+    let opened = host.call(
+        "ui.action",
+        json!({
+            "attachment_id": owner, "action_id": 1, "gate": 0,
+            "action": {"action": "run_command", "command": "new_workspace", "row": null}
+        }),
+    );
+    let id = opened["result"]["interaction_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    host.call(
+        "ui.action",
+        json!({
+            "attachment_id": owner, "action_id": 2,
+            "action": {"action": "provide_choices", "interaction_id": id, "choices": ["/tmp"]}
+        }),
+    );
+    let popup = UiClient::presenter(daemon.path().into(), id, Wake::default());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if popup.poll().is_some_and(|m| {
+            m.state
+                .blocking
+                .as_ref()
+                .is_some_and(|b| b.presenter.as_deref() == Some(&m.attachment_id))
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "presenter did not claim");
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(popup); // EOF on its dedicated primary subscription, not ui.detach
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "presenter loss wedged the gate");
+        let observer = random_uuid();
+        let view = host.call(
+            "ui.attach",
+            json!({"attachment_id": observer, "role": "dashboard"}),
+        );
+        host.call("ui.detach", json!({"attachment_id": observer}));
+        if view["result"]["publication"]["session"]["blocking"].is_null() {
+            let next = host.call(
+                "ui.action",
+                json!({
+                    "attachment_id": owner, "action_id": 3, "gate": view["result"]["publication"]["session"]["gate"],
+                    "action": {"action": "run_command", "command": "new_workspace", "row": null}
+                }),
+            );
+            assert_eq!(next["result"]["outcome"], "applied", "{next}");
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     daemon.stop();
 }

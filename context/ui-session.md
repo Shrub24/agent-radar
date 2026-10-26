@@ -27,7 +27,7 @@ One daemon-hosted reducer owns main-tree navigation and command continuation. Ex
 **Status:** active
 **Evidence:** confirmed
 **Source:** maintainer architecture discussion leading to the OpenSpec proposals, 2026-10-26
-**Verification:** corroborated — recorded in the ui-interactions delta and core design; implementation is pending
+**Verification:** corroborated — milestone C uses the same generic Picker in inline and detached roots; real handler tests cover direct results, origin loss, remote cancellation, receipt replay with one backend create, and presenter-stream loss
 **Revisit when:** a command needs multiple simultaneous presenters or a new presentation host
 **See:** ui-session.md#canonical-interaction-authority-not-synchronized-apps — 3abf8b19-768b-495f-8097-3566d4228855 — as of 2026-10-26
 
@@ -229,7 +229,7 @@ The local inspector includes relevant retained lifecycle events alongside operat
 **Status:** active
 **Evidence:** confirmed
 **Source:** maintainer decision after checking zoxide behavior, 2026-10-26
-**Verification:** corroborated — `zoxide query -l` output was identical from `/tmp`, the project directory and inside its own top entry (zoxide 0.10.0, this machine); the current leading start-directory entry is in `src/project.rs::select`
+**Verification:** corroborated — `zoxide query -l` output was identical across working directories on zoxide 0.10.0; milestone C removes the leading entry in `src/project.rs`, adds `tui.project_base`, and tests source ordering, fallback and unusable-base diagnostics through frontend discovery
 **Revisit when:** discovery gains a directory walker, several merged sources or ranking beyond the source's own order
 **See:** ui-session.md#canonical-interaction-authority-not-synchronized-apps — 3abf8b19-768b-495f-8097-3566d4228855 — as of 2026-10-26
 

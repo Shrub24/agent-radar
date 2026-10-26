@@ -27,6 +27,11 @@ fn main() -> io::Result<()> {
         print!("{}", load_config().to_document());
         return Ok(());
     }
+    if let Some(agent_radar::cli::Invocation::Present { interaction }) = &cli.invocation {
+        let result = run_presenter(interaction);
+        disable_mouse_capture();
+        return result.and(ratatui::try_restore());
+    }
     let dashboard = match &cli.invocation {
         None => Some((false, None)),
         Some(agent_radar::cli::Invocation::Sidebar) => Some((true, None)),
@@ -77,7 +82,7 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
                 }
             }
         }
-        Invocation::Sidebar | Invocation::Modal { .. } => {
+        Invocation::Sidebar | Invocation::Modal { .. } | Invocation::Present { .. } => {
             unreachable!("these are dashboards, not printing commands")
         }
         Invocation::Server(action) => {
@@ -495,6 +500,119 @@ fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
     );
 }
 
+fn run_presenter(interaction: &str) -> io::Result<()> {
+    use agent_radar::control_plane::public_contracts::ui_session::{InteractionResult, UiAction};
+    use agent_radar::picker::{Item, Picker, Step};
+    theme::install(load_config());
+    // Apply the same socket-path trust check as the dashboard before attaching.
+    let selected = control_plane::client::connect().map_err(io::Error::other)?;
+    let daemon = selected
+        .observation
+        .ok_or_else(|| io::Error::other("daemon has no observation service"))?;
+    let wake = Wake::default();
+    let client = UiClient::presenter(
+        daemon.socket().to_path_buf(),
+        interaction.into(),
+        wake.clone(),
+    );
+    let mut terminal = ratatui::try_init()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    let mut events = EventStream::new();
+    let mut picker = None::<Picker<String>>;
+    let mut submitting = false;
+    let mut attached = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(mirror) = client.poll() {
+            let Some(b) = mirror
+                .state
+                .blocking
+                .as_ref()
+                .filter(|b| b.interaction_id == interaction)
+            else {
+                return Ok(());
+            };
+            if b.presenter.as_deref() == Some(&mirror.attachment_id) {
+                attached = true;
+                if picker.is_none() && !submitting {
+                    let items = b
+                        .choices
+                        .iter()
+                        .map(|p| Item::new(p.clone(), None::<String>, p.clone()))
+                        .collect();
+                    picker = Some(Picker::new(
+                        "Workspace",
+                        b.note
+                            .as_ref()
+                            .map(|note| format!("{note} · enter open · esc cancel"))
+                            .unwrap_or_else(|| "enter open · esc cancel".into()),
+                        items,
+                    ));
+                }
+            }
+        }
+        if attached && !client.connected() {
+            return Err(io::Error::other(
+                "presenter connection lost; result may have been accepted",
+            ));
+        }
+        if !attached && Instant::now() >= deadline {
+            return Err(io::Error::other("interaction is closed or already claimed"));
+        }
+        terminal.draw(|frame| {
+            if let Some(picker) = &picker {
+                ui::picker::draw(frame, picker, true);
+            } else {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("Waiting for interaction acknowledgement…"),
+                    frame.area(),
+                );
+            }
+        })?;
+        let event = runtime.block_on(async {
+            tokio::select! {
+                event = events.next() => Some(event),
+                () = wake.woken() => None,
+                () = tokio::time::sleep(Duration::from_secs(1)) => None,
+            }
+        });
+        match &event {
+            Some(None) => return Ok(()),
+            Some(Some(Err(error))) => return Err(io::Error::other(error.to_string())),
+            _ => {}
+        }
+        if let Some(Some(Ok(Event::Key(key)))) = event
+            && key.kind != KeyEventKind::Release
+            && !submitting
+        {
+            let step = if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                Step::Close
+            } else if let Some(picker) = &mut picker {
+                picker.handle_key(key)
+            } else {
+                continue;
+            };
+            let action = match step {
+                Step::Continue => continue,
+                Step::Close => UiAction::CancelInteraction {
+                    interaction_id: interaction.into(),
+                },
+                Step::Choose(path) => UiAction::ResolveInteraction {
+                    interaction_id: interaction.into(),
+                    result: InteractionResult::Project { path },
+                },
+            };
+            client.submit(action);
+            submitting = true;
+            picker = None;
+        }
+    }
+}
+
 fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()> {
     let mut config = load_config();
     let workspace_host = sidebar
@@ -604,9 +722,12 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
     let mut attach = Attach::default();
     let mut sidebar_command = None;
     let mut flip_on_success = false;
+    let mut presentation = agent_radar::ui_session::presentation::Presentation::default();
 
     loop {
         dirty |= app.apply_session_update();
+        let detached = sidebar && in_workspace && app.sidebar_compact();
+        dirty |= presentation.poll(&mut app, &config.tui, detached, &wake);
         dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);
         // Foreground evidence is swept while a pane view is showing panes, and
         // while finished sessions are listed: telling a session that has gone
@@ -1009,9 +1130,13 @@ fn dispatch(
 /// in. It draws inside the dashboard rather than taking the terminal over, so the
 /// fleet stays visible and `Esc` costs nothing.
 fn open_workspace_picker(tui: &agent_radar::config::TuiConfig, app: &mut App) -> io::Result<()> {
-    let cwd = std::env::current_dir()?;
+    let base = tui
+        .project_base
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .unwrap_or_default();
     let found =
-        agent_radar::project::candidates(tui.project_source.as_deref(), tui.project_filter, &cwd);
+        agent_radar::project::candidates(tui.project_source.as_deref(), tui.project_filter, &base);
     if let Some(note) = found.note {
         app.set_focus_message(Some(note));
     }

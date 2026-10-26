@@ -615,7 +615,12 @@ impl Daemon {
             hub: None,
             ui: None,
         }));
-        let ui_service = crate::ui_session::actor::UiService::start();
+        let effect_core = Arc::downgrade(&core);
+        let effect_verification = Arc::clone(&verification);
+        let ui_service =
+            crate::ui_session::actor::UiService::with_executor(Some(Box::new(move |job| {
+                ui::execute(job, &effect_core, &effect_verification)
+            })));
         locked(&core).ui = Some(ui_service.handle());
         // One sampler for every display, sampling only while a reader asks. The
         // lifecycle sweep keeps its own coverage, so a daemon with no display

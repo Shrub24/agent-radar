@@ -66,6 +66,12 @@ pub enum Invocation {
         #[arg(long)]
         row: Option<String>,
     },
+    /// Present one daemon-owned interaction in a detached terminal.
+    #[command(hide = true)]
+    Present {
+        #[arg(long)]
+        interaction: String,
+    },
     /// Control the daemon's user units; with no action, serve in the foreground.
     Daemon {
         #[command(subcommand)]

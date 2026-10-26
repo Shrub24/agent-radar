@@ -38,6 +38,11 @@ pub enum UiError {
     Refused(dto::RefusalCode),
 }
 
+pub enum Effect {
+    Dispatch(super::gate::Completion),
+    Reconcile(String),
+}
+
 type Reply<T> = SyncSender<T>;
 
 enum Msg {
@@ -45,7 +50,8 @@ enum Msg {
     Attach(
         String,
         dto::AttachmentRole,
-        Reply<Result<(), dto::RefusalCode>>,
+        Option<String>,
+        Reply<Result<dto::AttachResult, dto::RefusalCode>>,
     ),
     Detach(String),
     Act(
@@ -55,6 +61,7 @@ enum Msg {
         dto::UiAction,
         Reply<dto::ActionOutcome>,
     ),
+    Finished(dto::CommandOutcome),
     Content(String, Reply<Option<Arc<Vec<dto::TreeRow>>>>),
     Subscribe(String, Reply<Result<(), dto::RefusalCode>>),
     Stop,
@@ -77,7 +84,39 @@ pub struct UiService {
 
 impl UiService {
     pub fn start() -> Self {
+        Self::with_executor(None)
+    }
+
+    pub fn with_executor(
+        executor: Option<Box<dyn Fn(Effect) -> dto::CommandOutcome + Send>>,
+    ) -> Self {
         let (tx, rx) = mpsc::sync_channel(MAILBOX);
+        let (work_tx, work_rx) = mpsc::sync_channel::<Effect>(8);
+        let done_tx = tx.clone();
+        let work = executor.map(|execute| {
+            thread::Builder::new()
+                .name("radar-ui-effects".into())
+                .spawn(move || {
+                    while let Ok(job) = work_rx.recv() {
+                        let id = match &job {
+                            Effect::Dispatch(job) => job.request_id.clone(),
+                            Effect::Reconcile(id) => id.clone(),
+                        };
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(job)))
+                                .unwrap_or(dto::CommandOutcome {
+                                    request_id: id,
+                                    status: dto::CommandStatus::SubmissionUncertain,
+                                    answer: None,
+                                });
+                        if done_tx.send(Msg::Finished(outcome)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("start UI effect worker");
+            work_tx
+        });
         let session = Session::new();
         let (publish, published) = watch::channel(Arc::new(session.current().clone()));
         let attached = Arc::new(AtomicUsize::new(0));
@@ -88,7 +127,7 @@ impl UiService {
             thread::Builder::new()
                 .name("radar-ui-session".into())
                 .spawn(move || {
-                    run(session, rx, publish, &attached);
+                    run(session, rx, publish, &attached, work);
                     stopped.store(true, Ordering::SeqCst);
                 })
                 .ok()
@@ -126,7 +165,10 @@ fn run(
     rx: mpsc::Receiver<Msg>,
     publish: watch::Sender<Arc<Published>>,
     attached: &AtomicUsize,
+    work: Option<SyncSender<Effect>>,
 ) {
+    let mut pending = HashMap::<String, Instant>::new();
+    let mut clock = Instant::now();
     let mut unsubscribed: HashMap<String, Instant> = HashMap::new();
     loop {
         let first = match rx.recv_timeout(Duration::from_secs(1)) {
@@ -147,8 +189,24 @@ fn run(
                 Msg::Observe(snapshot) => {
                     session.observe(&snapshot.observation, snapshot.tasks.as_ref());
                 }
-                Msg::Attach(id, role, reply) => {
-                    let result = session.attach(&id, role);
+                Msg::Attach(id, role, interaction, reply) => {
+                    let result = session.attach(&id, role).and_then(|()| {
+                        if let Some(interaction) = interaction {
+                            let claim = if role == dto::AttachmentRole::Presenter {
+                                session.claim_attachment(&id, &interaction)
+                            } else {
+                                Err(dto::RefusalCode::Role)
+                            };
+                            if let Err(code) = claim {
+                                session.detach(&id);
+                                return Err(code);
+                            }
+                        }
+                        Ok(dto::AttachResult {
+                            attachment_id: id.clone(),
+                            publication: session.current().publication(None),
+                        })
+                    });
                     if result.is_ok() {
                         unsubscribed.insert(id, Instant::now());
                     }
@@ -160,6 +218,15 @@ fn run(
                 }
                 Msg::Act(id, number, gate, action, reply) => {
                     let _ = reply.send(session.act_stamped(&id, number, gate, action));
+                }
+                Msg::Finished(outcome) => {
+                    if !matches!(
+                        outcome.status,
+                        dto::CommandStatus::SubmissionUncertain | dto::CommandStatus::Admitted
+                    ) {
+                        pending.remove(&outcome.request_id);
+                    }
+                    session.operation(outcome);
                 }
                 Msg::Content(hash, reply) => {
                     let _ = reply.send(session.content(&hash));
@@ -179,7 +246,42 @@ fn run(
                 }
             }
         }
+        for job in session.take_completions() {
+            let id = job.request_id.clone();
+            let status = if work
+                .as_ref()
+                .is_some_and(|work| work.try_send(Effect::Dispatch(job)).is_ok())
+            {
+                pending.insert(id.clone(), Instant::now());
+                dto::CommandStatus::DispatcherAccepted
+            } else {
+                dto::CommandStatus::DispatchRefused
+            };
+            session.operation(dto::CommandOutcome {
+                request_id: id,
+                status,
+                answer: None,
+            });
+        }
         let now = Instant::now();
+        for (id, since) in &mut pending {
+            if now.duration_since(*since) >= Duration::from_secs(5) {
+                if let Some(work) = &work {
+                    let _ = work.try_send(Effect::Reconcile(id.clone()));
+                }
+                session.operation(dto::CommandOutcome {
+                    request_id: id.clone(),
+                    status: dto::CommandStatus::SubmissionUncertain,
+                    answer: None,
+                });
+                *since = now;
+            }
+        }
+        let elapsed = now.duration_since(clock).as_secs();
+        if elapsed > 0 {
+            session.tick(elapsed);
+            clock += Duration::from_secs(elapsed);
+        }
         let expired: Vec<String> = unsubscribed
             .iter()
             .filter(|(_, since)| now.duration_since(**since) > UNSUBSCRIBED)
@@ -229,13 +331,17 @@ impl UiHandle {
         id: &str,
         role: dto::AttachmentRole,
     ) -> Result<dto::AttachResult, UiError> {
-        self.ask(|reply| Msg::Attach(id.to_string(), role, reply))?
-            .map_err(UiError::Refused)?;
-        let current = Arc::clone(&self.published.borrow());
-        Ok(dto::AttachResult {
-            attachment_id: id.to_string(),
-            publication: current.publication(None),
-        })
+        self.attach_for(id, role, None)
+    }
+
+    pub fn attach_for(
+        &self,
+        id: &str,
+        role: dto::AttachmentRole,
+        interaction: Option<String>,
+    ) -> Result<dto::AttachResult, UiError> {
+        self.ask(|reply| Msg::Attach(id.to_string(), role, interaction, reply))?
+            .map_err(UiError::Refused)
     }
 
     pub fn detach(&self, id: &str) {
@@ -401,5 +507,132 @@ mod tests {
             handle.act("a", 1, None, A::CycleOrder).unwrap(),
             Out::Detached
         );
+    }
+
+    fn create_from_picker(handle: &UiHandle, next: &mut u64) -> String {
+        let mut act = |action| {
+            *next += 1;
+            handle.act("a", *next, None, action).unwrap()
+        };
+        let Out::Applied {
+            interaction_id: Some(id),
+            ..
+        } = act(A::RunCommand {
+            command: dto::SharedCommand::NewWorkspace,
+            row: None,
+        })
+        else {
+            panic!("opens interaction")
+        };
+        assert!(matches!(
+            act(A::ProvideChoices {
+                interaction_id: id.clone(),
+                choices: vec!["/project".into()],
+                note: None
+            }),
+            Out::Applied { .. }
+        ));
+        assert!(matches!(
+            act(A::ClaimPresentation {
+                interaction_id: id.clone()
+            }),
+            Out::Applied { .. }
+        ));
+        let Out::Applied {
+            request_id: Some(request),
+            ..
+        } = act(A::ResolveInteraction {
+            interaction_id: id,
+            result: dto::InteractionResult::Project {
+                path: "/project".into(),
+            },
+        })
+        else {
+            panic!("returns a stable request id")
+        };
+        request
+    }
+
+    async fn operation(stream: &mut Subscription, id: &str, status: dto::CommandStatus) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let publication = stream.next().await.expect("service alive");
+                if publication
+                    .session
+                    .operation
+                    .as_ref()
+                    .is_some_and(|op| op.request_id == id && op.status == status)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("operation status published");
+    }
+
+    #[tokio::test]
+    async fn full_or_absent_dispatchers_refuse_without_holding_the_gate() {
+        let (release, held) = mpsc::sync_channel::<()>(1);
+        let service = UiService::with_executor(Some(Box::new(move |effect| {
+            let Effect::Dispatch(job) = effect else {
+                panic!("not a reconciliation")
+            };
+            let _ = held.recv();
+            dto::CommandOutcome {
+                request_id: job.request_id,
+                status: dto::CommandStatus::Completed,
+                answer: None,
+            }
+        })));
+        let handle = service.handle();
+        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        let mut stream = handle.subscribe("a", None).unwrap();
+        let mut next = 0;
+        let mut last = String::new();
+        for _ in 0..10 {
+            last = create_from_picker(&handle, &mut next);
+        }
+        operation(&mut stream, &last, dto::CommandStatus::DispatchRefused).await;
+        assert!(stream.published.borrow().state.blocking.is_none());
+        drop(release); // releases the held worker without leaving a test thread behind
+        drop(service);
+
+        let service = UiService::start();
+        let handle = service.handle();
+        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        let mut stream = handle.subscribe("a", None).unwrap();
+        let request = create_from_picker(&handle, &mut 0);
+        operation(&mut stream, &request, dto::CommandStatus::DispatchRefused).await;
+    }
+
+    #[tokio::test]
+    async fn an_uncertain_completion_is_read_by_request_id_never_dispatched_again() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&dispatched);
+        let service = UiService::with_executor(Some(Box::new(move |effect| match effect {
+            Effect::Dispatch(job) => {
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = job;
+                panic!("worker completion lost after possible admission");
+            }
+            Effect::Reconcile(id) => dto::CommandOutcome {
+                request_id: id,
+                status: dto::CommandStatus::Completed,
+                answer: Some(serde_json::json!({"recorded": true})),
+            },
+        })));
+        let handle = service.handle();
+        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        let mut stream = handle.subscribe("a", None).unwrap();
+        let request = create_from_picker(&handle, &mut 0);
+        operation(
+            &mut stream,
+            &request,
+            dto::CommandStatus::SubmissionUncertain,
+        )
+        .await;
+        operation(&mut stream, &request, dto::CommandStatus::Completed).await;
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 }
