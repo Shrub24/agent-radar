@@ -7,15 +7,11 @@
 //! directly.
 
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
 
 /// The socket unit that holds the control socket path and auto-starts the daemon.
 pub const SOCKET_UNIT: &str = "radar-control.socket";
 /// The daemon's service unit, started by the socket on the first connection.
 pub const DAEMON_UNIT: &str = "radar-daemon.service";
-
-/// How long a started tmux server may take to answer on its socket.
-const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The template instance unit that runs the tmux server `server`.
 pub fn tmux_unit(server: &str) -> String {
@@ -82,7 +78,7 @@ pub fn server_answers(server: &str) -> bool {
 ///
 /// A server that answers while its unit is not active was not started by Radar,
 /// so it is refused and nothing is started. Otherwise the unit is started and
-/// the server must answer within [`SERVER_START_TIMEOUT`].
+/// the unit's `ExecStartPost` waits for the server to answer before success.
 pub fn ensure_tmux_server(server: &str) -> Result<(), String> {
     let unit = tmux_unit(server);
     if unit_active(&unit) {
@@ -100,17 +96,7 @@ pub fn ensure_tmux_server(server: &str) -> Result<(), String> {
              Radar serves only the server its own unit owns and refuses this one"
         ));
     }
-    unit_action("start", &unit).map_err(|problem| format!("starting {problem}"))?;
-    let deadline = Instant::now() + SERVER_START_TIMEOUT;
-    while !server_answers(server) {
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "{unit} started but tmux server `{server}` does not answer on its socket"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Ok(())
+    unit_action("start", &unit).map_err(|problem| format!("starting {problem}"))
 }
 
 /// The panes `server` holds, live or retained, or `None` when no server answers.
@@ -176,20 +162,9 @@ pub fn start_after_reset() -> Result<(), String> {
 /// unlike the ordinary server restart it does not refuse while panes exist.
 pub fn restart_for_reset(server: &str) -> Result<(), String> {
     let unit = tmux_unit(server);
-    unit_action("restart", &unit).map_err(|problem| format!("restarting {problem}"))?;
-    // systemd's restart job can finish after exec but before tmux has bound its
-    // socket. Use the same readiness budget as ensure_tmux_server rather than
-    // treating that ordinary startup race as a failed reset.
-    let deadline = Instant::now() + SERVER_START_TIMEOUT;
-    while !server_answers(server) {
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "{unit} restarted but tmux server `{server}` does not answer"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Ok(())
+    // The unit's ExecStartPost owns the readiness check, so systemd's restart
+    // result is authoritative here.
+    unit_action("restart", &unit).map_err(|problem| format!("restarting {problem}"))
 }
 
 /// The gate every server stop and restart passes before it touches the unit: no

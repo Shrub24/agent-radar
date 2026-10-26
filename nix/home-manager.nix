@@ -44,6 +44,21 @@ let
         ''
         + cfg.tmux.extraConfig
       );
+
+  # `systemctl start/restart` is the readiness contract for every caller. tmux
+  # has no sd_notify support, so this post-start check waits for its socket and
+  # fails the unit if the server never becomes usable.
+  tmuxReady = pkgs.writeShellScript "radar-tmux-ready" ''
+    server="$1"
+    for attempt in {1..100}; do
+      if ${cfg.tmuxPackage}/bin/tmux -L "$server" show-options -g >/dev/null 2>&1; then
+        exit 0
+      fi
+      sleep 0.05
+    done
+    echo "tmux server '$server' did not answer within 5 seconds" >&2
+    exit 1
+  '';
 in
 {
   options.programs.radar = {
@@ -201,8 +216,10 @@ in
           X-SwitchMethod = "keep-old";
         };
         Service = {
-          Type = "simple";
+          Type = "exec";
           ExecStart = "${cfg.tmuxPackage}/bin/tmux -D -L %i -f ${tmuxConfig}";
+          ExecStartPost = "${tmuxReady} %i";
+          TimeoutStartSec = "10s";
           KillMode = "control-group";
           Restart = "no";
         };
