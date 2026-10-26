@@ -144,6 +144,6 @@ impl App {
     /// Ignored while a filter is active, as the fold keys are: the filtered
     /// view shows matching ancestry on purpose, so a fold could not take effect.
     pub(super) fn toggle_branch(&mut self, id: &RowId) {
-        self.navigate(|nav| nav.toggle_branch(id));
+        self.step(NavStep::ToggleBranch(id.clone()));
     }
 }

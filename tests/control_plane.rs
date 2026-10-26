@@ -12178,3 +12178,125 @@ fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
     }
     daemon.stop();
 }
+
+/// A frontend's client end to end: it attaches and receives the baseline, an
+/// action it submits comes back as the published state (and is not offered while
+/// still in flight), and when the daemon goes away and returns it re-attaches.
+#[test]
+fn the_ui_client_attaches_acts_and_reattaches_after_the_daemon_restarts() {
+    use agent_radar::control_plane::public_contracts::ui_session as dto;
+    use agent_radar::ui_session::client::{UiClient, Wake};
+
+    let sandbox = Sandbox::new("ui-client");
+    let mut daemon = sandbox.daemon();
+    let client = UiClient::start(
+        daemon.path().to_path_buf(),
+        dto::AttachmentRole::Dashboard,
+        Wake::default(),
+    );
+    let wait = |client: &UiClient, want: &dyn Fn(&dto::SessionState) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(mirror) = client.poll()
+                && want(&mirror.state)
+            {
+                return mirror;
+            }
+            assert!(Instant::now() < deadline, "no matching state was published");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let baseline = wait(&client, &|_| true);
+    assert_eq!(baseline.state.order, dto::RowOrderDto::Source);
+    assert!(client.connected());
+
+    client.submit(dto::UiAction::CycleOrder);
+    let moved = wait(&client, &|state| state.order == dto::RowOrderDto::State);
+    assert!(moved.update_id > baseline.update_id);
+
+    daemon.stop();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client.connected() {
+        assert!(
+            Instant::now() < deadline,
+            "loss of the daemon went unnoticed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut daemon = sandbox.daemon();
+    // A restarted daemon has a fresh session: the client takes its baseline.
+    let again = wait(&client, &|state| state.order == dto::RowOrderDto::Source);
+    assert!(client.connected());
+    drop(client);
+    daemon.stop();
+    let _ = again;
+}
+
+/// Two views on one daemon are one navigation: a change one makes is the other's
+/// state, and the shared filter has a single editor.
+#[test]
+fn two_views_share_navigation_and_one_filter_editor() {
+    use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
+    use agent_radar::ui_session::client::{UiClient, Wake};
+    use agent_radar::{App, PaneView};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let sandbox = Sandbox::new("ui-two-views");
+    let mut daemon = sandbox.daemon();
+    let view = |role| {
+        let mut app = App::new();
+        app.attach_session(UiClient::start(
+            daemon.path().to_path_buf(),
+            role,
+            Wake::default(),
+        ));
+        app
+    };
+    let mut dashboard = view(AttachmentRole::Dashboard);
+    let mut sidebar = view(AttachmentRole::Sidebar);
+    let key = |app: &mut App, code| {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    };
+    let until = |what: &str, check: &mut dyn FnMut() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !check() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    until("both views to attach", &mut || {
+        dashboard.apply_session_update();
+        sidebar.apply_session_update();
+        dashboard.session_connected() && sidebar.session_connected()
+    });
+
+    dashboard.cycle_panes();
+    let wanted: PaneView = dashboard.pane_view();
+    until("the sidebar to follow the pane view", &mut || {
+        dashboard.apply_session_update();
+        sidebar.apply_session_update();
+        sidebar.pane_view() == wanted
+    });
+
+    // The dashboard edits the filter; the sidebar shows it live.
+    key(&mut dashboard, KeyCode::Char('/'));
+    key(&mut dashboard, KeyCode::Char('a'));
+    key(&mut dashboard, KeyCode::Char('b'));
+    until("the sidebar to mirror the filter", &mut || {
+        dashboard.apply_session_update();
+        sidebar.apply_session_update();
+        sidebar.filter_query() == "ab"
+    });
+    // The sidebar cannot take the editor while the dashboard holds it: its
+    // typing is refused and its view returns to the shared query.
+    key(&mut sidebar, KeyCode::Char('/'));
+    key(&mut sidebar, KeyCode::Char('z'));
+    until("the refused edit to be undone", &mut || {
+        dashboard.apply_session_update();
+        sidebar.apply_session_update();
+        sidebar.filter_query() == "ab"
+    });
+    assert_eq!(dashboard.filter_query(), "ab");
+    drop((dashboard, sidebar));
+    daemon.stop();
+}

@@ -68,6 +68,11 @@ impl Focuser {
     }
 
     /// The finished request's outcome, if one is waiting. Never blocks.
+    /// Whether a focus request is still being answered.
+    pub fn is_busy(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
     pub fn poll(&mut self) -> Option<FocusOutcome> {
         let request = self.in_flight.as_mut()?;
         let outcome = match request.outcome.try_recv() {

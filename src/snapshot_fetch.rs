@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::control_plane::client::{DaemonRuntime, ObservationRead};
 use crate::control_plane::observation::Snapshot;
+use crate::ui_session::client::Wake;
 
 /// How long one fetch waits for a newer revision before asking again.
 const WAIT_MS: u64 = 1000;
@@ -49,7 +50,7 @@ pub struct SnapshotFetcher {
 
 impl SnapshotFetcher {
     /// Starts fetching from `daemon`.
-    pub fn new(daemon: Arc<DaemonRuntime>) -> Self {
+    pub fn new(daemon: Arc<DaemonRuntime>, wake: Wake) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let wanted = Arc::new(Mutex::new(Wanted::default()));
         let slot: Arc<Mutex<Option<Fetched>>> = Arc::new(Mutex::new(None));
@@ -59,7 +60,7 @@ impl SnapshotFetcher {
             let slot = Arc::clone(&slot);
             thread::Builder::new()
                 .name("radar-dashboard-fetch".to_string())
-                .spawn(move || fetch_loop(daemon, cancel, wanted, slot))
+                .spawn(move || fetch_loop(daemon, cancel, wanted, slot, wake))
                 .ok()
         };
         Self {
@@ -108,6 +109,7 @@ fn fetch_loop(
     cancel: Arc<AtomicBool>,
     wanted: Arc<Mutex<Wanted>>,
     slot: Arc<Mutex<Option<Fetched>>>,
+    wake: Wake,
 ) {
     let mut epoch: Option<String> = None;
     let mut revision: Option<u64> = None;
@@ -122,6 +124,7 @@ fn fetch_loop(
                 epoch = Some(snapshot.epoch.clone());
                 revision = Some(snapshot.revision);
                 *locked(&slot) = Some(Fetched::Snapshot(snapshot));
+                wake.notify();
             }
             // The daemon holds the revision this fetcher has and published
             // nothing newer within the wait. Asking again is the whole loop.
@@ -137,10 +140,12 @@ fn fetch_loop(
                 *locked(&slot) = Some(Fetched::Stale(
                     "the daemon's observation snapshot is larger than one response".to_string(),
                 ));
+                wake.notify();
                 sleep(RETRY, &cancel);
             }
             Err(problem) => {
                 *locked(&slot) = Some(Fetched::Stale(problem));
+                wake.notify();
                 sleep(RETRY, &cancel);
             }
         }

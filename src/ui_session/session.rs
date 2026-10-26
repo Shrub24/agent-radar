@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use super::navigation::{self, Navigation, PaneView, RowOrder};
+use super::navigation::{self, NavState, NavStep, Navigation, PaneView, RowOrder, TaskRows};
 use crate::control_plane::public_contracts::ui_session as dto;
 use crate::model::AgentState;
 use crate::observation::ObservationState;
@@ -242,21 +242,22 @@ impl Session {
         let foreign = self.editor.is_some() && !owns;
         match action {
             A::SelectRow { row } => {
-                if !self.nav.select_exact(&row_id(&row)) {
+                if !self.nav.apply(&NavStep::Select(row_id(&row))) {
                     return refuse(dto::RefusalCode::UnknownRow, "that row is not visible");
                 }
             }
-            A::Move { delta } => self.nav.move_selection(delta),
-            A::Collapse { row } => self.on_row(row, Navigation::collapse_selected)?,
-            A::Expand { row } => self.on_row(row, Navigation::expand_selected)?,
-            A::ToggleFold { row } => self.on_row(row, Navigation::toggle_fold)?,
-            A::CyclePaneView => self.nav.cycle_panes(),
-            A::CycleOrder => self.nav.cycle_order(),
-            A::ToggleFinished => self.nav.toggle_finished(),
-            A::ToggleTasks => self.nav.toggle_tasks(),
-            A::ShowEverything => self.nav.show_everything(),
-            A::NextAttention { forward } => self.nav.jump_attention(forward),
-            A::NextWorking { forward } => self.nav.jump_working(forward),
+            A::Move { delta } => self.step(NavStep::Move(delta)),
+            A::Collapse { row } => self.on_row(row, NavStep::Collapse)?,
+            A::Expand { row } => self.on_row(row, NavStep::Expand)?,
+            A::ToggleFold { row } => self.on_row(row, NavStep::ToggleFold)?,
+            A::ToggleBranch { row } => self.step(NavStep::ToggleBranch(row_id(&row))),
+            A::CyclePaneView => self.step(NavStep::CyclePanes),
+            A::CycleOrder => self.step(NavStep::CycleOrder),
+            A::ToggleFinished => self.step(NavStep::ToggleFinished),
+            A::ToggleTasks => self.step(NavStep::ToggleTasks),
+            A::ShowEverything => self.step(NavStep::ShowEverything),
+            A::NextAttention { forward } => self.step(NavStep::JumpAttention(forward)),
+            A::NextWorking { forward } => self.step(NavStep::JumpWorking(forward)),
             A::BeginFilterEdit => {
                 if foreign {
                     return refuse(
@@ -273,7 +274,7 @@ impl Session {
                         "begin editing the filter first",
                     );
                 }
-                self.nav.set_filter(&query);
+                self.nav.apply(&NavStep::SetFilter(query));
             }
             A::EndFilterEdit => {
                 if foreign {
@@ -291,7 +292,7 @@ impl Session {
                         "another view is editing the filter",
                     );
                 }
-                self.nav.clear_filter();
+                self.nav.apply(&NavStep::ClearFilter);
             }
             A::RunCommand { .. }
             | A::ResolveInteraction { .. }
@@ -308,20 +309,24 @@ impl Session {
         Ok(())
     }
 
+    fn step(&mut self, step: NavStep) {
+        self.nav.apply(&step);
+    }
+
     fn on_row(
         &mut self,
         row: Option<dto::UiRowId>,
-        op: fn(&mut Navigation),
+        step: NavStep,
     ) -> Result<(), (dto::RefusalCode, String)> {
         if let Some(row) = row
-            && !self.nav.select_exact(&row_id(&row))
+            && !self.nav.apply(&NavStep::Select(row_id(&row)))
         {
             return Err((
                 dto::RefusalCode::UnknownRow,
                 "that row is not visible".into(),
             ));
         }
-        op(&mut self.nav);
+        self.nav.apply(&step);
         Ok(())
     }
 
@@ -347,22 +352,28 @@ impl Session {
             })
             .collect();
         let tree_hash = hash(&rows);
+        let nav = self.nav.state();
         let state = dto::SessionState {
-            selected: self.nav.selected_id().map(ui_row_id),
-            order: match self.nav.order() {
+            selected: nav.selected.as_ref().map(ui_row_id),
+            order: match nav.order {
                 RowOrder::Source => dto::RowOrderDto::Source,
                 RowOrder::State => dto::RowOrderDto::State,
                 RowOrder::Name => dto::RowOrderDto::Name,
             },
-            pane_view: match self.nav.pane_view() {
+            pane_view: match nav.view {
                 PaneView::Hidden => dto::PaneViewDto::Hidden,
                 PaneView::Running => dto::PaneViewDto::Running,
                 PaneView::All => dto::PaneViewDto::All,
             },
-            show_finished: self.nav.shows_finished(),
-            show_tasks: self.nav.shows_tasks(),
+            show_finished: nav.finished_shown,
+            tasks: dto::TaskRowsDto {
+                agents: nav.task_rows.agents,
+                running: nav.task_rows.running,
+                all: nav.task_rows.all,
+            },
+            collapsed: nav.collapsed.iter().map(ui_row_id).collect(),
             filter: dto::FilterState {
-                query: self.nav.filter_query().to_string(),
+                query: nav.filter,
                 editor: self.editor.clone(),
             },
         };
@@ -450,10 +461,60 @@ pub fn row_id(id: &dto::UiRowId) -> RowId {
     }
 }
 
+/// The navigation state a published [`dto::SessionState`] describes.
+pub fn nav_state(state: &dto::SessionState) -> NavState {
+    NavState {
+        selected: state.selected.as_ref().map(row_id),
+        order: match state.order {
+            dto::RowOrderDto::Source => RowOrder::Source,
+            dto::RowOrderDto::State => RowOrder::State,
+            dto::RowOrderDto::Name => RowOrder::Name,
+        },
+        view: match state.pane_view {
+            dto::PaneViewDto::Hidden => PaneView::Hidden,
+            dto::PaneViewDto::Running => PaneView::Running,
+            dto::PaneViewDto::All => PaneView::All,
+        },
+        finished_shown: state.show_finished,
+        task_rows: TaskRows {
+            agents: state.tasks.agents,
+            running: state.tasks.running,
+            all: state.tasks.all,
+        },
+        filter: state.filter.query.clone(),
+        collapsed: state.collapsed.iter().map(row_id).collect(),
+    }
+}
+
+/// The action that makes `step` on the session.
+pub fn action_of(step: &NavStep) -> dto::UiAction {
+    use dto::UiAction as A;
+    match step {
+        NavStep::Select(id) => A::SelectRow { row: ui_row_id(id) },
+        NavStep::Move(delta) => A::Move { delta: *delta },
+        NavStep::Collapse => A::Collapse { row: None },
+        NavStep::Expand => A::Expand { row: None },
+        NavStep::ToggleFold => A::ToggleFold { row: None },
+        NavStep::ToggleBranch(id) => A::ToggleBranch { row: ui_row_id(id) },
+        NavStep::CyclePanes => A::CyclePaneView,
+        NavStep::CycleOrder => A::CycleOrder,
+        NavStep::ToggleFinished => A::ToggleFinished,
+        NavStep::ToggleTasks => A::ToggleTasks,
+        NavStep::ShowEverything => A::ShowEverything,
+        NavStep::JumpAttention(forward) => A::NextAttention { forward: *forward },
+        NavStep::JumpWorking(forward) => A::NextWorking { forward: *forward },
+        NavStep::SetFilter(query) => A::SetFilterQuery {
+            query: query.clone(),
+        },
+        NavStep::ClearFilter => A::ClearFilter,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use dto::{ActionOutcome as Out, RefusalCode, UiAction as A};
+    use std::time::Duration;
 
     fn seeded() -> Session {
         let mut state = ObservationState::new();
@@ -605,5 +666,122 @@ mod tests {
             }
         ));
         assert_eq!(session.current().state.selected, selected);
+    }
+
+    #[test]
+    fn the_shared_filter_is_fuzzy_and_keeps_the_ancestry_of_matches() {
+        let mut session = seeded();
+        let labels = |session: &Session| -> Vec<String> {
+            session
+                .current()
+                .rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect()
+        };
+        let all = labels(&session);
+        let title = all
+            .iter()
+            .find(|label| label.len() >= 4 && label.is_ascii())
+            .expect("a row with a usable label")
+            .clone();
+        // Every other letter of a label: not a substring, still a fuzzy match.
+        let skipped: String = title.chars().step_by(2).collect();
+        assert!(!title.to_lowercase().contains(&skipped.to_lowercase()));
+        session.act("a", 1, A::BeginFilterEdit);
+        session.act("a", 2, A::SetFilterQuery { query: skipped });
+        let shown = labels(&session);
+        assert!(shown.contains(&title), "{shown:?} should keep {title}");
+        assert!(shown.len() < all.len() || all.len() == 1);
+        // Ancestry stays: the first row of a filtered tree is a root.
+        assert_eq!(session.current().rows[0].depth, 0);
+    }
+
+    /// The fixture fleet repeated under distinct ids: `copies` times its size.
+    fn large_fleet(copies: usize) -> ObservationState {
+        let text = serde_json::to_string(&crate::model::testing::fleet()).unwrap();
+        let mut fleet: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut merged = fleet.clone();
+        for copy in 1..copies {
+            let renamed = text
+                .replace("\"wA", &format!("\"w{copy}A"))
+                .replace("\"wB", &format!("\"w{copy}B"));
+            let part: serde_json::Value = serde_json::from_str(&renamed).unwrap();
+            for key in ["workspaces", "tabs", "panes", "agents"] {
+                merged[key]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(part[key].as_array().unwrap().iter().cloned());
+            }
+        }
+        let _ = &mut fleet;
+        let mut state = ObservationState::new();
+        state.apply_success(serde_json::from_value(merged).unwrap());
+        state
+    }
+
+    /// The latency exercise of milestone B, as a bounded check: the work behind
+    /// one keypress on a fleet well beyond a real one stays far below a frame.
+    /// The numbers are printed so the exercise can be repeated and compared.
+    #[test]
+    fn the_work_behind_one_keypress_stays_small_on_a_large_fleet() {
+        use std::time::Instant;
+        let state = large_fleet(120);
+        let mut session = Session::new();
+        session.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        let started = Instant::now();
+        session.observe(&state, None);
+        let build = started.elapsed();
+        let rows = session.current().rows.len();
+        assert!(
+            rows > 500,
+            "the fleet is large enough to mean something: {rows}"
+        );
+
+        let mut moves = Vec::new();
+        for number in 1..=300u64 {
+            let started = Instant::now();
+            let delta = if number % 2 == 0 { 1 } else { -1 };
+            session.act("a", number, A::Move { delta });
+            moves.push(started.elapsed());
+        }
+        let mut filters = Vec::new();
+        session.act("a", 301, A::BeginFilterEdit);
+        let mut query = String::new();
+        for (offset, letter) in "agentreviewer".chars().enumerate() {
+            query.push(letter);
+            let started = Instant::now();
+            session.act(
+                "a",
+                302 + offset as u64,
+                A::SetFilterQuery {
+                    query: query.clone(),
+                },
+            );
+            filters.push(started.elapsed());
+        }
+        moves.sort();
+        filters.sort();
+        let worst = |times: &[std::time::Duration]| times[times.len() - 1];
+        let median = |times: &[std::time::Duration]| times[times.len() / 2];
+        eprintln!(
+            "rows={rows} observe={build:?} move median={:?} max={:?} filter median={:?} max={:?}",
+            median(&moves),
+            worst(&moves),
+            median(&filters),
+            worst(&filters),
+        );
+        // Debug builds are several times slower than release; this bound only
+        // catches a hot path that has become the wrong shape.
+        assert!(
+            worst(&moves) < Duration::from_millis(100),
+            "{:?}",
+            worst(&moves)
+        );
+        assert!(
+            worst(&filters) < Duration::from_millis(250),
+            "{:?}",
+            worst(&filters)
+        );
     }
 }

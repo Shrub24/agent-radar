@@ -148,6 +148,11 @@ pub struct DaemonRuntime {
 }
 
 impl DaemonRuntime {
+    /// The socket this client dials.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
     /// Whether the daemon advertised `contract`.
     fn serves(&self, contract: ops::Contract) -> bool {
         self.declared.iter().any(|name| name == contract.as_str())

@@ -31,14 +31,16 @@ use self::commands::CommandId;
 use crate::control_plane::client::{
     ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
 };
+use crate::control_plane::public_contracts::ui_session::UiAction;
 use crate::lifecycle::{self, CloseRequest, Containment, TargetIdentity};
 use crate::observation::{ObservationState, SourceFreshness};
 use crate::picker::{Item, Picker, Step};
 use crate::runtime::{CloseTarget, Target};
 use crate::tasks::{Task, TaskBoard, TaskEvent};
 use crate::theme;
-use crate::ui_session::Navigation;
+use crate::ui_session::client::UiClient;
 pub use crate::ui_session::navigation::{Connectors, PaneView, RowOrder, VisibleRow};
+use crate::ui_session::{NavState, NavStep, Navigation};
 use ratatui::layout::Rect;
 
 use crate::model::{
@@ -435,10 +437,28 @@ pub fn sidebar_collapsed(width: u16) -> bool {
 
 /// The fleet-overview view state: tree, selection, folds, filter and which
 /// panes are listed.
+/// The shared session an [`App`] navigates through, and the last state it took
+/// from it.
+struct SessionLink {
+    client: UiClient,
+    adopted: Option<NavState>,
+}
+
+impl std::fmt::Debug for SessionLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionLink")
+            .field("connected", &self.client.connected())
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct App {
     /// The shared navigation: the tree, folds, filter, pane view and selection.
     nav: Navigation,
+    /// The shared UI session this view navigates through, when the daemon
+    /// serves one. Without it the view navigates alone, on the same model.
+    session: Option<SessionLink>,
     filter_editing: bool,
     /// Whether the details panel is hidden. Stored inverted so `Default` — the
     /// state a run starts in — is "details shown".
@@ -688,7 +708,7 @@ impl App {
 
     /// Lists every row, so a row another view could see is one this can select.
     pub fn show_everything(&mut self) {
-        self.navigate(|nav| nav.show_everything());
+        self.step(NavStep::ShowEverything);
     }
 
     /// Whether a refused deletion is armed to be repeated with force.
@@ -699,7 +719,7 @@ impl App {
     /// Selects `id` exactly, or nothing: a row that is gone is not replaced by a
     /// neighbour, because the action it was chosen for must not land elsewhere.
     pub fn select_exact(&mut self, id: &RowId) -> bool {
-        self.navigate(|nav| nav.select_exact(id))
+        self.step(NavStep::Select(id.clone()))
     }
 
     /// Records the width this draw was given, so the sidebar's layout can follow
@@ -739,6 +759,7 @@ impl App {
         let mut tree = FleetTree::build(state);
         tree.attach_tasks(&self.bus);
         self.navigate(|nav| nav.replace_tree(tree));
+        self.readopt_session_state();
         self.source_current = matches!(state.source_freshness(), SourceFreshness::Current);
         self.focus_targets = if self.source_current {
             crate::focus::targets(self.nav.tree(), state)
@@ -779,7 +800,74 @@ impl App {
 
     /// Moves the selection to a row identity.
     fn select(&mut self, id: Option<RowId>) {
-        self.navigate(|nav| nav.select(id));
+        match id {
+            Some(id) => {
+                self.step(NavStep::Select(id));
+            }
+            None => self.navigate(|nav| nav.select(None)),
+        }
+    }
+
+    /// Makes one shared navigation step here at once and asks the session to
+    /// make it too. The session's answer arrives as the next published state and
+    /// replaces this view's copy, so both run [`Navigation::apply`] and agree.
+    /// Returns whether a selection step found its row.
+    fn step(&mut self, step: NavStep) -> bool {
+        let found = self.navigate(|nav| nav.apply(&step));
+        // A step that found nothing changed nothing, and is not worth ordering.
+        if found && let Some(link) = &self.session {
+            link.client
+                .submit(crate::ui_session::session::action_of(&step));
+        }
+        found
+    }
+
+    /// Joins the shared session through `client`.
+    pub fn attach_session(&mut self, client: UiClient) {
+        self.session = Some(SessionLink {
+            client,
+            adopted: None,
+        });
+    }
+
+    /// Takes the session's newest state, once everything this view sent has been
+    /// answered. Returns whether anything changed.
+    pub fn apply_session_update(&mut self) -> bool {
+        let Some(link) = &mut self.session else {
+            return false;
+        };
+        let Some(mirror) = link.client.poll() else {
+            return false;
+        };
+        let state = crate::ui_session::session::nav_state(&mirror.state);
+        link.adopted = Some(state.clone());
+        let before = self.nav.selected_id().cloned();
+        self.nav.adopt(state);
+        self.reset_reading_if_moved(before);
+        true
+    }
+
+    /// Re-takes the last adopted state after the local tree changed, so a
+    /// selection the session named before this view had that row is restored
+    /// once the row exists. Only when nothing of this view's own is in flight.
+    fn readopt_session_state(&mut self) {
+        let Some(link) = &self.session else {
+            return;
+        };
+        if link.client.idle()
+            && let Some(state) = link.adopted.clone()
+        {
+            let before = self.nav.selected_id().cloned();
+            self.nav.adopt(state);
+            self.reset_reading_if_moved(before);
+        }
+    }
+
+    /// Whether the shared session is attached.
+    pub fn session_connected(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|link| link.client.connected())
     }
 
     /// Runs one navigation step. A step that moves the selection starts the new
@@ -820,7 +908,7 @@ impl App {
 
     /// `s`: the next order, keeping the same rows visible.
     pub fn cycle_order(&mut self) {
-        self.nav.cycle_order();
+        self.step(NavStep::CycleOrder);
     }
 
     /// Index of the selected row within [`Self::visible_rows`], if any.
@@ -893,7 +981,7 @@ impl App {
     /// shows the latest report rather than a cached list. A task hidden under
     /// the selection falls back to its owner.
     pub fn toggle_tasks(&mut self) {
-        self.navigate(|nav| nav.toggle_tasks());
+        self.step(NavStep::ToggleTasks);
     }
 
     /// Applies one event from the bus listener.
@@ -931,13 +1019,10 @@ impl App {
 
     /// Lists or hides finished sessions.
     pub fn toggle_history(&mut self) {
-        self.navigate(|nav| nav.toggle_history());
+        self.step(NavStep::ToggleFinished);
     }
 
-    /// How many rows the history toggle would add to this view. The footer says
-    /// so, because a row hidden without a trace cannot be told apart from one
-    /// that is gone. A filter answers for itself, so no count is offered while
-    /// one is set.
+    /// History hidden by the current view, excluding a private filter draft.
     pub fn hidden_history(&self) -> usize {
         self.nav.hidden_history()
     }
@@ -1120,7 +1205,7 @@ impl App {
                 ))
             }
             KeyCode::Esc => {
-                self.navigate(|nav| nav.clear_filter());
+                self.step(NavStep::ClearFilter);
             }
             _ => {}
         }
@@ -1132,11 +1217,19 @@ impl App {
     fn run(&mut self, command: CommandId) -> Option<Action> {
         match command {
             CommandId::Focus => return self.focus_selected(),
-            CommandId::Filter => self.filter_editing = true,
-            CommandId::NextAttention => self.navigate(|nav| nav.jump_attention(true)),
-            CommandId::PreviousAttention => self.navigate(|nav| nav.jump_attention(false)),
-            CommandId::NextWorking => self.navigate(|nav| nav.jump_working(true)),
-            CommandId::PreviousWorking => self.navigate(|nav| nav.jump_working(false)),
+            CommandId::Filter => self.begin_filter_edit(),
+            CommandId::NextAttention => {
+                self.step(NavStep::JumpAttention(true));
+            }
+            CommandId::PreviousAttention => {
+                self.step(NavStep::JumpAttention(false));
+            }
+            CommandId::NextWorking => {
+                self.step(NavStep::JumpWorking(true));
+            }
+            CommandId::PreviousWorking => {
+                self.step(NavStep::JumpWorking(false));
+            }
             CommandId::Fold => self.toggle_fold(),
             CommandId::Collapse => self.collapse_selected(),
             CommandId::Expand => self.expand_selected(),
@@ -1332,44 +1425,66 @@ impl App {
             KeyCode::Esc => {
                 // Clearing the filter restores the unfiltered tree with its
                 // pre-filter fold state (folds are never touched by filtering).
-                self.navigate(|nav| nav.clear_filter());
-                self.filter_editing = false;
+                self.step(NavStep::ClearFilter);
+                self.end_filter_edit();
             }
-            KeyCode::Enter => self.filter_editing = false,
-            KeyCode::Backspace => self.navigate(|nav| nav.pop_filter()),
-            KeyCode::Char(c) => self.navigate(|nav| nav.push_filter(c)),
+            KeyCode::Enter => self.end_filter_edit(),
+            KeyCode::Backspace => {
+                let mut query = self.nav.filter_query().to_string();
+                query.pop();
+                self.step(NavStep::SetFilter(query));
+            }
+            KeyCode::Char(c) => {
+                let mut query = self.nav.filter_query().to_string();
+                query.push(c);
+                self.step(NavStep::SetFilter(query));
+            }
             _ => {}
+        }
+    }
+
+    fn begin_filter_edit(&mut self) {
+        self.filter_editing = true;
+        if let Some(link) = &self.session {
+            link.client.submit(UiAction::BeginFilterEdit);
+        }
+    }
+
+    fn end_filter_edit(&mut self) {
+        self.filter_editing = false;
+        if let Some(link) = &self.session {
+            link.client.submit(UiAction::EndFilterEdit);
         }
     }
 
     /// Moves the selection by `delta` visible rows, clamped to the view.
     pub fn move_selection(&mut self, delta: i32) {
-        self.navigate(|nav| nav.move_selection(delta));
+        self.step(NavStep::Move(delta));
     }
 
     /// Folds the selected branch when it is open and unfolds it when it is
     /// closed: one key for the whole gesture, whichever way the branch points.
     pub fn toggle_fold(&mut self) {
-        self.navigate(|nav| nav.toggle_fold());
+        self.step(NavStep::ToggleFold);
     }
 
     /// Folds the selected branch. No-op on a row without visible children, and
     /// while a filter is active: the filtered view keeps matching ancestors
     /// visible by design, so a fold could not take effect.
     pub fn collapse_selected(&mut self) {
-        self.navigate(|nav| nav.collapse_selected());
+        self.step(NavStep::Collapse);
     }
 
     /// Unfolds the selected branch. No-op when it is already unfolded, and while
     /// a filter is active, like [`Self::collapse_selected`].
     pub fn expand_selected(&mut self) {
-        self.navigate(|nav| nav.expand_selected());
+        self.step(NavStep::Expand);
     }
 
     /// Moves to the next pane view: agents, then what is running, then every
     /// pane, and round again.
     pub fn cycle_panes(&mut self) {
-        self.navigate(|nav| nav.cycle_panes());
+        self.step(NavStep::CyclePanes);
     }
 }
 

@@ -6,7 +6,11 @@
 //! The frontend that shows them keeps them, and resets them when the selected
 //! row changes.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Matcher, Utf32Str};
 
 use crate::model::AgentState;
 use crate::tasks::TaskBoard;
@@ -30,6 +34,65 @@ pub struct Navigation {
     /// Index of the selected row in the last visible-row list, used as the
     /// fallback position when the selected row disappears.
     anchor: usize,
+    /// Scratch space for the fuzzy matcher, reused across every row and call.
+    matcher: RefCell<Matcher>,
+}
+
+/// One change to the shared navigation state. The session applies these for
+/// every attachment, and a frontend applies the same step to its own replica
+/// before the published state arrives, so both run one implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NavStep {
+    Select(RowId),
+    Move(i32),
+    Collapse,
+    Expand,
+    ToggleFold,
+    /// A fold toggle for one named branch, as a click on its marker makes.
+    ToggleBranch(RowId),
+    CyclePanes,
+    CycleOrder,
+    ToggleFinished,
+    ToggleTasks,
+    ShowEverything,
+    JumpAttention(bool),
+    JumpWorking(bool),
+    SetFilter(String),
+    ClearFilter,
+}
+
+/// Everything about the navigation that two views must agree on, apart from the
+/// tree itself: what a published session state carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavState {
+    pub selected: Option<RowId>,
+    pub order: RowOrder,
+    pub view: PaneView,
+    pub finished_shown: bool,
+    pub task_rows: TaskRows,
+    pub filter: String,
+    /// Sorted, so equal states compare and serialize equally.
+    pub collapsed: Vec<RowId>,
+}
+
+/// A compiled filter query and the matcher that applies it.
+pub(crate) struct Needle<'a> {
+    pattern: Pattern,
+    matcher: &'a RefCell<Matcher>,
+}
+
+impl Needle<'_> {
+    /// Whether `text` matches every word of the query, fuzzily and without
+    /// regard to case, as the substring filter it replaces was.
+    pub(crate) fn hit(&self, text: &str) -> bool {
+        let mut buffer = Vec::new();
+        self.pattern
+            .score(
+                Utf32Str::new(text, &mut buffer),
+                &mut self.matcher.borrow_mut(),
+            )
+            .is_some()
+    }
 }
 
 impl Navigation {
@@ -139,6 +202,57 @@ impl Navigation {
     pub fn selected_row(&self) -> Option<VisibleRow<'_>> {
         let index = self.selected_index()?;
         self.visible_rows().into_iter().nth(index)
+    }
+
+    /// Applies one step. Returns whether a [`NavStep::Select`] found its row;
+    /// every other step reports `true`.
+    pub fn apply(&mut self, step: &NavStep) -> bool {
+        match step {
+            NavStep::Select(id) => return self.select_exact(id),
+            NavStep::Move(delta) => self.move_selection(*delta),
+            NavStep::Collapse => self.collapse_selected(),
+            NavStep::Expand => self.expand_selected(),
+            NavStep::ToggleFold => self.toggle_fold(),
+            NavStep::ToggleBranch(id) => self.toggle_branch(id),
+            NavStep::CyclePanes => self.cycle_panes(),
+            NavStep::CycleOrder => self.cycle_order(),
+            NavStep::ToggleFinished => self.toggle_history(),
+            NavStep::ToggleTasks => self.toggle_tasks(),
+            NavStep::ShowEverything => self.show_everything(),
+            NavStep::JumpAttention(forward) => self.jump_attention(*forward),
+            NavStep::JumpWorking(forward) => self.jump_working(*forward),
+            NavStep::SetFilter(query) => self.set_filter(query),
+            NavStep::ClearFilter => self.clear_filter(),
+        }
+        true
+    }
+
+    /// The agreed state, for publication.
+    pub fn state(&self) -> NavState {
+        let mut collapsed: Vec<RowId> = self.collapsed.iter().cloned().collect();
+        collapsed.sort();
+        NavState {
+            selected: self.selected.clone(),
+            order: self.order,
+            view: self.view,
+            finished_shown: self.finished_shown,
+            task_rows: self.task_rows,
+            filter: self.filter.clone(),
+            collapsed,
+        }
+    }
+
+    /// Takes on a published state wholesale. The selection is kept as published
+    /// when it is visible; otherwise the usual fallback picks a row.
+    pub fn adopt(&mut self, state: NavState) {
+        self.order = state.order;
+        self.view = state.view;
+        self.finished_shown = state.finished_shown;
+        self.task_rows = state.task_rows;
+        self.filter = state.filter;
+        self.collapsed = state.collapsed.into_iter().collect();
+        self.selected = state.selected;
+        self.reconcile();
     }
 
     /// Replaces the projected tree and keeps the selection on a visible row.
@@ -339,12 +453,20 @@ impl Navigation {
         }
     }
 
-    fn needle(&self) -> Option<String> {
+    fn needle(&self) -> Option<Needle<'_>> {
         let query = self.filter.trim();
         if query.is_empty() {
             return None;
         }
-        Some(query.to_lowercase())
+        Some(Needle {
+            pattern: Pattern::new(
+                query,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+            ),
+            matcher: &self.matcher,
+        })
     }
 
     /// The rows the tree currently lists.
@@ -538,10 +660,10 @@ impl Visibility {
 /// view of outstanding work and start with them shown. Each view keeps its own
 /// answer, so `b` in one view cannot change what another lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TaskRows {
-    agents: bool,
-    running: bool,
-    all: bool,
+pub struct TaskRows {
+    pub agents: bool,
+    pub running: bool,
+    pub all: bool,
 }
 
 impl Default for TaskRows {
@@ -672,8 +794,13 @@ fn collect_visible<'a>(
 /// Whether this subtree contributes a row to the filtered view: the row itself
 /// matches, or a visible descendant does. What the filter keeps, so the
 /// connectors are built from the rows that are drawn.
-fn subtree_matches(node: &TreeNode, needle: &str, visible: Visibility, order: RowOrder) -> bool {
-    node.row.matches(needle)
+fn subtree_matches(
+    node: &TreeNode,
+    needle: &Needle<'_>,
+    visible: Visibility,
+    order: RowOrder,
+) -> bool {
+    node.row.matches(|text| needle.hit(text))
         || ordered(&node.children, order).into_iter().any(|child| {
             visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
         })
@@ -780,7 +907,7 @@ pub(crate) fn is_working(row: &VisibleRow<'_>) -> bool {
 fn collect_filtered<'a>(
     node: &'a TreeNode,
     depth: usize,
-    needle: &str,
+    needle: &Needle<'_>,
     visible: Visibility,
     order: RowOrder,
     connectors: Connectors,

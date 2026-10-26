@@ -2,7 +2,8 @@
 //! and keeps it in-process; the daemon-hosted session builds on it.
 
 pub mod navigation;
-pub use navigation::Navigation;
+pub use navigation::{NavState, NavStep, Navigation};
 pub mod session;
 pub use session::Session;
 pub mod actor;
+pub mod client;

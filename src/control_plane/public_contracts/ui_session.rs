@@ -127,8 +127,19 @@ pub struct SessionState {
     pub order: RowOrderDto,
     pub pane_view: PaneViewDto,
     pub show_finished: bool,
-    pub show_tasks: bool,
+    pub tasks: TaskRowsDto,
+    /// Folded branches, sorted.
+    pub collapsed: Vec<UiRowId>,
     pub filter: FilterState,
+}
+
+/// Whether background tasks are listed, remembered separately for each pane view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRowsDto {
+    pub agents: bool,
+    pub running: bool,
+    pub all: bool,
 }
 
 /// Commands the palette runs on the tree. Terminal-local presentation commands
@@ -173,6 +184,10 @@ pub enum UiAction {
     },
     ToggleFold {
         row: Option<UiRowId>,
+    },
+    /// Folds or unfolds one named branch without moving the selection.
+    ToggleBranch {
+        row: UiRowId,
     },
     CyclePaneView,
     CycleOrder,

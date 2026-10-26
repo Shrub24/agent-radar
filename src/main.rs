@@ -3,18 +3,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_radar::control_plane::observation::Snapshot;
+use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
 use agent_radar::managed_control as radar;
 use agent_radar::snapshot_fetch::{Fetched, SnapshotFetcher};
 use agent_radar::topology::ContainerControl;
 use agent_radar::tree::RowId;
+use agent_radar::ui_session::client::{UiClient, Wake};
 use agent_radar::{
     Action, App, Closer, Config, Confirmed, Focuser, Geometry, ObservationState, PaneView,
     control_plane, theme, ui,
 };
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
+use futures_util::StreamExt;
 use ratatui::widgets::ListState;
 
 fn main() -> io::Result<()> {
@@ -568,7 +572,28 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
     // The daemon samples for every display; this fetcher is how the dashboard
     // reads what it published, and it is absent only from a daemon that does not
     // serve the observation contract, which the diagnostic screen refuses.
-    let fetcher = observation.map(SnapshotFetcher::new);
+    // Every producer wakes the one event loop: terminal input, the daemon's
+    // snapshot and the shared UI session.
+    let wake = Wake::default();
+    let session_socket = observation
+        .as_ref()
+        .map(|daemon| daemon.socket().to_path_buf());
+    let fetcher = observation.map(|daemon| SnapshotFetcher::new(daemon, wake.clone()));
+    if !app.is_modal_only()
+        && let Some(socket) = session_socket
+    {
+        // A popup is a throwaway view of one row and stays out of the session.
+        let role = if sidebar {
+            AttachmentRole::Sidebar
+        } else {
+            AttachmentRole::Dashboard
+        };
+        app.attach_session(UiClient::start(socket, role, wake.clone()));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    let mut events = EventStream::new();
     // The animation frame, and the clock it is derived from: a mark has to move
     // at the same rate whether or not anything else made the loop redraw.
     let started = Instant::now();
@@ -581,6 +606,7 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
     let mut flip_on_success = false;
 
     loop {
+        dirty |= app.apply_session_update();
         dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);
         // Foreground evidence is swept while a pane view is showing panes, and
         // while finished sessions are listed: telling a session that has gone
@@ -687,10 +713,16 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
         let timeout = if animating {
             Duration::from_millis(1000 / fps as u64)
         } else {
-            // A fetch that is waiting for a newer revision is answered off this
-            // thread; polling a little more often keeps a published revision
-            // from sitting unapplied behind the idle interval.
-            Duration::from_millis(50)
+            // Snapshots, session updates and input wake the loop themselves.
+            // What remains is work that only answers on its own thread, and
+            // clocks: messages that expire, an attach that retries.
+            let working = focuser.is_busy()
+                || closer.is_busy()
+                || managed.is_busy()
+                || containers.is_busy()
+                || attach.waiting.is_some()
+                || sidebar_command.is_some();
+            Duration::from_millis(if working { 50 } else { 250 })
         };
         // The popup is done once its modal is answered, its work has finished and
         // the answer has been read.
@@ -710,10 +742,20 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
         let event = match queued_key.take() {
             Some(key) => Event::Key(key),
             None => {
-                if !event::poll(timeout)? {
-                    continue;
+                let next = runtime.block_on(async {
+                    tokio::select! {
+                        event = events.next() => Some(event),
+                        () = wake.woken() => None,
+                        () = tokio::time::sleep(timeout) => None,
+                    }
+                });
+                match next {
+                    // Woken by a producer or by the clock: loop to apply it.
+                    None => continue,
+                    Some(Some(event)) => event?,
+                    // The terminal's input ended; nothing more can be asked of it.
+                    Some(None) => break,
                 }
-                event::read()?
             }
         };
         match event {
