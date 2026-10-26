@@ -757,3 +757,70 @@ fn pane_losses(pane: &PaneRow) -> Vec<String> {
     }
     lines
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frozen request names the same container either way; only `force`
+    /// changes, and only the answer of a previous attempt can set it.
+    #[test]
+    fn a_forced_deletion_is_the_same_effect_with_force_set() {
+        use crate::app::Operation;
+        use crate::tree::ContainerRef;
+
+        let mut state = ObservationState::new();
+        state.apply_success(crate::model::testing::fleet());
+        let container = ContainerRef {
+            container_id: "c1".into(),
+            kind: Kind::Workspace,
+            provenance: crate::control_plane::containers::Provenance::Created,
+            handle: "wA".into(),
+            recipe: false,
+            unresolved: None,
+        };
+        let selected = || Selected::Pane {
+            pane_id: "wA:p1".into(),
+            tab: None,
+            losses: Vec::new(),
+        };
+        let first = plan(
+            Operation::Delete,
+            selected(),
+            &state,
+            Some(&container),
+            false,
+            "r1",
+        )
+        .expect("a container deletion is freezable");
+        assert_eq!(first.method, "topology.delete");
+        assert_eq!(
+            first.params.pointer("/request/force"),
+            Some(&serde_json::Value::Bool(false)),
+            "the first attempt does not force anything"
+        );
+        let repeat = plan(
+            Operation::Delete,
+            selected(),
+            &state,
+            Some(&container),
+            true,
+            "r2",
+        )
+        .expect("a forced repeat is freezable");
+        assert_eq!(
+            repeat.params.pointer("/request/force"),
+            Some(&serde_json::Value::Bool(true)),
+            "the repeat carries the force it was authorised with"
+        );
+        assert_eq!(
+            repeat.params.pointer("/request/container_id"),
+            first.params.pointer("/request/container_id"),
+            "the repeat targets the same container"
+        );
+        assert_ne!(
+            repeat.request_id, first.request_id,
+            "a repeat is its own effect, not a replay of the refused one"
+        );
+    }
+}
