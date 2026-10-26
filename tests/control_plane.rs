@@ -12300,3 +12300,70 @@ fn two_views_share_navigation_and_one_filter_editor() {
     drop((dashboard, sidebar));
     daemon.stop();
 }
+
+/// The subscription bound is explicit: past it a subscription is refused `busy`,
+/// and releasing one makes room again.
+#[test]
+fn ui_subscriptions_are_bounded_and_a_released_slot_is_reusable() {
+    let sandbox = Sandbox::new("ui-capacity");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let subscribe = |attachment: &str| -> UnixStream {
+        let mut stream = UnixStream::connect(daemon.path()).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        writeln!(
+            stream,
+            "{}",
+            request_line(
+                &random_uuid(),
+                "ui.subscribe",
+                json!({"attachment_id": attachment})
+            )
+        )
+        .expect("subscribe");
+        stream
+    };
+    let first_line = |stream: &UnixStream| -> Value {
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("an answer");
+        serde_json::from_str(&line).expect("one JSON line")
+    };
+    let mut open = Vec::new();
+    for _ in 0..16 {
+        let attachment = random_uuid();
+        client.call(
+            "ui.attach",
+            json!({"attachment_id": attachment, "role": "sidebar"}),
+        );
+        let stream = subscribe(&attachment);
+        assert!(first_line(&stream)["result"].is_object());
+        open.push(stream);
+    }
+    let extra = random_uuid();
+    client.call(
+        "ui.attach",
+        json!({"attachment_id": extra, "role": "sidebar"}),
+    );
+    let refused = first_line(&subscribe(&extra));
+    assert_eq!(error_code(&refused), "busy", "{refused}");
+
+    drop(open.pop());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let answer = first_line(&subscribe(&extra));
+        if answer["result"].is_object() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the freed slot stayed taken: {answer}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    drop(open);
+    daemon.stop();
+}
