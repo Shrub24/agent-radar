@@ -1,0 +1,54 @@
+# Tasks
+
+Implement A–D in order; each migrated field/workflow has one owner. E is the dependent `tui-interaction-ux` change, not a prerequisite for this change. These boxes track implementation, not completion of the planning artifacts.
+
+## 1. Milestone A — Semantic extraction and input boundary
+
+- [ ] 1.1 Introduce typed command IDs, target requirements and catalogue metadata in the existing command seam; verify keyboard, mouse and palette map to the same command without synthetic key replay, using focused existing command tests.
+- [ ] 1.2 Evaluate and pin compatible Strum/tui-actions dependencies behind a local adapter; prove case-sensitive keys, gg, leader, editor precedence, failed/ambiguous prefix, timeout/Escape and gate reset in a small resolver test. Record concrete gaps before substituting a different resolver; verify MSRV and current Ratatui/Crossterm compatibility.
+- [ ] 1.3 Extract shared tree/filter/fold/selection transitions and projection from App, leaving geometry/details/private editors local; adapt existing navigation tests to run the semantic model without terminal or subprocess dependencies and verify the old frontend remains usable in-process.
+- [ ] 1.4 Preserve selection reconciliation, per-level ordering, task provenance and stale-data distinctions; extend only the existing tests needed to catch owner fallback, empty results and replacement-identity behavior.
+- [ ] 1.5 Document semantic versus local ownership and sequence policy near the maintained UI documentation; verify it matches the extracted API and that no second mutable copy of migrated state remains. Use Keep the Why to update `context/ui-session.md` for confirmed architectural/dependency forks and rejected alternatives; link procedures rather than duplicate them.
+
+## 2. Milestone B — Daemon session, protocol and shared navigation
+
+- [ ] 2.1 Freeze the proposed UI namespace, action variants, attachment roles, typed errors and advertised contract in the public protocol generator; verify params/result fixtures, capability grouping and existing drift guards, without adding a caller-role bypass.
+- [ ] 2.2 Host the model on one dedicated actor thread with a synchronous mailbox loop, bounded channels and existing observation demand; keep effects off-thread. Async actor execution is optional only after measurement justifies it. Consider bounded draining of already-queued messages without batch-fill delay, preserving every transition/effect/receipt. Verify cancellation/shutdown responsiveness, ordering and no permanent sampling when presentations release demand.
+- [ ] 2.3 Implement deterministic tree/state serialization, BLAKE3 identities, current/recent bounded payload retention and retrieval; test unchanged-tree reuse, A→B→A, explicit eviction recovery and reply-size bounds without silent row truncation.
+- [ ] 2.4 Implement fresh UUID attachment, zero-based client baseline, ordered action receipts, duplicate/conflict/gap answers and server publication IDs; verify an identical retry returns the original interaction/request receipt, conflicting reuse is refused, expired receipts require reconciliation, gated input flushing creates no number holes, and reconnect cannot replay uncertain commands or reset canonical state.
+- [ ] 2.5 Add asynchronous UI reads/actor waits and separate reusable action/update connections through existing transport admission; verify a pending read does not delay actions, reused connection recovery preserves uncertain submissions, and waiting clients/busy actor admission do not consume reserved lifecycle capacity.
+- [ ] 2.6 Implement one editor owner and shared live fuzzy filtering using the chosen nucleo matcher; test complete-query updates with local caret ownership, live mirrored results, preserved ancestry/folds, non-owner refusal and disconnect release retaining the last accepted query.
+- [ ] 2.7 Convert dashboard/sidebar navigation to ordered session submissions and read-only canonical projections; retain ordered rows and ID-to-index lookup for ordinary navigation. Implement the Tokio select!/Crossterm EventStream frontend with one synchronous Ratatui terminal owner, ordered outbound worker, socket-to-local-channel notifications and conditional animation ticks. Verify prompt wakeups, latest-state coalescing, independent details, no rollback/lost receipts/effects/gate invalidation, reconnect on closed channels, resize/quit/error cleanup and no blocking RPCs in input handling.
+- [ ] 2.8 Run a focused latency exercise at milestone B and repeat after C: record input-to-render tails, queue wait and matching/tree-reconstruction/serialization cost for a representative and conservative larger fleet under normal daemon work. Verify no sustained backlog or default input debounce; optimize the measured bottleneck rather than add delta/reconciliation infrastructure.
+- [ ] 2.9 Publish attachment/reconnect/content-retention and live-filter behavior in UI/wire documentation; verify generated examples and tests agree with the documented errors and baseline rules. Record milestone B evidence without claiming live acceptance.
+
+## 3. Milestone C — Project-picker interaction and detached presenter
+
+- [ ] 3.1 Implement typed Preparing/AwaitingResult continuations and the exclusive modal gate; test explicit captured targets, cancellation/result winner, old-generation actions after unblock and clearing pending local input/editor ownership.
+- [ ] 3.2 Run the project source in the invoking frontend's environment through an addressed preparation effect. Remove the leading start-directory candidate and add a configured base-directory fallback (default home), keeping filter/dedup/timeout behavior; update the existing project tests for cwd-independent candidates, empty/failed-source fallback and unusable base, and verify no daemon-environment substitution.
+- [ ] 3.3 Add retained addressed presentation requests, host acknowledgement and one valid presenter claim; test claim-before-host-ack, duplicate delivery/claim, bounded no-presenter abandonment and release on cancellation.
+- [ ] 3.4 Reuse the existing Picker and renderer in inline and detached roots; implement direct typed result submission and acknowledgement without a parent callback or tmux exit-code payload, and verify the generic picker remains independent of IPC.
+- [ ] 3.5 Adapt the current workspace popup launcher to the session-aware presenter and captured interaction ID; verify exact command construction and origin-independent presenter lifetime in non-live host-adapter tests, preserving existing argv/trust behavior.
+- [ ] 3.6 Extract/reuse the existing workspace creation admission service without changing preflight/replay semantics; freeze request ID and complete contents before dispatch, and test duplicate modal results plus loss of UI completion after admission producing one recorded operation/backend effect.
+- [ ] 3.7 Verify cancellation from another dashboard closes the presenter, a live claimed popup can outlast its originating sidebar, and presenter loss cannot wedge the gate; use the real session/handler path rather than only reducer helpers.
+- [ ] 3.8 Test full/stopped effect-dispatch refusal and lost worker completion through the session/service path; verify pending state resolves without a false admission claim, and possibly submitted work is reconciled using its original request ID.
+- [ ] 3.9 Document inline/detached behavior, abandonment, admission uncertainty and a concise user-run tmux acceptance procedure; record the A–C interface milestone so the dependent UX change can start without waiting for D.
+
+## 4. Milestone D — Remaining command coordination and cleanup
+
+- [ ] 4.1 Migrate destructive confirmations and subject/process controls through captured interaction targets and existing typed services; verify current fencing/revalidation tests plus a stale displayed-target invocation that cannot retarget to another client's selection.
+- [ ] 4.2 Migrate remaining topology/launch choices and non-modal shared commands; audit each admitted operation's request ID/content/replay point and verify it retains its existing outcome and privacy behavior without self-RPC or duplicated execution paths.
+- [ ] 4.3 Move pending request/outcome correlation into the session and keep informational overlays/local detail reads local; verify a refusal with no fleet change is delivered and frontend disconnect does not cancel an admitted operation.
+- [ ] 4.4 Remove obsolete reconstructed modal Apps, migrated frontend controller ownership and duplicate dispatch; verify one writer per canonical field/workflow and no retained synthetic-key/legacy modal fallback. Keep physical-host focus within the existing supported single-host model.
+- [ ] 4.5 Complete user-facing command/result documentation and coordinate the sidebar-view forward delta after the sidebar-mode baseline is synchronized; verify no unfinished acceptance is marked passed and no unrelated old-backend spec cleanup is bundled.
+
+## 5. Integrated verification
+
+- [ ] 5.1 Run the schema-affecting gate: cargo fmt, strict Clippy, Rust and SDK suites, generated-contract guards, strict OpenSpec validation and Nix build. Ensure new source is Git-visible through jj export before Nix; record exact commands/results without touching unrelated dirty files.
+- [ ] 5.2 Have the user run the two-view/inline/detached tmux acceptance: shared filter/navigation, independent details/geometry, global cancellation, origin/presenter loss, reconnect and safe physical focus. Record only observed results; leave this unchecked until supplied.
+
+## Workflow follow-up
+
+- Preserve the separate `sidebar-mode` acceptance and synchronize its capability baseline before merging this change's sidebar delta; archive prerequisites before their successor, not by rewriting them as completed.
+- Start `tui-interaction-ux` after milestone C stabilizes; coordinate frontend file ownership if it overlaps D. Archive this core change before the UX change.
+- Follow the explicit user-approved commit/release workflow; publishing or tagging is not authorized by creating this plan.
