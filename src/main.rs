@@ -541,6 +541,21 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
         App::new()
     };
     app.set_modal_host(in_workspace);
+    // Which presentation this process was started in. A sidebar that draws the
+    // full dashboard and a dashboard that was asked for look the same on screen,
+    // so the log states the mode, the argv that chose it and the width it was
+    // given, and the two can be told apart afterwards.
+    tracing::info!(
+        mode = match (app.is_modal_only(), app.is_sidebar()) {
+            (true, _) => "modal",
+            (false, true) => "sidebar",
+            (false, false) => "dashboard",
+        },
+        expanded = app.is_expanded(),
+        workspace_host = in_workspace,
+        argv = ?std::env::args().collect::<Vec<_>>(),
+        "dashboard started"
+    );
     // The popup opens its modal once the first snapshot has arrived, because the
     // row it was started for is selected by identity in that snapshot.
     let mut pending_modal = modal;
