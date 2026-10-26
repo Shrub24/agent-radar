@@ -111,20 +111,9 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             session,
         ]);
         run(&attach)?;
-        run(&["bind-key", "-n", "F10", "select-pane", "-t", "%0"])?;
-        // Returning to the agents while expanded collapses the sidebar first, so
-        // the window and the sidebar's mode change together.
-        run(&[
-            "bind-key",
-            "-n",
-            "F12",
-            "if-shell",
-            "-F",
-            "#{window_zoomed_flag}",
-            "send-keys -t %0 Z ; select-pane -t %1",
-            "select-pane -t %1",
-        ])?;
-        run(&["bind-key", "-n", "F8", "detach-client"])?;
+        for binding in bindings() {
+            run(&binding)?;
+        }
         // A workspace nobody is attached to has nothing left to show. Set once a
         // client has attached: tmux destroys an unattached session on its next
         // loop, so setting it earlier removes the workspace before it opens.
@@ -133,21 +122,6 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             "-g",
             "client-attached",
             "set-option -t workspace destroy-unattached on",
-        ])?;
-        // Expand sends the sidebar its own toggle, so the mode and the zoom change
-        // together, from either pane.
-        run(&[
-            "bind-key",
-            "-n",
-            "F11",
-            "select-pane",
-            "-t",
-            "%0",
-            ";",
-            "send-keys",
-            "-t",
-            "%0",
-            "Z",
         ])?;
         run(&["select-pane", "-t", "%1"])?;
         let status = Command::new(&tmux)
@@ -167,6 +141,36 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
     // it: one launch, one name, and nothing left in the socket directory.
     let _ = std::fs::remove_file(crate::service::server_socket(&host));
     result.and(cleanup)
+}
+
+/// The host's own key bindings.
+///
+/// A binding's command is a single argument. tmux parses a `;` given as its own
+/// argument as a command separator rather than as part of the binding, so the
+/// line becomes two commands: the binding takes the first half and the rest runs
+/// immediately. That is how `send-keys -t %0 Z` fired on every workspace launch
+/// and flipped the sidebar to the full dashboard before anyone pressed a key.
+fn bindings() -> [[&'static str; 4]; 4] {
+    [
+        ["bind-key", "-n", "F8", "detach-client"],
+        ["bind-key", "-n", "F10", "select-pane -t %0"],
+        // Expand sends the sidebar its own toggle, so the mode and the zoom change
+        // together, from either pane.
+        [
+            "bind-key",
+            "-n",
+            "F11",
+            "select-pane -t %0 ; send-keys -t %0 Z",
+        ],
+        // Returning to the agents while expanded collapses the sidebar first, so
+        // the window and the sidebar's mode change together.
+        [
+            "bind-key",
+            "-n",
+            "F12",
+            "if-shell -F \"#{window_zoomed_flag}\" \"send-keys -t %0 Z ; select-pane -t %1\" \"select-pane -t %1\"",
+        ],
+    ]
 }
 
 /// Host commands for a sidebar created by this launcher, not a terminal split.
@@ -308,6 +312,37 @@ mod tests {
         assert!(
             !picker.iter().any(|word| word.starts_with("--row")),
             "no row was selected"
+        );
+    }
+
+    #[test]
+    fn a_host_binding_keeps_its_whole_command_as_one_argument() {
+        for binding in bindings() {
+            assert_eq!(binding[0], "bind-key");
+            assert_eq!(binding[1], "-n");
+            assert!(
+                !binding.contains(&";"),
+                "{} is split into two commands, so tmux runs the second one at once",
+                binding[2]
+            );
+        }
+
+        let f11 = bindings()
+            .into_iter()
+            .find(|binding| binding[2] == "F11")
+            .expect("F11 focuses the sidebar and expands it");
+        assert_eq!(
+            f11[3], "select-pane -t %0 ; send-keys -t %0 Z",
+            "the focus and the toggle run in that order when the key is pressed"
+        );
+
+        let f12 = bindings()
+            .into_iter()
+            .find(|binding| binding[2] == "F12")
+            .expect("F12 returns to the agents");
+        assert!(
+            f12[3].contains("-F \"#{window_zoomed_flag}\""),
+            "an unquoted format is expanded when the key is bound, leaving if-shell no argument"
         );
     }
 
