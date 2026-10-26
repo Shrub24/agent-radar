@@ -177,10 +177,17 @@ pub fn start_after_reset() -> Result<(), String> {
 pub fn restart_for_reset(server: &str) -> Result<(), String> {
     let unit = tmux_unit(server);
     unit_action("restart", &unit).map_err(|problem| format!("restarting {problem}"))?;
-    if !server_answers(server) {
-        return Err(format!(
-            "{unit} restarted but tmux server `{server}` does not answer"
-        ));
+    // systemd's restart job can finish after exec but before tmux has bound its
+    // socket. Use the same readiness budget as ensure_tmux_server rather than
+    // treating that ordinary startup race as a failed reset.
+    let deadline = Instant::now() + SERVER_START_TIMEOUT;
+    while !server_answers(server) {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{unit} restarted but tmux server `{server}` does not answer"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
 }
