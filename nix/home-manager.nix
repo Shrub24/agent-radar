@@ -31,6 +31,19 @@
 
 let
   cfg = config.programs.radar;
+
+  # No file at all unless something was asked for: the server then loads nothing
+  # from the user's home, as before.
+  tmuxConfig =
+    if cfg.tmux.configFile == null && cfg.tmux.extraConfig == "" then
+      "/dev/null"
+    else
+      pkgs.writeText "radar-tmux.conf" (
+        lib.optionalString (cfg.tmux.configFile != null) ''
+          source-file -q ${toString cfg.tmux.configFile}
+        ''
+        + cfg.tmux.extraConfig
+      );
 in
 {
   options.programs.radar = {
@@ -53,6 +66,36 @@ in
         The tmux that serves the Radar server unit and that the daemon drives.
         Radar's observation design needs tmux 3.8 or newer.
       '';
+    };
+
+    tmux = {
+      configFile = lib.mkOption {
+        type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
+        default = null;
+        example = "~/.config/tmux/tmux.conf";
+        description = ''
+          A tmux configuration the Radar server sources, such as your own. The
+          server is started with no configuration file of its own, so without
+          this it ignores yours. A string is passed through as written, so `~`
+          is expanded by tmux; a missing file is not an error.
+
+          The server keeps the configuration it started with: a change applies to
+          a new server, or to the running one with
+          `tmux -L radar source-file <file>`. Restarting the unit would close
+          every pane.
+        '';
+      };
+
+      extraConfig = lib.mkOption {
+        type = lib.types.lines;
+        default = ''
+          set -g extended-keys on
+        '';
+        description = ''
+          tmux commands run after {option}`configFile`. The default turns on
+          extended keys, which Pi needs for modified keys such as Shift+Enter.
+        '';
+      };
     };
 
     managedAgents = lib.mkOption {
@@ -159,7 +202,7 @@ in
         };
         Service = {
           Type = "simple";
-          ExecStart = "${cfg.tmuxPackage}/bin/tmux -D -L %i -f /dev/null";
+          ExecStart = "${cfg.tmuxPackage}/bin/tmux -D -L %i -f ${tmuxConfig}";
           KillMode = "control-group";
           Restart = "no";
         };

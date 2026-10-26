@@ -31,6 +31,19 @@ The sidebar is on the left; keyboard focus starts in the attached agent area.
 | B, in sidebar | Shrink to rail / restore to 32 columns |
 | Z, in sidebar | Expand to the full dashboard (the pane takes the window) / return |
 
+The outer server is inert: no prefix (and no second prefix), an empty prefix key
+table, no status line, `escape-time 0`, no bell or activity output, and only the
+`F8`/`F10`–`F12` root bindings. Every other key reaches the pane under it. It
+loads no configuration file, so your own tmux config never applies to it.
+
+The agents' server is separate and is configured in Home Manager:
+`programs.radar.tmux.configFile` sources a file of yours (for example
+`"~/.config/tmux/tmux.conf"`), and `programs.radar.tmux.extraConfig` adds commands
+after it; the default turns `extended-keys` on. Without either the server loads no
+file, as before. A running server keeps what it started with: apply a change with
+`tmux -L radar source-file <file>` rather than restarting the unit, which would
+close every pane.
+
 The launcher supplies tmux hide/show/zoom commands to its sidebar instead of
 using the Kitty commands in the user's configuration. The zoom and unzoom
 commands state the zoom they want (`if-shell -F '#{window_zoomed_flag}'`), so

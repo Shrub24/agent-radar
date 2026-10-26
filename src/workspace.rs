@@ -66,9 +66,20 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             ["set-option", "-g", "set-clipboard", "on"],
             ["set-option", "-g", "extended-keys", "on"],
             ["set-option", "-g", "allow-passthrough", "on"],
+            // An inert host: it adds no latency and says nothing. Every key
+            // reaches the pane under it except the few bound below.
+            ["set-option", "-g", "escape-time", "0"],
+            ["set-option", "-g", "focus-events", "on"],
+            ["set-option", "-g", "prefix2", "None"],
+            ["set-option", "-g", "bell-action", "none"],
+            ["set-option", "-g", "visual-bell", "off"],
+            ["set-option", "-g", "visual-activity", "off"],
+            ["set-option", "-g", "visual-silence", "off"],
+            ["set-option", "-g", "display-time", "1"],
         ] {
             run(&options)?;
         }
+        run(&["unbind-key", "-a", "-T", "prefix"])?;
         let mut attach = vec![
             "split-window",
             "-h",

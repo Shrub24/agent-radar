@@ -19,6 +19,8 @@ pane. In the workspace there is no tmux prefix and no status bar.
 | 0.5 | Start two or three agents in it (a Pi, and anything else you run) | they appear in plain `radar` |
 | 0.6 | `radar --print-config` | no `[sidebar]` Kitty commands are required for the workspace; it supplies its own |
 
+| 0.7 | `tmux -L radar show -gv extended-keys` | `on` (set `programs.radar.tmux.extraConfig`/`configFile`, then `tmux -L radar source-file <file>` for the running server) |
+
 If 0.1 or 0.2 fail, stop: a 0.6.0 TUI or daemon will refuse the other.
 
 ## 1. Launch and teardown
