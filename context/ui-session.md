@@ -421,3 +421,39 @@ The session's tree projection is the canonical row set, order and nesting. Every
 
 **Consequence:** details, fold markers and process panels still read the local tree by identity, so a row that exists only in the projection selects but shows no detail until the next observation.
 
+## A subscription has no read timeout until its baseline arrives
+
+**Id:** a629a11e-79fb-4378-b825-000905f3f4bc
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** a frontend that stopped re-attaching after a daemon restart, reproduced only under a loaded suite
+**Verification:** corroborated — with the timeout in place, ten loaded control-plane runs were clean where three in ten had stalled; the attach trace showed the attempt parked in `read_line` on a subscription the daemon had accepted
+**Revisit when:** the daemon can prove a subscription is being served before it writes, or the push loop needs a keepalive
+
+The subscription connection keeps the ordinary reply read timeout until the first frame — the baseline — is in hand, and only then waits without one. A quiet fleet is not a failure, but an accepted-and-never-served subscription is, and it must not be mistaken for a quiet one.
+
+**Reason:** without the distinction the attach thread blocks indefinitely on a subscription the daemon accepted and never answers: no error, no backoff, no retry, and the frontend never sees state again. That is a liveness defect that presents as a hung UI, not a failed connection.
+
+**Rejected alternative:** a health check or keepalive on the push stream. It needs a protocol addition and a second way to say the same thing; the first frame is already the strongest possible evidence that the subscription is being served.
+
+**Consequence:** a subscription that would have delivered its baseline after the reply timeout is abandoned and retried, which costs one attachment. The reply timeout is short enough that this is invisible unless the daemon is overloaded past it.
+
+## Host acceptance is not tracked separately from the presenter claim
+
+**Id:** 21eaeff8-c82e-4274-a401-8a58eeafc2a4
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** a follow-up review asking whether the published field drives any transition
+**Verification:** corroborated — `host_accepted` had one writer (the acknowledgement action) and no reader anywhere in the tree; the acknowledgement action's only other effect was an ownership check that contradicted the rule that any view may cancel
+**Revisit when:** something needs to distinguish "the host opened a presenter" from "a presenter attached" — for example an inspector that must explain a popup that never appeared
+
+The protocol no longer carries an acknowledgement action or a field recording that the invoking host accepted a presentation. A presenter claims the interaction when it attaches, and a host that could not present reports `PresentationFailed`, which closes the interaction exactly as any other cancellation does.
+
+**Reason:** state that nothing reads is not a guarantee, it is a claim about a guarantee. Keeping it invites a reader to assume some behaviour depends on it, and it costs a protocol action, a field and match arms in three places.
+
+**Rejected alternative:** keep it as diagnostic state for the planned operation inspector. When the inspector exists it will want facts with an audience, designed against what it shows; carrying the field until then is speculative state, and a popup that never opened is already visible as an interaction that expired or was cancelled.
+
+**Consequence:** the distinction between host acceptance and presenter claim survives in the design as reasoning but not on the wire. If a future consumer needs it, the honest move is to add an observation with a reader, not to reintroduce an unused field.
+

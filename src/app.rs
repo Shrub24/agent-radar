@@ -683,17 +683,7 @@ impl App {
     /// observation only explains them. A row it cannot explain is still drawn,
     /// because the session says the row is there.
     pub fn draw_rows(&self) -> Vec<crate::ui_session::navigation::DrawRow<'_>> {
-        match self.mirror_ref() {
-            Some(mirror) if !mirror.rows.is_empty() => {
-                crate::ui_session::navigation::projected(&mirror.rows, &self.nav)
-            }
-            _ => self
-                .nav
-                .visible_rows()
-                .into_iter()
-                .map(crate::ui_session::navigation::DrawRow::Known)
-                .collect(),
-        }
+        Self::drawn(self.mirror_ref().map(|mirror| &**mirror), &self.nav)
     }
 
     /// Index of the selected row within [`Self::draw_rows`].
@@ -1066,6 +1056,25 @@ impl App {
     }
 
     /// Index of the selected row within [`Self::visible_rows`], if any.
+    /// The rows to draw for an adopted state, or for a view with none.
+    ///
+    /// An attached view draws what the session projects, **including nothing**: an
+    /// empty canonical tree is an answer, not a reason to resurrect the rows this
+    /// process happens to remember.
+    fn drawn<'a>(
+        mirror: Option<&'a crate::ui_session::client::Mirror>,
+        nav: &'a Navigation,
+    ) -> Vec<crate::ui_session::navigation::DrawRow<'a>> {
+        match mirror {
+            Some(mirror) => crate::ui_session::navigation::projected(&mirror.rows, nav),
+            None => nav
+                .visible_rows()
+                .into_iter()
+                .map(crate::ui_session::navigation::DrawRow::Known)
+                .collect(),
+        }
+    }
+
     /// Index of the selected row in the drawn list: the list the pointer maps
     /// onto and the list the highlight is placed in.
     pub fn selected_index(&self) -> Option<usize> {
@@ -2377,6 +2386,33 @@ mod tests {
 
         app.toggle_history();
         assert!(agent_rows(&app).is_empty(), "{:?}", row_ids(&app));
+    }
+
+    #[test]
+    fn an_empty_canonical_tree_draws_nothing_rather_than_the_rows_remembered_here() {
+        use crate::control_plane::public_contracts::ui_session as dto;
+        use crate::ui_session::client::Mirror;
+
+        let app = app_with_fixture();
+        assert!(
+            app.visible_rows().len() > 1,
+            "the fixture gives this view rows of its own"
+        );
+        let attached = Mirror {
+            attachment_id: "a".into(),
+            update_id: 1,
+            state: dto::SessionState::default(),
+            rows: std::sync::Arc::new(Vec::new()),
+        };
+        assert!(
+            App::drawn(Some(&attached), &app.nav).is_empty(),
+            "a session that projects no rows is an answer, not a gap to fill locally"
+        );
+        assert_eq!(
+            App::drawn(None, &app.nav).len(),
+            app.visible_rows().len(),
+            "a view with no session draws its own rows"
+        );
     }
 
     #[test]

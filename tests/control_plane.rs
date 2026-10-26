@@ -1278,6 +1278,9 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
 /// How long a test waits for a line or for a process to go.
 const DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long a frontend gets to re-attach across a daemon restart.
+const RECONNECT_DEADLINE: Duration = Duration::from_secs(30);
+
 struct SocketBlockingVerifier {
     entered: mpsc::SyncSender<()>,
     release: Mutex<mpsc::Receiver<()>>,
@@ -2226,10 +2229,16 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
     );
     assert_eq!(error_code(&stranger), "refused", "{stranger}");
     let close = |client: &mut Client, caller: &str| {
-        client.call(
-            "subject.child.close",
-            json!({"registration_id": caller, "subject_id": worker, "intent": "cancel"}),
-        )
+        // Closing verifies the pane's occupant inside the daemon's budget. A
+        // loaded machine can outrun that budget, which is a machine answer rather
+        // than an ownership one, so the attempt is repeated; a refusal that
+        // persists is still the answer this test asserts on.
+        retrying_load(|| {
+            client.call(
+                "subject.child.close",
+                json!({"registration_id": caller, "subject_id": worker, "intent": "cancel"}),
+            )
+        })
     };
     let refused = close(&mut client, &root);
     assert_eq!(
@@ -8746,6 +8755,24 @@ fn process_exists(pid: i32) -> bool {
         .success()
 }
 
+/// Repeats a request the daemon refused because it ran out of verification time.
+///
+/// `backend_unavailable` says the machine was too slow to prove the request's
+/// preconditions within the daemon's budget, not that the request was wrong. A
+/// test about routing or ownership treats that as load and asks again; the
+/// refusal that persists is returned, so the assertion still fails with it.
+fn retrying_load(mut attempt: impl FnMut() -> Value) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let answer = attempt();
+        // A success is an answer like any other: only a load refusal is repeated.
+        if answer["error"]["code"] != "backend_unavailable" || Instant::now() >= deadline {
+            return answer;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Waits for a child to go, with a deadline: a daemon that ignored its signal
 /// fails its test rather than hanging it.
 fn wait_for_exit(child: &mut Child, deadline: Duration) -> ExitStatus {
@@ -12228,7 +12255,9 @@ fn the_ui_client_attaches_acts_and_reattaches_after_the_daemon_restarts() {
         Wake::default(),
     );
     let wait = |client: &UiClient, want: &dyn Fn(&dto::SessionState) -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // A daemon restart costs a boot and an attach backoff on top of the
+        // attach itself; the budget is for reconnecting, not for speed.
+        let deadline = Instant::now() + RECONNECT_DEADLINE;
         loop {
             if let Some(mirror) = client.poll()
                 && want(&mirror.state)
@@ -12257,9 +12286,21 @@ fn the_ui_client_attaches_acts_and_reattaches_after_the_daemon_restarts() {
         thread::sleep(Duration::from_millis(10));
     }
     let mut daemon = sandbox.daemon();
-    // A restarted daemon has a fresh session: the client takes its baseline.
+    // A restarted daemon has a fresh session: the client takes its baseline. The
+    // wait is for that state, which cannot be the dead session's: every attach
+    // attempt clears the published mirror before it attaches, so a mirror present
+    // now was published by a subscription that exists. `connected` is a live
+    // status flag for the view, not a readiness barrier — asserting it at an
+    // arbitrary instant races the attach loop, which is free to lose and reclaim
+    // a subscription between two reads.
     let again = wait(&client, &|state| state.order == dto::RowOrderDto::Source);
-    assert!(client.connected());
+    // Publication ids belong to one daemon's counter and every attach starts a
+    // fresh one, so they are not comparable across the restart. The attachment is:
+    // a state published under a different attachment is the new session's.
+    assert_ne!(
+        again.attachment_id, baseline.attachment_id,
+        "the state after the restart came from a new attachment"
+    );
     drop(client);
     daemon.stop();
     let _ = again;
@@ -12444,15 +12485,6 @@ fn a_claimed_ui_project_result_survives_its_origin_and_admits_one_workspace() {
         }),
     );
     assert!(claim["result"].is_object(), "{claim}");
-    // Host acceptance is independent of the claim and may arrive afterwards.
-    let ack = host.call(
-        "ui.action",
-        json!({
-            "attachment_id": owner, "action_id": 3,
-            "action": {"action": "acknowledge_presentation", "effect_id": interaction}
-        }),
-    );
-    assert_eq!(ack["result"]["outcome"], "applied", "{ack}");
     host.call("ui.detach", json!({"attachment_id": owner}));
     drop(host);
 

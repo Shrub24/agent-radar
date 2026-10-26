@@ -152,7 +152,6 @@ pub struct Blocking {
     pub presenter: Option<String>,
     pub choices: Vec<String>,
     pub note: Option<String>,
-    pub host_accepted: bool,
     /// What the presenter asks. A project picker lists choices; a confirmation
     /// shows the question and what answering it loses.
     pub kind: InteractionKind,
@@ -325,9 +324,6 @@ pub enum UiAction {
     ClaimPresentation {
         interaction_id: String,
     },
-    AcknowledgePresentation {
-        effect_id: String,
-    },
     PresentationFailed {
         interaction_id: String,
         message: String,
@@ -343,7 +339,6 @@ impl UiAction {
                 | Self::CancelInteraction { .. }
                 | Self::ProvideChoices { .. }
                 | Self::ClaimPresentation { .. }
-                | Self::AcknowledgePresentation { .. }
                 | Self::PresentationFailed { .. }
         )
     }

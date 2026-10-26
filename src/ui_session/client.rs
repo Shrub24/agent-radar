@@ -337,13 +337,14 @@ fn session(inner: &Inner) -> Result<(), String> {
     let baseline = publish(inner, &attachment, &mut cache, attached.publication)?;
 
     let (mut stream, _) = dial(inner)?;
-    // The subscription outlives a quiet fleet: only the attach loop's cut ends it.
-    let _ = stream.set_read_timeout(None);
     let (id, line) = request(
         "ui.subscribe",
         json!({"attachment_id": attachment, "known_tree_hash": baseline}),
     );
     stream.write_all(&line).map_err(|error| error.to_string())?;
+    // Registered for cancellation before the handshake completes, so a stop or a
+    // re-attach ends this attempt instead of waiting out its reply timeout.
+    *locked(&inner.subscription) = Some(stream.try_clone().map_err(|error| error.to_string())?);
     // The subscription's first answer is the readiness barrier: the daemon has
     // accepted it and this attachment owns a stream. Reading it through the same
     // buffered reader the push loop uses keeps read-ahead with the frame stream.
@@ -359,13 +360,6 @@ fn session(inner: &Inner) -> Result<(), String> {
     let result = answered(&id, &accepted)?;
     let publication: dto::Publication =
         serde_json::from_value(result).map_err(|error| error.to_string())?;
-    publish(inner, &attachment, &mut cache, publication)?;
-    *locked(&inner.subscription) = Some(
-        frames
-            .get_ref()
-            .try_clone()
-            .map_err(|error| error.to_string())?,
-    );
     *locked(&inner.link) = Some(Link {
         action,
         reader,
@@ -377,7 +371,16 @@ fn session(inner: &Inner) -> Result<(), String> {
     if inner.stop.load(Ordering::SeqCst) {
         return Ok(());
     }
+    // Connected before the baseline is published, so a view that sees a mirror
+    // never sees one from a session it is not yet connected to.
     inner.connected.store(true, Ordering::SeqCst);
+    publish(inner, &attachment, &mut cache, publication)?;
+    // The baseline is in hand, so the subscription is alive: from here it waits
+    // without a read timeout, because a quiet fleet is not a failure. Until here
+    // it kept the reply timeout, so a subscription the daemon accepts and then
+    // never serves is abandoned and retried instead of parking the attach thread
+    // for the life of the process.
+    let _ = frames.get_ref().set_read_timeout(None);
     inner.wake.notify();
 
     loop {

@@ -296,7 +296,6 @@ impl Session {
                 A::ResolveInteraction { .. }
                     | A::CancelInteraction { .. }
                     | A::ClaimPresentation { .. }
-                    | A::AcknowledgePresentation { .. }
             )
         {
             return refuse(
@@ -313,7 +312,6 @@ impl Session {
                     | A::CancelInteraction { .. }
                     | A::ProvideChoices { .. }
                     | A::ClaimPresentation { .. }
-                    | A::AcknowledgePresentation { .. }
                     | A::PresentationFailed { .. }
             )
         {
@@ -399,12 +397,12 @@ impl Session {
                 result,
             } => self.gate.resolve(id, &interaction_id, result)?,
             A::CancelInteraction { interaction_id } => self.gate.cancel(&interaction_id)?,
-            A::AcknowledgePresentation { effect_id } => self.gate.acknowledge(id, &effect_id)?,
             A::PresentationFailed {
                 interaction_id,
                 message,
             } => {
-                self.gate.acknowledge(id, &interaction_id)?;
+                // A host that could not present reports a failure, which closes
+                // the interaction exactly as any other view's cancellation does.
                 self.gate.cancel(&interaction_id)?;
                 self.interaction_notice = Some(message);
             }
@@ -516,13 +514,11 @@ impl Session {
         match frozen {
             // Nothing to ask: the command goes ahead and is still one frozen effect.
             Ok(plan) if !plan.confirms => {
-                self.remember(&plan);
                 self.gate.enqueue(plan, command);
                 self.project();
                 Ok(None)
             }
             Ok(plan) => {
-                self.remember(&plan);
                 let interaction = self.gate.begin_at(
                     id,
                     command,
@@ -555,7 +551,16 @@ impl Session {
 
     /// What accepted interactions have set in motion, for the actor to dispatch.
     pub fn take_completions(&mut self) -> Vec<Completion> {
-        self.gate.take_completions()
+        let completions = self.gate.take_completions();
+        // Correlation is recorded for effects that reach dispatch, never for a
+        // question that may be cancelled: an asked-and-cancelled deletion would
+        // otherwise leave an entry nothing will ever settle.
+        for completion in &completions {
+            if let Some(plan) = &completion.plan {
+                self.remember(plan);
+            }
+        }
+        completions
     }
 
     pub fn tick(&mut self, seconds: u64) {
@@ -568,6 +573,11 @@ impl Session {
 
     pub fn operation(&mut self, outcome: dto::CommandOutcome) {
         use dto::CommandStatus as S;
+        if outcome.status == S::DispatchRefused {
+            // The effect never left this process, so there is no verdict to wait
+            // for and nothing for a repeat to be armed against.
+            self.held.remove(&outcome.request_id);
+        }
         // Acceptance is not an answer: a dispatched deletion is still on its way
         // to the verdict that decides whether a repeat may force it.
         let terminal = matches!(outcome.status, S::Completed | S::Refused | S::Unknown);
@@ -1009,6 +1019,66 @@ mod tests {
         assert!(frozen.contains(shown.as_str()), "{frozen}");
         assert!(!frozen.contains(other.as_str()), "{frozen}");
         assert_eq!(plan.method, "mux.close");
+    }
+
+    #[test]
+    fn a_held_target_is_correlated_only_once_its_effect_reaches_dispatch() {
+        let mut session = seeded();
+        let held_plan = super::super::targets::Plan {
+            method: "mux.close",
+            request_id: "r1".into(),
+            params: serde_json::json!({}),
+            prompt: "Close it".into(),
+            losses: vec!["an agent is running".into()],
+            confirms: true,
+            focus: None,
+            held_key: Some("c1".into()),
+        };
+        let interaction = session
+            .gate
+            .begin_at(
+                "a",
+                dto::SharedCommand::Delete,
+                None,
+                dto::InteractionKind::Confirm,
+                Some("Close it".into()),
+                vec!["an agent is running".into()],
+                Some(held_plan),
+                dto::InteractionStage::AwaitingResult,
+            )
+            .expect("the question opens");
+        assert!(
+            session.held.is_empty(),
+            "a question that may be cancelled has dispatched nothing yet"
+        );
+        session
+            .gate
+            .claim("a", &interaction)
+            .expect("the view that asked presents the question");
+        session
+            .gate
+            .resolve(
+                "a",
+                &interaction,
+                dto::InteractionResult::Confirm { accepted: true },
+            )
+            .expect("the answer is accepted");
+        let jobs = session.take_completions();
+        assert_eq!(jobs.len(), 1, "the answer dispatches one effect");
+        assert_eq!(
+            session.held.get("r1").map(String::as_str),
+            Some("c1"),
+            "the effect that reaches dispatch is the one correlated"
+        );
+        session.operation(dto::CommandOutcome {
+            request_id: jobs[0].request_id.clone(),
+            status: dto::CommandStatus::DispatchRefused,
+            answer: None,
+        });
+        assert!(
+            session.held.is_empty(),
+            "an effect the scheduler refused has no verdict to wait for"
+        );
     }
 
     #[test]

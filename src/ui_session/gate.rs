@@ -94,7 +94,6 @@ impl Gate {
                 presenter: None,
                 choices: Vec::new(),
                 note: None,
-                host_accepted: false,
             },
             captured,
             age: 0,
@@ -130,17 +129,6 @@ impl Gate {
         o.view.note = note;
         o.view.stage = InteractionStage::AwaitingResult;
         o.age = 0;
-        Ok(())
-    }
-    pub fn acknowledge(&mut self, by: &str, id: &str) -> Result<(), Refused> {
-        let o = self.named(id)?;
-        if o.view.owner != by {
-            return refused(
-                RefusalCode::Role,
-                "only the invoking host acknowledges presentation",
-            );
-        }
-        o.view.host_accepted = true;
         Ok(())
     }
     pub fn claim(&mut self, by: &str, id: &str) -> Result<(), Refused> {

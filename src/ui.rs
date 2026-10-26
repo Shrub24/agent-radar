@@ -6733,7 +6733,6 @@ mod tests {
             presenter: Some("view-a".into()),
             choices: Vec::new(),
             note: None,
-            host_accepted: true,
             kind: dto::InteractionKind::Confirm,
             prompt: Some(prompt.into()),
             losses: losses.iter().map(|loss| loss.to_string()).collect(),

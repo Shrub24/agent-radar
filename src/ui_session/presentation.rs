@@ -122,9 +122,6 @@ impl Presentation {
                     interaction_id: b.interaction_id.clone(),
                 });
             }
-            app.submit_session(UiAction::AcknowledgePresentation {
-                effect_id: b.interaction_id.clone(),
-            });
             return true;
         }
         false

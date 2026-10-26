@@ -635,70 +635,115 @@ pub fn projected<'a>(
     rows: &'a [crate::control_plane::public_contracts::ui_session::TreeRow],
     nav: &'a Navigation,
 ) -> Vec<DrawRow<'a>> {
-    let depths: Vec<usize> = rows.iter().map(|row| row.depth as usize).collect();
+    // One pass over the local tree rather than a search per row: the projection is
+    // the same size as the tree on any settled fleet, and a render must not be
+    // quadratic in it. A view that has observed nothing yet explains nothing, so
+    // it does not pay for an index it cannot use.
+    let mut local: std::collections::HashMap<&RowId, &TreeNode> = std::collections::HashMap::new();
+    if nav.tree().roots.is_empty() {
+        let connectors = flat_connectors_all(&depths_of(rows));
+        return rows
+            .iter()
+            .enumerate()
+            .map(|(index, wire)| DrawRow::Structure {
+                id: super::session::row_id(&wire.id),
+                row: wire,
+                connectors: connectors[index].clone(),
+            })
+            .collect();
+    }
+    fn collect<'a>(
+        nodes: &'a [TreeNode],
+        into: &mut std::collections::HashMap<&'a RowId, &'a TreeNode>,
+    ) {
+        for node in nodes {
+            into.insert(&node.row.id, node);
+            collect(&node.children, into);
+        }
+    }
+    collect(&nav.tree().roots, &mut local);
+
+    let depths = depths_of(rows);
     let ids: Vec<RowId> = rows
         .iter()
         .map(|row| super::session::row_id(&row.id))
         .collect();
+    let connectors = flat_connectors_all(&depths);
     let mut drawn = Vec::with_capacity(rows.len());
     for (index, wire) in rows.iter().enumerate() {
-        let connectors = flat_connectors(&depths, index);
-        match nav.node(&ids[index]) {
+        match local.get(&ids[index]) {
             Some(node) => drawn.push(DrawRow::Known(VisibleRow {
                 id: &node.row.id,
                 depth: depths[index],
                 node,
                 has_children: wire.has_children,
                 collapsed: wire.collapsed,
-                connectors,
+                connectors: connectors[index].clone(),
             })),
             None => drawn.push(DrawRow::Structure {
                 id: ids[index].clone(),
                 row: wire,
-                connectors,
+                connectors: connectors[index].clone(),
             }),
         }
     }
     drawn
 }
 
-/// The branch prefix of one row of a flat, depth-annotated listing.
-///
-/// A row's own connector and each ancestor's continuation are read from the
-/// depths around it: a sibling follows when the next row of the same depth comes
-/// before any shallower one, and an ancestor's line continues when that ancestor
-/// has a following sibling of its own.
-fn flat_connectors(depths: &[usize], index: usize) -> Connectors {
-    fn sibling_follows(depths: &[usize], from: usize, depth: usize) -> bool {
-        for &next in depths.iter().skip(from) {
-            if next < depth {
-                return false;
-            }
-            if next == depth {
-                return true;
-            }
-        }
-        false
-    }
-    let depth = depths[index];
-    let mut continuation = Vec::new();
-    // Each ancestor column, outermost first: find that ancestor by walking back.
-    for level in 1..depth {
-        let mut ancestor = index;
-        while ancestor > 0 && depths[ancestor] > level {
-            ancestor -= 1;
-        }
-        continuation.push(
-            depths[ancestor] >= level && sibling_follows(depths, index.min(ancestor) + 1, level),
-        );
-    }
-    Connectors {
-        continuation,
-        has_following_sibling: sibling_follows(depths, index + 1, depth),
-    }
+fn depths_of(rows: &[crate::control_plane::public_contracts::ui_session::TreeRow]) -> Vec<usize> {
+    rows.iter().map(|row| row.depth as usize).collect()
 }
 
-/// The prefix a child row draws: its parent's continuation columns, then the
+/// The branch prefix of every row of a flat, depth-annotated listing.
+///
+/// Two linear passes: one right-to-left answering "does a sibling follow" for
+/// every row, one left-to-right resolving each row's ancestor columns from the
+/// most recent row at each shallower depth.
+fn flat_connectors_all(depths: &[usize]) -> Vec<Connectors> {
+    let mut connectors = vec![
+        Connectors {
+            continuation: Vec::new(),
+            has_following_sibling: false,
+        };
+        depths.len()
+    ];
+    // A sibling follows when the nearest row to the right whose depth is not
+    // deeper has this row's depth: that is the first row to look at after this
+    // row's subtree.
+    let mut stack: Vec<usize> = Vec::new();
+    for index in (0..depths.len()).rev() {
+        while stack
+            .last()
+            .is_some_and(|&deeper| depths[deeper] > depths[index])
+        {
+            stack.pop();
+        }
+        connectors[index].has_following_sibling = stack
+            .last()
+            .is_some_and(|&next| depths[next] == depths[index]);
+        stack.push(index);
+    }
+    // An ancestor's column continues when that ancestor has a following sibling.
+    let deepest = depths.iter().copied().max().unwrap_or(0);
+    let mut last_at: Vec<Option<usize>> = vec![None; deepest + 1];
+    for index in 0..depths.len() {
+        let depth = depths[index];
+        // Nothing deeper can be an ancestor of this row or of anything after it.
+        for slot in last_at.iter_mut().skip(depth + 1) {
+            *slot = None;
+        }
+        connectors[index].continuation = (1..depth)
+            .filter_map(|level| last_at.get(level).copied().flatten())
+            .map(|ancestor| connectors[ancestor].has_following_sibling)
+            .collect();
+        if let Some(slot) = last_at.get_mut(depth) {
+            *slot = Some(index);
+        }
+    }
+    connectors
+}
+
+/// The prefix a child row draws:/// The prefix a child row draws:/// The prefix a child row draws: its parent's continuation columns, then the
 /// parent's own column when the parent is itself nested. A workspace root draws
 /// no connector, so its children start with an empty prefix and it leaves no
 /// continuation behind them.
