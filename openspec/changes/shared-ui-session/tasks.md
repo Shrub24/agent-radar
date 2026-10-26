@@ -40,6 +40,8 @@ Milestone C evidence: real socket tests cover inline discovery/result submission
 
 Post-C release repeat on the same 720-row fixture: projection rebuild 3.29 ms; navigation median 0.284 ms / max 0.448 ms; filter median 0.062 ms / max 0.347 ms. These remain reducer/matching/projection measurements, not socket input-to-render latency. The C gate passed formatting, strict Clippy, Rust suites, 111 SDK tests, both OpenSpec validations, Keep the Why lint and `nix build --no-link`. Live acceptance remains unchecked.
 
+Validation correction: an extra post-gate Rust run failed the existing `a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart` test (165/166 control-plane tests passed) with empty captured cgroup output. The isolated test passed. A regression reproduced the cause: the reader accepted the empty file created by shell redirection before `cat` wrote it. The helper now waits for newline-terminated output; the regression failed before the fix and the final strict-Clippy/full-Rust run passed (556 library tests; 167 control-plane tests). This follow-up changes test readiness only, not production scope/admission code. SDK, release-benchmark and Nix results above are from the preceding core gate.
+
 ## 4. Milestone D — Remaining command coordination and cleanup
 
 - [ ] 4.1 Migrate destructive confirmations and subject/process controls through captured interaction targets and existing typed services; verify current fencing/revalidation tests plus a stale displayed-target invocation that cannot retarget to another client's selection.

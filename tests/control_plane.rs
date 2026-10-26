@@ -12071,17 +12071,44 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
 /// The shell creates the file before it writes anything into it, so an existence
 /// check reads the empty file the redirection made rather than what the workload
 /// reported.
+#[test]
+fn a_workload_output_file_is_not_ready_just_because_redirection_created_it() {
+    let sandbox = Sandbox::new("workload-output-readiness");
+    let path = sandbox.root.join("membership");
+    fs::write(&path, "").unwrap(); // shell redirection, before the program writes
+    let reading = path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        tx.send(wait_for_text(&reading)).unwrap();
+    });
+    let early = rx.recv_timeout(Duration::from_millis(100));
+    // Always release/join the reader, including on the regression path.
+    fs::write(&path, "0::/radar.slice/example.scope\n").unwrap();
+    let text = match &early {
+        Ok(text) => text.clone(),
+        Err(_) => rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+    };
+    reader.join().unwrap();
+    assert!(
+        matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "an empty file is not a completed record: {early:?}"
+    );
+    assert_eq!(text, "0::/radar.slice/example.scope\n");
+}
+
+/// Waits for a newline-terminated workload record, not redirection's empty file.
+/// Waits for a newline-terminated workload record, not redirection's empty file.
 fn wait_for_text(path: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(text) = fs::read_to_string(path)
-            && !text.trim().is_empty()
+            && text.ends_with('\n')
         {
             return text;
         }
         assert!(
             Instant::now() < deadline,
-            "{} was never written",
+            "{} was never completely written",
             path.display()
         );
         thread::sleep(Duration::from_millis(20));
