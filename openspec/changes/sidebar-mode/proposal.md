@@ -8,7 +8,7 @@ Radar's TUI is a full-screen dashboard, so watching the fleet means leaving the 
 
 - Add `radar sidebar`: the same dashboard, run as its own process on the shared `observation.get`, drawn as a compressed session tree for a narrow terminal split. Tree, fold, selection and filter stay local to that process, as they are in the full TUI.
 - The sidebar draws compressed rows (mark, name and state), omits the details panel, and keeps the full TUI's navigation, filter, fold, `PaneView` and jump keys.
-- The sidebar offers no destructive lifecycle action. Delete, restart and the other confirmation dialogs stay in the full TUI.
+- The sidebar retains dashboard management, including launch and lifecycle actions. Confirmation and revalidation use the same path; workspace-wide modal presentation is the next host-integration slice.
 - Selecting an agent and pressing the focus key uses the existing focus action. One view is supported: the right-hand split is one plain `tmux attach`, so a focus moves that client. No focus parameter is added.
 - Hide and unhide are a pair of configured commands, `[sidebar] hide_command` and `show_command`, run by the TUI on one key. Below a minimum width the sidebar draws a collapsed rail. The width itself belongs to the host terminal.
 - Ship a Kitty launcher (a session layout and a host binding for unhide) as configuration. A WezTerm launcher follows later and needs no Radar change.

@@ -23,7 +23,7 @@ See proposal.md for the motivation. The sidebar adds no daemon behaviour. The TU
 
 **Unhide works from either split.** `B` runs `show_command` while the sidebar rail has focus. The Kitty launcher also supplies `Ctrl+Shift+B` to restore and focus the marked sidebar window from the tmux split. A stable window variable avoids depending on a mutable title.
 
-**Destructive actions are omitted by presentation, not by dialog.** The sidebar does not bind them and the footer does not list them. A dialog does not fit in about 30 columns, and the full TUI already has them. Alternative: hand the confirmation to a `tmux display-popup`, deferred until someone needs it.
+**Presentation does not restrict management.** The sidebar retains launch and lifecycle actions with the existing confirmation/revalidation path. The earlier omission was a misunderstanding of the intended control surface. The outer-tmux workspace in `docs/workspace-prototype.md` floats those modals over the whole client: the sidebar starts `radar modal` in a `display-popup` carrying the selected row's identity (serialised `RowId`), the popup selects it exactly or refuses, and the key then runs through the same handler as the dashboard. No daemon method is added.
 
 **Focus is unchanged.** The sidebar sends the same focus action as the full TUI. With one view and one attached client, the daemon's clientless `select-window` and `select-pane` move the client the user is looking at.
 

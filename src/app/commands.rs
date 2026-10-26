@@ -18,23 +18,32 @@ pub struct Command {
 impl Command {
     /// Whether this command exists only where `radar sidebar` is drawn.
     pub fn sidebar_only(&self) -> bool {
-        self.key == KeyCode::Char('B')
+        matches!(self.key, KeyCode::Char('B' | 'Z'))
     }
 
-    /// Whether this command is offered by a view. The sidebar manages nothing,
-    /// so the lifecycle actions are absent from it at any width; a compressed
-    /// sidebar draws no details panel either, so those keys are absent too.
+    /// Whether this command is about the sidebar's own split, so the sidebar
+    /// itself cannot offer it.
+    pub fn launches_sidebar(&self) -> bool {
+        self.key == KeyCode::Char('S')
+    }
+
+    /// Whether this command opens a picker or a confirmation, which is all the
+    /// workspace popup is for: the rest act on a view the popup does not show.
+    pub fn opens_modal(&self) -> bool {
+        matches!(
+            self.key,
+            KeyCode::Enter | KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R')
+        )
+    }
+
+    /// Both presentations manage the same fleet. Only commands for absent
+    /// panels and the sidebar's own host controls differ.
     pub fn offered(&self, sidebar: bool, compact: bool) -> bool {
         if self.sidebar_only() {
             return sidebar;
         }
-        if sidebar
-            && matches!(
-                self.key,
-                KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R')
-            )
-        {
-            return false;
+        if self.launches_sidebar() {
+            return !sidebar;
         }
         if sidebar && compact && matches!(self.key, KeyCode::Char('d') | KeyCode::Tab) {
             return false;
@@ -126,6 +135,11 @@ pub const COMMANDS: &[Command] = &[
         key: KeyCode::Char('!'),
     },
     Command {
+        label: "Open the sidebar beside this window",
+        keys: "S",
+        key: KeyCode::Char('S'),
+    },
+    Command {
         label: "Hide or unhide the sidebar",
         keys: "B",
         key: KeyCode::Char('B'),
@@ -169,10 +183,11 @@ pub const COMMANDS: &[Command] = &[
 
 /// The commands a picker offers, in its own order. Filtering and ranking are the
 /// picker's; this only decides what is on offer where.
-pub fn items(sidebar: bool, compact: bool) -> Vec<Item<KeyCode>> {
+pub fn items(sidebar: bool, compact: bool, modal: bool) -> Vec<Item<KeyCode>> {
     COMMANDS
         .iter()
         .filter(|command| command.offered(sidebar, compact))
+        .filter(|command| !modal || command.opens_modal())
         .map(|command| Item::new(command.label, Some(command.keys), command.key))
         .collect()
 }
@@ -188,7 +203,7 @@ mod tests {
     }
 
     fn offered_at(sidebar: bool, compact: bool, query: &str) -> Vec<String> {
-        let mut picker = Picker::new("Commands", "", items(sidebar, compact));
+        let mut picker = Picker::new("Commands", "", items(sidebar, compact, false));
         for ch in query.chars() {
             picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
@@ -209,21 +224,38 @@ mod tests {
     }
 
     #[test]
+    fn the_workspace_popup_lists_only_the_commands_that_open_a_modal() {
+        let mut picker = Picker::new("Commands", "", items(false, false, true));
+        let labels: Vec<String> = picker
+            .rows()
+            .into_iter()
+            .map(|(label, _)| label.to_string())
+            .collect();
+        assert!(labels.iter().any(|label| label.contains("Restart")));
+        assert!(labels.iter().any(|label| label.contains("Delete")));
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("Fold") || label.contains("pane view")),
+            "a view the popup does not show has nothing to fold: {labels:?}"
+        );
+        let _ = &mut picker;
+    }
+
+    #[test]
     fn the_sidebar_offers_only_what_it_draws() {
         let sidebar = offered(true, "");
         assert!(sidebar.contains(&"Hide or unhide the sidebar".to_string()));
-        assert!(!sidebar.iter().any(|label| label.contains("Restart")));
+        assert!(sidebar.iter().any(|label| label.contains("Restart")));
         assert!(!sidebar.iter().any(|label| label.contains("details panel")));
-        // Zoomed, the details panel comes back with its key, and management
-        // still does not.
+        // Zoom restores the details panel; management is available at either width.
         let zoomed = offered_at(true, false, "");
         assert!(zoomed.iter().any(|label| label.contains("details panel")));
-        assert!(!zoomed.iter().any(|label| label.contains("Restart")));
-        assert!(!zoomed.iter().any(|label| label.contains("workspace")));
-        assert_eq!(
-            offered(true, "restart"),
-            Vec::<String>::new(),
-            "no lifecycle action in the sidebar"
+        assert!(zoomed.iter().any(|label| label.contains("Restart")));
+        assert!(zoomed.iter().any(|label| label.contains("workspace")));
+        assert!(
+            !offered(true, "restart").is_empty(),
+            "the sidebar manages the fleet"
         );
         assert!(
             !offered(false, "").contains(&"Hide or unhide the sidebar".to_string()),
@@ -237,7 +269,7 @@ mod tests {
 
     #[test]
     fn choosing_a_command_answers_with_its_key() {
-        let mut picker = Picker::new("Commands", "", items(false, false));
+        let mut picker = Picker::new("Commands", "", items(false, false, false));
         for ch in "fold".chars() {
             picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }

@@ -51,7 +51,9 @@ pub enum TaskSource {
 /// were reported in: a publisher's id alone is not an identity, because ids are
 /// reused between panes and between successive sessions in one pane. A row that
 /// publishes no session UUID gets a pane-scoped identity instead of a wrong one.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct TaskId {
     /// The pane id of the agent row this task hangs under.
     pub owner: String,
@@ -123,7 +125,9 @@ impl TaskProjection {
 /// Selection and fold state are keyed by this identity so refreshes that
 /// change facts — or insert/remove rows elsewhere — preserve them wherever
 /// the row survives.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum RowId {
     Workspace(String),
     /// Agent row, keyed by its connector-scoped pane id.

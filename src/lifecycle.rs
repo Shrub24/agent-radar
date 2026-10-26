@@ -300,6 +300,11 @@ impl Closer {
         }
     }
 
+    /// Whether a confirmed close is still running.
+    pub fn is_busy(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
     /// Starts a confirmed close off the calling thread, replacing a request
     /// already in flight. Replacing waits only for that request's worker to
     /// notice the cancellation, never for its timeout.

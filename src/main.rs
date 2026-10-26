@@ -6,6 +6,7 @@ use agent_radar::control_plane::observation::Snapshot;
 use agent_radar::managed_control as radar;
 use agent_radar::snapshot_fetch::{Fetched, SnapshotFetcher};
 use agent_radar::topology::ContainerControl;
+use agent_radar::tree::RowId;
 use agent_radar::{
     Action, App, Closer, Config, Confirmed, Focuser, Geometry, ObservationState, PaneView,
     control_plane, theme, ui,
@@ -22,13 +23,24 @@ fn main() -> io::Result<()> {
         print!("{}", load_config().to_document());
         return Ok(());
     }
-    let dashboard = match cli.invocation {
-        None => Some(false),
-        Some(agent_radar::cli::Invocation::Sidebar) => Some(true),
+    let dashboard = match &cli.invocation {
+        None => Some((false, None)),
+        Some(agent_radar::cli::Invocation::Sidebar) => Some((true, None)),
+        Some(agent_radar::cli::Invocation::Modal { key, row }) => {
+            let row = match row.as_deref().map(serde_json::from_str) {
+                None => None,
+                Some(Ok(row)) => Some(row),
+                Some(Err(error)) => {
+                    eprintln!("radar modal: the row is not an identity: {error}");
+                    std::process::exit(2);
+                }
+            };
+            Some((false, Some((KeyCode::Char(*key), row))))
+        }
         Some(_) => None,
     };
-    if let Some(sidebar) = dashboard {
-        let result = run(sidebar);
+    if let Some((sidebar, modal)) = dashboard {
+        let result = run(sidebar, modal);
         disable_mouse_capture();
         let restored = ratatui::try_restore();
         return result.and(restored);
@@ -49,7 +61,21 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
             }
             None => serve_daemon(),
         },
-        Invocation::Sidebar => unreachable!("the sidebar is the dashboard, not a printing command"),
+        Invocation::Workspace { session } => {
+            match agent_radar::workspace::launch(
+                &load_config().daemon.tmux_server,
+                session.as_deref(),
+            ) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("radar workspace: {error}");
+                    1
+                }
+            }
+        }
+        Invocation::Sidebar | Invocation::Modal { .. } => {
+            unreachable!("these are dashboards, not printing commands")
+        }
         Invocation::Server(action) => {
             let (verb, name) = action.parts();
             let name = match name {
@@ -134,7 +160,7 @@ fn run_host_command(
     pending: &mut Option<std::process::Child>,
 ) {
     if pending.is_some() {
-        app.set_focus_message(Some("sidebar resize is still running".into()));
+        app.set_focus_message(Some("a sidebar host command is still running".into()));
         return;
     }
     let Some(command) = command else {
@@ -160,8 +186,10 @@ fn poll_sidebar_command(pending: &mut Option<std::process::Child>, app: &mut App
     match child.try_wait() {
         Ok(None) => return false,
         Ok(Some(status)) if status.success() => {}
-        Ok(Some(status)) => app.set_focus_message(Some(format!("sidebar resize exited {status}"))),
-        Err(error) => app.set_focus_message(Some(format!("sidebar resize: {error}"))),
+        Ok(Some(status)) => {
+            app.set_focus_message(Some(format!("sidebar host command exited {status}")))
+        }
+        Err(error) => app.set_focus_message(Some(format!("sidebar host command: {error}"))),
     }
     *pending = None;
     true
@@ -428,8 +456,15 @@ fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
     );
 }
 
-fn run(sidebar: bool) -> io::Result<()> {
-    let config = load_config();
+fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()> {
+    let mut config = load_config();
+    let workspace_host = sidebar
+        .then(agent_radar::workspace::sidebar_commands)
+        .flatten();
+    let in_workspace = workspace_host.is_some();
+    if let Some(commands) = workspace_host {
+        config.sidebar = commands;
+    }
     theme::install(config.clone());
     // The dashboard owns the terminal, so its diagnostics go to a file.
     let log_note = agent_radar::log::init_dashboard(&agent_radar::log::dashboard_log_path()).err();
@@ -463,7 +498,18 @@ fn run(sidebar: bool) -> io::Result<()> {
     // UI thread. A run without a daemon has no container to act on and says so.
     let mut containers = ContainerControl::new(container_controls);
     let mut state = ObservationState::new();
-    let mut app = if sidebar { App::sidebar() } else { App::new() };
+    let mut app = if modal.is_some() {
+        App::modal()
+    } else if sidebar {
+        App::sidebar()
+    } else {
+        App::new()
+    };
+    app.set_modal_host(in_workspace);
+    // The popup opens its modal once the first snapshot has arrived, because the
+    // row it was started for is selected by identity in that snapshot.
+    let mut pending_modal = modal;
+    let mut queued_key = None;
     if let Some(reason) = log_note {
         app.set_focus_message(Some(format!("no dashboard log: {reason}")));
     }
@@ -504,6 +550,20 @@ fn run(sidebar: bool) -> io::Result<()> {
                     app.set_task_diagnostic(source_diagnostic(&snapshot, "tasks"));
                     state = snapshot.observation.clone();
                     app.refresh(&state);
+                    if let Some((code, row)) = pending_modal.take() {
+                        app.show_everything();
+                        match row {
+                            // A row that is gone is refused, never replaced: the
+                            // action was chosen for that one.
+                            Some(row) if !app.select_exact(&row) => app.set_focus_message(Some(
+                                "that row is gone; nothing was changed".into(),
+                            )),
+                            _ => {
+                                queued_key =
+                                    Some(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+                            }
+                        }
+                    }
                     dirty = true;
                 }
                 // The previous view stands, and the reason it is not moving is
@@ -581,10 +641,30 @@ fn run(sidebar: bool) -> io::Result<()> {
             // from sitting unapplied behind the idle interval.
             Duration::from_millis(50)
         };
-        if !event::poll(timeout)? {
-            continue;
+        // The popup is done once its modal is answered, its work has finished and
+        // the answer has been read.
+        if app.is_modal_only()
+            && pending_modal.is_none()
+            && queued_key.is_none()
+            && !app.picker_open()
+            && app.confirmation().is_none()
+            && app.focus_message().is_none()
+            && !closer.is_busy()
+            && !managed.is_busy()
+            && !containers.is_busy()
+        {
+            break;
         }
-        match event::read()? {
+        let event = match queued_key.take() {
+            Some(key) => Event::Key(key),
+            None => {
+                if !event::poll(timeout)? {
+                    continue;
+                }
+                event::read()?
+            }
+        };
+        match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if (key.code == KeyCode::Char('q')
                     && !app.is_filter_editing()
@@ -626,6 +706,27 @@ fn run(sidebar: bool) -> io::Result<()> {
                         Action::ToggleZoom => {
                             let (key, command) = sidebar_zoom(&config, &app);
                             run_host_command(key, command, &mut app, &mut sidebar_command)
+                        }
+                        Action::LaunchSidebar => run_host_command(
+                            "launch_command",
+                            &config.sidebar.launch_command,
+                            &mut app,
+                            &mut sidebar_command,
+                        ),
+                        Action::Modal { key, row } => {
+                            let row = row.and_then(|row| serde_json::to_string(&row).ok());
+                            let radar = std::env::current_exe()
+                                .map(|path| path.to_string_lossy().into_owned())
+                                .unwrap_or_else(|_| "radar".into());
+                            let command = match key {
+                                KeyCode::Char(key) => agent_radar::workspace::popup_command(
+                                    &radar,
+                                    key,
+                                    row.as_deref(),
+                                ),
+                                _ => None,
+                            };
+                            run_host_command("modal", &command, &mut app, &mut sidebar_command)
                         }
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
@@ -693,6 +794,14 @@ fn run(sidebar: bool) -> io::Result<()> {
                             let (key, command) = sidebar_zoom(&config, &app);
                             run_host_command(key, command, &mut app, &mut sidebar_command)
                         }
+                        Action::LaunchSidebar => run_host_command(
+                            "launch_command",
+                            &config.sidebar.launch_command,
+                            &mut app,
+                            &mut sidebar_command,
+                        ),
+                        // Only a key opens a popup; a click reaches no action here.
+                        Action::Modal { .. } => {}
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
                             let path = std::env::var_os("PATH");

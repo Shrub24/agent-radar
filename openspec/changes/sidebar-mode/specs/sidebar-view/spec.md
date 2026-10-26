@@ -16,13 +16,33 @@
 - **WHEN** a navigation, jump, fold, filter or pane-view key is pressed in the sidebar
 - **THEN** it does what it does in the full dashboard
 
-### Requirement: The sidebar omits destructive actions
+### Requirement: The sidebar retains dashboard management
 
-The sidebar SHALL NOT offer delete, restart or any other action that opens a confirmation dialog.
+The sidebar SHALL offer the dashboard's launch and lifecycle actions. A narrow
+presentation SHALL NOT remove authority or bypass confirmation and revalidation.
 
-#### Scenario: Destructive key
-- **WHEN** a key that opens a confirmation dialog in the full dashboard is pressed in the sidebar
-- **THEN** no dialog opens and no request is sent
+#### Scenario: Management key
+- **WHEN** a management key is pressed in the sidebar
+- **THEN** it reaches the same action and confirmation path as the dashboard
+
+### Requirement: Modals float over the whole workspace where the host can
+
+Where the host can show a popup over the whole workspace, the sidebar SHALL open
+its pickers and confirmations there, over the row that was selected, instead of
+drawing them in its own pane. The popup SHALL select that row by identity and
+SHALL refuse, changing nothing, if it no longer exists.
+
+#### Scenario: Confirmation over both areas
+- **WHEN** a lifecycle key is pressed on a selected agent row in a workspace host
+- **THEN** its confirmation is drawn centred over the sidebar and the agent area, for that row
+
+#### Scenario: Row gone
+- **WHEN** the row selected in the sidebar has gone by the time the popup reads the fleet
+- **THEN** the popup says so, no confirmation opens and nothing is requested
+
+#### Scenario: Answered
+- **WHEN** the modal is answered and any work it started has finished
+- **THEN** the popup closes and the sidebar shows the result through the observation
 
 ### Requirement: Focusing an agent moves the view's client
 

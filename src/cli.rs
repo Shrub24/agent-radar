@@ -49,6 +49,23 @@ pub struct Cli {
 pub enum Invocation {
     /// Run the dashboard as a narrow tree for a split beside an agent's tmux client.
     Sidebar,
+    /// Experimental tmux-hosted workspace with a sidebar and a dashboard popup.
+    Workspace {
+        /// Existing session on the daemon's tmux server; omit for tmux's default.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// The popup behind a sidebar's picker or confirmation. Started by the
+    /// sidebar, not by hand.
+    #[command(hide = true)]
+    Modal {
+        /// The key whose picker or confirmation to open.
+        #[arg(long)]
+        key: char,
+        /// The selected row's identity, as JSON.
+        #[arg(long)]
+        row: Option<String>,
+    },
     /// Control the daemon's user units; with no action, serve in the foreground.
     Daemon {
         #[command(subcommand)]

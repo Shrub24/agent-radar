@@ -81,6 +81,11 @@ pub enum Action {
     Replay(KeyCode),
     /// The sidebar's zoom key; the caller owns the host commands.
     ToggleZoom,
+    /// Open a sidebar beside this dashboard; the caller owns the host command.
+    LaunchSidebar,
+    /// Open this key's picker or confirmation in the workspace popup, over the
+    /// row that was selected here.
+    Modal { key: KeyCode, row: Option<RowId> },
     /// The workspace chooser took this directory; open a workspace there.
     NewWorkspaceIn(PathBuf),
 }
@@ -622,6 +627,12 @@ pub struct App {
     /// Drawn as `radar sidebar`: compressed rows while the split is narrow, and
     /// the whole dashboard once the host has zoomed it.
     sidebar: bool,
+    /// Drawn as the popup behind a sidebar's picker or confirmation: only that
+    /// modal, over a row chosen by identity, and gone once it is answered.
+    modal_only: bool,
+    /// A host can show a popup over the whole workspace, so a sidebar's pickers
+    /// and confirmations go there instead of into its narrow pane.
+    modal_host: bool,
     /// The width the last draw was given. The sidebar's own layout follows it:
     /// the host terminal owns the split, so its width is the state.
     width: u16,
@@ -874,6 +885,47 @@ impl App {
 
     pub fn is_sidebar(&self) -> bool {
         self.sidebar
+    }
+
+    /// A view for the workspace popup behind a sidebar's picker or confirmation.
+    pub fn modal() -> Self {
+        Self {
+            modal_only: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_modal_only(&self) -> bool {
+        self.modal_only
+    }
+
+    /// Records that a workspace popup is available to this sidebar.
+    pub fn set_modal_host(&mut self, available: bool) {
+        self.modal_host = available;
+    }
+
+    /// The selected row's identity, which a popup selects again by value.
+    pub fn selected_id(&self) -> Option<RowId> {
+        self.selected.clone()
+    }
+
+    /// Lists every row, so a row another view could see is one this can select.
+    pub fn show_everything(&mut self) {
+        self.view = PaneView::All;
+        self.finished_shown = true;
+        self.task_rows.all = true;
+        self.reconcile_selection();
+    }
+
+    /// Selects `id` exactly, or nothing: a row that is gone is not replaced by a
+    /// neighbour, because the action it was chosen for must not land elsewhere.
+    pub fn select_exact(&mut self, id: &RowId) -> bool {
+        let Some(index) = self.visible_rows().iter().position(|row| row.id == id) else {
+            return false;
+        };
+        self.select(Some(id.clone()));
+        self.anchor = index;
+        true
     }
 
     /// Records the width this draw was given, so the sidebar's layout can follow
@@ -1256,27 +1308,37 @@ impl App {
         // whether it is compressed or zoomed.
         if self.sidebar {
             match key.code {
+                // Where the host can float a popup over the whole workspace, the
+                // pickers and confirmations go there; this pane is too narrow.
+                KeyCode::Char(ch @ ('r' | 'a' | 'A' | 'E' | 'D' | 'R' | '?'))
+                    if self.modal_host =>
+                {
+                    let row = (ch != 'A').then(|| self.selected.clone()).flatten();
+                    return Some(Action::Modal {
+                        key: KeyCode::Char(ch),
+                        row,
+                    });
+                }
                 KeyCode::Char('B') => return Some(Action::ToggleSidebar),
                 KeyCode::Char('Z') => return Some(Action::ToggleZoom),
                 _ => {}
             }
-            // The sidebar manages nothing: restart, containers, new workspaces,
-            // launches, presence and deletes stay in the full dashboard, zoomed
-            // or not. Compressed, it also has no details panel and no room for a
-            // confirmation, so the keys that open either do nothing.
-            if matches!(
-                key.code,
-                KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R')
-            ) || (self.sidebar_compact()
-                && matches!(
-                    key.code,
-                    KeyCode::Char('d') | KeyCode::Tab | KeyCode::BackTab
-                ))
+            // Presentation changes which panels exist, not the authority to
+            // manage the selected row. A sidebar cannot open another sidebar.
+            if key.code == KeyCode::Char('S')
+                || (self.sidebar_compact()
+                    && matches!(
+                        key.code,
+                        KeyCode::Char('d') | KeyCode::Tab | KeyCode::BackTab
+                    ))
             {
                 return None;
             }
         }
         match key.code {
+            // `S` asks the host to open a sidebar beside this dashboard; the
+            // sidebar itself cannot, so the key is gated above.
+            KeyCode::Char('S') => return Some(Action::LaunchSidebar),
             KeyCode::Char('r') => return Some(Action::BeginAction(Operation::Restart)),
             // Container controls act on a container Radar records rather than on an
             // owner: `a` adds a place inside it, `D` deletes it, `R` reloads its slot.
@@ -1313,7 +1375,7 @@ impl App {
                 self.palette = Some(Picker::new(
                     "Commands",
                     "enter run · esc close",
-                    commands::items(self.sidebar, self.sidebar_compact()),
+                    commands::items(self.sidebar, self.sidebar_compact(), self.modal_only),
                 ))
             }
             KeyCode::Char('/') => self.filter_editing = true,
@@ -2925,6 +2987,74 @@ mod tests {
             .expect("row visible");
         app.move_selection(index as i32 - app.selected_index().unwrap_or(0) as i32);
         assert_eq!(app.selected_row().expect("selection").id, row);
+    }
+
+    #[test]
+    fn a_workspace_sidebar_sends_its_modals_to_the_popup_with_the_exact_row() {
+        let (state, _) = fixture();
+        let row = RowId::Agent("wA:p1".into());
+        let mut sidebar = App::sidebar();
+        sidebar.refresh(&state);
+        sidebar.show_everything();
+        select_row(&mut sidebar, &row);
+
+        // Without a host that can float a popup, the sidebar handles the key itself.
+        assert!(matches!(
+            press(&mut sidebar, KeyCode::Char('D')),
+            Some(Action::BeginAction(Operation::Delete))
+        ));
+
+        sidebar.set_modal_host(true);
+        for ch in ['r', 'D', '?'] {
+            assert_eq!(
+                press(&mut sidebar, KeyCode::Char(ch)),
+                Some(Action::Modal {
+                    key: KeyCode::Char(ch),
+                    row: Some(row.clone())
+                }),
+                "{ch} opens in the popup, over the row selected here"
+            );
+        }
+        assert_eq!(
+            press(&mut sidebar, KeyCode::Char('A')),
+            Some(Action::Modal {
+                key: KeyCode::Char('A'),
+                row: None
+            }),
+            "a new workspace belongs to no row"
+        );
+        assert!(sidebar.confirmation().is_none() && !sidebar.picker_open());
+    }
+
+    #[test]
+    fn the_popup_selects_by_identity_in_any_view_and_refuses_a_row_that_is_gone() {
+        let (state, _) = fixture();
+        let mut popup = App::modal();
+        popup.refresh(&state);
+        popup.show_everything();
+        let row = RowId::Agent("wA:p1".into());
+        assert!(popup.select_exact(&row));
+        assert_eq!(popup.selected_id(), Some(row));
+
+        let gone = RowId::Agent("wZ:gone".into());
+        assert!(!popup.select_exact(&gone));
+        assert_ne!(
+            popup.selected_id(),
+            Some(gone),
+            "no neighbour stands in for it"
+        );
+        assert!(matches!(
+            press(&mut popup, KeyCode::Char('D')),
+            Some(Action::BeginAction(Operation::Delete))
+        ));
+        assert_eq!(
+            serde_json::from_str::<RowId>(
+                &serde_json::to_string(&RowId::Agent("x".into())).unwrap()
+            )
+            .unwrap(),
+            RowId::Agent("x".into()),
+            "the identity survives the argument it travels in"
+        );
     }
 
     #[test]

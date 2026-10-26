@@ -11,21 +11,26 @@ use crate::picker::Picker;
 use crate::{theme, ui};
 
 /// Draws `picker` in the middle of the screen. Nothing else is drawn in that
-/// block: a picker is a moment, not a panel.
-pub fn draw<T>(frame: &mut Frame, picker: &Picker<T>) {
+/// block: a picker is a moment, not a panel. In a popup of its own, `fill` makes
+/// the block the whole frame, since the popup already is the centred block.
+pub fn draw<T>(frame: &mut Frame, picker: &Picker<T>, fill: bool) {
     let ink = theme::palette();
     let rows = picker.rows();
     let screen = frame.area();
     // A fixed block rather than a panel that grows to the edges: it keeps its
     // shape whatever the query selects, and scrolls inside itself on a short
     // terminal.
-    let popup = ui::centered(
-        screen,
-        screen.width.saturating_sub(8).min(72),
-        (rows.len() as u16 + 6)
-            .min(screen.height.saturating_mul(3) / 5)
-            .clamp(6, screen.height),
-    );
+    let popup = if fill {
+        screen
+    } else {
+        ui::centered(
+            screen,
+            screen.width.saturating_sub(8).min(72),
+            (rows.len() as u16 + 6)
+                .min(screen.height.saturating_mul(3) / 5)
+                .clamp(6, screen.height),
+        )
+    };
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_style(Style::new().fg(ink.border))

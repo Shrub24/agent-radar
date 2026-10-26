@@ -33,6 +33,7 @@ pub mod tmux;
 pub mod topology;
 pub mod tree;
 pub mod ui;
+pub mod workspace;
 
 pub use app::{
     Action, App, Confirmation, Confirmed, Geometry, Notice, Operation, PaneView, RowOrder,

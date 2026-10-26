@@ -77,6 +77,9 @@ pub fn render(
     list_state: &mut ListState,
     tick: usize,
 ) -> Geometry {
+    if app.is_modal_only() {
+        return render_modal(frame, app);
+    }
     let compact = app.sidebar_compact();
     let rail = app.sidebar_railed();
     let area = if compact {
@@ -250,10 +253,10 @@ pub fn render(
 
     let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
     if let Some(picker) = app.palette() {
-        picker::draw(frame, picker);
+        picker::draw(frame, picker, false);
     }
     if let Some(picker) = app.workspace_picker() {
-        picker::draw(frame, picker);
+        picker::draw(frame, picker, false);
     }
     draw_outcomes(frame, app);
 
@@ -508,6 +511,39 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// The popup behind a sidebar's picker or confirmation: only that modal, filling
+/// the popup the host floated over the workspace, or the answer it ended with.
+fn render_modal(frame: &mut Frame, app: &App) -> Geometry {
+    let (confirm_cancel, confirm_confirm) = draw_confirmation(frame, app);
+    if let Some(picker) = app.palette() {
+        picker::draw(frame, picker, true);
+    }
+    if let Some(picker) = app.workspace_picker() {
+        picker::draw(frame, picker, true);
+    }
+    if app.confirmation().is_none()
+        && !app.picker_open()
+        && let Some(message) = app.focus_message()
+    {
+        let palette = theme::palette();
+        let block = Block::bordered()
+            .border_style(Style::new().fg(palette.border))
+            .title(" Radar ")
+            .padding(ratatui::widgets::Padding::horizontal(1));
+        frame.render_widget(
+            Paragraph::new(sanitize(message))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(block),
+            frame.area(),
+        );
+    }
+    Geometry {
+        confirm_cancel,
+        confirm_confirm,
+        ..Geometry::default()
+    }
+}
+
 fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect>) {
     let Some(confirmation) = app.confirmation() else {
         return (None, None);
@@ -558,11 +594,15 @@ fn draw_confirmation(frame: &mut Frame, app: &App) -> (Option<Rect>, Option<Rect
     ]));
 
     let inner_width = lines.iter().map(Line::width).max().unwrap_or(16) as u16;
-    let popup = centered(
-        screen,
-        (inner_width + 4).min(screen.width),
-        (lines.len() as u16 + 2).min(screen.height),
-    );
+    let popup = if app.is_modal_only() {
+        screen
+    } else {
+        centered(
+            screen,
+            (inner_width + 4).min(screen.width),
+            (lines.len() as u16 + 2).min(screen.height),
+        )
+    };
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_style(Style::new().fg(palette.border))
@@ -1754,13 +1794,18 @@ mod tests {
         let press = |app: &mut App, ch| {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
         };
-        for destructive in ['D', 'r', 'a', 'A', 'L', 'E', 'R', 'd'] {
-            assert_eq!(
-                press(&mut app, destructive),
-                None,
-                "{destructive} must do nothing"
-            );
+        for layout in ['d', 'S'] {
+            assert_eq!(press(&mut app, layout), None, "{layout} has no panel here");
         }
+        assert_eq!(
+            press(&mut app, 'r'),
+            Some(crate::app::Action::BeginAction(Operation::Restart))
+        );
+        assert_eq!(
+            press(&mut app, 'L'),
+            Some(crate::app::Action::LaunchConfigured)
+        );
+        assert_eq!(press(&mut app, 'A'), Some(crate::app::Action::NewWorkspace));
         app.note_width(30);
         assert_eq!(
             press(&mut app, 'B'),
@@ -1775,13 +1820,19 @@ mod tests {
             None,
             "the details are already drawn, and d toggles them"
         );
-        for destructive in ['r', 'a', 'A', 'L', 'E', 'D', 'R'] {
-            assert_eq!(
-                press(&mut app, destructive),
-                None,
-                "{destructive} manages nothing even zoomed"
-            );
-        }
+        assert_eq!(
+            press(&mut app, 'r'),
+            Some(crate::app::Action::BeginAction(Operation::Restart))
+        );
+        assert_eq!(
+            press(&mut app, 'L'),
+            Some(crate::app::Action::LaunchConfigured)
+        );
+        assert_eq!(
+            press(&mut app, 'S'),
+            None,
+            "do not launch a sidebar from itself"
+        );
         assert_eq!(press(&mut app, 'Z'), Some(crate::app::Action::ToggleZoom));
 
         let mut full = App::new();
@@ -6725,6 +6776,50 @@ mod tests {
         let panes = render_text(&state, &app, 180, 32);
         assert!(panes.contains("nvim notes.md"), "{panes}");
         assert!(!panes.contains("· exited"), "{panes}");
+    }
+
+    #[test]
+    fn the_workspace_popup_is_only_the_modal_filling_its_frame_and_then_the_answer() {
+        let state = with_running_pane(fixture_state(), "wA:p3");
+        let mut popup = App::modal();
+        popup.refresh(&state);
+        popup.show_everything();
+        assert!(popup.select_exact(&crate::tree::RowId::Pane("wA:p3".into())));
+        popup.begin_action(crate::app::Operation::Delete, &state);
+        assert!(popup.confirmation().is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(68, 16)).expect("infallible");
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| {
+                geometry = render(frame, &state, &popup, &mut ListState::default(), 0);
+            })
+            .expect("draw");
+        let screen = render_text(&state, &popup, 68, 16);
+        assert!(
+            screen.lines().next().unwrap().starts_with('┌'),
+            "the dialog is the frame:\n{screen}"
+        );
+        assert!(
+            screen.contains("Confirm") && screen.contains("Cancel"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("Details"),
+            "no dashboard behind it:\n{screen}"
+        );
+        assert!(
+            geometry.confirm_cancel.is_some(),
+            "its buttons answer the pointer"
+        );
+
+        // Answered, it shows the outcome in the same frame rather than a dashboard.
+        popup.set_focus_message(Some("that row is gone; nothing was changed".into()));
+        let _ = popup.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        popup.set_focus_message(Some("that row is gone; nothing was changed".into()));
+        let screen = render_text(&state, &popup, 68, 16);
+        assert!(screen.contains("that row is gone"), "{screen}");
+        assert!(!screen.contains("Details"), "{screen}");
     }
 
     #[test]

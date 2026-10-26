@@ -252,6 +252,9 @@ pub enum ProjectFilter {
 /// owns the split's width, so Radar only runs what the user configured.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarConfig {
+    /// Splits a host window and runs `radar sidebar` in it. Run by `S` and by the
+    /// palette, so the sidebar is one key away from the dashboard.
+    pub launch_command: Option<Vec<String>>,
     pub hide_command: Option<Vec<String>>,
     pub show_command: Option<Vec<String>>,
     pub zoom_command: Option<Vec<String>>,
@@ -469,6 +472,11 @@ impl Config {
         let sidebar = file.sidebar.unwrap_or_default();
         for (name, command, slot) in [
             (
+                "sidebar.launch_command",
+                sidebar.launch_command,
+                &mut config.sidebar.launch_command,
+            ),
+            (
                 "sidebar.hide_command",
                 sidebar.hide_command,
                 &mut config.sidebar.hide_command,
@@ -648,6 +656,7 @@ impl Config {
             "\n[sidebar]\n\
              # `radar sidebar` runs these, without a shell, to hide and unhide itself: the\n\
              # terminal owns the split's width. Unset, the toggle key says so and runs nothing.\n\
+             # launch_command = [\"kitten\", \"@\", \"launch\", \"--location=vsplit\", \"--bias=25\", \"--allow-remote-control\", \"radar\", \"sidebar\"]\n\
              # hide_command = [\"kitten\", \"@\", \"resize-window\", \"--self\", \"--axis=horizontal\", \"--increment=-10000\"]\n\
              # show_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 25\"]\n\
              # `Z` zooms the sidebar to the whole window and back, drawing the full\n\
@@ -656,6 +665,7 @@ impl Config {
              # unzoom_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 25\"]\n",
         );
         for (name, command) in [
+            ("launch_command", &self.sidebar.launch_command),
             ("hide_command", &self.sidebar.hide_command),
             ("show_command", &self.sidebar.show_command),
             ("zoom_command", &self.sidebar.zoom_command),
@@ -836,6 +846,7 @@ struct FileConfig {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct FileSidebar {
+    launch_command: Option<Vec<String>>,
     hide_command: Option<Vec<String>>,
     show_command: Option<Vec<String>>,
     zoom_command: Option<Vec<String>>,

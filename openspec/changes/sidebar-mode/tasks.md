@@ -2,7 +2,8 @@
 
 - [x] 1.1 Add the `sidebar` invocation in `src/cli.rs` and `src/main.rs`, and a `Presentation` on `App` that the invocation sets. Verify with one app-level test that the sidebar presentation has no details panel and that navigation, fold, filter and `PaneView` keys behave as in the full dashboard.
 - [x] 1.2 Draw compressed rows in `src/ui.rs` (mark, name, state; the name gives way first) and no details panel. Verify with a render test at a narrow width.
-- [x] 1.3 Gate the destructive actions on the presentation so no key opens a confirmation dialog in the sidebar, and keep them out of the sidebar footer. Verify that such a key sends no request.
+- [x] 1.3 Retain management actions in the sidebar and its command picker; verify launch and restart bindings at compact and zoomed widths.
+- [x] 1.4 Hand the sidebar's exact selection and pending action into a workspace-wide picker/confirmation through `radar modal`, preserving cancellation and revalidation.
 
 ## 2. Hide and unhide
 

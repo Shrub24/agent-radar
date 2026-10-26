@@ -11,8 +11,10 @@ command with the key that runs it. `Enter` focuses the selected pane through the
 On a workspace it switches to that session, preserving its active window and
 pane. One view is supported.
 
-Lifecycle actions (`r`, `a`, `A`, `L`, `E`, `D`, `R`) are unavailable in the
-sidebar. Use the full dashboard for those.
+The sidebar has the dashboard's management keys, including launch and lifecycle
+controls. Narrow confirmations are not yet promoted to workspace-wide popups.
+For the outer-tmux experiment and its full-width management surface, see
+[Workspace host prototype](workspace-prototype.md).
 
 ## Kitty setup
 
