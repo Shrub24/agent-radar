@@ -12077,11 +12077,17 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
-/// Waits for a file a launched program writes, returning its text.
+/// Waits for a workload to write its file, and reads it once it has text.
+///
+/// The shell creates the file before it writes anything into it, so an existence
+/// check reads the empty file the redirection made rather than what the workload
+/// reported.
 fn wait_for_text(path: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(text) = fs::read_to_string(path) {
+        if let Ok(text) = fs::read_to_string(path)
+            && !text.trim().is_empty()
+        {
             return text;
         }
         assert!(
