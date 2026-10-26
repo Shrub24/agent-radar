@@ -70,6 +70,8 @@ than imply that gathering several panes is atomic.
 | Known-process enrichment and descendant tree | Mechanisms recorded in plan.md | P3 | medium | Resource questions in daily use |
 | Optional systemd workload accounting and controls | [Exploration](docs/systemd-resource-management.md): shallow per-agent-execution slices containing a main scope and independently managed background-task scopes; subagents have separate slices. Logical ownership remains in Radar. Accounting first; no automatic freezing or ownership-driven migration. No implementation scope yet | P2 | medium; launch compatibility unverified | A concrete agent/task accounting or control need warrants the isolated feasibility experiment |
 | Preview and search | Peek into pane output | P3 | low | Repeated need to see output without focusing |
+| Graced history rows | An exited or unresolved row stays on screen for a few seconds after it becomes history, so an agent leaving the fleet is seen rather than vanished | P2 | medium | An operator mistakes a hidden row for a lost one |
+| Unresolved rows kept as a warning | (a) history hides them with the rest (current); (b) a separate class that stays visible because an unresolved row may be a live agent Radar failed to join | P2 | medium | A live agent is ever found hidden as unresolved |
 
 ## Herdr removal and housekeeping
 

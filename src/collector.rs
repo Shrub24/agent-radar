@@ -457,6 +457,7 @@ fn collect(
                     process: subject.process.clone(),
                     state: subject.state,
                     session: subject.session.clone(),
+                    ended: subject.ended(),
                 })
                 .collect()
         })

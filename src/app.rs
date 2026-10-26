@@ -528,7 +528,7 @@ impl PaneView {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Visibility {
     view: PaneView,
-    finished: bool,
+    history: bool,
     tasks: bool,
 }
 
@@ -544,15 +544,21 @@ impl Visibility {
                 // explicit toggle brings it into a view — and only while the
                 // pane is not in use again.
                 PaneView::Hidden => {
-                    self.finished && pane.exited.is_some() && pane.command().is_none()
+                    self.history && pane.exited.is_some() && pane.command().is_none()
                 }
                 PaneView::Running => {
                     pane.command().is_some()
-                        || (self.finished && pane.exited.is_some() && pane.command().is_none())
+                        || (self.history && pane.exited.is_some() && pane.command().is_none())
                 }
                 PaneView::All => true,
             },
-            RowKind::Workspace { .. } | RowKind::Agent(_) | RowKind::Lifecycle(_) => true,
+            // An agent that joins no pane, or whose subject's process the daemon
+            // recorded as ended, is history. So is a subject that outlived its
+            // process: both are reachable through the same toggle, and both are
+            // counted where the footer says how many rows are hidden.
+            RowKind::Agent(agent) => !agent.history() || self.history,
+            RowKind::Lifecycle(subject) => !subject.history() || self.history,
+            RowKind::Workspace { .. } => true,
         }
     }
 }
@@ -643,7 +649,7 @@ pub struct App {
     /// Whether finished sessions are listed while ordinary panes are hidden.
     /// Off by default: the agents view is the live fleet, and a fleet with its
     /// history in it stops being an overview.
-    finished_shown: bool,
+    history_shown: bool,
     /// Whether task children are listed, remembered per pane view for this run.
     task_rows: TaskRows,
     selected: Option<RowId>,
@@ -912,7 +918,7 @@ impl App {
     /// Lists every row, so a row another view could see is one this can select.
     pub fn show_everything(&mut self) {
         self.view = PaneView::All;
-        self.finished_shown = true;
+        self.history_shown = true;
         self.task_rows.all = true;
         self.reconcile_selection();
     }
@@ -1008,6 +1014,12 @@ impl App {
             }
             None => {
                 for root in ordered(&self.tree.roots, self.order) {
+                    // A heading with nothing left under it is not a row: history
+                    // belonging to one workspace must not leave an empty
+                    // workspace standing in the fleet view.
+                    if !subtree_has_visible(root, self.visibility()) {
+                        continue;
+                    }
                     collect_visible(
                         root,
                         0,
@@ -1123,8 +1135,8 @@ impl App {
 
     /// Whether panes whose label is a finished session are listed even while
     /// ordinary panes are hidden.
-    pub fn shows_finished(&self) -> bool {
-        self.finished_shown
+    pub fn shows_history(&self) -> bool {
+        self.history_shown
     }
 
     /// Whether background-task children are listed in the current view.
@@ -1179,8 +1191,8 @@ impl App {
     }
 
     /// Lists or hides finished sessions.
-    pub fn toggle_finished(&mut self) {
-        self.finished_shown = !self.finished_shown;
+    pub fn toggle_history(&mut self) {
+        self.history_shown = !self.history_shown;
         self.reconcile_selection();
     }
 
@@ -1188,9 +1200,33 @@ impl App {
     fn visibility(&self) -> Visibility {
         Visibility {
             view: self.view,
-            finished: self.finished_shown,
+            history: self.history_shown,
             tasks: self.task_rows.shown(self.view),
         }
+    }
+
+    /// How many rows the history toggle would add to this view. The footer says
+    /// so, because a row hidden without a trace cannot be told apart from one
+    /// that is gone. A filter answers for itself, so no count is offered while
+    /// one is set.
+    pub fn hidden_history(&self) -> usize {
+        if self.history_shown || self.needle().is_some() {
+            return 0;
+        }
+        let listed = self.visibility();
+        let with_history = Visibility {
+            history: true,
+            ..listed
+        };
+        let mut count = 0;
+        let mut pending: Vec<&TreeNode> = self.tree.roots.iter().collect();
+        while let Some(node) = pending.pop() {
+            if with_history.includes(&node.row.kind) && !listed.includes(&node.row.kind) {
+                count += 1;
+            }
+            pending.extend(node.children.iter());
+        }
+        count
     }
 
     /// The active filter query (empty when none is set).
@@ -1388,7 +1424,7 @@ impl App {
             KeyCode::Char('w') => self.jump(is_working, true),
             KeyCode::Char('W') => self.jump(is_working, false),
             KeyCode::Char('d') => self.toggle_details(),
-            KeyCode::Char('e') => self.toggle_finished(),
+            KeyCode::Char('e') => self.toggle_history(),
             KeyCode::Char('b') => self.toggle_tasks(),
             KeyCode::Char('?') => {
                 self.palette = Some(Picker::new(
@@ -1969,6 +2005,24 @@ fn has_visible_children(node: &TreeNode, visible: Visibility) -> bool {
         .any(|child| visible.includes(&child.row.kind))
 }
 
+/// Whether this node or anything below it survives the view. A workspace is a
+/// heading rather than a fact, so it is listed through what is under it and a
+/// workspace left holding nothing is not a row of its own. Every other row is a
+/// fact that is drawn when it passes the view, whatever it holds.
+fn subtree_has_visible(node: &TreeNode, visible: Visibility) -> bool {
+    let below = |node: &TreeNode| {
+        node.children
+            .iter()
+            .any(|child| subtree_has_visible(child, visible))
+    };
+    match &node.row.kind {
+        // A workspace the projection holds with nothing under it stays: it is a
+        // place that exists. One emptied by this view's own toggles does not.
+        RowKind::Workspace { .. } => node.children.is_empty() || below(node),
+        _ => visible.includes(&node.row.kind) || below(node),
+    }
+}
+
 /// Collects the unfolded view, skipping hidden ordinary panes. A branch's
 /// connector is decided from the siblings that survive filtering and folding,
 /// not from the children the projection holds.
@@ -2198,11 +2252,11 @@ mod tests {
     #[test]
     fn finished_sessions_are_opt_in() {
         let mut app = app_with_fixture();
-        assert!(!app.shows_finished());
+        assert!(!app.shows_history());
         app.handle_key(key(KeyCode::Char('e')));
-        assert!(app.shows_finished());
+        assert!(app.shows_history());
         app.handle_key(key(KeyCode::Char('e')));
-        assert!(!app.shows_finished());
+        assert!(!app.shows_history());
     }
 
     #[test]
@@ -4150,6 +4204,16 @@ mod tests {
         status: RuntimeStatus,
         owner: Option<&str>,
     ) -> ObservationState {
+        managed_state_ending(facts, status, owner, false)
+    }
+
+    /// The same worker, with the daemon's recorded exit decided by the caller.
+    fn managed_state_ending(
+        facts: crate::model::HerdsmanFacts,
+        status: RuntimeStatus,
+        owner: Option<&str>,
+        ended: bool,
+    ) -> ObservationState {
         let location = Location {
             workspace_id: "wM".into(),
             tab_id: "wM:t1".into(),
@@ -4218,11 +4282,70 @@ mod tests {
                         child_close: None,
                         state: crate::control_plane::lifecycle::State::Bound,
                         session: Some(MANAGED_OWNER.into()),
+                        ended,
                     }),
                 }),
             }],
         });
         state
+    }
+
+    /// The agent rows a view lists, ignoring workspace and pane rows. An agent
+    /// that joins no pane is keyed by its registration, so both names count.
+    fn agent_rows(app: &App) -> Vec<RowId> {
+        row_ids(app)
+            .into_iter()
+            .filter(|id| matches!(id, RowId::Agent(_) | RowId::Registered(_)))
+            .collect()
+    }
+
+    #[test]
+    fn an_exited_worker_is_history_until_the_toggle_asks_for_it() {
+        let state = managed_state_ending(
+            managed_facts(),
+            RuntimeStatus::Idle,
+            Some(MANAGED_OWNER),
+            true,
+        );
+        let mut app = App::new();
+        app.refresh(&state);
+
+        // The daemon recorded this subject's process as ended, so the live fleet
+        // does not list it — and the count says one row is behind the toggle
+        // rather than losing it silently.
+        assert!(agent_rows(&app).is_empty(), "{:?}", row_ids(&app));
+        assert_eq!(app.hidden_history(), 1);
+
+        app.toggle_history();
+        assert_eq!(agent_rows(&app).len(), 1, "{:?}", row_ids(&app));
+        assert_eq!(app.hidden_history(), 0);
+
+        app.toggle_history();
+        assert!(agent_rows(&app).is_empty(), "{:?}", row_ids(&app));
+    }
+
+    #[test]
+    fn an_agent_that_joins_no_pane_is_history_too() {
+        let mut state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
+        let mut observation = state.inventory().expect("current inventory").clone();
+        observation.agents[0]
+            .registry
+            .as_mut()
+            .expect("registry view")
+            .binding = crate::registry_observation::Binding::Unjoined(
+            crate::registry_observation::Unjoined::PaneAbsent,
+        );
+        state.apply_success(observation);
+        let mut app = App::new();
+        app.refresh(&state);
+
+        // A registration that joins no live pane is not part of the fleet, and
+        // the workspace holding nothing else goes with it.
+        assert!(row_ids(&app).is_empty(), "{:?}", row_ids(&app));
+        assert_eq!(app.hidden_history(), 1);
+
+        app.toggle_history();
+        assert_eq!(agent_rows(&app).len(), 1, "{:?}", row_ids(&app));
     }
 
     #[test]
@@ -4476,15 +4599,18 @@ mod tests {
         // Keys reach the query, not the tree: `e` would otherwise show finished
         // sessions, and `q` would be a quit the main loop must not see.
         let selected = app.selected_index();
-        for ch in "show or hide finished".chars() {
+        for ch in "show or hide history".chars() {
             press(&mut app, KeyCode::Char(ch));
         }
         assert_eq!(app.selected_index(), selected);
         let palette = app.palette().expect("open");
-        assert_eq!(palette.query(), "show or hide finished");
+        assert_eq!(palette.query(), "show or hide history");
         assert_eq!(
             palette.rows(),
-            [("Show or hide finished sessions", Some("e"))],
+            [(
+                "Show or hide history: exited, finished and unresolved rows",
+                Some("e")
+            )],
             "only the matching command is offered"
         );
 
@@ -4497,7 +4623,7 @@ mod tests {
 
         // The caller replays the key; here that lands on the real binding.
         press(&mut app, KeyCode::Char('e'));
-        assert!(app.shows_finished());
+        assert!(app.shows_history());
 
         press(&mut app, KeyCode::Char('?'));
         assert_eq!(press(&mut app, KeyCode::Esc), None);

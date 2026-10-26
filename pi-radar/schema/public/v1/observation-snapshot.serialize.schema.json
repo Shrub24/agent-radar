@@ -920,6 +920,11 @@
             "null"
           ]
         },
+        "ended": {
+          "default": false,
+          "description": "Whether the daemon recorded this subject's process as ended. A subject\noutlives its process, so the tree needs the exit to tell a subject that is\nstill running from one that is history.",
+          "type": "boolean"
+        },
         "process": {
           "anyOf": [
             {
@@ -948,7 +953,8 @@
         "bound_registration_id",
         "process",
         "state",
-        "session"
+        "session",
+        "ended"
       ],
       "type": "object"
     },
@@ -1092,6 +1098,11 @@
         "claim_id": {
           "type": "string"
         },
+        "ended": {
+          "default": false,
+          "description": "Whether the subject's process is recorded as ended. A bound subject is\nlive until this is set, whatever its registration still publishes.",
+          "type": "boolean"
+        },
         "metadata": {
           "$ref": "#/$defs/ManagedMetadata"
         },
@@ -1118,7 +1129,8 @@
         "metadata",
         "child_close",
         "state",
-        "session"
+        "session",
+        "ended"
       ],
       "type": "object"
     },

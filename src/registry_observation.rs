@@ -92,6 +92,21 @@ pub struct LifecycleSubject {
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,
     #[serde(default)]
     pub session: Option<String>,
+    /// When the daemon verified this subject's process gone.
+    #[serde(default)]
+    pub exited_at: Option<String>,
+    /// When the daemon confirmed the subject's pane command ended without its own
+    /// signal, which ends the subject just as an observed exit does.
+    #[serde(default)]
+    pub ended_externally_at: Option<String>,
+}
+
+impl LifecycleSubject {
+    /// Whether the daemon recorded this subject as ended: it verified the exit,
+    /// or confirmed the pane's command ended on its own.
+    pub fn ended(&self) -> bool {
+        self.exited_at.is_some() || self.ended_externally_at.is_some()
+    }
 }
 
 /// A daemon-owned process lifecycle target, joined to one registration by exact
@@ -105,6 +120,10 @@ pub struct ManagedSubject {
     pub child_close: Option<ChildCloseTarget>,
     pub state: crate::control_plane::lifecycle::State,
     pub session: Option<String>,
+    /// Whether the subject's process is recorded as ended. A bound subject is
+    /// live until this is set, whatever its registration still publishes.
+    #[serde(default)]
+    pub ended: bool,
 }
 
 /// The process evidence `agent.list` serves beside a registration. Only the
@@ -375,6 +394,7 @@ fn managed_subject(
             }),
         state: subject.state,
         session: subject.session.clone(),
+        ended: subject.ended(),
     })
 }
 
@@ -900,6 +920,8 @@ mod tests {
             state: crate::control_plane::lifecycle::State::Bound,
             managed: crate::control_plane::lifecycle::ManagedMetadata::default(),
             session: Some("session".into()),
+            exited_at: None,
+            ended_externally_at: None,
         };
         let edge: PublicSpawnTopology = serde_json::from_value(json!({
             "version": 1,

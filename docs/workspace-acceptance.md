@@ -53,7 +53,7 @@ This is the main risk of the outer tmux. Compare against attaching directly:
 | # | Do | Expect |
 |---|---|---|
 | 3.1 | `F10` | focus moves to the sidebar. `F12` moves it back |
-| 3.2 | `j`/`k`, `space`, `/`, `p`, `e`, `b`, `n`/`N`, `w`/`W` | as in the dashboard. By default panes with a command show, finished sessions do not |
+| 3.2 | `j`/`k`, `space`, `/`, `p`, `e`, `b`, `n`/`N`, `w`/`W` | as in the dashboard. By default panes with a command show; finished sessions, exited subjects and unresolved registrations do not, and the footer says how many rows `e` would bring back |
 | 3.3 | `Enter` on an agent row | the agent area switches to that agent's pane; the sidebar stays put |
 | 3.4 | `Enter` on a workspace row | the agent area switches to that session, on the window and pane you last left in it |
 | 3.5 | Rows | compressed: mark and name, plus a state label only when exceptional |

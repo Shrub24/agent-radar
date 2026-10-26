@@ -570,7 +570,7 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
         // Foreground evidence is swept while a pane view is showing panes, and
         // while finished sessions are listed: telling a session that has gone
         // from a pane in use again needs the foreground either way.
-        let sweeping = app.pane_view() != PaneView::Hidden || app.shows_finished();
+        let sweeping = app.pane_view() != PaneView::Hidden || app.shows_history();
         if let Some(fetcher) = &fetcher {
             fetcher.wants(sweeping);
             match fetcher.poll() {

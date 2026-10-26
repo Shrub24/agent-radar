@@ -5,7 +5,7 @@ work in. Selection, folds and filters belong to that dashboard process. Rows
 keep state marks, names and exceptional state labels, but omit ages and model
 metadata. There is no details panel.
 
-Navigation, folds, filters, jumps, `p` (pane view), `e` (finished) and `b` (tasks)
+Navigation, folds, filters, jumps, `p` (pane view), `e` (history) and `b` (tasks)
 work as in the dashboard, and `?` opens the command palette, which lists every
 command with the key that runs it. `Enter` focuses the selected pane through the daemon.
 On a workspace it switches to that session, preserving its active window and

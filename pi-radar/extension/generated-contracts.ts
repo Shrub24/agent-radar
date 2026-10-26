@@ -1265,6 +1265,11 @@ export interface RegistryLocation {
 export interface ManagedSubject {
   child_close: ChildCloseTarget | null;
   claim_id: string;
+  /**
+   * Whether the subject's process is recorded as ended. A bound subject is
+   * live until this is set, whatever its registration still publishes.
+   */
+  ended: boolean;
   metadata: ManagedMetadata;
   process: ProcessIdentity;
   session: string | null;
@@ -1677,6 +1682,12 @@ export interface Binding2 {
  */
 export interface LifecycleObservation {
   bound_registration_id: string | null;
+  /**
+   * Whether the daemon recorded this subject's process as ended. A subject
+   * outlives its process, so the tree needs the exit to tell a subject that is
+   * still running from one that is history.
+   */
+  ended: boolean;
   process: ProcessIdentity | null;
   session: string | null;
   state: State;

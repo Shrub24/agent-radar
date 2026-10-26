@@ -110,7 +110,7 @@ pub const COMMANDS: &[Command] = &[
         key: KeyCode::Char('s'),
     },
     Command {
-        label: "Show or hide finished sessions",
+        label: "Show or hide history: exited, finished and unresolved rows",
         keys: "e",
         key: KeyCode::Char('e'),
     },

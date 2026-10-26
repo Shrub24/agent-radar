@@ -267,6 +267,14 @@ pub struct LifecycleRow {
     pub title: String,
 }
 
+impl LifecycleRow {
+    /// Whether this subject is history: its process is recorded as ended. The
+    /// subject itself is kept so it can be continued.
+    pub fn history(&self) -> bool {
+        self.subject.ended
+    }
+}
+
 /// An agent row: current facts, or the last-observed facts of a retained
 /// association (marked via `retained`, never presented as current).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +334,19 @@ impl AgentRow {
         self.registry
             .as_ref()
             .is_none_or(|view| view.binding == Binding::Joined)
+    }
+
+    /// Whether this row is history rather than fleet: its subject's process is
+    /// recorded as ended, or it joins no pane at all. The class decides what the
+    /// ordinary views list, so it is stated once, from the same evidence the row
+    /// draws.
+    pub fn history(&self) -> bool {
+        !self.joined()
+            || self
+                .registry
+                .as_ref()
+                .and_then(|view| view.managed.as_ref())
+                .is_some_and(|managed| managed.ended)
     }
 
     /// How the foreground executable compares with the program installed now,
@@ -2018,6 +2039,7 @@ mod tests {
                     process: None,
                     state: crate::control_plane::lifecycle::State::Pending,
                     session: None,
+                    ended: false,
                 },
                 LifecycleObservation {
                     subject_id: "subject-bound-unjoined".into(),
@@ -2029,6 +2051,7 @@ mod tests {
                     }),
                     state: crate::control_plane::lifecycle::State::Bound,
                     session: None,
+                    ended: false,
                 },
                 LifecycleObservation {
                     subject_id: "subject-revoked".into(),
@@ -2036,6 +2059,7 @@ mod tests {
                     process: None,
                     state: crate::control_plane::lifecycle::State::Revoked,
                     session: None,
+                    ended: false,
                 },
             ],
             ..FleetObservation::default()

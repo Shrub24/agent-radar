@@ -262,6 +262,14 @@ fn projection(app: &App, pane_id: &str) -> TaskProjection {
         .unwrap_or_default()
 }
 
+/// The app with history listed: an unresolved registration and an exited
+/// subject sit behind `e`, and these tests are about what such a row says.
+fn app_with_history(state: &ObservationState) -> App {
+    let mut app = app_for(state);
+    app.toggle_history();
+    app
+}
+
 fn app_for(state: &ObservationState) -> App {
     // Installed before any draw in this binary: the configuration is global to
     // the process, so every test installs the same one before it can render.
@@ -865,7 +873,7 @@ fn vanished_metadata_shows_no_row_and_its_pane_refuses_a_direct_close() {
     );
     assert!(state.retained_containment().contains_key("wH:p1"));
 
-    let mut app = app_for(&state);
+    let mut app = app_with_history(&state);
     assert!(agent_node(&app.tree().roots, "wH:p1").is_none());
     // Every pane shows, so the pane row is the close target.
     while app.pane_view() != PaneView::All {
@@ -1925,7 +1933,7 @@ fn registry_state(
 
 /// Text of one registered row's details, every page open.
 fn details(state: &ObservationState, id: &RowId) -> String {
-    let mut app = app_for(state);
+    let mut app = app_with_history(state);
     select(&mut app, id);
     pages(state, &mut app)
 }
@@ -1946,7 +1954,7 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
         ],
         Vec::new(),
     );
-    let mut app = app_for(&state);
+    let mut app = app_with_history(&state);
     {
         let tree = app.tree();
         for id in ["r1", "r2"] {

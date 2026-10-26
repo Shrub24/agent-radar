@@ -631,6 +631,11 @@ pub struct LifecycleObservation {
     pub process: Option<ProcessIdentity>,
     pub state: LifecycleState,
     pub session: Option<String>,
+    /// Whether the daemon recorded this subject's process as ended. A subject
+    /// outlives its process, so the tree needs the exit to tell a subject that is
+    /// still running from one that is history.
+    #[serde(default)]
+    pub ended: bool,
 }
 
 /// One successful inventory: workspaces, tabs, panes, reported agents and

@@ -52,6 +52,7 @@ unknown = "diamond"
         process: None,
         state: LifecycleState::Pending,
         session: None,
+        ended: false,
     });
     let mut state = ObservationState::new();
     state.apply_success(observation);

@@ -882,6 +882,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     // that cannot hold it in two lines gets the terse wording instead, so the
     // state words are the first thing to go rather than the last keys.
     let tasks = task_rows_label(app.shows_tasks());
+    let history = history_label(app);
     let full = vec![
         ("j/k", String::new()),
         ("spc", "fold".to_string()),
@@ -894,7 +895,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("s", app.order().label().to_string()),
         ("p", app.pane_view().label().to_string()),
         ("d", toggle_label(app.shows_details(), "details")),
-        ("e", toggle_label(app.shows_finished(), "finished")),
+        ("e", history.clone()),
         ("b", tasks.clone()),
         ("?", "commands".to_string()),
         ("q", "quit".to_string()),
@@ -911,7 +912,7 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         ("s", app.order().label().to_string()),
         ("p", app.pane_view().label().to_string()),
         ("d", "details".to_string()),
-        ("e", "finished".to_string()),
+        ("e", history),
         ("b", tasks),
         ("q", "quit".to_string()),
     ];
@@ -928,6 +929,18 @@ fn toggle_label(shown: bool, noun: &str) -> String {
         format!("hide {noun}")
     } else {
         noun.to_string()
+    }
+}
+
+/// The history hint: while it is off, how many rows it would bring back. Hiding
+/// a row is only honest if the operator can see that it happened.
+fn history_label(app: &App) -> String {
+    if app.shows_history() {
+        return "hide history".to_string();
+    }
+    match app.hidden_history() {
+        0 => "history".to_string(),
+        hidden => format!("{hidden} hidden"),
     }
 }
 
@@ -6751,13 +6764,15 @@ mod tests {
         // The default view is the live fleet, and says how to see the rest.
         let fleet = render_text(&state, &app, 180, 32);
         assert!(!fleet.contains("01a0edc4"), "{fleet}");
-        assert!(fleet.contains("e finished"), "{fleet}");
-        assert!(!fleet.contains("e hide finished"), "{fleet}");
+        // The footer offers the toggle and says a row is behind it, so a hidden
+        // row is never mistaken for one that is gone.
+        assert!(fleet.contains("e 1 hidden"), "{fleet}");
+        assert!(!fleet.contains("e hide history"), "{fleet}");
 
         press(&mut app, 'e');
         let with_history = render_text(&state, &app, 180, 32);
         assert!(with_history.contains("01a0edc4 · exited"), "{with_history}");
-        assert!(with_history.contains("e hide finished"), "{with_history}");
+        assert!(with_history.contains("e hide history"), "{with_history}");
 
         press(&mut app, 'e');
         let fleet_again = render_text(&state, &app, 180, 32);
@@ -6988,6 +7003,7 @@ mod tests {
                         child_close: None,
                         state: crate::control_plane::lifecycle::State::Bound,
                         session: Some("01a10c77-8a6b-7035-8a0e-b1fa607bb507".into()),
+                        ended: false,
                     }),
                 }),
             }],
