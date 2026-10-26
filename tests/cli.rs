@@ -64,9 +64,9 @@ fn a_workspace_keeps_backend_ownership_and_cleans_up_only_its_private_host() {
         r#"#!/bin/sh
 for word in "$@"; do printf '<%s>' "$word"; done >> "$RADAR_TEST_LOG"
 printf '\n' >> "$RADAR_TEST_LOG"
-if [ "$3" = has-session ] && [ "$RADAR_TEST_MISSING" = yes ]; then
-    echo 'no existing backend session' >&2
-    exit 1
+if [ "$3" = list-sessions ]; then
+    [ "$RADAR_TEST_MISSING" = yes ] && { echo 'no server running' >&2; exit 1; }
+    echo 'chosen session'
 fi
 "#,
     )
@@ -89,7 +89,10 @@ fi
     );
     let calls = std::fs::read_to_string(&log).unwrap();
     let calls: Vec<_> = calls.lines().collect();
-    assert!(calls[0].ends_with("<has-session><-t><chosen session>"));
+    assert!(
+        calls[0].contains("<list-sessions>"),
+        "the server is asked, not started"
+    );
     assert!(
         calls
             .iter()
@@ -99,8 +102,8 @@ fi
     );
     assert!(
         calls.iter().any(|line| line.contains("<env><-u><TMUX>")
-            && line.ends_with("<attach-session><-t><chosen session>")),
-        "the agent area attaches to the requested existing session"
+            && line.ends_with("<new-session><-A><-s><chosen session>")),
+        "the agent area attaches to the requested session, creating it if absent"
     );
     assert!(calls.last().unwrap().ends_with("<kill-server>"));
 
@@ -110,7 +113,7 @@ fi
     assert_eq!(
         std::fs::read_to_string(&log).unwrap().lines().count(),
         1,
-        "a missing backend creates no host"
+        "a missing server creates no host"
     );
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -29,19 +29,27 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             ))
         }
     };
-    // Check the existing backend before creating any presentation state. Never
-    // start a shell, agent or backend server as a side effect of opening a view.
-    let mut check = Command::new(&tmux);
-    check.args(["-L", backend, "has-session"]);
-    if let Some(session) = session {
-        check.args(["-t", session]);
+    // The agents' server is the daemon's unit: never start it from here, so a
+    // missing one is reported, not replaced by a stray server of the same name.
+    let sessions = Command::new(&tmux)
+        .args(["-L", backend, "list-sessions", "-F", "#{session_name}"])
+        .output()?;
+    if !sessions.status.success() {
+        return Err(io::Error::other(format!(
+            "no tmux server '{backend}' is running; start it with `radar server start`"
+        )));
     }
-    let output = check.output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
-    }
+    // Attach to the named session, or the first one, creating it only when the
+    // server has none, so opening a workspace works from a fresh server.
+    let first = String::from_utf8_lossy(&sessions.stdout)
+        .lines()
+        .next()
+        .map(str::to_string);
+    let session = session
+        .map(str::to_string)
+        .or(first)
+        .unwrap_or_else(|| "main".into());
+    let session = session.as_str();
     let result = (|| {
         run(&[
             "new-session",
@@ -92,10 +100,15 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             "TMUX",
         ];
         let tmux_word = tmux.to_string_lossy();
-        attach.extend([&tmux_word, "-L", backend, "attach-session"]);
-        if let Some(session) = session {
-            attach.extend(["-t", session]);
-        }
+        attach.extend([
+            &tmux_word,
+            "-L",
+            backend,
+            "new-session",
+            "-A",
+            "-s",
+            session,
+        ]);
         run(&attach)?;
         run(&["bind-key", "-n", "F10", "select-pane", "-t", "%0"])?;
         // Returning to the agents while expanded collapses the sidebar first, so
@@ -111,8 +124,15 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             "select-pane -t %1",
         ])?;
         run(&["bind-key", "-n", "F8", "detach-client"])?;
-        // A workspace nobody is attached to has nothing left to show.
-        run(&["set-option", "-g", "destroy-unattached", "on"])?;
+        // A workspace nobody is attached to has nothing left to show. Set once a
+        // client has attached: tmux destroys an unattached session on its next
+        // loop, so setting it earlier removes the workspace before it opens.
+        run(&[
+            "set-hook",
+            "-g",
+            "client-attached",
+            "set-option -t workspace destroy-unattached on",
+        ])?;
         // Expand sends the sidebar its own toggle, so the mode and the zoom change
         // together, from either pane.
         run(&[

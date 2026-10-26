@@ -15,8 +15,7 @@ pane. In the workspace there is no tmux prefix and no status bar.
 | 0.1 | `radar --version` | `radar 0.7.0 (wire 10)` |
 | 0.2 | `radar daemon restart`, then `radar daemon status` | both units active, from the same store path as `radar` |
 | 0.3 | `radar server status` | the `radar` tmux server runs; if not, `radar server start` |
-| 0.4 | `tmux -L radar ls` | at least one session. If none, make one: `tmux -L radar new-session -d -s 0` |
-| 0.5 | Start two or three agents in it (a Pi, and anything else you run) | they appear in plain `radar` |
+| 0.4 | Start two or three agents in it (a Pi, and anything else you run) | they appear in plain `radar` |
 | 0.6 | `radar --print-config` | no `[sidebar]` Kitty commands are required for the workspace; it supplies its own |
 
 | 0.7 | `tmux -L radar show -gv extended-keys` | `on` (set `programs.radar.tmux.extraConfig`/`configFile`, then `tmux -L radar source-file <file>` for the running server) |
@@ -27,8 +26,8 @@ If 0.1 or 0.2 fail, stop: a 0.6.0 TUI or daemon will refuse the other.
 
 | # | Do | Expect |
 |---|---|---|
-| 1.1 | `radar workspace --session 0` (use your session name) | sidebar on the left, about a quarter wide; the agent area on the right shows that session; focus starts in the agent area |
-| 1.2 | `radar workspace --session nope` | exits non-zero with tmux's message, and creates nothing: `tmux ls` shows no `radar-ui-*` server |
+| 1.1 | `radar workspace` (add `--session NAME` to pick one; it is created if the server has none) | sidebar on the left, about a quarter wide; the agent area on the right shows that session; focus starts in the agent area |
+| 1.2 | Optional, only if the server holds nothing you need: `radar server stop`, `radar workspace` | exits non-zero saying the server is not running, creates nothing |
 | 1.3 | Press `F8` in the workspace (and, on a second launch, close the terminal tab) | the launcher returns, `tmux ls` shows no `radar-ui-*` server |
 | 1.4 | `tmux -L radar ls`; look at the agents | the agent sessions and processes are untouched |
 

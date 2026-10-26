@@ -13,11 +13,13 @@ terminal:
 ```sh
 cargo build --bin radar
 ./target/debug/radar workspace
-# Or pick an existing session on the daemon's configured tmux server:
+# Or pick a session on the daemon's configured tmux server; it is created if absent:
 ./target/debug/radar workspace --session 0
 ```
 
-The launcher checks that the backend session exists before creating a view. It
+The launcher asks the daemon's tmux server for its sessions before creating a view,
+and refuses (starting nothing) if the server is not running; it attaches to the named
+or first session and creates one only when the server has none. It
 uses a private, per-launch UI server with no user tmux configuration, no status
 bar and no prefix. It does not create agents or change the daemon's server.
 The sidebar is on the left; keyboard focus starts in the attached agent area.
