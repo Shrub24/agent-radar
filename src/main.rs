@@ -142,11 +142,10 @@ fn sidebar_resize<'a>(config: &'a Config, app: &App) -> (&'static str, &'a Optio
     }
 }
 
-/// Which host command zooms the sidebar to the window or back: the width that
-/// decides when it is drawn as the whole dashboard.
+/// Which host command gives the sidebar the window or takes it back: the mode
+/// chooses, and the width follows it.
 fn sidebar_zoom<'a>(config: &'a Config, app: &App) -> (&'static str, &'a Option<Vec<String>>) {
-    let full = app.is_sidebar() && !app.sidebar_compact();
-    if full {
+    if app.is_expanded() {
         ("unzoom_command", &config.sidebar.unzoom_command)
     } else {
         ("zoom_command", &config.sidebar.zoom_command)
@@ -158,14 +157,14 @@ fn run_host_command(
     command: &Option<Vec<String>>,
     app: &mut App,
     pending: &mut Option<std::process::Child>,
-) {
+) -> bool {
     if pending.is_some() {
         app.set_focus_message(Some("a sidebar host command is still running".into()));
-        return;
+        return false;
     }
     let Some(command) = command else {
         app.set_focus_message(Some(format!("set [sidebar] {key}")));
-        return;
+        return false;
     };
     let result = std::process::Command::new(&command[0])
         .args(&command[1..])
@@ -174,8 +173,14 @@ fn run_host_command(
         .stderr(std::process::Stdio::null())
         .spawn();
     match result {
-        Ok(child) => *pending = Some(child),
-        Err(error) => app.set_focus_message(Some(format!("sidebar {key}: {error}"))),
+        Ok(child) => {
+            *pending = Some(child);
+            true
+        }
+        Err(error) => {
+            app.set_focus_message(Some(format!("sidebar {key}: {error}")));
+            false
+        }
     }
 }
 
@@ -241,7 +246,7 @@ mod sidebar_tests {
     }
 
     #[test]
-    fn the_width_chooses_hide_show_zoom_or_unzoom() {
+    fn the_width_chooses_hide_or_show_and_the_mode_chooses_zoom_or_unzoom() {
         let config = Config::default();
         let mut app = App::sidebar();
         app.note_width(30);
@@ -249,16 +254,35 @@ mod sidebar_tests {
         app.note_width(10);
         assert_eq!(sidebar_resize(&config, &app).0, "show_command");
 
-        app.note_width(140);
-        assert_eq!(sidebar_zoom(&config, &app).0, "unzoom_command");
+        assert_eq!(sidebar_zoom(&config, &app).0, "zoom_command");
+        app.toggle_expanded();
+        app.note_width(30);
+        assert_eq!(
+            sidebar_zoom(&config, &app).0,
+            "unzoom_command",
+            "the mode, not the width, says it is expanded"
+        );
         assert!(
             !app.sidebar_compact(),
-            "a zoomed sidebar draws the dashboard"
+            "an expanded sidebar is the dashboard"
         );
-        app.note_width(30);
-        assert!(app.sidebar_compact());
-        assert_eq!(sidebar_zoom(&config, &app).0, "zoom_command");
+        app.note_width(10);
+        assert!(!app.sidebar_railed(), "and cannot be the rail");
         assert!(!App::new().sidebar_compact(), "the dashboard never is");
+    }
+
+    #[test]
+    fn a_host_command_that_cannot_run_leaves_the_mode_alone() {
+        let mut app = App::sidebar();
+        let mut pending = None;
+        assert!(!run_host_command(
+            "zoom_command",
+            &None,
+            &mut app,
+            &mut pending
+        ));
+        assert!(!app.is_expanded());
+        assert!(app.focus_message().unwrap().contains("zoom_command"));
     }
 }
 
@@ -701,18 +725,24 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
                         ),
                         Action::ToggleSidebar => {
                             let (key, command) = sidebar_resize(&config, &app);
-                            run_host_command(key, command, &mut app, &mut sidebar_command)
+                            let _ = run_host_command(key, command, &mut app, &mut sidebar_command);
                         }
+                        // The mode follows the host: it flips only once the host
+                        // has been asked, so a missing command leaves it as it was.
                         Action::ToggleZoom => {
                             let (key, command) = sidebar_zoom(&config, &app);
-                            run_host_command(key, command, &mut app, &mut sidebar_command)
+                            if run_host_command(key, command, &mut app, &mut sidebar_command) {
+                                app.toggle_expanded();
+                            }
                         }
-                        Action::LaunchSidebar => run_host_command(
-                            "launch_command",
-                            &config.sidebar.launch_command,
-                            &mut app,
-                            &mut sidebar_command,
-                        ),
+                        Action::LaunchSidebar => {
+                            let _ = run_host_command(
+                                "launch_command",
+                                &config.sidebar.launch_command,
+                                &mut app,
+                                &mut sidebar_command,
+                            );
+                        }
                         Action::Modal { key, row } => {
                             let row = row.and_then(|row| serde_json::to_string(&row).ok());
                             let radar = std::env::current_exe()
@@ -726,7 +756,8 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
                                 ),
                                 _ => None,
                             };
-                            run_host_command("modal", &command, &mut app, &mut sidebar_command)
+                            let _ =
+                                run_host_command("modal", &command, &mut app, &mut sidebar_command);
                         }
                         Action::LaunchConfigured => {
                             let shell = std::env::var("SHELL").ok();
@@ -788,18 +819,24 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
                         ),
                         Action::ToggleSidebar => {
                             let (key, command) = sidebar_resize(&config, &app);
-                            run_host_command(key, command, &mut app, &mut sidebar_command)
+                            let _ = run_host_command(key, command, &mut app, &mut sidebar_command);
                         }
+                        // The mode follows the host: it flips only once the host
+                        // has been asked, so a missing command leaves it as it was.
                         Action::ToggleZoom => {
                             let (key, command) = sidebar_zoom(&config, &app);
-                            run_host_command(key, command, &mut app, &mut sidebar_command)
+                            if run_host_command(key, command, &mut app, &mut sidebar_command) {
+                                app.toggle_expanded();
+                            }
                         }
-                        Action::LaunchSidebar => run_host_command(
-                            "launch_command",
-                            &config.sidebar.launch_command,
-                            &mut app,
-                            &mut sidebar_command,
-                        ),
+                        Action::LaunchSidebar => {
+                            let _ = run_host_command(
+                                "launch_command",
+                                &config.sidebar.launch_command,
+                                &mut app,
+                                &mut sidebar_command,
+                            );
+                        }
                         // Only a key opens a popup; a click reaches no action here.
                         Action::Modal { .. } => {}
                         Action::LaunchConfigured => {

@@ -1813,8 +1813,11 @@ mod tests {
         );
         assert_eq!(press(&mut app, 'Z'), Some(crate::app::Action::ToggleZoom));
         assert!(!app.shows_details(), "a compact sidebar draws no details");
-        app.note_width(120);
-        assert!(app.shows_details(), "a zoomed sidebar draws the dashboard");
+        app.toggle_expanded();
+        assert!(
+            app.shows_details(),
+            "an expanded sidebar draws the dashboard"
+        );
         assert_eq!(
             press(&mut app, 'd'),
             None,

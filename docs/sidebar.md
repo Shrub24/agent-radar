@@ -63,10 +63,13 @@ repeated toggles cannot accumulate resize drift. `--self` makes both commands ac
 on the sidebar's own split rather than whichever window has focus. Manual resizing is
 also supported; the rail follows the actual width.
 
-`Z` zooms the sidebar: it runs `zoom_command` and, from 100 columns up, the
-whole dashboard is drawn in the same window instead of the compressed tree, so
-every key and the details panel work as usual. Pressing `Z` again runs
-`unzoom_command`:
+`Z` expands the sidebar into the full dashboard and back. It is an explicit mode of
+the same process, not a width: `Z` asks the host to give the sidebar the window
+with `zoom_command`, and once that has started the process draws the whole
+dashboard, with the details panel and every key. `Z` again runs `unzoom_command`
+and returns to the compressed tree. A host command that is unset or fails leaves
+the mode as it was. The commands should state the layout they want rather than
+toggle it, so a manual resize cannot leave the host and the mode disagreeing:
 
 ```toml
 [sidebar]

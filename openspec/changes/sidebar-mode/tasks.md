@@ -13,10 +13,10 @@
 ## 3. Launchers and documentation
 
 - [x] 3.1 Add a Kitty launcher under `examples/` (a layout with the sidebar on the left and `tmux attach` on the right; focus moves with Kitty's `neighboring_window`), taking the commands from Kitty's documentation. Document it, and the sidebar, in `docs/`.
-- [x] 3.3 Add `Z` and `[sidebar] zoom_command` / `unzoom_command`, drawing the whole dashboard from `SIDEBAR_FULL_AT` columns up.
+- [x] 3.3 Add `Z` and `[sidebar] zoom_command` / `unzoom_command`, toggling an explicit expanded mode of the same process that draws the whole dashboard; the mode never depends on width.
 - [x] 3.2 Record follow mode and the multi-view focus argument in `ideas.md`, and add the WezTerm launcher as a follow-up row.
 
 ## 4. Gate and acceptance
 
-- [ ] 4.1 Run fmt, strict Clippy, the Rust test suites, strict OpenSpec validation and the Nix build. Record real exit codes. Blocker: `tests/cli.rs` fails on `radar 0.6.0 (wire 9)` versus the working tree's uncommitted `PROTOCOL_REVISION = 10`, which is another change's in-flight work; every other suite passes.
-- [ ] 4.2 Hand the operator the live acceptance: in the Kitty layout, check that Pi renders correctly beside the sidebar, mouse and clipboard work in both splits, focusing an agent moves the right-hand client, hide and unhide work from both the sidebar key and the host binding, and closing the sidebar leaves the agents running.
+- [x] 4.1 Run fmt, strict Clippy, the Rust test suites, strict OpenSpec validation and the Nix build. All exit 0 on the explicit expanded mode (18 suites ok, `radar 0.7.0 (wire 10)`).
+- [ ] 4.2 Operator: run the live acceptance in `docs/workspace-prototype.md` (nested Pi rendering, keys, mouse and clipboard; sidebar `?`/`A`/`D` popups over both areas on the selected row; `Z`/F11 expand and return; `B` rail; detaching leaves the agents running), and the Kitty layout in `docs/sidebar.md` if it is kept.

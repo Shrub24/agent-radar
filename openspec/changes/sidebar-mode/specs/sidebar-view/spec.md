@@ -56,20 +56,25 @@ Pressing the focus key on an agent in the sidebar SHALL send the existing focus 
 - **WHEN** the observation is stale
 - **THEN** the sidebar does not send a focus and says why, as the full dashboard does
 
-### Requirement: Zooming swaps the projection for the dashboard
+### Requirement: The sidebar expands into the dashboard as an explicit mode
 
-The sidebar SHALL run `[sidebar] zoom_command` or `unzoom_command` on its zoom key.
-From `SIDEBAR_FULL_AT` columns it SHALL draw the whole dashboard in place of the
-compressed tree, with the details panel and every key available again.
+The sidebar is the dashboard process and SHALL have an explicit expanded mode,
+toggled by its zoom key, that draws the whole dashboard with the details panel and
+every key. The mode SHALL NOT depend on the terminal's width. Toggling SHALL ask
+the host with `[sidebar] zoom_command` or `unzoom_command` and change the mode
+only if the host command started.
 
-#### Scenario: Zoomed
-- **WHEN** the host has widened the sidebar to the full window
-- **THEN** the dashboard is drawn in it, with compressed rows, the omitted
-  actions and the rail no longer applied
+#### Scenario: Expanded
+- **WHEN** the zoom key is pressed and `zoom_command` starts
+- **THEN** the same process draws the whole dashboard on the same selection and filter
 
-#### Scenario: Zoom and unzoom
-- **WHEN** the zoom key is pressed in a narrow sidebar and again once it is wide
-- **THEN** `zoom_command` runs first and `unzoom_command` second
+#### Scenario: Returned
+- **WHEN** the zoom key is pressed again
+- **THEN** `unzoom_command` runs and the compressed tree is drawn again
+
+#### Scenario: No host command
+- **WHEN** the zoom key is pressed with the command unset or failing to start
+- **THEN** the mode is unchanged and the footer names the command to set
 
 ### Requirement: Hide and unhide are host commands
 

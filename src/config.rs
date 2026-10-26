@@ -659,8 +659,8 @@ impl Config {
              # launch_command = [\"kitten\", \"@\", \"launch\", \"--location=vsplit\", \"--bias=25\", \"--allow-remote-control\", \"radar\", \"sidebar\"]\n\
              # hide_command = [\"kitten\", \"@\", \"resize-window\", \"--self\", \"--axis=horizontal\", \"--increment=-10000\"]\n\
              # show_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 25\"]\n\
-             # `Z` zooms the sidebar to the whole window and back, drawing the full\n\
-             # dashboard from 100 columns up.\n\
+             # `Z` expands the sidebar into the full dashboard and back; these say what\n\
+             # the host should do. State the layout wanted rather than toggle it.\n\
              # zoom_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 100\"]\n\
              # unzoom_command = [\"kitten\", \"@\", \"action\", \"--self\", \"layout_action bias 25\"]\n",
         );

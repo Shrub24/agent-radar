@@ -24,23 +24,25 @@ The sidebar is on the left; keyboard focus starts in the attached agent area.
 
 | Key | Action |
 | --- | --- |
-| F9 | Open the full dashboard in a centred popup over both panes |
 | F10 | Focus the sidebar |
-| F11 | Toggle sidebar pane zoom |
+| F11 | Expand the sidebar to the full dashboard / return (sends the sidebar its `Z`) |
 | F12 | Focus the agent area |
 | B, in sidebar | Shrink to rail / restore to 32 columns |
-| Z, in sidebar | Toggle sidebar pane zoom |
+| Z, in sidebar | Expand to the full dashboard (the pane takes the window) / return |
 
-Inside the F9 popup, `?` opens the shared command picker and `A` opens the
-workspace picker. Lifecycle confirmations use the ordinary dashboard path.
-`q` closes the dashboard popup once its local picker/confirmation has closed.
 The launcher supplies tmux hide/show/zoom commands to its sidebar instead of
-using the Kitty commands in the user's configuration.
+using the Kitty commands in the user's configuration. The zoom and unzoom
+commands state the zoom they want (`if-shell -F '#{window_zoomed_flag}'`), so
+zooming by hand cannot leave the sidebar's mode and the window disagreeing.
+
+The sidebar is the dashboard process. Expanding it is an explicit mode, not a
+width: it keeps its selection, filter, folds and scroll, and there is no second
+dashboard to open.
 
 The outer server is disposable: detaching from it returns to the launching
 terminal and cleans up that UI server. The inner server and agents are not
 terminated. Closing the terminal abruptly is not yet a guaranteed cleanup path.
-F9–F12 are prototype bindings, not a settled hotkey scheme.
+F10–F12 are prototype bindings, not a settled hotkey scheme.
 
 ## What this establishes — and does not
 
@@ -65,8 +67,9 @@ so it covers the sidebar and the agent area, and runs `radar modal` in it:
 - `?` in the popup lists only the commands that open a modal; the rest act on a
   view the popup does not show.
 
-`L` (launch in the configured pane) has no dialog and runs in the sidebar. F9
-still opens the whole dashboard in a popup.
+`L` (launch in the configured pane) has no dialog and runs in the sidebar. While
+the sidebar is expanded the pane is the whole window, so its pickers and
+confirmations are drawn in it, centred, rather than in a popup.
 
 ## Operator acceptance
 
@@ -74,9 +77,10 @@ still opens the whole dashboard in a popup.
    rendering, modifier keys, bracketed paste, mouse, clipboard and resize.
 2. In the sidebar press `?`, `A`, then `D` on an agent row: each should float
    centred over both areas, act on the row that was selected, and cancel with
-   `Esc`. Confirm one and check the sidebar updates behind it. Open F9 and close
-   the dashboard with `q`.
-3. Test F10/F12 focus, B hide/restore, and F11/Z zoom/restore.
+   `Esc`. Confirm one and check the sidebar updates behind it.
+3. Test F10/F12 focus and B hide/restore. Press `Z` (and F11 from the agent
+   pane): the sidebar should fill the window as the full dashboard on the same
+   selection, and return on the next press.
 4. Navigate to another existing agent session through Radar; verify the outer
    sidebar remains in place.
 5. Detach the outer workspace and verify the original agent sessions remain.

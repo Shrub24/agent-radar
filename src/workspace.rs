@@ -86,21 +86,23 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             attach.extend(["-t", session]);
         }
         run(&attach)?;
+        run(&["bind-key", "-n", "F10", "select-pane", "-t", "%0"])?;
+        run(&["bind-key", "-n", "F12", "select-pane", "-t", "%1"])?;
+        // Expand sends the sidebar its own toggle, so the mode and the zoom change
+        // together, from either pane.
         run(&[
             "bind-key",
             "-n",
-            "F9",
-            "display-popup",
-            "-E",
-            "-w",
-            "85%",
-            "-h",
-            "85%",
-            &radar,
+            "F11",
+            "select-pane",
+            "-t",
+            "%0",
+            ";",
+            "send-keys",
+            "-t",
+            "%0",
+            "Z",
         ])?;
-        run(&["bind-key", "-n", "F10", "select-pane", "-t", "%0"])?;
-        run(&["bind-key", "-n", "F12", "select-pane", "-t", "%1"])?;
-        run(&["bind-key", "-n", "F11", "resize-pane", "-Z", "-t", "%0"])?;
         run(&["select-pane", "-t", "%1"])?;
         let status = Command::new(&tmux)
             .args(["-L", &host, "attach-session", "-t", "workspace"])
@@ -146,11 +148,32 @@ fn commands(tmux: &str, host: &str, pane: &str) -> SidebarConfig {
             .concat(),
         )
     };
+    // Zoom and unzoom state what they want rather than toggle, so the mode and the
+    // window cannot disagree after the user zooms by hand.
+    let zoomed = |then: &str, otherwise: &str| {
+        Some(
+            [
+                tmux,
+                "-L",
+                host,
+                "if-shell",
+                "-F",
+                "-t",
+                pane,
+                "#{window_zoomed_flag}",
+                then,
+                otherwise,
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+    };
+    let leave = format!("resize-pane -Z -t {pane}");
     SidebarConfig {
         hide_command: resize(&["-x", "1"]),
         show_command: resize(&["-x", "32"]),
-        zoom_command: resize(&["-Z"]),
-        unzoom_command: resize(&["-Z"]),
+        zoom_command: zoomed("", &leave),
+        unzoom_command: zoomed(&leave, ""),
         launch_command: None,
     }
 }
@@ -256,6 +279,18 @@ mod tests {
             ]
         );
         assert_eq!(commands.show_command.unwrap().last().unwrap(), "32");
-        assert_eq!(commands.zoom_command, commands.unzoom_command);
+        let zoom = commands.zoom_command.unwrap();
+        let unzoom = commands.unzoom_command.unwrap();
+        assert_ne!(zoom, unzoom, "each says which state it wants");
+        assert_eq!(
+            zoom.last().unwrap(),
+            "resize-pane -Z -t %0",
+            "zoom acts only when not zoomed"
+        );
+        assert_eq!(
+            unzoom[unzoom.len() - 2],
+            "resize-pane -Z -t %0",
+            "unzoom acts only when zoomed"
+        );
     }
 }

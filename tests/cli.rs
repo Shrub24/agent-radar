@@ -98,12 +98,6 @@ fi
         "every mutation targets the private UI server: {calls:?}"
     );
     assert!(
-        calls
-            .iter()
-            .any(|line| line.contains("<display-popup>") && line.contains("<85%>")),
-        "popup belongs to the outer host"
-    );
-    assert!(
         calls.iter().any(|line| line.contains("<env><-u><TMUX>")
             && line.ends_with("<attach-session><-t><chosen session>")),
         "the agent area attaches to the requested existing session"

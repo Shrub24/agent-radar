@@ -602,10 +602,6 @@ impl TaskRows {
 /// Below this width the sidebar is drawn as a one-column rail of state marks.
 pub const SIDEBAR_RAIL_BELOW: u16 = 16;
 
-/// At this width a zoomed sidebar is drawn as the whole dashboard. The host
-/// terminal sets the split, so the width is the sidebar's only layout state.
-pub const SIDEBAR_FULL_AT: u16 = 100;
-
 /// Whether a sidebar given `width` columns is drawn as the collapsed rail.
 pub fn sidebar_collapsed(width: u16) -> bool {
     width < SIDEBAR_RAIL_BELOW
@@ -633,6 +629,10 @@ pub struct App {
     /// A host can show a popup over the whole workspace, so a sidebar's pickers
     /// and confirmations go there instead of into its narrow pane.
     modal_host: bool,
+    /// The sidebar has been expanded into the whole dashboard. An explicit mode,
+    /// not a width: the toggle asks the host to give it the window, and the host
+    /// cannot take the mode back by resizing.
+    expanded: bool,
     /// The width the last draw was given. The sidebar's own layout follows it:
     /// the host terminal owns the split, so its width is the state.
     width: u16,
@@ -934,16 +934,25 @@ impl App {
         self.width = width;
     }
 
-    /// Whether the sidebar is drawn compressed: narrow rows, no details and no
-    /// lifecycle actions. False for the dashboard, and false for a sidebar the
-    /// host has zoomed to the full width.
+    /// Whether the sidebar is drawn compressed: narrow rows and no details
+    /// panel. False for the dashboard, and false once the sidebar is expanded.
     pub fn sidebar_compact(&self) -> bool {
-        self.sidebar && self.width < SIDEBAR_FULL_AT
+        self.sidebar && !self.expanded
     }
 
     /// Whether the sidebar is drawn as the collapsed rail.
     pub fn sidebar_railed(&self) -> bool {
-        self.sidebar && sidebar_collapsed(self.width)
+        self.sidebar_compact() && sidebar_collapsed(self.width)
+    }
+
+    /// Whether the sidebar has been expanded into the whole dashboard.
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Flips between the compressed sidebar and the whole dashboard.
+    pub fn toggle_expanded(&mut self) {
+        self.expanded = !self.expanded;
     }
 
     /// Rebuilds the projected tree and re-validates selection.
@@ -1311,7 +1320,7 @@ impl App {
                 // Where the host can float a popup over the whole workspace, the
                 // pickers and confirmations go there; this pane is too narrow.
                 KeyCode::Char(ch @ ('r' | 'a' | 'A' | 'E' | 'D' | 'R' | '?'))
-                    if self.modal_host =>
+                    if self.modal_host && self.sidebar_compact() =>
                 {
                     let row = (ch != 'A').then(|| self.selected.clone()).flatten();
                     return Some(Action::Modal {
@@ -3005,6 +3014,13 @@ mod tests {
         ));
 
         sidebar.set_modal_host(true);
+        // Expanded, the pane is the whole window, so its dialogs are drawn in it.
+        sidebar.toggle_expanded();
+        assert!(matches!(
+            press(&mut sidebar, KeyCode::Char('D')),
+            Some(Action::BeginAction(Operation::Delete))
+        ));
+        sidebar.toggle_expanded();
         for ch in ['r', 'D', '?'] {
             assert_eq!(
                 press(&mut sidebar, KeyCode::Char(ch)),
