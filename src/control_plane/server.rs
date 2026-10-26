@@ -44,7 +44,7 @@ use crate::control_plane::registry::{
 };
 use crate::control_plane::store::{self, Category, RequestOutcome, RequestRecord, Store};
 use crate::control_plane::transport::{
-    Dispatch, EventReady, IngestDispatch, ListenerSource, Transport,
+    Dispatch, EventReady, IngestDispatch, ListenerSource, StreamOpen, Transport,
 };
 use crate::lifecycle::{self, CloseRequest, DirectClose};
 use crate::model::SessionUuid;
@@ -69,6 +69,7 @@ mod registration;
 mod subject_control;
 mod subject_reads;
 mod sweeper;
+mod ui;
 mod verification;
 use admission::*;
 use child_close::*;
@@ -387,6 +388,8 @@ struct Core {
     /// there is nothing to observe, and the read refuses rather than publishing
     /// an empty fleet as a successful one.
     hub: Option<Arc<crate::control_plane::observation::Hub>>,
+    /// The shared UI session every dashboard and sidebar attaches to.
+    ui: Option<crate::ui_session::actor::UiHandle>,
 }
 
 /// The control-plane daemon.
@@ -406,6 +409,8 @@ pub struct Daemon {
     /// The inode this daemon bound, or `None` for a socket systemd passed.
     socket_identity: Option<(u64, u64)>,
     core: Arc<Mutex<Core>>,
+    /// Owns the UI session's thread and the thread that feeds it observations.
+    ui: Option<(crate::ui_session::actor::UiService, Option<JoinHandle<()>>)>,
 }
 
 impl Daemon {
@@ -608,7 +613,10 @@ impl Daemon {
             sweep_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bootstrap,
             hub: None,
+            ui: None,
         }));
+        let ui_service = crate::ui_session::actor::UiService::start();
+        locked(&core).ui = Some(ui_service.handle());
         // One sampler for every display, sampling only while a reader asks. The
         // lifecycle sweep keeps its own coverage, so a daemon with no display
         // attached still observes what its managed state needs.
@@ -623,6 +631,15 @@ impl Daemon {
             ));
             locked(&core).hub = Some(hub);
         }
+        let ui_feeder = {
+            let (hub, handle) = {
+                let core = locked(&core);
+                (core.hub.clone(), core.ui.clone())
+            };
+            hub.zip(handle).and_then(|(hub, handle)| {
+                crate::ui_session::actor::feed(hub, handle, Arc::clone(&stopping))
+            })
+        };
         let dispatch_core = Arc::clone(&core);
         let dispatch_stopping = Arc::clone(&stopping);
         let dispatch_verification = Arc::clone(&verification);
@@ -636,12 +653,18 @@ impl Daemon {
                 &dispatch_stopping,
             );
         });
+        let stream_core = Arc::clone(&core);
+        let streams: Arc<StreamOpen> = Arc::new(move |line| {
+            let handle = locked(&stream_core).ui.clone();
+            ui::open(handle.as_ref(), line)
+        });
         let mut sources = vec![ListenerSource::control(
             listener,
             dispatch,
             event_signal,
             event_notification,
             event_ready,
+            streams,
         )];
         if let (Some(listener), Some(ingest)) = (task_listener, task_ingest) {
             let dispatch_ingest = Arc::clone(&ingest);
@@ -708,6 +731,7 @@ impl Daemon {
             sweeper,
             socket_identity,
             core,
+            ui: Some((ui_service, ui_feeder)),
         })
     }
 
@@ -754,6 +778,12 @@ impl Daemon {
         // served answers, and a request that arrives while stopping is refused
         // without being dispatched.
         transport.stop();
+        if let Some((service, feeder)) = self.ui.take() {
+            if let Some(feeder) = feeder {
+                let _ = feeder.join();
+            }
+            drop(service);
+        }
         if let Some(sweeper) = self.sweeper.take() {
             let _ = sweeper.join();
         }
@@ -859,6 +889,10 @@ fn handle_line(
         Method::Admit => answer(writer, admit_request(core, &request, verification)),
         Method::Wake => answer(writer, wake_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
+        Method::Ui => {
+            let handle = locked(core).ui.clone();
+            answer(writer, ui::request(handle.as_ref(), &request));
+        }
         Method::Operation(operation) => {
             let response = execute(operation, &request, core, verification);
             answer(writer, response);

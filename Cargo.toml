@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "=1.2.3"
 signal-hook = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
 toml = "1.1.6"
 # Domain errors state their own message and source rather than a hand-written
 # `Display`; the wire keeps its typed codes, so no error becomes opaque here.
@@ -40,3 +40,4 @@ tui-spinner = "0.4"
 strum = { version = "0.28", features = ["derive"] }
 # Key-to-command resolution for the dashboard. Pre-1.0, so pinned exactly.
 tui-actions = "=0.1.1"
+blake3 = "1.8.7"

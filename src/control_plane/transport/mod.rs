@@ -23,6 +23,9 @@ const MAX_CONNECTIONS: usize = 32;
 const CONTROL_LIMIT: usize = 8;
 const INGEST_LIMIT: usize = 4;
 const WAITING_LIMIT: usize = 8;
+/// Long-lived UI subscriptions. They hold a connection, not a handler or a lane
+/// permit, so they are bounded on their own and below `MAX_CONNECTIONS`.
+const SUBSCRIPTION_LIMIT: usize = 16;
 const MAX_BLOCKING_HANDLERS: usize = CONTROL_LIMIT + INGEST_LIMIT + WAITING_LIMIT;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -119,6 +122,19 @@ pub(crate) struct IngestResult {
 pub(crate) type Disconnect = dyn Fn(u64) + Send + Sync + 'static;
 pub(crate) type EventReady = dyn Fn(&[u8]) -> bool + Send + Sync + 'static;
 
+/// A stream of encoded response lines the server pushes until it ends. Each call
+/// waits for the next line; `None` ends the stream.
+pub(crate) trait FrameStream: Send {
+    fn next<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>>;
+}
+
+/// Opens the stream a request asks for. `None` means the method is not a
+/// streaming one; otherwise the stream, or the refusal that answers the request.
+pub(crate) type StreamOpen =
+    dyn Fn(&[u8]) -> Option<Result<Box<dyn FrameStream>, Response>> + Send + Sync + 'static;
+
 #[derive(Clone)]
 pub(crate) struct EventNotification {
     sender: watch::Sender<(u64, bool)>,
@@ -154,6 +170,7 @@ pub(crate) enum Service {
         dispatch: Arc<Dispatch>,
         signal: EventSignal,
         ready: Arc<EventReady>,
+        streams: Arc<StreamOpen>,
     },
     Ingest {
         dispatch: Arc<IngestDispatch>,
@@ -174,6 +191,7 @@ impl ListenerSource {
         signal: EventSignal,
         notification: EventNotification,
         ready: Arc<EventReady>,
+        streams: Arc<StreamOpen>,
     ) -> Self {
         Self {
             listener,
@@ -181,6 +199,7 @@ impl ListenerSource {
                 dispatch,
                 signal,
                 ready,
+                streams,
             },
             event_notification: Some(notification),
         }
@@ -389,6 +408,7 @@ struct Admission {
     control: Arc<Semaphore>,
     ingest: Arc<Semaphore>,
     waiting: Arc<Semaphore>,
+    subscriptions: Arc<Semaphore>,
 }
 
 impl Admission {
@@ -397,6 +417,7 @@ impl Admission {
             control: Arc::new(Semaphore::new(CONTROL_LIMIT)),
             ingest: Arc::new(Semaphore::new(INGEST_LIMIT)),
             waiting: Arc::new(Semaphore::new(WAITING_LIMIT)),
+            subscriptions: Arc::new(Semaphore::new(SUBSCRIPTION_LIMIT)),
         }
     }
 
@@ -530,6 +551,39 @@ async fn serve(
                 Service::Ingest { .. } => break,
             },
             ReadLine::Data(line) => {
+                if let Service::Control { streams, .. } = &service
+                    && is_stream_request(&line)
+                {
+                    if serving.stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Some(permit) = Arc::clone(&admission.subscriptions)
+                        .try_acquire_owned()
+                        .ok()
+                    else {
+                        let response = Response::refused(
+                            &request_id_of(&line),
+                            &Refusal::new(Code::Busy, "the subscription limit is reached"),
+                        );
+                        write_response(&writer, &response);
+                        continue;
+                    };
+                    let open = Arc::clone(streams);
+                    let request = line.clone();
+                    let opened = tokio::task::spawn_blocking(move || open(&request)).await;
+                    match opened {
+                        Ok(Some(Ok(stream))) => {
+                            push_frames(&mut reader, stream).await;
+                            drop(permit);
+                            break;
+                        }
+                        Ok(Some(Err(response))) => {
+                            write_response(&writer, &response);
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
                 let lane = match &service {
                     Service::Control { .. } => lane(&line),
                     Service::Ingest { .. } => Lane::Ingest,
@@ -570,6 +624,7 @@ async fn serve(
                         dispatch,
                         signal,
                         ready,
+                        ..
                     } => {
                         let line = wait_for_event(&line, signal, Arc::clone(ready)).await;
                         let dispatch = Arc::clone(dispatch);
@@ -602,6 +657,39 @@ async fn serve(
     connections.remove(id);
     if let Service::Ingest { disconnect, .. } = service {
         let _ = tokio::task::spawn_blocking(move || disconnect(id)).await;
+    }
+}
+
+fn is_stream_request(line: &[u8]) -> bool {
+    protocol::decode_request(line).is_ok_and(|request| request.method == "ui.subscribe")
+}
+
+/// Pushes a stream's lines until it ends, the peer closes or a write stalls.
+///
+/// The peer is watched for closure independently of publications, so an idle
+/// subscription is released as soon as its client goes. A slow reader costs only
+/// its own write deadline: the stream hands over the latest state, never a queue.
+async fn push_frames(
+    reader: &mut tokio::io::BufReader<UnixStream>,
+    mut stream: Box<dyn FrameStream>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut closed = [0u8; 1];
+    loop {
+        let frame = tokio::select! {
+            frame = stream.next() => frame,
+            _ = reader.read(&mut closed) => return,
+        };
+        let Some(mut frame) = frame else { return };
+        frame.push(b'\n');
+        let write = async {
+            let socket = reader.get_mut();
+            socket.write_all(&frame).await?;
+            socket.flush().await
+        };
+        if !matches!(tokio::time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
+            return;
+        }
     }
 }
 
@@ -827,6 +915,7 @@ mod tests {
                 signal,
                 notification,
                 ready,
+                Arc::new(|_| None),
             )],
             Arc::clone(&stopping),
         )

@@ -3499,7 +3499,8 @@ fn ping_answers_the_revision_and_backend_contracts_without_a_mux() {
             // Abandonment and observation are daemon-owned and need no mux.
             "lifecycle.abandon.v1",
             "observation.get.v1",
-            "communication.handoff.v1"
+            "communication.handoff.v1",
+            "ui.session.v1"
         ])
     );
     let unsupported = client.call(
@@ -12085,4 +12086,95 @@ fn wait_for_text(path: &Path) -> String {
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The UI session over a real socket: an attachment's push stream carries the
+/// baseline and then each newer state with no request in between, an action on
+/// its own connection is never held up by the idle stream, and closing the
+/// stream releases the attachment.
+#[test]
+fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
+    let sandbox = Sandbox::new("ui-subscribe");
+    let mut daemon = sandbox.daemon();
+    let mut client = Client::dial(daemon.path());
+    let attachment = random_uuid();
+
+    let ping = client.call("daemon.ping", json!({}));
+    assert!(
+        ping["result"]["contracts"]
+            .as_array()
+            .expect("contracts")
+            .iter()
+            .any(|contract| contract == "ui.session.v1"),
+        "{ping}"
+    );
+    let attached = client.call(
+        "ui.attach",
+        json!({"attachment_id": attachment, "role": "dashboard"}),
+    );
+    assert_eq!(
+        attached["result"]["attachment_id"], attachment,
+        "{attached}"
+    );
+
+    let mut stream = UnixStream::connect(daemon.path()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    writeln!(
+        stream,
+        "{}",
+        request_line(
+            &random_uuid(),
+            "ui.subscribe",
+            json!({"attachment_id": attachment})
+        )
+    )
+    .expect("subscribe");
+    let mut frames = BufReader::new(stream.try_clone().expect("clone"));
+    let mut next = || -> Value {
+        let mut line = String::new();
+        frames.read_line(&mut line).expect("a pushed frame");
+        serde_json::from_str(&line).expect("a frame is one JSON line")
+    };
+    let baseline = next();
+    let before = baseline["result"]["update_id"].as_u64().expect("update id");
+    assert_eq!(
+        baseline["result"]["session"]["order"], "source",
+        "{baseline}"
+    );
+
+    // The action travels the other connection while the stream sits idle.
+    let moved = client.call(
+        "ui.action",
+        json!({"attachment_id": attachment, "action_id": 1, "action": {"action": "cycle_order"}}),
+    );
+    assert_eq!(moved["result"]["outcome"], "applied", "{moved}");
+    let pushed = next();
+    assert!(pushed["result"]["update_id"].as_u64().expect("update id") > before);
+    assert_eq!(pushed["result"]["session"]["order"], "state", "{pushed}");
+
+    // A second primary subscription is refused rather than replacing the first.
+    let mut second = Client::dial(daemon.path());
+    let refused = second.call("ui.subscribe", json!({"attachment_id": attachment}));
+    assert_eq!(error_code(&refused), "refused", "{refused}");
+
+    drop(frames);
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let outcome = client.call(
+            "ui.action",
+            json!({"attachment_id": attachment, "action_id": 2, "action": {"action": "cycle_order"}}),
+        );
+        if outcome["result"]["outcome"] == "detached" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the attachment outlived its stream: {outcome}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    daemon.stop();
 }

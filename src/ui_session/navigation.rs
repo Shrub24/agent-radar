@@ -207,6 +207,14 @@ impl Navigation {
         self.reconcile();
     }
 
+    /// Replaces the whole query: the shared filter is edited by complete
+    /// strings, never by character.
+    pub fn set_filter(&mut self, query: &str) {
+        self.filter.clear();
+        self.filter.push_str(query);
+        self.reconcile();
+    }
+
     pub fn pop_filter(&mut self) {
         self.filter.pop();
         self.reconcile();
@@ -746,7 +754,7 @@ const RETAINED_RANK: u8 = 9;
 
 /// Whether a row is one a human should look at: stuck, unanswered, or in a
 /// state no source could name.
-fn needs_attention(row: &VisibleRow<'_>) -> bool {
+pub(crate) fn needs_attention(row: &VisibleRow<'_>) -> bool {
     matches!(
         &row.node.row.kind,
         RowKind::Agent(agent)
@@ -759,7 +767,7 @@ fn needs_attention(row: &VisibleRow<'_>) -> bool {
 }
 
 /// Whether a row is moving: an agent in the working state.
-fn is_working(row: &VisibleRow<'_>) -> bool {
+pub(crate) fn is_working(row: &VisibleRow<'_>) -> bool {
     matches!(
         &row.node.row.kind,
         RowKind::Agent(agent) if agent.state == AgentState::Working

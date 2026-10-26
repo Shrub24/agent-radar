@@ -3,6 +3,7 @@
 pub mod observation;
 pub mod spawn_list;
 pub mod subject;
+pub mod ui_session;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
