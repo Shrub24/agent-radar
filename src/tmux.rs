@@ -689,13 +689,26 @@ impl TmuxRuntime {
 
     /// Moves a pane's window into view and then makes the pane active in it.
     ///
-    /// Two commands, because tmux splits them: `select-window` alone leaves the
-    /// window's active pane where it was, and `select-pane` alone does not bring
-    /// the window into view. A failure of the second leaves the first applied,
-    /// so either failure is `unknown`.
+    /// Three commands, because tmux splits them: `switch-client` moves the
+    /// attached client to the session holding the pane, `select-window` brings
+    /// the window into view for that session, and `select-pane` makes the pane
+    /// active in it. Without the first, a target in another session changes that
+    /// session's current window while the client keeps showing its own, so the
+    /// focus has no visible effect and still reports success. A failure of a
+    /// later command leaves the earlier ones applied, so either is `unknown`.
     fn focus_pane(&self, handle: &str, cancel: &AtomicBool) -> Result<(), Failure> {
         let pane = self.address(handle, Kind::Pane).map_err(Failure::refused)?;
         self.require_client(cancel)?;
+        self.run(&["switch-client", "-t", &pane], cancel)
+            .map_err(|message| {
+                // Racing the last client's detach changes nothing: a definite
+                // refusal, not an effect that may have happened.
+                if message.contains("no current client") {
+                    Failure::refused(message)
+                } else {
+                    Failure::unknown(message)
+                }
+            })?;
         self.run(&["select-window", "-t", &pane], cancel)
             .map_err(Failure::unknown)?;
         self.run(&["select-pane", "-t", &pane], cancel)

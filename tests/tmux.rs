@@ -933,6 +933,56 @@ fn focus_moves_the_window_and_makes_the_pane_active() {
         .collect();
     assert_eq!(active[1], "1", "the focused pane's window is current");
     assert_eq!(active[2], "1", "the focused pane is active in its window");
+
+    // A pane in a session the client is not looking at must bring that session
+    // into the client's view. Selecting a window alone only changes the target
+    // session's own state, which the client never sees.
+    let other = probe.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "other",
+        "-x",
+        "100",
+        "-y",
+        "30",
+        "-P",
+        "-F",
+        "#{pane_id}",
+    ]);
+    let other = other.trim().to_string();
+    assert_eq!(
+        probe
+            .tmux(&["list-clients", "-F", "#{client_session}"])
+            .trim(),
+        "main",
+        "the client starts on the other session"
+    );
+    let outcome = probe
+        .runtime
+        .focus_outcome(&Target::Pane(probe.runtime_handle(&other)), &cancel());
+    assert_eq!(outcome, FocusOutcome::Completed, "{outcome:?}");
+    assert_eq!(
+        probe
+            .tmux(&["list-clients", "-F", "#{client_session}"])
+            .trim(),
+        "other",
+        "the client shows the focused pane's session"
+    );
+    let active = probe.tmux(&[
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id} #{window_active} #{pane_active}",
+    ]);
+    let active = active
+        .lines()
+        .find(|line| line.split(' ').next() == Some(other.as_str()))
+        .expect("the pane this test focused")
+        .split(' ')
+        .collect::<Vec<_>>();
+    assert_eq!(active[1], "1", "its window is current in its session");
+    assert_eq!(active[2], "1", "it is active in its window");
 }
 
 #[test]
