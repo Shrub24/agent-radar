@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 
+use self::commands::CommandId;
 use crate::control_plane::client::{
     ContainerCreate, ContainerCreateKind, ContainerDelete, ContainerReload,
 };
@@ -36,15 +37,16 @@ use crate::picker::{Item, Picker, Step};
 use crate::runtime::{CloseTarget, Target};
 use crate::tasks::{Task, TaskBoard, TaskEvent};
 use crate::theme;
+use crate::ui_session::Navigation;
+pub use crate::ui_session::navigation::{Connectors, PaneView, RowOrder, VisibleRow};
 use ratatui::layout::Rect;
 
 use crate::model::{
-    AgentState, CpuPercent, DescendantSample, FleetObservation, ForegroundEvidence,
-    ProcessIdentity, ProcessResources,
+    CpuPercent, DescendantSample, FleetObservation, ForegroundEvidence, ProcessIdentity,
+    ProcessResources,
 };
 use crate::tree::{
     AgentRow, ContainerRef, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskRow, TaskSource,
-    TreeNode,
 };
 
 /// How long a focus message stays up when no key clears it first.
@@ -77,8 +79,6 @@ pub enum Action {
     LaunchConfigured,
     /// The sidebar's hide/unhide key; the caller owns the host commands.
     ToggleSidebar,
-    /// The palette chose a command: run this key and use whatever it returns.
-    Replay(KeyCode),
     /// The sidebar's zoom key; the caller owns the host commands.
     ToggleZoom,
     /// Open a sidebar beside this dashboard; the caller owns the host command.
@@ -425,186 +425,6 @@ impl Operation {
     }
 }
 
-/// One row of the current view: the projected node plus its display depth,
-/// fold state and branch prefix.
-#[derive(Clone, Debug)]
-pub struct VisibleRow<'a> {
-    pub id: &'a RowId,
-    pub depth: usize,
-    pub node: &'a TreeNode,
-    /// Whether the row has children that this view can show (a workspace whose
-    /// only panes are hidden has none).
-    pub has_children: bool,
-    pub collapsed: bool,
-    /// The branch prefix to draw before the row's own marks.
-    pub connectors: Connectors,
-}
-
-impl VisibleRow<'_> {
-    /// Where this row's disclosure marker begins, in cells from the panel
-    /// content's left edge: exactly the branch prefix drawn before it. The draw
-    /// and a later marker hit test read one layout through this.
-    pub fn marker_column(&self) -> u16 {
-        (self.connectors.continuation.len() as u16 + u16::from(self.depth > 0)) * 2
-    }
-}
-
-/// How a visible row's branch prefix reads: the vertical continuation lines its
-/// visible ancestry requires, and whether a visible sibling follows it.
-///
-/// Derived while flattening the ordered, filtered view, so folds and filtering
-/// change it with the rows actually drawn; raw child indices cannot say this.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Connectors {
-    /// One flag per nested ancestor from the workspace inward: `true` where that
-    /// ancestor is followed by a visible sibling, so its branch line continues
-    /// past this row.
-    pub continuation: Vec<bool>,
-    /// Whether a visible sibling follows this row: the branch connector when
-    /// true, the last-child connector when false.
-    pub has_following_sibling: bool,
-}
-
-/// The prefix a child row draws: its parent's continuation columns, then the
-/// parent's own column when the parent is itself nested. A workspace root draws
-/// no connector, so its children start with an empty prefix and it leaves no
-/// continuation behind them.
-fn child_connectors(
-    parent: &Connectors,
-    parent_depth: usize,
-    has_following_sibling: bool,
-) -> Connectors {
-    let mut continuation = parent.continuation.clone();
-    if parent_depth > 0 {
-        continuation.push(parent.has_following_sibling);
-    }
-    Connectors {
-        continuation,
-        has_following_sibling,
-    }
-}
-
-/// Which ordinary panes the fleet tree lists.
-///
-/// Agents are the fleet; panes are the places work is happening without one.
-/// The fleet starts at `Running`: a pane with a command in the foreground is
-/// where a build, an editor or a merge tool is, and an exited pane is history
-/// rather than part of it. `All` is the explicit answer, and `Hidden` the quiet
-/// one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PaneView {
-    /// Agents only.
-    Hidden,
-    /// Panes with a command in the foreground.
-    #[default]
-    Running,
-    /// Every pane, whatever it is doing.
-    All,
-}
-
-impl PaneView {
-    /// The view `p` moves to next.
-    pub fn next(self) -> Self {
-        match self {
-            Self::Hidden => Self::Running,
-            Self::Running => Self::All,
-            Self::All => Self::Hidden,
-        }
-    }
-
-    /// A short name for the hint line and tests.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Hidden => "agents",
-            Self::Running => "running",
-            Self::All => "all",
-        }
-    }
-}
-
-/// Which rows the tree lists: the pane view, plus whether finished sessions are
-/// listed while ordinary panes are hidden and whether background tasks are
-/// listed in this view.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Visibility {
-    view: PaneView,
-    history: bool,
-    tasks: bool,
-}
-
-impl Visibility {
-    /// Whether this view lists a row of this kind. A workspace, an agent and an
-    /// ordinary pane follow the pane view; background tasks follow their own
-    /// per-view choice.
-    fn includes(self, kind: &RowKind) -> bool {
-        match kind {
-            RowKind::Task(_) => self.tasks,
-            RowKind::Pane(pane) => match self.view {
-                // A finished session is history rather than fleet, so only the
-                // explicit toggle brings it into a view — and only while the
-                // pane is not in use again.
-                PaneView::Hidden => {
-                    self.history && pane.exited.is_some() && pane.command().is_none()
-                }
-                PaneView::Running => {
-                    pane.command().is_some()
-                        || (self.history && pane.exited.is_some() && pane.command().is_none())
-                }
-                PaneView::All => true,
-            },
-            // An agent that joins no pane, or whose subject's process the daemon
-            // recorded as ended, is history. So is a subject that outlived its
-            // process: both are reachable through the same toggle, and both are
-            // counted where the footer says how many rows are hidden.
-            RowKind::Agent(agent) => !agent.history() || self.history,
-            RowKind::Lifecycle(subject) => !subject.history() || self.history,
-            RowKind::Workspace { .. } => true,
-        }
-    }
-}
-
-/// Whether background-task children are listed, per pane view, for this Radar
-/// run.
-///
-/// A presentation choice rather than a fact: `agents` view is the fleet, so it
-/// starts with the children hidden, while `running` and `all` are the operator's
-/// view of outstanding work and start with them shown. Each view keeps its own
-/// answer, so `b` in one view cannot change what another lists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TaskRows {
-    agents: bool,
-    running: bool,
-    all: bool,
-}
-
-impl Default for TaskRows {
-    fn default() -> Self {
-        Self {
-            agents: false,
-            running: true,
-            all: true,
-        }
-    }
-}
-
-impl TaskRows {
-    fn shown(self, view: PaneView) -> bool {
-        match view {
-            PaneView::Hidden => self.agents,
-            PaneView::Running => self.running,
-            PaneView::All => self.all,
-        }
-    }
-
-    fn toggle(&mut self, view: PaneView) {
-        match view {
-            PaneView::Hidden => self.agents = !self.agents,
-            PaneView::Running => self.running = !self.running,
-            PaneView::All => self.all = !self.all,
-        }
-    }
-}
-
 /// Below this width the sidebar is drawn as a one-column rail of state marks.
 pub const SIDEBAR_RAIL_BELOW: u16 = 16;
 
@@ -617,12 +437,9 @@ pub fn sidebar_collapsed(width: u16) -> bool {
 /// panes are listed.
 #[derive(Debug, Default)]
 pub struct App {
-    tree: FleetTree,
-    collapsed: HashSet<RowId>,
-    /// Filter query as typed; empty means "no filter".
-    filter: String,
+    /// The shared navigation: the tree, folds, filter, pane view and selection.
+    nav: Navigation,
     filter_editing: bool,
-    view: PaneView,
     /// Whether the details panel is hidden. Stored inverted so `Default` — the
     /// state a run starts in — is "details shown".
     details_hidden: bool,
@@ -643,19 +460,9 @@ pub struct App {
     /// the host terminal owns the split, so its width is the state.
     width: u16,
     /// The command palette.
-    palette: Option<Picker<KeyCode>>,
+    palette: Option<Picker<CommandId>>,
     /// The workspace chooser, open while a new workspace waits for its directory.
     workspace_picker: Option<Picker<PathBuf>>,
-    /// Whether finished sessions are listed while ordinary panes are hidden.
-    /// Off by default: the agents view is the live fleet, and a fleet with its
-    /// history in it stops being an overview.
-    history_shown: bool,
-    /// Whether task children are listed, remembered per pane view for this run.
-    task_rows: TaskRows,
-    selected: Option<RowId>,
-    /// Index of the selected row in the last visible-row list, used as the
-    /// fallback position when the selected row disappears.
-    anchor: usize,
     /// Bus data pushed by connected extensions, joined to rows when they are
     /// drawn. It sits beside the tree rather than inside it: bus facts are true
     /// only while their connection is open, so a refresh must never be able to
@@ -680,8 +487,6 @@ pub struct App {
     /// lifecycle close — and when it was set. It clears on the next key press or
     /// after [`FOCUS_MESSAGE_TTL`].
     focus_message: Option<(String, Instant)>,
-    /// How siblings are ordered. Structure is never changed by it.
-    order: RowOrder,
     /// Where the last draw put things, and how far each page is scrolled.
     layout: Geometry,
     /// Which page of the selected row the panel shows.
@@ -841,40 +646,6 @@ pub struct Geometry {
     pub confirm_confirm: Option<Rect>,
 }
 
-/// How rows within a level are ordered. Ordering never moves a row out of its
-/// parent, its group or its workspace — it only changes the sequence of
-/// siblings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RowOrder {
-    /// The order the observation arrived in. The default.
-    #[default]
-    Source,
-    /// Rows that need a human first, then the rest by the state's own weight.
-    /// A group ranks by its most urgent row.
-    State,
-    /// Alphabetically, by the label a row shows.
-    Name,
-}
-
-impl RowOrder {
-    /// The order's name, as the hint line states it.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Source => "source",
-            Self::State => "state",
-            Self::Name => "name",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Source => Self::State,
-            Self::State => Self::Name,
-            Self::Name => Self::Source,
-        }
-    }
-}
-
 impl App {
     /// A fresh view: no tree, no selection, ordinary panes hidden, no bus data.
     pub fn new() -> Self {
@@ -912,15 +683,12 @@ impl App {
 
     /// The selected row's identity, which a popup selects again by value.
     pub fn selected_id(&self) -> Option<RowId> {
-        self.selected.clone()
+        self.nav.selected_id().cloned()
     }
 
     /// Lists every row, so a row another view could see is one this can select.
     pub fn show_everything(&mut self) {
-        self.view = PaneView::All;
-        self.history_shown = true;
-        self.task_rows.all = true;
-        self.reconcile_selection();
+        self.navigate(|nav| nav.show_everything());
     }
 
     /// Whether a refused deletion is armed to be repeated with force.
@@ -931,12 +699,7 @@ impl App {
     /// Selects `id` exactly, or nothing: a row that is gone is not replaced by a
     /// neighbour, because the action it was chosen for must not land elsewhere.
     pub fn select_exact(&mut self, id: &RowId) -> bool {
-        let Some(index) = self.visible_rows().iter().position(|row| row.id == id) else {
-            return false;
-        };
-        self.select(Some(id.clone()));
-        self.anchor = index;
-        true
+        self.navigate(|nav| nav.select_exact(id))
     }
 
     /// Records the width this draw was given, so the sidebar's layout can follow
@@ -973,66 +736,28 @@ impl App {
     /// when that row is gone. The focus targets are re-derived here too: what
     /// `Enter` may focus is a property of the observation that was just drawn.
     pub fn refresh(&mut self, state: &ObservationState) {
-        self.tree = FleetTree::build(state);
-        self.tree.attach_tasks(&self.bus);
+        let mut tree = FleetTree::build(state);
+        tree.attach_tasks(&self.bus);
+        self.navigate(|nav| nav.replace_tree(tree));
         self.source_current = matches!(state.source_freshness(), SourceFreshness::Current);
         self.focus_targets = if self.source_current {
-            crate::focus::targets(&self.tree, state)
+            crate::focus::targets(self.nav.tree(), state)
         } else {
             HashMap::new()
         };
-        self.reconcile_selection();
         self.prune_disclosures();
         self.reconcile_process();
     }
 
     /// The projected tree as of the last [`Self::refresh`].
     pub fn tree(&self) -> &FleetTree {
-        &self.tree
+        self.nav.tree()
     }
 
     /// Rows currently displayed, in source order, honouring folds, the
     /// ordinary-pane toggle and the filter.
     pub fn visible_rows(&self) -> Vec<VisibleRow<'_>> {
-        let mut rows = Vec::new();
-        match self.needle() {
-            Some(needle) => {
-                let roots = ordered(&self.tree.roots, self.order)
-                    .into_iter()
-                    .filter(|root| subtree_matches(root, &needle, self.visibility(), self.order));
-                for root in roots {
-                    collect_filtered(
-                        root,
-                        0,
-                        &needle,
-                        self.visibility(),
-                        self.order,
-                        Connectors::default(),
-                        &mut rows,
-                    );
-                }
-            }
-            None => {
-                for root in ordered(&self.tree.roots, self.order) {
-                    // A heading with nothing left under it is not a row: history
-                    // belonging to one workspace must not leave an empty
-                    // workspace standing in the fleet view.
-                    if !subtree_has_visible(root, self.visibility()) {
-                        continue;
-                    }
-                    collect_visible(
-                        root,
-                        0,
-                        self.visibility(),
-                        &self.collapsed,
-                        self.order,
-                        Connectors::default(),
-                        &mut rows,
-                    );
-                }
-            }
-        }
-        rows
+        self.nav.visible_rows()
     }
 
     /// Records where the draw just put the panels, and keeps the page on screen
@@ -1052,48 +777,65 @@ impl App {
         }
     }
 
-    /// Moves the selection to a row identity. Another row starts every page at
-    /// its top: a scroll belongs to the row it was scrolled in, and so does an
-    /// opened block.
+    /// Moves the selection to a row identity.
     fn select(&mut self, id: Option<RowId>) {
-        if self.selected != id {
-            self.detail_scroll = [0; DetailPage::COUNT];
-            self.expanded_disclosures.clear();
-            self.disclosure_target = 0;
-            // The process table belongs to the row it was drawn for: another row
-            // is another process, and folds and a cursor are not carried onto it.
-            self.process = ProcessCursor::default();
+        self.navigate(|nav| nav.select(id));
+    }
+
+    /// Runs one navigation step. A step that moves the selection starts the new
+    /// row's reading from the top: its scroll, opened blocks and process cursor
+    /// belong to the row they were made in.
+    fn navigate<R>(&mut self, step: impl FnOnce(&mut Navigation) -> R) -> R {
+        let before = self.nav.selected_id().cloned();
+        let outcome = step(&mut self.nav);
+        self.reset_reading_if_moved(before);
+        outcome
+    }
+
+    fn reset_reading_if_moved(&mut self, before: Option<RowId>) {
+        if self.nav.selected_id() == before.as_ref() {
+            return;
         }
-        self.selected = id;
+        self.detail_scroll = [0; DetailPage::COUNT];
+        self.expanded_disclosures.clear();
+        self.disclosure_target = 0;
+        // The process table belongs to the row it was drawn for: another row is
+        // another process, and folds and a cursor are not carried onto it.
+        self.process = ProcessCursor::default();
+    }
+
+    /// Attaches the task bus to the projected tree. The bus sits beside the tree
+    /// as App state, so this borrows both fields instead of going through
+    /// [`Self::navigate`].
+    fn attach_tasks(&mut self) {
+        let before = self.nav.selected_id().cloned();
+        self.nav.attach_tasks(&self.bus);
+        self.reset_reading_if_moved(before);
     }
 
     /// The order siblings are shown in, which `s` cycles.
     pub fn order(&self) -> RowOrder {
-        self.order
+        self.nav.order()
     }
 
     /// `s`: the next order, keeping the same rows visible.
     pub fn cycle_order(&mut self) {
-        self.order = self.order.next();
+        self.nav.cycle_order();
     }
 
     /// Index of the selected row within [`Self::visible_rows`], if any.
     pub fn selected_index(&self) -> Option<usize> {
-        let selected = self.selected.as_ref()?;
-        self.visible_rows()
-            .iter()
-            .position(|row| row.id == selected)
+        self.nav.selected_index()
     }
 
     /// The selected row, if the selection still resolves to a visible row.
     pub fn selected_row(&self) -> Option<VisibleRow<'_>> {
-        let index = self.selected_index()?;
-        self.visible_rows().into_iter().nth(index)
+        self.nav.selected_row()
     }
 
     /// Whether the row is currently folded.
     pub fn is_collapsed(&self, id: &RowId) -> bool {
-        self.collapsed.contains(id)
+        self.nav.is_collapsed(id)
     }
 
     /// Whether anything on screen is animating, which is what makes a redraw
@@ -1124,7 +866,7 @@ impl App {
 
     /// Which ordinary panes are listed. Running panes by default.
     pub fn pane_view(&self) -> PaneView {
-        self.view
+        self.nav.pane_view()
     }
 
     /// Whether the details panel is shown. Shown by default, and toggleable
@@ -1136,12 +878,12 @@ impl App {
     /// Whether panes whose label is a finished session are listed even while
     /// ordinary panes are hidden.
     pub fn shows_history(&self) -> bool {
-        self.history_shown
+        self.nav.shows_history()
     }
 
     /// Whether background-task children are listed in the current view.
     pub fn shows_tasks(&self) -> bool {
-        self.task_rows.shown(self.view)
+        self.nav.shows_tasks()
     }
 
     /// `b`: lists or hides background-task children in the current view only.
@@ -1149,10 +891,9 @@ impl App {
     /// Facts are untouched: the projection, the parent badges and the details
     /// stay current while the children are hidden, so revealing them later
     /// shows the latest report rather than a cached list. A task hidden under
-    /// the selection falls back through [`Self::reconcile_selection`].
+    /// the selection falls back to its owner.
     pub fn toggle_tasks(&mut self) {
-        self.task_rows.toggle(self.view);
-        self.reconcile_selection();
+        self.navigate(|nav| nav.toggle_tasks());
     }
 
     /// Applies one event from the bus listener.
@@ -1164,8 +905,7 @@ impl App {
     /// and now.
     pub fn apply_task_event(&mut self, event: TaskEvent) {
         self.bus.apply(event);
-        self.tree.attach_tasks(&self.bus);
-        self.reconcile_selection();
+        self.attach_tasks();
         self.prune_disclosures();
     }
 
@@ -1175,8 +915,7 @@ impl App {
             bus.apply(event);
         }
         self.bus = bus;
-        self.tree.attach_tasks(&self.bus);
-        self.reconcile_selection();
+        self.attach_tasks();
         self.prune_disclosures();
     }
 
@@ -1192,17 +931,7 @@ impl App {
 
     /// Lists or hides finished sessions.
     pub fn toggle_history(&mut self) {
-        self.history_shown = !self.history_shown;
-        self.reconcile_selection();
-    }
-
-    /// The rows the tree currently lists.
-    fn visibility(&self) -> Visibility {
-        Visibility {
-            view: self.view,
-            history: self.history_shown,
-            tasks: self.task_rows.shown(self.view),
-        }
+        self.navigate(|nav| nav.toggle_history());
     }
 
     /// How many rows the history toggle would add to this view. The footer says
@@ -1210,28 +939,12 @@ impl App {
     /// that is gone. A filter answers for itself, so no count is offered while
     /// one is set.
     pub fn hidden_history(&self) -> usize {
-        if self.history_shown || self.needle().is_some() {
-            return 0;
-        }
-        let listed = self.visibility();
-        let with_history = Visibility {
-            history: true,
-            ..listed
-        };
-        let mut count = 0;
-        let mut pending: Vec<&TreeNode> = self.tree.roots.iter().collect();
-        while let Some(node) = pending.pop() {
-            if with_history.includes(&node.row.kind) && !listed.includes(&node.row.kind) {
-                count += 1;
-            }
-            pending.extend(node.children.iter());
-        }
-        count
+        self.nav.hidden_history()
     }
 
     /// The active filter query (empty when none is set).
     pub fn filter_query(&self) -> &str {
-        &self.filter
+        self.nav.filter_query()
     }
 
     /// Whether `/` has put the view into text-entry mode. While true, all
@@ -1242,7 +955,7 @@ impl App {
     }
 
     /// The open command palette, if any.
-    pub fn palette(&self) -> Option<&Picker<KeyCode>> {
+    pub fn palette(&self) -> Option<&Picker<CommandId>> {
         self.palette.as_ref()
     }
 
@@ -1269,8 +982,8 @@ impl App {
         self.workspace_picker = Some(Picker::new("Workspace", "enter open · esc cancel", items));
     }
 
-    /// One picker key. Answers with the replay of a chosen command, or with the
-    /// chosen workspace, so the caller keeps the effect.
+    /// One picker key. Answers with the effect of a chosen command or workspace,
+    /// so the caller keeps the effect.
     fn handle_picker_key(&mut self, key: KeyEvent) -> Option<Action> {
         if let Some(mut picker) = self.palette.take() {
             return match picker.handle_key(key) {
@@ -1279,7 +992,7 @@ impl App {
                     None
                 }
                 Step::Close => None,
-                Step::Choose(code) => Some(Action::Replay(code)),
+                Step::Choose(command) => self.run(command),
             };
         }
         let mut picker = self.workspace_picker.take()?;
@@ -1363,12 +1076,14 @@ impl App {
                 KeyCode::Char(ch @ ('r' | 'a' | 'A' | 'E' | 'D' | 'R' | '?'))
                     if self.modal_host
                         && self.sidebar_compact()
-                        && (ch == 'A' || self.selected.is_some()) =>
+                        && (ch == 'A' || self.nav.selected_id().is_some()) =>
                 {
                     // With nothing selected, a key that needs a row is handled
                     // here, where it says so: the popup would otherwise pick its
                     // own default row and act on that.
-                    let row = (ch != 'A').then(|| self.selected.clone()).flatten();
+                    let row = (ch != 'A')
+                        .then(|| self.nav.selected_id().cloned())
+                        .flatten();
                     return Some(Action::Modal {
                         key: KeyCode::Char(ch),
                         row,
@@ -1390,42 +1105,13 @@ impl App {
                 return None;
             }
         }
+        if let Some(command) = commands::resolve(key.code) {
+            return self.run(command);
+        }
         match key.code {
-            // `S` asks the host to open a sidebar beside this dashboard; the
-            // sidebar itself cannot, so the key is gated above.
-            KeyCode::Char('S') => return Some(Action::LaunchSidebar),
-            KeyCode::Char('r') => return Some(Action::BeginAction(Operation::Restart)),
-            // Container controls act on a container Radar records rather than on an
-            // owner: `a` adds a place inside it, `D` deletes it, `R` reloads its slot.
-            KeyCode::Char('a') => return Some(Action::BeginAction(Operation::CreateContainer)),
-            // `A` starts a workspace from nowhere: nothing is selected, replaced or
-            // confirmed, because an addition cannot take anything away.
-            KeyCode::Char('A') => return Some(Action::NewWorkspace),
-            // `L` launches the configured managed agent in a new tab or pane.
-            // `E` reports Radar's automatic Pi presence standing.
-            KeyCode::Char('E') => return Some(Action::BeginAction(Operation::PresenceStatus)),
-            KeyCode::Char('L') => return Some(Action::LaunchConfigured),
-            KeyCode::Char('D') => return Some(Action::BeginAction(Operation::Delete)),
-            KeyCode::Char('R') => return Some(Action::BeginAction(Operation::ReloadContainer)),
             KeyCode::Char('c') => self.dismiss_notices(),
-            // `!` opens the whole text of what was reported: the footer shows one
-            // clipped line, and a refusal is longer than that.
-            KeyCode::Char('!') => self.toggle_notices(),
-            KeyCode::Tab | KeyCode::BackTab => self.toggle_detail_focus(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char(' ') => self.toggle_fold(),
-            KeyCode::Left => self.collapse_selected(),
-            KeyCode::Right => self.expand_selected(),
-            KeyCode::Char('p') => self.cycle_panes(),
-            KeyCode::Char('s') => self.cycle_order(),
-            KeyCode::Char('n') => self.jump(needs_attention, true),
-            KeyCode::Char('N') => self.jump(needs_attention, false),
-            KeyCode::Char('w') => self.jump(is_working, true),
-            KeyCode::Char('W') => self.jump(is_working, false),
-            KeyCode::Char('d') => self.toggle_details(),
-            KeyCode::Char('e') => self.toggle_history(),
-            KeyCode::Char('b') => self.toggle_tasks(),
             KeyCode::Char('?') => {
                 self.palette = Some(Picker::new(
                     "Commands",
@@ -1433,13 +1119,59 @@ impl App {
                     commands::items(self.sidebar, self.sidebar_compact(), self.modal_only),
                 ))
             }
-            KeyCode::Char('/') => self.filter_editing = true,
             KeyCode::Esc => {
-                self.filter.clear();
-                self.reconcile_selection();
+                self.navigate(|nav| nav.clear_filter());
             }
-            KeyCode::Enter => return self.focus_selected(),
             _ => {}
+        }
+        None
+    }
+
+    /// Runs a command by its identity. A key and a palette choice both arrive
+    /// here, so a command means the same wherever it was chosen.
+    fn run(&mut self, command: CommandId) -> Option<Action> {
+        match command {
+            CommandId::Focus => return self.focus_selected(),
+            CommandId::Filter => self.filter_editing = true,
+            CommandId::NextAttention => self.navigate(|nav| nav.jump_attention(true)),
+            CommandId::PreviousAttention => self.navigate(|nav| nav.jump_attention(false)),
+            CommandId::NextWorking => self.navigate(|nav| nav.jump_working(true)),
+            CommandId::PreviousWorking => self.navigate(|nav| nav.jump_working(false)),
+            CommandId::Fold => self.toggle_fold(),
+            CommandId::Collapse => self.collapse_selected(),
+            CommandId::Expand => self.expand_selected(),
+            CommandId::PaneView => self.cycle_panes(),
+            CommandId::TreeOrder => self.cycle_order(),
+            CommandId::FinishedSessions => self.toggle_history(),
+            CommandId::BackgroundTasks => self.toggle_tasks(),
+            CommandId::Details => self.toggle_details(),
+            CommandId::FocusSwap => self.toggle_detail_focus(),
+            // `!` opens the whole text of what was reported: the footer shows one
+            // clipped line, and a refusal is longer than that.
+            CommandId::Notices => self.toggle_notices(),
+            // `S` and `B` are the sidebar's host controls; a dashboard has no sidebar
+            // to hide, so its `B` does nothing.
+            CommandId::OpenSidebar => return Some(Action::LaunchSidebar),
+            CommandId::HideSidebar => return self.sidebar.then_some(Action::ToggleSidebar),
+            // `A` starts a workspace from nowhere: nothing is selected, replaced or
+            // confirmed, because an addition cannot take anything away.
+            CommandId::NewWorkspace => return Some(Action::NewWorkspace),
+            // `L` launches the configured managed agent in a new tab or pane.
+            CommandId::LaunchConfigured => return Some(Action::LaunchConfigured),
+            CommandId::Restart => return Some(Action::BeginAction(Operation::Restart)),
+            // Container controls act on a container Radar records rather than on an
+            // owner: `a` adds a place inside it, `D` deletes it, `R` reloads its slot.
+            CommandId::CreateContainer => {
+                return Some(Action::BeginAction(Operation::CreateContainer));
+            }
+            CommandId::ReloadContainer => {
+                return Some(Action::BeginAction(Operation::ReloadContainer));
+            }
+            // `E` reports Radar's automatic Pi presence standing.
+            CommandId::PresenceStatus => {
+                return Some(Action::BeginAction(Operation::PresenceStatus));
+            }
+            CommandId::Delete => return Some(Action::BeginAction(Operation::Delete)),
         }
         None
     }
@@ -1522,40 +1254,6 @@ impl App {
         true
     }
 
-    /// `n`/`N` and `w`/`W`: move the selection to the nearest row of a kind,
-    /// wrapping at the ends. A row hidden by a fold or excluded by the filter is
-    /// not visible, so it cannot be jumped to; an empty view moves nothing.
-    fn jump(&mut self, wanted: fn(&VisibleRow<'_>) -> bool, forward: bool) {
-        let rows = self.visible_rows();
-        if rows.is_empty() {
-            return;
-        }
-        let matching: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| wanted(row))
-            .map(|(index, _)| index)
-            .collect();
-        let next = match (forward, self.selected_index()) {
-            (true, Some(current)) => matching
-                .iter()
-                .copied()
-                .find(|index| *index > current)
-                .or_else(|| matching.first().copied()),
-            (false, Some(current)) => matching
-                .iter()
-                .rev()
-                .copied()
-                .find(|index| *index < current)
-                .or_else(|| matching.last().copied()),
-            (true, None) => matching.first().copied(),
-            (false, None) => matching.last().copied(),
-        };
-        if let Some(index) = next {
-            self.select(Some(rows[index].id.clone()));
-        }
-    }
-
     /// `Enter`: the action that focuses the selected row, or a one-line message
     /// saying why it cannot be done.
     ///
@@ -1634,127 +1332,44 @@ impl App {
             KeyCode::Esc => {
                 // Clearing the filter restores the unfiltered tree with its
                 // pre-filter fold state (folds are never touched by filtering).
-                self.filter.clear();
+                self.navigate(|nav| nav.clear_filter());
                 self.filter_editing = false;
             }
             KeyCode::Enter => self.filter_editing = false,
-            KeyCode::Backspace => {
-                self.filter.pop();
-            }
-            KeyCode::Char(c) => self.filter.push(c),
-            _ => return,
+            KeyCode::Backspace => self.navigate(|nav| nav.pop_filter()),
+            KeyCode::Char(c) => self.navigate(|nav| nav.push_filter(c)),
+            _ => {}
         }
-        self.reconcile_selection();
     }
 
     /// Moves the selection by `delta` visible rows, clamped to the view.
     pub fn move_selection(&mut self, delta: i32) {
-        let rows = self.visible_rows();
-        if rows.is_empty() {
-            self.select(None);
-            self.anchor = 0;
-            return;
-        }
-        let current = self
-            .selected_index()
-            .unwrap_or_else(|| self.anchor.min(rows.len() - 1));
-        let next = (current as i64 + delta as i64).clamp(0, rows.len() as i64 - 1) as usize;
-        self.select(Some(rows[next].id.clone()));
-        self.anchor = next;
+        self.navigate(|nav| nav.move_selection(delta));
     }
 
     /// Folds the selected branch when it is open and unfolds it when it is
     /// closed: one key for the whole gesture, whichever way the branch points.
     pub fn toggle_fold(&mut self) {
-        match self.selected_row().map(|row| row.collapsed) {
-            Some(true) => self.expand_selected(),
-            Some(false) => self.collapse_selected(),
-            None => {}
-        }
+        self.navigate(|nav| nav.toggle_fold());
     }
 
-    /// Folds the selected branch. No-op on a row without visible children.
-    ///
-    /// Folding is ignored while a filter is active: the filtered view keeps
-    /// matching ancestors visible by design, so a fold could not take effect.
+    /// Folds the selected branch. No-op on a row without visible children, and
+    /// while a filter is active: the filtered view keeps matching ancestors
+    /// visible by design, so a fold could not take effect.
     pub fn collapse_selected(&mut self) {
-        if self.needle().is_some() {
-            return;
-        }
-        let Some(row) = self.selected_row() else {
-            return;
-        };
-        if row.has_children {
-            self.collapsed.insert(row.id.clone());
-            self.reconcile_selection();
-        }
+        self.navigate(|nav| nav.collapse_selected());
     }
 
-    /// Unfolds the selected branch. No-op when it is already unfolded.
-    ///
-    /// Ignored while a filter is active, like [`Self::collapse_selected`].
+    /// Unfolds the selected branch. No-op when it is already unfolded, and while
+    /// a filter is active, like [`Self::collapse_selected`].
     pub fn expand_selected(&mut self) {
-        if self.needle().is_some() {
-            return;
-        }
-        let Some(id) = self.selected_row().map(|row| row.id.clone()) else {
-            return;
-        };
-        if self.collapsed.remove(&id) {
-            self.reconcile_selection();
-        }
+        self.navigate(|nav| nav.expand_selected());
     }
 
     /// Moves to the next pane view: agents, then what is running, then every
     /// pane, and round again.
     pub fn cycle_panes(&mut self) {
-        self.view = self.view.next();
-        self.reconcile_selection();
-    }
-
-    fn needle(&self) -> Option<String> {
-        let query = self.filter.trim();
-        if query.is_empty() {
-            return None;
-        }
-        Some(query.to_lowercase())
-    }
-
-    /// Keeps the selection on a real, visible row.
-    fn reconcile_selection(&mut self) {
-        let rows = self.visible_rows();
-        if rows.is_empty() {
-            self.select(None);
-            self.anchor = 0;
-            return;
-        }
-        if let Some(selected) = &self.selected
-            && let Some(index) = rows.iter().position(|row| row.id == selected)
-        {
-            self.anchor = index;
-            return;
-        }
-        // A task its publisher stopped reporting falls back to the agent row it
-        // hung under, which is still there for it to be read from. Only when
-        // that row is gone too does the position fallback below apply.
-        let task_owner = match &self.selected {
-            Some(RowId::Task(task)) => Some(task.owner.clone()),
-            _ => None,
-        };
-        if let Some(owner) = task_owner
-            && let Some(index) = rows
-                .iter()
-                .position(|row| matches!(&row.id, RowId::Agent(pane_id) if *pane_id == owner))
-        {
-            self.select(Some(rows[index].id.clone()));
-            self.anchor = index;
-            return;
-        }
-        // The selected row is gone: stay at the same position if the view has
-        // one, otherwise at its end. Selection is never left dangling.
-        let anchor = self.anchor.min(rows.len() - 1);
-        self.select(Some(rows[anchor].id.clone()));
-        self.anchor = anchor;
+        self.navigate(|nav| nav.cycle_panes());
     }
 }
 
@@ -1998,226 +1613,12 @@ fn tab_losses(inventory: &FleetObservation, tab_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether this node has children the current view can display.
-fn has_visible_children(node: &TreeNode, visible: Visibility) -> bool {
-    node.children
-        .iter()
-        .any(|child| visible.includes(&child.row.kind))
-}
-
-/// Whether this node or anything below it survives the view. A workspace is a
-/// heading rather than a fact, so it is listed through what is under it and a
-/// workspace left holding nothing is not a row of its own. Every other row is a
-/// fact that is drawn when it passes the view, whatever it holds.
-fn subtree_has_visible(node: &TreeNode, visible: Visibility) -> bool {
-    let below = |node: &TreeNode| {
-        node.children
-            .iter()
-            .any(|child| subtree_has_visible(child, visible))
-    };
-    match &node.row.kind {
-        // A workspace the projection holds with nothing under it stays: it is a
-        // place that exists. One emptied by this view's own toggles does not.
-        RowKind::Workspace { .. } => node.children.is_empty() || below(node),
-        _ => visible.includes(&node.row.kind) || below(node),
-    }
-}
-
-/// Collects the unfolded view, skipping hidden ordinary panes. A branch's
-/// connector is decided from the siblings that survive filtering and folding,
-/// not from the children the projection holds.
-fn collect_visible<'a>(
-    node: &'a TreeNode,
-    depth: usize,
-    visible: Visibility,
-    collapsed: &HashSet<RowId>,
-    order: RowOrder,
-    connectors: Connectors,
-    out: &mut Vec<VisibleRow<'a>>,
-) {
-    let folded = collapsed.contains(&node.row.id);
-    out.push(VisibleRow {
-        id: &node.row.id,
-        depth,
-        node,
-        has_children: has_visible_children(node, visible),
-        collapsed: folded,
-        connectors: connectors.clone(),
-    });
-    if folded {
-        return;
-    }
-    let children: Vec<&TreeNode> = ordered(&node.children, order)
-        .into_iter()
-        .filter(|child| visible.includes(&child.row.kind))
-        .collect();
-    let count = children.len();
-    for (index, child) in children.into_iter().enumerate() {
-        collect_visible(
-            child,
-            depth + 1,
-            visible,
-            collapsed,
-            order,
-            child_connectors(&connectors, depth, index + 1 < count),
-            out,
-        );
-    }
-}
-
-/// Whether this subtree contributes a row to the filtered view: the row itself
-/// matches, or a visible descendant does. What the filter keeps, so the
-/// connectors are built from the rows that are drawn.
-fn subtree_matches(node: &TreeNode, needle: &str, visible: Visibility, order: RowOrder) -> bool {
-    node.row.matches(needle)
-        || ordered(&node.children, order).into_iter().any(|child| {
-            visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
-        })
-}
-
 /// Whether a position falls inside an area. Radar's areas are half-open, as the
 /// terminal's are: the edge cell belongs to the next panel.
 fn inside(area: Option<Rect>, at: (u16, u16)) -> bool {
     area.is_some_and(|area| {
         at.0 >= area.x && at.0 < area.right() && at.1 >= area.y && at.1 < area.bottom()
     })
-}
-
-/// One level's children in the chosen order.
-///
-/// The sort is stable, so rows that compare equal keep the order the
-/// observation gave them and a re-sort never shuffles them.
-fn ordered(children: &[TreeNode], order: RowOrder) -> Vec<&TreeNode> {
-    let mut ordered: Vec<&TreeNode> = children.iter().collect();
-    match order {
-        RowOrder::Source => {}
-        RowOrder::State => ordered.sort_by_key(|node| state_rank(node)),
-        RowOrder::Name => ordered.sort_by_key(|node| node.row.title().to_lowercase()),
-    }
-    ordered
-}
-
-/// How urgently a subtree wants a human: the lowest rank anywhere beneath it, so
-/// a group ranks by its most urgent row rather than by a row of its own.
-fn state_rank(node: &TreeNode) -> u8 {
-    let own = match &node.row.kind {
-        // A retained row holds the last status anyone saw, so it cannot be what
-        // needs a human now: it ranks after everything observed.
-        RowKind::Agent(agent) if agent.retained.is_some() => RETAINED_RANK,
-        RowKind::Agent(agent) => agent_rank(&agent.state),
-        RowKind::Task(task) => task_rank(task),
-        // A pane carries no state of its own, and a workspace carries none
-        // except through what is beneath it.
-        RowKind::Lifecycle(_) => u8::MAX - 1,
-        RowKind::Pane(_) | RowKind::Workspace { .. } => u8::MAX,
-    };
-    node.children
-        .iter()
-        // A task's phase orders task rows among their siblings; it never raises
-        // the rank of the agent or workspace they hang under, because an agent's
-        // urgency is its own state and not its tasks'.
-        .filter(|child| !matches!(child.row.kind, RowKind::Task(_)))
-        .map(state_rank)
-        .fold(own, std::cmp::min)
-}
-
-/// Where a task's phase sits in state order: a capture that has exited and is
-/// still to be read or certified first, then a process still running, then a
-/// word Radar cannot place. A display rank, and nothing else — no row's state is
-/// derived from it.
-fn task_rank(task: &TaskRow) -> u8 {
-    match task.phase.as_deref() {
-        Some("review") | Some("flushing") => 0,
-        Some("running") => 3,
-        _ => 5,
-    }
-}
-
-/// Where a state sits in state order: what is stuck or unanswered first, then
-/// what is moving, then the states Radar cannot name, then parked and finished
-/// rows.
-///
-/// One list in one place: adding a state is a line here, and a state's rank
-/// never depends on where it is read.
-fn agent_rank(state: &AgentState) -> u8 {
-    match state {
-        AgentState::Blocked => 0,
-        AgentState::Lost => 1,
-        AgentState::Waiting => 2,
-        AgentState::Working => 3,
-        AgentState::Settling => 4,
-        AgentState::Unknown => 5,
-        AgentState::Other(_) => 6,
-        AgentState::Idle => 7,
-        AgentState::Done => 8,
-    }
-}
-
-/// After every observed state: a retained row keeps the last facts anyone saw.
-const RETAINED_RANK: u8 = 9;
-
-/// Whether a row is one a human should look at: stuck, unanswered, or in a
-/// state no source could name.
-fn needs_attention(row: &VisibleRow<'_>) -> bool {
-    matches!(
-        &row.node.row.kind,
-        RowKind::Agent(agent)
-            if matches!(
-                agent.state,
-                AgentState::Blocked | AgentState::Lost | AgentState::Waiting | AgentState::Unknown
-                    | AgentState::Other(_)
-            )
-    )
-}
-
-/// Whether a row is moving: an agent in the working state.
-fn is_working(row: &VisibleRow<'_>) -> bool {
-    matches!(
-        &row.node.row.kind,
-        RowKind::Agent(agent) if agent.state == AgentState::Working
-    )
-}
-
-/// Collects the filtered view: matching rows plus the ancestry that explains
-/// their placement. Fold state is deliberately ignored here. As in the
-/// unfolded view, the connectors come from the rows the filter keeps.
-fn collect_filtered<'a>(
-    node: &'a TreeNode,
-    depth: usize,
-    needle: &str,
-    visible: Visibility,
-    order: RowOrder,
-    connectors: Connectors,
-    out: &mut Vec<VisibleRow<'a>>,
-) {
-    let children: Vec<&TreeNode> = ordered(&node.children, order)
-        .into_iter()
-        .filter(|child| {
-            visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
-        })
-        .collect();
-    out.push(VisibleRow {
-        id: &node.row.id,
-        depth,
-        node,
-        has_children: has_visible_children(node, visible),
-        // Folding does not apply while filtering: the filtered view shows the
-        // ancestry of matches on purpose, so no row reports as collapsed here.
-        collapsed: false,
-        connectors: connectors.clone(),
-    });
-    let count = children.len();
-    for (index, child) in children.into_iter().enumerate() {
-        collect_filtered(
-            child,
-            depth + 1,
-            needle,
-            visible,
-            order,
-            child_connectors(&connectors, depth, index + 1 < count),
-            out,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -4591,7 +3992,26 @@ mod tests {
     }
 
     #[test]
-    fn the_palette_filters_commands_and_runs_the_chosen_one_by_its_key() {
+    fn a_palette_choice_is_a_tree_command_even_while_details_hold_the_keyboard() {
+        let (_, mut app) = fixture();
+        press(&mut app, KeyCode::Tab);
+        assert!(app.details_focused, "Tab hands the keyboard to details");
+        // The details panel keeps its own `r`, so the key itself does nothing.
+        assert_eq!(press(&mut app, KeyCode::Char('r')), None);
+
+        press(&mut app, KeyCode::Char('?'));
+        for ch in "restart".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::BeginAction(Operation::Restart)),
+            "the palette runs Restart on the tree, not through the details panel"
+        );
+    }
+
+    #[test]
+    fn the_palette_filters_commands_and_runs_the_chosen_one_by_its_identity() {
         let (_, mut app) = fixture();
         assert_eq!(press(&mut app, KeyCode::Char('?')), None);
         assert!(app.palette().is_some(), "? opens the palette");
@@ -4615,15 +4035,9 @@ mod tests {
         );
 
         // Enter answers with that command's key, which does what the key does.
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::Replay(KeyCode::Char('e')))
-        );
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
         assert!(app.palette().is_none(), "choosing closes the palette");
-
-        // The caller replays the key; here that lands on the real binding.
-        press(&mut app, KeyCode::Char('e'));
-        assert!(app.shows_history());
+        assert!(app.shows_history(), "the chosen command ran by identity");
 
         press(&mut app, KeyCode::Char('?'));
         assert_eq!(press(&mut app, KeyCode::Esc), None);

@@ -727,19 +727,8 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
                 {
                     break;
                 }
-                // A palette choice runs the key it names, so a command and its
-                // hotkey share one implementation.
-                let mut pressing = vec![key];
-                while let Some(key) = pressing.pop() {
-                    let Some(action) = app.handle_key(key) else {
-                        break;
-                    };
-                    if let Action::Replay(code) = action {
-                        pressing.push(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE));
-                        continue;
-                    }
+                if let Some(action) = app.handle_key(key) {
                     match action {
-                        Action::Replay(_) => {}
                         Action::Focus(target) => {
                             attach.ask(&target);
                             focuser.start(target);
@@ -831,8 +820,6 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
             Event::Mouse(mouse) => {
                 if let Some(action) = app.handle_mouse(mouse) {
                     match action {
-                        // Only the palette chooses commands, and it takes keys.
-                        Action::Replay(_) => {}
                         Action::Focus(target) => {
                             attach.ask(&target);
                             focuser.start(target);

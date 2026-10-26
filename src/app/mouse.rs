@@ -109,7 +109,7 @@ impl App {
             self.toggle_branch(&id);
             return None;
         }
-        let already = self.selected.as_ref() == Some(&id);
+        let already = self.nav.selected_id() == Some(&id);
         self.select(Some(id));
         if already {
             return self.focus_selected();
@@ -145,12 +145,6 @@ impl App {
     /// Ignored while a filter is active, as the fold keys are: the filtered
     /// view shows matching ancestry on purpose, so a fold could not take effect.
     pub(super) fn toggle_branch(&mut self, id: &RowId) {
-        if self.needle().is_some() {
-            return;
-        }
-        if !self.collapsed.remove(id) {
-            self.collapsed.insert(id.clone());
-        }
-        self.reconcile_selection();
+        self.navigate(|nav| nav.toggle_branch(id));
     }
 }

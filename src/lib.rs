@@ -33,6 +33,7 @@ pub mod tmux;
 pub mod topology;
 pub mod tree;
 pub mod ui;
+pub mod ui_session;
 pub mod workspace;
 
 pub use app::{

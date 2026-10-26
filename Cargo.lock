@@ -15,11 +15,13 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "strum",
  "thiserror 2.0.21",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "tui-actions",
  "tui-spinner",
  "unicode-width",
 ]
@@ -1799,6 +1801,15 @@ dependencies = [
  "thread_local",
  "tracing",
  "tracing-core",
+]
+
+[[package]]
+name = "tui-actions"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91d9b89d95221dae51778de94f963b18bd3a53c077f047e5096d5e711eb426f2"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]
