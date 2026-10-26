@@ -1320,14 +1320,11 @@ mod tests {
     }
 
     fn wait(actions: &mut ManagedActions) -> Update {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(update) = actions.poll() {
-                return update;
-            }
-            assert!(std::time::Instant::now() < deadline, "no update arrived");
-            thread::sleep(Duration::from_millis(5));
-        }
+        crate::testing::eventually_within(
+            Duration::from_secs(10),
+            "an update from the manager",
+            &mut || actions.poll(),
+        )
     }
 
     fn request_files(root: &Path) -> usize {

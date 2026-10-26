@@ -868,7 +868,7 @@ mod tests {
         use std::os::unix::net::UnixStream as StdStream;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let directory = std::env::temp_dir().join(format!(
             "radar-transport-drain-{}-{}",
@@ -949,14 +949,9 @@ mod tests {
         ask(&mut busy, BUSY);
         ask(&mut later, "8f8f8f8f-8f8f-4f8f-8f8f-8f8f8f8f8f8f");
         assert_eq!(answer(&mut later)["result"]["served"], true);
-        let waiting = Instant::now();
-        while !held.load(Ordering::SeqCst) {
-            assert!(
-                waiting.elapsed() < Duration::from_secs(5),
-                "the held request was never dispatched"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        crate::testing::eventually("the held request to be dispatched", || {
+            held.load(Ordering::SeqCst).then_some(())
+        });
 
         let finished = Arc::new(AtomicBool::new(false));
         let (stop_finished, stop_stopping) = (Arc::clone(&finished), Arc::clone(&stopping));

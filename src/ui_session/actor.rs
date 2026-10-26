@@ -498,11 +498,9 @@ mod tests {
             Some(UiError::Refused(dto::RefusalCode::Conflict))
         );
         drop(stream);
-        let released = (0..50).any(|_| {
-            std::thread::sleep(Duration::from_millis(20));
-            handle.attachments() == 0
+        crate::testing::eventually("losing the subscription detaches its attachment", || {
+            (handle.attachments() == 0).then_some(())
         });
-        assert!(released, "losing the subscription detaches its attachment");
         assert_eq!(
             handle.act("a", 1, None, A::CycleOrder).unwrap(),
             Out::Detached

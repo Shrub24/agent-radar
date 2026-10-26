@@ -27,6 +27,8 @@ pub mod runtime;
 pub mod service;
 pub mod snapshot_fetch;
 pub mod tasks;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod theme;
 pub mod title;
 pub mod tmux;
