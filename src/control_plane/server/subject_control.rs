@@ -97,7 +97,7 @@ pub(super) fn execute_subject_control(
     // up reports that instead of closing anything again. A bound launch's pane
     // belongs to its child, and a stop leaves the launch exactly as it is.
     let cleanup = match (&termination, operation, &backend) {
-        (Ok(_), ops::Operation::Cancel, Some(backend)) => cleanup_unbound_pane(
+        (Ok(_), ops::Operation::Cancel, Some(backend)) => cleanup_launch_pane(
             &registry,
             backend,
             &verifier,
@@ -574,6 +574,7 @@ pub(super) fn restart_lead(
             Arc::clone(&core.verifier),
         )
     };
+    let stopping = Arc::clone(&locked(core).stopping);
     let Some(backend) = backend else {
         return refusal_settlement("no backend is wired");
     };
@@ -749,21 +750,45 @@ pub(super) fn restart_lead(
             session: Some(session.to_string()),
             identity: Some(identity),
             prepared: Some(prepared),
-            in_place: true,
         },
     );
+    // The predecessor's launch ended when its exit was verified above, so the pane
+    // it ran in is a dead shell this daemon made permanent by arming
+    // remain-on-exit. It is removed once the successor exists, because the
+    // successor's pane is split from it and a split needs its target present. A
+    // successor that never launched leaves the pane where the failure can be read.
+    let predecessor_pane = |effects: &mut Vec<String>| {
+        effects.push(
+            match cleanup_launch_pane(
+                &registry,
+                &backend,
+                &verifier,
+                &subject.claim_id,
+                &stopping,
+                verification,
+                store::now_ms(),
+            ) {
+                Some(cleanup) => cleanup.effect(),
+                None => "pane kept".to_string(),
+            },
+        );
+    };
     match registry.spawn_edge(successor) {
         Ok(Some(edge)) => match edge.launched {
             RequestOutcome::Completed => {
                 effects.push("launched replacement".to_string());
+                predecessor_pane(&mut effects);
                 (RequestOutcome::Completed, None, None, effects)
             }
-            RequestOutcome::Unknown => (
-                RequestOutcome::Unknown,
-                Some(Category::BACKEND_UNAVAILABLE),
-                Some("replacement launch is unknown; it will not be retried".into()),
-                effects,
-            ),
+            RequestOutcome::Unknown => {
+                predecessor_pane(&mut effects);
+                (
+                    RequestOutcome::Unknown,
+                    Some(Category::BACKEND_UNAVAILABLE),
+                    Some("replacement launch is unknown; it will not be retried".into()),
+                    effects,
+                )
+            }
             _ => (
                 RequestOutcome::Refused,
                 Some(Category::BACKEND_REFUSED),

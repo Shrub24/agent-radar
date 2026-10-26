@@ -352,7 +352,6 @@ pub(super) fn continuation(
         session: Some(session.to_string()),
         identity: Some((subject_id, last.to_string())),
         prepared: None,
-        in_place: false,
     };
     Ok((
         SpawnParams {
@@ -371,7 +370,6 @@ pub(super) struct SpawnLineage {
     pub(super) session: Option<String>,
     pub(super) identity: Option<(String, String)>,
     pub(super) prepared: Option<(Bootstrap, subjects::Ticket)>,
-    pub(super) in_place: bool,
 }
 
 /// Creates the pane a child runs in and launches it there, once its parent pane is
@@ -508,15 +506,7 @@ pub(super) fn spawn_child(
         direction: SplitDirection::Right,
         focus: false,
     };
-    let created = if lineage.in_place {
-        CreateOutcome::Completed(crate::runtime::CreatedLocation {
-            workspace_id: None,
-            tab_id: None,
-            pane_id: Some(parent_pane),
-        })
-    } else {
-        backend.create(&create_request, &cancel)
-    };
+    let created = backend.create(&create_request, &cancel);
     let (created_outcome, named, mut created_message) = match &created {
         CreateOutcome::Completed(named) => (
             RequestOutcome::Completed,
@@ -534,7 +524,7 @@ pub(super) fn spawn_child(
     // The pane this launch was dispatched into is recorded as one of this
     // daemon's containers before the edge and the launch are recorded: a spawned
     // agent's slot is topology, not only a location on an edge.
-    if let Some(named) = named.filter(|_| !lineage.in_place) {
+    if let Some(named) = named {
         let registry = {
             let core = locked(core);
             Arc::clone(&core.registry)

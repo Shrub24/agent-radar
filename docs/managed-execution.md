@@ -67,11 +67,21 @@ through the scope. Only after confirming pane cleanup does it record
 process or uncertain cleanup is not reported as a safe-to-retry failure.
 
 Continue names the parent's released child with `continue_subject_id`; restart
-replaces a live child in its existing pane. Both use the subject's recorded
-session and the shared `resume_launch`/`spawn_child` path. A continued launch
-reporting a different session is refused. A new launch cannot claim a session
-already recorded for another subject; it must continue that subject explicitly.
-Later session switches in a granted process keep their normal presence behavior.
+stops the predecessor, launches the successor through the same path, and only
+then removes the predecessor's pane. Both use the subject's recorded session and
+the shared `resume_launch`/`spawn_child` path. A continued launch reporting a
+different session is refused. A new launch cannot claim a session already
+recorded for another subject; it must continue that subject explicitly. Later
+session switches in a granted process keep their normal presence behavior.
+
+A launch owns the pane it created, and ending the launch is what removes it. The
+daemon arms `remain-on-exit` on that pane before the program runs, so an exit
+leaves a dead shell holding the final output; cancelling a launch closes the
+process first and the pane second, and the successor of a restart is placed
+before the predecessor's pane goes, because its pane is split from it. A launch
+whose process may still be alive keeps its pane, and a launch that never created
+one — an adopted agent, a `radar run` command in the operator's own pane — leaves
+that pane alone.
 
 ## Names
 

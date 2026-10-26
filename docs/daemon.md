@@ -90,6 +90,11 @@ process is stopped or cancelled through its own verified path, a lead can be
 enrolled as a restartable subject, and an observation pass re-observes every tracked
 launch by verified identity. Process stop, cancellation and restart are their own
 contracts (`lifecycle.*`) and claim nothing about assignments or registration. A
+launch owns the pane it created: ending the launch — cancelled, or stopped and
+verified exited — removes that pane, and a restart places its successor before
+the predecessor's pane goes, because the successor's pane is split from it. A
+launch that never created a pane (an adopted agent, a `radar run` command in the
+operator's own pane) leaves that pane alone. A
 created pane is not a bound child until that child registers with the private
 spawn token, and private launch/resume specifications stored on registrations
 remain inert unless explicitly used by a supported operation.
@@ -415,9 +420,9 @@ launches; registration with its token establishes the child identity.
 `spawn.close`
 closes only the verified pane; it does not certify child-process exit. Neither topology freshness
 nor a missing pane establishes process exit or authorizes lifecycle action.
-Resume, restart, recovery, and adoption of foreign panes are not provided;
-recovery of children, pending asks and results must be specified and verified
-separately.
+Resume and restart are the `lifecycle.*` operations above, not generic recovery;
+adoption of foreign panes is not provided, and recovery of children, pending asks
+and results must be specified and verified separately.
 
 ## Examples and compatibility
 

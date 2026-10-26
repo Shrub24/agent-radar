@@ -415,7 +415,7 @@ pub(super) fn bounded_foreground(
 /// refusal and an unanswered dispatch are each durable facts of the launch. An
 /// eligibility refusal dispatches nothing, so it records nothing and a later
 /// admitted cancel re-decides it against the evidence it finds.
-pub(super) fn cleanup_unbound_pane(
+pub(super) fn cleanup_launch_pane(
     registry: &Arc<Registry>,
     backend: &Arc<dyn RuntimeProvider>,
     verifier: &Arc<dyn ProcessVerifier>,
@@ -436,14 +436,18 @@ pub(super) fn cleanup_unbound_pane(
     if let Some(recorded) = subject.process.pane_cleanup.clone() {
         return Some(recorded);
     }
-    if subject.process.state == subjects::State::Bound {
-        // A bound launch's pane belongs to its registered child, so no cancel
-        // has anything to say about it.
-        return None;
-    }
-    if subject.process.state != subjects::State::Revoked {
+    // A bound launch's pane belongs to its registered child while that child is
+    // alive, so a cancel has nothing to say about it. Once the child is
+    // verifiably gone the pane is a dead shell this daemon made permanent by
+    // arming remain-on-exit on it, so removing it is the daemon's own cleanup.
+    // A launch that is neither bound nor revoked has no pane of its own at all.
+    if !matches!(
+        subject.process.state,
+        subjects::State::Bound | subjects::State::Revoked
+    ) {
         return Some(PaneCleanup::Refused(
-            "the launch is not a revoked one, so its pane is not this cancel's to remove".into(),
+            "the launch is not a bound or revoked one, so its pane is not this cleanup's to remove"
+                .into(),
         ));
     }
     // A subject with no spawn edge never had a pane of this daemon's: an
@@ -484,13 +488,21 @@ pub(super) fn cleanup_unbound_pane(
             "this backend cannot report whether the pane's command has exited".into(),
         ));
     }
-    let exited = subject.process.identity.is_none()
-        || subject.process.exited_at.is_some()
-        || (edge.exit.is_some()
-            && matches!(
-                bounded_exit_observation(backend, &pane, stopping, budget),
-                Ok(PaneExitObservation::Exited { .. })
-            ));
+    let pane_dead = matches!(
+        bounded_exit_observation(backend, &pane, stopping, budget),
+        Ok(PaneExitObservation::Exited { .. })
+    );
+    // A bound child's pane can be handed to another process once that child is
+    // gone, so only the backend's own report that this very pane is dead makes
+    // it a dead shell to remove. A revoked launch never had a child, so a
+    // verified exit is enough.
+    let exited = if subject.process.state == subjects::State::Bound {
+        pane_dead
+    } else {
+        subject.process.identity.is_none()
+            || subject.process.exited_at.is_some()
+            || (edge.exit.is_some() && pane_dead)
+    };
     if !exited {
         return Some(PaneCleanup::Refused(
             "the launch's process is not verified gone; closing its pane would end it unclaimed"

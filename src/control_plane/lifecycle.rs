@@ -903,8 +903,11 @@ pub fn record_pane_cleanup(
     if let Some(recorded) = subject.process.pane_cleanup.clone() {
         return Ok(recorded);
     }
-    if subject.process.state != State::Revoked {
-        return Err("only a revoked launch's own pane is cleaned up".into());
+    // A pane is only removed for a launch whose process is gone: revoked before it
+    // ever bound, or bound and verified exited. The pane itself is checked where it
+    // is closed; this is the launch-side half of the same rule.
+    if subject.process.state != State::Revoked && subject.process.exited_at.is_none() {
+        return Err("the launch has not ended, so its pane is not cleaned up".into());
     }
     subject.process.pane_cleanup = Some(outcome.clone());
     subject.process.recorded_at = format_millis(now_ms);

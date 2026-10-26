@@ -78,7 +78,8 @@ Do these in the sidebar while it is compact.
 | 5.3 | Select an agent row, `D` | a confirmation is centred over both panes, names the row you selected, and defaults to Cancel |
 | 5.4 | `Esc` or choose Cancel | the popup closes and nothing changed |
 | 5.5 | Select a plain pane you can lose, `D`, Confirm | the pane closes, and the sidebar drops the row within a refresh |
-| 5.6 | Select a managed worker, `r`, Confirm | the restart runs and the result shows in the popup before it closes |
+| 5.5a | `D` on a managed agent, Confirm | the agent's pane closes with it once the process exit is verified; the effect reads `pane cleaned up`, not `pane kept` |
+| 5.6 | Select a managed worker, `r`, Confirm | the restart runs and the result shows in the popup before it closes; the successor appears in a new pane and the predecessor's pane is gone, with no `pane is dead` shell left behind |
 | 5.7 | `A` | the workspace picker appears over both panes; choose a directory and a workspace opens |
 | 5.8 | `L` on a workspace row | the configured launch runs from the sidebar with no popup |
 | 5.8a | Filter the sidebar until no row matches, leave filter editing, press `D` | the sidebar answers that nothing is selected; no popup opens |

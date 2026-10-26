@@ -656,11 +656,14 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
         {
             facts.execution.exited_at = Some(event.at.clone())
         }
-        // Only a launch this daemon revoked left a pane nobody owns, and its
-        // cleanup outcome is recorded once: a later cancel reports it.
+        // A launch that ended leaves a pane nobody owns: one revoked before it
+        // bound, or one bound and verifiably exited. Its cleanup outcome is
+        // recorded once, so a later operation on the same launch reports it
+        // rather than closing anything twice.
         Transition::PaneCleanup(outcome)
-            if facts.execution.state == State::Revoked
-                && facts.execution.pane_cleanup.is_none() =>
+            if facts.execution.pane_cleanup.is_none()
+                && (facts.execution.state == State::Revoked
+                    || facts.execution.exited_at.is_some()) =>
         {
             facts.execution.pane_cleanup = Some(outcome.clone())
         }

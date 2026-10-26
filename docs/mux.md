@@ -132,15 +132,24 @@ scrubber: shell/application output can contain sensitive data, and arbitrary
 terminal input/argv should not be assumed private. The daemon is a same-UID local
 service; filesystem permissions do not isolate it from other same-user processes.
 
-## Unsupported lifecycle operations
+## Lifecycle operations and pane ownership
 
-No daemon operation currently provides process stop with verified exit,
-retained-session resume, lead restart, child replacement or post-owner-restart
-reconciliation. `spawn.close` is a pane-close fact, never an exit or assignment
-completion verdict, and `already_exited` is the pane command's recorded exit plus
-retained-pane cleanup rather than proof about the registered process. Stored
-registration launch/resume specifications are not a
-promise that the daemon can execute them.
+`lifecycle.cancel`, `lifecycle.stop`, `lifecycle.restart` and `lifecycle.enroll`
+operate on a launch this daemon tracked, and `spawn.close` remains a pane-close
+fact, never an exit or assignment completion verdict. `already_exited` is the
+pane command's recorded exit plus retained-pane cleanup rather than proof about
+the registered process. Stored registration launch/resume specifications are not
+a promise that the daemon can execute them.
+
+A launch owns the pane it created. Ending the launch removes that pane: a cancel
+signals the process, verifies the exit, and only then closes the pane the spawn
+edge recorded, gated on the backend reporting that same pane dead and on the
+process serving the backend still being the one that created it. A stop leaves
+the launch and its pane as they are. A restart stops the predecessor, launches the
+successor through the ordinary spawn path, and removes the predecessor's pane
+afterwards — the successor is placed first because its pane is split from the
+predecessor's. A pane is kept, with the reason in the operation's effects, when
+the process may still be alive or the launch never created one.
 
 A restart's readiness is positive evidence that the fresh process reported in, not
 that its pane was created. Binding says which child belongs to the creation and

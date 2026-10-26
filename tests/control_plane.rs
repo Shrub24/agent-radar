@@ -5049,10 +5049,25 @@ fn a_cancel_after_binding_stops_the_bound_process() {
     );
     assert_eq!(
         result_record(&cancelled)["effects"],
-        json!(["sigterm dispatched", "pane kept", "process exit verified"]),
+        json!([
+            "sigterm dispatched",
+            "pane cleaned up",
+            "process exit verified"
+        ]),
         "{cancelled}"
     );
     assert!(!process_exists(pid), "the bound process {pid} still runs");
+    // The pane the launch made permanent goes with the launch that made it: a
+    // bound child that exits leaves a dead shell nobody owns.
+    let pane = recorded_edge(&state, &spawn_id)["location"]["pane"]
+        .as_str()
+        .expect("the launch records its pane")
+        .to_string();
+    assert!(
+        !pane_ids(&server).contains(&pane),
+        "the launch's own pane {pane} is gone: {:?}",
+        pane_ids(&server)
+    );
     assert_eq!(subject_record(&state, &subject)["state"], "bound");
     let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
     assert_eq!(

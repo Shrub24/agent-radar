@@ -145,7 +145,7 @@ pub(super) fn withdraw_unpresented(
             return Ok(false);
         };
         Ok(matches!(
-            cleanup_unbound_pane(
+            cleanup_launch_pane(
                 &registry,
                 backend,
                 &verifier,
