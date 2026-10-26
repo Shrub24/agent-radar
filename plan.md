@@ -193,6 +193,31 @@ they improve timeliness; do not require control mode, an async rewrite or a
 database migration. Bounds do not remove the current cost of process
 verification on every registry read; shared scheduling is the intended remedy.
 
+### tmux 3.8 turns exits into events (replan pending)
+
+A `pane-exited` hook event carries the exit as a payload: `server-fn.c` sets
+`exit_status` when the child exited, `exit_signal` when it was signalled, and
+`exit_success` either way, all reachable from a hook as `#{hook_exit_status}`,
+`#{hook_exit_signal}`, `#{hook_exit_success}` and `#{hook_pane}`. tmux's own
+`regress/hooks-notify.sh` asserts this with `remain-on-exit` off.
+
+This makes `remain-on-exit` unnecessary as an evidence mechanism, and with it
+the retained dead pane, the per-launch `pane-died` wake, and the launch-pane
+cleanup added in `1e5d636b`. Two costs are real and belong in the replan: a lost
+event leaves the status unknown with no retained pane to re-read (the exit
+itself stays provable as the launch process's verified absence), and restart can
+no longer anchor on the predecessor's pane, so it anchors on the window instead
+(`split-window -t @0` targets a window, verified on the installed tmux).
+
+Still excluded: exit events are hooks, not control-mode notifications. Even on
+master, `%exit [reason]` is the client exiting and no `%pane-exited` notification
+exists. `wait-for -E` waits for one event and leaves a gap between waits with no
+backlog, so a hook that reports to the daemon is the delivery mechanism.
+
+`openspec/changes/tmux-control-mode/` currently states the opposite — retained
+pane evidence stays, `pane-died` stays, the launch chain is untouched. It needs
+replanning before any of its tasks start, not just an amendment.
+
 ### Priority 3 — Broaden from operational feedback
 
 Managed placement extends spawn; generic workspace/tab creation already exists.
