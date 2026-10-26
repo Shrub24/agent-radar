@@ -62,10 +62,10 @@ The sidebar is the dashboard process and SHALL have an explicit expanded mode,
 toggled by its zoom key, that draws the whole dashboard with the details panel and
 every key. The mode SHALL NOT depend on the terminal's width. Toggling SHALL ask
 the host with `[sidebar] zoom_command` or `unzoom_command` and change the mode
-only if the host command started.
+only if the host command succeeded.
 
 #### Scenario: Expanded
-- **WHEN** the zoom key is pressed and `zoom_command` starts
+- **WHEN** the zoom key is pressed and `zoom_command` succeeds
 - **THEN** the same process draws the whole dashboard on the same selection and filter
 
 #### Scenario: Returned
@@ -73,7 +73,7 @@ only if the host command started.
 - **THEN** `unzoom_command` runs and the compressed tree is drawn again
 
 #### Scenario: No host command
-- **WHEN** the zoom key is pressed with the command unset or failing to start
+- **WHEN** the zoom key is pressed with the command unset, failing to start, or exiting unsuccessfully
 - **THEN** the mode is unchanged and the footer names the command to set
 
 ### Requirement: Hide and unhide are host commands

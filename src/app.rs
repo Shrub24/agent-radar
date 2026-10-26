@@ -917,6 +917,11 @@ impl App {
         self.reconcile_selection();
     }
 
+    /// Whether a refused deletion is armed to be repeated with force.
+    pub fn holds_deletion(&self) -> bool {
+        !self.deletion_held.is_empty()
+    }
+
     /// Selects `id` exactly, or nothing: a row that is gone is not replaced by a
     /// neighbour, because the action it was chosen for must not land elsewhere.
     pub fn select_exact(&mut self, id: &RowId) -> bool {
@@ -1320,8 +1325,13 @@ impl App {
                 // Where the host can float a popup over the whole workspace, the
                 // pickers and confirmations go there; this pane is too narrow.
                 KeyCode::Char(ch @ ('r' | 'a' | 'A' | 'E' | 'D' | 'R' | '?'))
-                    if self.modal_host && self.sidebar_compact() =>
+                    if self.modal_host
+                        && self.sidebar_compact()
+                        && (ch == 'A' || self.selected.is_some()) =>
                 {
+                    // With nothing selected, a key that needs a row is handled
+                    // here, where it says so: the popup would otherwise pick its
+                    // own default row and act on that.
                     let row = (ch != 'A').then(|| self.selected.clone()).flatten();
                     return Some(Action::Modal {
                         key: KeyCode::Char(ch),
@@ -3040,6 +3050,31 @@ mod tests {
             "a new workspace belongs to no row"
         );
         assert!(sidebar.confirmation().is_none() && !sidebar.picker_open());
+    }
+
+    #[test]
+    fn a_workspace_sidebar_with_nothing_selected_does_not_send_a_row_key_to_the_popup() {
+        let mut sidebar = App::sidebar();
+        sidebar.set_modal_host(true);
+        assert!(sidebar.selected_id().is_none());
+        assert!(
+            matches!(
+                press(&mut sidebar, KeyCode::Char('A')),
+                Some(Action::Modal { row: None, .. })
+            ),
+            "a new workspace needs no row"
+        );
+        // The popup would pick its own default row, so the key stays here, where
+        // the dashboard's own "nothing selected" answer applies.
+        for ch in ['r', 'D', 'E', 'R', '?'] {
+            assert!(
+                !matches!(
+                    press(&mut sidebar, KeyCode::Char(ch)),
+                    Some(Action::Modal { .. })
+                ),
+                "{ch} must not reach the popup without a row"
+            );
+        }
     }
 
     #[test]

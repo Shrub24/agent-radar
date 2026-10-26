@@ -184,18 +184,29 @@ fn run_host_command(
     }
 }
 
-fn poll_sidebar_command(pending: &mut Option<std::process::Child>, app: &mut App) -> bool {
+/// Reaps a finished host command. A pending expand or return takes effect only
+/// when the host reports success: the mode follows the window, not the attempt.
+fn poll_sidebar_command(
+    pending: &mut Option<std::process::Child>,
+    flip: &mut bool,
+    app: &mut App,
+) -> bool {
     let Some(child) = pending.as_mut() else {
         return false;
     };
     match child.try_wait() {
         Ok(None) => return false,
-        Ok(Some(status)) if status.success() => {}
+        Ok(Some(status)) if status.success() => {
+            if std::mem::take(flip) {
+                app.toggle_expanded();
+            }
+        }
         Ok(Some(status)) => {
             app.set_focus_message(Some(format!("sidebar host command exited {status}")))
         }
         Err(error) => app.set_focus_message(Some(format!("sidebar host command: {error}"))),
     }
+    *flip = false;
     *pending = None;
     true
 }
@@ -240,7 +251,7 @@ mod sidebar_tests {
         );
         assert!(app.focus_message().unwrap().contains("still running"));
         pending.as_mut().unwrap().wait().unwrap();
-        assert!(poll_sidebar_command(&mut pending, &mut app));
+        assert!(poll_sidebar_command(&mut pending, &mut false, &mut app));
         assert!(pending.is_none());
         assert!(app.focus_message().unwrap().contains("exited"));
     }
@@ -552,9 +563,10 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
     // client has to exist before a focus can show anything.
     let mut attach = Attach::default();
     let mut sidebar_command = None;
+    let mut flip_on_success = false;
 
     loop {
-        dirty |= poll_sidebar_command(&mut sidebar_command, &mut app);
+        dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);
         // Foreground evidence is swept while a pane view is showing panes, and
         // while finished sessions are listed: telling a session that has gone
         // from a pane in use again needs the foreground either way.
@@ -673,6 +685,7 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
             && !app.picker_open()
             && app.confirmation().is_none()
             && app.focus_message().is_none()
+            && !app.holds_deletion()
             && !closer.is_busy()
             && !managed.is_busy()
             && !containers.is_busy()
@@ -727,13 +740,12 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
                             let (key, command) = sidebar_resize(&config, &app);
                             let _ = run_host_command(key, command, &mut app, &mut sidebar_command);
                         }
-                        // The mode follows the host: it flips only once the host
-                        // has been asked, so a missing command leaves it as it was.
+                        // The mode follows the host: it flips when the command
+                        // reports success, so a missing or failing one leaves it.
                         Action::ToggleZoom => {
                             let (key, command) = sidebar_zoom(&config, &app);
-                            if run_host_command(key, command, &mut app, &mut sidebar_command) {
-                                app.toggle_expanded();
-                            }
+                            flip_on_success =
+                                run_host_command(key, command, &mut app, &mut sidebar_command);
                         }
                         Action::LaunchSidebar => {
                             let _ = run_host_command(
@@ -821,13 +833,12 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
                             let (key, command) = sidebar_resize(&config, &app);
                             let _ = run_host_command(key, command, &mut app, &mut sidebar_command);
                         }
-                        // The mode follows the host: it flips only once the host
-                        // has been asked, so a missing command leaves it as it was.
+                        // The mode follows the host: it flips when the command
+                        // reports success, so a missing or failing one leaves it.
                         Action::ToggleZoom => {
                             let (key, command) = sidebar_zoom(&config, &app);
-                            if run_host_command(key, command, &mut app, &mut sidebar_command) {
-                                app.toggle_expanded();
-                            }
+                            flip_on_success =
+                                run_host_command(key, command, &mut app, &mut sidebar_command);
                         }
                         Action::LaunchSidebar => {
                             let _ = run_host_command(

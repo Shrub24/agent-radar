@@ -26,7 +26,8 @@ The sidebar is on the left; keyboard focus starts in the attached agent area.
 | --- | --- |
 | F10 | Focus the sidebar |
 | F11 | Expand the sidebar to the full dashboard / return (sends the sidebar its `Z`) |
-| F12 | Focus the agent area |
+| F12 | Focus the agent area (collapses an expanded sidebar first) |
+| F8 | Detach the workspace and clean up its private server |
 | B, in sidebar | Shrink to rail / restore to 32 columns |
 | Z, in sidebar | Expand to the full dashboard (the pane takes the window) / return |
 
@@ -64,8 +65,14 @@ so it covers the sidebar and the agent area, and runs `radar modal` in it:
   dashboard. Nothing is added to the daemon.
 - It closes when the modal is answered and the work it started has finished. A
   message (an outcome, or a refusal) stays until a key is pressed or it expires.
-- `?` in the popup lists only the commands that open a modal; the rest act on a
-  view the popup does not show.
+- `?` in the popup lists only the commands that open a modal; focus and the rest
+  act on a view the popup does not show or outlive it.
+- With nothing selected in the sidebar, `r a E D R ?` are handled by the sidebar
+  itself, so the popup never picks a default row. Only `A` needs no row.
+- A deletion refused because a living agent holds the container stays armed in
+  the popup, which stays open showing that, so `D` repeats it with force; `q`
+  closes it. The popup is its own dashboard process, so this state does not
+  outlive it.
 
 `L` (launch in the configured pane) has no dialog and runs in the sidebar. While
 the sidebar is expanded the pane is the whole window, so its pickers and
@@ -83,7 +90,7 @@ confirmations are drawn in it, centred, rather than in a popup.
    selection, and return on the next press.
 4. Navigate to another existing agent session through Radar; verify the outer
    sidebar remains in place.
-5. Detach the outer workspace and verify the original agent sessions remain.
+5. Press F8 to detach the workspace and verify the original agent sessions remain. Closing the terminal also removes the private server (`destroy-unattached`).
 
 The agent has compiled and tested command routing, not performed these live
 checks. Do not interpret that as acceptance of nested keyboard/clipboard support.

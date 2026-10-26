@@ -32,7 +32,7 @@ impl Command {
     pub fn opens_modal(&self) -> bool {
         matches!(
             self.key,
-            KeyCode::Enter | KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R')
+            KeyCode::Char('r' | 'a' | 'A' | 'L' | 'E' | 'D' | 'R')
         )
     }
 

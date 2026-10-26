@@ -521,9 +521,12 @@ fn render_modal(frame: &mut Frame, app: &App) -> Geometry {
     if let Some(picker) = app.workspace_picker() {
         picker::draw(frame, picker, true);
     }
+    let held = "held by a living agent: D repeats it with force, q closes";
     if app.confirmation().is_none()
         && !app.picker_open()
-        && let Some(message) = app.focus_message()
+        && let Some(message) = app
+            .focus_message()
+            .or_else(|| app.holds_deletion().then_some(held))
     {
         let palette = theme::palette();
         let block = Block::bordered()

@@ -65,7 +65,7 @@ also supported; the rail follows the actual width.
 
 `Z` expands the sidebar into the full dashboard and back. It is an explicit mode of
 the same process, not a width: `Z` asks the host to give the sidebar the window
-with `zoom_command`, and once that has started the process draws the whole
+with `zoom_command`, and once that has succeeded the process draws the whole
 dashboard, with the details panel and every key. `Z` again runs `unzoom_command`
 and returns to the compressed tree. A host command that is unset or fails leaves
 the mode as it was. The commands should state the layout they want rather than

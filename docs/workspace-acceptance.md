@@ -27,7 +27,7 @@ If 0.1 or 0.2 fail, stop: a 0.6.0 TUI or daemon will refuse the other.
 |---|---|---|
 | 1.1 | `radar workspace --session 0` (use your session name) | sidebar on the left, about a quarter wide; the agent area on the right shows that session; focus starts in the agent area |
 | 1.2 | `radar workspace --session nope` | exits non-zero with tmux's message, and creates nothing: `tmux ls` shows no `radar-ui-*` server |
-| 1.3 | In the workspace, detach: close the terminal tab or `Ctrl+c` the launcher | the launcher returns, `tmux ls` shows no `radar-ui-*` server |
+| 1.3 | Press `F8` in the workspace (and, on a second launch, close the terminal tab) | the launcher returns, `tmux ls` shows no `radar-ui-*` server |
 | 1.4 | `tmux -L radar ls`; look at the agents | the agent sessions and processes are untouched |
 
 Relaunch for the rest.
@@ -80,6 +80,7 @@ Do these in the sidebar while it is compact.
 | 5.6 | Select a managed worker, `r`, Confirm | the restart runs and the result shows in the popup before it closes |
 | 5.7 | `A` | the workspace picker appears over both panes; choose a directory and a workspace opens |
 | 5.8 | `L` on a workspace row | the configured launch runs from the sidebar with no popup |
+| 5.8a | Filter the sidebar until no row matches, leave filter editing, press `D` | the sidebar answers that nothing is selected; no popup opens |
 | 5.9 | Open `D` on a row, and from the agent area close that pane before confirming | Confirm is refused or the popup says the row is gone; nothing happens to another row |
 | 5.10 | Mouse: click Cancel and Confirm | both buttons answer |
 
@@ -92,7 +93,7 @@ Do these in the sidebar while it is compact.
 | 6.1 | Select an agent row, press `Z` | the sidebar takes the whole window and draws the full dashboard (details panel, wide rows) on the same selection |
 | 6.2 | Use a filter, fold a branch, then `Z` | back to the split with the same selection, filter and folds |
 | 6.3 | Expand, then press `D` or `?` | the dialog is drawn centred inside the expanded pane |
-| 6.4 | `F11` from the agent area | it expands the sidebar and focuses it; `F11` again returns |
+| 6.4 | `F11` from the agent area | it expands the sidebar and focuses it; `F11` again, or `F12`, returns, and the sidebar is compact again |
 | 6.5 | Zoom the window by hand with the tmux binding, then `Z` | no stuck state: after one or two presses the mode and window agree |
 | 6.6 | Expand, then press `B` | the rail does not appear while expanded; note what happens |
 

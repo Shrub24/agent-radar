@@ -87,7 +87,21 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
         }
         run(&attach)?;
         run(&["bind-key", "-n", "F10", "select-pane", "-t", "%0"])?;
-        run(&["bind-key", "-n", "F12", "select-pane", "-t", "%1"])?;
+        // Returning to the agents while expanded collapses the sidebar first, so
+        // the window and the sidebar's mode change together.
+        run(&[
+            "bind-key",
+            "-n",
+            "F12",
+            "if-shell",
+            "-F",
+            "#{window_zoomed_flag}",
+            "send-keys -t %0 Z ; select-pane -t %1",
+            "select-pane -t %1",
+        ])?;
+        run(&["bind-key", "-n", "F8", "detach-client"])?;
+        // A workspace nobody is attached to has nothing left to show.
+        run(&["set-option", "-g", "destroy-unattached", "on"])?;
         // Expand sends the sidebar its own toggle, so the mode and the zoom change
         // together, from either pane.
         run(&[
