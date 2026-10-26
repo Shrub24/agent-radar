@@ -3,7 +3,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Work is admitted by lane with reserved capacity
-The transport SHALL admit control requests, publication ingest and waiting reads against separate limits, and SHALL keep capacity for control requests that ingest and waiting reads cannot use. UI update waits SHALL use waiting admission, and UI submissions SHALL have bounded admission. A request over its limit SHALL receive a typed busy answer rather than consume unbounded resources or delay another lane.
+The transport SHALL admit control requests, publication ingest and waiting reads against separate limits, and SHALL keep capacity for control requests that ingest and waiting reads cannot use. UI action submissions SHALL have bounded admission. UI subscriptions SHALL have an explicit separate subscription limit and count toward total connection capacity; their lifetime SHALL NOT consume control or waiting-read permits. A request over its limit SHALL receive a typed busy answer rather than consume unbounded resources or delay another lane.
 
 #### Scenario: Ingest saturated
 - **WHEN** publication ingest has reached its limit
@@ -17,8 +17,12 @@ The transport SHALL admit control requests, publication ingest and waiting reads
 - **WHEN** the UI actor cannot accept another action within its bound
 - **THEN** submission receives an explicit retryable admission answer without being represented as an applied action
 
+#### Scenario: Subscription capacity saturated
+- **WHEN** the UI subscription limit is reached while reserved control connection capacity remains
+- **THEN** a further subscription is refused as busy before acceptance and lifecycle controls remain admissible
+
 ### Requirement: Waiting reads do not occupy handler capacity
-A read waiting for journal events or a UI publication SHALL wait asynchronously in the transport and SHALL NOT hold synchronous handler capacity. Journal results and cursors SHALL retain their existing semantics. UI waits SHALL return a current publication or an explicit timeout, detached or shutdown answer. Awaiting a UI actor reply SHALL NOT block a transport worker thread.
+A read waiting for journal events SHALL wait asynchronously in the transport and SHALL NOT hold synchronous handler capacity. Journal results and cursors SHALL retain their existing semantics. Awaiting a UI actor reply SHALL NOT block a transport worker thread. UI publication delivery SHALL use the dedicated subscription requirements below rather than a UI long-poll method.
 
 #### Scenario: Event during a wait
 - **WHEN** a fact commits while a journal reader waits
@@ -28,19 +32,41 @@ A read waiting for journal events or a UI publication SHALL wait asynchronously 
 - **WHEN** a journal wait ends with no new event
 - **THEN** the reader receives an empty list and the same cursor
 
-#### Scenario: UI clients waiting
-- **WHEN** several presentations wait for a new UI publication
-- **THEN** those waits do not occupy the synchronous handler pool and lifecycle controls remain admissible within their own bounds
-
 ## ADDED Requirements
 
-### Requirement: UI connections are reusable without read-side head-of-line blocking
-The transport SHALL support repeated UI exchanges on a connection within existing framing, authentication, timeout and admission rules. Frontends SHALL separate ordered action submission from pending update reads so a long read cannot hold up an action. Connection loss SHALL preserve established attachment/reconciliation and uncertain-submission semantics rather than silently replay effectful commands.
+### Requirement: UI subscriptions push typed frames independently of action RPCs
+The existing authenticated socket SHALL support ui.subscribe: an acceptance/baseline frame followed by typed publications correlated with request and attachment. Actions, receipts and content fetches SHALL use independent reusable one-response RPCs. UI updates SHALL require no read renewal or wait_ms. Existing domain reads SHALL remain unchanged; this change SHALL NOT introduce a generic subscription framework.
 
-#### Scenario: Action while waiting for a publication
-- **WHEN** a frontend has an update read outstanding and the user navigates
-- **THEN** its action uses the independent reusable action path without waiting for the read to finish
+#### Scenario: Action during an idle subscription
+- **WHEN** a frontend's subscription is open with no new publication and the user navigates
+- **THEN** the action uses the independent reusable RPC path without waiting for a subscription frame
 
-#### Scenario: Reuse ends
-- **WHEN** an idle timeout or transport failure closes a reused connection
-- **THEN** the frontend recovers through defined connection/attachment handling without treating an uncertain action as new
+#### Scenario: Publication without input
+- **WHEN** the session publishes while the frontend is idle
+- **THEN** the server pushes a publication frame without another client read request or a periodic renewal
+
+### Requirement: Subscription writers are bounded and asynchronous
+Subscriptions SHALL use connection-owned async writers with bounded write deadlines and buffering, not a blocking cloned-writer mutex. Their lifetime SHALL NOT hold handler/control capacity or block the actor/other clients. They MAY skip intermediate publications. Ordinary RPC idle expiry SHALL NOT end a healthy subscription, and peer closure SHALL be detected independently of publications.
+
+#### Scenario: Slow subscriber
+- **WHEN** a frontend stops consuming publication frames
+- **THEN** retained publication buffering stays bounded, the actor and other subscribers continue, and a blocked write exceeding its deadline ends that subscription
+
+#### Scenario: Quiet live subscriber
+- **WHEN** a subscription remains connected without publications beyond the ordinary RPC idle timeout
+- **THEN** it remains subscribed without requiring idle read renewals
+
+### Requirement: Subscription termination releases presentation resources
+Peer closure, detach, write failure/deadline and shutdown SHALL release subscription capacity. Primary subscription loss SHALL invalidate its dashboard/sidebar attachment and release editor ownership, retaining the query. Recovery SHALL use a fresh attachment/baseline, without automatically replaying uncertain actions under new IDs. Separately claimed presenters SHALL remain independent. Closure SHALL NOT imply process exit or domain cancellation.
+
+#### Scenario: Peer closes while idle
+- **WHEN** a frontend closes its subscription while no publication is pending
+- **THEN** the transport detects closure and releases subscription capacity and attachment ownership without waiting for the next publication
+
+#### Scenario: Origin disconnects with a live presenter
+- **WHEN** a sidebar loses its primary subscription after a separate presenter has claimed its interaction
+- **THEN** the sidebar attachment is invalidated but the presenter can still resolve the interaction
+
+#### Scenario: Shutdown with idle subscriptions
+- **WHEN** the daemon shuts down while subscription tasks are waiting
+- **THEN** those tasks terminate and release capacity without waiting for a publication or a long-poll timeout

@@ -177,13 +177,34 @@ Identical retained action retries return the original acceptance and its establi
 **Revisit when:** latency measurements identify a different bottleneck or a transport requirement changes
 **See:** ui-session.md#isolate-actor-scheduling-on-a-dedicated-thread — b60d09ec-26d3-4266-bafd-e7baebe087ca — as of 2026-10-26
 
-Frontend input, updates and relevant completions wake processing directly. Available snapshots can collapse to one latest coherent render, but action receipts, effects and input-gate invalidation remain independently processed. Reusable action and update-read connections are separate, so a long read cannot hold up ordered input. No default input debounce or batch-fill delay is selected.
+Frontend input, updates and relevant completions wake processing directly. Available snapshots can collapse to one latest coherent render, but action receipts, effects and input-gate invalidation remain independently processed. The reusable action/RPC connection and dedicated push subscription are separate, so waiting for publications cannot hold up ordered input; the subscription choice is recorded below. No default input debounce or batch-fill delay is selected.
 
 **Reason:** fast actor processing is not enough if incoming results wait behind an idle terminal poll or pending serial read. Rendering every superseded frame adds work without improving feedback. Cached row/index navigation and separate payloads remove avoidable repeated computation.
 
 **Rejected alternative:** retain periodic state-application polling and draw every intermediate snapshot. Those introduce unnecessary waiting/render work. Async actor execution, projection workers and deltas are not assumed fixes; they need measured benefit first.
 
 **Consequence:** event-driven behavior alone does not require async execution. The frontend mechanism was subsequently selected separately below; the actor stays synchronous. A later projection worker, if justified, must fence all relevant observation/query/fold/order/visibility inputs rather than accept stale builds.
+
+## Push latest UI state through a dedicated subscription
+
+**Id:** 582f431c-95d9-4da0-ad27-1f2f89a1c2ba
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer approval of push subscriptions and Slice B scope, 2026-10-26
+**Verification:** corroborated — core proposal, design and session/transport deltas specify push delivery; implementation is pending
+**Revisit when:** consumers need durable transition history rather than latest coherent UI state
+**See:** ui-session.md#wake-from-events-and-render-the-latest-state — 8c31790a-7bf0-4af0-ad07-12245cccbd26 — as of 2026-10-26
+
+Slice B uses ui.subscribe on a dedicated connection: an authoritative baseline followed by pushed latest-state publications. The action/RPC connection remains independent. Async bounded writers isolate slow clients from the actor; retained addressed effects and action receipts are not disposable snapshot notifications.
+
+**Reason:** a continuously attached UI is naturally represented by a subscription with explicit lifetime, backpressure and teardown. Choosing it before the frontend migration avoids a later transport rewrite. Subscription registration must cover changes after attach without a baseline gap; reconnect adopts current state, not a historical replay stream.
+
+**Rejected alternative:** ui.read with bounded long-poll renewal. It can wake immediately and support an event-driven frontend; it was not rejected as inherently slow or incorrect. Push removes the idle renewal cycle and makes stream lifetime explicit.
+
+**Rejected alternative:** stream through the existing blocking cloned writer or queue every publication per client. Neither gives the required nonblocking actor boundary and bounded slow-client behavior.
+
+**Consequence:** this is not a generic event-subscription framework. Existing domain reads and tmux observation remain separate; durable domain subscriptions would need cursor and retention-gap semantics, not UI snapshot coalescing.
 
 ## Inspect events without flattening their authority
 

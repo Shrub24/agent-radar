@@ -10,9 +10,10 @@ Sidebar, dashboard and popup processes currently share fleet facts but own separ
 - Extract typed commands and a terminal-independent reducer; retain local geometry, details, viewports, informational overlays and picker editing.
 - Publish ordered references to content-addressed tree and session payloads, with bounded retrieval and reconnect semantics.
 - Use attachment-local action IDs with bounded replayable receipts, one shared-text editor sending full queries, and a modal input-generation barrier.
-- Use reusable independent action/update IPC paths and adopt Tokio select! plus Crossterm EventStream in Slice B, with one synchronous Ratatui rendering owner and latest-state coalescing. Keep the dedicated actor thread synchronous initially; measure before adding async projection workers.
+- Use a reusable ordered action/RPC connection and a dedicated `ui.subscribe` push stream in Slice B, with gap-free baseline delivery, bounded async writers and latest-state coalescing. Adopt Tokio select! plus Crossterm EventStream with one synchronous Ratatui rendering owner. Keep the dedicated actor thread synchronous initially; measure before adding async projection workers.
 - Give shared command interactions one inline or detached presenter. Presenters submit typed results directly over IPC; tmux exit codes and parent callbacks do not carry choices.
 - Reuse existing domain admission and request IDs, preserving frozen targets and authoritative outcomes, with explicit scheduling refusal and uncertain-submission recovery. Remove migrated frontend dispatch, synthetic-key replay and modal reconstruction paths.
+- Design the full session/interaction contract together as a soft freeze and migrate the frontend/shared commands in one coordinated pass; no interim UI long-poll path or staged compatibility layers. Existing domain reads and tmux observation are not migrated to subscriptions here.
 - Evaluate Strum and tui-actions during semantic extraction, including leader sequences. No actor framework, new daemon or terminal-engine change.
 
 ## Capabilities
@@ -28,7 +29,7 @@ Sidebar, dashboard and popup processes currently share fleet facts but own separ
 - `lifecycle-actions`: project candidates no longer depend on the requesting process's working directory; a configured base directory replaces the leading start-directory entry as the fallback.
 - `fleet-overview`: shared canonical navigation/filtering and session-scoped task visibility, without moving local details/layout into the actor.
 - `row-navigation`: semantic jumps operate on the canonical visible tree.
-- `daemon-transport`: UI actor calls and update waits use existing bounded transport without occupying synchronous handler capacity while waiting.
+- `daemon-transport`: UI actor calls and bounded push subscriptions use the existing socket without holding synchronous handler/control capacity for subscription lifetimes; slow clients cannot block the actor.
 - `sidebar-view`: shared tree state and detached interaction presentation replace process-local state and reconstructed popup Apps. This capability is currently introduced by `sidebar-mode`; its baseline must be synchronized before applying this delta to main specs.
 
 ## Impact

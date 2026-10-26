@@ -28,6 +28,32 @@ Attach and reconnect SHALL establish a fresh attachment UUID, an authoritative c
 - **WHEN** a second frontend attaches to an existing session
 - **THEN** it receives the current selection and filter without resetting them
 
+### Requirement: Subscription starts from a gap-free current baseline
+ui.subscribe SHALL establish one primary subscription per attachment with an authoritative baseline and subsequent latest-state publications, without a registration/baseline gap. Its baseline MAY be newer than attach's. Clients SHALL use last_update_id locally for stale-update rejection, not history replay. Reconnect SHALL use a fresh attachment/current baseline.
+
+#### Scenario: Session changes between attach and subscribe
+- **WHEN** the actor publishes after attach returns but before subscription registration completes
+- **THEN** the subscription baseline or a subsequent pushed publication includes that change or a newer coherent state without waiting for an unrelated future update
+
+#### Scenario: Second primary subscription
+- **WHEN** another subscription is requested for an attachment that already has its primary subscription
+- **THEN** it is refused without replacing the existing subscription or creating two owners of that attachment's stream
+
+### Requirement: Coalescing preserves non-snapshot delivery
+Subscriptions MAY skip snapshots but SHALL preserve latest coherent publication order, not promise event history. Receipts SHALL remain on the ordered RPC path. Addressed effects SHALL remain retained/visible until acknowledged or superseded; delivery changes SHALL wake subscribers even with unchanged content hashes. Gate generations SHALL invalidate stale input despite skipped modal snapshots.
+
+#### Scenario: Pending effect survives a skipped frame
+- **WHEN** a publication containing a presentation request is superseded before its subscriber consumes it
+- **THEN** the latest delivery still contains that unacknowledged request unless it has been superseded or cancelled
+
+#### Scenario: Addressed delivery changes without new content
+- **WHEN** a retained addressed delivery changes while tree/state hashes remain equal
+- **THEN** its recipient is woken and receives the current pending delivery information
+
+#### Scenario: Modal opens and closes before a frame
+- **WHEN** a frontend skips the intermediate snapshots of a complete modal gate transition
+- **THEN** the latest gate generation still invalidates input interpreted before that transition
+
 ### Requirement: Client action IDs preserve ordered application
 Actions SHALL be identified by attachment UUID and increasing client counter. The session SHALL apply the next expected action once, refuse conflicting reuse, and not execute an already applied ID again. A gap SHALL report the expected ID and permit explicit retry or reattachment. Frontends SHALL submit through one ordered path and SHALL NOT replay uncertain actions under fresh IDs automatically.
 
