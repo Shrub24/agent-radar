@@ -470,17 +470,20 @@ impl Session {
             }
             // A configured launch is the one command that needs the invoking
             // frontend's environment; the session derives the rest.
-            A::PrepareLaunch { spec } => {
+            A::PrepareLaunch { row, spec } => {
                 let Some(state) = self.state.as_ref() else {
                     self.interaction_notice = Some("no fleet inventory: nothing was sent".into());
                     return Ok(None);
                 };
-                let container = self
-                    .nav
-                    .selected_id()
-                    .and_then(|id| self.nav.node(id))
-                    .and_then(|node| super::targets::selected_container(&node.row.kind))
-                    .cloned();
+                let Some(node) = row
+                    .as_ref()
+                    .and_then(|id| self.nav.node(&super::session::row_id(id)))
+                else {
+                    self.interaction_notice = Some("that row is gone; nothing was changed".into());
+                    self.project();
+                    return Ok(None);
+                };
+                let container = super::targets::selected_container(&node.row.kind).cloned();
                 let request_id = crate::control_plane::random_uuid();
                 match super::targets::launch_plan(container.as_ref(), &spec, state, &request_id) {
                     Ok(plan) => self
@@ -515,8 +518,7 @@ impl Session {
             self.interaction_notice = Some("no fleet inventory: nothing was sent".into());
             return Ok(None);
         };
-        let captured = row.or_else(|| self.nav.selected_id().map(super::session::ui_row_id));
-        let Some(captured) = captured else {
+        let Some(captured) = row else {
             self.interaction_notice = Some("nothing selected: no action target".into());
             return Ok(None);
         };
@@ -601,8 +603,6 @@ impl Session {
     }
 
     pub fn operation(&mut self, outcome: dto::CommandOutcome) {
-        // Whether a repeat may force this deletion is the daemon's record, not
-        // this session's memory: it arrives with the next observation.
         self.operation = Some(outcome);
         self.project();
     }
@@ -1159,6 +1159,35 @@ mod tests {
         assert!(frozen.contains(shown.as_str()), "{frozen}");
         assert!(!frozen.contains(other.as_str()), "{frozen}");
         assert_eq!(method, &"mux.close");
+    }
+
+    #[test]
+    fn configured_launch_refuses_a_missing_displayed_row() {
+        let mut session = seeded();
+        session.act("a", 1, A::ShowEverything);
+        session.act(
+            "a",
+            2,
+            A::PrepareLaunch {
+                row: Some(dto::UiRowId::Pane {
+                    pane_id: "missing".into(),
+                }),
+                spec: dto::LaunchSpec {
+                    command: vec!["echo".into(), "hello".into()],
+                    shell: "/bin/sh".into(),
+                    path: None,
+                },
+            },
+        );
+        assert!(session.take_completions().is_empty());
+        assert!(
+            session
+                .current()
+                .state
+                .interaction_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("row is gone"))
+        );
     }
 
     #[test]

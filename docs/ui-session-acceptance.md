@@ -53,9 +53,10 @@ Run these in a dashboard and a compact sidebar attached to the same daemon.
    popup exits after the session acknowledges the result.
 4. Delete an idle pane with no agent and nothing running. Expect: no question,
    one close, and an outcome recorded in `!` with its request id.
-5. Delete a container whose agent is still alive. Expect: the daemon holds it,
-   the refusal is published, and repeating `D` on that container sends the
-   forced deletion.
+5. Delete a container whose agent is still alive. Expect: the question names the
+   running agent, and one confirmation sends one delete. If the agent ignores
+   its stop window the place still closes, and the outcome says its exit was
+   not verified. No second prompt appears.
 6. Press `L` on a selected workspace. Expect: a new tab in that workspace running
    the configured command, with no question asked.
 7. Detach the dashboard while a close is in flight. Expect: the operation still

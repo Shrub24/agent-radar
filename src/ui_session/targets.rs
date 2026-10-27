@@ -375,10 +375,6 @@ fn container_plan(
     request_id: &str,
 ) -> Result<Plan, String> {
     use crate::app::Operation;
-    // Consent belongs to the place, not to a cursor: the daemon recorded that it
-    // already asked, so a repeat closes even if the operator navigated away and
-    // back, or asked from another frontend.
-    let force = container.deletion_held;
     let described = container_name(inventory, container);
     // A container whose place cannot be verified has nothing to freeze, so every
     // control but a deletion is refused. Deleting it is the record going, and the
@@ -395,7 +391,6 @@ fn container_plan(
                 params: json!({
                     "request": {
                         "container_id": container.container_id,
-                        "force": force,
                         "frozen": Value::Null,
                     },
                     "requester": REQUESTER,
@@ -420,7 +415,6 @@ fn container_plan(
             json!({
                 "request": {
                     "container_id": container.container_id,
-                    "force": force,
                     "frozen": {"target": target, "identity": lifecycle::identity(inventory, &target)},
                 },
                 "requester": REQUESTER,
@@ -767,11 +761,10 @@ fn pane_losses(pane: &PaneRow) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// The frozen request names the same container either way; only `force`
-    /// changes, and it is the daemon's record of a held deletion that sets it —
-    /// not anything this frontend remembers.
+    /// The daemon sees a plain guarded close: the operator's confirmation, not a
+    /// flag on the request, is what authorises ending the agents inside.
     #[test]
-    fn a_forced_deletion_is_the_same_effect_with_force_set() {
+    fn a_container_deletion_is_a_plain_close_with_no_consent_flag() {
         use crate::app::Operation;
         use crate::tree::ContainerRef;
 
@@ -784,60 +777,25 @@ mod tests {
             handle: "wA".into(),
             recipe: false,
             unresolved: None,
-            deletion_held: false,
         };
-        let selected = || Selected::Pane {
+        let selected = Selected::Pane {
             pane_id: "wA:p1".into(),
             tab: None,
             losses: Vec::new(),
         };
-        /// The request a plan would dispatch.
-        fn request(plan: &Plan) -> (&'static str, Value) {
-            match &plan.effect {
-                Effect::Domain { method, params } => (method, params.clone()),
-                Effect::Focus(_) => panic!("a deletion is a domain request"),
-            }
-        }
-        let first = plan(
-            Operation::Delete,
-            selected(),
-            &state,
-            Some(&container),
-            "r1",
-        )
-        .expect("a container deletion is freezable");
-        let (method, params) = request(&first);
-        assert_eq!(method, "topology.delete");
+        let delete = plan(Operation::Delete, selected, &state, Some(&container), "r1")
+            .expect("a container deletion is freezable");
+        let Effect::Domain { method, params } = &delete.effect else {
+            panic!("a deletion is a domain request");
+        };
+        assert_eq!(*method, "topology.delete");
         assert_eq!(
-            params.pointer("/request/force"),
-            Some(&serde_json::Value::Bool(false)),
-            "the first attempt does not force anything"
-        );
-        let repeat = plan(
-            Operation::Delete,
-            selected(),
-            &state,
-            Some(&ContainerRef {
-                deletion_held: true,
-                ..container.clone()
-            }),
-            "r2",
-        )
-        .expect("a forced repeat is freezable");
-        let (_, repeat_params) = request(&repeat);
-        assert_eq!(
-            repeat_params.pointer("/request/force"),
-            Some(&serde_json::Value::Bool(true)),
-            "the repeat carries the force the daemon recorded a hold for"
-        );
-        assert_eq!(
-            repeat_params.pointer("/request/container_id"),
             params.pointer("/request/container_id"),
-            "the repeat targets the same container"
+            Some(&serde_json::json!("c1"))
         );
-        assert_ne!(
-            repeat.request_id, first.request_id,
-            "a repeat is its own effect, not a replay of the refused one"
+        assert!(
+            params.pointer("/request/force").is_none(),
+            "consent is the confirmation the operator gave, never a request field"
         );
     }
 }

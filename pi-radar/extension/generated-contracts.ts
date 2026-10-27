@@ -1651,11 +1651,6 @@ export interface PublicContainer {
    * The operation that created it, for a caller reconciling its own requests.
    */
   created_by: string | null;
-  /**
-   * Whether a deletion of this container was held by an agent that survived it.
-   * A client that wants to close the place anyway asks with `force`.
-   */
-  deletion_held: boolean;
   kind: Kind;
   label: string | null;
   observed_at: string | null;

@@ -295,6 +295,7 @@ pub enum UiAction {
     /// A command that needs what only the invoking frontend knows. The session
     /// derives its target from the shared inventory and dispatches it.
     PrepareLaunch {
+        row: Option<UiRowId>,
         spec: LaunchSpec,
     },
     ResolveInteraction {
@@ -476,6 +477,62 @@ fn three_payloads<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Vec<Co
         }
     }
     decoder.deserialize_seq(Payloads)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentOpen {
+    pub attachment_id: String,
+    pub role: AttachmentRole,
+    pub interaction_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DuplexRequest {
+    pub id: u64,
+    pub request: DuplexOperation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DuplexOperation {
+    Action {
+        action_id: u64,
+        gate: Option<u64>,
+        action: UiAction,
+    },
+    Content {
+        hash: String,
+    },
+    Demand {
+        processes: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DuplexMetadata {
+    Publication { head: Head },
+    Reply { id: u64, reply: DuplexReply },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DuplexReply {
+    Action { outcome: ActionOutcome },
+    Content { hash: String },
+    Expired { head: Head },
+    Demand,
+    Refused { code: String, message: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DuplexFrame {
+    pub metadata: DuplexMetadata,
+    #[serde(deserialize_with = "three_payloads")]
+    pub content: Vec<Content>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

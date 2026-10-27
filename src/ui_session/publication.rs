@@ -42,6 +42,40 @@ mod tests {
     }
 
     #[test]
+    fn duplex_reply_keeps_shared_content_and_exact_request_identity() {
+        use crate::control_plane::public_contracts::ui_session as dto;
+        let payload = Content::encode(&"content").unwrap();
+        let metadata = dto::DuplexMetadata::Reply {
+            id: 9_007_199_254_740_993,
+            reply: dto::DuplexReply::Content {
+                hash: payload.hash.clone(),
+            },
+        };
+        let segments =
+            crate::content::content_frame(&metadata, std::slice::from_ref(&payload)).unwrap();
+        assert!(
+            segments
+                .0
+                .iter()
+                .any(|part| std::sync::Arc::ptr_eq(part, &payload.bytes))
+        );
+        let bytes: Vec<u8> = segments
+            .0
+            .iter()
+            .flat_map(|part| part.iter().copied())
+            .collect();
+        let decoded: dto::DuplexFrame = crate::content::read_frame(&mut bytes.as_slice()).unwrap();
+        assert!(matches!(
+            decoded.metadata,
+            dto::DuplexMetadata::Reply {
+                id: 9_007_199_254_740_993,
+                ..
+            }
+        ));
+        assert_eq!(decoded.content[0].hash, payload.hash);
+    }
+
+    #[test]
     fn portable_payload_fixtures_pin_all_three_lane_layouts() {
         use crate::control_plane::public_contracts::ui_session as dto;
         let observation = fixture(include_str!(

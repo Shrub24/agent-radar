@@ -899,11 +899,14 @@ fn perform(
                 shell: std::env::var("SHELL").unwrap_or_default(),
                 path: std::env::var_os("PATH").map(|path| path.to_string_lossy().into_owned()),
             };
-            app.submit_session(
-                agent_radar::control_plane::public_contracts::ui_session::UiAction::PrepareLaunch {
-                    spec,
-                },
-            );
+            if let Some(row) = app.command_row() {
+                app.submit_session(
+                    agent_radar::control_plane::public_contracts::ui_session::UiAction::PrepareLaunch {
+                        row,
+                        spec,
+                    },
+                );
+            }
         }
         // The session froze the effect, so the answer names the interaction rather
         // than re-deriving a target.

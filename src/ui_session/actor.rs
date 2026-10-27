@@ -8,9 +8,9 @@
 //! can never hold the actor up.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,19 @@ pub enum Effect {
     Reconcile(String),
 }
 
-type Reply<T> = SyncSender<T>;
+enum Reply<T> {
+    Sync(SyncSender<T>),
+    Async(tokio::sync::oneshot::Sender<T>),
+}
+
+impl<T> Reply<T> {
+    fn send(self, value: T) -> Result<(), T> {
+        match self {
+            Self::Sync(sender) => sender.send(value).map_err(|error| error.0),
+            Self::Async(sender) => sender.send(value),
+        }
+    }
+}
 
 enum Msg {
     Observe(
@@ -60,6 +72,13 @@ enum Msg {
         Reply<Result<dto::AttachResult, dto::RefusalCode>>,
     ),
     Detach(String),
+    Open(
+        String,
+        dto::AttachmentRole,
+        Option<String>,
+        Weak<()>,
+        Reply<Result<watch::Receiver<bool>, dto::RefusalCode>>,
+    ),
     Act(
         String,
         u64,
@@ -214,6 +233,16 @@ impl Owed {
     }
 }
 
+fn reap_attachment(session: &mut Session, leases: &mut HashMap<String, Weak<()>>, id: &str) {
+    if leases
+        .get(id)
+        .is_some_and(|lease| lease.strong_count() == 0)
+    {
+        leases.remove(id);
+        session.detach(id);
+    }
+}
+
 fn run(
     mut session: Session,
     rx: mpsc::Receiver<Msg>,
@@ -225,6 +254,7 @@ fn run(
     let mut pending = HashMap::<String, Owed>::new();
     let mut process_demand = std::collections::HashSet::new();
     let mut subscriptions: HashMap<String, watch::Sender<bool>> = HashMap::new();
+    let mut leases: HashMap<String, Weak<()>> = HashMap::new();
     let mut clock = Instant::now();
     let mut unsubscribed: HashMap<String, Instant> = HashMap::new();
     loop {
@@ -253,6 +283,7 @@ fn run(
                     let _ = reply.send(session.encoded_content(&hash));
                 }
                 Msg::Demand(id, wanted, reply) => {
+                    reap_attachment(&mut session, &mut leases, &id);
                     let result = if session.attachments_contain(&id) {
                         if wanted {
                             process_demand.insert(id);
@@ -290,9 +321,38 @@ fn run(
                 }
                 Msg::Detach(id) => {
                     unsubscribed.remove(&id);
+                    leases.remove(&id);
                     session.detach(&id);
                 }
+                Msg::Open(id, role, interaction, lease, reply) => {
+                    let result = if lease.strong_count() == 0 {
+                        Err(dto::RefusalCode::Unavailable)
+                    } else {
+                        session.attach(&id, role).and_then(|()| {
+                            if let Some(interaction) = interaction {
+                                let claim = if role == dto::AttachmentRole::Presenter {
+                                    session.claim_attachment(&id, &interaction)
+                                } else {
+                                    Err(dto::RefusalCode::Role)
+                                };
+                                if let Err(code) = claim {
+                                    session.detach(&id);
+                                    return Err(code);
+                                }
+                            }
+                            let (alive, receiver) = watch::channel(true);
+                            subscriptions.insert(id.clone(), alive);
+                            leases.insert(id.clone(), lease);
+                            Ok(receiver)
+                        })
+                    };
+                    if result.is_ok() && session.current().update_id != publish.borrow().update_id {
+                        publish.send_replace(Arc::new(session.current().clone()));
+                    }
+                    let _ = reply.send(result);
+                }
                 Msg::Act(id, number, gate, action, reply) => {
+                    reap_attachment(&mut session, &mut leases, &id);
                     let _ = reply.send(session.act_stamped(&id, number, gate, action));
                 }
                 Msg::Finished(outcome) => {
@@ -337,6 +397,14 @@ fn run(
                 status,
                 answer: None,
             });
+        }
+        let expired: Vec<_> = leases
+            .iter()
+            .filter_map(|(id, lease)| (lease.strong_count() == 0).then_some(id.clone()))
+            .collect();
+        for id in expired {
+            leases.remove(&id);
+            session.detach(&id);
         }
         let now = Instant::now();
         for (id, owed) in &mut pending {
@@ -419,10 +487,39 @@ impl UiHandle {
             .map_err(UiError::Refused)
     }
 
+    fn enqueue<T>(
+        &self,
+        build: impl FnOnce(Reply<T>) -> Msg,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, UiError> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.tx
+            .try_send(build(Reply::Async(reply)))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => UiError::Busy,
+                mpsc::TrySendError::Disconnected(_) => UiError::Stopped,
+            })?;
+        Ok(answer)
+    }
+
+    pub fn enqueue_content(
+        &self,
+        hash: &str,
+    ) -> Result<tokio::sync::oneshot::Receiver<Option<crate::content::Content>>, UiError> {
+        self.enqueue(|reply| Msg::Encoded(hash.into(), reply))
+    }
+
+    pub fn enqueue_demand(
+        &self,
+        id: &str,
+        processes: bool,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), dto::RefusalCode>>, UiError> {
+        self.enqueue(|reply| Msg::Demand(id.into(), processes, reply))
+    }
+
     fn ask<T>(&self, build: impl FnOnce(Reply<T>) -> Msg) -> Result<T, UiError> {
         let (reply, answer) = mpsc::sync_channel(1);
         self.tx
-            .try_send(build(reply))
+            .try_send(build(Reply::Sync(reply)))
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => UiError::Busy,
                 mpsc::TrySendError::Disconnected(_) => UiError::Stopped,
@@ -469,6 +566,37 @@ impl UiHandle {
         }
     }
 
+    pub fn enqueue_attachment(
+        &self,
+        id: &str,
+        role: dto::AttachmentRole,
+        interaction: Option<String>,
+        lease: &Arc<()>,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<watch::Receiver<bool>, dto::RefusalCode>>,
+        UiError,
+    > {
+        self.enqueue(|reply| {
+            Msg::Open(
+                id.to_string(),
+                role,
+                interaction,
+                Arc::downgrade(lease),
+                reply,
+            )
+        })
+    }
+
+    pub fn enqueue_action(
+        &self,
+        id: &str,
+        number: u64,
+        gate: Option<u64>,
+        action: dto::UiAction,
+    ) -> Result<tokio::sync::oneshot::Receiver<dto::ActionOutcome>, UiError> {
+        self.enqueue(|reply| Msg::Act(id.to_string(), number, gate, action, reply))
+    }
+
     /// Takes the attachment's one primary subscription.
     pub fn subscribe(&self, id: &str) -> Result<Subscription, UiError> {
         let alive = self
@@ -484,6 +612,32 @@ impl UiHandle {
             sent: None,
             known_head: None,
             alive,
+            lease: None,
+        })
+    }
+
+    pub async fn open_duplex(
+        &self,
+        id: &str,
+        role: dto::AttachmentRole,
+        interaction: Option<String>,
+    ) -> Result<Subscription, UiError> {
+        let lease = Arc::new(());
+        let alive = self
+            .enqueue_attachment(id, role, interaction, &lease)?
+            .await
+            .map_err(|_| UiError::Stopped)?
+            .map_err(UiError::Refused)?;
+        let mut published = self.published.clone();
+        published.mark_changed();
+        Ok(Subscription {
+            handle: self.clone(),
+            attachment: id.to_string(),
+            published,
+            sent: None,
+            known_head: None,
+            alive,
+            lease: Some(lease),
         })
     }
 }
@@ -497,10 +651,17 @@ pub struct Subscription {
     sent: Option<u64>,
     known_head: Option<super::publication::Head>,
     alive: watch::Receiver<bool>,
+    lease: Option<Arc<()>>,
 }
 
 impl Subscription {
     pub async fn next_frame(&mut self, session_only: bool) -> Option<super::publication::Frame> {
+        let frame = self.prepare_frame(session_only).await?;
+        self.sent_frame(&frame.head);
+        Some(frame)
+    }
+
+    pub async fn prepare_frame(&mut self, session_only: bool) -> Option<super::publication::Frame> {
         loop {
             if !*self.alive.borrow() {
                 return None;
@@ -508,10 +669,7 @@ impl Subscription {
             {
                 let current = self.published.borrow_and_update();
                 if self.sent.is_none_or(|sent| current.update_id > sent) {
-                    let frame = current.frame(self.known_head.as_ref(), session_only);
-                    self.sent = Some(current.update_id);
-                    self.known_head = Some(frame.head.clone());
-                    return Some(frame);
+                    return Some(current.frame(self.known_head.as_ref(), session_only));
                 }
             }
             tokio::select! {
@@ -520,11 +678,18 @@ impl Subscription {
             }
         }
     }
+
+    pub fn sent_frame(&mut self, head: &super::publication::Head) {
+        self.sent = Some(head.update_id);
+        self.known_head = Some(head.clone());
+    }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        self.handle.detach(&self.attachment);
+        if self.lease.is_none() {
+            self.handle.detach(&self.attachment);
+        }
     }
 }
 
@@ -591,6 +756,98 @@ mod tests {
             (!handle.processes.load(Ordering::SeqCst)).then_some(())
         });
         assert!(handle.demand("a", true).is_err());
+    }
+
+    #[test]
+    fn a_released_lease_is_checked_before_action_admission() {
+        let mut session = Session::new();
+        session.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        let lease = Arc::new(());
+        let mut leases = HashMap::from([("a".to_owned(), Arc::downgrade(&lease))]);
+        drop(lease);
+        reap_attachment(&mut session, &mut leases, "a");
+        assert!(matches!(
+            session.act("a", 1, A::Move { delta: 1 }),
+            Out::Detached
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_duplex_lease_releases_its_attachment() {
+        let service = UiService::start();
+        let handle = service.handle();
+        let lease = Arc::new(());
+        let alive = handle
+            .enqueue_attachment("duplex", dto::AttachmentRole::Dashboard, None, &lease)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*alive.borrow());
+        drop(lease);
+        crate::testing::eventually("released attachment", || (!*alive.borrow()).then_some(()));
+        let outcome = handle
+            .enqueue_action("duplex", 1, None, A::Move { delta: 1 })
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Out::Detached));
+    }
+
+    #[tokio::test]
+    async fn an_unsent_candidate_does_not_advance_content_knowledge() {
+        let service = UiService::start();
+        let handle = service.handle();
+        handle.observe(snapshot());
+        let mut stream = handle
+            .open_duplex("duplex", dto::AttachmentRole::Dashboard, None)
+            .await
+            .unwrap();
+        let first = stream.prepare_frame(false).await.unwrap();
+        assert_eq!(first.content.len(), 3);
+        handle
+            .enqueue_action("duplex", 1, None, A::Move { delta: 1 })
+            .unwrap()
+            .await
+            .unwrap();
+        crate::testing::eventually("new publication", || {
+            (handle.head().update_id > first.head.update_id).then_some(())
+        });
+        let later = stream.prepare_frame(false).await.unwrap();
+        assert_eq!(later.content.len(), 3);
+        stream.sent_frame(&later.head);
+        assert!(later.head.update_id > first.head.update_id);
+    }
+
+    #[tokio::test]
+    async fn an_enqueued_action_answers_without_blocking_the_caller() {
+        let service = UiService::start();
+        let handle = service.handle();
+        handle.observe(snapshot());
+        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        let answer = handle
+            .enqueue_action("a", 1, None, A::Move { delta: 1 })
+            .unwrap();
+        assert!(matches!(answer.await.unwrap(), Out::Applied { .. }));
+    }
+
+    #[test]
+    fn a_full_mailbox_rejects_before_an_action_is_enqueued() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        assert!(tx.try_send(Msg::Stop).is_ok());
+        let session = Session::new();
+        let (_, published) = watch::channel(Arc::new(session.current().clone()));
+        let handle = UiHandle {
+            tx,
+            published,
+            attached: Arc::new(AtomicUsize::new(0)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            processes: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(matches!(
+            handle.enqueue_action("a", 1, None, A::Move { delta: 1 }),
+            Err(UiError::Busy)
+        ));
     }
 
     #[tokio::test]
