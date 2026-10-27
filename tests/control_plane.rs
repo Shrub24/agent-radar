@@ -532,6 +532,7 @@ struct MuxBackend {
     closed: Mutex<Vec<CloseTarget>>,
     close_answer: CloseAnswer,
     created_requests: Mutex<Vec<CreateRequest>>,
+    focused_targets: Mutex<Vec<Target>>,
     input_requests: Mutex<Vec<InputRequest>>,
     output_requests: Mutex<Vec<OutputRequest>>,
     report_requests: Mutex<Vec<ReportRequest>>,
@@ -575,6 +576,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: CloseAnswer::Completed,
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -599,6 +601,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: close,
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -622,6 +625,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -649,6 +653,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -673,6 +678,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -697,6 +703,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -724,6 +731,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -748,6 +756,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -792,6 +801,7 @@ impl MuxBackend {
             closed: Mutex::new(Vec::new()),
             close_answer: self.close_answer.clone(),
             created_requests: Mutex::new(Vec::new()),
+            focused_targets: Mutex::new(Vec::new()),
             input_requests: Mutex::new(Vec::new()),
             output_requests: Mutex::new(Vec::new()),
             report_requests: Mutex::new(Vec::new()),
@@ -840,6 +850,11 @@ impl MuxBackend {
             .expect("the create list")
             .clone()
     }
+
+    /// The targets this backend was asked to focus, in order.
+    fn focused(&self) -> Vec<Target> {
+        self.focused_targets.lock().expect("the focus list").clone()
+    }
 }
 
 impl RuntimeProvider for MuxBackend {
@@ -887,8 +902,12 @@ impl RuntimeProvider for MuxBackend {
     fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
         self.foreground.clone()
     }
-    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
-        unreachable!("the mux backend is never asked to focus")
+    fn focus(&self, target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
+        self.focused_targets
+            .lock()
+            .expect("the focus list")
+            .push(target.clone());
+        Ok(())
     }
     fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
         self.close_outcome(target, cancel)
@@ -8465,7 +8484,7 @@ fn the_mux_primitives_are_served_and_recorded() {
         CreateRequest::PaneSplit {
             pane_id: "wA:p1".into(),
             direction: SplitDirection::Right,
-            focus: false,
+            focus: Some(false),
         }
     );
 
@@ -9162,7 +9181,7 @@ fn the_daemon_client_serves_every_method_over_a_real_socket() {
             &CreateRequest::PaneSplit {
                 pane_id: "wA:p1".into(),
                 direction: SplitDirection::Right,
-                focus: false,
+                focus: Some(false),
             },
             &cancel
         ),
@@ -9260,7 +9279,7 @@ fn a_backend_that_lacks_a_capability_refuses_that_operation_through_the_client()
 
     let refused = client.create(
         &CreateRequest::Workspace {
-            focus: false,
+            focus: Some(false),
             directory: None,
         },
         &cancel,
@@ -10478,6 +10497,52 @@ fn a_radar_creation_answers_with_the_container_it_recorded() {
         backend.creates().len(),
         1,
         "only the admitted creation reached the backend"
+    );
+    daemon.stop();
+}
+
+/// A created location becomes the one the operator is looking at, and creating it
+/// is not itself what moves them: the focus is a separate effect afterwards,
+/// which is why the backend can report one without the create having asked.
+#[test]
+fn a_created_container_is_focused_after_it_is_recorded() {
+    let sandbox = Sandbox::new("topology-create-focus");
+    let backend = MuxBackend::new(MUX_PRIMITIVES).naming(CreatedLocation {
+        workspace_id: Some("wA".into()),
+        tab_id: None,
+        pane_id: Some("wA:p1".into()),
+    });
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+
+    let created = client.call(
+        "topology.create",
+        json!({
+            "request": {"kind": "pane_split", "pane_id": "wA:p0", "direction": "right"},
+            "requester": "test",
+        }),
+    );
+    assert_eq!(result_record(&created)["outcome"], "completed", "{created}");
+    assert_eq!(
+        backend.focused(),
+        vec![Target::Pane("wA:p1".into())],
+        "the pane the creation named is what is focused"
+    );
+
+    // A request that says not to move the operator is obeyed: a child is created
+    // where its parent is, and the tree the operator is reading stays put.
+    let quiet = client.call(
+        "topology.create",
+        json!({
+            "request": {"kind": "pane_split", "pane_id": "wA:p1", "direction": "right", "focus": false},
+            "requester": "test",
+        }),
+    );
+    assert_eq!(result_record(&quiet)["outcome"], "completed", "{quiet}");
+    assert_eq!(
+        backend.focused(),
+        vec![Target::Pane("wA:p1".into())],
+        "an unfocused creation focuses nothing"
     );
     daemon.stop();
 }
@@ -13234,7 +13299,7 @@ fn a_claimed_ui_project_result_survives_its_origin_and_admits_one_workspace() {
 fn the_inline_project_picker_creates_through_the_session_and_can_be_cancelled_remotely() {
     use agent_radar::control_plane::public_contracts::ui_session::{AttachmentRole, UiAction};
     use agent_radar::ui_session::{client::Wake, presentation::Presentation};
-    use agent_radar::{App, config::TuiConfig};
+    use agent_radar::{App, config::ProjectsConfig};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let sandbox = Sandbox::new("ui-inline-project");
     let backend = MuxBackend::new(MUX_PRIMITIVES).naming(CreatedLocation {
@@ -13248,14 +13313,14 @@ fn the_inline_project_picker_creates_through_the_session_and_can_be_cancelled_re
     let (_runtime, client) = ui_session(daemon.path(), AttachmentRole::Dashboard);
     app.attach_session(client);
     let mut host = Presentation::default();
-    let config = TuiConfig {
-        project_source: Some(vec![
+    let config = ProjectsConfig {
+        source: Some(vec![
             "printf".into(),
             "%s\n".into(),
             sandbox.root.to_string_lossy().into_owned(),
         ]),
-        project_filter: agent_radar::config::ProjectFilter::None,
-        ..TuiConfig::default()
+        filter: agent_radar::config::ProjectFilter::None,
+        ..ProjectsConfig::default()
     };
     let until = |app: &mut App, host: &mut Presentation, predicate: &dyn Fn(&App) -> bool| {
         let deadline = Instant::now() + Duration::from_secs(5);

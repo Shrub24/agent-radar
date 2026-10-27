@@ -140,7 +140,7 @@ in
         colors.done = "light-green";
         appearance.working = "pulse";
         processes.nvim = "N";
-        daemon.tmux_server = "radar";
+        server.tmux_server = "radar";
       };
       description = ''
         Freeform TOML written to {file}`radar/config.toml` under the XDG

@@ -1,7 +1,7 @@
 //! Frontend-owned discovery and terminal hosting. Interaction state stays in the daemon.
 use crate::control_plane::public_contracts::ui_session::{InteractionStage, UiAction};
 use crate::ui_session::client::Wake;
-use crate::{App, config::TuiConfig};
+use crate::{App, config::ProjectsConfig};
 use std::process::ExitStatus;
 use std::sync::mpsc;
 
@@ -24,7 +24,13 @@ enum Progress {
 }
 
 impl Presentation {
-    pub fn poll(&mut self, app: &mut App, config: &TuiConfig, detached: bool, wake: &Wake) -> bool {
+    pub fn poll(
+        &mut self,
+        app: &mut App,
+        projects: &ProjectsConfig,
+        detached: bool,
+        wake: &Wake,
+    ) -> bool {
         let Some(mirror) = app.session_mirror() else {
             return false;
         };
@@ -80,20 +86,18 @@ impl Presentation {
             _ => {}
         }
         if blocking.stage == InteractionStage::Preparing && matches!(work.progress, Progress::New) {
-            let config = config.clone();
+            let projects = projects.clone();
             let wake = wake.clone();
             let (tx, rx) = mpsc::channel();
             work.progress = Progress::Discovering(rx);
             std::thread::spawn(move || {
-                let base = config
-                    .project_base
+                let base = projects
+                    .base
+                    .clone()
                     .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
                     .unwrap_or_default();
-                let found = crate::project::candidates(
-                    config.project_source.as_deref(),
-                    config.project_filter,
-                    &base,
-                );
+                let found =
+                    crate::project::candidates(projects.source.as_deref(), projects.filter, &base);
                 let _ = tx.send(found);
                 wake.notify();
             });

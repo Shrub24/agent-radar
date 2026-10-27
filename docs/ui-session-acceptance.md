@@ -24,7 +24,7 @@ Milestone C migrates workspace creation; other shared commands remain milestone 
    choice should still create once. Separately terminate only the presenter:
    the remaining dashboard should regain control without creating anything.
    Report host-level popup teardown separately from session behavior.
-6. Set a nonexistent `[tui] project_source` program. The picker should show the
+6. Set a nonexistent `[projects] source` program. The picker should show the
    absolute `project_base` (default home) and a diagnostic. Set an unusable base:
    it should instead be empty with a diagnostic. A working source should keep its
    order without a start-directory entry. Run from two directories and compare.

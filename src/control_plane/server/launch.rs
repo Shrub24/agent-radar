@@ -504,7 +504,9 @@ pub(super) fn spawn_child(
     let create_request = CreateRequest::PaneSplit {
         pane_id: parent_pane.clone(),
         direction: SplitDirection::Right,
-        focus: false,
+        // A child is created where its parent is, and creating one must not move
+        // the operator's cursor.
+        focus: Some(false),
     };
     let created = backend.create(&create_request, &cancel);
     let (created_outcome, named, mut created_message) = match &created {

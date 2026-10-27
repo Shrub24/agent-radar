@@ -151,7 +151,7 @@ fn drive(fake: &Fake) {
     let _ = runtime.close_outcome(&CloseTarget::Tab(fake.handle("@0")), &cancel);
     let _ = runtime.create(
         &CreateRequest::Workspace {
-            focus: false,
+            focus: Some(false),
             directory: None,
         },
         &cancel,
@@ -159,7 +159,7 @@ fn drive(fake: &Fake) {
     let _ = runtime.create(
         &CreateRequest::Tab {
             workspace_id: workspace.clone(),
-            focus: false,
+            focus: Some(false),
         },
         &cancel,
     );
@@ -167,7 +167,7 @@ fn drive(fake: &Fake) {
         &CreateRequest::PaneSplit {
             pane_id: pane.clone(),
             direction: SplitDirection::Right,
-            focus: false,
+            focus: Some(false),
         },
         &cancel,
     );
@@ -390,7 +390,7 @@ fn a_command_that_failed_after_dispatch_is_unknown_never_refused() {
     );
     let created = runtime.create(
         &CreateRequest::Workspace {
-            focus: false,
+            focus: Some(false),
             directory: None,
         },
         &cancel,
@@ -413,7 +413,7 @@ fn a_workspace_starts_in_the_named_directory_and_refuses_one_that_does_not_exist
     std::fs::create_dir_all(&directory).expect("a directory");
     let cancel = AtomicBool::new(false);
     let request = |directory: &str| CreateRequest::Workspace {
-        focus: false,
+        focus: Some(false),
         directory: Some(directory.to_string()),
     };
     let created = probe
@@ -447,7 +447,7 @@ fn a_workspace_that_cannot_be_focused_is_refused_before_creating_anything() {
     let runtime = &fake.runtime;
     let created = runtime.create(
         &CreateRequest::Workspace {
-            focus: true,
+            focus: Some(true),
             directory: None,
         },
         &cancel(),
@@ -560,7 +560,7 @@ fn records_with_tmux_3_5as_escaped_separator_decode_the_same_way() {
     let created = runtime.create(
         &CreateRequest::Tab {
             workspace_id: workspace.clone(),
-            focus: false,
+            focus: Some(false),
         },
         &cancel,
     );
@@ -578,7 +578,7 @@ fn records_with_tmux_3_5as_escaped_separator_decode_the_same_way() {
         &CreateRequest::PaneSplit {
             pane_id: pane,
             direction: SplitDirection::Right,
-            focus: false,
+            focus: Some(false),
         },
         &cancel,
     );
@@ -995,7 +995,7 @@ fn create_names_the_locations_it_made() {
 
     let created = runtime.create(
         &CreateRequest::Workspace {
-            focus: false,
+            focus: Some(false),
             directory: None,
         },
         &cancel,
@@ -1009,7 +1009,7 @@ fn create_names_the_locations_it_made() {
     let created = runtime.create(
         &CreateRequest::Tab {
             workspace_id: workspace_id.clone(),
-            focus: false,
+            focus: Some(false),
         },
         &cancel,
     );
@@ -1031,7 +1031,7 @@ fn create_names_the_locations_it_made() {
         &CreateRequest::PaneSplit {
             pane_id: pane,
             direction: SplitDirection::Right,
-            focus: false,
+            focus: Some(false),
         },
         &cancel,
     );
@@ -1048,7 +1048,7 @@ fn create_names_the_locations_it_made() {
     let created = runtime.create(
         &CreateRequest::Tab {
             workspace_id: workspace_id.clone(),
-            focus: true,
+            focus: Some(true),
         },
         &cancel,
     );
@@ -1074,7 +1074,7 @@ fn create_names_the_locations_it_made() {
         &CreateRequest::PaneSplit {
             pane_id: probe.runtime_handle(window_pane.trim()),
             direction: SplitDirection::Down,
-            focus: true,
+            focus: Some(true),
         },
         &cancel,
     );
@@ -1722,7 +1722,7 @@ fn adapter_work_leaves_tmuxs_default_server_alone() {
     let _ = probe.runtime.create(
         &CreateRequest::Tab {
             workspace_id: probe.runtime_handle("$0"),
-            focus: false,
+            focus: Some(false),
         },
         &cancel,
     );

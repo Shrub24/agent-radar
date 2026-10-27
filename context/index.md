@@ -26,6 +26,8 @@
 
 ## C
 
+- [config-and-create-focus.md](config-and-create-focus.md) — config sections by surface, and why a create does not move the operator
+
 ## D
 
 ## E

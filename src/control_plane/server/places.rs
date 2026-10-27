@@ -407,6 +407,17 @@ pub(super) fn dispatch_creation(
     // checked here: a recipe this backend cannot carry refuses before a pane
     // exists, exactly as a spawn is preflighted.
     let recipe = creation_recipe(request, &create)?;
+    // What the caller asked for, or the daemon's own choice when it said nothing.
+    // A create dispatched unfocused is followed by a focus of what it made, so a
+    // backend never moves the operator as a side effect of creating. A workspace
+    // is exempt: tmux focuses one by switching a client, which a create cannot
+    // do, so the follow-up focus is the only place that can.
+    let focus = match &create {
+        CreateRequest::Workspace { .. } => false,
+        CreateRequest::Tab { focus, .. } | CreateRequest::PaneSplit { focus, .. } => {
+            focus.unwrap_or_else(|| locked(core).config.focus_created)
+        }
+    };
     if let Some(recipe) = &recipe
         && let Err(refusal) = preflight_recipe(core, &create, recipe)
     {
@@ -536,6 +547,28 @@ pub(super) fn dispatch_creation(
                 }
                 None => (RequestOutcome::Completed, None),
             };
+            // A successful creation is followed by a focus of the location it
+            // named. The creation has already happened, so a focus that cannot
+            // move a client is reported and never changes the creation's outcome
+            // or repeats it.
+            if focus && matches!(outcome, RequestOutcome::Completed) {
+                match created.pane_id.as_deref() {
+                    Some(pane) => {
+                        match backend.focus_outcome(&Target::Pane(pane.to_string()), &cancel) {
+                            FocusOutcome::Completed => {}
+                            FocusOutcome::Refused(message) => {
+                                notes.push(format!("the created pane was not focused: {message}"));
+                            }
+                            FocusOutcome::Unknown(message) => {
+                                notes.push(format!(
+                                    "the focus of the created pane is unknown: {message}"
+                                ));
+                            }
+                        }
+                    }
+                    None => notes.push("the creation named no pane to focus".to_string()),
+                }
+            }
             let note = (!notes.is_empty()).then(|| notes.join("; "));
             return Ok(Creation {
                 record: record

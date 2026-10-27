@@ -385,7 +385,7 @@ fn replay_restores_a_container_without_rewriting_it() {
             recipe: false,
             request: &crate::runtime::CreateRequest::Tab {
                 workspace_id: "wA".into(),
-                focus: false,
+                focus: Some(false),
             },
             created: &crate::runtime::CreatedLocation {
                 workspace_id: Some("wA".into()),

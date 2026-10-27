@@ -18,7 +18,7 @@ The daemon exposes physical control, registry reads/publications, and volatile b
 | Background-task read | Read volatile task snapshots grouped by exact Pi session UUID | [Publisher bridge](radar-bus.md) |
 
 The physical backend is tmux on the server named `radar`. The server name comes from
-`RADAR_TMUX_SERVER` or the `[daemon] tmux_server` setting. The daemon runs the
+`RADAR_TMUX_SERVER` or the `[server] tmux_server` setting. The daemon runs the
 executables named by `RADAR_TMUX` and `RADAR_SYSTEMCTL` (absolute paths in the
 Home Manager unit, `tmux` and `systemctl` from `PATH` otherwise), so its unit
 needs no `PATH`: tmux gives a new session its creator's `PATH`, and a unit with
@@ -40,7 +40,7 @@ anything changes, and a focus never holds its target against a later mutation.
 The dashboard, not the daemon, opens a terminal when a focus is refused for
 want of a client, because only it holds the user's desktop session: it runs
 `[tui] terminal` (else `$TERMINAL -e`) with `tmux -L <server> attach-session -t
-<id>` and asks again. `L` immediately launches `[tui] launch_command` (default
+<id>` and asks again. `L` immediately launches `[agents] launch_command` (default
 `["pi"]`) through the user's login/interactive shell, in the selected workspace's
 recorded directory or pane's current directory. The shell initializes its normal
 environment and applies direnv for that target; Radar does not copy the dashboard's
@@ -201,7 +201,7 @@ Clients connect directly using Unix-domain UTF-8 JSON Lines, protocol version
 `2`, with a canonical UUID request ID and one matching response per request.
 Send `daemon.ping` first. The answer includes protocol `2`, a wire `revision`, and the contracts this daemon serves. External consumers pin only what they use: `registry.v1` for a registry publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader, `observation.get.v1` for a display or any reader of the shared observation snapshot, `tasks.list.v1` for background-task snapshots, `communication.handoff.v1` for durable handoffs, and `spawn.v1`/`spawn.close.v1` for managed children. Unknown contract names are tolerated. The bundled Radar client requires its minimum revision and shows a blocking diagnostic with the daemon restart command if a daemon outlived an install. `mux.*` primitives are internal and are not sent in the handshake.
 
-Default control socket resolution: `RADAR_CONTROL_SOCKET`, then `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then `/tmp/agent-radar-<uid>/control.sock`. The daemon temporarily also binds the legacy publisher socket path described in [the publisher bridge](radar-bus.md); it is an ingest-only compatibility entry into the same transport and task state. See the [protocol reference](control-plane.md#start-and-select) for state-path resolution, the `[daemon]` table, and physical-backend selection.
+Default control socket resolution: `RADAR_CONTROL_SOCKET`, then `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then `/tmp/agent-radar-<uid>/control.sock`. The daemon temporarily also binds the legacy publisher socket path described in [the publisher bridge](radar-bus.md); it is an ingest-only compatibility entry into the same transport and task state. See the [protocol reference](control-plane.md#start-and-select) for state-path resolution, the `[server]` table, and physical-backend selection.
 
 Before connecting, check that the socket and its parent are not symlinks, the
 parent is a user-owned real directory with mode `0700`, and the socket is a

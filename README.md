@@ -475,6 +475,14 @@ timeout — is stated on that line too, which clears on the next key press or af
 a few seconds. Nothing the focus path asks tmux for changes an agent, a pane's
 contents or a layout: it selects the window or the pane and nothing else.
 
+Adding a pane or a tab, and `L`, move the client to what they created, because a
+create is dispatched unfocused and focused afterwards: `[server] focus_created`
+(default `true`) decides that, and a request may say otherwise. The focus is a
+second effect on a completed creation, so a refusal is reported without undoing
+or repeating the create; a completed focus says nothing, since moving a terminal
+changes nothing in the tree. Creating a workspace is unfocused, because tmux
+cannot create a session and switch a client to it in one command.
+
 `D` is one key for every row: it ends whatever the selected row is. A
 confirmation names the row and lists what the action may lose — the agent and its
 assignment, outstanding background work, the tab's member panes — and starts on
@@ -926,10 +934,10 @@ pane title and label, which describe the pane rather than an agent.
   `A` creates a workspace named for a chosen project, whatever row is selected.
   One private picker blocks shared tree input across all views: inline in the
   dashboard or detached over a compact workspace sidebar. Candidates come from
-  `[tui] project_source` (default `zoxide query -l`), filtered to git projects by
-  `project_filter`. An empty or failed source falls back to `[tui] project_base`
+  `[projects] source` (default `zoxide query -l`), filtered to git projects by
+  `filter`. An empty or failed source falls back to `[projects] base`
   (default home), with a diagnostic. The invoking start directory is not prepended.
-  `L` immediately launches the configured `[tui] launch_command` argv (default `["pi"]`) as a managed agent in a new tab of the selected place's workspace — from a pane it opens its own window rather than splitting that pane — and it uses the selected pane's directory (or the workspace's) and starts the resolved command through the user's login/interactive shell, applying the target directory's direnv environment without copying the TUI's environment. Use `a` to add an empty shell for arbitrary commands. A lead started with `L` is enrolled as a lifecycle subject when it registers, so it can be stopped and restarted; `E` enrolls any other registered lead after a confirmation.
+  `L` immediately launches the configured `[agents] launch_command` argv (default `["pi"]`) as a managed agent in a new tab of the selected place's workspace — from a pane it opens its own window rather than splitting that pane — and it uses the selected pane's directory (or the workspace's) and starts the resolved command through the user's login/interactive shell, applying the target directory's direnv environment without copying the TUI's environment. Use `a` to add an empty shell for arbitrary commands. A lead started with `L` is enrolled as a lifecycle subject when it registers, so it can be stopped and restarted; `E` enrolls any other registered lead after a confirmation.
   Enter on a row focuses it; with no tmux client attached it opens a terminal
   attached to the server (`[tui] terminal`, else `$TERMINAL -e`) and asks again. Children are not nested under their
   parent: the exact spawn edge is shown in the details. An ordinary pane never

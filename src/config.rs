@@ -189,56 +189,66 @@ pub enum ControlBackend {
 /// The tmux server a daemon serves when none is named. Never tmux's own default.
 pub const DEFAULT_TMUX_SERVER: &str = "radar";
 
-/// What the control daemon serves. The daemon reads this at startup; the TUI
-/// reads nothing here, because it only ever talks to the daemon's socket.
+/// What Radar serves: the physical backend and the server it lives on.
 ///
-/// Environment variables override the file: `RADAR_CONTROL_BACKEND` and
-/// `RADAR_TMUX_SERVER`.
+/// The daemon reads this at startup and the dashboard needs the server name to
+/// reach the daemon's socket. Environment variables override the file:
+/// `RADAR_CONTROL_BACKEND` and `RADAR_TMUX_SERVER`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DaemonConfig {
+pub struct ServerConfig {
     pub backend: ControlBackend,
     /// The tmux server a tmux backend serves. Never tmux's default server.
     pub tmux_server: String,
+    /// Whether a location Radar creates becomes the one the operator is looking
+    /// at. A request may say otherwise; this is what it gets when it says nothing.
+    pub focus_created: bool,
 }
 
-impl Default for DaemonConfig {
+impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             backend: ControlBackend::Tmux,
             tmux_server: DEFAULT_TMUX_SERVER.to_string(),
+            focus_created: true,
         }
     }
 }
 
-/// What the dashboard itself does on the user's desktop.
+/// What runs when a managed agent is launched.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TuiConfig {
+pub struct AgentsConfig {
     /// The argv used by `L` for a managed-agent launch. Defaults to `pi`.
     pub launch_command: Vec<String>,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            launch_command: vec!["pi".into()],
+        }
+    }
+}
+
+/// What the dashboard is and draws in on the user's desktop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TuiConfig {
     /// The program and leading arguments that run a command in a new terminal,
     /// used to attach to the server when a focus finds no client. Unset runs
     /// `$TERMINAL -e`.
     pub terminal: Option<Vec<String>>,
-    /// The command that prints candidate project directories, one per line, for
-    /// a new workspace. Unset runs `zoxide query -l`; a program that is missing
-    /// or fails offers only project_base (default home).
-    pub project_source: Option<Vec<String>>,
-    /// Empty-source fallback. Relative paths are rejected.
-    pub project_base: Option<std::path::PathBuf>,
-    /// Which of the source's directories are offered.
-    pub project_filter: ProjectFilter,
 }
 
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self {
-            launch_command: vec!["pi".into()],
-            terminal: None,
-            project_source: None,
-            project_base: None,
-            project_filter: ProjectFilter::default(),
-        }
-    }
+/// Which project directories a new-workspace picker offers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectsConfig {
+    /// The command that prints candidate project directories, one per line.
+    /// Unset runs `zoxide query -l`; a program that is missing or fails offers
+    /// only [`Self::base`].
+    pub source: Option<Vec<String>>,
+    /// Empty-source fallback. Relative paths are rejected.
+    pub base: Option<std::path::PathBuf>,
+    /// Which of the source's directories are offered.
+    pub filter: ProjectFilter,
 }
 
 /// Which candidate directories a new-workspace picker offers.
@@ -273,9 +283,13 @@ pub struct Config {
     /// Program marks for pane rows, by program name. Unknown programs fall back
     /// to the pane's own mark, and a value of `"none"` removes a program's.
     pub processes: BTreeMap<String, String>,
-    /// What the control daemon serves.
-    pub daemon: DaemonConfig,
-    /// What the dashboard does on the desktop.
+    /// What Radar serves.
+    pub server: ServerConfig,
+    /// What a managed agent launch runs.
+    pub agents: AgentsConfig,
+    /// Which projects a new workspace offers.
+    pub projects: ProjectsConfig,
+    /// What the dashboard is on the desktop.
     pub tui: TuiConfig,
     /// How `radar sidebar` asks its host terminal to hide and unhide it.
     pub sidebar: SidebarConfig,
@@ -288,7 +302,9 @@ impl Default for Config {
             brands: default_brands(),
             appearance: Appearance::default(),
             processes: default_processes(),
-            daemon: DaemonConfig::default(),
+            server: ServerConfig::default(),
+            agents: AgentsConfig::default(),
+            projects: ProjectsConfig::default(),
             tui: TuiConfig::default(),
             sidebar: SidebarConfig::default(),
         }
@@ -408,62 +424,80 @@ impl Config {
             }
             config.appearance.fps = fps;
         }
-        let daemon = file.daemon.unwrap_or_default();
-        if let Some(backend) = daemon.backend {
-            config.daemon.backend = match backend.trim().to_ascii_lowercase().as_str() {
+        if file.daemon.is_some() {
+            return Err(
+                "`[daemon]` is now `[server]`: move backend and tmux_server there and \
+                        remove the old table"
+                    .to_string(),
+            );
+        }
+        let tui = file.tui.unwrap_or_default();
+        if let Some(key) = tui.other.keys().next() {
+            return Err(match moved_to(key) {
+                Some(section) => format!("tui.{key} is now {section}.{key}"),
+                None => format!("tui: unknown key `{key}`"),
+            });
+        }
+        let server = file.server.unwrap_or_default();
+        if let Some(backend) = server.backend {
+            config.server.backend = match backend.trim().to_ascii_lowercase().as_str() {
                 "tmux" => ControlBackend::Tmux,
                 other => {
                     return Err(format!(
-                        "daemon.backend: `{other}` is not a backend; use `tmux`"
+                        "server.backend: `{other}` is not a backend; use `tmux`"
                     ));
                 }
             };
         }
-        if let Some(server) = &daemon.tmux_server {
+        if let Some(name) = &server.tmux_server {
             // An empty name would reach tmux's own default server, which Radar
             // never targets, so it is refused here rather than read as unset.
-            let server = server.trim();
-            if server.is_empty() {
-                return Err("daemon.tmux_server: an empty name names no tmux server".to_string());
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("server.tmux_server: an empty name names no tmux server".to_string());
             }
-            config.daemon.tmux_server = server.to_string();
+            config.server.tmux_server = name.to_string();
         }
-        let tui = file.tui.unwrap_or_default();
-        if let Some(command) = tui.launch_command {
+        if let Some(focus) = server.focus_created {
+            config.server.focus_created = focus;
+        }
+        let agents = file.agents.unwrap_or_default();
+        if let Some(command) = agents.launch_command {
             if command
                 .first()
                 .is_none_or(|program| program.trim().is_empty())
             {
-                return Err("tui.launch_command: name a program, for example [\"pi\"]".to_string());
+                return Err(
+                    "agents.launch_command: name a program, for example [\"pi\"]".to_string(),
+                );
             }
-            config.tui.launch_command = command;
+            config.agents.launch_command = command;
         }
-        if let Some(source) = tui.project_source {
+        let projects = file.projects.unwrap_or_default();
+        if let Some(source) = projects.source {
             if source
                 .first()
                 .is_none_or(|program| program.trim().is_empty())
             {
                 return Err(
-                    "tui.project_source: name a program, for example [\"zoxide\", \"query\", \"-l\"]"
+                    "projects.source: name a program, for example [\"zoxide\", \"query\", \"-l\"]"
                         .to_string(),
                 );
             }
-            config.tui.project_source = Some(source);
+            config.projects.source = Some(source);
         }
-        if let Some(base) = tui.project_base {
+        if let Some(base) = projects.base {
             if !base.is_absolute() {
-                return Err("tui.project_base must be absolute".into());
+                return Err("projects.base must be absolute".into());
             }
-            config.tui.project_base = Some(base);
+            config.projects.base = Some(base);
         }
-        match tui.project_filter.as_deref() {
+        match projects.filter.as_deref() {
             None => {}
-            Some("git") => config.tui.project_filter = ProjectFilter::Git,
-            Some("none") => config.tui.project_filter = ProjectFilter::None,
+            Some("git") => config.projects.filter = ProjectFilter::Git,
+            Some("none") => config.projects.filter = ProjectFilter::None,
             Some(other) => {
-                return Err(format!(
-                    "tui.project_filter: `{other}` is not `git` or `none`"
-                ));
+                return Err(format!("projects.filter: `{other}` is not `git` or `none`"));
             }
         }
         if let Some(terminal) = tui.terminal {
@@ -615,53 +649,64 @@ impl Config {
                 out.push_str(&format!("\n\"{program}\" = \"none\""));
             }
         }
-        let backend = match self.daemon.backend {
+        let backend = match self.server.backend {
             ControlBackend::Tmux => "tmux",
         };
-        let server = &self.daemon.tmux_server;
+        let server = &self.server.tmux_server;
         out.push_str(&format!(
-            "\n\n# What the control daemon serves. `tmux` serves the named tmux server, which\n\
-             # Radar owns and starts through its own user unit.\n\
-             [daemon]\n\
+            "\n\n# What Radar serves. `tmux` serves the named tmux server, which Radar owns and\n\
+             # starts through its own user unit.\n\
+             [server]\n\
              # `tmux`\n\
              backend = \"{backend}\"\n\
              # the tmux server a `tmux` backend serves; never tmux's default server\n\
-             tmux_server = \"{server}\""
+             tmux_server = \"{server}\"\n\
+             # whether a location Radar creates becomes the one you are looking at\n\
+             focus_created = {}",
+            self.server.focus_created
         ));
         out.push_str(
-            "\n\n# What the dashboard does on the desktop.\n\
-             [tui]\n\
-             # The program and arguments that run a command in a new terminal, used to attach\n\
-             # to the tmux server when a focus finds no client. Unset runs `$TERMINAL -e`.\n\
-             # terminal = [\"wezterm\", \"start\", \"--\"]\n\
-             # The command that prints candidate project directories for a new workspace, one\n\
-             # per line. Unset runs `zoxide query -l`.\n\
-             # project_source = [\"zoxide\", \"query\", \"-l\"]\n\
-             # `git` offers only directories containing `.git`; `none` offers every directory.\n\
-             # project_filter = \"git\"\n\
-             # Empty-source fallback; unset uses $HOME. Must be absolute.\n\
-             # project_base = \"/home/you\"\n",
+            "\n\n# What a managed agent launch runs.\n\
+             [agents]\n\
+             # `L` launches this argv as a managed agent. Use `a` for an empty shell.\n\
+             # launch_command = [\"pi\"]\n",
         );
-        out.push_str("# `L` launches this argv as a managed agent; unset defaults to `pi`. Use `a` for an empty shell.\n# launch_command = [\"pi\"]\n");
-        if self.tui.launch_command != ["pi"] {
+        if self.agents.launch_command != ["pi"] {
             let quoted: Vec<String> = self
-                .tui
+                .agents
                 .launch_command
                 .iter()
                 .map(|word| format!("{word:?}"))
                 .collect();
             out.push_str(&format!("launch_command = [{}]\n", quoted.join(", ")));
         }
-        if let Some(source) = &self.tui.project_source {
+        out.push_str(
+            "\n# Which projects a new workspace offers.\n\
+             [projects]\n\
+             # The command that prints candidate project directories, one per line. Unset runs\n\
+             # `zoxide query -l`.\n",
+        );
+        if let Some(source) = &self.projects.source {
             let quoted: Vec<String> = source.iter().map(|word| format!("{word:?}")).collect();
-            out.push_str(&format!("project_source = [{}]\n", quoted.join(", ")));
+            out.push_str(&format!("source = [{}]\n", quoted.join(", ")));
         }
-        if let Some(base) = &self.tui.project_base {
-            out.push_str(&format!("project_base = {:?}\n", base.to_string_lossy()));
+        out.push_str("# Empty-source fallback; unset uses $HOME. Must be absolute.\n");
+        if let Some(base) = &self.projects.base {
+            out.push_str(&format!("base = {:?}\n", base.to_string_lossy()));
         }
-        if self.tui.project_filter == ProjectFilter::None {
-            out.push_str("project_filter = \"none\"\n");
+        out.push_str(
+            "# `git` offers only directories containing `.git`; `none` offers every directory.\n",
+        );
+        if self.projects.filter == ProjectFilter::None {
+            out.push_str("filter = \"none\"\n");
         }
+        out.push_str(
+            "\n# What the dashboard is on the desktop.\n\
+             [tui]\n\
+             # The program and arguments that run a command in a new terminal, used to attach\n\
+             # to the tmux server when a focus finds no client. Unset runs `$TERMINAL -e`.\n\
+             # terminal = [\"wezterm\", \"start\", \"--\"]\n",
+        );
         if let Some(terminal) = &self.tui.terminal {
             let quoted: Vec<String> = terminal.iter().map(|word| format!("{word:?}")).collect();
             out.push_str(&format!("terminal = [{}]\n", quoted.join(", ")));
@@ -852,9 +897,35 @@ struct FileConfig {
     brands: Option<BTreeMap<String, ColorSpec>>,
     appearance: Option<FileAppearance>,
     processes: Option<BTreeMap<String, String>>,
-    daemon: Option<FileDaemon>,
+    server: Option<FileServer>,
+    agents: Option<FileAgents>,
+    projects: Option<FileProjects>,
     tui: Option<FileTui>,
     sidebar: Option<FileSidebar>,
+    /// The table `[server]` replaced, kept only so its contents are reported.
+    daemon: Option<toml::Value>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileServer {
+    backend: Option<String>,
+    tmux_server: Option<String>,
+    focus_created: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileAgents {
+    launch_command: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileProjects {
+    source: Option<Vec<String>>,
+    base: Option<std::path::PathBuf>,
+    filter: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -867,21 +938,40 @@ struct FileSidebar {
     unzoom_command: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
+/// The dashboard's own settings.
+///
+/// Deserialized by hand so a key that belongs to another section can say which
+/// one (see [`moved_to`]) instead of reading as a typo.
+#[derive(Default)]
 struct FileTui {
-    launch_command: Option<Vec<String>>,
     terminal: Option<Vec<String>>,
-    project_source: Option<Vec<String>>,
-    project_base: Option<std::path::PathBuf>,
-    project_filter: Option<String>,
+    /// Every other key the table held, kept only to be refused.
+    other: BTreeMap<String, toml::Value>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct FileDaemon {
-    backend: Option<String>,
-    tmux_server: Option<String>,
+impl<'de> Deserialize<'de> for FileTui {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Body {
+            terminal: Option<Vec<String>>,
+            #[serde(flatten)]
+            other: BTreeMap<String, toml::Value>,
+        }
+        let body = Body::deserialize(deserializer)?;
+        Ok(Self {
+            terminal: body.terminal,
+            other: body.other,
+        })
+    }
+}
+
+/// The section a key moved to, if it moved.
+fn moved_to(key: &str) -> Option<&'static str> {
+    match key {
+        "launch_command" => Some("agents"),
+        "project_source" | "project_base" | "project_filter" => Some("projects"),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1141,23 +1231,23 @@ htop = "none"
     }
 
     #[test]
-    fn tmux_on_the_radar_server_is_the_default_daemon() {
-        assert_eq!(DaemonConfig::default().backend, ControlBackend::Tmux);
-        assert_eq!(DaemonConfig::default().tmux_server, "radar");
-        // A file that names nothing about the daemon serves the default, and so
+    fn tmux_on_the_radar_server_is_the_default() {
+        assert_eq!(ServerConfig::default().backend, ControlBackend::Tmux);
+        assert_eq!(ServerConfig::default().tmux_server, "radar");
+        // A file that names nothing about the server serves the default, and so
         // does one that names another section.
-        for document in ["", "[colors]\ndone = \"red\"\n", "[daemon]\n"] {
+        for document in ["", "[colors]\ndone = \"red\"\n", "[server]\n"] {
             let config = Config::parse(document).expect("parses");
-            assert_eq!(config.daemon, DaemonConfig::default(), "{document}");
+            assert_eq!(config.server, ServerConfig::default(), "{document}");
         }
     }
 
     #[test]
-    fn the_daemon_backend_and_server_are_configurable() {
-        let config = Config::parse("[daemon]\nbackend = \"tmux\"\ntmux_server = \"work\"\n")
+    fn the_backend_and_server_are_configurable() {
+        let config = Config::parse("[server]\nbackend = \"tmux\"\ntmux_server = \"work\"\n")
             .expect("parses");
-        assert_eq!(config.daemon.backend, ControlBackend::Tmux);
-        assert_eq!(config.daemon.tmux_server, "work");
+        assert_eq!(config.server.backend, ControlBackend::Tmux);
+        assert_eq!(config.server.tmux_server, "work");
 
         // The document prints the choice and reads back as the same config.
         let printed = config.to_document();
@@ -1170,6 +1260,19 @@ htop = "none"
             Config::parse(&printed).expect("round trips"),
             Config::default()
         );
+    }
+
+    #[test]
+    fn a_created_location_is_focused_unless_the_configuration_says_otherwise() {
+        assert!(ServerConfig::default().focus_created);
+        let config = Config::parse("[server]\nfocus_created = false\n").expect("parses the choice");
+        assert!(!config.server.focus_created);
+        assert_eq!(
+            Config::parse(&config.to_document()).expect("round trips"),
+            config
+        );
+        let error = Config::parse("[server]\nfocus_created = \"yes\"\n").expect_err("not a bool");
+        assert!(error.contains("focus_created"), "{error}");
     }
 
     #[test]
@@ -1218,7 +1321,7 @@ htop = "none"
     #[test]
     fn managed_launch_command_defaults_to_pi_and_round_trips_overrides() {
         let default = Config::default();
-        assert_eq!(default.tui.launch_command, ["pi"]);
+        assert_eq!(default.agents.launch_command, ["pi"]);
         assert!(
             default
                 .to_document()
@@ -1230,10 +1333,10 @@ htop = "none"
         );
 
         let configured =
-            Config::parse("[tui]\nlaunch_command = [\"pi\", \"--model\", \"test model\"]\n")
+            Config::parse("[agents]\nlaunch_command = [\"pi\", \"--model\", \"test model\"]\n")
                 .expect("parses argv");
         assert_eq!(
-            configured.tui.launch_command,
+            configured.agents.launch_command,
             ["pi", "--model", "test model"]
         );
         assert_eq!(
@@ -1241,21 +1344,42 @@ htop = "none"
             configured
         );
         for document in [
-            "[tui]\nlaunch_command = []\n",
-            "[tui]\nlaunch_command = [\" \"]\n",
+            "[agents]\nlaunch_command = []\n",
+            "[agents]\nlaunch_command = [\" \"]\n",
         ] {
             assert!(Config::parse(document).is_err(), "{document}");
         }
     }
 
     #[test]
-    fn a_daemon_setting_it_does_not_know_says_so() {
-        let error = Config::parse("[daemon]\nbackend = \"docker\"\n").expect_err("unknown");
-        assert!(error.contains("daemon.backend"), "{error}");
+    fn a_server_setting_it_does_not_know_says_so() {
+        let error = Config::parse("[server]\nbackend = \"docker\"\n").expect_err("unknown");
+        assert!(error.contains("server.backend"), "{error}");
         assert!(error.contains("docker"), "{error}");
-        let error = Config::parse("[daemon]\ntmux_servr = \"x\"\n").expect_err("unknown key");
+        let error = Config::parse("[server]\ntmux_servr = \"x\"\n").expect_err("unknown key");
         assert!(error.contains("tmux_servr"), "{error}");
-        assert!(Config::parse("[daemon]\ntmux_server = \"\"\n").is_err());
+        assert!(Config::parse("[server]\ntmux_server = \"\"\n").is_err());
+    }
+
+    #[test]
+    fn a_key_that_moved_says_where_it_went() {
+        let error = Config::parse("[daemon]\ntmux_server = \"work\"\n").expect_err("moved");
+        assert!(error.contains("[server]"), "{error}");
+        for (key, section) in [
+            ("launch_command = [\"pi\"]", "agents"),
+            ("project_source = [\"zoxide\"]", "projects"),
+            ("project_base = \"/tmp\"", "projects"),
+            ("project_filter = \"none\"", "projects"),
+            ("term = []", "tui"),
+        ] {
+            let error = Config::parse(&format!("[tui]\n{key}\n")).expect_err("not a tui key");
+            let expected = if section == "tui" {
+                "tui".to_string()
+            } else {
+                format!("{section}.")
+            };
+            assert!(error.contains(&expected), "{key}: {error}");
+        }
     }
 
     #[test]

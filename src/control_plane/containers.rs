@@ -993,7 +993,7 @@ mod tests {
             CreateRequest::PaneSplit {
                 pane_id: "wA:p1".into(),
                 direction: SplitDirection::Right,
-                focus: false,
+                focus: Some(false),
             },
             CreatedLocation {
                 pane_id: Some("wA:p2".into()),
@@ -1004,7 +1004,7 @@ mod tests {
             &registry,
             CreateRequest::Tab {
                 workspace_id: "wA".into(),
-                focus: false,
+                focus: Some(false),
             },
             CreatedLocation {
                 workspace_id: Some("wA".into()),

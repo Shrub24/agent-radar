@@ -288,7 +288,7 @@ impl std::fmt::Display for BackendConfigError {
             }
             Self::TmuxServerMissing => write!(
                 f,
-                "control backend `tmux`: the server name is empty; set `daemon.tmux_server` or `RADAR_TMUX_SERVER`"
+                "control backend `tmux`: the server name is empty; set `server.tmux_server` or `RADAR_TMUX_SERVER`"
             ),
             Self::ConfigFile { problem } => write!(f, "configuration: {problem}"),
             Self::AdapterConfiguration { backend, problem } => {
@@ -306,7 +306,7 @@ impl std::fmt::Display for BackendConfigError {
 pub fn physical_backend() -> Result<PhysicalBackend, BackendConfigError> {
     let file = crate::config::Config::load()
         .map_err(|problem| BackendConfigError::ConfigFile { problem })?
-        .daemon;
+        .server;
     physical_backend_with(
         std::env::var_os("RADAR_CONTROL_BACKEND").as_deref(),
         std::env::var_os("RADAR_TMUX_SERVER").as_deref(),
@@ -319,7 +319,7 @@ pub fn physical_backend() -> Result<PhysicalBackend, BackendConfigError> {
 pub fn physical_backend_with(
     backend: Option<&std::ffi::OsStr>,
     tmux_server: Option<&std::ffi::OsStr>,
-    file: &crate::config::DaemonConfig,
+    file: &crate::config::ServerConfig,
 ) -> Result<PhysicalBackend, BackendConfigError> {
     let name = match backend.map(|value| value.to_string_lossy().trim().to_ascii_lowercase()) {
         Some(name) if !name.is_empty() => name,
@@ -391,6 +391,9 @@ struct Core {
     hub: Option<Arc<crate::control_plane::observation::Hub>>,
     /// The shared UI session every dashboard and sidebar attaches to.
     ui: Option<crate::ui_session::actor::UiHandle>,
+    /// What Radar serves, as configured: the choice a create that names none of
+    /// its own gets.
+    config: crate::config::ServerConfig,
 }
 
 /// The control-plane daemon.
@@ -428,12 +431,14 @@ impl Daemon {
         let PhysicalBackend::Tmux { server } = &backend;
         crate::service::ensure_tmux_server(server)?;
         let task_socket = crate::bus::socket_path();
+        let config = crate::config::Config::load()?.server;
         Self::bind_with_backend_and_verifier_and_ingest(
             &socket_path(),
             &state_dir(),
             Some(adapter),
             Arc::new(LocalProcfsVerifier),
             Some(&task_socket),
+            config,
         )
     }
 
@@ -474,7 +479,14 @@ impl Daemon {
         backend: Option<Arc<dyn RuntimeProvider>>,
         verifier: Arc<dyn ProcessVerifier>,
     ) -> Result<Self, String> {
-        Self::bind_with_backend_and_verifier_and_ingest(socket, state, backend, verifier, None)
+        Self::bind_with_backend_and_verifier_and_ingest(
+            socket,
+            state,
+            backend,
+            verifier,
+            None,
+            crate::config::ServerConfig::default(),
+        )
     }
 
     fn bind_with_backend_and_verifier_and_ingest(
@@ -483,6 +495,7 @@ impl Daemon {
         backend: Option<Arc<dyn RuntimeProvider>>,
         verifier: Arc<dyn ProcessVerifier>,
         task_socket_path: Option<&Path>,
+        config: crate::config::ServerConfig,
     ) -> Result<Self, String> {
         // The socket's own directory is what must be ours, not the socket path:
         // binding in a directory anyone can write is the thing being refused.
@@ -615,6 +628,7 @@ impl Daemon {
             bootstrap,
             hub: None,
             ui: None,
+            config,
         }));
         let effect_core = Arc::downgrade(&core);
         let effect_verification = Arc::clone(&verification);
@@ -1449,7 +1463,7 @@ mod tests {
     #[test]
     fn the_physical_backend_is_the_configured_one_and_only_named_names_serve() {
         let value = std::ffi::OsStr::new;
-        let file = crate::config::DaemonConfig::default();
+        let file = crate::config::ServerConfig::default();
         // Unset and empty fall back to the configured backend, which is tmux on
         // the `radar` server by default.
         for backend in [None, Some(value(""))] {
@@ -1472,9 +1486,10 @@ mod tests {
     #[test]
     fn the_environment_names_the_server_and_the_file_supplies_it_when_unset() {
         let value = std::ffi::OsStr::new;
-        let file = crate::config::DaemonConfig {
+        let file = crate::config::ServerConfig {
             backend: crate::config::ControlBackend::Tmux,
             tmux_server: "work".to_string(),
+            ..crate::config::ServerConfig::default()
         };
         assert_eq!(
             physical_backend_with(None, None, &file),
@@ -1493,9 +1508,10 @@ mod tests {
     #[test]
     fn an_empty_server_name_never_reaches_tmux_default() {
         let value = std::ffi::OsStr::new;
-        let file = crate::config::DaemonConfig {
+        let file = crate::config::ServerConfig {
             backend: crate::config::ControlBackend::Tmux,
             tmux_server: "   ".to_string(),
+            ..crate::config::ServerConfig::default()
         };
         assert_eq!(
             physical_backend_with(Some(value("tmux")), Some(value("")), &file),
@@ -1509,7 +1525,7 @@ mod tests {
             physical_backend_with(
                 Some(std::ffi::OsStr::new(" Docker ")),
                 None,
-                &crate::config::DaemonConfig::default()
+                &crate::config::ServerConfig::default()
             ),
             Err(BackendConfigError::UnknownBackend {
                 name: "docker".to_string()
@@ -1526,7 +1542,7 @@ mod tests {
             physical_backend_with(
                 Some(std::ffi::OsStr::from_bytes(b"tmux\xff")),
                 Some(std::ffi::OsStr::new("probe")),
-                &crate::config::DaemonConfig::default()
+                &crate::config::ServerConfig::default()
             ),
             Err(BackendConfigError::UnknownBackend { .. })
         ));
@@ -1660,6 +1676,7 @@ mod tests {
             )),
             Arc::new(LocalProcfsVerifier),
             Some(&publisher),
+            crate::config::ServerConfig::default(),
         )
         .expect("bind daemon and publisher listener");
         let ping = call(&control, "daemon.ping", json!({}));

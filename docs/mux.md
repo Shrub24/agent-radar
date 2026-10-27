@@ -17,7 +17,7 @@ promised stable third-party Rust API. The daemon owns durable operation records,
 spawn correlation and target admission; the adapter performs physical effects
 and reports their certainty. Assignment decisions remain outside the adapter.
 
-The daemon's physical adapter is tmux on the server named by `[daemon] tmux_server`
+The daemon's physical adapter is tmux on the server named by `[server] tmux_server`
 (default `radar`); `RADAR_TMUX_SERVER` overrides the file. A missing server name
 refuses startup, with no fallback. The adapter uses only `tmux -L <name>` and does
 not touch the default server. The server is started and verified by its own user

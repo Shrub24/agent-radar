@@ -42,7 +42,7 @@ kitty --session /path/to/examples/kitty/radar-sidebar.session
 
 The session uses Kitty's splits layout: the sidebar gets 25% of the width and the
 tmux client gets 75%, and focus starts on the tmux side. If you changed
-`[daemon] tmux_server`, change `-L radar` in the session file to match. Copy the
+`[server] tmux_server`, change `-L radar` in the session file to match. Copy the
 session file anywhere you like.
 
 The sidebar is launched with `--allow-remote-control`; global remote control

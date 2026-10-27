@@ -55,7 +55,7 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
         },
         Invocation::Workspace { session } => {
             match agent_radar::workspace::launch(
-                &load_config().daemon.tmux_server,
+                &load_config().server.tmux_server,
                 session.as_deref(),
             ) {
                 Ok(()) => 0,
@@ -72,7 +72,7 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
             let (verb, name) = action.parts();
             let name = match name {
                 Some(name) => name.to_string(),
-                None => load_config().daemon.tmux_server.clone(),
+                None => load_config().server.tmux_server.clone(),
             };
             let (message, code) = agent_radar::service::server_command(verb, &name);
             println!("{message}");
@@ -80,7 +80,7 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
         }
         Invocation::Lifecycle(action) => run_lifecycle_command(action),
         Invocation::Reset { hard, yes } => {
-            let server = load_config().daemon.tmux_server;
+            let server = load_config().server.tmux_server;
             agent_radar::reset::run(&server, hard, yes)
         }
         Invocation::Completions { shell } => {
@@ -752,7 +752,7 @@ fn run(sidebar: bool) -> io::Result<()> {
             loop {
                 dirty |= app.apply_session_update();
                 let detached = sidebar && in_workspace && app.sidebar_compact();
-                dirty |= presentation.poll(&mut app, &config.tui, detached, &wake);
+                dirty |= presentation.poll(&mut app, &config.projects, detached, &wake);
                 dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);
                 // Foreground evidence is swept while a pane view is showing panes, and
                 // while finished sessions are listed: telling a session that has gone
@@ -915,7 +915,7 @@ fn perform(
             // The shell, PATH and command are the invoking terminal's; the place
             // and directory are the session's.
             let spec = agent_radar::control_plane::public_contracts::ui_session::LaunchSpec {
-                command: config.tui.launch_command.clone(),
+                command: config.agents.launch_command.clone(),
                 shell: std::env::var("SHELL").unwrap_or_default(),
                 path: std::env::var_os("PATH").map(|path| path.to_string_lossy().into_owned()),
             };

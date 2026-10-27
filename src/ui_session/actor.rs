@@ -186,13 +186,17 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 struct Owed {
     since: Instant,
     published: bool,
+    /// A view-only effect (focus): success is not announced, only refusal or
+    /// uncertainty is.
+    quiet: bool,
 }
 
 impl Owed {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, quiet: bool) -> Self {
         Self {
             since: now,
             published: false,
+            quiet,
         }
     }
 
@@ -320,28 +324,39 @@ fn run(
                     let _ = reply.send(session.act_stamped(&id, number, gate, action));
                 }
                 Msg::Finished(outcome) => {
+                    let quiet = pending
+                        .get(&outcome.request_id)
+                        .is_some_and(|owed| owed.quiet);
                     if !matches!(
                         outcome.status,
                         dto::CommandStatus::SubmissionUncertain | dto::CommandStatus::Admitted
                     ) {
                         pending.remove(&outcome.request_id);
                     }
-                    session.operation(outcome);
+                    if !(quiet && outcome.status == dto::CommandStatus::Completed) {
+                        session.operation(outcome);
+                    }
                 }
             }
         }
         for job in session.take_completions() {
             let id = job.request_id.clone();
+            let quiet = matches!(
+                job.plan.as_ref().map(|plan| &plan.effect),
+                Some(crate::ui_session::targets::Effect::Focus(_))
+            );
             let status = if work
                 .as_ref()
                 .is_some_and(|work| work.try_send(Effect::Dispatch(Box::new(job))).is_ok())
             {
-                pending.insert(id.clone(), Owed::new(Instant::now()));
+                pending.insert(id.clone(), Owed::new(Instant::now(), quiet));
                 dto::CommandStatus::DispatcherAccepted
             } else {
                 dto::CommandStatus::DispatchRefused
             };
-            session.operation(dto::CommandOutcome::new(&id, status));
+            if !(quiet && status == dto::CommandStatus::DispatcherAccepted) {
+                session.operation(dto::CommandOutcome::new(&id, status));
+            }
         }
         let expired: Vec<_> = leases
             .iter()
@@ -889,6 +904,115 @@ mod tests {
         .expect("operation status published");
     }
 
+    /// A focus is a view-only effect: moving a terminal changes nothing in the
+    /// tree, so its success is not announced, while a refusal still is — that is
+    /// the answer that tells the operator nothing moved.
+    #[tokio::test]
+    async fn a_focus_announces_a_refusal_but_not_a_success() {
+        async fn focus_row(service: &UiService) -> Subscription {
+            let handle = service.handle();
+            handle.observe(snapshot());
+            let mut stream = handle
+                .open_duplex("a", dto::AttachmentRole::Dashboard, None)
+                .await
+                .unwrap();
+            let _baseline = stream.prepare_frame(false).await.unwrap();
+            let row = stream
+                .published
+                .borrow()
+                .tree()
+                .read::<Vec<dto::TreeRow>>()
+                .unwrap()
+                .first()
+                .expect("a tree row")
+                .id
+                .clone();
+            let Out::Applied { .. } = handle
+                .enqueue_action(
+                    "a",
+                    1,
+                    None,
+                    A::RunCommand {
+                        command: dto::SharedCommand::Focus,
+                        row: Some(row),
+                    },
+                )
+                .unwrap()
+                .await
+                .unwrap()
+            else {
+                panic!("the focus is accepted");
+            };
+            drop(handle);
+            stream
+        }
+
+        // A refusal is published: it is the answer that nothing moved.
+        let service = UiService::with_executor(Some(Box::new(|effect| {
+            let Effect::Dispatch(job) = effect else {
+                panic!("not a reconciliation")
+            };
+            assert!(matches!(
+                job.plan.as_ref().map(|plan| &plan.effect),
+                Some(crate::ui_session::targets::Effect::Focus(_))
+            ));
+            dto::CommandOutcome::error(
+                &job.request_id,
+                dto::CommandStatus::Refused,
+                "no_client",
+                "no tmux client is attached",
+            )
+        })));
+        let mut stream = focus_row(&service).await;
+        let published = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = stream.prepare_frame(false).await.expect("service alive");
+                stream.sent_frame(&frame.head);
+                let state: dto::SessionState = frame
+                    .content
+                    .iter()
+                    .find(|content| content.hash == frame.head.session)
+                    .expect("session payload")
+                    .read()
+                    .unwrap();
+                if let Some(operation) = state.operation {
+                    break operation;
+                }
+            }
+        })
+        .await
+        .expect("the refusal is published");
+        assert_eq!(published.status, dto::CommandStatus::Refused);
+        assert_eq!(
+            published.answer.as_ref().and_then(|answer| {
+                answer.pointer("/error/code").and_then(|code| code.as_str())
+            }),
+            Some("no_client"),
+            "the answer carries why nothing moved"
+        );
+
+        // Success is not published at all, so a dashboard that asked for a focus
+        // never replaces its message with the fact that a terminal moved.
+        let ran = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&ran);
+        let service = UiService::with_executor(Some(Box::new(move |effect| {
+            let Effect::Dispatch(job) = effect else {
+                panic!("not a reconciliation")
+            };
+            finished.store(true, Ordering::SeqCst);
+            dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::Completed)
+        })));
+        let stream = focus_row(&service).await;
+        crate::testing::eventually("the executor ran", || {
+            ran.load(Ordering::SeqCst).then_some(())
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            stream.published.borrow().state.operation.is_none(),
+            "a completed focus publishes no outcome"
+        );
+    }
+
     #[tokio::test]
     async fn full_or_absent_dispatchers_refuse_without_holding_the_gate() {
         let (release, held) = mpsc::sync_channel::<()>(1);
@@ -965,7 +1089,7 @@ mod owed_tests {
     #[test]
     fn uncertainty_is_published_once_and_still_looked_for_every_interval() {
         let start = Instant::now();
-        let mut owed = Owed::new(start);
+        let mut owed = Owed::new(start, false);
         assert!(!owed.due(start), "not before the interval has passed");
         let first = start + RECONCILE_INTERVAL;
         assert!(owed.due(first), "the interval asks again");

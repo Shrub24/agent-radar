@@ -34,17 +34,32 @@ dispatched and no record is written.
 
 ## Start and select
 
-The daemon runs as a user service, activated by its socket unit, or can be run in the foreground for development. `radar` starts the daemon by default before opening the TUI. Its physical adapter is tmux on the server named by `[daemon] tmux_server` (default `radar`); the backend is selected only with `RADAR_CONTROL_BACKEND=tmux`. The systemd daemon unit orders after and wants the matching `radar-tmux@<name>.service`; the daemon verifies the answering server's identity and refuses an unowned or unavailable instance. A foreground daemon requires that server unit to be started separately. Unknown backends and missing server names refuse startup.
+The daemon runs as a user service, activated by its socket unit, or can be run in the foreground for development. `radar` starts the daemon by default before opening the TUI. Its physical adapter is tmux on the server named by `[server] tmux_server` (default `radar`); the backend is selected only with `RADAR_CONTROL_BACKEND=tmux`. The systemd daemon unit orders after and wants the matching `radar-tmux@<name>.service`; the daemon verifies the answering server's identity and refuses an unowned or unavailable instance. A foreground daemon requires that server unit to be started separately. Unknown backends and missing server names refuse startup.
 
-Settings live in a `[daemon]` table. Environment variables override them:
+Settings live in a `[server]` table. Environment variables override them:
 
 ```toml
-[daemon]
+[server]
 backend = "tmux"
 tmux_server = "radar"
+focus_created = true
 ```
 
-The former `[runtime]` table is removed. A configuration that still sets it is refused as containing unknown keys.
+Configuration is grouped by what is being configured, not by which process reads
+it: `[server]` is what Radar serves, `[agents]` is what a managed launch runs,
+`[projects]` is which projects a new workspace offers, and `[tui]` is the
+dashboard itself. The former `[daemon]` table is now `[server]`, and
+`launch_command` and the `project_*` keys moved from `[tui]` to `[agents]` and
+`[projects]`. A configuration that still uses a former table or key is refused
+with the section it belongs in.
+
+`focus_created` decides whether a location Radar creates becomes the one the
+client is looking at. A create is dispatched unfocused and the daemon focuses the
+location it made afterwards, through the same path a focus request takes; a
+refused focus is reported on the creation's record and never undoes or repeats
+the creation. A request may set `"focus": false` to keep the client where it is,
+which a child agent spawn does. The older `[runtime]` table is refused as
+unknown keys.
 
 For example, start a daemon on a named tmux server with:
 
@@ -333,7 +348,7 @@ Ordinary input without a gate stamp is refused as bad parameters. Input is stamp
 
 An accepted project result freezes a domain request UUID, returned in its receipt and reused by duplicate receipts. A bounded daemon worker invokes the existing `topology.create` admission service, never a self-RPC. `session.operation` distinguishes `dispatcher_accepted`, `dispatch_refused`, `submission_uncertain`, `admitted`, and authoritative `completed`/`refused`/`unknown`, carrying the original response when established. A missing completion is queried by the same request ID every five seconds, not re-executed. Queue rejection claims no admission; a daemon restart loses volatile UI state but preserves whatever the domain service durably recorded.
 
-Project candidates keep source order, validation and deduplication. The invoking frontend supplies its own configured source/environment; no source process runs in the daemon. `[tui] project_base` must be absolute and defaults to `$HOME`; it is offered only if no source directory passes the filter. A missing/unusable base yields an empty picker and a diagnostic. No invoking start-directory entry is prepended.
+Project candidates keep source order, validation and deduplication. The invoking frontend supplies its own configured source/environment; no source process runs in the daemon. `[projects] base` must be absolute and defaults to `$HOME`; it is offered only if no source directory passes the filter. A missing/unusable base yields an empty picker and a diagnostic. No invoking start-directory entry is prepended.
 
 #### Focus
 

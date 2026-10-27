@@ -449,7 +449,10 @@ impl RuntimeProvider for TmuxRuntime {
     }
 
     fn create(&self, request: &CreateRequest, cancel: &AtomicBool) -> CreateOutcome {
-        self.create_location(request, cancel)
+        // Nothing asks a backend to move the operator as a side effect of
+        // creating: a create is dispatched unfocused, and the daemon focuses what
+        // it made afterwards, through the same path a focus request takes.
+        self.create_location(request, false, cancel)
             .map_or_else(Failure::into_create, CreateOutcome::Completed)
     }
 
@@ -786,11 +789,12 @@ impl TmuxRuntime {
     fn create_location(
         &self,
         request: &CreateRequest,
+        focus: bool,
         cancel: &AtomicBool,
     ) -> Result<CreatedLocation, Failure> {
         match request {
-            CreateRequest::Workspace { focus, directory } => {
-                if *focus {
+            CreateRequest::Workspace { directory, .. } => {
+                if focus {
                     // tmux focuses a session by switching a client to it, and
                     // this command has no client. Creating first and switching
                     // after would leave a workspace that exists and a caller
@@ -825,10 +829,7 @@ impl TmuxRuntime {
                     ..CreatedLocation::default()
                 })
             }
-            CreateRequest::Tab {
-                workspace_id,
-                focus,
-            } => {
+            CreateRequest::Tab { workspace_id, .. } => {
                 let session = self
                     .address(workspace_id, Kind::Session)
                     .map_err(Failure::refused)?;
@@ -850,9 +851,7 @@ impl TmuxRuntime {
                 })
             }
             CreateRequest::PaneSplit {
-                pane_id,
-                direction,
-                focus,
+                pane_id, direction, ..
             } => {
                 let pane = self
                     .address(pane_id, Kind::Pane)

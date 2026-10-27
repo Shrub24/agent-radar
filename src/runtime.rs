@@ -154,18 +154,28 @@ pub enum CreateRequest {
     /// is an absolute path the runtime checks; it is never taken from the caller's
     /// own working directory.
     Workspace {
-        focus: bool,
+        /// Whether to make the new workspace current. Unset takes the daemon's
+        /// configured choice; a caller that must not move the operator says so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         directory: Option<String>,
     },
     /// A new tab in `workspace_id`. The workspace is named by the caller rather
     /// than taken from whichever pane the multiplexer currently has focused.
-    Tab { workspace_id: String, focus: bool },
+    Tab {
+        workspace_id: String,
+        /// See [`Self::Workspace`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
+    },
     /// A new pane beside `pane_id`.
     PaneSplit {
         pane_id: String,
         direction: SplitDirection,
-        focus: bool,
+        /// See [`Self::Workspace`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
     },
 }
 
