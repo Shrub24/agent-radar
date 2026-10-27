@@ -7,6 +7,39 @@ The queue behind the OpenSpec changes. An item lives here with the decision it
 still needs, and leaves when it becomes a change worth specifying. What is
 already settled is in `README.md` and `openspec/`; this file is the future.
 
+## Priority debt — typed contracts across the Rust daemon
+
+High-priority architectural cleanup, ahead of further feature expansion: sweep
+Rust-owned operation, response, state and error structures across the daemon and
+its Rust consumers. Closed domain vocabularies must be enums and typed payloads,
+not strings or `serde_json::Value` inspected with key paths. Reuse existing
+outcome/error types; do not introduce another parallel vocabulary or a generic
+operation framework. Use typing/error crates only where they remove real work
+beyond ordinary Rust types.
+
+The problem is broader than the TUI's `outcome_status`: operation handlers build
+JSON results, and internal consumers reconstruct state from wire strings.
+Serialization must be a boundary adapter, not the internal domain contract.
+Keep genuinely open extension data and human-readable diagnostics as such; this
+is not a ban on strings or JSON at external boundaries.
+
+Scope the sweep across admission, execution, durable/public operation records,
+reconciliation, Rust clients, and other daemon handlers with the same pattern.
+Use typed request/result DTOs and structured errors end to end, with one explicit
+mapping at each persistence or wire boundary. Preserve distinctions between
+pre-admission refusal, pending/admitted work, execution uncertainty and settled
+domain outcomes; these are not interchangeable states to collapse for brevity.
+The previous illustrative `OpResult` is not an approved contract: establish the
+actual state model before choosing its variants.
+
+Deliver through complete handler/consumer paths, deleting replaced JSON probing,
+string comparisons, duplicate state representations and hand-built envelopes in
+the same slices. Aim for unchanged wire/persistence compatibility; identify any
+necessary contract change explicitly rather than hiding it inside the refactor.
+Validate owned semantics and boundary compatibility with existing checks plus
+focused missing evidence, not a new exhaustive test matrix. Done when Rust-owned
+closed contracts no longer require reparsing serialized state to recover meaning.
+
 ## Unified publication and transport direction
 
 The TUI change is proposed in

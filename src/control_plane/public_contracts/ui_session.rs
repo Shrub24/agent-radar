@@ -157,6 +157,34 @@ pub struct CommandOutcome {
     pub answer: Option<serde_json::Value>,
 }
 
+impl CommandOutcome {
+    pub fn new(request_id: &str, status: CommandStatus) -> Self {
+        Self {
+            request_id: request_id.to_owned(),
+            status,
+            answer: None,
+        }
+    }
+
+    /// An answer carried with a status: what the caller sees, and what its
+    /// status was read from.
+    pub fn answering(request_id: &str, status: CommandStatus, answer: serde_json::Value) -> Self {
+        Self {
+            request_id: request_id.to_owned(),
+            status,
+            answer: Some(answer),
+        }
+    }
+
+    pub fn error(request_id: &str, status: CommandStatus, code: &str, message: &str) -> Self {
+        Self::answering(
+            request_id,
+            status,
+            serde_json::json!({"error": {"code": code, "message": message}}),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, strum::Display)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -397,13 +425,6 @@ pub enum ActionOutcome {
     Detached,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AttachResult {
-    pub attachment_id: String,
-    pub update_id: u64,
-}
-
 // Binary TUI publication/content protocol. Domain RPCs retain their JSON DTOs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Head {
@@ -442,41 +463,6 @@ impl From<crate::content::Error> for PublicationFailure {
             },
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Frame {
-    #[serde(rename = "metadata")]
-    pub head: Head,
-    #[serde(deserialize_with = "three_payloads")]
-    pub content: Vec<Content>,
-}
-
-fn three_payloads<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Vec<Content>, D::Error> {
-    struct Payloads;
-    impl<'de> serde::de::Visitor<'de> for Payloads {
-        type Value = Vec<Content>;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("at most three lane payloads")
-        }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut input: A,
-        ) -> Result<Self::Value, A::Error> {
-            if input.size_hint().is_some_and(|size| size > 3) {
-                return Err(serde::de::Error::custom("too many lane payloads"));
-            }
-            let mut payloads = Vec::with_capacity(3);
-            while let Some(payload) = input.next_element()? {
-                if payloads.len() == 3 {
-                    return Err(serde::de::Error::custom("too many lane payloads"));
-                }
-                payloads.push(payload);
-            }
-            Ok(payloads)
-        }
-    }
-    decoder.deserialize_seq(Payloads)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -520,64 +506,26 @@ pub enum DuplexMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DuplexReply {
-    Action { outcome: ActionOutcome },
-    Content { hash: String },
-    Expired { head: Head },
+    Action {
+        outcome: ActionOutcome,
+    },
+    Content {
+        hash: String,
+    },
+    Expired {
+        head: Head,
+    },
     Demand,
-    Refused { code: String, message: String },
+    Refused {
+        code: crate::control_plane::protocol::Code,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DuplexFrame {
     pub metadata: DuplexMetadata,
-    #[serde(deserialize_with = "three_payloads")]
+    /// The payloads this frame carries: at most one per lane, and a reply's own.
     pub content: Vec<Content>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "request", rename_all = "snake_case")]
-pub enum Request {
-    Attach {
-        attachment_id: String,
-        role: AttachmentRole,
-        interaction_id: Option<String>,
-    },
-    Action {
-        attachment_id: String,
-        action_id: u64,
-        gate: Option<u64>,
-        action: UiAction,
-    },
-    Content {
-        hash: String,
-    },
-    Detach {
-        attachment_id: String,
-    },
-    Demand {
-        attachment_id: String,
-        processes: bool,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case")]
-pub enum Reply {
-    Attached,
-    Action { outcome: ActionOutcome },
-    Content { content: Content },
-    Expired { head: Head },
-    Demand,
-    Refused { code: String, message: String },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "role", rename_all = "snake_case")]
-pub enum Open {
-    Actions,
-    Subscribe {
-        attachment_id: String,
-        session_only: bool,
-    },
 }

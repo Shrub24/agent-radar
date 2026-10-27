@@ -106,7 +106,7 @@ Daemon contracts are versioned promises that the daemon serves the methods its i
 | `events.v1` | — | `events.read` |
 | `communication.handoff.v1` | — | `communication.publish`, `communication.inbox`, `communication.get`, `communication.ack` |
 | `observation.get.v1` | `mux.observe` | `observation.get`: the daemon's shared observation snapshot |
-| `ui.session.v1` | — | `ui.attach`, `ui.detach`, `ui.action`, `ui.subscribe`, `ui.content.get`: the shared UI session |
+| `ui.session.v1` | — | `ui.open`: one duplex MessagePack attachment per TUI, carrying actions, content and publications |
 | `tasks.list.v1` | task ingest configured | volatile publisher task snapshots via `tasks.list` |
 | `spawn.v1` | `mux.create` + `mux.launch` | `spawn.create` |
 | `spawn.close.v1` | `mux.observe` + `mux.close` | `spawn.close` |
@@ -219,41 +219,47 @@ The durable record stores the request ID, edge, bound child, recorded pane and i
 `ui.session.v1` serves one daemon-hosted navigation session that every dashboard and sidebar shares: the tree, selection, folds, pane view, order, task and finished-session visibility, and the filter. Terminal geometry, details panels and process readings stay with each frontend. The session holds no lifecycle truth; it projects the observation the daemon already publishes. It lives in memory, so a daemon restart starts a new one.
 
 **Wire opening.** UI delivery uses MessagePack, not the JSON domain-RPC codec.
-A bounded JSON `ui.open` request selects `{"role":"actions"}` or
-`{"role":"subscribe","attachment_id":"<UUID>","session_only":false}`. The
-ordinary JSON reply confirms `{"codec":"messagepack","framing":"u32-be"}`;
-after its newline, that connection carries four-byte big-endian lengths followed
-by MessagePack bodies. An action/content connection remains ordered request/reply;
-a subscription pushes heads and accepts no further requests. Non-TUI RPCs,
-`observation.get`, events, presence, ingest and pi-radar are unchanged. There are
-no legacy JSON UI-method aliases.
+One duplex connection serves one attachment. A bounded JSON `ui.open` names it:
+`{"attachment_id":"<UUID>","role":"dashboard"|"sidebar"|"presenter","interaction_id":"<UUID>"|null}`.
+The ordinary JSON reply confirms `{"codec":"messagepack","framing":"u32-be"}`;
+after its newline both directions carry four-byte big-endian lengths followed by
+MessagePack bodies, and no further JSON is read on that connection. Bytes the
+reader already buffered past the opener line are the peer's first frames and are
+honoured, not discarded. Non-TUI RPCs, `observation.get`, events, presence,
+ingest and pi-radar are unchanged. There are no legacy JSON UI-method aliases,
+and no separate action or subscription connections.
 
-**Attach.** On the ordered binary connection send
-`{request:"attach", attachment_id, role, interaction_id?}`. The result tag is
-`attached`; the subscription's first complete head, not attach acceptance,
-establishes readiness. A presenter claims its interaction at attach time, without
-consuming an action number. Reconnect always uses a new attachment UUID, resets
-the local action counter to zero and discards old responses. It neither resets
-canonical state nor gives head counters meaning across daemon restarts.
+**Establishment.** The opener registers the attachment and takes its publication
+receiver in one actor operation, so a publication generated at that moment is
+either the baseline or a newer head, never lost between two registrations. The
+first complete head — not the opener's acknowledgement — establishes readiness.
+A presenter claims its interaction at establishment, without consuming an action
+number; a claim for an interaction that does not exist is refused by the session,
+not reported as a capacity problem.
 
-**Actions.** Send `{request:"action", attachment_id, action_id, gate?, action}`.
-The reply is `{result:"action", outcome:<ActionOutcome>}`. The existing outcome
-tags remain `applied`, `replayed`, `refused`, `receipt_expired`, `gap`,
-`busy` and `detached`. Sixty-four receipts per attachment preserve original
+**Actions.** Send `{id, request:{kind:"action", action_id, gate?, action}}`.
+`id` is this connection's request identity and correlates any reply; `action_id`
+is the attachment's ordered action number. The reply is
+`{id, reply:{kind:"action", outcome:<ActionOutcome>}}` with the existing outcome
+tags `applied`, `replayed`, `refused`, `receipt_expired`, `gap`, `busy` and
+`detached`. Sixty-four receipts per attachment preserve original
 interaction/request identities. A conflicting payload under a retained ID is
-refused; an uncertain action is never automatically replayed under a new ID.
-Ordinary input requires its interpretation-time gate stamp. Pre-admission errors
-use `{result:"refused", code, message}`; control-capacity refusal consumes no
-action number. Shared filtering retains one editor, complete-query updates,
-fuzzy matching and ancestry retention.
+refused; an uncertain action is never automatically replayed under a new ID. One
+action is in flight per attachment: its reply slot stays taken until the reply is
+on the wire, so a second action is refused `busy` rather than silently dropped.
+Ordinary input requires its interpretation-time gate stamp and is refused
+`bad_params` before any action number is consumed. Content and demand requests use
+at most two auxiliary slots and are answered through the same reply correlation.
+Attach, action numbers and receipts, and request ids are three distinct
+identities and are never interchanged.
 
-**Heads and content.** A subscription frame is
-`{metadata:{update_id, observation, tree, session, gate, diagnostic}, content:[{hash,bytes},...]}`.
+**Heads and content.** A publication frame is
+`{metadata:{kind:"publication", head:{update_id, observation, tree, session, gate, diagnostic}}, content:[{hash,bytes},...]}`.
 The three reference fields are hashes; `bytes` is a MessagePack BIN, not a JSON
 byte array or base64 string. The baseline includes the requested payloads.
-Later frames inline changed content relative to the last frame delivered on
-that connection. A detached presenter sets `session_only:true` and need not
-download fleet observations. The full head always names all three lanes.
+Later frames inline changed content relative to the last frame *fully written* on
+that connection. A presenter's role means it receives session state only and need
+not download fleet observations. The full head always names all three lanes.
 
 Each hash is the XXH3-128 value of the exact encoded payload, written as 32
 lowercase hexadecimal digits. Named struct fields, explicit string enum tags,
@@ -268,26 +274,44 @@ A client displays only a complete head and holds current payloads plus bounded
 handover work, not an LRU/history. The receiver invalidates stale input promptly
 even while its materialiser waits for content or an action reply. Its pending
 target is latest-wins; already-executing recovery is bounded and fenced before
-adoption. Immutable encoded payload slices are reused by subscription writers;
-they are not serialized or copied afresh per subscriber.
+adoption. Immutable encoded payload slices are reused by connection writers; they
+are not serialized or copied afresh per attachment.
 
-**Recovery and limits.** `{request:"content",hash}` returns
-`{result:"content",content:{hash,bytes}}`, or
-`{result:"expired",head:<current head>}`. Expiry causes current-baseline
-recovery, never substitution of different content for a requested hash.
-The daemon pins current content and retains at most 16 MiB / 32 historical
-entries. Encoded payloads are limited to 1 MiB, frames to 4 MiB and decoding depth
-to 64. Lengths are checked before body allocation; truncated frames are discarded.
+**Fairness and progress.** One writer serves the connection. It writes at most
+four replies back to back, then offers the newest publication, and never starts a
+second frame while one is being written: a partially written frame cannot be
+overtaken, so ordering is preserved without a queue of frames. A publication
+advances the connection's content cursor only after it is fully written, so an
+unsent head is still sent in full rather than assumed known.
+
+**Recovery and limits.** `{id, request:{kind:"content",hash}}` returns
+`{id, reply:{kind:"content",hash}}` carrying the payload, or
+`{id, reply:{kind:"expired",head:<current head>}}`. Expiry causes
+current-baseline recovery, never substitution of different content for a
+requested hash. The daemon pins current content and retains at most 16 MiB / 32
+historical entries. Encoded payloads are limited to 1 MiB, frames to 4 MiB and
+decoding depth to 64. Lengths are checked before body allocation. Established UI
+connections may remain silent indefinitely; once the first byte arrives, the
+frame must complete within ten seconds, including its remaining length prefix.
 Size failure is `diagnostic:{code:"content_too_large"}`: the last coherent head
 remains available, a persistent stale diagnostic is shown, and no reconnect
 loop is used to retry the same rejected candidate. A newer usable candidate
 clears it. Encoding failures carry `{code:"encoding",message}`.
 
-At most 16 primary subscriptions are open; a second for the same attachment is
-refused. A stalled write has a two-second deadline and costs only its connection.
-Action/content requests retain the existing control admission and idle limits.
-`{request:"detach",attachment_id}`, peer close or shutdown releases the
-attachment and primary stream; admitted domain operations continue.
+**Capacity and release.** Connections are admitted by class. Eight openings may
+be in flight, 32 ordinary connections exist, and at most 16 UI attachments are
+established; one further slot is reserved for a presenter that names an
+interaction, so a full dashboard budget cannot strand a modal. Admission is
+decided once the first line names the class, and a refusal is a typed `busy`
+reply rather than a silently closed socket. A UI attachment is released when its
+connection ends — an explicit detach is not required — and the lease is also
+reaped by the session if a connection dies without its task ending. A stalled
+write has a two-second deadline and costs only its connection. Any essential
+connection task ending cancels its siblings and releases capacity; an idle reader
+cannot keep a failed writer's connection alive. Ordinary non-UI connections
+retain their existing control admission and idle limits. Losing a connection never
+cancels an admitted domain operation, and an action whose result was lost with
+the connection is reported unknown, never replayed.
 `{request:"demand",attachment_id,processes}` sets local process-panel demand,
 aggregated with other attachments and existing readers and released on loss.
 

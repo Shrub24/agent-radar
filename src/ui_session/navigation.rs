@@ -331,21 +331,11 @@ impl Navigation {
         self.reconcile();
     }
 
-    pub fn push_filter(&mut self, ch: char) {
-        self.filter.push(ch);
-        self.reconcile();
-    }
-
     /// Replaces the whole query: the shared filter is edited by complete
     /// strings, never by character.
     pub fn set_filter(&mut self, query: &str) {
         self.filter.clear();
         self.filter.push_str(query);
-        self.reconcile();
-    }
-
-    pub fn pop_filter(&mut self) {
-        self.filter.pop();
         self.reconcile();
     }
 

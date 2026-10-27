@@ -40,21 +40,34 @@ struct Attachment {
 #[derive(Clone, Debug)]
 pub struct Published {
     pub update_id: u64,
-    pub tree_hash: String,
     pub rows: Arc<Vec<dto::TreeRow>>,
-    pub state_hash: String,
     pub state: dto::SessionState,
+    /// The three lanes, in the order a head names them.
     pub content: [Content; 3],
     pub diagnostic: Option<dto::PublicationFailure>,
 }
 
 impl Published {
+    /// The observation lane's content: the hash names it, and its payload is what
+    /// a client without it asks for.
+    pub fn observation(&self) -> &Content {
+        &self.content[0]
+    }
+
+    pub fn tree(&self) -> &Content {
+        &self.content[1]
+    }
+
+    pub fn session(&self) -> &Content {
+        &self.content[2]
+    }
+
     pub fn head(&self) -> Head {
         Head {
             update_id: self.update_id,
-            observation: self.content[0].hash.clone(),
-            tree: self.content[1].hash.clone(),
-            session: self.content[2].hash.clone(),
+            observation: self.observation().hash.clone(),
+            tree: self.tree().hash.clone(),
+            session: self.session().hash.clone(),
             gate: self.state.gate,
             diagnostic: self.diagnostic.clone(),
         }
@@ -91,6 +104,7 @@ pub struct Session {
     state: Option<ObservationState>,
     current: Published,
     content_store: ContentStore,
+    /// The observation lane's newest content, published with the next head.
     observation_content: Content,
     tree_dirty: bool,
     observation_error: Option<dto::PublicationFailure>,
@@ -115,9 +129,7 @@ impl Session {
             state: None,
             current: Published {
                 update_id: 0,
-                tree_hash: String::new(),
                 rows: Arc::new(Vec::new()),
-                state_hash: String::new(),
                 state: dto::SessionState::default(),
                 content: [
                     Content::encode(&Observation::default()).expect("empty observation"),
@@ -689,46 +701,42 @@ impl Session {
                 )
             };
         let tree_content = if rows == self.current.rows {
-            self.current.content[1].clone()
+            self.current.tree().clone()
         } else {
             match Content::encode(&rows) {
                 Ok(content) => content,
                 Err(error) => return self.content_failed(error.into()),
             }
         };
-        let tree_hash = tree_content.hash.clone();
         let session_content = if state == self.current.state {
-            self.current.content[2].clone()
+            self.current.session().clone()
         } else {
             match Content::encode(&state) {
                 Ok(content) => content,
                 Err(error) => return self.content_failed(error.into()),
             }
         };
-        let state_hash = session_content.hash.clone();
-        if tree_hash == self.current.tree_hash
-            && state_hash == self.current.state_hash
-            && self.observation_content.hash == self.current.content[0].hash
+        if tree_content.hash == self.current.tree().hash
+            && session_content.hash == self.current.session().hash
+            && self.observation_content.hash == self.current.observation().hash
             && self.current.diagnostic == self.observation_error
         {
             self.tree_dirty = false;
             return false;
         }
+        let rows = if tree_content.hash == self.current.tree().hash {
+            Arc::clone(&self.current.rows)
+        } else {
+            rows
+        };
         let content = self.content_store.pin(vec![
             self.observation_content.clone(),
             tree_content,
             session_content,
         ]);
-        let rows = if tree_hash == self.current.tree_hash {
-            Arc::clone(&self.current.rows)
-        } else {
-            rows
-        };
         self.current = Published {
             update_id: self.current.update_id + 1,
-            tree_hash,
             rows,
-            state_hash,
             state,
             content: content.try_into().expect("three lanes"),
             diagnostic: self.observation_error.clone(),
@@ -873,12 +881,12 @@ mod tests {
             Out::Applied { .. }
         ));
         let after = session.current();
-        assert_eq!(after.tree_hash, before.tree_hash);
-        assert_ne!(after.state_hash, before.state_hash);
+        assert_eq!(after.tree().hash, before.tree().hash);
+        assert_ne!(after.session().hash, before.session().hash);
         assert!(after.update_id > before.update_id);
         let delta = after.frame(Some(&before.head()), false);
         assert_eq!(delta.content.len(), 1);
-        assert_eq!(delta.content[0].hash, after.state_hash);
+        assert_eq!(delta.content[0].hash, after.session().hash);
     }
 
     #[test]
@@ -966,8 +974,8 @@ mod tests {
         session.observe_content(&observation, Content::encode(&observation).unwrap());
         let after = session.current();
         assert_ne!(before.head().observation, after.head().observation);
-        assert_eq!(before.tree_hash, after.tree_hash);
-        assert_eq!(before.state_hash, after.state_hash);
+        assert_eq!(before.tree().hash, after.tree().hash);
+        assert_eq!(before.session().hash, after.session().hash);
         assert!(Arc::ptr_eq(
             &before.content[1].bytes,
             &after.content[1].bytes
@@ -1065,7 +1073,7 @@ mod tests {
     #[test]
     fn replaced_content_is_retrievable_until_evicted() {
         let mut session = seeded();
-        let first = session.current().tree_hash.clone();
+        let first = session.current().tree().hash.clone();
         session.act("a", 1, A::ToggleTasks);
         session.act("a", 2, A::CyclePaneView);
         session.act("a", 3, A::CyclePaneView);
@@ -1295,15 +1303,14 @@ mod tests {
         let before = session.current().clone();
         // A refused effect changes no row, and must still reach every view: the
         // answer is what tells the operator nothing happened.
-        session.operation(dto::CommandOutcome {
-            request_id: "request-1".into(),
-            status: dto::CommandStatus::Refused,
-            answer: Some(serde_json::json!({
-                "error": {"code": "agents_alive", "message": "an agent inside did not exit"}
-            })),
-        });
+        session.operation(dto::CommandOutcome::error(
+            "request-1",
+            dto::CommandStatus::Refused,
+            "agents_alive",
+            "an agent inside did not exit",
+        ));
         let after = session.current();
-        assert_eq!(after.tree_hash, before.tree_hash, "no row moved");
+        assert_eq!(after.tree().hash, before.tree().hash, "no row moved");
         assert!(
             after.update_id > before.update_id,
             "the answer was published"

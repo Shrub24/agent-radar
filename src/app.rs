@@ -781,6 +781,12 @@ impl App {
         Ok(nav.selected_id().map(crate::ui_session::session::ui_row_id))
     }
 
+    pub async fn shutdown_session(&mut self) {
+        if let Some(mut link) = self.session.take() {
+            link.client.shutdown().await;
+        }
+    }
+
     /// Joins the shared session through `client`.
     pub fn attach_session(&mut self, client: UiClient) {
         self.session = Some(SessionLink {

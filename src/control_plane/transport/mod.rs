@@ -11,7 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use std::future::Future;
+use std::pin::Pin;
+
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -19,16 +23,24 @@ use tokio::task::JoinSet;
 
 use super::protocol::{self, Code, Refusal, Response};
 
-const MAX_CONNECTIONS: usize = 32;
 const CONTROL_LIMIT: usize = 8;
 const INGEST_LIMIT: usize = 4;
 const WAITING_LIMIT: usize = 8;
-/// Long-lived UI subscriptions. They hold a connection, not a handler or a lane
-/// permit, so they are bounded on their own and below `MAX_CONNECTIONS`.
-const SUBSCRIPTION_LIMIT: usize = 16;
+
+/// Connection budgets, by the class a connection is established as. A peer is
+/// admitted as unclassified first, then transfers to the class its opener names,
+/// so long-lived attachments cannot consume ordinary connection capacity.
+const OPENING_SLOTS: usize = 8;
+const ORDINARY_SLOTS: usize = 32;
+const UI_ATTACHMENT_SLOTS: usize = 16;
+/// Held for a presenter that already names an interaction, so a full attachment
+/// budget cannot strand a modal that is waiting to be answered.
+const UI_PRESENTER_SLOTS: usize = 1;
 const MAX_BLOCKING_HANDLERS: usize = CONTROL_LIMIT + INGEST_LIMIT + WAITING_LIMIT;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// One frame must arrive and finish within this window, however slowly it trickles.
+pub(crate) const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_RECHECK: Duration = Duration::from_millis(100);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -122,30 +134,40 @@ pub(crate) struct IngestResult {
 pub(crate) type Disconnect = dyn Fn(u64) + Send + Sync + 'static;
 pub(crate) type EventReady = dyn Fn(&[u8]) -> bool + Send + Sync + 'static;
 
-/// A stream of encoded response lines the server pushes until it ends. Each call
-/// waits for the next line; `None` ends the stream.
-pub(crate) trait FrameStream: Send {
-    fn accepts_requests(&self) -> bool;
-    fn busy(&self) -> Option<crate::content::Segments>;
-    fn respond<'a>(
-        &'a mut self,
-        _request: Vec<u8>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<crate::content::Segments>> + Send + 'a>,
-    > {
-        Box::pin(async { None })
-    }
-    fn next<'a>(
-        &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<crate::content::Segments>> + Send + 'a>,
-    >;
-}
+/// A TUI attachment served on one duplex connection.
+///
+/// The UI side owns both socket directions once the opener has switched the
+/// connection to binary frames; transport decides only admission and when the
+/// connection is cut.
+pub(crate) type DuplexFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+/// Serves one opened attachment on both directions of its connection.
+pub(crate) type StreamOpen = dyn Fn(protocol::Request, Box<dyn AsyncRead + Send + Unpin>, OwnedWriteHalf) -> DuplexFuture
+    + Send
+    + Sync
+    + 'static;
 
-/// Opens the stream a request asks for. `None` means the method is not a
-/// streaming one; otherwise the stream, or the refusal that answers the request.
-pub(crate) type StreamOpen =
-    dyn Fn(&[u8]) -> Option<Result<Box<dyn FrameStream>, Response>> + Send + Sync + 'static;
+/// The tasks of one connection. Dropping the set ends them, including when the
+/// owner is cancelled rather than finishing.
+#[derive(Default)]
+pub(crate) struct Tasks(JoinSet<()>);
+
+impl Tasks {
+    pub(crate) fn spawn<F>(&mut self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.0.spawn(task);
+    }
+
+    /// Any essential task ending ends the connection; dropping the set aborts its siblings.
+    pub(crate) async fn wait(&mut self) {
+        let _ = self.0.join_next().await;
+    }
+
+    pub(crate) async fn shutdown(&mut self) {
+        self.0.shutdown().await;
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct EventNotification {
@@ -249,9 +271,6 @@ impl ConnectionSet {
 
     fn register(&self, stream: &StdStream) -> io::Result<Option<(u64, StdStream)>> {
         let mut live = self.live.lock().unwrap_or_else(|error| error.into_inner());
-        if live.len() >= MAX_CONNECTIONS {
-            return Ok(None);
-        }
         let seen = stream.try_clone()?;
         let writer = stream.try_clone()?;
         let mut next_id = self
@@ -333,7 +352,6 @@ impl Transport {
         };
         let in_flight = Arc::clone(&serving.in_flight);
         let admission = Arc::new(Admission::new());
-        let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let accept_connections = Arc::clone(&connections);
         let accept_serving = serving.clone();
         let thread_runtime = Arc::clone(&runtime);
@@ -348,7 +366,6 @@ impl Transport {
                             source.service,
                             Arc::clone(&accept_connections),
                             Arc::clone(&admission),
-                            Arc::clone(&connection_slots),
                             accept_serving.clone(),
                         ))
                     })
@@ -420,7 +437,17 @@ struct Admission {
     control: Arc<Semaphore>,
     ingest: Arc<Semaphore>,
     waiting: Arc<Semaphore>,
-    subscriptions: Arc<Semaphore>,
+    opening: Arc<Semaphore>,
+    ordinary: Arc<Semaphore>,
+    attachments: Arc<Semaphore>,
+    presenters: Arc<Semaphore>,
+}
+
+/// The class a connection is established as, once its opener has said so.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Ui { presenter: bool },
+    Ordinary,
 }
 
 impl Admission {
@@ -429,7 +456,10 @@ impl Admission {
             control: Arc::new(Semaphore::new(CONTROL_LIMIT)),
             ingest: Arc::new(Semaphore::new(INGEST_LIMIT)),
             waiting: Arc::new(Semaphore::new(WAITING_LIMIT)),
-            subscriptions: Arc::new(Semaphore::new(SUBSCRIPTION_LIMIT)),
+            opening: Arc::new(Semaphore::new(OPENING_SLOTS)),
+            ordinary: Arc::new(Semaphore::new(ORDINARY_SLOTS)),
+            attachments: Arc::new(Semaphore::new(UI_ATTACHMENT_SLOTS)),
+            presenters: Arc::new(Semaphore::new(UI_PRESENTER_SLOTS)),
         }
     }
 
@@ -438,6 +468,15 @@ impl Admission {
             Lane::Control => &self.control,
             Lane::Ingest => &self.ingest,
             Lane::Waiting => &self.waiting,
+        };
+        Arc::clone(semaphore).try_acquire_owned().ok()
+    }
+
+    fn establish(&self, class: Class) -> Option<OwnedSemaphorePermit> {
+        let semaphore = match class {
+            Class::Ui { presenter: true } => &self.presenters,
+            Class::Ui { presenter: false } => &self.attachments,
+            Class::Ordinary => &self.ordinary,
         };
         Arc::clone(semaphore).try_acquire_owned().ok()
     }
@@ -480,7 +519,6 @@ async fn accept_loop(
     service: Service,
     connections: Arc<ConnectionSet>,
     admission: Arc<Admission>,
-    connection_slots: Arc<Semaphore>,
     serving: Serving,
 ) {
     let listener = match UnixListener::from_std(listener) {
@@ -491,9 +529,8 @@ async fn accept_loop(
     while !serving.stopping.load(Ordering::SeqCst) {
         match tokio::time::timeout(ACCEPT_RECHECK, listener.accept()).await {
             Ok(Ok((stream, _))) => {
-                let slot = match Arc::clone(&connection_slots).try_acquire_owned() {
-                    Ok(slot) => slot,
-                    Err(_) => continue,
+                let Ok(opening) = Arc::clone(&admission.opening).try_acquire_owned() else {
+                    continue;
                 };
                 let Ok(std_stream) = stream.into_std() else {
                     continue;
@@ -509,9 +546,21 @@ async fn accept_loop(
                 let admission = Arc::clone(&admission);
                 let connections = Arc::clone(&connections);
                 let serving = serving.clone();
+                let connection = Connection {
+                    stream: reader,
+                    writer,
+                    id,
+                };
                 tasks.spawn(async move {
-                    serve(reader, writer, id, connections, service, admission, serving).await;
-                    drop(slot);
+                    serve(
+                        connection,
+                        connections,
+                        service,
+                        admission,
+                        serving,
+                        opening,
+                    )
+                    .await;
                 });
             }
             Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -531,18 +580,28 @@ async fn drain(tasks: &mut JoinSet<()>) {
     while tasks.join_next().await.is_some() {}
 }
 
-async fn serve(
+/// One accepted socket and the identity the connection registry knows it by.
+struct Connection {
     stream: UnixStream,
     writer: StdStream,
     id: u64,
+}
+
+async fn serve(
+    Connection { stream, writer, id }: Connection,
     connections: Arc<ConnectionSet>,
     service: Service,
     admission: Arc<Admission>,
     serving: Serving,
+    opening: OwnedSemaphorePermit,
 ) {
     let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
     let writer = Arc::new(Mutex::new(writer));
     let mut reader = tokio::io::BufReader::new(stream);
+    // Unclassified until the first line names a class; only then does the
+    // connection hold a budget of its own.
+    let mut opening = Some(opening);
+    let mut _class: Option<OwnedSemaphorePermit> = None;
     loop {
         let line = match tokio::time::timeout(IDLE_TIMEOUT, read_line(&mut reader)).await {
             Ok(Ok(Some(line))) => line,
@@ -563,62 +622,62 @@ async fn serve(
                 Service::Ingest { .. } => break,
             },
             ReadLine::Data(line) => {
-                if let Service::Control { streams, .. } = &service
-                    && is_stream_request(&line)
-                {
+                // One decode decides both the class and, for an attachment, the
+                // request the handler serves.
+                let request = protocol::decode_request(&line).ok();
+                let opener = match (service.clone(), request.clone()) {
+                    (Service::Control { .. }, Some(request)) if request.method == "ui.open" => {
+                        Some(request)
+                    }
+                    _ => None,
+                };
+                let attachment = opener.is_some();
+                if opening.is_some() {
+                    let class = if attachment {
+                        Class::Ui {
+                            presenter: opener.as_ref().is_some_and(names_interaction),
+                        }
+                    } else {
+                        Class::Ordinary
+                    };
+                    match admission.establish(class) {
+                        Some(permit) => {
+                            _class = Some(permit);
+                            opening = None;
+                        }
+                        None => {
+                            let reason = match class {
+                                Class::Ui { .. } => "the UI attachment limit is reached",
+                                Class::Ordinary => "the connection limit is reached",
+                            };
+                            if matches!(&service, Service::Ingest { .. }) {
+                                break;
+                            }
+                            let response = Response::refused(
+                                &request_id_of(&line),
+                                &Refusal::new(Code::Busy, reason),
+                            );
+                            write_response(&writer, &response);
+                            break;
+                        }
+                    }
+                }
+                if attachment {
                     if serving.stopping.load(Ordering::SeqCst) {
                         break;
                     }
-                    let actions = protocol::decode_request(&line).is_ok_and(|request| {
-                        request.method == "ui.open"
-                            && request
-                                .params
-                                .get("role")
-                                .and_then(serde_json::Value::as_str)
-                                == Some("actions")
-                    });
-                    let permit = if actions {
-                        None
-                    } else {
-                        match Arc::clone(&admission.subscriptions).try_acquire_owned() {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
-                                write_response(
-                                    &writer,
-                                    &Response::refused(
-                                        &request_id_of(&line),
-                                        &Refusal::new(
-                                            Code::Busy,
-                                            "the subscription limit is reached",
-                                        ),
-                                    ),
-                                );
-                                continue;
-                            }
-                        }
+                    let Service::Control { streams: open, .. } = &service else {
+                        break;
                     };
-                    let open = Arc::clone(streams);
-                    let request = line.clone();
-                    let opened = tokio::task::spawn_blocking(move || open(&request)).await;
-                    match opened {
-                        Ok(Some(Ok(stream))) => {
-                            write_response(
-                                &writer,
-                                &Response::ok(
-                                    &request_id_of(&line),
-                                    serde_json::json!({"codec": "messagepack", "framing": "u32-be"}),
-                                ),
-                            );
-                            binary_frames(&mut reader, stream, &admission, &serving).await;
-                            drop(permit);
-                            break;
-                        }
-                        Ok(Some(Err(response))) => {
-                            write_response(&writer, &response);
-                            continue;
-                        }
-                        _ => break,
-                    }
+                    let open = Arc::clone(open);
+                    // Bytes the reader already holds past the opener line are
+                    // the peer's first binary frames, not discards.
+                    let buffered = reader.buffer().to_vec();
+                    let (read, write) = reader.into_inner().into_split();
+                    let read: Box<dyn AsyncRead + Send + Unpin> =
+                        Box::new(Prefixed::new(buffered, read));
+                    open(opener.expect("an attachment names its opener"), read, write).await;
+                    break;
                 }
                 let lane = match &service {
                     Service::Control { .. } => lane(&line),
@@ -696,79 +755,88 @@ async fn serve(
     }
 }
 
-fn is_stream_request(line: &[u8]) -> bool {
-    protocol::decode_request(line).is_ok_and(|request| request.method == "ui.open")
+/// A presenter names the interaction it will claim; that is what earns the
+/// reserved capacity, and the actor still validates the claim.
+fn names_interaction(request: &protocol::Request) -> bool {
+    request
+        .params
+        .get("interaction_id")
+        .is_some_and(|id| id.is_string())
 }
 
-/// Pushes a stream's lines until it ends, the peer closes or a write stalls.
-///
-/// The peer is watched for closure independently of publications, so an idle
-/// subscription is released as soon as its client goes. A slow reader costs only
-/// its own write deadline: the stream hands over the latest state, never a queue.
-async fn read_binary(
-    reader: &mut tokio::io::BufReader<UnixStream>,
+/// Bytes read past a JSON opener, replayed before the binary frames behind them.
+pub(crate) struct Prefixed<R> {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: R,
+}
+
+impl<R> Prefixed<R> {
+    fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Prefixed<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset < this.prefix.len() {
+            let held = &this.prefix[this.offset..];
+            let take = held.len().min(buffer.remaining());
+            buffer.put_slice(&held[..take]);
+            this.offset += take;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(context, buffer)
+    }
+}
+
+/// Silence is unlimited; a frame must finish before `complete` once its first byte arrives.
+pub(crate) async fn read_frame_body<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    complete: Duration,
 ) -> Result<Vec<u8>, crate::content::Error> {
     use tokio::io::AsyncReadExt;
     let mut prefix = [0; 4];
-    reader.read_exact(&mut prefix).await?;
-    let size = crate::content::frame_length(prefix)?;
-    let mut bytes = vec![0; size];
-    reader.read_exact(&mut bytes).await?;
-    Ok(bytes)
-}
-
-async fn binary_input(
-    reader: &mut tokio::io::BufReader<UnixStream>,
-    requests: bool,
-) -> Result<Vec<u8>, ()> {
-    use tokio::io::AsyncReadExt;
-    if !requests {
-        let _ = reader.read(&mut [0]).await;
-        return Err(());
+    let first = reader.read(&mut prefix[..1]).await?;
+    if first == 0 {
+        return Err(crate::content::Error::Io(
+            io::ErrorKind::UnexpectedEof.into(),
+        ));
     }
-    tokio::time::timeout(IDLE_TIMEOUT, read_binary(reader))
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
+    tokio::time::timeout(complete, async {
+        reader.read_exact(&mut prefix[1..]).await?;
+        let size = crate::content::frame_length(prefix)?;
+        let mut bytes = vec![0; size];
+        reader.read_exact(&mut bytes).await?;
+        Ok::<_, crate::content::Error>(bytes)
+    })
+    .await
+    .map_err(|_| crate::content::Error::Io(io::ErrorKind::TimedOut.into()))?
 }
 
-async fn binary_frames(
-    reader: &mut tokio::io::BufReader<UnixStream>,
-    mut stream: Box<dyn FrameStream>,
-    admission: &Arc<Admission>,
-    serving: &Serving,
-) {
+/// Writes every segment of one frame before [`WRITE_TIMEOUT`]; a partial write
+/// ends the connection rather than resuming at a later frame boundary.
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &crate::content::Segments,
+) -> bool {
     use tokio::io::AsyncWriteExt;
-    let requests = stream.accepts_requests();
-    loop {
-        let frame = tokio::select! {
-            frame = stream.next() => frame,
-            request = binary_input(reader, requests) => {
-                let Ok(request) = request else { return };
-                if serving.stopping.load(Ordering::SeqCst) { return; }
-                match admission.acquire(Lane::Control) {
-                    Some(permit) => {
-                        serving.in_flight.fetch_add(1, Ordering::SeqCst);
-                        let frame = stream.respond(request).await;
-                        serving.in_flight.fetch_sub(1, Ordering::SeqCst);
-                        drop(permit);
-                        frame
-                    }
-                    None => stream.busy(),
-                }
-            }
-        };
-        let Some(frame) = frame else { return };
-        let write = async {
-            for part in &frame.0 {
-                reader.get_mut().write_all(part).await?;
-            }
-            Ok::<_, std::io::Error>(())
-        };
-        if !matches!(tokio::time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
-            return;
+    let write = async {
+        for part in &frame.0 {
+            writer.write_all(part).await?;
         }
-    }
+        writer.flush().await
+    };
+    matches!(tokio::time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(())))
 }
 
 /// The id a line names, so a refusal can answer the request it will not serve.
@@ -885,11 +953,61 @@ fn write_response(writer: &Arc<Mutex<StdStream>>, response: &Response) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Admission, CONTROL_LIMIT, INGEST_LIMIT, Lane, ReadLine, WAITING_LIMIT, lane, read_line,
+        Admission, CONTROL_LIMIT, INGEST_LIMIT, Lane, ReadLine, WAITING_LIMIT, lane,
+        read_frame_body, read_line,
     };
     use crate::control_plane::protocol::{self};
     use serde_json::json;
     use tokio::io::AsyncWriteExt;
+
+    /// An attachment may be quiet indefinitely; a frame that has started may not.
+    #[tokio::test]
+    async fn a_quiet_connection_is_not_treated_as_an_unfinished_frame() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let frame = crate::content::Segments::encoded(&serde_json::json!({"a": 1})).unwrap();
+        let expected = frame.0.concat()[4..].to_vec();
+        let sending = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            client.write_all(&frame.0.concat()).await.unwrap();
+            client
+        });
+        let read = read_frame_body(&mut server, Duration::from_millis(20))
+            .await
+            .expect("silence must not consume the frame-completion deadline");
+        assert_eq!(read, expected);
+
+        let mut client = sending.await.unwrap();
+        client.write_all(&10u32.to_be_bytes()).await.unwrap();
+        client.write_all(&[0]).await.unwrap();
+        assert!(
+            read_frame_body(&mut server, Duration::from_millis(20))
+                .await
+                .is_err(),
+            "an unfinished frame must have a completion deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_essential_task_ending_cancels_the_connection() {
+        let mut tasks = super::Tasks::default();
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        tasks.spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        tasks.spawn(async {});
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.wait())
+            .await
+            .expect("a non-reader exit must end the connection");
+        tasks.shutdown().await;
+        assert!(
+            released.await.is_err(),
+            "the sibling must release its resources"
+        );
+    }
 
     fn request(method: &str, params: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&json!({
@@ -993,7 +1111,7 @@ mod tests {
                 signal,
                 notification,
                 ready,
-                Arc::new(|_| None),
+                Arc::new(|_, _, _| Box::pin(std::future::pending())),
             )],
             Arc::clone(&stopping),
         )

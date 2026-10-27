@@ -70,7 +70,7 @@ mod subject_control;
 mod subject_reads;
 mod sweeper;
 mod ui;
-mod ui_binary;
+mod ui_duplex;
 mod verification;
 use admission::*;
 use child_close::*;
@@ -660,9 +660,9 @@ impl Daemon {
             );
         });
         let stream_core = Arc::clone(&core);
-        let streams: Arc<StreamOpen> = Arc::new(move |line| {
+        let streams: Arc<StreamOpen> = Arc::new(move |request, read, write| {
             let handle = locked(&stream_core).ui.clone();
-            ui::open(handle.as_ref(), line)
+            ui_duplex::open(handle.as_ref(), request, read, write)
         });
         let mut sources = vec![ListenerSource::control(
             listener,

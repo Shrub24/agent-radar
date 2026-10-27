@@ -1,30 +1,11 @@
-//! The daemon side of the shared UI session: request handlers and the push
-//! stream. The session itself lives in [`crate::ui_session`]; this adapts it to
-//! the wire and owns nothing of its own.
+//! Executes the effects the shared UI session plans. The session itself lives in
+//! [`crate::ui_session`] and the connection in `ui_duplex`; nothing of its own
+//! state lives here.
 
 use serde_json::json;
 
-use super::ui_binary::BinaryFrames;
-use super::{Request, Response, decode_params};
-use crate::control_plane::protocol::{self, Code, Refusal};
+use super::Request;
 use crate::control_plane::public_contracts::ui_session as dto;
-use crate::control_plane::transport::FrameStream;
-use crate::ui_session::actor::{UiError, UiHandle};
-
-fn refusal(request: &Request, error: UiError) -> Response {
-    let (code, message) = match error {
-        UiError::Busy => (Code::Busy, "the UI session is busy".to_string()),
-        UiError::Stopped => (Code::Busy, "the UI session has stopped".to_string()),
-        UiError::Refused(reason) => (
-            Code::Refused,
-            serde_json::to_value(reason)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_default(),
-        ),
-    };
-    Response::refused(&request.id, &Refusal::new(code, message))
-}
 
 /// Reuses domain admission directly, not a self-RPC or a second creation path.
 pub(super) fn execute(
@@ -41,18 +22,9 @@ pub(super) fn execute(
             return match record {
                 Some(record) => {
                     let answer = json!({"result": { "request": super::public_record(record) }});
-                    let status = outcome_status(&answer);
-                    dto::CommandOutcome {
-                        request_id: id,
-                        status,
-                        answer: Some(answer),
-                    }
+                    dto::CommandOutcome::answering(&id, outcome_status(&answer), answer)
                 }
-                None => dto::CommandOutcome {
-                    request_id: id,
-                    status: dto::CommandStatus::SubmissionUncertain,
-                    answer: None,
-                },
+                None => dto::CommandOutcome::new(&id, dto::CommandStatus::SubmissionUncertain),
             };
         }
     };
@@ -64,23 +36,21 @@ pub(super) fn execute(
         crate::ui_session::targets::Effect::Domain { .. } => None,
     }) {
         let Some(core) = core.upgrade() else {
-            return dto::CommandOutcome {
-                request_id: job.request_id,
-                status: dto::CommandStatus::DispatchRefused,
-                answer: None,
-            };
+            return dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::DispatchRefused);
         };
         let Some(backend) = super::locked(&core).backend.clone() else {
-            return dto::CommandOutcome {
-                request_id: job.request_id,
-                status: dto::CommandStatus::Refused,
-                answer: Some(json!({"error": {"code": "backend_unavailable",
-                    "message": "this daemon has no runtime to move focus on"}})),
-            };
+            return dto::CommandOutcome::error(
+                &job.request_id,
+                dto::CommandStatus::Refused,
+                "backend_unavailable",
+                "this daemon has no runtime to move focus on",
+            );
         };
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let (status, answer) = match backend.focus_outcome(&target, &cancel) {
-            crate::runtime::FocusOutcome::Completed => (dto::CommandStatus::Completed, None),
+        match backend.focus_outcome(&target, &cancel) {
+            crate::runtime::FocusOutcome::Completed => {
+                return dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::Completed);
+            }
             crate::runtime::FocusOutcome::Refused(message) => {
                 // A server with nothing attached is answered with the place that
                 // could not be shown: the frontend can open a terminal for it.
@@ -89,22 +59,21 @@ pub(super) fn execute(
                 } else {
                     "refused"
                 };
-                (
+                return dto::CommandOutcome::answering(
+                    &job.request_id,
                     dto::CommandStatus::Refused,
-                    Some(json!({"error": {"code": code, "message": message,
-                        "target": target}})),
-                )
+                    json!({"error": {"code": code, "message": message, "target": target}}),
+                );
             }
-            crate::runtime::FocusOutcome::Unknown(message) => (
-                dto::CommandStatus::Unknown,
-                Some(json!({"error": {"code": "unknown", "message": message}})),
-            ),
-        };
-        return dto::CommandOutcome {
-            request_id: job.request_id,
-            status,
-            answer,
-        };
+            crate::runtime::FocusOutcome::Unknown(message) => {
+                return dto::CommandOutcome::error(
+                    &job.request_id,
+                    dto::CommandStatus::Unknown,
+                    "unknown",
+                    &message,
+                );
+            }
+        }
     }
     // A frozen plan carries the request a client would have sent, under the
     // identity it was frozen with; a project answer names the directory the
@@ -116,20 +85,15 @@ pub(super) fn execute(
             }
             // A focus never reaches this branch: it is served above.
             crate::ui_session::targets::Effect::Focus(_) => {
-                return dto::CommandOutcome {
-                    request_id: job.request_id,
-                    status: dto::CommandStatus::DispatchRefused,
-                    answer: None,
-                };
+                return dto::CommandOutcome::new(
+                    &job.request_id,
+                    dto::CommandStatus::DispatchRefused,
+                );
             }
         },
         None => {
             let dto::InteractionResult::Project { path } = &job.result else {
-                return dto::CommandOutcome {
-                    request_id: job.request_id,
-                    status: dto::CommandStatus::Refused,
-                    answer: None,
-                };
+                return dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::Refused);
             };
             (
                 "topology.create".to_string(),
@@ -147,33 +111,20 @@ pub(super) fn execute(
         params,
     };
     let Some(core) = core.upgrade() else {
-        return dto::CommandOutcome {
-            request_id: job.request_id,
-            status: dto::CommandStatus::DispatchRefused,
-            answer: None,
-        };
+        return dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::DispatchRefused);
     };
     let response = match super::ops::classify(&request.method) {
         Some(super::ops::Method::Operation(operation)) => {
             super::execute(operation, &request, &core, verification)
         }
-        _ => {
-            return dto::CommandOutcome {
-                request_id: job.request_id,
-                status: dto::CommandStatus::Refused,
-                answer: None,
-            };
-        }
+        _ => return dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::Refused),
     };
     let answer = serde_json::to_value(response).expect("serialize domain response");
-    let status = outcome_status(&answer);
-    dto::CommandOutcome {
-        request_id: job.request_id,
-        status,
-        answer: Some(answer),
-    }
+    dto::CommandOutcome::answering(&job.request_id, outcome_status(&answer), answer)
 }
 
+/// Domain operations answer JSON, so the status is read from the answer that will
+/// be sent: one fact, not a parallel judgement about it.
 fn outcome_status(answer: &serde_json::Value) -> dto::CommandStatus {
     use dto::CommandStatus as S;
     match answer
@@ -192,40 +143,4 @@ fn outcome_status(answer: &serde_json::Value) -> dto::CommandStatus {
             _ => S::SubmissionUncertain,
         },
     }
-}
-
-/// Explicitly switches a TUI connection from its JSON opener to binary frames.
-pub(super) fn open(
-    handle: Option<&UiHandle>,
-    line: &[u8],
-) -> Option<Result<Box<dyn FrameStream>, Response>> {
-    let request = protocol::decode_request(line).ok()?;
-    if request.method != "ui.open" {
-        return None;
-    }
-    let Some(handle) = handle else {
-        return Some(Err(Response::refused(
-            &request.id,
-            &Refusal::new(Code::BackendUnavailable, "this daemon has no UI session"),
-        )));
-    };
-    let params: crate::ui_session::publication::Open = match decode_params(&request) {
-        Ok(params) => params,
-        Err(response) => return Some(Err(response)),
-    };
-    let (subscription, session_only) = match params {
-        crate::ui_session::publication::Open::Actions => (None, false),
-        crate::ui_session::publication::Open::Subscribe {
-            attachment_id,
-            session_only,
-        } => match handle.subscribe(&attachment_id) {
-            Ok(subscription) => (Some(subscription), session_only),
-            Err(error) => return Some(Err(refusal(&request, error))),
-        },
-    };
-    Some(Ok(Box::new(BinaryFrames {
-        handle: handle.clone(),
-        subscription,
-        session_only,
-    })))
 }

@@ -5,7 +5,17 @@ use serde::{Deserialize, Serialize};
 use crate::control_plane::observation::{Snapshot, SourceState};
 use crate::observation::ObservationState;
 
-pub use crate::control_plane::public_contracts::ui_session::{Frame, Head, Open, Reply, Request};
+pub use crate::control_plane::public_contracts::ui_session::{
+    AttachmentOpen, DuplexFrame, DuplexMetadata, DuplexOperation, DuplexReply, DuplexRequest, Head,
+};
+
+/// One publication as the session generates it, before it is framed for a
+/// connection: the head plus whatever payloads that connection does not hold.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    pub head: Head,
+    pub content: Vec<crate::content::Content>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Observation {

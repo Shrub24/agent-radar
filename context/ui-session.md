@@ -425,7 +425,8 @@ The session's tree projection is the canonical row set, order and nesting. Every
 
 **Id:** a629a11e-79fb-4378-b825-000905f3f4bc
 **Type:** decision
-**Status:** active
+**Status:** superseded
+**Superseded by:** 5151539a-a107-4b74-9c94-aab0444601ad
 **Evidence:** confirmed
 **Source:** a frontend that stopped re-attaching after a daemon restart, reproduced only under a loaded suite
 **Verification:** corroborated — with the timeout in place, ten loaded control-plane runs were clean where three in ten had stalled; the attach trace showed the attempt parked in `read_line` on a subscription the daemon had accepted
@@ -438,6 +439,8 @@ The subscription connection keeps the ordinary reply read timeout until the firs
 **Rejected alternative:** a health check or keepalive on the push stream. It needs a protocol addition and a second way to say the same thing; the first frame is already the strongest possible evidence that the subscription is being served.
 
 **Consequence:** a subscription that would have delivered its baseline after the reply timeout is abandoned and retried, which costs one attachment. The reply timeout is short enough that this is invisible unless the daemon is overloaded past it.
+
+**Superseded:** the rule was about the second socket. With one duplex connection the opener is answered on the same socket the frames arrive on, and the first complete head is the readiness barrier, so there is no state in which an accepted-but-unserved subscription can park a thread.
 
 ## Host acceptance is not tracked separately from the presenter claim
 
@@ -456,6 +459,58 @@ The protocol no longer carries an acknowledgement action or a field recording th
 **Rejected alternative:** keep it as diagnostic state for the planned operation inspector. When the inspector exists it will want facts with an audience, designed against what it shows; carrying the field until then is speculative state, and a popup that never opened is already visible as an interaction that expired or was cancelled.
 
 **Consequence:** the distinction between host acceptance and presenter claim survives in the design as reasoning but not on the wire. If a future consumer needs it, the honest move is to add an observation with a reader, not to reintroduce an unused field.
+
+## One duplex attachment connection, not two sockets
+
+**Id:** 5151539a-a107-4b74-9c94-aab0444601ad
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer direction to evaluate the transport as a whole rather than patch admission around the two-socket path
+**Verification:** corroborated — `src/control_plane/server/ui_duplex.rs` serves one attachment per connection and `src/ui_session/client.rs` runs reader, writer, materialiser, demand and the ordered action pump as tasks on the caller's runtime; `FrameStream`, the role-switching opener, `ui.subscribe`/`ui.attach`/`ui.action`/`ui.detach` and the `Link` mutex are deleted; 171 control-plane tests pass over the real socket
+**Revisit when:** a second consumer needs domain RPCs and publications on one connection, or measurements show head-of-line blocking costing responsiveness on a readable peer
+
+One connection per TUI attachment carries requests out and replies and publications in. Logical lanes remain distinct — one ordered action slot, two auxiliary content/demand slots, and a latest-publication slot — but they are not separate sockets.
+
+**Reason:** the two-socket split existed because the old serving loop awaited its handler inside a `select!` arm while holding the stream, so an action in flight would have starved the push. That is an artefact of the loop's shape, not a property of the protocol. One connection makes attachment lifetime and release a single fact: the connection owns the attachment, so there is no primary-subscription-versus-action-link pair to reconcile, and no window where one half has closed and the other has not.
+
+**Rejected alternative:** keep two sockets and only fix admission. It fixes the capacity arithmetic while leaving two writers, two failure modes and an attachment whose lifetime is two sockets' intersection.
+
+**Rejected alternative:** one connection but asynchronous credit machinery for replies. One action in flight plus a small fixed auxiliary bound is enough for a single human at a keyboard, and bounded refusal is easier to reason about than credit.
+
+**Consequence:** a stalled reader now stalls its own receipts as well as its publications. That is accepted on a local socket, and the write deadline still closes the connection rather than holding the actor.
+
+## Connection-owned task sets
+
+**Id:** e064d29e-fe9d-4172-b043-d9acffdd0494
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** three integration defects traced to lifecycle at the seam during the duplex cutover
+**Verification:** corroborated — dropping a client left its socket halves open until the tasks were made connection-owned (`Tasks` guard on both ends); the release, capacity-reuse and presenter-gate tests failed before the guard and pass after it
+**Revisit when:** a connection grows work that outlives it (a background drain, a retained delivery)
+
+Dropping a `JoinHandle` does not stop a task. Both ends therefore own their essential connection tasks in a `JoinSet`: any task ending terminates the connection, sibling cancellation is awaited on normal teardown, and dropping the owner aborts siblings on cancellation. TUI shutdown signals the supervisor and awaits bounded cleanup inside its outer async lifetime.
+
+**Reason:** cancellation is the normal way these futures end — a client is dropped, a daemon stops — and any cleanup written after the last `await` simply does not run. A leak here is not a warning: it holds the socket, the attachment lease and a class permit, so capacity and gate claims survive a frontend that is gone.
+
+**Rejected alternative:** make only the reader determine lifetime. The initial cutover used that policy, but review showed that a failed materialiser could leave a stale view connected and a failed server writer could leave a class permit held until the peer closed. Ownership prevents orphan tasks; observing every essential task's completion also prevents half-alive connections.
+
+## Class-based connection admission
+
+**Id:** a4c545a4-cc80-4c75-a997-131002923cf6
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** review arithmetic error that first looked like a live bug and turned out to be a latent cap
+**Verification:** corroborated — `Admission` holds opening (8), ordinary (32), attachment (16) and presenter (1) budgets; the registry's duplicate cap is gone; the capacity test fills all 16 attachments, still reaches the actor for a presenter claim, and reuses a slot after a connection closes
+**Revisit when:** a frontend needs more than one attachment per view, or a measured workload hits a class budget
+
+A connection is admitted as unclassified and takes its class budget once its opener names it, so long-lived attachments cannot consume the capacity ordinary requests need, and a full dashboard budget cannot strand a modal that is waiting to be answered.
+
+**Reason:** one global connection count conflated two different resources — sockets held for a long time and sockets held for one request — and refused the latter first. The failure was silent: the registry dropped the connection instead of answering.
+
+**Rejected alternative:** keep one cap and raise it. It moves the cliff without separating the resources, and the client still learns nothing when it is refused.
 
 ## Dissents recorded from the follow-up review
 

@@ -493,15 +493,16 @@ fn run_presenter(interaction: &str) -> io::Result<()> {
         .observation
         .ok_or_else(|| io::Error::other("daemon has no observation service"))?;
     let wake = Wake::default();
-    let client = UiClient::presenter(
+    let mut terminal = ratatui::try_init()?;
+    let runtime = session_runtime()?;
+    runtime.block_on(async {
+    let mut client = UiClient::presenter(
+        &tokio::runtime::Handle::current(),
         daemon.socket().to_path_buf(),
         interaction.into(),
         wake.clone(),
     );
-    let mut terminal = ratatui::try_init()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()?;
+    let result = async {
     let mut events = EventStream::new();
     let mut picker = None::<Picker<String>>;
     let mut confirm = None::<agent_radar::ui_session::confirm::Confirm>;
@@ -595,13 +596,11 @@ fn run_presenter(interaction: &str) -> io::Result<()> {
                 );
             }
         })?;
-        let event = runtime.block_on(async {
-            tokio::select! {
-                event = events.next() => Some(event),
-                () = wake.woken() => None,
-                () = tokio::time::sleep(Duration::from_secs(1)) => None,
-            }
-        });
+        let event = tokio::select! {
+            event = events.next() => Some(event),
+            () = wake.woken() => None,
+            () = tokio::time::sleep(Duration::from_secs(1)) => None,
+        };
         match &event {
             Some(None) => return Ok(()),
             Some(Some(Err(error))) => return Err(io::Error::other(error.to_string())),
@@ -656,6 +655,10 @@ fn run_presenter(interaction: &str) -> io::Result<()> {
             picker = None;
         }
     }
+    }.await;
+    client.shutdown().await;
+    result
+    })
 }
 
 fn run(sidebar: bool) -> io::Result<()> {
@@ -717,147 +720,156 @@ fn run(sidebar: bool) -> io::Result<()> {
         .as_ref()
         .map(|daemon| daemon.socket().to_path_buf());
     let mut displayed_observation: Option<std::sync::Arc<Observation>> = None;
-    if let Some(socket) = session_socket {
-        let role = if sidebar {
-            AttachmentRole::Sidebar
-        } else {
-            AttachmentRole::Dashboard
-        };
-        app.attach_session(UiClient::start(socket, role, wake.clone()));
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()?;
-    let mut events = EventStream::new();
-    // The animation frame, and the clock it is derived from: a mark has to move
-    // at the same rate whether or not anything else made the loop redraw.
-    let started = Instant::now();
-    let mut phase: usize = 0;
-    let mut dirty = true;
-    // A focus with no client attached opens a terminal and asks again, because a
-    // client has to exist before a focus can show anything.
-    let mut attach = Attach::default();
-    let mut sidebar_command = None;
-    let mut flip_on_success = false;
-    let mut presentation = agent_radar::ui_session::presentation::Presentation::default();
+    let runtime = session_runtime()?;
+    runtime.block_on(async {
+        if let Some(socket) = session_socket {
+            let role = if sidebar {
+                AttachmentRole::Sidebar
+            } else {
+                AttachmentRole::Dashboard
+            };
+            app.attach_session(UiClient::start(
+                &tokio::runtime::Handle::current(),
+                socket,
+                role,
+                wake.clone(),
+            ));
+        }
+        let result = async {
+            let mut events = EventStream::new();
+            // The animation frame, and the clock it is derived from: a mark has to move
+            // at the same rate whether or not anything else made the loop redraw.
+            let started = Instant::now();
+            let mut phase: usize = 0;
+            let mut dirty = true;
+            // A focus with no client attached opens a terminal and asks again, because a
+            // client has to exist before a focus can show anything.
+            let mut attach = Attach::default();
+            let mut sidebar_command = None;
+            let mut flip_on_success = false;
+            let mut presentation = agent_radar::ui_session::presentation::Presentation::default();
 
-    loop {
-        dirty |= app.apply_session_update();
-        let detached = sidebar && in_workspace && app.sidebar_compact();
-        dirty |= presentation.poll(&mut app, &config.tui, detached, &wake);
-        dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);
-        // Foreground evidence is swept while a pane view is showing panes, and
-        // while finished sessions are listed: telling a session that has gone
-        // from a pane in use again needs the foreground either way.
-        let sweeping = app.pane_view() != PaneView::Hidden || app.shows_history();
-        app.wants_processes(sweeping);
-        if let Some(observation) = app.session_observation()
-            && displayed_observation
-                .as_ref()
-                .is_none_or(|old| !std::sync::Arc::ptr_eq(old, &observation))
-        {
-            app.set_task_diagnostic(source_diagnostic(&observation, "tasks"));
-            state = observation.observation.clone();
-            displayed_observation = Some(observation);
-            dirty = true;
-        }
-        // The session answers a focus. A server with no client attached is the one
-        // answer this process acts on: it opens a terminal for the place it named
-        // and asks again, so the retry stays one session command.
-        if let Some((row, target)) = app.take_focus_recovery() {
-            attach.ask(&target, row);
-            if let Some(message) = attach.answered(true, &config.tui) {
-                app.set_focus_message(Some(message));
-            }
-            dirty = true;
-        }
-        if let Some(message) = attach.poll(&mut app) {
-            app.set_focus_message(Some(message));
-            dirty = true;
-        }
-        // Animation runs on the clock and only while something is working, so
-        // a quiet dashboard redraws when it changed and nothing moves on its
-        // own; a busy one redraws at the configured rate.
-        let fps = theme::config().appearance.fps.max(1);
-        let animating = app.animates();
-        if animating {
-            let next = (started.elapsed().as_millis() as usize * fps as usize) / 1000;
-            if next != phase {
-                phase = next;
-                dirty = true;
-            }
-        } else {
-            phase = 0;
-        }
-        if dirty {
-            let mut geometry = Geometry::default();
-            app.note_width(terminal.size()?.width);
-            terminal.draw(|frame| {
-                geometry = ui::render(frame, &state, &app, &mut list, phase);
-            })?;
-            app.note_layout(geometry);
-            dirty = false;
-        }
-        let timeout = if animating {
-            Duration::from_millis(1000 / fps as u64)
-        } else {
-            // Snapshots, session updates and input wake the loop themselves.
-            // What remains is work that only answers on its own thread, and
-            // clocks: messages that expire, an attach that retries.
-            let working = attach.waiting.is_some() || sidebar_command.is_some();
-            Duration::from_millis(if working { 50 } else { 250 })
-        };
-        let event = {
-            let next = runtime.block_on(async {
-                tokio::select! {
-                    event = events.next() => Some(event),
-                    () = wake.woken() => None,
-                    () = tokio::time::sleep(timeout) => None,
-                }
-            });
-            match next {
-                // Woken by a producer or by the clock: loop to apply it.
-                None => continue,
-                Some(Some(event)) => event?,
-                // The terminal's input ended; nothing more can be asked of it.
-                Some(None) => break,
-            }
-        };
-        match event {
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if (key.code == KeyCode::Char('q')
-                    && !app.is_filter_editing()
-                    && !app.picker_open()
-                    && app.session_confirm().is_none())
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
+            loop {
+                dirty |= app.apply_session_update();
+                let detached = sidebar && in_workspace && app.sidebar_compact();
+                dirty |= presentation.poll(&mut app, &config.tui, detached, &wake);
+                dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);
+                // Foreground evidence is swept while a pane view is showing panes, and
+                // while finished sessions are listed: telling a session that has gone
+                // from a pane in use again needs the foreground either way.
+                let sweeping = app.pane_view() != PaneView::Hidden || app.shows_history();
+                app.wants_processes(sweeping);
+                if let Some(observation) = app.session_observation()
+                    && displayed_observation
+                        .as_ref()
+                        .is_none_or(|old| !std::sync::Arc::ptr_eq(old, &observation))
                 {
-                    break;
+                    app.set_task_diagnostic(source_diagnostic(&observation, "tasks"));
+                    state = observation.observation.clone();
+                    displayed_observation = Some(observation);
+                    dirty = true;
                 }
-                if let Some(action) = app.handle_key(key)
-                    && let Some(flip) =
-                        perform(action, &mut app, &config, &state, &mut sidebar_command)
-                {
-                    flip_on_success = flip;
+                // The session answers a focus. A server with no client attached is the one
+                // answer this process acts on: it opens a terminal for the place it named
+                // and asks again, so the retry stays one session command.
+                if let Some((row, target)) = app.take_focus_recovery() {
+                    attach.ask(&target, row);
+                    if let Some(message) = attach.answered(true, &config.tui) {
+                        app.set_focus_message(Some(message));
+                    }
+                    dirty = true;
                 }
-                dirty = true;
+                if let Some(message) = attach.poll(&mut app) {
+                    app.set_focus_message(Some(message));
+                    dirty = true;
+                }
+                // Animation runs on the clock and only while something is working, so
+                // a quiet dashboard redraws when it changed and nothing moves on its
+                // own; a busy one redraws at the configured rate.
+                let fps = theme::config().appearance.fps.max(1);
+                let animating = app.animates();
+                if animating {
+                    let next = (started.elapsed().as_millis() as usize * fps as usize) / 1000;
+                    if next != phase {
+                        phase = next;
+                        dirty = true;
+                    }
+                } else {
+                    phase = 0;
+                }
+                if dirty {
+                    let mut geometry = Geometry::default();
+                    app.note_width(terminal.size()?.width);
+                    terminal.draw(|frame| {
+                        geometry = ui::render(frame, &state, &app, &mut list, phase);
+                    })?;
+                    app.note_layout(geometry);
+                    dirty = false;
+                }
+                let timeout = if animating {
+                    Duration::from_millis(1000 / fps as u64)
+                } else {
+                    // Snapshots, session updates and input wake the loop themselves.
+                    // What remains is work that only answers on its own thread, and
+                    // clocks: messages that expire, an attach that retries.
+                    let working = attach.waiting.is_some() || sidebar_command.is_some();
+                    Duration::from_millis(if working { 50 } else { 250 })
+                };
+                let event = {
+                    let next = tokio::select! {
+                        event = events.next() => Some(event),
+                        () = wake.woken() => None,
+                        () = tokio::time::sleep(timeout) => None,
+                    };
+                    match next {
+                        // Woken by a producer or by the clock: loop to apply it.
+                        None => continue,
+                        Some(Some(event)) => event?,
+                        // The terminal's input ended; nothing more can be asked of it.
+                        Some(None) => break,
+                    }
+                };
+                match event {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        if (key.code == KeyCode::Char('q')
+                            && !app.is_filter_editing()
+                            && !app.picker_open()
+                            && app.session_confirm().is_none())
+                            || (key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL))
+                        {
+                            break;
+                        }
+                        if let Some(action) = app.handle_key(key)
+                            && let Some(flip) =
+                                perform(action, &mut app, &config, &state, &mut sidebar_command)
+                        {
+                            flip_on_success = flip;
+                        }
+                        dirty = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        if let Some(action) = app.handle_mouse(mouse) {
+                            // The pointer has no mode to flip: the host state it shows is
+                            // the one the keys report.
+                            let _ =
+                                perform(action, &mut app, &config, &state, &mut sidebar_command);
+                        }
+                        if let Some(offset) = app.take_scroll() {
+                            *list.offset_mut() = offset;
+                        }
+                        dirty = true;
+                    }
+                    Event::Resize(_, _) => dirty = true,
+                    _ => {}
+                }
             }
-            Event::Mouse(mouse) => {
-                if let Some(action) = app.handle_mouse(mouse) {
-                    // The pointer has no mode to flip: the host state it shows is
-                    // the one the keys report.
-                    let _ = perform(action, &mut app, &config, &state, &mut sidebar_command);
-                }
-                if let Some(offset) = app.take_scroll() {
-                    *list.offset_mut() = offset;
-                }
-                dirty = true;
-            }
-            Event::Resize(_, _) => dirty = true,
-            _ => {}
+            Ok(())
         }
-    }
-    Ok(())
+        .await;
+        app.shutdown_session().await;
+        result
+    })
 }
 
 /// What the dashboard asked the host to do.
@@ -865,6 +877,14 @@ fn run(sidebar: bool) -> io::Result<()> {
 /// Keys and the pointer produce the same actions, so they go through one
 /// executor: two matches would drift, and only one of them would learn a new
 /// command.
+/// One runtime for a window and the attachment it reads: the client's tasks live
+/// inside the loop that owns the terminal.
+fn session_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
 fn perform(
     action: Action,
     app: &mut App,

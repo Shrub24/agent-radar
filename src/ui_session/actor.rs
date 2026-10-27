@@ -23,10 +23,6 @@ use crate::control_plane::public_contracts::ui_session as dto;
 const MAILBOX: usize = 256;
 /// Queued messages one pass may take before it publishes.
 const DRAIN: usize = 32;
-/// How long a caller waits for the actor before it is told the session is busy.
-const REPLY: Duration = Duration::from_secs(2);
-/// An attachment that never subscribes is released after this long.
-const UNSUBSCRIBED: Duration = Duration::from_secs(30);
 
 /// Why the session could not answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,14 +40,12 @@ pub enum Effect {
 }
 
 enum Reply<T> {
-    Sync(SyncSender<T>),
     Async(tokio::sync::oneshot::Sender<T>),
 }
 
 impl<T> Reply<T> {
     fn send(self, value: T) -> Result<(), T> {
         match self {
-            Self::Sync(sender) => sender.send(value).map_err(|error| error.0),
             Self::Async(sender) => sender.send(value),
         }
     }
@@ -65,13 +59,6 @@ enum Msg {
     ContentFailed(dto::PublicationFailure),
     Encoded(String, Reply<Option<crate::content::Content>>),
     Demand(String, bool, Reply<Result<(), dto::RefusalCode>>),
-    Attach(
-        String,
-        dto::AttachmentRole,
-        Option<String>,
-        Reply<Result<dto::AttachResult, dto::RefusalCode>>,
-    ),
-    Detach(String),
     Open(
         String,
         dto::AttachmentRole,
@@ -87,10 +74,6 @@ enum Msg {
         Reply<dto::ActionOutcome>,
     ),
     Finished(dto::CommandOutcome),
-    Subscribe(
-        String,
-        Reply<Result<watch::Receiver<bool>, dto::RefusalCode>>,
-    ),
     Stop,
 }
 
@@ -132,11 +115,10 @@ impl UiService {
                         };
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(job)))
-                                .unwrap_or(dto::CommandOutcome {
-                                    request_id: id,
-                                    status: dto::CommandStatus::SubmissionUncertain,
-                                    answer: None,
-                                });
+                                .unwrap_or(dto::CommandOutcome::new(
+                                    &id,
+                                    dto::CommandStatus::SubmissionUncertain,
+                                ));
                         if done_tx.send(Msg::Finished(outcome)).is_err() {
                             break;
                         }
@@ -256,13 +238,23 @@ fn run(
     let mut subscriptions: HashMap<String, watch::Sender<bool>> = HashMap::new();
     let mut leases: HashMap<String, Weak<()>> = HashMap::new();
     let mut clock = Instant::now();
-    let mut unsubscribed: HashMap<String, Instant> = HashMap::new();
     loop {
         let first = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(message) => Some(message),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        // A connection that has gone is discovered without asking it to speak:
+        // the lease it held is the only thing that had to survive the socket.
+        let gone: Vec<String> = leases
+            .iter()
+            .filter(|(_, lease)| lease.strong_count() == 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            leases.remove(&id);
+            session.detach(&id);
+        }
         let mut first = first;
         for pass in 0..DRAIN {
             let message = if pass == 0 {
@@ -295,34 +287,6 @@ fn run(
                         Err(dto::RefusalCode::Unavailable)
                     };
                     let _ = reply.send(result);
-                }
-                Msg::Attach(id, role, interaction, reply) => {
-                    let result = session.attach(&id, role).and_then(|()| {
-                        if let Some(interaction) = interaction {
-                            let claim = if role == dto::AttachmentRole::Presenter {
-                                session.claim_attachment(&id, &interaction)
-                            } else {
-                                Err(dto::RefusalCode::Role)
-                            };
-                            if let Err(code) = claim {
-                                session.detach(&id);
-                                return Err(code);
-                            }
-                        }
-                        Ok(dto::AttachResult {
-                            attachment_id: id.clone(),
-                            update_id: session.current().update_id,
-                        })
-                    });
-                    if result.is_ok() {
-                        unsubscribed.insert(id, Instant::now());
-                    }
-                    let _ = reply.send(result);
-                }
-                Msg::Detach(id) => {
-                    unsubscribed.remove(&id);
-                    leases.remove(&id);
-                    session.detach(&id);
                 }
                 Msg::Open(id, role, interaction, lease, reply) => {
                     let result = if lease.strong_count() == 0 {
@@ -364,21 +328,6 @@ fn run(
                     }
                     session.operation(outcome);
                 }
-                Msg::Subscribe(id, reply) => {
-                    // One primary subscription per attachment: the marker is
-                    // the attachment leaving the unsubscribed set, and a second
-                    // request finds it already gone.
-                    let result = if unsubscribed.remove(&id).is_some() {
-                        let (alive, receiver) = watch::channel(true);
-                        subscriptions.insert(id.clone(), alive);
-                        Ok(receiver)
-                    } else if session.attachments_contain(&id) {
-                        Err(dto::RefusalCode::Conflict)
-                    } else {
-                        Err(dto::RefusalCode::Unavailable)
-                    };
-                    let _ = reply.send(result);
-                }
             }
         }
         for job in session.take_completions() {
@@ -392,11 +341,7 @@ fn run(
             } else {
                 dto::CommandStatus::DispatchRefused
             };
-            session.operation(dto::CommandOutcome {
-                request_id: id,
-                status,
-                answer: None,
-            });
+            session.operation(dto::CommandOutcome::new(&id, status));
         }
         let expired: Vec<_> = leases
             .iter()
@@ -418,26 +363,16 @@ fn run(
             // come, so it is made once per request: repeating it every interval
             // republishes the same fact, costs a redraw and hides nothing new.
             if owed.mark_published() {
-                session.operation(dto::CommandOutcome {
-                    request_id: id.clone(),
-                    status: dto::CommandStatus::SubmissionUncertain,
-                    answer: None,
-                });
+                session.operation(dto::CommandOutcome::new(
+                    id,
+                    dto::CommandStatus::SubmissionUncertain,
+                ));
             }
         }
         let elapsed = now.duration_since(clock).as_secs();
         if elapsed > 0 {
             session.tick(elapsed);
             clock += Duration::from_secs(elapsed);
-        }
-        let expired: Vec<String> = unsubscribed
-            .iter()
-            .filter(|(_, since)| now.duration_since(**since) > UNSUBSCRIBED)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in expired {
-            unsubscribed.remove(&id);
-            session.detach(&id);
         }
         subscriptions.retain(|id, alive| {
             if session.attachments_contain(id) {
@@ -478,15 +413,6 @@ impl UiHandle {
         self.published.borrow().head()
     }
 
-    pub fn encoded_content(&self, hash: &str) -> Result<Option<crate::content::Content>, UiError> {
-        self.ask(|reply| Msg::Encoded(hash.into(), reply))
-    }
-
-    pub fn demand(&self, id: &str, processes: bool) -> Result<(), UiError> {
-        self.ask(|reply| Msg::Demand(id.into(), processes, reply))?
-            .map_err(UiError::Refused)
-    }
-
     fn enqueue<T>(
         &self,
         build: impl FnOnce(Reply<T>) -> Msg,
@@ -514,56 +440,6 @@ impl UiHandle {
         processes: bool,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(), dto::RefusalCode>>, UiError> {
         self.enqueue(|reply| Msg::Demand(id.into(), processes, reply))
-    }
-
-    fn ask<T>(&self, build: impl FnOnce(Reply<T>) -> Msg) -> Result<T, UiError> {
-        let (reply, answer) = mpsc::sync_channel(1);
-        self.tx
-            .try_send(build(Reply::Sync(reply)))
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => UiError::Busy,
-                mpsc::TrySendError::Disconnected(_) => UiError::Stopped,
-            })?;
-        answer.recv_timeout(REPLY).map_err(|error| match error {
-            RecvTimeoutError::Timeout => UiError::Busy,
-            RecvTimeoutError::Disconnected => UiError::Stopped,
-        })
-    }
-
-    /// Registers an attachment and returns the current state as its baseline.
-    pub fn attach(
-        &self,
-        id: &str,
-        role: dto::AttachmentRole,
-    ) -> Result<dto::AttachResult, UiError> {
-        self.attach_for(id, role, None)
-    }
-
-    pub fn attach_for(
-        &self,
-        id: &str,
-        role: dto::AttachmentRole,
-        interaction: Option<String>,
-    ) -> Result<dto::AttachResult, UiError> {
-        self.ask(|reply| Msg::Attach(id.to_string(), role, interaction, reply))?
-            .map_err(UiError::Refused)
-    }
-
-    pub fn detach(&self, id: &str) {
-        let _ = self.tx.send(Msg::Detach(id.to_string()));
-    }
-
-    pub fn act(
-        &self,
-        id: &str,
-        number: u64,
-        gate: Option<u64>,
-        action: dto::UiAction,
-    ) -> Result<dto::ActionOutcome, UiError> {
-        match self.ask(|reply| Msg::Act(id.to_string(), number, gate, action, reply)) {
-            Err(UiError::Busy) => Ok(dto::ActionOutcome::Busy),
-            other => other,
-        }
     }
 
     pub fn enqueue_attachment(
@@ -597,25 +473,6 @@ impl UiHandle {
         self.enqueue(|reply| Msg::Act(id.to_string(), number, gate, action, reply))
     }
 
-    /// Takes the attachment's one primary subscription.
-    pub fn subscribe(&self, id: &str) -> Result<Subscription, UiError> {
-        let alive = self
-            .ask(|reply| Msg::Subscribe(id.to_string(), reply))?
-            .map_err(UiError::Refused)?;
-        let mut published = self.published.clone();
-        // Marks the current value unseen so the first frame is the baseline.
-        published.mark_changed();
-        Ok(Subscription {
-            handle: self.clone(),
-            attachment: id.to_string(),
-            published,
-            sent: None,
-            known_head: None,
-            alive,
-            lease: None,
-        })
-    }
-
     pub async fn open_duplex(
         &self,
         id: &str,
@@ -631,36 +488,26 @@ impl UiHandle {
         let mut published = self.published.clone();
         published.mark_changed();
         Ok(Subscription {
-            handle: self.clone(),
-            attachment: id.to_string(),
             published,
-            sent: None,
             known_head: None,
             alive,
-            lease: Some(lease),
+            _lease: lease,
         })
     }
 }
 
-/// One attachment's push stream: the latest state, skipping what it was too
-/// slow to read. Dropping it releases the attachment.
+/// One attachment's publication stream: the latest state, skipping heads the
+/// connection was too slow to take. Dropping it releases the attachment.
 pub struct Subscription {
-    handle: UiHandle,
-    attachment: String,
     published: watch::Receiver<Arc<Published>>,
-    sent: Option<u64>,
+    /// The last head this connection fully wrote; everything after it is news.
     known_head: Option<super::publication::Head>,
     alive: watch::Receiver<bool>,
-    lease: Option<Arc<()>>,
+    /// Held for the attachment's lifetime: dropping it is the release signal.
+    _lease: Arc<()>,
 }
 
 impl Subscription {
-    pub async fn next_frame(&mut self, session_only: bool) -> Option<super::publication::Frame> {
-        let frame = self.prepare_frame(session_only).await?;
-        self.sent_frame(&frame.head);
-        Some(frame)
-    }
-
     pub async fn prepare_frame(&mut self, session_only: bool) -> Option<super::publication::Frame> {
         loop {
             if !*self.alive.borrow() {
@@ -668,7 +515,8 @@ impl Subscription {
             }
             {
                 let current = self.published.borrow_and_update();
-                if self.sent.is_none_or(|sent| current.update_id > sent) {
+                let sent = self.known_head.as_ref().map(|head| head.update_id);
+                if sent.is_none_or(|sent| current.update_id > sent) {
                     return Some(current.frame(self.known_head.as_ref(), session_only));
                 }
             }
@@ -680,16 +528,7 @@ impl Subscription {
     }
 
     pub fn sent_frame(&mut self, head: &super::publication::Head) {
-        self.sent = Some(head.update_id);
         self.known_head = Some(head.clone());
-    }
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        if self.lease.is_none() {
-            self.handle.detach(&self.attachment);
-        }
     }
 }
 
@@ -737,25 +576,49 @@ mod tests {
         })
     }
 
-    #[test]
-    fn process_demand_is_attachment_scoped_and_released_on_loss() {
+    #[tokio::test]
+    async fn process_demand_is_attachment_scoped_and_released_on_loss() {
         let service = UiService::start();
         let handle = service.handle();
-        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        handle.attach("b", dto::AttachmentRole::Sidebar).unwrap();
-        handle.demand("a", true).unwrap();
-        handle.demand("b", true).unwrap();
+        let a = handle
+            .open_duplex("a", dto::AttachmentRole::Dashboard, None)
+            .await
+            .unwrap();
+        let _b = handle
+            .open_duplex("b", dto::AttachmentRole::Sidebar, None)
+            .await
+            .unwrap();
+        handle
+            .enqueue_demand("a", true)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        handle
+            .enqueue_demand("b", true)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
         crate::testing::eventually("process demand", || {
             handle.processes.load(Ordering::SeqCst).then_some(())
         });
-        handle.detach("a");
         // The second owner remains; clearing it releases demand, not merely one
         // boolean overwritten by whichever attachment spoke last.
-        handle.demand("b", false).unwrap();
+        drop(a);
+        handle
+            .enqueue_demand("b", false)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
         crate::testing::eventually("process demand released", || {
             (!handle.processes.load(Ordering::SeqCst)).then_some(())
         });
-        assert!(handle.demand("a", true).is_err());
+        assert_eq!(
+            handle.enqueue_demand("a", true).unwrap().await.unwrap(),
+            Err(dto::RefusalCode::Unavailable)
+        );
     }
 
     #[test]
@@ -824,7 +687,10 @@ mod tests {
         let service = UiService::start();
         let handle = service.handle();
         handle.observe(snapshot());
-        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        let _attached = handle
+            .open_duplex("a", dto::AttachmentRole::Dashboard, None)
+            .await
+            .unwrap();
         let answer = handle
             .enqueue_action("a", 1, None, A::Move { delta: 1 })
             .unwrap();
@@ -855,18 +721,24 @@ mod tests {
         let service = UiService::start();
         let handle = service.handle();
         handle.observe(snapshot());
-        let attached = handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        let mut stream = handle.subscribe("a").unwrap();
-        let baseline = stream.next_frame(false).await.unwrap();
-        assert!(baseline.head.update_id >= attached.update_id);
+        let mut stream = handle
+            .open_duplex("a", dto::AttachmentRole::Dashboard, None)
+            .await
+            .unwrap();
+        let baseline = stream.prepare_frame(false).await.unwrap();
+        stream.sent_frame(&baseline.head);
         assert_eq!(baseline.content.len(), 3);
 
-        // Actions travel a different path from the stream and never wait on it.
+        // Actions travel a different path from the publication and never wait on it.
         assert!(matches!(
-            handle.act("a", 1, None, A::Move { delta: 1 }).unwrap(),
+            handle
+                .enqueue_action("a", 1, None, A::Move { delta: 1 })
+                .unwrap()
+                .await
+                .unwrap(),
             Out::Applied { .. }
         ));
-        let moved = tokio::time::timeout(Duration::from_secs(2), stream.next_frame(false))
+        let moved = tokio::time::timeout(Duration::from_secs(2), stream.prepare_frame(false))
             .await
             .expect("an update is pushed without a request")
             .unwrap();
@@ -876,73 +748,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_subscription_is_refused_and_dropping_one_releases_the_attachment() {
+    async fn losing_the_connection_releases_the_attachment_and_its_publication() {
         let service = UiService::start();
         let handle = service.handle();
-        handle.attach("a", dto::AttachmentRole::Sidebar).unwrap();
-        let stream = handle.subscribe("a").unwrap();
+        let mut stream = handle
+            .open_duplex("a", dto::AttachmentRole::Sidebar, None)
+            .await
+            .unwrap();
+        stream.prepare_frame(false).await.unwrap();
+        // The same attachment cannot be opened twice: one connection owns it.
         assert_eq!(
-            handle.subscribe("a").err(),
+            handle
+                .open_duplex("a", dto::AttachmentRole::Sidebar, None)
+                .await
+                .err(),
             Some(UiError::Refused(dto::RefusalCode::Conflict))
         );
         drop(stream);
-        crate::testing::eventually("losing the subscription detaches its attachment", || {
+        crate::testing::eventually("losing the connection detaches its attachment", || {
             (handle.attachments() == 0).then_some(())
         });
         assert_eq!(
-            handle.act("a", 1, None, A::CycleOrder).unwrap(),
-            Out::Detached
-        );
-        handle.attach("b", dto::AttachmentRole::Sidebar).unwrap();
-        let mut stream = handle.subscribe("b").unwrap();
-        stream.next_frame(false).await.unwrap();
-        handle.detach("b");
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), stream.next_frame(false))
-                .await
+            handle
+                .enqueue_action("a", 1, None, A::CycleOrder)
                 .unwrap()
-                .is_none()
+                .await
+                .unwrap(),
+            Out::Detached
         );
     }
 
-    fn create_from_picker(handle: &UiHandle, next: &mut u64) -> String {
-        let mut act = |action| {
-            *next += 1;
-            handle.act("a", *next, None, action).unwrap()
-        };
+    async fn create_from_picker(handle: &UiHandle, next: &mut u64) -> String {
+        *next += 1;
         let Out::Applied {
             interaction_id: Some(id),
             ..
-        } = act(A::RunCommand {
-            command: dto::SharedCommand::NewWorkspace,
-            row: None,
-        })
+        } = handle
+            .enqueue_action(
+                "a",
+                *next,
+                None,
+                A::RunCommand {
+                    command: dto::SharedCommand::NewWorkspace,
+                    row: None,
+                },
+            )
+            .unwrap()
+            .await
+            .unwrap()
         else {
             panic!("opens interaction")
         };
+        *next += 1;
         assert!(matches!(
-            act(A::ProvideChoices {
-                interaction_id: id.clone(),
-                choices: vec!["/project".into()],
-                note: None
-            }),
+            handle
+                .enqueue_action(
+                    "a",
+                    *next,
+                    None,
+                    A::ProvideChoices {
+                        interaction_id: id.clone(),
+                        choices: vec!["/project".into()],
+                        note: None
+                    },
+                )
+                .unwrap()
+                .await
+                .unwrap(),
             Out::Applied { .. }
         ));
+        *next += 1;
         assert!(matches!(
-            act(A::ClaimPresentation {
-                interaction_id: id.clone()
-            }),
+            handle
+                .enqueue_action(
+                    "a",
+                    *next,
+                    None,
+                    A::ClaimPresentation {
+                        interaction_id: id.clone()
+                    },
+                )
+                .unwrap()
+                .await
+                .unwrap(),
             Out::Applied { .. }
         ));
+        *next += 1;
         let Out::Applied {
             request_id: Some(request),
             ..
-        } = act(A::ResolveInteraction {
-            interaction_id: id,
-            result: dto::InteractionResult::Project {
-                path: "/project".into(),
-            },
-        })
+        } = handle
+            .enqueue_action(
+                "a",
+                *next,
+                None,
+                A::ResolveInteraction {
+                    interaction_id: id,
+                    result: dto::InteractionResult::Project {
+                        path: "/project".into(),
+                    },
+                },
+            )
+            .unwrap()
+            .await
+            .unwrap()
         else {
             panic!("returns a stable request id")
         };
@@ -952,12 +861,19 @@ mod tests {
     async fn operation(stream: &mut Subscription, id: &str, status: dto::CommandStatus) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let publication = stream.next_frame(false).await.expect("service alive");
-                let session: dto::SessionState = stream
-                    .handle
-                    .encoded_content(&publication.head.session)
-                    .unwrap()
-                    .unwrap()
+                let publication = stream.prepare_frame(false).await.expect("service alive");
+                stream.sent_frame(&publication.head);
+                let session: dto::SessionState = publication
+                    .content
+                    .iter()
+                    .find(|content| content.hash == publication.head.session)
+                    .or_else(|| {
+                        publication
+                            .content
+                            .iter()
+                            .find(|content| content.hash == publication.head.session)
+                    })
+                    .expect("session payload")
                     .read()
                     .unwrap();
                 if session
@@ -981,30 +897,31 @@ mod tests {
                 panic!("not a reconciliation")
             };
             let _ = held.recv();
-            dto::CommandOutcome {
-                request_id: job.request_id,
-                status: dto::CommandStatus::Completed,
-                answer: None,
-            }
+            dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::Completed)
         })));
         let handle = service.handle();
-        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        let mut stream = handle.subscribe("a").unwrap();
+        let mut stream = handle
+            .open_duplex("a", dto::AttachmentRole::Dashboard, None)
+            .await
+            .unwrap();
         let mut next = 0;
         let mut last = String::new();
         for _ in 0..10 {
-            last = create_from_picker(&handle, &mut next);
+            last = create_from_picker(&handle, &mut next).await;
         }
         operation(&mut stream, &last, dto::CommandStatus::DispatchRefused).await;
         assert!(stream.published.borrow().state.blocking.is_none());
         drop(release); // releases the held worker without leaving a test thread behind
+        drop(stream);
         drop(service);
 
         let service = UiService::start();
         let handle = service.handle();
-        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        let mut stream = handle.subscribe("a").unwrap();
-        let request = create_from_picker(&handle, &mut 0);
+        let mut stream = handle
+            .open_duplex("a", dto::AttachmentRole::Dashboard, None)
+            .await
+            .unwrap();
+        let request = create_from_picker(&handle, &mut 0).await;
         operation(&mut stream, &request, dto::CommandStatus::DispatchRefused).await;
     }
 
@@ -1018,16 +935,18 @@ mod tests {
                 let _ = job;
                 panic!("worker completion lost after possible admission");
             }
-            Effect::Reconcile(id) => dto::CommandOutcome {
-                request_id: id,
-                status: dto::CommandStatus::Completed,
-                answer: Some(serde_json::json!({"recorded": true})),
-            },
+            Effect::Reconcile(id) => dto::CommandOutcome::answering(
+                &id,
+                dto::CommandStatus::Completed,
+                serde_json::json!({"recorded": true}),
+            ),
         })));
         let handle = service.handle();
-        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        let mut stream = handle.subscribe("a").unwrap();
-        let request = create_from_picker(&handle, &mut 0);
+        let mut stream = handle
+            .open_duplex("a", dto::AttachmentRole::Dashboard, None)
+            .await
+            .unwrap();
+        let request = create_from_picker(&handle, &mut 0).await;
         operation(
             &mut stream,
             &request,

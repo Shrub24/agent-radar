@@ -3,16 +3,24 @@ use crate::control_plane::public_contracts::ui_session::{InteractionStage, UiAct
 use crate::ui_session::client::Wake;
 use crate::{App, config::TuiConfig};
 use std::process::ExitStatus;
-
-type PopupExit = (String, Result<ExitStatus, String>);
 use std::sync::mpsc;
 
 #[derive(Default)]
 pub struct Presentation {
-    preparing: Option<String>,
-    prepared: Option<mpsc::Receiver<(String, crate::project::Candidates)>>,
-    hosted: Option<String>,
-    popup: Option<mpsc::Receiver<PopupExit>>,
+    current: Option<LocalWork>,
+}
+
+struct LocalWork {
+    interaction_id: String,
+    progress: Progress,
+}
+
+enum Progress {
+    New,
+    Discovering(mpsc::Receiver<crate::project::Candidates>),
+    ChoicesProvided,
+    Hosting(mpsc::Receiver<Result<ExitStatus, String>>),
+    Presented,
 }
 
 impl Presentation {
@@ -20,50 +28,62 @@ impl Presentation {
         let Some(mirror) = app.session_mirror() else {
             return false;
         };
-        let blocking = mirror.state.blocking.as_ref();
-        if let Some(rx) = &self.popup
-            && let Ok((id, status)) = rx.try_recv()
-        {
-            if blocking.is_some_and(|b| b.interaction_id == id) {
-                app.submit_session(UiAction::PresentationFailed {
-                    interaction_id: id,
-                    message: match status {
-                        Ok(status) => format!("popup closed before resolution ({status})"),
-                        Err(error) => error,
-                    },
-                });
-            }
-            self.popup = None;
-        }
-        if let Some(rx) = &self.prepared
-            && let Ok((id, found)) = rx.try_recv()
-        {
-            if blocking.is_some_and(|b| b.interaction_id == id) {
-                app.submit_session(UiAction::ProvideChoices {
-                    interaction_id: id,
-                    choices: found
-                        .directories
-                        .into_iter()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect(),
-                    note: found.note,
-                });
-            }
-            self.prepared = None;
-            return true;
-        }
-        let Some(b) = blocking.filter(|b| b.owner == mirror.attachment_id) else {
+        let Some(blocking) = mirror
+            .state
+            .blocking
+            .as_ref()
+            .filter(|b| b.owner == mirror.attachment_id)
+        else {
+            self.current = None;
             return false;
         };
-        if b.stage == InteractionStage::Preparing
-            && self.preparing.as_deref() != Some(&b.interaction_id)
+        if self
+            .current
+            .as_ref()
+            .is_none_or(|work| work.interaction_id != blocking.interaction_id)
         {
-            self.preparing = Some(b.interaction_id.clone());
-            let id = b.interaction_id.clone();
+            self.current = Some(LocalWork {
+                interaction_id: blocking.interaction_id.clone(),
+                progress: Progress::New,
+            });
+        }
+        let work = self.current.as_mut().expect("current interaction");
+        match &work.progress {
+            Progress::Discovering(rx) => {
+                if let Ok(found) = rx.try_recv() {
+                    app.submit_session(UiAction::ProvideChoices {
+                        interaction_id: work.interaction_id.clone(),
+                        choices: found
+                            .directories
+                            .into_iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect(),
+                        note: found.note,
+                    });
+                    work.progress = Progress::ChoicesProvided;
+                    return true;
+                }
+            }
+            Progress::Hosting(rx) => {
+                if let Ok(status) = rx.try_recv() {
+                    app.submit_session(UiAction::PresentationFailed {
+                        interaction_id: work.interaction_id.clone(),
+                        message: match status {
+                            Ok(status) => format!("popup closed before resolution ({status})"),
+                            Err(error) => error,
+                        },
+                    });
+                    work.progress = Progress::Presented;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        if blocking.stage == InteractionStage::Preparing && matches!(work.progress, Progress::New) {
             let config = config.clone();
             let wake = wake.clone();
             let (tx, rx) = mpsc::channel();
-            self.prepared = Some(rx);
+            work.progress = Progress::Discovering(rx);
             std::thread::spawn(move || {
                 let base = config
                     .project_base
@@ -74,21 +94,21 @@ impl Presentation {
                     config.project_filter,
                     &base,
                 );
-                let _ = tx.send((id, found));
+                let _ = tx.send(found);
                 wake.notify();
             });
         }
-        if b.stage == InteractionStage::AwaitingResult
-            && self.hosted.as_deref() != Some(&b.interaction_id)
+        if blocking.stage == InteractionStage::AwaitingResult
+            && matches!(work.progress, Progress::New | Progress::ChoicesProvided)
         {
-            self.hosted = Some(b.interaction_id.clone());
+            work.progress = Progress::Presented;
             if detached {
                 let result = std::env::current_exe()
                     .map_err(|e| e.to_string())
                     .and_then(|exe| {
                         crate::workspace::presenter_command(
                             &exe.to_string_lossy(),
-                            &b.interaction_id,
+                            &work.interaction_id,
                         )
                         .ok_or_else(|| "workspace popup host is unavailable".to_string())
                     })
@@ -101,25 +121,23 @@ impl Presentation {
                 match result {
                     Ok(mut child) => {
                         let (tx, rx) = mpsc::channel();
-                        self.popup = Some(rx);
-                        let id = b.interaction_id.clone();
+                        work.progress = Progress::Hosting(rx);
                         let wake = wake.clone();
                         std::thread::spawn(move || {
-                            let _ = tx.send((id, child.wait().map_err(|error| error.to_string())));
+                            let _ = tx.send(child.wait().map_err(|error| error.to_string()));
                             wake.notify();
                         });
                     }
                     Err(message) => {
                         app.submit_session(UiAction::PresentationFailed {
-                            interaction_id: b.interaction_id.clone(),
+                            interaction_id: work.interaction_id.clone(),
                             message,
                         });
-                        return true;
                     }
                 }
             } else {
                 app.submit_session(UiAction::ClaimPresentation {
-                    interaction_id: b.interaction_id.clone(),
+                    interaction_id: work.interaction_id.clone(),
                 });
             }
             return true;

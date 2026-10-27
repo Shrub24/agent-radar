@@ -64,7 +64,7 @@
 
 ## U
 
-- [ui-session.md](ui-session.md) — shared UI ownership, presenters, filtering, content identity, ordering, latency, inspection and host choices
+- [ui-session.md](ui-session.md) — shared UI ownership, presenters, filtering, content identity, ordering, latency, inspection, host choices, the duplex attachment transport and connection admission
 
 ## V
 

@@ -27,8 +27,44 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// A UI client needs a runtime that keeps its connection tasks running; a test
+/// thread polling `poll()` is not one.
+fn ui_session(
+    path: &Path,
+    role: AttachmentRole,
+) -> (
+    tokio::runtime::Runtime,
+    agent_radar::ui_session::client::UiClient,
+) {
+    ui_session_with(path, role, agent_radar::ui_session::client::Wake::default())
+}
+
+/// The same client, on a wake the caller also waits on.
+fn ui_session_with(
+    path: &Path,
+    role: AttachmentRole,
+    wake: agent_radar::ui_session::client::Wake,
+) -> (
+    tokio::runtime::Runtime,
+    agent_radar::ui_session::client::UiClient,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a client runtime");
+    let client = agent_radar::ui_session::client::UiClient::start(
+        runtime.handle(),
+        path.to_path_buf(),
+        role,
+        wake,
+    );
+    (runtime, client)
+}
+
 use agent_radar::Daemon;
 use agent_radar::control_plane::ops::Operation;
+use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
 use agent_radar::control_plane::registry::{MAX_LISTED, ProcessVerifier};
 use agent_radar::control_plane::{
     Category, DaemonRuntime, Derived, MAX_LINE_BYTES, MAX_VERIFICATION_JOBS, PROTOCOL_VERSION,
@@ -47,6 +83,7 @@ use agent_radar::runtime::{
     PaneExitObservation, Primitives, ReportOutcome, ReportRequest, ReportedState, RuntimeProvider,
     SplitDirection, StateReport, Target,
 };
+use agent_radar::ui_session::publication as wire;
 use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
 use serde_json::{Value, json};
 
@@ -2888,10 +2925,14 @@ fn observation_refuses_without_a_backend_instead_of_publishing_an_empty_fleet() 
     daemon.stop();
 }
 
-/// One connection, one line at a time.
+/// One connection: JSON lines, or one duplex attachment once `ui.open` has
+/// switched it to frames.
 struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// Requests sent on the duplex connection, so replies can be correlated.
+    next_request: u64,
+    duplex: bool,
 }
 
 impl Client {
@@ -2904,6 +2945,8 @@ impl Client {
         Self {
             reader: BufReader::new(stream),
             writer,
+            next_request: 1,
+            duplex: false,
         }
     }
 
@@ -2928,18 +2971,92 @@ impl Client {
     }
 
     fn call(&mut self, method: &str, params: Value) -> Value {
-        if matches!(method, "ui.attach" | "ui.action" | "ui.detach") {
-            return ui_call(
-                self.writer.peer_addr().unwrap().as_pathname().unwrap(),
-                method,
-                params,
-            );
+        match method {
+            "ui.attach" => self.attach(params),
+            "ui.action" => self.ui(wire::DuplexOperation::Action {
+                action_id: params["action_id"].as_u64().expect("an action number"),
+                gate: params.get("gate").and_then(Value::as_u64),
+                action: serde_json::from_value(params["action"].clone()).expect("an action"),
+            }),
+            // The connection is the attachment: dropping it releases.
+            "ui.detach" => json!({"result": {}}),
+            // Publications arrive on the attachment's own connection.
+            "ui.subscribe" => json!({"result": {}}),
+            _ => {
+                let id = random_uuid();
+                self.call_id(&id, method, params)
+            }
         }
-        if method == "ui.subscribe" {
-            return self.call("ui.open", json!({"role": "subscribe", "attachment_id": params["attachment_id"], "session_only": false}));
-        }
+    }
+
+    /// Opens the connection as one duplex attachment.
+    fn attach(&mut self, params: Value) -> Value {
+        let attachment = params["attachment_id"]
+            .as_str()
+            .expect("an attachment")
+            .to_string();
+        let role: AttachmentRole =
+            serde_json::from_value(params["role"].clone()).unwrap_or(AttachmentRole::Dashboard);
+        let interaction = params
+            .get("interaction_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let opener = json!({
+            "attachment_id": attachment,
+            "role": role,
+            "interaction_id": interaction,
+        });
         let id = random_uuid();
-        self.call_id(&id, method, params)
+        self.send(&request_line(&id, "ui.open", opener));
+        let answer = self.read();
+        if answer.get("result").is_some() {
+            self.duplex = true;
+        }
+        if answer.get("result").is_some() {
+            json!({"result": {"attachment_id": params["attachment_id"]}})
+        } else {
+            answer
+        }
+    }
+
+    /// Sends one duplex request and waits for the reply carrying its id.
+    fn ui(&mut self, operation: wire::DuplexOperation) -> Value {
+        assert!(self.duplex, "the connection is not a duplex attachment");
+        let id = self.next_request;
+        self.next_request += 1;
+        agent_radar::content::write_frame(
+            &mut self.writer,
+            &wire::DuplexRequest {
+                id,
+                request: operation,
+            },
+        )
+        .expect("write a request");
+        loop {
+            let frame: wire::DuplexFrame =
+                agent_radar::content::read_frame(&mut self.reader).expect("read a frame");
+            match frame.metadata {
+                wire::DuplexMetadata::Publication { .. } => continue,
+                wire::DuplexMetadata::Reply { id: got, reply } if got == id => {
+                    return match reply {
+                        wire::DuplexReply::Action { outcome } => {
+                            json!({"result": outcome})
+                        }
+                        wire::DuplexReply::Refused { code, message } => {
+                            json!({"error": {"code": code, "message": message}})
+                        }
+                        wire::DuplexReply::Content { hash } => {
+                            json!({"result": {"content": {"hash": hash}}})
+                        }
+                        wire::DuplexReply::Expired { .. } => {
+                            json!({"error": {"code": "content_expired", "message": "expired"}})
+                        }
+                        wire::DuplexReply::Demand => json!({"result": {}}),
+                    };
+                }
+                wire::DuplexMetadata::Reply { .. } => continue,
+            }
+        }
     }
 
     /// The first snapshot this daemon publishes, asking until it has one.
@@ -2967,26 +3084,6 @@ impl Client {
     fn call_id(&mut self, id: &str, method: &str, params: Value) -> Value {
         self.send(&request_line(id, method, params));
         self.read()
-    }
-}
-
-// UI-specific test adapter: the production path is the same framed protocol,
-// not JSON RPC aliases. Each isolated test request has a bounded connection.
-fn ui_call(path: &Path, method: &str, mut params: Value) -> Value {
-    use agent_radar::{content, ui_session::publication as wire};
-    let mut client = Client::dial(path);
-    let opened = client.call("ui.open", json!({"role": "actions"}));
-    assert!(opened["result"].is_object(), "{opened}");
-    params["request"] = json!(method.strip_prefix("ui.").unwrap());
-    let request: wire::Request = serde_json::from_value(params.clone()).unwrap();
-    content::write_frame(&mut client.writer, &request).unwrap();
-    match content::read_frame::<_, wire::Reply>(&mut client.reader).unwrap() {
-        wire::Reply::Attached => json!({"result": {"attachment_id": params["attachment_id"]}}),
-        wire::Reply::Action { outcome } => json!({"result": outcome}),
-        wire::Reply::Refused { code, message } => {
-            json!({"error": {"code": code, "message": message}})
-        }
-        other => panic!("unexpected UI response: {other:?}"),
     }
 }
 
@@ -12439,7 +12536,7 @@ fn wait_for_text(path: &Path) -> String {
 #[ignore = "release-build key-handler to in-memory-frame latency measurement"]
 fn unified_publication_latency_probe() {
     use agent_radar::control_plane::public_contracts::ui_session as dto;
-    use agent_radar::ui_session::client::{UiClient, Wake};
+    use agent_radar::ui_session::client::Wake;
     use agent_radar::{App, content, ui};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, widgets::ListState};
@@ -12485,11 +12582,8 @@ fn unified_publication_latency_probe() {
         })
     };
     // Establish canonical all-pane visibility before attaching the measured App.
-    let setup = UiClient::start(
-        daemon.path().to_path_buf(),
-        dto::AttachmentRole::Dashboard,
-        wake.clone(),
-    );
+    let (setup_runtime, setup) =
+        ui_session_with(daemon.path(), dto::AttachmentRole::Dashboard, wake.clone());
     loop {
         if let Some(view) = setup.poll() {
             if view.state.pane_view == dto::PaneViewDto::All {
@@ -12500,12 +12594,11 @@ fn unified_publication_latency_probe() {
         wait();
     }
     drop(setup);
+    drop(setup_runtime);
     let mut app = App::new();
-    app.attach_session(UiClient::start(
-        daemon.path().to_path_buf(),
-        dto::AttachmentRole::Dashboard,
-        wake.clone(),
-    ));
+    let (_runtime, client) =
+        ui_session_with(daemon.path(), dto::AttachmentRole::Dashboard, wake.clone());
+    app.attach_session(client);
     loop {
         app.apply_session_update();
         if app.session_mirror().is_some_and(|m| m.rows.len() == 744) {
@@ -12535,9 +12628,11 @@ fn unified_publication_latency_probe() {
         gate: mirror.state.gate,
         diagnostic: None,
     };
-    let parts =
-        content::content_frame(&head, &[observation.clone(), tree.clone(), session.clone()])
-            .unwrap();
+    let parts = content::content_frame(
+        &dto::DuplexMetadata::Publication { head },
+        &[observation.clone(), tree.clone(), session.clone()],
+    )
+    .unwrap();
     let frame_bytes: usize = parts.0.iter().map(|p| p.len()).sum();
     let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
     let mut list = ListState::default();
@@ -12583,7 +12678,7 @@ fn unified_publication_latency_probe() {
 #[test]
 fn a_stalled_binary_subscriber_is_closed_without_blocking_another_view() {
     use agent_radar::control_plane::public_contracts::ui_session as dto;
-    use agent_radar::ui_session::client::{UiClient, Wake};
+
     let sandbox = Sandbox::new("ui-slow-reader");
     let (mut inventory, _) = populated_graph();
     inventory.workspaces[0].label = Some("large workspace ".repeat(32 * 1024));
@@ -12598,11 +12693,7 @@ fn a_stalled_binary_subscriber_is_closed_without_blocking_another_view() {
     let accepted = slow.call("ui.subscribe", json!({"attachment_id":attachment}));
     assert!(accepted["result"].is_object(), "{accepted}");
     // Do not read any of its binary frames.
-    let fast = UiClient::start(
-        daemon.path().to_path_buf(),
-        dto::AttachmentRole::Dashboard,
-        Wake::default(),
-    );
+    let (_fast_runtime, fast) = ui_session(daemon.path(), dto::AttachmentRole::Dashboard);
     let deadline = Instant::now() + RECONNECT_DEADLINE;
     loop {
         if let Some(view) = fast.poll()
@@ -12629,17 +12720,17 @@ fn a_stalled_binary_subscriber_is_closed_without_blocking_another_view() {
         );
         thread::sleep(Duration::from_millis(10));
     }
-    let mut reader = Client::dial(daemon.path());
-    let mut number = 0;
+    // The stalled writer's connection was closed, so its attachment is free
+    // again: the same id can be attached where it could not be while held.
     loop {
-        number += 1;
-        let reply = reader.call("ui.action", json!({"attachment_id":attachment,"action_id":number,"gate":0,"action":{"action":"move","delta":0}}));
-        if reply["result"]["outcome"] == "detached" {
+        let mut retry = Client::dial(daemon.path());
+        let answer = retry.attach(json!({"attachment_id": attachment, "role": "sidebar"}));
+        if answer["result"].is_object() {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "stalled writer did not release its attachment: {reply}"
+            "stalled writer did not release its attachment: {answer}"
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -12650,7 +12741,7 @@ fn a_stalled_binary_subscriber_is_closed_without_blocking_another_view() {
 #[test]
 fn an_oversized_tui_observation_is_explicit_without_a_reconnect_loop() {
     use agent_radar::control_plane::public_contracts::ui_session as dto;
-    use agent_radar::ui_session::client::{UiClient, Wake};
+
     let sandbox = Sandbox::new("ui-oversized");
     let (mut inventory, _) = populated_graph();
     inventory.workspaces[0].label = Some("x".repeat(agent_radar::content::MAX_PAYLOAD));
@@ -12658,11 +12749,7 @@ fn an_oversized_tui_observation_is_explicit_without_a_reconnect_loop() {
         inventory,
         FocusAnswer::Completed,
     )));
-    let client = UiClient::start(
-        daemon.path().to_path_buf(),
-        dto::AttachmentRole::Dashboard,
-        Wake::default(),
-    );
+    let (_runtime, client) = ui_session(daemon.path(), dto::AttachmentRole::Dashboard);
     let deadline = Instant::now() + RECONNECT_DEADLINE;
     let attachment = loop {
         if let Some(view) = client.poll()
@@ -12705,9 +12792,10 @@ fn an_oversized_tui_observation_is_explicit_without_a_reconnect_loop() {
     daemon.stop();
 }
 
-/// Baseline, push, independent actions and release over the real binary socket.
+/// Baseline, push, correlated action and release over the real binary socket:
+/// one connection carries the attachment in both directions.
 #[test]
-fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
+fn a_ui_connection_pushes_state_and_its_loss_releases_the_attachment() {
     let sandbox = Sandbox::new("ui-subscribe");
     let mut daemon = sandbox.daemon();
     let mut client = Client::dial(daemon.path());
@@ -12722,15 +12810,8 @@ fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
             .any(|contract| contract == "ui.session.v1"),
         "{ping}"
     );
-    let attached = client.call(
-        "ui.attach",
-        json!({"attachment_id": attachment, "role": "dashboard"}),
-    );
-    assert_eq!(
-        attached["result"]["attachment_id"], attachment,
-        "{attached}"
-    );
 
+    // The opener switches this connection to frames and takes the attachment.
     let mut stream = UnixStream::connect(daemon.path()).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -12741,76 +12822,137 @@ fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
         request_line(
             &random_uuid(),
             "ui.open",
-            json!({"role":"subscribe", "attachment_id": attachment, "session_only": false})
+            json!({"attachment_id": attachment, "role": "dashboard", "interaction_id": null})
         )
     )
-    .expect("subscribe");
+    .expect("open");
     let mut frames = BufReader::new(stream.try_clone().expect("clone"));
     let mut accepted = String::new();
     frames.read_line(&mut accepted).expect("opening answer");
-    assert!(serde_json::from_str::<Value>(&accepted).unwrap()["result"].is_object());
-    let mut next = || -> agent_radar::ui_session::publication::Frame {
+    assert!(
+        serde_json::from_str::<Value>(&accepted).unwrap()["result"].is_object(),
+        "{accepted}"
+    );
+
+    let mut next = || -> wire::DuplexFrame {
         agent_radar::content::read_frame(&mut frames).expect("a complete binary head")
     };
+    let head = |frame: &wire::DuplexFrame| match &frame.metadata {
+        wire::DuplexMetadata::Publication { head } => head.clone(),
+        wire::DuplexMetadata::Reply { .. } => panic!("expected a publication"),
+    };
+    let session_of = |frame: &wire::DuplexFrame| {
+        let head = match &frame.metadata {
+            wire::DuplexMetadata::Publication { head } => head,
+            wire::DuplexMetadata::Reply { .. } => panic!("expected a publication"),
+        };
+        frame
+            .content
+            .iter()
+            .find(|content| content.hash == head.session)
+            .expect("session payload")
+            .read::<agent_radar::control_plane::public_contracts::ui_session::SessionState>()
+            .unwrap()
+    };
+
     let baseline = next();
-    let before = baseline.head.update_id;
-    let session: agent_radar::control_plane::public_contracts::ui_session::SessionState = baseline
-        .content
-        .iter()
-        .find(|c| c.hash == baseline.head.session)
-        .unwrap()
-        .read()
-        .unwrap();
+    let before = head(&baseline).update_id;
     assert_eq!(
-        session.order,
+        session_of(&baseline).order,
         agent_radar::control_plane::public_contracts::ui_session::RowOrderDto::Source
     );
 
-    // Missing provenance is rejected before allocating an action number.
-    let unstamped = client.call(
-        "ui.action",
-        json!({"attachment_id": attachment, "action_id": 1, "action": {"action": "cycle_order"}}),
-    );
-    assert_eq!(error_code(&unstamped), "bad_params", "{unstamped}");
-    // The action travels the other connection while the stream sits idle.
-    let moved = client.call(
-        "ui.action",
-        json!({"attachment_id": attachment, "action_id": 1, "gate": 0, "action": {"action": "cycle_order"}}),
-    );
-    assert_eq!(moved["result"]["outcome"], "applied", "{moved}");
-    let pushed = next();
-    assert!(pushed.head.update_id > before);
-    let session: agent_radar::control_plane::public_contracts::ui_session::SessionState = pushed
-        .content
-        .iter()
-        .find(|c| c.hash == pushed.head.session)
-        .unwrap()
-        .read()
-        .unwrap();
+    // An action answered on the same connection is published for it.
+    let unnumbered =
+        json!({"attachment_id": attachment, "action_id": 1, "action": {"action": "cycle_order"}});
+    agent_radar::content::write_frame(
+        &mut stream,
+        &wire::DuplexRequest {
+            id: 1,
+            request: serde_json::from_value(json!({
+                "kind": "action", "action_id": 1, "gate": null, "action": {"action": "cycle_order"}
+            }))
+            .unwrap(),
+        },
+    )
+    .expect("write");
+    let unstamped = next();
+    match &unstamped.metadata {
+        // Refused before an action number is consumed, so the number stays free.
+        wire::DuplexMetadata::Reply { reply, .. } => match reply {
+            wire::DuplexReply::Refused { code, .. } => {
+                assert_eq!(
+                    *code,
+                    agent_radar::control_plane::protocol::Code::BadParams,
+                    "{unnumbered}"
+                )
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        },
+        _ => panic!("expected a reply"),
+    }
+
+    agent_radar::content::write_frame(
+        &mut stream,
+        &wire::DuplexRequest {
+            id: 2,
+            request: serde_json::from_value(json!({
+                "kind": "action", "action_id": 1, "gate": 0, "action": {"action": "cycle_order"}
+            }))
+            .unwrap(),
+        },
+    )
+    .expect("write");
+    let mut ordered = None;
+    let mut pushed = None;
+    for _ in 0..4 {
+        let frame = next();
+        match &frame.metadata {
+            wire::DuplexMetadata::Reply { .. } => ordered = Some(frame),
+            wire::DuplexMetadata::Publication { .. } => pushed = Some(frame),
+        }
+        if ordered.is_some() && pushed.is_some() {
+            break;
+        }
+    }
+    let ordered = ordered.expect("the action was answered on this connection");
+    match &ordered.metadata {
+        wire::DuplexMetadata::Reply { reply, .. } => match reply {
+            wire::DuplexReply::Action { outcome } => assert_eq!(
+                serde_json::to_value(outcome).unwrap()["outcome"],
+                "applied",
+                "{outcome:?}"
+            ),
+            other => panic!("unexpected reply: {other:?}"),
+        },
+        _ => unreachable!(),
+    }
+    let pushed = pushed.expect("the applied action was published");
+    assert!(head(&pushed).update_id > before);
     assert_eq!(
-        session.order,
+        session_of(&pushed).order,
         agent_radar::control_plane::public_contracts::ui_session::RowOrderDto::State
     );
 
-    // A second primary subscription is refused rather than replacing the first.
+    // One connection owns an attachment: a second opener for the same id is
+    // refused rather than replacing it.
     let mut second = Client::dial(daemon.path());
-    let refused = second.call("ui.subscribe", json!({"attachment_id": attachment}));
+    let refused = second.attach(json!({"attachment_id": attachment, "role": "dashboard"}));
     assert_eq!(error_code(&refused), "refused", "{refused}");
 
+    // Losing the connection releases the attachment, and the id is usable again.
     drop(frames);
     drop(stream);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let outcome = client.call(
-            "ui.action",
-            json!({"attachment_id": attachment, "action_id": 2, "gate": 0, "action": {"action": "cycle_order"}}),
-        );
-        if outcome["result"]["outcome"] == "detached" {
+        let mut retry = Client::dial(daemon.path());
+        let answer = retry.attach(json!({"attachment_id": attachment, "role": "dashboard"}));
+        if answer["result"].is_object() {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the attachment outlived its stream: {outcome}"
+            "the attachment outlived its connection: {answer}"
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -12823,15 +12965,11 @@ fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
 #[test]
 fn the_ui_client_attaches_acts_and_reattaches_after_the_daemon_restarts() {
     use agent_radar::control_plane::public_contracts::ui_session as dto;
-    use agent_radar::ui_session::client::{UiClient, Wake};
+    use agent_radar::ui_session::client::UiClient;
 
     let sandbox = Sandbox::new("ui-client");
     let mut daemon = sandbox.daemon();
-    let client = UiClient::start(
-        daemon.path().to_path_buf(),
-        dto::AttachmentRole::Dashboard,
-        Wake::default(),
-    );
+    let (_runtime, client) = ui_session(daemon.path(), dto::AttachmentRole::Dashboard);
     let wait = |client: &UiClient, want: &dyn Fn(&dto::SessionState) -> bool| {
         // A daemon restart costs a boot and an attach backoff on top of the
         // attach itself; the budget is for reconnecting, not for speed.
@@ -12889,7 +13027,7 @@ fn the_ui_client_attaches_acts_and_reattaches_after_the_daemon_restarts() {
 #[test]
 fn two_views_share_navigation_and_one_filter_editor() {
     use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
-    use agent_radar::ui_session::client::{UiClient, Wake};
+
     use agent_radar::{App, PaneView};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -12897,15 +13035,12 @@ fn two_views_share_navigation_and_one_filter_editor() {
     let mut daemon = sandbox.daemon();
     let view = |role| {
         let mut app = App::new();
-        app.attach_session(UiClient::start(
-            daemon.path().to_path_buf(),
-            role,
-            Wake::default(),
-        ));
-        app
+        let (runtime, client) = ui_session(daemon.path(), role);
+        app.attach_session(client);
+        (runtime, app)
     };
-    let mut dashboard = view(AttachmentRole::Dashboard);
-    let mut sidebar = view(AttachmentRole::Sidebar);
+    let (_dashboard_runtime, mut dashboard) = view(AttachmentRole::Dashboard);
+    let (_sidebar_runtime, mut sidebar) = view(AttachmentRole::Sidebar);
     let key = |app: &mut App, code| {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
     };
@@ -12949,64 +13084,56 @@ fn two_views_share_navigation_and_one_filter_editor() {
         sidebar.filter_query() == "ab"
     });
     assert_eq!(dashboard.filter_query(), "ab");
+    let attachment = sidebar.session_mirror().unwrap().attachment_id.clone();
+    for _ in 0..2 {
+        sidebar.cycle_panes();
+        let wanted = sidebar.pane_view();
+        until("valid navigation after a refused edit", &mut || {
+            dashboard.apply_session_update();
+            sidebar.apply_session_update();
+            dashboard.pane_view() == wanted
+        });
+        assert_eq!(sidebar.session_mirror().unwrap().attachment_id, attachment);
+    }
     drop((dashboard, sidebar));
     daemon.stop();
 }
 
-/// The subscription bound is explicit: past it a subscription is refused `busy`,
-/// and releasing one makes room again.
+/// The attachment bound is explicit: past it an opener is refused `busy`, and
+/// releasing one makes room again. A presenter that names an interaction draws
+/// on its own reserved capacity instead of competing with dashboards.
 #[test]
-fn ui_subscriptions_are_bounded_and_a_released_slot_is_reusable() {
+fn ui_attachments_are_bounded_and_a_released_slot_is_reusable() {
     let sandbox = Sandbox::new("ui-capacity");
     let mut daemon = sandbox.daemon();
-    let mut client = Client::dial(daemon.path());
-    let subscribe = |attachment: &str| -> UnixStream {
-        let mut stream = UnixStream::connect(daemon.path()).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
-        writeln!(
-            stream,
-            "{}",
-            request_line(
-                &random_uuid(),
-                "ui.open",
-                json!({"role":"subscribe", "attachment_id": attachment, "session_only": false})
-            )
-        )
-        .expect("subscribe");
-        stream
-    };
-    let first_line = |stream: &UnixStream| -> Value {
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().expect("clone"))
-            .read_line(&mut line)
-            .expect("an answer");
-        serde_json::from_str(&line).expect("one JSON line")
-    };
     let mut open = Vec::new();
     for _ in 0..16 {
+        let mut client = Client::dial(daemon.path());
         let attachment = random_uuid();
-        client.call(
-            "ui.attach",
-            json!({"attachment_id": attachment, "role": "sidebar"}),
-        );
-        let stream = subscribe(&attachment);
-        assert!(first_line(&stream)["result"].is_object());
-        open.push(stream);
+        let attached = client.attach(json!({"attachment_id": attachment, "role": "sidebar"}));
+        assert!(attached["result"].is_object(), "{attached}");
+        open.push(client);
     }
-    let extra = random_uuid();
-    client.call(
-        "ui.attach",
-        json!({"attachment_id": extra, "role": "sidebar"}),
-    );
-    let refused = first_line(&subscribe(&extra));
+    let mut extra = Client::dial(daemon.path());
+    let refused = extra.attach(json!({"attachment_id": random_uuid(), "role": "sidebar"}));
     assert_eq!(error_code(&refused), "busy", "{refused}");
+
+    // The reserved class is reachable at full attachment capacity, and the actor
+    // still decides the claim: an interaction that does not exist is refused
+    // rather than reported as a capacity problem.
+    let mut presenter = Client::dial(daemon.path());
+    let claim = presenter.attach(json!({
+        "attachment_id": random_uuid(),
+        "role": "presenter",
+        "interaction_id": random_uuid(),
+    }));
+    assert_eq!(error_code(&claim), "refused", "{claim}");
 
     drop(open.pop());
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let answer = first_line(&subscribe(&extra));
+        let mut retry = Client::dial(daemon.path());
+        let answer = retry.attach(json!({"attachment_id": random_uuid(), "role": "sidebar"}));
         if answer["result"].is_object() {
             break;
         }
@@ -13078,11 +13205,7 @@ fn a_claimed_ui_project_result_survives_its_origin_and_admits_one_workspace() {
         .as_str()
         .expect("stable domain request id");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let reader = agent_radar::ui_session::client::UiClient::start(
-        daemon.path().to_path_buf(),
-        agent_radar::control_plane::public_contracts::ui_session::AttachmentRole::Dashboard,
-        agent_radar::ui_session::client::Wake::default(),
-    );
+    let (_reader_runtime, reader) = ui_session(daemon.path(), AttachmentRole::Dashboard);
     loop {
         if let Some(view) = reader.poll()
             && view.state.operation.as_ref().is_some_and(|op| op.request_id == request && op.status == agent_radar::control_plane::public_contracts::ui_session::CommandStatus::Completed)
@@ -13110,10 +13233,7 @@ fn a_claimed_ui_project_result_survives_its_origin_and_admits_one_workspace() {
 #[test]
 fn the_inline_project_picker_creates_through_the_session_and_can_be_cancelled_remotely() {
     use agent_radar::control_plane::public_contracts::ui_session::{AttachmentRole, UiAction};
-    use agent_radar::ui_session::{
-        client::{UiClient, Wake},
-        presentation::Presentation,
-    };
+    use agent_radar::ui_session::{client::Wake, presentation::Presentation};
     use agent_radar::{App, config::TuiConfig};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let sandbox = Sandbox::new("ui-inline-project");
@@ -13125,11 +13245,8 @@ fn the_inline_project_picker_creates_through_the_session_and_can_be_cancelled_re
     let mut daemon = sandbox.daemon_with(backend.clone());
     let wake = Wake::default();
     let mut app = App::new();
-    app.attach_session(UiClient::start(
-        daemon.path().into(),
-        AttachmentRole::Dashboard,
-        wake.clone(),
-    ));
+    let (_runtime, client) = ui_session(daemon.path(), AttachmentRole::Dashboard);
+    app.attach_session(client);
     let mut host = Presentation::default();
     let config = TuiConfig {
         project_source: Some(vec![
@@ -13232,7 +13349,17 @@ fn losing_a_detached_presenters_primary_stream_releases_the_shared_gate() {
             "action": {"action": "provide_choices", "interaction_id": id, "choices": ["/tmp"]}
         }),
     );
-    let popup = UiClient::presenter(daemon.path().into(), id, Wake::default());
+    let popup_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a presenter runtime");
+    let popup = UiClient::presenter(
+        popup_runtime.handle(),
+        daemon.path().into(),
+        id,
+        Wake::default(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if popup.poll().is_some_and(|m| {
@@ -13248,11 +13375,7 @@ fn losing_a_detached_presenters_primary_stream_releases_the_shared_gate() {
     }
     drop(popup); // EOF on its dedicated primary subscription, not ui.detach
     let deadline = Instant::now() + Duration::from_secs(5);
-    let observer = UiClient::start(
-        daemon.path().into(),
-        agent_radar::control_plane::public_contracts::ui_session::AttachmentRole::Dashboard,
-        Wake::default(),
-    );
+    let (_observer_runtime, observer) = ui_session(daemon.path(), AttachmentRole::Dashboard);
     loop {
         assert!(Instant::now() < deadline, "presenter loss wedged the gate");
         let view = observer.poll();
