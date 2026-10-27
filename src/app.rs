@@ -423,6 +423,7 @@ pub fn sidebar_collapsed(width: u16) -> bool {
 struct SessionLink {
     client: UiClient,
     mirror: Option<std::sync::Arc<crate::ui_session::client::Mirror>>,
+    connected: bool,
 }
 
 impl std::fmt::Debug for SessionLink {
@@ -653,8 +654,8 @@ impl App {
     ///
     /// Fold state is kept for every row identity that survives; the selection
     /// follows its row identity, and falls back to the nearest surviving row
-    /// when that row is gone. The focus targets are re-derived here too: what
-    /// `Enter` may focus is a property of the observation that was just drawn.
+    /// when that row is gone. Freshness remains a local judgement of the facts
+    /// this frontend drew; focus targets are derived only by the session.
     pub fn refresh(&mut self, state: &ObservationState) {
         let mut tree = FleetTree::build(state);
         tree.attach_tasks(&self.bus);
@@ -788,6 +789,7 @@ impl App {
         self.session = Some(SessionLink {
             client,
             mirror: None,
+            connected: false,
         });
     }
 
@@ -797,9 +799,19 @@ impl App {
         let Some(link) = &mut self.session else {
             return false;
         };
+        let connected = link.client.connected();
+        let health_changed = connected != link.connected;
+        link.connected = connected;
         let Some(mirror) = link.client.poll() else {
-            return false;
+            if !connected {
+                self.source_current = false;
+            }
+            return health_changed;
         };
+        let observation_changed = link
+            .mirror
+            .as_ref()
+            .is_none_or(|last| !std::sync::Arc::ptr_eq(&last.observation, &mirror.observation));
         let gate_changed = link
             .mirror
             .as_ref()
@@ -854,6 +866,24 @@ impl App {
             self.workspace_picker = None;
             self.interaction_picker = None;
             self.session_confirm = None;
+        }
+        if observation_changed {
+            if let Some(tasks) = &mirror.observation.tasks {
+                match crate::control_plane::client::tasks_from_snapshot(tasks) {
+                    Ok(events) => self.replace_task_snapshot(events),
+                    Err(error) => self.set_task_diagnostic(Some(error)),
+                }
+            }
+            self.refresh(&mirror.observation.observation);
+        }
+        self.source_current = connected
+            && mirror.diagnostic.is_none()
+            && matches!(
+                mirror.observation.observation.source_freshness(),
+                SourceFreshness::Current
+            );
+        if let Some(diagnostic) = &mirror.diagnostic {
+            self.set_focus_message(Some(diagnostic.to_string()));
         }
         let before = self.nav.selected_id().cloned();
         self.nav.adopt(state);
@@ -1031,6 +1061,33 @@ impl App {
     pub fn shared_blocking(&self) -> bool {
         self.session_mirror()
             .is_some_and(|m| m.state.blocking.is_some())
+    }
+
+    pub fn session_observation(
+        &self,
+    ) -> Option<std::sync::Arc<crate::ui_session::publication::Observation>> {
+        self.mirror_ref()
+            .map(|m| std::sync::Arc::clone(&m.observation))
+    }
+
+    pub fn wants_processes(&self, wanted: bool) {
+        if let Some(link) = &self.session {
+            link.client.wants_processes(wanted);
+        }
+    }
+
+    pub fn session_diagnostic(&self) -> Option<&str> {
+        let link = self.session.as_ref()?;
+        if !link.client.connected() {
+            return Some("daemon disconnected · showing last coherent view");
+        }
+        let Some(mirror) = &link.mirror else {
+            return Some("waiting for a coherent baseline");
+        };
+        mirror
+            .diagnostic
+            .as_ref()
+            .map(|failure| failure.description())
     }
 
     /// Whether the shared session is attached.
@@ -2422,6 +2479,8 @@ mod tests {
         let app = app_with_fixture();
         let local = app.nav.selected_id().cloned().expect("a selection");
         let agreed = Mirror {
+            observation: std::sync::Arc::new(crate::ui_session::publication::Observation::default()),
+            diagnostic: None,
             attachment_id: "a".into(),
             update_id: 1,
             state: dto::SessionState {
@@ -2438,6 +2497,8 @@ mod tests {
 
         // The session selects a row this view's observation cannot describe.
         let elsewhere = Mirror {
+            observation: std::sync::Arc::new(crate::ui_session::publication::Observation::default()),
+            diagnostic: None,
             attachment_id: "a".into(),
             update_id: 2,
             state: dto::SessionState {
@@ -2471,6 +2532,8 @@ mod tests {
             "the fixture gives this view rows of its own"
         );
         let attached = Mirror {
+            observation: std::sync::Arc::new(crate::ui_session::publication::Observation::default()),
+            diagnostic: None,
             attachment_id: "a".into(),
             update_id: 1,
             state: dto::SessionState::default(),

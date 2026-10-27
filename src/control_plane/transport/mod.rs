@@ -125,9 +125,21 @@ pub(crate) type EventReady = dyn Fn(&[u8]) -> bool + Send + Sync + 'static;
 /// A stream of encoded response lines the server pushes until it ends. Each call
 /// waits for the next line; `None` ends the stream.
 pub(crate) trait FrameStream: Send {
+    fn accepts_requests(&self) -> bool;
+    fn busy(&self) -> Option<crate::content::Segments>;
+    fn respond<'a>(
+        &'a mut self,
+        _request: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<crate::content::Segments>> + Send + 'a>,
+    > {
+        Box::pin(async { None })
+    }
     fn next<'a>(
         &'a mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<crate::content::Segments>> + Send + 'a>,
+    >;
 }
 
 /// Opens the stream a request asks for. `None` means the method is not a
@@ -557,23 +569,47 @@ async fn serve(
                     if serving.stopping.load(Ordering::SeqCst) {
                         break;
                     }
-                    let Some(permit) = Arc::clone(&admission.subscriptions)
-                        .try_acquire_owned()
-                        .ok()
-                    else {
-                        let response = Response::refused(
-                            &request_id_of(&line),
-                            &Refusal::new(Code::Busy, "the subscription limit is reached"),
-                        );
-                        write_response(&writer, &response);
-                        continue;
+                    let actions = protocol::decode_request(&line).is_ok_and(|request| {
+                        request.method == "ui.open"
+                            && request
+                                .params
+                                .get("role")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("actions")
+                    });
+                    let permit = if actions {
+                        None
+                    } else {
+                        match Arc::clone(&admission.subscriptions).try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                write_response(
+                                    &writer,
+                                    &Response::refused(
+                                        &request_id_of(&line),
+                                        &Refusal::new(
+                                            Code::Busy,
+                                            "the subscription limit is reached",
+                                        ),
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
                     };
                     let open = Arc::clone(streams);
                     let request = line.clone();
                     let opened = tokio::task::spawn_blocking(move || open(&request)).await;
                     match opened {
                         Ok(Some(Ok(stream))) => {
-                            push_frames(&mut reader, stream).await;
+                            write_response(
+                                &writer,
+                                &Response::ok(
+                                    &request_id_of(&line),
+                                    serde_json::json!({"codec": "messagepack", "framing": "u32-be"}),
+                                ),
+                            );
+                            binary_frames(&mut reader, stream, &admission, &serving).await;
                             drop(permit);
                             break;
                         }
@@ -661,7 +697,7 @@ async fn serve(
 }
 
 fn is_stream_request(line: &[u8]) -> bool {
-    protocol::decode_request(line).is_ok_and(|request| request.method == "ui.subscribe")
+    protocol::decode_request(line).is_ok_and(|request| request.method == "ui.open")
 }
 
 /// Pushes a stream's lines until it ends, the peer closes or a write stalls.
@@ -669,23 +705,65 @@ fn is_stream_request(line: &[u8]) -> bool {
 /// The peer is watched for closure independently of publications, so an idle
 /// subscription is released as soon as its client goes. A slow reader costs only
 /// its own write deadline: the stream hands over the latest state, never a queue.
-async fn push_frames(
+async fn read_binary(
+    reader: &mut tokio::io::BufReader<UnixStream>,
+) -> Result<Vec<u8>, crate::content::Error> {
+    use tokio::io::AsyncReadExt;
+    let mut prefix = [0; 4];
+    reader.read_exact(&mut prefix).await?;
+    let size = crate::content::frame_length(prefix)?;
+    let mut bytes = vec![0; size];
+    reader.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+
+async fn binary_input(
+    reader: &mut tokio::io::BufReader<UnixStream>,
+    requests: bool,
+) -> Result<Vec<u8>, ()> {
+    use tokio::io::AsyncReadExt;
+    if !requests {
+        let _ = reader.read(&mut [0]).await;
+        return Err(());
+    }
+    tokio::time::timeout(IDLE_TIMEOUT, read_binary(reader))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+async fn binary_frames(
     reader: &mut tokio::io::BufReader<UnixStream>,
     mut stream: Box<dyn FrameStream>,
+    admission: &Arc<Admission>,
+    serving: &Serving,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut closed = [0u8; 1];
+    use tokio::io::AsyncWriteExt;
+    let requests = stream.accepts_requests();
     loop {
         let frame = tokio::select! {
             frame = stream.next() => frame,
-            _ = reader.read(&mut closed) => return,
+            request = binary_input(reader, requests) => {
+                let Ok(request) = request else { return };
+                if serving.stopping.load(Ordering::SeqCst) { return; }
+                match admission.acquire(Lane::Control) {
+                    Some(permit) => {
+                        serving.in_flight.fetch_add(1, Ordering::SeqCst);
+                        let frame = stream.respond(request).await;
+                        serving.in_flight.fetch_sub(1, Ordering::SeqCst);
+                        drop(permit);
+                        frame
+                    }
+                    None => stream.busy(),
+                }
+            }
         };
-        let Some(mut frame) = frame else { return };
-        frame.push(b'\n');
+        let Some(frame) = frame else { return };
         let write = async {
-            let socket = reader.get_mut();
-            socket.write_all(&frame).await?;
-            socket.flush().await
+            for part in &frame.0 {
+                reader.get_mut().write_all(part).await?;
+            }
+            Ok::<_, std::io::Error>(())
         };
         if !matches!(tokio::time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
             return;

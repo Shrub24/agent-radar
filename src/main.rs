@@ -1,10 +1,9 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use agent_radar::control_plane::observation::Snapshot;
 use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
-use agent_radar::snapshot_fetch::{Fetched, SnapshotFetcher};
 use agent_radar::ui_session::client::{UiClient, Wake};
+use agent_radar::ui_session::publication::Observation;
 use agent_radar::{
     Action, App, Config, Geometry, ObservationState, PaneView, control_plane, theme, ui,
 };
@@ -448,7 +447,7 @@ fn await_daemon(
 ///
 /// A source that is stale or unavailable names why, and the footer shows that
 /// rather than a fleet-wide verdict the source did not make.
-fn source_diagnostic(snapshot: &Snapshot, name: &str) -> Option<String> {
+fn source_diagnostic(snapshot: &Observation, name: &str) -> Option<String> {
     snapshot
         .sources
         .iter()
@@ -717,7 +716,7 @@ fn run(sidebar: bool) -> io::Result<()> {
     let session_socket = observation
         .as_ref()
         .map(|daemon| daemon.socket().to_path_buf());
-    let fetcher = observation.map(|daemon| SnapshotFetcher::new(daemon, wake.clone()));
+    let mut displayed_observation: Option<std::sync::Arc<Observation>> = None;
     if let Some(socket) = session_socket {
         let role = if sidebar {
             AttachmentRole::Sidebar
@@ -751,31 +750,16 @@ fn run(sidebar: bool) -> io::Result<()> {
         // while finished sessions are listed: telling a session that has gone
         // from a pane in use again needs the foreground either way.
         let sweeping = app.pane_view() != PaneView::Hidden || app.shows_history();
-        if let Some(fetcher) = &fetcher {
-            fetcher.wants(sweeping);
-            match fetcher.poll() {
-                Some(Fetched::Snapshot(snapshot)) => {
-                    // Task sessions arrive as one source of the same revision, so
-                    // the dashboard no longer reads them separately.
-                    if let Some(tasks) = snapshot.tasks.as_ref() {
-                        match control_plane::client::tasks_from_snapshot(tasks) {
-                            Ok(events) => app.replace_task_snapshot(events),
-                            Err(problem) => app.set_task_diagnostic(Some(problem)),
-                        }
-                    }
-                    app.set_task_diagnostic(source_diagnostic(&snapshot, "tasks"));
-                    state = snapshot.observation.clone();
-                    app.refresh(&state);
-                    dirty = true;
-                }
-                // The previous view stands, and the reason it is not moving is
-                // on the footer rather than in a half-updated screen.
-                Some(Fetched::Stale(reason)) => {
-                    app.set_focus_message(Some(reason));
-                    dirty = true;
-                }
-                None => {}
-            }
+        app.wants_processes(sweeping);
+        if let Some(observation) = app.session_observation()
+            && displayed_observation
+                .as_ref()
+                .is_none_or(|old| !std::sync::Arc::ptr_eq(old, &observation))
+        {
+            app.set_task_diagnostic(source_diagnostic(&observation, "tasks"));
+            state = observation.observation.clone();
+            displayed_observation = Some(observation);
+            dirty = true;
         }
         // The session answers a focus. A server with no client attached is the one
         // answer this process acts on: it opens a terminal for the place it named

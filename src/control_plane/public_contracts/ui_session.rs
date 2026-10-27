@@ -6,6 +6,7 @@
 //! are explicit DTOs rather than the internal tree and navigation types, so the
 //! internal types can change without changing the published contract.
 
+use crate::content::Content;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -96,17 +97,6 @@ pub struct TreeRow {
     pub collapsed: bool,
     pub needs_attention: bool,
     pub working: bool,
-}
-
-/// The projected tree as content. `hash` identifies the rows; `rows` is omitted
-/// when the caller already holds that hash, so an unchanged tree is not sent
-/// again.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TreeProjection {
-    pub hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rows: Option<Vec<TreeRow>>,
 }
 
 /// The shared filter. `editor` names the attachment that owns the query while
@@ -406,87 +396,131 @@ pub enum ActionOutcome {
     Detached,
 }
 
-/// Attach: a fresh attachment, identified by a UUID the client mints, and the
-/// authoritative baseline it starts from.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AttachParams {
-    /// Minted by the client for each communication incarnation.
-    pub attachment_id: String,
-    pub role: AttachmentRole,
-    /// The interaction a presenter claims at attach time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interaction_id: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttachResult {
     pub attachment_id: String,
-    pub publication: Publication,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DetachParams {
-    pub attachment_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DetachResult {
-    pub released: bool,
-}
-
-/// Subscribe: the attachment's one primary push stream. The first frame is the
-/// current [`Publication`]; each later frame is a newer one. A frame carries
-/// tree rows only when they differ from the last frame sent on the stream, so
-/// `known_tree_hash` lets a client that already holds content skip it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SubscribeParams {
-    pub attachment_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub known_tree_hash: Option<String>,
-}
-
-/// Retrieves retained tree content by hash. An evicted hash is refused with
-/// `content_expired`; the caller then reads the current state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ContentGetParams {
-    pub hash: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ContentGetResult {
-    pub rows: Vec<TreeRow>,
-}
-
-/// Submits one action. `action_id` is the attachment's counter, starting at 1:
-/// the session applies each id once, in order, and replays a retried one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ActionParams {
-    pub attachment_id: String,
-    pub action_id: u64,
-    /// The gate generation the input was interpreted under. Navigation stamped
-    /// with an earlier generation is refused; interaction actions are named by
-    /// interaction id instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gate: Option<u64>,
-    pub action: UiAction,
-}
-
-/// One published state: the ordered update id, the tree by content hash and the
-/// lightweight session fields by content hash. `tree.rows` is present only when
-/// the receiver does not already hold that hash.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Publication {
     pub update_id: u64,
-    pub tree: TreeProjection,
-    pub state_hash: String,
-    pub session: SessionState,
+}
+
+// Binary TUI publication/content protocol. Domain RPCs retain their JSON DTOs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Head {
+    pub update_id: u64,
+    pub observation: String,
+    pub tree: String,
+    pub session: String,
+    pub gate: u64,
+    pub diagnostic: Option<PublicationFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum PublicationFailure {
+    #[error("content_too_large · showing last coherent view")]
+    ContentTooLarge,
+    #[error("{message}")]
+    Encoding { message: String },
+}
+
+impl PublicationFailure {
+    pub fn description(&self) -> &str {
+        match self {
+            Self::ContentTooLarge => "content_too_large · showing last coherent view",
+            Self::Encoding { message } => message,
+        }
+    }
+}
+
+impl From<crate::content::Error> for PublicationFailure {
+    fn from(error: crate::content::Error) -> Self {
+        match error {
+            crate::content::Error::TooLarge => Self::ContentTooLarge,
+            other => Self::Encoding {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Frame {
+    #[serde(rename = "metadata")]
+    pub head: Head,
+    #[serde(deserialize_with = "three_payloads")]
+    pub content: Vec<Content>,
+}
+
+fn three_payloads<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Vec<Content>, D::Error> {
+    struct Payloads;
+    impl<'de> serde::de::Visitor<'de> for Payloads {
+        type Value = Vec<Content>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("at most three lane payloads")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut input: A,
+        ) -> Result<Self::Value, A::Error> {
+            if input.size_hint().is_some_and(|size| size > 3) {
+                return Err(serde::de::Error::custom("too many lane payloads"));
+            }
+            let mut payloads = Vec::with_capacity(3);
+            while let Some(payload) = input.next_element()? {
+                if payloads.len() == 3 {
+                    return Err(serde::de::Error::custom("too many lane payloads"));
+                }
+                payloads.push(payload);
+            }
+            Ok(payloads)
+        }
+    }
+    decoder.deserialize_seq(Payloads)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case")]
+pub enum Request {
+    Attach {
+        attachment_id: String,
+        role: AttachmentRole,
+        interaction_id: Option<String>,
+    },
+    Action {
+        attachment_id: String,
+        action_id: u64,
+        gate: Option<u64>,
+        action: UiAction,
+    },
+    Content {
+        hash: String,
+    },
+    Detach {
+        attachment_id: String,
+    },
+    Demand {
+        attachment_id: String,
+        processes: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum Reply {
+    Attached,
+    Action { outcome: ActionOutcome },
+    Content { content: Content },
+    Expired { head: Head },
+    Demand,
+    Refused { code: String, message: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum Open {
+    Actions,
+    Subscribe {
+        attachment_id: String,
+        session_only: bool,
+    },
 }

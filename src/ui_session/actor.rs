@@ -46,7 +46,13 @@ pub enum Effect {
 type Reply<T> = SyncSender<T>;
 
 enum Msg {
-    Observe(Arc<Snapshot>),
+    Observe(
+        Box<super::publication::Observation>,
+        crate::content::Content,
+    ),
+    ContentFailed(dto::PublicationFailure),
+    Encoded(String, Reply<Option<crate::content::Content>>),
+    Demand(String, bool, Reply<Result<(), dto::RefusalCode>>),
     Attach(
         String,
         dto::AttachmentRole,
@@ -62,8 +68,10 @@ enum Msg {
         Reply<dto::ActionOutcome>,
     ),
     Finished(dto::CommandOutcome),
-    Content(String, Reply<Option<Arc<Vec<dto::TreeRow>>>>),
-    Subscribe(String, Reply<Result<(), dto::RefusalCode>>),
+    Subscribe(
+        String,
+        Reply<Result<watch::Receiver<bool>, dto::RefusalCode>>,
+    ),
     Stop,
 }
 
@@ -74,6 +82,7 @@ pub struct UiHandle {
     published: watch::Receiver<Arc<Published>>,
     attached: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
+    processes: Arc<AtomicBool>,
 }
 
 /// Owns the actor thread. Dropping it stops the session.
@@ -121,13 +130,15 @@ impl UiService {
         let (publish, published) = watch::channel(Arc::new(session.current().clone()));
         let attached = Arc::new(AtomicUsize::new(0));
         let stopped = Arc::new(AtomicBool::new(false));
+        let processes = Arc::new(AtomicBool::new(false));
         let thread = {
             let attached = Arc::clone(&attached);
             let stopped = Arc::clone(&stopped);
+            let processes = Arc::clone(&processes);
             thread::Builder::new()
                 .name("radar-ui-session".into())
                 .spawn(move || {
-                    run(session, rx, publish, &attached, work);
+                    run(session, rx, publish, &attached, &processes, work);
                     stopped.store(true, Ordering::SeqCst);
                 })
                 .ok()
@@ -138,6 +149,7 @@ impl UiService {
                 published,
                 attached,
                 stopped,
+                processes,
             },
             thread,
         }
@@ -207,9 +219,12 @@ fn run(
     rx: mpsc::Receiver<Msg>,
     publish: watch::Sender<Arc<Published>>,
     attached: &AtomicUsize,
+    processes: &AtomicBool,
     work: Option<SyncSender<Effect>>,
 ) {
     let mut pending = HashMap::<String, Owed>::new();
+    let mut process_demand = std::collections::HashSet::new();
+    let mut subscriptions: HashMap<String, watch::Sender<bool>> = HashMap::new();
     let mut clock = Instant::now();
     let mut unsubscribed: HashMap<String, Instant> = HashMap::new();
     loop {
@@ -228,8 +243,27 @@ fn run(
             let Some(message) = message else { break };
             match message {
                 Msg::Stop => return,
-                Msg::Observe(snapshot) => {
-                    session.observe(&snapshot.observation, snapshot.tasks.as_ref());
+                Msg::Observe(observation, content) => {
+                    session.observe_content(&observation, content);
+                }
+                Msg::ContentFailed(error) => {
+                    session.observation_failed(error);
+                }
+                Msg::Encoded(hash, reply) => {
+                    let _ = reply.send(session.encoded_content(&hash));
+                }
+                Msg::Demand(id, wanted, reply) => {
+                    let result = if session.attachments_contain(&id) {
+                        if wanted {
+                            process_demand.insert(id);
+                        } else {
+                            process_demand.remove(&id);
+                        }
+                        Ok(())
+                    } else {
+                        Err(dto::RefusalCode::Unavailable)
+                    };
+                    let _ = reply.send(result);
                 }
                 Msg::Attach(id, role, interaction, reply) => {
                     let result = session.attach(&id, role).and_then(|()| {
@@ -246,7 +280,7 @@ fn run(
                         }
                         Ok(dto::AttachResult {
                             attachment_id: id.clone(),
-                            publication: session.current().publication(None),
+                            update_id: session.current().update_id,
                         })
                     });
                     if result.is_ok() {
@@ -270,15 +304,14 @@ fn run(
                     }
                     session.operation(outcome);
                 }
-                Msg::Content(hash, reply) => {
-                    let _ = reply.send(session.content(&hash));
-                }
                 Msg::Subscribe(id, reply) => {
                     // One primary subscription per attachment: the marker is
                     // the attachment leaving the unsubscribed set, and a second
                     // request finds it already gone.
                     let result = if unsubscribed.remove(&id).is_some() {
-                        Ok(())
+                        let (alive, receiver) = watch::channel(true);
+                        subscriptions.insert(id.clone(), alive);
+                        Ok(receiver)
                     } else if session.attachments_contain(&id) {
                         Err(dto::RefusalCode::Conflict)
                     } else {
@@ -338,6 +371,16 @@ fn run(
             unsubscribed.remove(&id);
             session.detach(&id);
         }
+        subscriptions.retain(|id, alive| {
+            if session.attachments_contain(id) {
+                true
+            } else {
+                alive.send_replace(false);
+                false
+            }
+        });
+        process_demand.retain(|id| session.attachments_contain(id));
+        processes.store(!process_demand.is_empty(), Ordering::SeqCst);
         attached.store(session.attachments(), Ordering::SeqCst);
         if session.current().update_id != publish.borrow().update_id {
             publish.send_replace(Arc::new(session.current().clone()));
@@ -355,7 +398,25 @@ impl UiHandle {
     }
 
     pub fn observe(&self, snapshot: Arc<Snapshot>) {
-        let _ = self.tx.send(Msg::Observe(snapshot));
+        let observation = super::publication::Observation::from(snapshot.as_ref());
+        let message = match crate::content::Content::encode(&observation) {
+            Ok(content) => Msg::Observe(Box::new(observation), content),
+            Err(error) => Msg::ContentFailed(error.into()),
+        };
+        let _ = self.tx.send(message);
+    }
+
+    pub fn head(&self) -> super::publication::Head {
+        self.published.borrow().head()
+    }
+
+    pub fn encoded_content(&self, hash: &str) -> Result<Option<crate::content::Content>, UiError> {
+        self.ask(|reply| Msg::Encoded(hash.into(), reply))
+    }
+
+    pub fn demand(&self, id: &str, processes: bool) -> Result<(), UiError> {
+        self.ask(|reply| Msg::Demand(id.into(), processes, reply))?
+            .map_err(UiError::Refused)
     }
 
     fn ask<T>(&self, build: impl FnOnce(Reply<T>) -> Msg) -> Result<T, UiError> {
@@ -408,13 +469,10 @@ impl UiHandle {
         }
     }
 
-    pub fn content(&self, hash: &str) -> Result<Option<Arc<Vec<dto::TreeRow>>>, UiError> {
-        self.ask(|reply| Msg::Content(hash.to_string(), reply))
-    }
-
     /// Takes the attachment's one primary subscription.
-    pub fn subscribe(&self, id: &str, known: Option<String>) -> Result<Subscription, UiError> {
-        self.ask(|reply| Msg::Subscribe(id.to_string(), reply))?
+    pub fn subscribe(&self, id: &str) -> Result<Subscription, UiError> {
+        let alive = self
+            .ask(|reply| Msg::Subscribe(id.to_string(), reply))?
             .map_err(UiError::Refused)?;
         let mut published = self.published.clone();
         // Marks the current value unseen so the first frame is the baseline.
@@ -423,8 +481,9 @@ impl UiHandle {
             handle: self.clone(),
             attachment: id.to_string(),
             published,
-            known,
             sent: None,
+            known_head: None,
+            alive,
         })
     }
 }
@@ -435,26 +494,29 @@ pub struct Subscription {
     handle: UiHandle,
     attachment: String,
     published: watch::Receiver<Arc<Published>>,
-    known: Option<String>,
     sent: Option<u64>,
+    known_head: Option<super::publication::Head>,
+    alive: watch::Receiver<bool>,
 }
 
 impl Subscription {
-    /// Waits for a state newer than the last one delivered. `None` means the
-    /// session has stopped.
-    pub async fn next(&mut self) -> Option<dto::Publication> {
+    pub async fn next_frame(&mut self, session_only: bool) -> Option<super::publication::Frame> {
         loop {
+            if !*self.alive.borrow() {
+                return None;
+            }
             {
                 let current = self.published.borrow_and_update();
                 if self.sent.is_none_or(|sent| current.update_id > sent) {
-                    let publication = current.publication(self.known.as_deref());
+                    let frame = current.frame(self.known_head.as_ref(), session_only);
                     self.sent = Some(current.update_id);
-                    self.known = Some(current.tree_hash.clone());
-                    return Some(publication);
+                    self.known_head = Some(frame.head.clone());
+                    return Some(frame);
                 }
             }
-            if self.published.changed().await.is_err() {
-                return None;
+            tokio::select! {
+                result = self.published.changed() => if result.is_err() { return None; },
+                _ = self.alive.changed() => return None,
             }
         }
     }
@@ -475,7 +537,9 @@ pub fn feed(hub: Arc<Hub>, handle: UiHandle, stopping: Arc<AtomicBool>) -> Optio
             let mut seen = 0;
             while !stopping.load(Ordering::SeqCst) && !handle.is_stopped() {
                 if handle.attachments() > 0 {
-                    hub.demand(Classes { processes: true });
+                    hub.demand(Classes {
+                        processes: handle.processes.load(Ordering::SeqCst),
+                    });
                 }
                 let (revision, snapshot) = hub.current();
                 if revision != seen {
@@ -508,30 +572,50 @@ mod tests {
         })
     }
 
+    #[test]
+    fn process_demand_is_attachment_scoped_and_released_on_loss() {
+        let service = UiService::start();
+        let handle = service.handle();
+        handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        handle.attach("b", dto::AttachmentRole::Sidebar).unwrap();
+        handle.demand("a", true).unwrap();
+        handle.demand("b", true).unwrap();
+        crate::testing::eventually("process demand", || {
+            handle.processes.load(Ordering::SeqCst).then_some(())
+        });
+        handle.detach("a");
+        // The second owner remains; clearing it releases demand, not merely one
+        // boolean overwritten by whichever attachment spoke last.
+        handle.demand("b", false).unwrap();
+        crate::testing::eventually("process demand released", || {
+            (!handle.processes.load(Ordering::SeqCst)).then_some(())
+        });
+        assert!(handle.demand("a", true).is_err());
+    }
+
     #[tokio::test]
     async fn a_subscriber_gets_a_baseline_then_only_newer_state() {
         let service = UiService::start();
         let handle = service.handle();
         handle.observe(snapshot());
         let attached = handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        let mut stream = handle.subscribe("a", None).unwrap();
-        let baseline = stream.next().await.unwrap();
-        assert!(baseline.update_id >= attached.publication.update_id);
-        assert!(baseline.tree.rows.is_some());
+        let mut stream = handle.subscribe("a").unwrap();
+        let baseline = stream.next_frame(false).await.unwrap();
+        assert!(baseline.head.update_id >= attached.update_id);
+        assert_eq!(baseline.content.len(), 3);
 
         // Actions travel a different path from the stream and never wait on it.
         assert!(matches!(
             handle.act("a", 1, None, A::Move { delta: 1 }).unwrap(),
             Out::Applied { .. }
         ));
-        let moved = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        let moved = tokio::time::timeout(Duration::from_secs(2), stream.next_frame(false))
             .await
             .expect("an update is pushed without a request")
             .unwrap();
-        assert!(moved.update_id > baseline.update_id);
-        // The tree did not change, so its rows are not sent again.
-        assert!(moved.tree.rows.is_none());
-        assert_eq!(moved.tree.hash, baseline.tree.hash);
+        assert!(moved.head.update_id > baseline.head.update_id);
+        assert_eq!(moved.content.len(), 1);
+        assert_eq!(moved.head.tree, baseline.head.tree);
     }
 
     #[tokio::test]
@@ -539,9 +623,9 @@ mod tests {
         let service = UiService::start();
         let handle = service.handle();
         handle.attach("a", dto::AttachmentRole::Sidebar).unwrap();
-        let stream = handle.subscribe("a", None).unwrap();
+        let stream = handle.subscribe("a").unwrap();
         assert_eq!(
-            handle.subscribe("a", None).err(),
+            handle.subscribe("a").err(),
             Some(UiError::Refused(dto::RefusalCode::Conflict))
         );
         drop(stream);
@@ -551,6 +635,16 @@ mod tests {
         assert_eq!(
             handle.act("a", 1, None, A::CycleOrder).unwrap(),
             Out::Detached
+        );
+        handle.attach("b", dto::AttachmentRole::Sidebar).unwrap();
+        let mut stream = handle.subscribe("b").unwrap();
+        stream.next_frame(false).await.unwrap();
+        handle.detach("b");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next_frame(false))
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -601,9 +695,15 @@ mod tests {
     async fn operation(stream: &mut Subscription, id: &str, status: dto::CommandStatus) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let publication = stream.next().await.expect("service alive");
-                if publication
-                    .session
+                let publication = stream.next_frame(false).await.expect("service alive");
+                let session: dto::SessionState = stream
+                    .handle
+                    .encoded_content(&publication.head.session)
+                    .unwrap()
+                    .unwrap()
+                    .read()
+                    .unwrap();
+                if session
                     .operation
                     .as_ref()
                     .is_some_and(|op| op.request_id == id && op.status == status)
@@ -632,7 +732,7 @@ mod tests {
         })));
         let handle = service.handle();
         handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        let mut stream = handle.subscribe("a", None).unwrap();
+        let mut stream = handle.subscribe("a").unwrap();
         let mut next = 0;
         let mut last = String::new();
         for _ in 0..10 {
@@ -646,7 +746,7 @@ mod tests {
         let service = UiService::start();
         let handle = service.handle();
         handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        let mut stream = handle.subscribe("a", None).unwrap();
+        let mut stream = handle.subscribe("a").unwrap();
         let request = create_from_picker(&handle, &mut 0);
         operation(&mut stream, &request, dto::CommandStatus::DispatchRefused).await;
     }
@@ -669,7 +769,7 @@ mod tests {
         })));
         let handle = service.handle();
         handle.attach("a", dto::AttachmentRole::Dashboard).unwrap();
-        let mut stream = handle.subscribe("a", None).unwrap();
+        let mut stream = handle.subscribe("a").unwrap();
         let request = create_from_picker(&handle, &mut 0);
         operation(
             &mut stream,

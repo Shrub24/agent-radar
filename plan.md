@@ -7,6 +7,47 @@ The queue behind the OpenSpec changes. An item lives here with the decision it
 still needs, and leaves when it becomes a change worth specifying. What is
 already settled is in `README.md` and `openspec/`; this file is the future.
 
+## Unified publication and transport direction
+
+The TUI change is proposed in
+[`unified-tui-publications`](openspec/changes/unified-tui-publications/proposal.md).
+It replaces the TUI's independent observation fetch with one coherent actor
+publication head referencing three immutable payloads: observation, tree
+projection and UI-session state. One head sequence orders publications; XXH3-128
+hashes identify MessagePack payload bytes. Publication counters/timestamps and
+delivery bookkeeping do not enter payload hashes; genuine domain identities,
+source freshness and sample times retain their meaning. The TUI holds only its
+current head plus a bounded in-progress replacement, not historical content.
+
+Build reusable, domain-agnostic encoding, content-reference/store and bounded
+framing/subscription functions as part of that implementation. Keep typed
+producers and three explicit lane fields rather than an arbitrary lane/plugin
+framework. Reuse unchanged immutable encoded objects, serialize changed
+candidates once, and centralise publication coalescing; no frontend smoothing.
+
+### Follow-on: pi-radar and other daemon lanes
+
+Extend the same MessagePack conventions, XXH3-128 content machinery where useful,
+and bounded, event-driven subscription transport to pi-radar and other daemon
+consumers in separate changes. Use Tokio for appropriate Rust socket tasks and
+the native event loop in TypeScript; do not create a second runtime or actor
+framework. Cross-language fixtures must pin named fields, enum tags, exact
+integer handling, hash representation and deterministic map encoding.
+
+Snapshot feeds may coalesce to latest state and use content references. Ordered
+lifecycle/event feeds instead need cursors, retention gaps and recovery; commands
+retain request identity, domain admission and acknowledgement semantics, while
+presence/ingest retain their own backpressure contracts. Do not add hashes to
+messages without a content-identity use. Migrate each consumer completely and
+remove its replaced path rather than maintain duplicate codecs/delivery paths.
+
+These other lanes, their clients and the observation sampler's domain semantics
+are NOT migrated by the TUI change. It may adapt the existing observation hub,
+UI actor and serving transport only as required to deliver the three TUI
+payloads; no speculative wiring for later consumers. Observation smoothing,
+compression, chunking, deltas and broader connection-admission redesign remain
+out of scope until separately justified.
+
 ## Accepted baseline
 
 The operator accepted the live smoke on 2026-10-06. The initial fleet overview,

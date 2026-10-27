@@ -82,7 +82,7 @@ pub fn render(
     } else {
         content_column(frame.area())
     };
-    let hints = if rail && app.focus_message().is_none() {
+    let hints = if rail && app.focus_message().is_none() && app.session_diagnostic().is_none() {
         Vec::new()
     } else {
         footer(app, area.width as usize)
@@ -751,6 +751,12 @@ fn elide(text: &str, width: usize) -> String {
 /// tree heading and the details.
 fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
     let palette = theme::palette();
+    if let Some(problem) = app.session_diagnostic() {
+        return vec![Line::from(Span::styled(
+            elide(&first_line(&sanitize(problem)), width),
+            Style::new().fg(palette.failed),
+        ))];
+    }
     if let Some(m) = app.session_mirror()
         && let Some(b) = &m.state.blocking
     {

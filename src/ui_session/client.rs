@@ -15,13 +15,15 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
+use super::publication::{Frame, Observation, Open, Reply, Request as UiRequest};
+use crate::content::{self, Content};
 use crate::control_plane::protocol::PROTOCOL_VERSION;
 use crate::control_plane::public_contracts::ui_session as dto;
 use crate::control_plane::random_uuid;
@@ -52,6 +54,8 @@ pub struct Mirror {
     pub update_id: u64,
     pub state: dto::SessionState,
     pub rows: Arc<Vec<dto::TreeRow>>,
+    pub observation: Arc<Observation>,
+    pub diagnostic: Option<dto::PublicationFailure>,
 }
 
 struct Link {
@@ -59,6 +63,7 @@ struct Link {
     reader: BufReader<UnixStream>,
     attachment: String,
     next_action: u64,
+    processes: bool,
 }
 
 struct Inner {
@@ -67,6 +72,9 @@ struct Inner {
     interaction: Option<String>,
     incarnation: AtomicU64,
     displayed_gate: AtomicU64,
+    observed_gate: AtomicU64,
+    observed_update: AtomicU64,
+    processes: AtomicBool,
     wake: Wake,
     stop: AtomicBool,
     /// Actions queued or in flight.
@@ -126,6 +134,9 @@ impl UiClient {
             interaction,
             incarnation: AtomicU64::new(0),
             displayed_gate: AtomicU64::new(0),
+            observed_gate: AtomicU64::new(0),
+            observed_update: AtomicU64::new(0),
+            processes: AtomicBool::new(false),
             wake,
             stop: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
@@ -166,6 +177,12 @@ impl UiClient {
 
     /// Queues an action behind every earlier one. Never blocks.
     pub fn submit(&self, action: dto::UiAction) {
+        if action.is_ordinary()
+            && self.inner.observed_gate.load(Ordering::SeqCst)
+                != self.inner.displayed_gate.load(Ordering::SeqCst)
+        {
+            return;
+        }
         self.inner.pending.fetch_add(1, Ordering::SeqCst);
         let pending = Pending {
             action,
@@ -177,6 +194,10 @@ impl UiClient {
             self.inner.resync.store(true, Ordering::SeqCst);
             cut(&self.inner);
         }
+    }
+
+    pub fn wants_processes(&self, wanted: bool) {
+        self.inner.processes.store(wanted, Ordering::SeqCst);
     }
 
     /// Whether every action sent has been answered and the newest state
@@ -345,135 +366,273 @@ fn attach_loop(inner: &Inner) {
     }
 }
 
-/// One attachment: attach, subscribe, and publish until the stream ends.
+fn binary_exchange(link: &mut Link, request: &UiRequest) -> Result<Reply, String> {
+    content::write_frame(&mut link.action, request).map_err(|e| e.to_string())?;
+    content::read_frame(&mut link.reader).map_err(|e| e.to_string())
+}
+
+fn open(inner: &Inner, mode: Open) -> Result<(UnixStream, BufReader<UnixStream>), String> {
+    let (mut stream, mut reader) = dial(inner)?;
+    // A stop must be able to cancel even a peer that never answers the opener.
+    if matches!(mode, Open::Subscribe { .. }) {
+        *locked(&inner.subscription) = Some(stream.try_clone().map_err(|e| e.to_string())?);
+    }
+    exchange(
+        &mut stream,
+        &mut reader,
+        "ui.open",
+        serde_json::to_value(mode).map_err(|e| e.to_string())?,
+    )?;
+    Ok((stream, reader))
+}
+
+/// One attachment owns an ordered action/content link and a push subscription.
 fn session(inner: &Inner) -> Result<(), String> {
     let attachment = random_uuid();
     inner.incarnation.fetch_add(1, Ordering::SeqCst);
-    let (mut action, mut reader) = dial(inner)?;
-    // Update ids belong to one daemon's counter; a new attachment starts over.
+    inner.observed_update.store(0, Ordering::SeqCst);
     inner.floor.store(0, Ordering::SeqCst);
     inner.delivered.store(0, Ordering::SeqCst);
     *locked(&inner.latest) = None;
-    let attached = exchange(
-        &mut action,
-        &mut reader,
-        "ui.attach",
-        json!({"attachment_id": attachment, "role": inner.role, "interaction_id": inner.interaction}),
-    )?;
-    let attached: dto::AttachResult =
-        serde_json::from_value(attached).map_err(|error| error.to_string())?;
-    let mut cache: Option<(String, Arc<Vec<dto::TreeRow>>)> = None;
-    let baseline = publish(inner, &attachment, &mut cache, attached.publication)?;
-
-    let (mut stream, _) = dial(inner)?;
-    let (id, line) = request(
-        "ui.subscribe",
-        json!({"attachment_id": attachment, "known_tree_hash": baseline}),
-    );
-    stream.write_all(&line).map_err(|error| error.to_string())?;
-    // Registered for cancellation before the handshake completes, so a stop or a
-    // re-attach ends this attempt instead of waiting out its reply timeout.
-    *locked(&inner.subscription) = Some(stream.try_clone().map_err(|error| error.to_string())?);
-    // The subscription's first answer is the readiness barrier: the daemon has
-    // accepted it and this attachment owns a stream. Reading it through the same
-    // buffered reader the push loop uses keeps read-ahead with the frame stream.
-    let mut frames = BufReader::new(stream);
-    let mut accepted = String::new();
-    if frames
-        .read_line(&mut accepted)
-        .map_err(|error| error.to_string())?
-        == 0
-    {
-        return Err("the subscription closed before it was accepted".to_string());
-    }
-    let result = answered(&id, &accepted)?;
-    let publication: dto::Publication =
-        serde_json::from_value(result).map_err(|error| error.to_string())?;
-    *locked(&inner.link) = Some(Link {
+    let (action, reader) = open(inner, Open::Actions)?;
+    let mut link = Link {
         action,
         reader,
         attachment: attachment.clone(),
         next_action: 1,
-    });
-    // A stop requested while this attachment was being made found no stream to
-    // cut, so it is honoured here rather than blocking on a quiet one.
+        processes: false,
+    };
+    match binary_exchange(
+        &mut link,
+        &UiRequest::Attach {
+            attachment_id: attachment.clone(),
+            role: inner.role,
+            interaction_id: inner.interaction.clone(),
+        },
+    )? {
+        Reply::Attached => {}
+        other => return Err(format!("attach refused: {other:?}")),
+    }
+    *locked(&inner.link) = Some(link);
+    let (stream, mut frames) = open(
+        inner,
+        Open::Subscribe {
+            attachment_id: attachment.clone(),
+            session_only: inner.role == dto::AttachmentRole::Presenter,
+        },
+    )?;
+    let baseline: Frame = content::read_frame(&mut frames).map_err(|e| e.to_string())?;
     if inner.stop.load(Ordering::SeqCst) {
         return Ok(());
     }
-    // Connected before the baseline is published, so a view that sees a mirror
-    // never sees one from a session it is not yet connected to.
     inner.connected.store(true, Ordering::SeqCst);
-    publish(inner, &attachment, &mut cache, publication)?;
-    // The baseline is in hand, so the subscription is alive: from here it waits
-    // without a read timeout, because a quiet fleet is not a failure. Until here
-    // it kept the reply timeout, so a subscription the daemon accepts and then
-    // never serves is abandoned and retried instead of parking the attach thread
-    // for the life of the process.
-    let _ = frames.get_ref().set_read_timeout(None);
-    inner.wake.notify();
-
-    loop {
-        let mut line = String::new();
-        let read = frames
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
-        if read == 0 || inner.stop.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        let result = answered(&id, &line)?;
-        let publication: dto::Publication =
-            serde_json::from_value(result).map_err(|error| error.to_string())?;
-        publish(inner, &attachment, &mut cache, publication)?;
-    }
+    stream.set_read_timeout(None).map_err(|e| e.to_string())?;
+    handover(inner, &attachment, frames, baseline)
 }
 
-/// Resolves the rows a publication names and stores it as the newest state.
+#[derive(Default)]
+struct Handover {
+    next: Option<Frame>,
+    closed: bool,
+}
+
+/// The receiver never waits for a content RPC: it can invalidate input and
+/// replace the pending target while the bounded materialiser finishes a fetch.
+fn handover(
+    inner: &Inner,
+    attachment: &str,
+    mut reader: BufReader<UnixStream>,
+    baseline: Frame,
+) -> Result<(), String> {
+    let slot = (Mutex::new(Handover::default()), Condvar::new());
+    let error = Mutex::new(None);
+    thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let mut current = Vec::new();
+            loop {
+                let frame = {
+                    let mut state = locked(&slot.0);
+                    while state.next.is_none() && !state.closed {
+                        state = slot.1.wait(state).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if state.closed {
+                        return;
+                    }
+                    state.next.take().expect("pending head")
+                };
+                if let Err(problem) = publish(inner, attachment, &mut current, frame) {
+                    *locked(&error) = Some(problem);
+                    cut(inner);
+                    return;
+                }
+            }
+        });
+        let mut frame = baseline;
+        let result = loop {
+            let mut state = locked(&slot.0);
+            if frame.head.update_id >= inner.observed_update.load(Ordering::SeqCst) {
+                let _adoption = locked(&inner.latest);
+                inner.observed_gate.store(frame.head.gate, Ordering::SeqCst);
+                inner
+                    .observed_update
+                    .store(frame.head.update_id, Ordering::SeqCst);
+                state.next = Some(frame);
+                slot.1.notify_one();
+                inner.wake.notify();
+            }
+            drop(state);
+            match content::read_frame(&mut reader) {
+                Ok(next) if !inner.stop.load(Ordering::SeqCst) => frame = next,
+                Ok(_) => break Ok(()),
+                Err(problem) => break Err(problem.to_string()),
+            }
+        };
+        locked(&slot.0).closed = true;
+        slot.1.notify_one();
+        let _ = worker.join();
+        if let Some(problem) = locked(&error).take() {
+            Err(problem)
+        } else {
+            result
+        }
+    })
+}
+
+/// Materialise exactly one head; only current payloads survive the handover.
 fn publish(
     inner: &Inner,
     attachment: &str,
-    cache: &mut Option<(String, Arc<Vec<dto::TreeRow>>)>,
-    publication: dto::Publication,
-) -> Result<String, String> {
-    let hash = publication.tree.hash;
-    let rows = match (publication.tree.rows, cache.as_ref()) {
-        (Some(rows), _) => Arc::new(rows),
-        (None, Some((held, rows))) if *held == hash => Arc::clone(rows),
-        // The frame assumed content this client does not hold: fetch it, and if
-        // it has been evicted take a fresh attachment's baseline instead.
-        (None, _) => {
-            let (mut stream, mut reader) = dial(inner)?;
-            let content = exchange(
-                &mut stream,
-                &mut reader,
-                "ui.content.get",
-                json!({"hash": hash}),
-            )?;
-            let content: dto::ContentGetResult =
-                serde_json::from_value(content).map_err(|error| error.to_string())?;
-            Arc::new(content.rows)
+    current: &mut Vec<Content>,
+    frame: Frame,
+) -> Result<(), String> {
+    if frame.head.update_id < inner.observed_update.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if locked(&inner.latest)
+        .as_ref()
+        .is_some_and(|m| m.update_id >= frame.head.update_id)
+    {
+        return Ok(());
+    }
+    let hashes = [
+        &frame.head.observation,
+        &frame.head.tree,
+        &frame.head.session,
+    ];
+    let session_only = inner.role == dto::AttachmentRole::Presenter;
+    let mut next = Vec::new();
+    for (index, hash) in hashes.into_iter().enumerate() {
+        if session_only && index != 2 {
+            continue;
         }
+        let held = frame
+            .content
+            .iter()
+            .chain(current.iter())
+            .find(|c| &c.hash == hash)
+            .cloned();
+        let payload = match held {
+            Some(content) => content,
+            None => {
+                let mut link = locked(&inner.link);
+                let link = link.as_mut().ok_or("content link is not attached")?;
+                match binary_exchange(link, &UiRequest::Content { hash: hash.clone() })? {
+                    Reply::Content { content } if &content.hash == hash => content,
+                    Reply::Expired { .. } => return Err("content_expired".into()),
+                    _ => return Err("content fetch refused".into()),
+                }
+            }
+        };
+        next.push(payload);
+    }
+    let session = next
+        .iter()
+        .find(|c| c.hash == frame.head.session)
+        .ok_or("session content missing")?;
+    let state: dto::SessionState = session.read().map_err(|e| e.to_string())?;
+    if state.gate != frame.head.gate {
+        return Err("head gate differs from session".into());
+    }
+    let previous = locked(&inner.latest).clone();
+    let observation = if session_only {
+        Arc::new(Observation::default())
+    } else if let Some(previous) = previous
+        .as_ref()
+        .filter(|_| current.iter().any(|c| c.hash == frame.head.observation))
+    {
+        Arc::clone(&previous.observation)
+    } else {
+        Arc::new(
+            next.iter()
+                .find(|c| c.hash == frame.head.observation)
+                .ok_or("observation missing")?
+                .read()
+                .map_err(|e| e.to_string())?,
+        )
     };
-    *cache = Some((hash.clone(), Arc::clone(&rows)));
-    *locked(&inner.latest) = Some(Arc::new(Mirror {
+    let rows = if session_only {
+        Arc::new(Vec::new())
+    } else if let Some(previous) = previous
+        .as_ref()
+        .filter(|_| current.iter().any(|c| c.hash == frame.head.tree))
+    {
+        Arc::clone(&previous.rows)
+    } else {
+        Arc::new(
+            next.iter()
+                .find(|c| c.hash == frame.head.tree)
+                .ok_or("rows missing")?
+                .read()
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let mut latest = locked(&inner.latest);
+    if frame.head.update_id < inner.observed_update.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    *current = next;
+    *latest = Some(Arc::new(Mirror {
         attachment_id: attachment.into(),
-        update_id: publication.update_id,
-        state: publication.session,
+        update_id: frame.head.update_id,
+        state,
         rows,
+        observation,
+        diagnostic: frame.head.diagnostic,
     }));
     inner.wake.notify();
-    Ok(hash)
+    Ok(())
 }
 
 fn action_loop(inner: &Inner, queue: &mpsc::Receiver<Pending>) {
     loop {
         let action = match queue.recv_timeout(Duration::from_millis(250)) {
             Ok(action) => action,
-            Err(RecvTimeoutError::Timeout) if !inner.stop.load(Ordering::SeqCst) => continue,
+            Err(RecvTimeoutError::Timeout) if !inner.stop.load(Ordering::SeqCst) => {
+                sync_demand(inner);
+                continue;
+            }
             Err(_) => return,
         };
         send(inner, action);
+        sync_demand(inner);
         inner.pending.fetch_sub(1, Ordering::SeqCst);
         inner.wake.notify();
+    }
+}
+
+fn sync_demand(inner: &Inner) {
+    let wanted = inner.processes.load(Ordering::SeqCst);
+    let mut link = locked(&inner.link);
+    let Some(link) = link.as_mut() else { return };
+    if link.processes == wanted {
+        return;
+    }
+    let request = UiRequest::Demand {
+        attachment_id: link.attachment.clone(),
+        processes: wanted,
+    };
+    if matches!(binary_exchange(link, &request), Ok(Reply::Demand)) {
+        link.processes = wanted;
     }
 }
 
@@ -491,24 +650,22 @@ fn send(inner: &Inner, pending: Pending) {
     };
     // Flushing unnumbered input never creates action-number gaps.
     let ordinary = action.is_ordinary();
-    if ordinary
-        && locked(&inner.latest)
-            .as_ref()
-            .is_some_and(|m| m.state.gate != pending.gate)
-    {
+    if ordinary && inner.observed_gate.load(Ordering::SeqCst) != pending.gate {
         return;
     }
     let number = link.next_action;
     link.next_action += 1;
     let gate = Some(pending.gate);
-    let outcome = exchange(
-        &mut link.action,
-        &mut link.reader,
-        "ui.action",
-        json!({"attachment_id": link.attachment, "action_id": number, "gate": gate, "action": action}),
-    )
-    .and_then(|value| {
-        serde_json::from_value::<dto::ActionOutcome>(value).map_err(|error| error.to_string())
+    let request = UiRequest::Action {
+        attachment_id: link.attachment.clone(),
+        action_id: number,
+        gate,
+        action,
+    };
+    let outcome = binary_exchange(link, &request).and_then(|reply| match reply {
+        Reply::Action { outcome } => Ok(outcome),
+        Reply::Refused { code, .. } if code == "busy" => Ok(dto::ActionOutcome::Busy),
+        other => Err(format!("unexpected action reply: {other:?}")),
     });
     match outcome {
         Ok(dto::ActionOutcome::Applied { update_id, .. })
@@ -549,6 +706,8 @@ mod tests {
                 ..dto::SessionState::default()
             },
             rows: std::sync::Arc::new(Vec::new()),
+            observation: Arc::new(Observation::default()),
+            diagnostic: None,
         }
     }
 
@@ -591,35 +750,19 @@ mod tests {
                 served += 1;
                 count.store(served, std::sync::atomic::Ordering::SeqCst);
                 if served == 1 {
-                    // The attach answer: enough of a publication for the client to
-                    // proceed to the subscription it will never get.
-                    let attach = dto::AttachResult {
-                        attachment_id: "a".into(),
-                        publication: dto::Publication {
-                            update_id: 1,
-                            tree: dto::TreeProjection {
-                                hash: "h".into(),
-                                rows: Some(Vec::new()),
-                            },
-                            state_hash: "s".into(),
-                            session: dto::SessionState::default(),
-                        },
-                    };
-                    let id = line
-                        .split("\"id\":\"")
-                        .nth(1)
-                        .and_then(|rest| rest.split('"').next())
-                        .unwrap_or_default()
-                        .to_string();
-                    let answer = serde_json::json!({"id": id, "result": attach});
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let answer = json!({"id": request["id"], "result": {"codec": "messagepack"}});
                     let mut writer = stream;
-                    use std::io::Write;
-                    let _ = writer.write_all(format!("{answer}\n").as_bytes());
+                    writeln!(writer, "{answer}").unwrap();
+                    let _: UiRequest = content::read_frame(&mut reader).unwrap();
+                    content::write_frame(&mut writer, &Reply::Attached).unwrap();
+                    // Keep the action socket alive while accepting its subscription.
+                    std::mem::drop(writer);
                     continue;
                 }
-                // The subscription: accepted by silence, for as long as the test
-                // leaves this thread alive.
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                // Wait for cancellation, not a wall-clock sleep.
+                let mut byte = [0];
+                let _ = std::io::Read::read(&mut reader, &mut byte);
                 return;
             }
         });
@@ -656,6 +799,148 @@ mod tests {
         );
         drop(peer);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_new_head_invalidates_input_behind_delayed_action_and_content_replies() {
+        use crate::ui_session::session::Session;
+        use std::io::Read;
+        let directory = std::env::temp_dir().join(format!("radar-handover-{}", random_uuid()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let baseline = Session::new().current().frame(None, false);
+        let delayed = Observation {
+            collected_at: Some("delayed".into()),
+            ..Observation::default()
+        };
+        let delayed = Content::encode(&delayed).unwrap();
+        let newest = Observation {
+            collected_at: Some("newest".into()),
+            ..Observation::default()
+        };
+        let newest = Content::encode(&newest).unwrap();
+        let one = Content::encode(&dto::SessionState {
+            gate: 1,
+            ..dto::SessionState::default()
+        })
+        .unwrap();
+        let two = Content::encode(&dto::SessionState {
+            gate: 2,
+            ..dto::SessionState::default()
+        })
+        .unwrap();
+        let older = Frame {
+            head: super::super::publication::Head {
+                update_id: 2,
+                observation: delayed.hash.clone(),
+                session: one.hash.clone(),
+                gate: 1,
+                ..baseline.head.clone()
+            },
+            content: vec![one],
+        };
+        let later = Frame {
+            head: super::super::publication::Head {
+                update_id: 3,
+                observation: newest.hash.clone(),
+                session: two.hash.clone(),
+                gate: 2,
+                ..baseline.head.clone()
+            },
+            content: vec![newest, baseline.content[1].clone(), two],
+        };
+        let (heads, pushed) = mpsc::sync_channel::<Frame>(1);
+        let (action_started, action_seen) = mpsc::sync_channel(1);
+        let (release_action, action_release) = mpsc::sync_channel(1);
+        let (fetch_started, fetch_seen) = mpsc::sync_channel(1);
+        let (release_fetch, fetch_release) = mpsc::sync_channel(1);
+        fn accept_open(
+            listener: &std::os::unix::net::UnixListener,
+        ) -> (UnixStream, BufReader<UnixStream>) {
+            let (mut writer, _) = listener.accept().unwrap();
+            writer.set_read_timeout(Some(REPLY_TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(writer.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(
+                writer,
+                "{}",
+                json!({"id":request["id"], "result":{"codec":"messagepack"}})
+            )
+            .unwrap();
+            (writer, reader)
+        }
+        let peer = thread::spawn(move || {
+            thread::scope(|scope| {
+                let (mut writer, mut reader) = accept_open(&listener);
+                assert!(matches!(
+                    content::read_frame::<_, UiRequest>(&mut reader).unwrap(),
+                    UiRequest::Attach { .. }
+                ));
+                content::write_frame(&mut writer, &Reply::Attached).unwrap();
+                scope.spawn(move || {
+                assert!(matches!(content::read_frame::<_, UiRequest>(&mut reader).unwrap(), UiRequest::Action { .. }));
+                action_started.send(()).unwrap();
+                action_release.recv_timeout(REPLY_TIMEOUT).unwrap();
+                content::write_frame(&mut writer, &Reply::Action { outcome: dto::ActionOutcome::Applied { update_id: 1, interaction_id: None, request_id: None } }).unwrap();
+                assert!(matches!(content::read_frame::<_, UiRequest>(&mut reader).unwrap(), UiRequest::Content { hash } if hash == delayed.hash));
+                fetch_started.send(()).unwrap();
+                fetch_release.recv_timeout(REPLY_TIMEOUT).unwrap();
+                content::write_frame(&mut writer, &Reply::Content { content: delayed }).unwrap();
+                let _ = reader.read(&mut [0]);
+            });
+                let (mut writer, mut reader) = accept_open(&listener);
+                content::write_frame(&mut writer, &baseline).unwrap();
+                for _ in 0..2 {
+                    let frame = pushed.recv_timeout(REPLY_TIMEOUT).unwrap();
+                    content::write_frame(&mut writer, &frame).unwrap();
+                }
+                let _ = reader.read(&mut [0]);
+            })
+        });
+        let client = UiClient::start(socket, dto::AttachmentRole::Dashboard, Wake::default());
+        crate::testing::eventually("baseline", || client.poll());
+        client.submit(dto::UiAction::CycleOrder);
+        action_seen.recv_timeout(REPLY_TIMEOUT).unwrap();
+        heads.send(older).unwrap();
+        crate::testing::eventually("gate before action receipt", || {
+            (client.inner.observed_gate.load(Ordering::SeqCst) == 1).then_some(())
+        });
+        assert!(
+            client.poll().is_none(),
+            "an incomplete head is not rendered"
+        );
+        client.submit(dto::UiAction::CycleOrder);
+        assert_eq!(
+            client.inner.pending.load(Ordering::SeqCst),
+            1,
+            "stale input is not queued"
+        );
+        release_action.send(()).unwrap();
+        fetch_seen.recv_timeout(REPLY_TIMEOUT).unwrap();
+        heads.send(later).unwrap();
+        crate::testing::eventually("gate before content reply", || {
+            (client.inner.observed_gate.load(Ordering::SeqCst) == 2).then_some(())
+        });
+        release_fetch.send(()).unwrap();
+        let final_view = crate::testing::eventually("latest coherent head", || {
+            let view = client.poll()?;
+            assert_ne!(
+                view.update_id, 2,
+                "superseded fetch must not adopt its old target"
+            );
+            (view.update_id == 3).then_some(view)
+        });
+        assert_eq!(
+            final_view.observation.collected_at.as_deref(),
+            Some("newest")
+        );
+        assert_eq!(final_view.state.gate, 2);
+        drop(client);
+        peer.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

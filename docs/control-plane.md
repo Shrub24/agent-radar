@@ -218,20 +218,85 @@ The durable record stores the request ID, edge, bound child, recorded pane and i
 
 `ui.session.v1` serves one daemon-hosted navigation session that every dashboard and sidebar shares: the tree, selection, folds, pane view, order, task and finished-session visibility, and the filter. Terminal geometry, details panels and process readings stay with each frontend. The session holds no lifecycle truth; it projects the observation the daemon already publishes. It lives in memory, so a daemon restart starts a new one.
 
-**Attach.** `ui.attach {attachment_id, role, interaction_id?}` takes a UUID the client mints for each connection incarnation and answers `{attachment_id, publication}`, the authoritative baseline. A detached presenter uses role `presenter` and the interaction ID to claim atomically with attachment; a conflicting claim refuses attachment. This does not consume an action number: every attachment's first action is still 1. A `publication` is `{update_id, tree:{hash, rows?}, state_hash, session}`. `update_id` is the daemon's own increasing counter and means nothing across daemon restarts. A fresh attachment has its own action numbering and never inherits another's; it resets the frontend's copy of shared state, not the session's.
+**Wire opening.** UI delivery uses MessagePack, not the JSON domain-RPC codec.
+A bounded JSON `ui.open` request selects `{"role":"actions"}` or
+`{"role":"subscribe","attachment_id":"<UUID>","session_only":false}`. The
+ordinary JSON reply confirms `{"codec":"messagepack","framing":"u32-be"}`;
+after its newline, that connection carries four-byte big-endian lengths followed
+by MessagePack bodies. An action/content connection remains ordered request/reply;
+a subscription pushes heads and accepts no further requests. Non-TUI RPCs,
+`observation.get`, events, presence, ingest and pi-radar are unchanged. There are
+no legacy JSON UI-method aliases.
 
-**Actions.** `ui.action {attachment_id, action_id, gate?, action}` runs on a connection of its own. Ids start at 1 and are processed in order, once. The answer is `applied {update_id}`, `refused {code, message}`, `replayed {update_id, ...}` for an id already accepted with the same action, `receipt_expired` when the bounded receipt cache (64 per attachment) no longer holds an id, `gap {expected}` when the id is ahead of the next one, `busy` or `detached`. Reusing an id for a different action is `refused`. A client that cannot read a result attaches again rather than resending; a receipt is a response cache, not an exactly-once guarantee. Only one attachment edits the filter at a time (`BeginFilterEdit`, `SetFilterQuery` with the complete query, `EndFilterEdit`); another attachment's edit is refused `not_editor`. Releasing the editor, or losing its attachment, keeps the accepted query. The filter is a case-insensitive fuzzy match that keeps the ancestors of matching rows.
+**Attach.** On the ordered binary connection send
+`{request:"attach", attachment_id, role, interaction_id?}`. The result tag is
+`attached`; the subscription's first complete head, not attach acceptance,
+establishes readiness. A presenter claims its interaction at attach time, without
+consuming an action number. Reconnect always uses a new attachment UUID, resets
+the local action counter to zero and discards old responses. It neither resets
+canonical state nor gives head counters meaning across daemon restarts.
 
-**Subscribe.** `ui.subscribe {attachment_id, known_tree_hash?}` is a push stream on its own connection. It sends one frame answering the request id with the current publication, then a frame whenever the session changes, each carrying the newest state: a subscriber too slow to read skips states rather than receiving a backlog, and never delays the session. Rows are sent only when their hash differs from the last frame on that stream (or from `known_tree_hash`); otherwise the client reuses the rows it holds for that hash. At most 16 subscriptions are open; a further one is refused `busy`, and a second for the same attachment is refused. A write that does not complete within 2 seconds, a peer that closes, `ui.detach` or daemon shutdown ends the stream and releases the attachment. Losing the stream means attaching again with a new id and taking its baseline.
+**Actions.** Send `{request:"action", attachment_id, action_id, gate?, action}`.
+The reply is `{result:"action", outcome:<ActionOutcome>}`. The existing outcome
+tags remain `applied`, `replayed`, `refused`, `receipt_expired`, `gap`,
+`busy` and `detached`. Sixty-four receipts per attachment preserve original
+interaction/request identities. A conflicting payload under a retained ID is
+refused; an uncertain action is never automatically replayed under a new ID.
+Ordinary input requires its interpretation-time gate stamp. Pre-admission errors
+use `{result:"refused", code, message}`; control-capacity refusal consumes no
+action number. Shared filtering retains one editor, complete-query updates,
+fuzzy matching and ancestry retention.
 
-**Content.** `ui.content.get {hash}` returns the rows for a hash among the most recent 16 trees. An older hash is refused `not_found` (`content_expired`); the caller then attaches again.
+**Heads and content.** A subscription frame is
+`{metadata:{update_id, observation, tree, session, gate, diagnostic}, content:[{hash,bytes},...]}`.
+The three reference fields are hashes; `bytes` is a MessagePack BIN, not a JSON
+byte array or base64 string. The baseline includes the requested payloads.
+Later frames inline changed content relative to the last frame delivered on
+that connection. A detached presenter sets `session_only:true` and need not
+download fleet observations. The full head always names all three lanes.
+
+Each hash is the XXH3-128 value of the exact encoded payload, written as 32
+lowercase hexadecimal digits. Named struct fields, explicit string enum tags,
+ordered map keys and domain-defined list order give deterministic bytes.
+Unsigned 64-bit integers are exact: future TypeScript consumers must decode
+large values as BigInt, not silently coerce them into JavaScript numbers.
+Publication sequence/time and hub delivery revisions are outside payload hashes;
+real sample times, domain identities, source failures and freshness remain facts.
+Portable byte fixtures live in `tests/fixtures/tui/`.
+
+A client displays only a complete head and holds current payloads plus bounded
+handover work, not an LRU/history. The receiver invalidates stale input promptly
+even while its materialiser waits for content or an action reply. Its pending
+target is latest-wins; already-executing recovery is bounded and fenced before
+adoption. Immutable encoded payload slices are reused by subscription writers;
+they are not serialized or copied afresh per subscriber.
+
+**Recovery and limits.** `{request:"content",hash}` returns
+`{result:"content",content:{hash,bytes}}`, or
+`{result:"expired",head:<current head>}`. Expiry causes current-baseline
+recovery, never substitution of different content for a requested hash.
+The daemon pins current content and retains at most 16 MiB / 32 historical
+entries. Encoded payloads are limited to 1 MiB, frames to 4 MiB and decoding depth
+to 64. Lengths are checked before body allocation; truncated frames are discarded.
+Size failure is `diagnostic:{code:"content_too_large"}`: the last coherent head
+remains available, a persistent stale diagnostic is shown, and no reconnect
+loop is used to retry the same rejected candidate. A newer usable candidate
+clears it. Encoding failures carry `{code:"encoding",message}`.
+
+At most 16 primary subscriptions are open; a second for the same attachment is
+refused. A stalled write has a two-second deadline and costs only its connection.
+Action/content requests retain the existing control admission and idle limits.
+`{request:"detach",attachment_id}`, peer close or shutdown releases the
+attachment and primary stream; admitted domain operations continue.
+`{request:"demand",attachment_id,processes}` sets local process-panel demand,
+aggregated with other attachments and existing readers and released on loss.
 
 #### Shared command interactions
 
 A command that changes the world is a session command: the frontend sends what the operator asked for and which row they were looking at, and never the target. `delete`, `restart`, `create_container` and `reload_container` run this way, as does `new_workspace`. An action such as:
 
 ```json
-{"attachment_id":"<origin UUID>","action_id":1,"gate":0,"action":{"action":"run_command","command":"new_workspace","row":null}}
+{"request":"action","attachment_id":"<origin UUID>","action_id":1,"gate":0,"action":{"action":"run_command","command":"new_workspace","row":null}}
 ```
 
 returns an applied receipt containing the new `interaction_id`. The session state retains a `blocking` specification: preparing/awaiting-result stage, owner attachment, fixed choices and diagnostic, and the presenting attachment. The owner runs the configured project source off the terminal loop and submits `provide_choices`. Only the owner prepares it. The main tree is blocked, but observations and cancellation keep progressing. There is one presentation per interaction, and it is identified by the interaction ID.

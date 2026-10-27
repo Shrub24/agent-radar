@@ -7,6 +7,7 @@ pub mod bus;
 pub mod cli;
 pub mod collector;
 pub mod config;
+pub mod content;
 pub mod control;
 pub mod control_plane;
 pub mod focus;
@@ -25,7 +26,6 @@ pub mod registry_observation;
 pub mod reset;
 pub mod runtime;
 pub mod service;
-pub mod snapshot_fetch;
 pub mod tasks;
 #[cfg(test)]
 pub(crate) mod testing;

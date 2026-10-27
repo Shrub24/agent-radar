@@ -359,9 +359,6 @@ pub enum Method {
     Observation,
     /// Durable handoff publication, retrieval and recipient receipt.
     Communication,
-    /// The shared UI session: attach, detach, ordered actions and retained
-    /// content. `ui.subscribe` is a push stream and is opened by the transport.
-    Ui,
     /// Volatile task sessions received from extension publishers.
     Tasks,
     /// Registry reads and writes: the daemon's own durable records, answered
@@ -393,7 +390,6 @@ pub fn classify(method: &str) -> Option<Method> {
         | "communication.inbox"
         | "communication.get"
         | "communication.ack" => Method::Communication,
-        "ui.attach" | "ui.detach" | "ui.action" | "ui.content.get" | "ui.subscribe" => Method::Ui,
         "tasks.list" => Method::Tasks,
         "agent.presence"
         | "agent.release"

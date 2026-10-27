@@ -70,6 +70,7 @@ mod subject_control;
 mod subject_reads;
 mod sweeper;
 mod ui;
+mod ui_binary;
 mod verification;
 use admission::*;
 use child_close::*;
@@ -894,10 +895,6 @@ fn handle_line(
         Method::Admit => answer(writer, admit_request(core, &request, verification)),
         Method::Wake => answer(writer, wake_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
-        Method::Ui => {
-            let handle = locked(core).ui.clone();
-            answer(writer, ui::request(handle.as_ref(), &request));
-        }
         Method::Operation(operation) => {
             let response = execute(operation, &request, core, verification);
             answer(writer, response);

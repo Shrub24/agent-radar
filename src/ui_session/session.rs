@@ -13,6 +13,8 @@ use serde_json::Value;
 
 use super::gate::{Completion, Gate};
 use super::navigation::{self, NavState, NavStep, Navigation, PaneView, RowOrder, TaskRows};
+use super::publication::{Frame, Head, Observation};
+use crate::content::{Content, Store as ContentStore};
 use crate::control_plane::public_contracts::ui_session as dto;
 use crate::model::AgentState;
 use crate::observation::ObservationState;
@@ -21,8 +23,6 @@ use crate::tree::{FleetTree, RowId, RowKind, TaskId};
 
 /// Receipts kept per attachment. An older action id answers `receipt_expired`.
 const RECEIPTS: usize = 64;
-/// Superseded tree payloads kept besides the current one.
-const RETAINED_TREES: usize = 16;
 
 struct Receipt {
     action_id: u64,
@@ -44,19 +44,36 @@ pub struct Published {
     pub rows: Arc<Vec<dto::TreeRow>>,
     pub state_hash: String,
     pub state: dto::SessionState,
+    pub content: [Content; 3],
+    pub diagnostic: Option<dto::PublicationFailure>,
 }
 
 impl Published {
-    /// The wire form, with rows only when the receiver lacks `known` content.
-    pub fn publication(&self, known: Option<&str>) -> dto::Publication {
-        dto::Publication {
+    pub fn head(&self) -> Head {
+        Head {
             update_id: self.update_id,
-            tree: dto::TreeProjection {
-                hash: self.tree_hash.clone(),
-                rows: (known != Some(self.tree_hash.as_str())).then(|| (*self.rows).clone()),
-            },
-            state_hash: self.state_hash.clone(),
-            session: self.state.clone(),
+            observation: self.content[0].hash.clone(),
+            tree: self.content[1].hash.clone(),
+            session: self.content[2].hash.clone(),
+            gate: self.state.gate,
+            diagnostic: self.diagnostic.clone(),
+        }
+    }
+
+    pub fn frame(&self, known: Option<&Head>, session_only: bool) -> Frame {
+        let hashes = known.map(|h| [&h.observation, &h.tree, &h.session]);
+        let content = self
+            .content
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                (!session_only || *i == 2) && hashes.as_ref().is_none_or(|h| *h[*i] != c.hash)
+            })
+            .map(|(_, c)| c.clone())
+            .collect();
+        Frame {
+            head: self.head(),
+            content,
         }
     }
 }
@@ -78,7 +95,10 @@ pub struct Session {
     /// The held key of each effect this session dispatched, by request id.
     held: HashMap<String, String>,
     current: Published,
-    retained: VecDeque<(String, Arc<Vec<dto::TreeRow>>)>,
+    content_store: ContentStore,
+    observation_content: Content,
+    tree_dirty: bool,
+    observation_error: Option<dto::PublicationFailure>,
 }
 
 impl Default for Session {
@@ -106,8 +126,18 @@ impl Session {
                 rows: Arc::new(Vec::new()),
                 state_hash: String::new(),
                 state: dto::SessionState::default(),
+                content: [
+                    Content::encode(&Observation::default()).expect("empty observation"),
+                    Content::encode(&Vec::<dto::TreeRow>::new()).expect("empty rows"),
+                    Content::encode(&dto::SessionState::default()).expect("empty session"),
+                ],
+                diagnostic: None,
             },
-            retained: VecDeque::new(),
+            content_store: ContentStore::default(),
+            observation_content: Content::encode(&Observation::default())
+                .expect("empty observation"),
+            tree_dirty: true,
+            observation_error: None,
         };
         session.project();
         session
@@ -138,6 +168,23 @@ impl Session {
     /// Folds a new observation into the tree. Returns whether anything a
     /// presentation shows changed.
     pub fn observe(&mut self, state: &ObservationState, tasks: Option<&Value>) -> bool {
+        let observation = Observation {
+            observation: state.clone(),
+            tasks: tasks.cloned(),
+            ..Observation::default()
+        };
+        match Content::encode(&observation) {
+            Ok(content) => self.observe_content(&observation, content),
+            Err(error) => self.observation_failed(error.into()),
+        }
+    }
+
+    pub fn observe_content(&mut self, observation: &Observation, content: Content) -> bool {
+        self.observation_content = content;
+        self.tree_dirty = true;
+        self.observation_error = None;
+        let state = &observation.observation;
+        let tasks = observation.tasks.as_ref();
         if let Some(tasks) = tasks
             && let Ok(events) = crate::control_plane::client::tasks_from_snapshot(tasks)
         {
@@ -182,14 +229,22 @@ impl Session {
         known
     }
 
-    pub fn content(&self, hash: &str) -> Option<Arc<Vec<dto::TreeRow>>> {
-        if self.current.tree_hash == hash {
-            return Some(Arc::clone(&self.current.rows));
+    pub fn encoded_content(&self, hash: &str) -> Option<Content> {
+        self.content_store.get(hash)
+    }
+
+    pub fn observation_failed(&mut self, diagnostic: dto::PublicationFailure) -> bool {
+        self.observation_error = Some(diagnostic.clone());
+        self.content_failed(diagnostic)
+    }
+
+    pub fn content_failed(&mut self, diagnostic: dto::PublicationFailure) -> bool {
+        if self.current.diagnostic.as_ref() == Some(&diagnostic) {
+            return false;
         }
-        self.retained
-            .iter()
-            .find(|(held, _)| held == hash)
-            .map(|(_, rows)| Arc::clone(rows))
+        self.current.diagnostic = Some(diagnostic);
+        self.current.update_id += 1;
+        true
     }
 
     /// Applies action `action_id` of attachment `id` once and in order.
@@ -623,25 +678,6 @@ impl Session {
     /// Rebuilds the published projection from the model. Content that did not
     /// change keeps its hash and its update id.
     fn project(&mut self) -> bool {
-        let rows: Vec<dto::TreeRow> = self
-            .nav
-            .visible_rows()
-            .iter()
-            .map(|row| dto::TreeRow {
-                id: ui_row_id(row.id),
-                depth: row.depth as u32,
-                label: row.node.row.title().to_string(),
-                state: match &row.node.row.kind {
-                    RowKind::Agent(agent) => Some(agent_state(&agent.state)),
-                    _ => None,
-                },
-                has_children: row.has_children,
-                collapsed: row.collapsed,
-                needs_attention: navigation::needs_attention(row),
-                working: navigation::is_working(row),
-            })
-            .collect();
-        let tree_hash = hash(&rows);
         let nav = self.nav.state();
         let state = dto::SessionState {
             selected: nav.selected.as_ref().map(ui_row_id),
@@ -661,7 +697,11 @@ impl Session {
                 running: nav.task_rows.running,
                 all: nav.task_rows.all,
             },
-            collapsed: nav.collapsed.iter().map(ui_row_id).collect(),
+            collapsed: {
+                let mut rows: Vec<_> = nav.collapsed.iter().map(ui_row_id).collect();
+                rows.sort_by_cached_key(|row| serde_json::to_string(row).expect("row id"));
+                rows
+            },
             gate: self.gate.generation(),
             blocking: self.gate.blocking(),
             operation: self.operation.clone(),
@@ -671,36 +711,87 @@ impl Session {
                 editor: self.editor.clone(),
             },
         };
-        let state_hash = hash(&state);
-        if tree_hash == self.current.tree_hash && state_hash == self.current.state_hash {
+        let rows: Arc<Vec<dto::TreeRow>> =
+            if !self.tree_dirty && same_tree_options(&state, &self.current.state) {
+                Arc::clone(&self.current.rows)
+            } else {
+                Arc::new(
+                    self.nav
+                        .visible_rows()
+                        .iter()
+                        .map(|row| dto::TreeRow {
+                            id: ui_row_id(row.id),
+                            depth: row.depth as u32,
+                            label: row.node.row.title().to_string(),
+                            state: match &row.node.row.kind {
+                                RowKind::Agent(agent) => Some(agent_state(&agent.state)),
+                                _ => None,
+                            },
+                            has_children: row.has_children,
+                            collapsed: row.collapsed,
+                            needs_attention: navigation::needs_attention(row),
+                            working: navigation::is_working(row),
+                        })
+                        .collect(),
+                )
+            };
+        let tree_content = if rows == self.current.rows {
+            self.current.content[1].clone()
+        } else {
+            match Content::encode(&rows) {
+                Ok(content) => content,
+                Err(error) => return self.content_failed(error.into()),
+            }
+        };
+        let tree_hash = tree_content.hash.clone();
+        let session_content = if state == self.current.state {
+            self.current.content[2].clone()
+        } else {
+            match Content::encode(&state) {
+                Ok(content) => content,
+                Err(error) => return self.content_failed(error.into()),
+            }
+        };
+        let state_hash = session_content.hash.clone();
+        if tree_hash == self.current.tree_hash
+            && state_hash == self.current.state_hash
+            && self.observation_content.hash == self.current.content[0].hash
+            && self.current.diagnostic == self.observation_error
+        {
+            self.tree_dirty = false;
             return false;
         }
-        if tree_hash != self.current.tree_hash {
-            // Stored before it is published, so a reference never outruns its content.
-            let old = std::mem::replace(&mut self.current.rows, Arc::new(rows));
-            if !self.current.tree_hash.is_empty() {
-                self.retained
-                    .push_back((self.current.tree_hash.clone(), old));
-            }
-            self.retained.retain(|(held, _)| *held != tree_hash);
-            while self.retained.len() > RETAINED_TREES {
-                self.retained.pop_front();
-            }
-        }
+        let content = self.content_store.pin(vec![
+            self.observation_content.clone(),
+            tree_content,
+            session_content,
+        ]);
+        let rows = if tree_hash == self.current.tree_hash {
+            Arc::clone(&self.current.rows)
+        } else {
+            rows
+        };
         self.current = Published {
             update_id: self.current.update_id + 1,
             tree_hash,
-            rows: Arc::clone(&self.current.rows),
+            rows,
             state_hash,
             state,
+            content: content.try_into().expect("three lanes"),
+            diagnostic: self.observation_error.clone(),
         };
+        self.tree_dirty = false;
         true
     }
 }
 
-fn hash<T: serde::Serialize>(value: &T) -> String {
-    let bytes = serde_json::to_vec(value).expect("projection payloads serialize");
-    blake3::hash(&bytes).to_hex().to_string()
+fn same_tree_options(a: &dto::SessionState, b: &dto::SessionState) -> bool {
+    a.order == b.order
+        && a.pane_view == b.pane_view
+        && a.show_finished == b.show_finished
+        && a.tasks == b.tasks
+        && a.collapsed == b.collapsed
+        && a.filter.query == b.filter.query
 }
 
 fn agent_state(state: &AgentState) -> dto::AgentStateDto {
@@ -832,13 +923,106 @@ mod tests {
         assert_eq!(after.tree_hash, before.tree_hash);
         assert_ne!(after.state_hash, before.state_hash);
         assert!(after.update_id > before.update_id);
-        assert!(
-            after
-                .publication(Some(&before.tree_hash))
-                .tree
-                .rows
-                .is_none()
+        let delta = after.frame(Some(&before.head()), false);
+        assert_eq!(delta.content.len(), 1);
+        assert_eq!(delta.content[0].hash, after.state_hash);
+    }
+
+    #[test]
+    fn an_oversized_observation_keeps_the_last_head_stale_until_observation_recovers() {
+        let mut session = seeded();
+        let before = session.current().head();
+        let state = session.state.clone().unwrap();
+        let huge = serde_json::json!({"oversized": "x".repeat(crate::content::MAX_PAYLOAD)});
+        assert!(session.observe(&state, Some(&huge)));
+        assert_eq!(session.current().head().observation, before.observation);
+        assert_eq!(
+            session.current().diagnostic.as_ref(),
+            Some(&dto::PublicationFailure::ContentTooLarge)
         );
+        let failed_id = session.current().update_id;
+        assert!(!session.observe(&state, Some(&huge)));
+        assert_eq!(session.current().update_id, failed_id);
+        session.act("a", 1, A::Move { delta: 1 });
+        assert_eq!(
+            session.current().diagnostic.as_ref(),
+            Some(&dto::PublicationFailure::ContentTooLarge)
+        );
+        assert!(session.observe(&state, None));
+        assert!(session.current().diagnostic.is_none());
+    }
+
+    #[test]
+    fn the_head_joins_rows_to_the_observation_that_produced_them() {
+        let mut session = seeded();
+        let mut fleet = crate::model::testing::fleet();
+        let workspace = fleet.workspaces[0].workspace_id.clone();
+        fleet.workspaces[0].label = Some("new snapshot".into());
+        let mut state = ObservationState::new();
+        state.apply_success(fleet);
+        session.observe(&state, None);
+        let frame = session.current().frame(None, false);
+        let observation: Observation = frame
+            .content
+            .iter()
+            .find(|c| c.hash == frame.head.observation)
+            .unwrap()
+            .read()
+            .unwrap();
+        let rows: Vec<dto::TreeRow> = frame
+            .content
+            .iter()
+            .find(|c| c.hash == frame.head.tree)
+            .unwrap()
+            .read()
+            .unwrap();
+        assert_eq!(
+            observation.observation.inventory().unwrap().workspaces[0]
+                .label
+                .as_deref(),
+            Some("new snapshot")
+        );
+        assert!(rows.iter().any(|row| row.id
+            == dto::UiRowId::Workspace {
+                id: workspace.clone()
+            }
+            && row.label.contains("new snapshot")));
+        let session: dto::SessionState = frame
+            .content
+            .iter()
+            .find(|c| c.hash == frame.head.session)
+            .unwrap()
+            .read()
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| Some(&row.id) == session.selected.as_ref())
+        );
+        assert_eq!(session.gate, frame.head.gate);
+    }
+
+    #[test]
+    fn an_observation_only_head_keeps_tree_and_session_content() {
+        let mut session = seeded();
+        let before = session.current().clone();
+        let observation = Observation {
+            observation: session.state.clone().unwrap(),
+            collected_at: Some("new collection".into()),
+            ..Observation::default()
+        };
+        session.observe_content(&observation, Content::encode(&observation).unwrap());
+        let after = session.current();
+        assert_ne!(before.head().observation, after.head().observation);
+        assert_eq!(before.tree_hash, after.tree_hash);
+        assert_eq!(before.state_hash, after.state_hash);
+        assert!(Arc::ptr_eq(
+            &before.content[1].bytes,
+            &after.content[1].bytes
+        ));
+        assert!(Arc::ptr_eq(
+            &before.content[2].bytes,
+            &after.content[2].bytes
+        ));
     }
 
     #[test]
@@ -935,8 +1119,8 @@ mod tests {
         session.act("a", 4, A::CyclePaneView);
         session.act("a", 5, A::ToggleTasks);
         // Returning to earlier content reuses its payload and hash.
-        assert!(session.content(&first).is_some());
-        assert!(session.content("unknown").is_none());
+        assert!(session.encoded_content(&first).is_some());
+        assert!(session.encoded_content("unknown").is_none());
     }
 
     #[test]

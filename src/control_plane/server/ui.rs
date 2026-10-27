@@ -2,16 +2,14 @@
 //! stream. The session itself lives in [`crate::ui_session`]; this adapts it to
 //! the wire and owns nothing of its own.
 
-use std::future::Future;
-use std::pin::Pin;
-
 use serde_json::json;
 
+use super::ui_binary::BinaryFrames;
 use super::{Request, Response, decode_params};
 use crate::control_plane::protocol::{self, Code, Refusal};
 use crate::control_plane::public_contracts::ui_session as dto;
 use crate::control_plane::transport::FrameStream;
-use crate::ui_session::actor::{Subscription, UiError, UiHandle};
+use crate::ui_session::actor::{UiError, UiHandle};
 
 fn refusal(request: &Request, error: UiError) -> Response {
     let (code, message) = match error {
@@ -26,83 +24,6 @@ fn refusal(request: &Request, error: UiError) -> Response {
         ),
     };
     Response::refused(&request.id, &Refusal::new(code, message))
-}
-
-/// Serves `ui.attach`, `ui.detach`, `ui.action` and `ui.content.get`.
-pub(super) fn request(handle: Option<&UiHandle>, request: &Request) -> Response {
-    let Some(handle) = handle else {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(Code::BackendUnavailable, "this daemon has no UI session"),
-        );
-    };
-    match request.method.as_str() {
-        "ui.attach" => {
-            let params: dto::AttachParams = match decode_params(request) {
-                Ok(params) => params,
-                Err(response) => return response,
-            };
-            match handle.attach_for(&params.attachment_id, params.role, params.interaction_id) {
-                Ok(result) => Response::ok(&request.id, json!(result)),
-                Err(error) => refusal(request, error),
-            }
-        }
-        "ui.detach" => {
-            let params: dto::DetachParams = match decode_params(request) {
-                Ok(params) => params,
-                Err(response) => return response,
-            };
-            handle.detach(&params.attachment_id);
-            Response::ok(&request.id, json!(dto::DetachResult { released: true }))
-        }
-        "ui.action" => {
-            let params: dto::ActionParams = match decode_params(request) {
-                Ok(params) => params,
-                Err(response) => return response,
-            };
-            if params.action.is_ordinary() && params.gate.is_none() {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(
-                        Code::BadParams,
-                        "ordinary UI input requires its displayed gate generation",
-                    ),
-                );
-            }
-            match handle.act(
-                &params.attachment_id,
-                params.action_id,
-                params.gate,
-                params.action,
-            ) {
-                Ok(outcome) => Response::ok(&request.id, json!(outcome)),
-                Err(error) => refusal(request, error),
-            }
-        }
-        "ui.content.get" => {
-            let params: dto::ContentGetParams = match decode_params(request) {
-                Ok(params) => params,
-                Err(response) => return response,
-            };
-            match handle.content(&params.hash) {
-                Ok(Some(rows)) => Response::ok(
-                    &request.id,
-                    json!(dto::ContentGetResult {
-                        rows: (*rows).clone()
-                    }),
-                ),
-                Ok(None) => Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::NotFound, "content_expired"),
-                ),
-                Err(error) => refusal(request, error),
-            }
-        }
-        other => Response::refused(
-            &request.id,
-            &Refusal::new(Code::UnknownMethod, format!("unknown method `{other}`")),
-        ),
-    }
 }
 
 /// Reuses domain admission directly, not a self-RPC or a second creation path.
@@ -273,27 +194,13 @@ fn outcome_status(answer: &serde_json::Value) -> dto::CommandStatus {
     }
 }
 
-struct Frames {
-    id: String,
-    subscription: Subscription,
-}
-
-impl FrameStream for Frames {
-    fn next<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
-        Box::pin(async move {
-            let publication = self.subscription.next().await?;
-            serde_json::to_vec(&Response::ok(&self.id, json!(publication))).ok()
-        })
-    }
-}
-
-/// Opens the push stream `ui.subscribe` asks for.
+/// Explicitly switches a TUI connection from its JSON opener to binary frames.
 pub(super) fn open(
     handle: Option<&UiHandle>,
     line: &[u8],
 ) -> Option<Result<Box<dyn FrameStream>, Response>> {
     let request = protocol::decode_request(line).ok()?;
-    if request.method != "ui.subscribe" {
+    if request.method != "ui.open" {
         return None;
     }
     let Some(handle) = handle else {
@@ -302,17 +209,23 @@ pub(super) fn open(
             &Refusal::new(Code::BackendUnavailable, "this daemon has no UI session"),
         )));
     };
-    let params: dto::SubscribeParams = match decode_params(&request) {
+    let params: crate::ui_session::publication::Open = match decode_params(&request) {
         Ok(params) => params,
         Err(response) => return Some(Err(response)),
     };
-    Some(
-        match handle.subscribe(&params.attachment_id, params.known_tree_hash) {
-            Ok(subscription) => Ok(Box::new(Frames {
-                id: request.id,
-                subscription,
-            })),
-            Err(error) => Err(refusal(&request, error)),
+    let (subscription, session_only) = match params {
+        crate::ui_session::publication::Open::Actions => (None, false),
+        crate::ui_session::publication::Open::Subscribe {
+            attachment_id,
+            session_only,
+        } => match handle.subscribe(&attachment_id) {
+            Ok(subscription) => (Some(subscription), session_only),
+            Err(error) => return Some(Err(refusal(&request, error))),
         },
-    )
+    };
+    Some(Ok(Box::new(BinaryFrames {
+        handle: handle.clone(),
+        subscription,
+        session_only,
+    })))
 }

@@ -1049,9 +1049,12 @@ One Cargo package, with `radar` as its binary:
   than proof that a pane went away.
 - `src/control_plane/observation.rs`: the daemon's one observation sampler and
   the immutable revisioned snapshot every reader shares. It samples only while a
-  reader has asked, and publishing a revision appends nothing to the journal.
-- `src/snapshot_fetch.rs`: the dashboard's read of that snapshot. The dashboard
-  collects nothing itself and has no local fallback.
+  reader or active TUI attachment has asked, and publishing appends nothing to the journal.
+- `src/ui_session/publication.rs` and `src/ui_session/client.rs`: observation,
+  tree and UI-session payloads adopted under one coherent push head. The TUI
+  collects nothing itself and has no parallel observation-fetch connection.
+- `src/content.rs`: shared bounded MessagePack encoding, XXH3-128 content,
+  immutable byte retention and segmented framing; no UI-domain dependencies.
 - `src/bus.rs` and `src/control_plane/ingest.rs`: publisher protocol decoding and daemon-owned volatile task ingestion; `src/control_plane/transport/` provides the shared bounded socket runtime.
 - `src/model.rs` / `src/observation.rs`: normalized facts and reconciliation.
 - `src/config.rs` / `src/theme.rs`: the colours, where they come from, and the

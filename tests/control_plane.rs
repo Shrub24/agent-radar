@@ -2928,6 +2928,16 @@ impl Client {
     }
 
     fn call(&mut self, method: &str, params: Value) -> Value {
+        if matches!(method, "ui.attach" | "ui.action" | "ui.detach") {
+            return ui_call(
+                self.writer.peer_addr().unwrap().as_pathname().unwrap(),
+                method,
+                params,
+            );
+        }
+        if method == "ui.subscribe" {
+            return self.call("ui.open", json!({"role": "subscribe", "attachment_id": params["attachment_id"], "session_only": false}));
+        }
         let id = random_uuid();
         self.call_id(&id, method, params)
     }
@@ -2957,6 +2967,26 @@ impl Client {
     fn call_id(&mut self, id: &str, method: &str, params: Value) -> Value {
         self.send(&request_line(id, method, params));
         self.read()
+    }
+}
+
+// UI-specific test adapter: the production path is the same framed protocol,
+// not JSON RPC aliases. Each isolated test request has a bounded connection.
+fn ui_call(path: &Path, method: &str, mut params: Value) -> Value {
+    use agent_radar::{content, ui_session::publication as wire};
+    let mut client = Client::dial(path);
+    let opened = client.call("ui.open", json!({"role": "actions"}));
+    assert!(opened["result"].is_object(), "{opened}");
+    params["request"] = json!(method.strip_prefix("ui.").unwrap());
+    let request: wire::Request = serde_json::from_value(params.clone()).unwrap();
+    content::write_frame(&mut client.writer, &request).unwrap();
+    match content::read_frame::<_, wire::Reply>(&mut client.reader).unwrap() {
+        wire::Reply::Attached => json!({"result": {"attachment_id": params["attachment_id"]}}),
+        wire::Reply::Action { outcome } => json!({"result": outcome}),
+        wire::Reply::Refused { code, message } => {
+            json!({"error": {"code": code, "message": message}})
+        }
+        other => panic!("unexpected UI response: {other:?}"),
     }
 }
 
@@ -12162,10 +12192,278 @@ fn wait_for_text(path: &Path) -> String {
     }
 }
 
-/// The UI session over a real socket: an attachment's push stream carries the
-/// baseline and then each newer state with no request in between, an action on
-/// its own connection is never held up by the idle stream, and closing the
-/// stream releases the attachment.
+/// Opt-in evidence, not a timing assertion or a normal gate test.
+#[test]
+#[ignore = "release-build key-handler to in-memory-frame latency measurement"]
+fn unified_publication_latency_probe() {
+    use agent_radar::control_plane::public_contracts::ui_session as dto;
+    use agent_radar::ui_session::client::{UiClient, Wake};
+    use agent_radar::{App, content, ui};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend, widgets::ListState};
+    let sandbox = Sandbox::new("unified-publication-latency");
+    let (template, _) = populated_graph();
+    let mut inventory = FleetObservation::default();
+    for w in 0..24 {
+        let id = format!("w{w}");
+        let tab_id = format!("{id}:t1");
+        let mut workspace = template.workspaces[0].clone();
+        workspace.workspace_id = id.clone();
+        workspace.label = Some(format!("workspace {w}"));
+        inventory.workspaces.push(workspace);
+        let mut tab = template.tabs[0].clone();
+        tab.workspace_id = id.clone();
+        tab.tab_id = tab_id.clone();
+        inventory.tabs.push(tab);
+        for p in 0..30 {
+            let mut pane = template.panes[0].clone();
+            pane.location = Location {
+                workspace_id: id.clone(),
+                tab_id: tab_id.clone(),
+                pane_id: format!("{id}:p{p}"),
+            };
+            pane.label = Some(format!("worker {p}"));
+            inventory.panes.push(pane);
+        }
+    }
+    let mut daemon = sandbox.daemon_with(Arc::new(FakeBackend::new(
+        inventory,
+        FocusAnswer::Completed,
+    )));
+    let wake = Wake::default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let wait = || {
+        rt.block_on(async {
+            tokio::time::timeout(RECONNECT_DEADLINE, wake.woken())
+                .await
+                .expect("frontend wake");
+        })
+    };
+    // Establish canonical all-pane visibility before attaching the measured App.
+    let setup = UiClient::start(
+        daemon.path().to_path_buf(),
+        dto::AttachmentRole::Dashboard,
+        wake.clone(),
+    );
+    loop {
+        if let Some(view) = setup.poll() {
+            if view.state.pane_view == dto::PaneViewDto::All {
+                break;
+            }
+            setup.submit(dto::UiAction::CyclePaneView);
+        }
+        wait();
+    }
+    drop(setup);
+    let mut app = App::new();
+    app.attach_session(UiClient::start(
+        daemon.path().to_path_buf(),
+        dto::AttachmentRole::Dashboard,
+        wake.clone(),
+    ));
+    loop {
+        app.apply_session_update();
+        if app.session_mirror().is_some_and(|m| m.rows.len() == 744) {
+            break;
+        }
+        wait();
+    }
+    let mirror = app.session_mirror().unwrap();
+    let mut encode = Vec::new();
+    let mut decode = Vec::new();
+    for _ in 0..100 {
+        let started = Instant::now();
+        let encoded = content::Content::encode(mirror.observation.as_ref()).unwrap();
+        encode.push(started.elapsed().as_micros());
+        let started = Instant::now();
+        let _: agent_radar::ui_session::publication::Observation = encoded.read().unwrap();
+        decode.push(started.elapsed().as_micros());
+    }
+    let observation = content::Content::encode(mirror.observation.as_ref()).unwrap();
+    let tree = content::Content::encode(mirror.rows.as_ref()).unwrap();
+    let session = content::Content::encode(&mirror.state).unwrap();
+    let head = dto::Head {
+        update_id: mirror.update_id,
+        observation: observation.hash.clone(),
+        tree: tree.hash.clone(),
+        session: session.hash.clone(),
+        gate: mirror.state.gate,
+        diagnostic: None,
+    };
+    let parts =
+        content::content_frame(&head, &[observation.clone(), tree.clone(), session.clone()])
+            .unwrap();
+    let frame_bytes: usize = parts.0.iter().map(|p| p.len()).sum();
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let mut list = ListState::default();
+    let mut timings = Vec::new();
+    for tick in 0..50 {
+        let before = app.session_mirror().unwrap().update_id;
+        let started = Instant::now();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let target = app
+            .selected_id()
+            .map(|id| agent_radar::ui_session::session::ui_row_id(&id));
+        loop {
+            app.apply_session_update();
+            if app
+                .session_mirror()
+                .is_some_and(|m| m.update_id > before && m.state.selected == target)
+            {
+                break;
+            }
+            wait();
+        }
+        let facts = app.session_observation().unwrap();
+        terminal
+            .draw(|frame| {
+                ui::render(frame, &facts.observation, &app, &mut list, tick);
+            })
+            .unwrap();
+        timings.push(started.elapsed().as_micros());
+    }
+    fn summary(mut values: Vec<u128>) -> Value {
+        values.sort_unstable();
+        json!({"samples":values.len(), "median_us":values[values.len()/2], "p95_us":values[values.len()*95/100], "max_us":values[values.len()-1]})
+    }
+    println!(
+        "{}",
+        json!({"workspaces":24,"panes":720,"rows":744,"viewport":"120x40","observation_bytes":observation.bytes.len(),"tree_bytes":tree.bytes.len(),"session_bytes":session.bytes.len(),"full_frame_bytes":frame_bytes,"observation_encode_hash":summary(encode),"observation_hash_decode":summary(decode),"key_handler_to_memory_frame":summary(timings)})
+    );
+    drop(app);
+    daemon.stop();
+}
+
+/// A stalled large baseline costs only its writer, not actor/other-view progress.
+#[test]
+fn a_stalled_binary_subscriber_is_closed_without_blocking_another_view() {
+    use agent_radar::control_plane::public_contracts::ui_session as dto;
+    use agent_radar::ui_session::client::{UiClient, Wake};
+    let sandbox = Sandbox::new("ui-slow-reader");
+    let (mut inventory, _) = populated_graph();
+    inventory.workspaces[0].label = Some("large workspace ".repeat(32 * 1024));
+    let backend = Arc::new(FakeBackend::new(inventory, FocusAnswer::Completed));
+    let mut daemon = sandbox.daemon_with(backend);
+    let mut slow = Client::dial(daemon.path());
+    let attachment = random_uuid();
+    slow.call(
+        "ui.attach",
+        json!({"attachment_id":attachment,"role":"sidebar"}),
+    );
+    let accepted = slow.call("ui.subscribe", json!({"attachment_id":attachment}));
+    assert!(accepted["result"].is_object(), "{accepted}");
+    // Do not read any of its binary frames.
+    let fast = UiClient::start(
+        daemon.path().to_path_buf(),
+        dto::AttachmentRole::Dashboard,
+        Wake::default(),
+    );
+    let deadline = Instant::now() + RECONNECT_DEADLINE;
+    loop {
+        if let Some(view) = fast.poll()
+            && view.observation.observation.inventory().is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the other view did not receive observation"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    fast.submit(dto::UiAction::CycleOrder);
+    loop {
+        if let Some(view) = fast.poll()
+            && view.state.order == dto::RowOrderDto::State
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a slow subscriber held up an action/publication"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut reader = Client::dial(daemon.path());
+    let mut number = 0;
+    loop {
+        number += 1;
+        let reply = reader.call("ui.action", json!({"attachment_id":attachment,"action_id":number,"gate":0,"action":{"action":"move","delta":0}}));
+        if reply["result"]["outcome"] == "detached" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stalled writer did not release its attachment: {reply}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    drop((fast, slow));
+    daemon.stop();
+}
+
+#[test]
+fn an_oversized_tui_observation_is_explicit_without_a_reconnect_loop() {
+    use agent_radar::control_plane::public_contracts::ui_session as dto;
+    use agent_radar::ui_session::client::{UiClient, Wake};
+    let sandbox = Sandbox::new("ui-oversized");
+    let (mut inventory, _) = populated_graph();
+    inventory.workspaces[0].label = Some("x".repeat(agent_radar::content::MAX_PAYLOAD));
+    let mut daemon = sandbox.daemon_with(Arc::new(FakeBackend::new(
+        inventory,
+        FocusAnswer::Completed,
+    )));
+    let client = UiClient::start(
+        daemon.path().to_path_buf(),
+        dto::AttachmentRole::Dashboard,
+        Wake::default(),
+    );
+    let deadline = Instant::now() + RECONNECT_DEADLINE;
+    let attachment = loop {
+        if let Some(view) = client.poll()
+            && view.diagnostic == Some(dto::PublicationFailure::ContentTooLarge)
+        {
+            break view.attachment_id.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no explicit oversized-candidate diagnostic"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    client.submit(dto::UiAction::CycleOrder);
+    loop {
+        if let Some(view) = client.poll()
+            && view.state.order == dto::RowOrderDto::State
+        {
+            assert_eq!(
+                view.attachment_id, attachment,
+                "a rejected candidate does not break the subscription"
+            );
+            assert_eq!(
+                view.diagnostic,
+                Some(dto::PublicationFailure::ContentTooLarge)
+            );
+            assert!(
+                view.observation.observation.inventory().is_none(),
+                "no partial oversized observation was adopted"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the size diagnostic parked the action path"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    daemon.stop();
+}
+
+/// Baseline, push, independent actions and release over the real binary socket.
 #[test]
 fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
     let sandbox = Sandbox::new("ui-subscribe");
@@ -12200,22 +12498,30 @@ fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
         "{}",
         request_line(
             &random_uuid(),
-            "ui.subscribe",
-            json!({"attachment_id": attachment})
+            "ui.open",
+            json!({"role":"subscribe", "attachment_id": attachment, "session_only": false})
         )
     )
     .expect("subscribe");
     let mut frames = BufReader::new(stream.try_clone().expect("clone"));
-    let mut next = || -> Value {
-        let mut line = String::new();
-        frames.read_line(&mut line).expect("a pushed frame");
-        serde_json::from_str(&line).expect("a frame is one JSON line")
+    let mut accepted = String::new();
+    frames.read_line(&mut accepted).expect("opening answer");
+    assert!(serde_json::from_str::<Value>(&accepted).unwrap()["result"].is_object());
+    let mut next = || -> agent_radar::ui_session::publication::Frame {
+        agent_radar::content::read_frame(&mut frames).expect("a complete binary head")
     };
     let baseline = next();
-    let before = baseline["result"]["update_id"].as_u64().expect("update id");
+    let before = baseline.head.update_id;
+    let session: agent_radar::control_plane::public_contracts::ui_session::SessionState = baseline
+        .content
+        .iter()
+        .find(|c| c.hash == baseline.head.session)
+        .unwrap()
+        .read()
+        .unwrap();
     assert_eq!(
-        baseline["result"]["session"]["order"], "source",
-        "{baseline}"
+        session.order,
+        agent_radar::control_plane::public_contracts::ui_session::RowOrderDto::Source
     );
 
     // Missing provenance is rejected before allocating an action number.
@@ -12231,8 +12537,18 @@ fn a_ui_subscription_pushes_state_and_its_loss_releases_the_attachment() {
     );
     assert_eq!(moved["result"]["outcome"], "applied", "{moved}");
     let pushed = next();
-    assert!(pushed["result"]["update_id"].as_u64().expect("update id") > before);
-    assert_eq!(pushed["result"]["session"]["order"], "state", "{pushed}");
+    assert!(pushed.head.update_id > before);
+    let session: agent_radar::control_plane::public_contracts::ui_session::SessionState = pushed
+        .content
+        .iter()
+        .find(|c| c.hash == pushed.head.session)
+        .unwrap()
+        .read()
+        .unwrap();
+    assert_eq!(
+        session.order,
+        agent_radar::control_plane::public_contracts::ui_session::RowOrderDto::State
+    );
 
     // A second primary subscription is refused rather than replacing the first.
     let mut second = Client::dial(daemon.path());
@@ -12412,8 +12728,8 @@ fn ui_subscriptions_are_bounded_and_a_released_slot_is_reusable() {
             "{}",
             request_line(
                 &random_uuid(),
-                "ui.subscribe",
-                json!({"attachment_id": attachment})
+                "ui.open",
+                json!({"role":"subscribe", "attachment_id": attachment, "session_only": false})
             )
         )
         .expect("subscribe");
@@ -12520,25 +12836,22 @@ fn a_claimed_ui_project_result_survives_its_origin_and_admits_one_workspace() {
         .as_str()
         .expect("stable domain request id");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let observer = random_uuid();
-    let mut reader = Client::dial(daemon.path());
+    let reader = agent_radar::ui_session::client::UiClient::start(
+        daemon.path().to_path_buf(),
+        agent_radar::control_plane::public_contracts::ui_session::AttachmentRole::Dashboard,
+        agent_radar::ui_session::client::Wake::default(),
+    );
     loop {
-        let view = reader.call(
-            "ui.attach",
-            json!({"attachment_id": observer, "role": "dashboard"}),
-        );
-        reader.call("ui.detach", json!({"attachment_id": observer}));
-        if view["result"]["publication"]["session"]["operation"]["answer"]["result"]["request"]["outcome"]
-            == "completed"
-        {
-            break;
-        }
+        if let Some(view) = reader.poll()
+            && view.state.operation.as_ref().is_some_and(|op| op.request_id == request && op.status == agent_radar::control_plane::public_contracts::ui_session::CommandStatus::Completed)
+        { break; }
         assert!(
             Instant::now() < deadline,
-            "no completed outcome for {request}: {view}"
+            "no completed outcome for {request}"
         );
         thread::sleep(Duration::from_millis(20));
     }
+    drop(reader);
     assert_eq!(backend.creates().len(), 1);
     // A duplicate under a new action number is a late result, not another create.
     let late = popup.call("ui.action", json!({
@@ -12693,19 +13006,19 @@ fn losing_a_detached_presenters_primary_stream_releases_the_shared_gate() {
     }
     drop(popup); // EOF on its dedicated primary subscription, not ui.detach
     let deadline = Instant::now() + Duration::from_secs(5);
+    let observer = UiClient::start(
+        daemon.path().into(),
+        agent_radar::control_plane::public_contracts::ui_session::AttachmentRole::Dashboard,
+        Wake::default(),
+    );
     loop {
         assert!(Instant::now() < deadline, "presenter loss wedged the gate");
-        let observer = random_uuid();
-        let view = host.call(
-            "ui.attach",
-            json!({"attachment_id": observer, "role": "dashboard"}),
-        );
-        host.call("ui.detach", json!({"attachment_id": observer}));
-        if view["result"]["publication"]["session"]["blocking"].is_null() {
+        let view = observer.poll();
+        if let Some(view) = view.filter(|view| view.state.blocking.is_none()) {
             let next = host.call(
                 "ui.action",
                 json!({
-                    "attachment_id": owner, "action_id": 3, "gate": view["result"]["publication"]["session"]["gate"],
+                    "attachment_id": owner, "action_id": 3, "gate": view.state.gate,
                     "action": {"action": "run_command", "command": "new_workspace", "row": null}
                 }),
             );
