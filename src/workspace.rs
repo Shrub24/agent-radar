@@ -88,6 +88,11 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
         ] {
             run(&options)?;
         }
+        // The host's own client is the terminal (Kitty, `xterm-kitty`), which
+        // tmux does not credit with extended keys by itself. Without the
+        // feature it never asks the terminal for them and Shift+Enter arrives
+        // as a plain Enter.
+        run(&["set-option", "-as", "terminal-features", "xterm*:extkeys"])?;
         run(&["unbind-key", "-a", "-T", "prefix"])?;
         let mut attach = vec![
             "split-window",

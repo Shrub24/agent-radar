@@ -108,10 +108,13 @@ in
           # csi-u is what Pi reads modified keys from; tmux's default format
           # reports them the older xterm way.
           set -g extended-keys-format csi-u
+          # Focus changes reach the pane only if every tmux layer forwards them.
+          set -g focus-events on
         '';
         description = ''
           tmux commands run after {option}`configFile`. The default turns on
-          extended keys, which Pi needs for modified keys such as Shift+Enter.
+          extended keys, which Pi needs for modified keys such as Shift+Enter, and
+          focus events.
         '';
       };
     };
