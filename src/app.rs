@@ -1935,8 +1935,7 @@ mod tests {
     #[test]
     fn pane_view_starts_at_running_and_cycles_to_all_then_agents() {
         let mut app = app_with_fixture();
-        // The fixture reports no foreground process, so the default running view
-        // lists the agents but no ordinary pane.
+        // Without foreground evidence, ordinary panes are unresolved.
         assert_eq!(app.pane_view(), PaneView::Running);
         for row in row_ids(&app) {
             assert!(
@@ -1957,6 +1956,34 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.pane_view(), PaneView::Running);
+    }
+
+    #[test]
+    fn workspaces_survive_pane_modes_and_a_filter_with_no_matches() {
+        let mut observation = crate::model::testing::fleet();
+        observation.agents.clear();
+        let mut state = ObservationState::new();
+        state.apply_success(observation);
+        let mut app = App::new();
+        app.refresh(&state);
+        let workspaces = vec![RowId::Workspace("wA".into()), RowId::Workspace("wB".into())];
+        for mode in [PaneView::Running, PaneView::All, PaneView::Hidden] {
+            assert_eq!(app.pane_view(), mode);
+            let ids = row_ids(&app);
+            assert!(workspaces.iter().all(|id| ids.contains(id)));
+            app.handle_key(key(KeyCode::Char('/')));
+            for c in "this-query-matches-no-existing-row-123456789".chars() {
+                app.handle_key(key(KeyCode::Char(c)));
+            }
+            app.handle_key(key(KeyCode::Enter));
+            assert_eq!(
+                row_ids(&app),
+                workspaces,
+                "workspace rows survive in {mode:?}"
+            );
+            app.handle_key(key(KeyCode::Esc));
+            app.handle_key(key(KeyCode::Char('p')));
+        }
     }
 
     #[test]
@@ -2031,12 +2058,13 @@ mod tests {
                 RowId::Workspace("wA".into()),
                 RowId::Agent("wA:p1".into()),
                 RowId::Agent("wA:p2".into()),
+                RowId::Workspace("wB".into()),
             ]
         );
-        // Rows without the match or a matching descendant are hidden.
+        // Non-workspace rows without a matching descendant are hidden.
         assert!(!ids.contains(&RowId::Agent("wA:p5".into())));
         assert!(!ids.contains(&RowId::Agent("wB:p1".into())));
-        assert!(!ids.contains(&RowId::Workspace("wB".into())));
+        assert!(ids.contains(&RowId::Workspace("wB".into())));
 
         // Backspace widens the match again through the real editing path.
         for _ in 0..5 {
@@ -2120,7 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn running_view_lists_only_panes_with_a_command_in_the_foreground() {
+    fn running_view_lists_live_shells_and_commands_but_not_unresolved_panes() {
         let mut state = ObservationState::new();
         state.apply_success(crate::model::testing::fleet());
         state.apply_evidence(
@@ -2131,15 +2159,32 @@ mod tests {
                 Some("hunk diff".into()),
             ),
         );
+        state.apply_evidence("wA:p6", crate::model::ForegroundEvidence::Shell);
+        state.apply_evidence("wA:p4", crate::model::ForegroundEvidence::Inconclusive);
         let mut app = App::new();
         app.refresh(&state);
         assert_eq!(app.pane_view(), PaneView::Running);
 
         let ids = row_ids(&app);
         assert!(ids.contains(&RowId::Pane("wA:p3".into())));
-        assert!(!ids.contains(&RowId::Pane("wA:p6".into())));
-        // Agents are the fleet in every view.
+        assert!(ids.contains(&RowId::Pane("wA:p6".into())));
+        assert!(!ids.contains(&RowId::Pane("wA:p4".into())));
         assert!(ids.contains(&RowId::Agent("wA:p2".into())));
+
+        state.apply_evidence(
+            "wA:p4",
+            crate::model::ForegroundEvidence::NonShell {
+                pid: 9,
+                name: None,
+                command: None,
+                local: Default::default(),
+            },
+        );
+        app.refresh(&state);
+        assert!(
+            row_ids(&app).contains(&RowId::Pane("wA:p4".into())),
+            "a live process needs no command label"
+        );
     }
 
     #[test]
@@ -2583,9 +2628,7 @@ mod tests {
         let mut app = App::new();
         app.refresh(&state);
 
-        // A registration that joins no live pane is not part of the fleet, and
-        // the workspace holding nothing else goes with it.
-        assert!(row_ids(&app).is_empty(), "{:?}", row_ids(&app));
+        assert_eq!(row_ids(&app), vec![RowId::Workspace("wM".into())]);
         assert_eq!(app.hidden_history(), 1);
 
         app.toggle_history();

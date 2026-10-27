@@ -1687,9 +1687,10 @@ fn a_hidden_task_leaves_no_rows_filter_matches_or_pointer_targets() {
     }
     app.handle_key(key(KeyCode::Enter));
     assert!(!app.shows_tasks());
-    assert!(
-        visible_ids(&app).is_empty(),
-        "the hidden task matched nothing"
+    assert_eq!(
+        visible_ids(&app),
+        vec![RowId::Workspace("wH".into())],
+        "hidden tasks stay filtered out; the workspace remains"
     );
 }
 

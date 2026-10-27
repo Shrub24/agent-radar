@@ -6,6 +6,18 @@ Provide a full-screen fleet overview that makes agent ownership, runtime locatio
 
 ## Requirements
 
+### Requirement: Workspace rows remain visible
+
+Radar SHALL retain every workspace row in the canonical tree projection regardless of the text filter or pane visibility mode. These controls SHALL continue to filter the workspace's descendants. A workspace SHALL remain selectable even when none of its descendants are visible, so a newly created workspace does not disappear from the overview.
+
+#### Scenario: Workspace contains only hidden panes
+- **WHEN** all of a workspace's descendants are excluded by the current pane or history controls
+- **THEN** its workspace row remains visible even though its pane rows are hidden
+
+#### Scenario: Filter matches no descendant
+- **WHEN** the text filter matches neither a workspace nor any of its visible descendants
+- **THEN** the workspace row remains visible without revealing nonmatching descendants
+
 ### Requirement: Connectors describe the visible tree
 
 Radar SHALL draw branch and continuation connectors for visible agent, task and ordinary-pane rows beneath workspace roots. Connectors SHALL reflect the current order, filtering and folds, including a branch with only one child. Existing state and kind marks SHALL remain distinct from those connectors.
@@ -121,7 +133,7 @@ Radar SHALL provide a standalone full-screen tree grouped by workspace. Each win
 
 ### Requirement: Pane views over ordinary panes
 
-Radar SHALL offer three views of ordinary non-agent panes — hidden, running and all — cycled by one key, initially hidden. Each pane SHALL appear at most once in the fleet tree; a current or retained agent association SHALL suppress an additional ordinary-pane row in every view.
+Radar SHALL offer three views of ordinary non-agent panes — hidden, running and all — cycled by one key, initially running. The running view SHALL include conclusively live shells and foreground commands, but SHALL hide unresolved and finished-session rows by default. Existing explicit pane and history controls SHALL remain available. Each pane SHALL appear at most once in the fleet tree; a current or retained agent association SHALL suppress an additional ordinary-pane row in every view.
 
 #### Scenario: Show every pane
 - **WHEN** the user selects the view that lists all panes
@@ -129,8 +141,9 @@ Radar SHALL offer three views of ordinary non-agent panes — hidden, running an
 
 #### Scenario: Show only running panes
 - **WHEN** the user selects the running view
-- **THEN** only ordinary panes whose foreground holds a command are listed, led by that command
-- **AND** a pane whose foreground is its shell, or whose foreground has not been observed, is not listed
+- **THEN** ordinary panes with conclusive shell or non-shell foreground evidence are listed, including idle shells and processes whose command label is unavailable
+- **AND** missing or inconclusive foreground evidence does not count as live
+- **AND** a finished-session row stays hidden until explicitly revealed or its pane is reused by a live foreground command
 
 #### Scenario: A program and a command read differently
 - **WHEN** one pane's foreground has taken the terminal over and another's is still using the shell's line discipline

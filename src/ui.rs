@@ -3661,10 +3661,8 @@ mod tests {
             press(&mut app, character);
         }
         press(&mut app, '\n');
-        assert!(
-            app.visible_rows().is_empty(),
-            "the filter excludes every row, the lost one included"
-        );
+        assert_eq!(app.visible_rows().len(), 1, "only the workspace remains");
+        assert_eq!(selected_id(&app), Some(workspace));
         press(&mut app, 'n');
         assert_ne!(
             selected_id(&app),

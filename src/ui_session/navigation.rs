@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
-use crate::model::AgentState;
+use crate::model::{AgentState, ForegroundEvidence};
 use crate::tasks::TaskBoard;
 use crate::tree::{FleetTree, RowId, RowKind, TaskRow, TreeNode};
 
@@ -752,18 +752,12 @@ fn child_connectors(
     }
 }
 
-/// Which ordinary panes the fleet tree lists.
-///
-/// Agents are the fleet; panes are the places work is happening without one.
-/// The fleet starts at `Running`: a pane with a command in the foreground is
-/// where a build, an editor or a merge tool is, and an exited pane is history
-/// rather than part of it. `All` is the explicit answer, and `Hidden` the quiet
-/// one.
+/// Which ordinary panes the fleet tree lists. The default is live shells and commands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PaneView {
     /// Agents only.
     Hidden,
-    /// Panes with a command in the foreground.
+    /// Live shells and foreground commands, excluding unresolved and finished rows.
     #[default]
     Running,
     /// Every pane, whatever it is doing.
@@ -801,25 +795,25 @@ struct Visibility {
 }
 
 impl Visibility {
-    /// Whether this view lists a row of this kind. A workspace, an agent and an
-    /// ordinary pane follow the pane view; background tasks follow their own
-    /// per-view choice.
+    /// Workspaces stay visible; pane, history and task controls govern their contents.
     fn includes(self, kind: &RowKind) -> bool {
         match kind {
             RowKind::Task(_) => self.tasks,
-            RowKind::Pane(pane) => match self.view {
-                // A finished session is history rather than fleet, so only the
-                // explicit toggle brings it into a view — and only while the
-                // pane is not in use again.
-                PaneView::Hidden => {
-                    self.finished && pane.exited.is_some() && pane.command().is_none()
+            RowKind::Pane(pane) => {
+                let history = self.finished && pane.exited.is_some() && pane.command().is_none();
+                match self.view {
+                    PaneView::Hidden => history,
+                    PaneView::Running => {
+                        history
+                            || match pane.foreground {
+                                Some(ForegroundEvidence::Shell) => pane.exited.is_none(),
+                                Some(ForegroundEvidence::NonShell { .. }) => true,
+                                Some(ForegroundEvidence::Inconclusive) | None => false,
+                            }
+                    }
+                    PaneView::All => true,
                 }
-                PaneView::Running => {
-                    pane.command().is_some()
-                        || (self.finished && pane.exited.is_some() && pane.command().is_none())
-                }
-                PaneView::All => true,
-            },
+            }
             RowKind::Agent(agent) => !agent.history() || self.finished,
             RowKind::Lifecycle(subject) => !subject.history() || self.finished,
             RowKind::Workspace { .. } => true,
@@ -903,19 +897,12 @@ impl RowOrder {
     }
 }
 
-/// Whether this node has children the current view can display.
 fn subtree_has_visible(node: &TreeNode, visible: Visibility) -> bool {
-    let below = |node: &TreeNode| {
-        node.children
+    visible.includes(&node.row.kind)
+        || node
+            .children
             .iter()
             .any(|child| subtree_has_visible(child, visible))
-    };
-    match &node.row.kind {
-        // A workspace the projection holds with nothing under it stays: it is a
-        // place that exists. One emptied by this view's own toggles does not.
-        RowKind::Workspace { .. } => node.children.is_empty() || below(node),
-        _ => visible.includes(&node.row.kind) || below(node),
-    }
 }
 
 fn has_visible_children(node: &TreeNode, visible: Visibility) -> bool {
@@ -966,16 +953,15 @@ fn collect_visible<'a>(
     }
 }
 
-/// Whether this subtree contributes a row to the filtered view: the row itself
-/// matches, or a visible descendant does. What the filter keeps, so the
-/// connectors are built from the rows that are drawn.
+/// Workspaces stay visible; other rows must match or have a matching visible descendant.
 fn subtree_matches(
     node: &TreeNode,
     needle: &Needle<'_>,
     visible: Visibility,
     order: RowOrder,
 ) -> bool {
-    node.row.matches(|text| needle.hit(text))
+    matches!(node.row.kind, RowKind::Workspace { .. })
+        || node.row.matches(|text| needle.hit(text))
         || ordered(&node.children, order).into_iter().any(|child| {
             visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
         })

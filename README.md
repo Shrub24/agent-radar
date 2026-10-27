@@ -660,15 +660,14 @@ it is showing:
 
 | View | Lists |
 | --- | --- |
-| `agents` | Only agents — the fleet. The default. |
-| `running` | Panes with a command in the foreground, led by that command |
-| `all` | Every pane, including idle shells and finished sessions (`e` covers finished sessions in the other two views) |
+| `agents` | Only live agents |
+| `running` | Live panes, including idle shells and foreground commands. The default. |
+| `all` | Every pane, including unresolved and finished rows |
 
-The `running` view is what answers "what is actually happening in this fleet":
-builds, editors, merge tools and editors that no agent owns. It costs one
-`#{pane_pid}`/`#{pane_current_command}` read per pane and only sweeps while a pane
-view is active; the first press of `p` fills it in on the next refresh. A pane an agent is already reporting is not
-listed twice — the agent row is the row for that pane.
+The default view waits for conclusive shell or process evidence; unresolved,
+exited and finished rows stay hidden unless explicitly revealed with `p` or `e`.
+A pane an agent already represents is not listed twice. Workspace rows remain
+visible in every view and under text filtering.
 
 Which task children those views list is a choice of its own rather than the pane
 filter: `agents` starts with them hidden, `running` and `all` with every
@@ -811,7 +810,7 @@ details.
 
 The backend latches a session title as the pane's **label**, and it survives the
 session: on a fleet that has run many agents, most ordinary panes carry one.
-Those are historical, not running, so they stay out of the default `agents` view
+Those are historical, not running, so they stay out of the default `running` view
 — `e` lists them there anyway, and `e` again hides them.
 
 ## Observation and continuity
