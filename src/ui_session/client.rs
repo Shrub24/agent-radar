@@ -195,17 +195,26 @@ impl UiClient {
 
     /// The newest published state, once it reflects every action this client
     /// has had answered and nothing is still in flight. Returns each state once.
+    ///
+    /// A change of gate is exempt from the wait for this client's own actions: a
+    /// view still owing an answer must still learn that the session opened or
+    /// closed a blocking interaction, because the gate decides whether its queued
+    /// input is still valid and whether it has a modal to show. Withholding that
+    /// would hide a modal raised elsewhere behind a slow local queue.
     pub fn poll(&self) -> Option<Arc<Mirror>> {
-        if self.inner.pending.load(Ordering::SeqCst) > 0 {
-            return None;
-        }
+        let pending = self.inner.pending.load(Ordering::SeqCst) > 0;
         let latest = locked(&self.inner.latest).clone()?;
         let resync = self.inner.resync.swap(false, Ordering::SeqCst);
-        if latest.update_id < self.inner.floor.load(Ordering::SeqCst) {
+        let deliverable = deliverable(
+            &latest,
+            pending,
+            self.inner.floor.load(Ordering::SeqCst),
+            self.inner.delivered.load(Ordering::SeqCst),
+            resync,
+            self.inner.displayed_gate.load(Ordering::SeqCst),
+        );
+        if !deliverable {
             self.inner.resync.fetch_or(resync, Ordering::SeqCst);
-            return None;
-        }
-        if latest.update_id == self.inner.delivered.load(Ordering::SeqCst) && !resync {
             return None;
         }
         self.inner
@@ -226,6 +235,26 @@ impl Drop for UiClient {
             let _ = thread.join();
         }
     }
+}
+
+/// Whether the newest publication is shown to this view now.
+///
+/// A gate change is the one thing that does not wait for this view's own actions:
+/// it decides whether what the view is about to submit is still valid, and it is
+/// how a blocking interaction opened elsewhere reaches a view that is mid-action.
+fn deliverable(
+    latest: &Mirror,
+    pending: bool,
+    floor: u64,
+    delivered: u64,
+    resync: bool,
+    displayed_gate: u64,
+) -> bool {
+    let gate_changed = latest.state.gate != displayed_gate;
+    if gate_changed {
+        return true;
+    }
+    !pending && latest.update_id >= floor && (resync || latest.update_id != delivered)
 }
 
 /// Ends the subscription so the attach loop reconnects (or stops).
@@ -504,5 +533,50 @@ fn send(inner: &Inner, pending: Pending) {
             inner.resync.store(true, Ordering::SeqCst);
             cut(inner);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mirror(gate: u64, update_id: u64) -> Mirror {
+        Mirror {
+            attachment_id: "a".into(),
+            update_id,
+            state: dto::SessionState {
+                gate,
+                ..dto::SessionState::default()
+            },
+            rows: std::sync::Arc::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_gate_change_reaches_a_view_that_owes_an_answer() {
+        assert!(
+            deliverable(&mirror(1, 5), true, 4, 3, false, 0),
+            "a modal opened elsewhere is not hidden behind this view's own queue"
+        );
+        assert!(
+            !deliverable(&mirror(0, 5), true, 4, 3, false, 0),
+            "ordinary state still waits for the view's own answer"
+        );
+    }
+
+    #[test]
+    fn ordinary_delivery_waits_for_the_floor_and_skips_what_was_seen() {
+        assert!(
+            !deliverable(&mirror(0, 5), false, 6, 3, false, 0),
+            "below the floor"
+        );
+        assert!(
+            !deliverable(&mirror(0, 5), false, 4, 5, false, 0),
+            "already delivered"
+        );
+        assert!(
+            deliverable(&mirror(0, 5), false, 4, 5, true, 0),
+            "a resync shows it again"
+        );
     }
 }

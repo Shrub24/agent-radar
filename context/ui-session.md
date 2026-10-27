@@ -457,3 +457,19 @@ The protocol no longer carries an acknowledgement action or a field recording th
 
 **Consequence:** the distinction between host acceptance and presenter claim survives in the design as reasoning but not on the wire. If a future consumer needs it, the honest move is to add an observation with a reader, not to reintroduce an unused field.
 
+## Dissents recorded from the follow-up review
+
+**Id:** e9458aaf-eb60-4cc8-a909-b3cd9072b403
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** an external review proposing one authoritative row representation and treating the client's synchronisation flags as accidental state
+**Verification:** corroborated — the renderer draws from `draw_rows()` only (every `visible_rows()` call in `src/ui.rs` is inside its test module), and each client flag has a distinct reader
+**Revisit when:** `Structure` rows become routinely visible, or two flags are found with the same reader and the same lifetime
+
+Two review findings were heard and not adopted, and the reasons belong here rather than only in a conversation.
+
+**Rows have two authorities on purpose.** The session's projection owns structure: which rows exist, their order, their nesting and their folds. The local observation owns facts about a row: its contextual label, its state marks, its processes and its details. `DrawRow::Structure` is how a projected row that local observation cannot yet explain is drawn honestly, and `selected_row()` resolving through local visibility means a selected row this process cannot explain selects but shows no detail. The alternative — one representation, fed from the session — makes the session own presentation facts and turns the UI contract into a rendering contract.
+
+**The client's synchronisation flags are not accidental state.** `floor` is the minimum publication reflecting this view's acknowledged action; `delivered` is delivery dedupe; `resync` forces one re-delivery after a refusal; `incarnation` fences actions queued across attachments; `connected` and `pending` feed readiness. They answer different questions and have different lifetimes, so grouping them behind one value is welcome and collapsing them into fewer states is not.
+
