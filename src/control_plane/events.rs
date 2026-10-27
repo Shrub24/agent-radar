@@ -196,6 +196,9 @@ pub enum Transition {
     OperationSettled(RequestRecord),
     ContainerCreated(Container),
     ContainerObserved(ContainerObservation),
+    /// A deletion of this container was held by an agent inside it that did not
+    /// exit. Nothing about the place changed; the daemon recorded its own question.
+    ContainerHeld,
     ContainerRemoved,
 }
 
@@ -205,7 +208,10 @@ impl Transition {
     pub fn is_container(&self) -> bool {
         matches!(
             self,
-            Self::ContainerCreated(_) | Self::ContainerObserved(_) | Self::ContainerRemoved
+            Self::ContainerCreated(_)
+                | Self::ContainerObserved(_)
+                | Self::ContainerHeld
+                | Self::ContainerRemoved
         )
     }
 }
@@ -693,6 +699,9 @@ fn reduce_container(previous: Option<&Container>, event: &Event) -> Result<Conta
     match &event.transition {
         Transition::ContainerObserved(observation) if container.removed_at.is_none() => {
             observation.apply_to(&mut container, &event.at);
+        }
+        Transition::ContainerHeld if container.removed_at.is_none() => {
+            container.deletion_held = true;
         }
         Transition::ContainerRemoved if container.removed_at.is_none() => {
             container.removed_at = Some(event.at.clone());

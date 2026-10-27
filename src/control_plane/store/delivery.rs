@@ -84,6 +84,7 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::OperationSettled(_) => "lifecycle.settled",
         Transition::ContainerCreated(_) => "container.created",
         Transition::ContainerObserved(_) => "container.observed",
+        Transition::ContainerHeld => "container.deletion_held",
         Transition::ContainerRemoved => "container.removed",
     };
     let facts = event.subject_id.as_deref().and_then(|id| log.facts(id));

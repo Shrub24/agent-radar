@@ -123,6 +123,11 @@ pub struct Container {
     /// A source-labelled reason the binding cannot be trusted right now.
     pub unresolved: Option<String>,
     pub removed_at: Option<String>,
+    /// A deletion of this container was held because an agent inside it did not
+    /// exit. It is the daemon's own record of the question it already asked, so a
+    /// repeat can be recognised without a client remembering anything.
+    #[serde(default)]
+    pub deletion_held: bool,
     pub recorded_at: String,
 }
 
@@ -260,6 +265,7 @@ impl Container {
             observed_at: self.observed_at.clone(),
             unresolved: self.unresolved.clone(),
             removed_at: self.removed_at.clone(),
+            deletion_held: self.deletion_held,
         }
     }
 }
@@ -283,6 +289,9 @@ pub struct PublicContainer {
     pub observed_at: Option<String>,
     pub unresolved: Option<String>,
     pub removed_at: Option<String>,
+    /// Whether a deletion of this container was held by an agent that survived it.
+    /// A client that wants to close the place anyway asks with `force`.
+    pub deletion_held: bool,
 }
 
 /// A container's stored record, read back through the log's replay.
@@ -409,6 +418,7 @@ pub fn record_created(
         observed_at: None,
         unresolved: None,
         removed_at: None,
+        deletion_held: false,
         recorded_at: at.to_owned(),
     };
     log.append(
@@ -483,6 +493,7 @@ pub fn adopt(
             observed_at: Some(at.to_owned()),
             unresolved: None,
             removed_at: None,
+            deletion_held: false,
             recorded_at: at.to_owned(),
         };
         log.append(
@@ -658,6 +669,29 @@ pub fn subtree(registry: &Registry, id: &str) -> Result<Vec<String>, String> {
 /// reappearing under another serving instance is a different container. Nothing
 /// here dispatches, and a container already recorded as removed is reported as it
 /// stands rather than appended twice.
+/// Records that a deletion of this container was held: the daemon asked for the
+/// agents inside it to end and at least one did not. A repeat that names `force`
+/// answers it; the fact is the daemon's, so a client restart cannot lose it.
+pub fn record_held(registry: &Registry, id: &str, at: &str) -> Result<Container, String> {
+    let previous = read(registry, id)?.ok_or_else(|| format!("container {id} is not recorded"))?;
+    if previous.deletion_held || previous.removed_at.is_some() {
+        return Ok(previous);
+    }
+    let mut next = previous.clone();
+    next.deletion_held = true;
+    {
+        let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+        log.append_container_checked(
+            id,
+            at,
+            Source::TopologyControl,
+            Transition::ContainerHeld,
+            &next,
+        )?;
+    }
+    Ok(next)
+}
+
 pub fn record_removed(registry: &Registry, id: &str, at: &str) -> Result<Container, String> {
     let previous = read(registry, id)?.ok_or_else(|| format!("container {id} is not recorded"))?;
     if previous.removed_at.is_some() {
@@ -819,6 +853,7 @@ mod tests {
             observed_at: None,
             unresolved: None,
             removed_at: None,
+            deletion_held: false,
             recorded_at: "1000".into(),
         }
     }

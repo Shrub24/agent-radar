@@ -89,11 +89,6 @@ pub struct Session {
     /// The inventory a command's target is derived from, as last observed. Kept
     /// so the session decides what a command acts on, not the calling frontend.
     state: Option<ObservationState>,
-    /// Containers whose deletion the daemon held back: a repeat asks it to close
-    /// anyway. A plain deletion never carries force.
-    deletions_held: std::collections::HashSet<String>,
-    /// The held key of each effect this session dispatched, by request id.
-    held: HashMap<String, String>,
     current: Published,
     content_store: ContentStore,
     observation_content: Content,
@@ -118,8 +113,6 @@ impl Session {
             operation: None,
             interaction_notice: None,
             state: None,
-            deletions_held: std::collections::HashSet::new(),
-            held: HashMap::new(),
             current: Published {
                 update_id: 0,
                 tree_hash: String::new(),
@@ -563,9 +556,6 @@ impl Session {
             super::targets::selection(kind, super::targets::represents_tab(kind)),
             state,
             container.as_ref(),
-            container
-                .as_ref()
-                .is_some_and(|container| self.deletions_held.contains(&container.container_id)),
             &crate::control_plane::random_uuid(),
         );
         match frozen {
@@ -597,25 +587,9 @@ impl Session {
         }
     }
 
-    /// Records which target an effect may hold a repeat of.
-    fn remember(&mut self, plan: &super::targets::Plan) {
-        if let Some(key) = &plan.held_key {
-            self.held.insert(plan.request_id.clone(), key.clone());
-        }
-    }
-
     /// What accepted interactions have set in motion, for the actor to dispatch.
     pub fn take_completions(&mut self) -> Vec<Completion> {
-        let completions = self.gate.take_completions();
-        // Correlation is recorded for effects that reach dispatch, never for a
-        // question that may be cancelled: an asked-and-cancelled deletion would
-        // otherwise leave an entry nothing will ever settle.
-        for completion in &completions {
-            if let Some(plan) = &completion.plan {
-                self.remember(plan);
-            }
-        }
-        completions
+        self.gate.take_completions()
     }
 
     pub fn tick(&mut self, seconds: u64) {
@@ -627,29 +601,8 @@ impl Session {
     }
 
     pub fn operation(&mut self, outcome: dto::CommandOutcome) {
-        use dto::CommandStatus as S;
-        if outcome.status == S::DispatchRefused {
-            // The effect never left this process, so there is no verdict to wait
-            // for and nothing for a repeat to be armed against.
-            self.held.remove(&outcome.request_id);
-        }
-        // Acceptance is not an answer: a dispatched deletion is still on its way
-        // to the verdict that decides whether a repeat may force it.
-        let terminal = matches!(outcome.status, S::Completed | S::Refused | S::Unknown);
-        if terminal && let Some(key) = self.held.remove(&outcome.request_id) {
-            let held = outcome.status == S::Refused
-                && outcome
-                    .answer
-                    .as_ref()
-                    .and_then(|answer| answer.pointer("/result/request/category"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some(crate::control_plane::store::Category::AGENTS_ALIVE);
-            if held {
-                self.deletions_held.insert(key);
-            } else if outcome.status == S::Completed {
-                self.deletions_held.remove(&key);
-            }
-        }
+        // Whether a repeat may force this deletion is the daemon's record, not
+        // this session's memory: it arrives with the next observation.
         self.operation = Some(outcome);
         self.project();
     }
@@ -1206,97 +1159,6 @@ mod tests {
         assert!(frozen.contains(shown.as_str()), "{frozen}");
         assert!(!frozen.contains(other.as_str()), "{frozen}");
         assert_eq!(method, &"mux.close");
-    }
-
-    #[test]
-    fn a_held_target_is_correlated_only_once_its_effect_reaches_dispatch() {
-        let mut session = seeded();
-        let held_plan = super::super::targets::Plan {
-            effect: super::super::targets::Effect::Domain {
-                method: "mux.close",
-                params: serde_json::json!({}),
-            },
-            request_id: "r1".into(),
-            prompt: "Close it".into(),
-            losses: vec!["an agent is running".into()],
-            confirms: true,
-            held_key: Some("c1".into()),
-        };
-        let interaction = session
-            .gate
-            .begin_confirmation(
-                "a",
-                dto::SharedCommand::Delete,
-                None,
-                Some("Close it".into()),
-                vec!["an agent is running".into()],
-                held_plan,
-            )
-            .expect("the question opens");
-        assert!(
-            session.held.is_empty(),
-            "a question that may be cancelled has dispatched nothing yet"
-        );
-        session
-            .gate
-            .claim("a", &interaction)
-            .expect("the view that asked presents the question");
-        session
-            .gate
-            .resolve(
-                "a",
-                &interaction,
-                dto::InteractionResult::Confirm { accepted: true },
-            )
-            .expect("the answer is accepted");
-        let jobs = session.take_completions();
-        assert_eq!(jobs.len(), 1, "the answer dispatches one effect");
-        assert_eq!(
-            session.held.get("r1").map(String::as_str),
-            Some("c1"),
-            "the effect that reaches dispatch is the one correlated"
-        );
-        session.operation(dto::CommandOutcome {
-            request_id: jobs[0].request_id.clone(),
-            status: dto::CommandStatus::DispatchRefused,
-            answer: None,
-        });
-        assert!(
-            session.held.is_empty(),
-            "an effect the scheduler refused has no verdict to wait for"
-        );
-    }
-
-    #[test]
-    fn a_held_deletion_is_settled_by_its_verdict_not_by_its_acceptance() {
-        let mut session = Session::new();
-        // The correlation a container deletion records when it is frozen.
-        session.held.insert("request-1".into(), "c1".into());
-        session.operation(dto::CommandOutcome {
-            request_id: "request-1".into(),
-            status: dto::CommandStatus::DispatcherAccepted,
-            answer: None,
-        });
-        assert!(
-            !session.deletions_held.contains("c1"),
-            "an accepted dispatch has not said why a deletion was refused"
-        );
-        assert!(session.held.contains_key("request-1"), "the answer is owed");
-        session.operation(dto::CommandOutcome {
-            request_id: "request-1".into(),
-            status: dto::CommandStatus::Refused,
-            answer: Some(serde_json::json!({
-                "result": {"request": {"category": "agents_alive"}}
-            })),
-        });
-        assert!(
-            session.deletions_held.contains("c1"),
-            "the refusal arms the forced repeat"
-        );
-        assert!(
-            !session.held.contains_key("request-1"),
-            "the answer settled it"
-        );
     }
 
     #[test]

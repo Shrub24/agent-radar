@@ -59,9 +59,6 @@ pub struct Plan {
     /// Whether the operator must agree first. A deletion that would lose no work
     /// is the one control that goes ahead without asking.
     pub confirms: bool,
-    /// The container a refused deletion was held for, so a repeat can ask the
-    /// daemon to close it anyway.
-    pub held_key: Option<String>,
 }
 
 /// What a frozen effect does when it reaches the daemon.
@@ -113,7 +110,6 @@ pub(crate) fn focus_plan(target: crate::runtime::Target, request_id: String) -> 
         prompt: format!("Focus {}", target.description()),
         losses: Vec::new(),
         confirms: false,
-        held_key: None,
     }
 }
 
@@ -174,7 +170,6 @@ pub(crate) fn plan(
     selected: Selected,
     state: &ObservationState,
     container: Option<&ContainerRef>,
-    force: bool,
     request_id: &str,
 ) -> Result<Plan, String> {
     use crate::app::Operation;
@@ -191,7 +186,6 @@ pub(crate) fn plan(
             container.ok_or("this row is not a container Radar records: nothing to act on")?,
             inventory,
             state,
-            force,
             request_id,
         );
     }
@@ -339,7 +333,6 @@ fn close_plan(
         prompt: described,
         losses,
         confirms: true,
-        held_key: None,
     })
 }
 
@@ -371,7 +364,6 @@ fn subject_plan(
         prompt: described,
         losses,
         confirms: true,
-        held_key: None,
     })
 }
 
@@ -380,10 +372,13 @@ fn container_plan(
     container: &ContainerRef,
     inventory: &FleetObservation,
     state: &ObservationState,
-    force: bool,
     request_id: &str,
 ) -> Result<Plan, String> {
     use crate::app::Operation;
+    // Consent belongs to the place, not to a cursor: the daemon recorded that it
+    // already asked, so a repeat closes even if the operator navigated away and
+    // back, or asked from another frontend.
+    let force = container.deletion_held;
     let described = container_name(inventory, container);
     // A container whose place cannot be verified has nothing to freeze, so every
     // control but a deletion is refused. Deleting it is the record going, and the
@@ -410,7 +405,6 @@ fn container_plan(
             prompt: described,
             losses: Vec::new(),
             confirms: true,
-            held_key: Some(container.container_id.clone()),
         });
     }
     let target = container.kind.target(&container.handle);
@@ -484,7 +478,6 @@ fn container_plan(
         // work, so it is not a question.
         confirms: !(operation == Operation::Delete && running.is_empty()),
         losses,
-        held_key: (operation == Operation::Delete).then(|| container.container_id.clone()),
     })
 }
 
@@ -564,7 +557,6 @@ pub(crate) fn launch_plan(
         losses: Vec::new(),
         // A launch adds a place; it takes nothing away, so it is not a question.
         confirms: false,
-        held_key: None,
     })
 }
 
@@ -776,7 +768,8 @@ mod tests {
     use super::*;
 
     /// The frozen request names the same container either way; only `force`
-    /// changes, and only the answer of a previous attempt can set it.
+    /// changes, and it is the daemon's record of a held deletion that sets it —
+    /// not anything this frontend remembers.
     #[test]
     fn a_forced_deletion_is_the_same_effect_with_force_set() {
         use crate::app::Operation;
@@ -791,6 +784,7 @@ mod tests {
             handle: "wA".into(),
             recipe: false,
             unresolved: None,
+            deletion_held: false,
         };
         let selected = || Selected::Pane {
             pane_id: "wA:p1".into(),
@@ -809,7 +803,6 @@ mod tests {
             selected(),
             &state,
             Some(&container),
-            false,
             "r1",
         )
         .expect("a container deletion is freezable");
@@ -824,8 +817,10 @@ mod tests {
             Operation::Delete,
             selected(),
             &state,
-            Some(&container),
-            true,
+            Some(&ContainerRef {
+                deletion_held: true,
+                ..container.clone()
+            }),
             "r2",
         )
         .expect("a forced repeat is freezable");
@@ -833,7 +828,7 @@ mod tests {
         assert_eq!(
             repeat_params.pointer("/request/force"),
             Some(&serde_json::Value::Bool(true)),
-            "the repeat carries the force it was authorised with"
+            "the repeat carries the force the daemon recorded a hold for"
         );
         assert_eq!(
             repeat_params.pointer("/request/container_id"),

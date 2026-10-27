@@ -1543,6 +1543,10 @@
             "null"
           ]
         },
+        "deletion_held": {
+          "description": "Whether a deletion of this container was held by an agent that survived it.\nA client that wants to close the place anyway asks with `force`.",
+          "type": "boolean"
+        },
         "kind": {
           "$ref": "#/$defs/Kind"
         },
@@ -1589,7 +1593,8 @@
         "kind",
         "recipe",
         "provenance",
-        "created_at"
+        "created_at",
+        "deletion_held"
       ],
       "type": "object"
     },

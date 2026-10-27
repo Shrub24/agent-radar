@@ -10895,6 +10895,62 @@ fn a_deletion_is_held_by_a_surviving_agent_until_it_is_repeated_with_force() {
 /// An exit the daemon could not verify is not an exit: a managed launch whose
 /// scope cannot be confirmed holds the deletion exactly as an agent that outlived
 /// the stop window does, and the place is not closed over it until `force`.
+/// The hold is the daemon's own record, not a client's memory: it names the held
+/// deletion in the container read and still does so after a daemon restart, so a
+/// repeat from a fresh session is the second ask.
+#[test]
+fn a_held_deletion_is_a_container_fact_that_survives_a_restart() {
+    let (sandbox, backend, mut daemon, mut client, mut child, id) =
+        deletion_over_a_surviving_agent("topology-delete-held-durable", false);
+    let request = json!({
+        "request": {"container_id": id, "frozen": frozen_workspace("wA")},
+        "requester": "test",
+    });
+
+    let held = client.call("topology.delete", request.clone());
+    assert_eq!(result_record(&held)["category"], "agents_alive", "{held}");
+    let read = |client: &mut Client| {
+        client.call("topology.list", json!({}))["result"]["containers"]
+            .as_array()
+            .expect("the containers")
+            .iter()
+            .find(|container| container["container_id"] == json!(id))
+            .cloned()
+            .expect("the container")
+    };
+    let published = read(&mut client);
+    assert_eq!(
+        published["deletion_held"],
+        json!(true),
+        "the hold is a published container fact: {published}"
+    );
+
+    // A fresh daemon has the durable record and nothing else: the session that
+    // armed the repeat is gone with the old process.
+    daemon.stop();
+    let mut daemon = sandbox.daemon_with(backend.clone());
+    let mut client = Client::dial(daemon.path());
+    assert_eq!(
+        read(&mut client)["deletion_held"],
+        json!(true),
+        "the hold outlives the session that learned it"
+    );
+
+    let mut forced = request;
+    forced["request"]["force"] = json!(true);
+    let closed = client.call("topology.delete", forced);
+    assert_eq!(result_record(&closed)["outcome"], "completed", "{closed}");
+    assert_eq!(
+        backend.closed_targets(),
+        vec![CloseTarget::Workspace("wA".to_string())],
+        "the second ask closes the place once"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    daemon.stop();
+}
+
 #[test]
 fn a_deletion_is_held_when_an_agents_exit_cannot_be_verified() {
     let (_sandbox, backend, mut daemon, mut client, mut child, id) =

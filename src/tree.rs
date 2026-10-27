@@ -224,6 +224,9 @@ pub struct ContainerRef {
     pub recipe: bool,
     /// A source-labelled reason the binding cannot be trusted right now.
     pub unresolved: Option<String>,
+    /// The daemon held a deletion of this container: an agent inside it survived.
+    /// A repeat carries `force`, because consent outlives one frontend's memory.
+    pub deletion_held: bool,
 }
 
 /// The labels and container identities one build resolves its rows from.
@@ -1188,6 +1191,7 @@ fn container_refs(inventory: &FleetObservation, kind: Kind) -> HashMap<&str, Con
                     handle: binding.handle.clone(),
                     recipe: container.recipe,
                     unresolved: container.unresolved.clone(),
+                    deletion_held: container.deletion_held,
                 },
             ))
         })
@@ -1319,6 +1323,7 @@ mod tests {
             observed_at: None,
             unresolved: None,
             removed_at: removed.map(str::to_string),
+            deletion_held: false,
         }
     }
 
@@ -1394,6 +1399,7 @@ mod tests {
             observed_at: None,
             unresolved: None,
             removed_at: removed.map(str::to_string),
+            deletion_held: false,
         }
     }
 

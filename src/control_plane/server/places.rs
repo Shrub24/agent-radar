@@ -833,6 +833,12 @@ pub(super) fn execute_container_delete(
         stopped = cancelled.stopped;
         alive = cancelled.survivors;
         if let Some(message) = surviving_agents(&alive, delete.force, &frozen.target) {
+            // The daemon records that it asked: a repeat that names `force` is
+            // recognised from this record, not from what a client remembers.
+            let at = store::format_millis(store::now_ms());
+            if let Err(error) = containers::record_held(&registry, &container.id, &at) {
+                return write_refused(request, record, &error, core);
+            }
             return write_refused_with(
                 request,
                 record,
