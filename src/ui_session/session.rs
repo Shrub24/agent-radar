@@ -377,7 +377,9 @@ impl Session {
                 command: dto::SharedCommand::NewWorkspace,
                 row,
             } => {
-                let interaction = self.gate.begin(id, dto::SharedCommand::NewWorkspace, row)?;
+                let interaction =
+                    self.gate
+                        .begin_project(id, dto::SharedCommand::NewWorkspace, row)?;
                 // Starting a blocking interaction ends editing: the query stays.
                 self.editor = None;
                 self.interaction_notice = None;
@@ -519,15 +521,13 @@ impl Session {
                 Ok(None)
             }
             Ok(plan) => {
-                let interaction = self.gate.begin_at(
+                let interaction = self.gate.begin_confirmation(
                     id,
                     command,
                     Some(captured),
-                    dto::InteractionKind::Confirm,
                     Some(plan.prompt.clone()),
                     plan.losses.clone(),
-                    Some(plan),
-                    dto::InteractionStage::AwaitingResult,
+                    plan,
                 )?;
                 // Opening the question is a published change: the other views have
                 // to see that the session is blocked.
@@ -588,7 +588,7 @@ impl Session {
                     .as_ref()
                     .and_then(|answer| answer.pointer("/result/request/category"))
                     .and_then(serde_json::Value::as_str)
-                    == Some("agents_alive");
+                    == Some(crate::control_plane::store::Category::AGENTS_ALIVE);
             if held {
                 self.deletions_held.insert(key);
             } else if outcome.status == S::Completed {
@@ -1010,7 +1010,10 @@ mod tests {
         );
         let jobs = session.take_completions();
         let plan = jobs[0].plan.as_ref().expect("a frozen effect");
-        let frozen = serde_json::to_string(&plan.params).unwrap();
+        let crate::ui_session::targets::Effect::Domain { method, params } = &plan.effect else {
+            panic!("a deletion is a domain request");
+        };
+        let frozen = serde_json::to_string(params).unwrap();
         let (dto::UiRowId::Pane { pane_id: shown }, dto::UiRowId::Pane { pane_id: other }) =
             (&shown, &other)
         else {
@@ -1018,33 +1021,32 @@ mod tests {
         };
         assert!(frozen.contains(shown.as_str()), "{frozen}");
         assert!(!frozen.contains(other.as_str()), "{frozen}");
-        assert_eq!(plan.method, "mux.close");
+        assert_eq!(method, &"mux.close");
     }
 
     #[test]
     fn a_held_target_is_correlated_only_once_its_effect_reaches_dispatch() {
         let mut session = seeded();
         let held_plan = super::super::targets::Plan {
-            method: "mux.close",
+            effect: super::super::targets::Effect::Domain {
+                method: "mux.close",
+                params: serde_json::json!({}),
+            },
             request_id: "r1".into(),
-            params: serde_json::json!({}),
             prompt: "Close it".into(),
             losses: vec!["an agent is running".into()],
             confirms: true,
-            focus: None,
             held_key: Some("c1".into()),
         };
         let interaction = session
             .gate
-            .begin_at(
+            .begin_confirmation(
                 "a",
                 dto::SharedCommand::Delete,
                 None,
-                dto::InteractionKind::Confirm,
                 Some("Close it".into()),
                 vec!["an agent is running".into()],
-                Some(held_plan),
-                dto::InteractionStage::AwaitingResult,
+                held_plan,
             )
             .expect("the question opens");
         assert!(
@@ -1204,7 +1206,10 @@ mod tests {
         assert!(session.current().state.blocking.is_none());
         let jobs = session.take_completions();
         assert_eq!(
-            jobs[0].plan.as_ref().expect("a frozen effect").focus,
+            match &jobs[0].plan.as_ref().expect("a frozen effect").effect {
+                crate::ui_session::targets::Effect::Focus(target) => Some(target.clone()),
+                crate::ui_session::targets::Effect::Domain { .. } => None,
+            },
             Some(crate::runtime::Target::Pane(pane))
         );
     }

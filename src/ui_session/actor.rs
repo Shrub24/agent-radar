@@ -160,6 +160,48 @@ impl Drop for UiService {
     }
 }
 
+/// A dispatched effect whose answer is owed.
+///
+/// It keeps asking the daemon for the request's record, and it says so once: an
+/// operation repeatedly re-announced as uncertain tells the operator nothing the
+/// first announcement did not, while the repeated publication bumps the state
+/// every interval. The entry leaves this map only on a verdict, so an operation
+/// that stays in flight is still being asked about.
+/// How often an owed answer is looked for.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+
+struct Owed {
+    since: Instant,
+    published: bool,
+}
+
+impl Owed {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            published: false,
+        }
+    }
+
+    /// Whether this interval's look for the answer has come round.
+    fn due(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.since) < RECONCILE_INTERVAL {
+            return false;
+        }
+        self.since = now;
+        true
+    }
+
+    /// Whether publishing uncertainty now would say something new.
+    fn mark_published(&mut self) -> bool {
+        if self.published {
+            return false;
+        }
+        self.published = true;
+        true
+    }
+}
+
 fn run(
     mut session: Session,
     rx: mpsc::Receiver<Msg>,
@@ -167,7 +209,7 @@ fn run(
     attached: &AtomicUsize,
     work: Option<SyncSender<Effect>>,
 ) {
-    let mut pending = HashMap::<String, Instant>::new();
+    let mut pending = HashMap::<String, Owed>::new();
     let mut clock = Instant::now();
     let mut unsubscribed: HashMap<String, Instant> = HashMap::new();
     loop {
@@ -252,7 +294,7 @@ fn run(
                 .as_ref()
                 .is_some_and(|work| work.try_send(Effect::Dispatch(Box::new(job))).is_ok())
             {
-                pending.insert(id.clone(), Instant::now());
+                pending.insert(id.clone(), Owed::new(Instant::now()));
                 dto::CommandStatus::DispatcherAccepted
             } else {
                 dto::CommandStatus::DispatchRefused
@@ -264,17 +306,22 @@ fn run(
             });
         }
         let now = Instant::now();
-        for (id, since) in &mut pending {
-            if now.duration_since(*since) >= Duration::from_secs(5) {
-                if let Some(work) = &work {
-                    let _ = work.try_send(Effect::Reconcile(id.clone()));
-                }
+        for (id, owed) in &mut pending {
+            if !owed.due(now) {
+                continue;
+            }
+            if let Some(work) = &work {
+                let _ = work.try_send(Effect::Reconcile(id.clone()));
+            }
+            // The published uncertainty is a statement that the answer has not
+            // come, so it is made once per request: repeating it every interval
+            // republishes the same fact, costs a redraw and hides nothing new.
+            if owed.mark_published() {
                 session.operation(dto::CommandOutcome {
                     request_id: id.clone(),
                     status: dto::CommandStatus::SubmissionUncertain,
                     answer: None,
                 });
-                *since = now;
             }
         }
         let elapsed = now.duration_since(clock).as_secs();
@@ -632,5 +679,29 @@ mod tests {
         .await;
         operation(&mut stream, &request, dto::CommandStatus::Completed).await;
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod owed_tests {
+    use super::*;
+
+    #[test]
+    fn uncertainty_is_published_once_and_still_looked_for_every_interval() {
+        let start = Instant::now();
+        let mut owed = Owed::new(start);
+        assert!(!owed.due(start), "not before the interval has passed");
+        let first = start + RECONCILE_INTERVAL;
+        assert!(owed.due(first), "the interval asks again");
+        assert!(
+            owed.mark_published(),
+            "the first announcement says something"
+        );
+        let second = first + RECONCILE_INTERVAL;
+        assert!(owed.due(second), "a slow operation is still asked about");
+        assert!(
+            !owed.mark_published(),
+            "a repeated announcement would rewrite the state with the same fact"
+        );
     }
 }

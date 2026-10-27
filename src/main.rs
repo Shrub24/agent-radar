@@ -952,10 +952,19 @@ struct Attach {
     /// The row that asked for it, so the retry goes through the session rather
     /// than a second implementation of the same decision.
     row: Option<agent_radar::control_plane::public_contracts::ui_session::UiRowId>,
-    /// Set once a terminal was opened for `asked`, with when to look again.
-    waiting: Option<(Instant, u32)>,
+    /// Set once a terminal was opened for `asked`: what the recovery is doing.
+    waiting: Option<Waiting>,
     /// What the terminal thread says when it ends.
     ended: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+}
+
+/// Where a focus recovery stands, once a terminal has been opened for it.
+#[derive(Clone, Copy)]
+enum Waiting {
+    /// It is time to ask again when this elapses.
+    Retry { at: Instant, tries: u32 },
+    /// The focus was just asked again; nothing happens until its answer arrives.
+    Reply { tries: u32 },
 }
 
 /// How often, and how many times, a focus is asked again once a terminal is open.
@@ -985,12 +994,18 @@ impl Attach {
             self.waiting = None;
             return None;
         };
-        if let Some((_, tries)) = self.waiting {
+        if let Some(asked_again) = self.waiting {
+            let tries = match asked_again {
+                Waiting::Retry { tries, .. } | Waiting::Reply { tries } => tries,
+            };
             if tries >= ATTACH_TRIES {
                 self.waiting = None;
                 return Some("no terminal attached to the tmux server in time".to_string());
             }
-            self.waiting = Some((Instant::now() + ATTACH_RETRY, tries + 1));
+            self.waiting = Some(Waiting::Retry {
+                at: Instant::now() + ATTACH_RETRY,
+                tries: tries + 1,
+            });
             return None;
         }
         let environment = std::env::var("TERMINAL").ok();
@@ -1011,7 +1026,10 @@ impl Attach {
         std::thread::spawn(move || {
             let _ = sender.send(agent_radar::attach::open_terminal(&prefix, &handle));
         });
-        self.waiting = Some((Instant::now() + ATTACH_RETRY, 0));
+        self.waiting = Some(Waiting::Retry {
+            at: Instant::now() + ATTACH_RETRY,
+            tries: 0,
+        });
         Some("no tmux client attached: opening a terminal".to_string())
     }
 
@@ -1022,15 +1040,15 @@ impl Attach {
             self.ended = None;
             return Some(message);
         }
-        let (at, _) = self.waiting?;
+        let Waiting::Retry { at, tries } = self.waiting? else {
+            // Waiting on the answer to the focus just asked again.
+            return None;
+        };
         if Instant::now() >= at
             && let Some(row) = self.row.clone()
         {
             app.submit_focus_row(row);
-            // Not asked again until its answer sets the next time.
-            self.waiting = self
-                .waiting
-                .map(|(_, tries)| (Instant::now() + Duration::from_secs(3600), tries));
+            self.waiting = Some(Waiting::Reply { tries });
         }
         None
     }

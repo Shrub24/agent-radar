@@ -16,6 +16,17 @@ pub struct Completion {
 }
 
 #[derive(Debug)]
+/// What opens an interaction, before the gate mints its identity.
+struct Opening {
+    kind: InteractionKind,
+    owner: String,
+    command: SharedCommand,
+    stage: InteractionStage,
+    prompt: Option<String>,
+    losses: Vec<String>,
+}
+
+#[derive(Debug)]
 struct Open {
     view: Blocking,
     captured: Option<UiRowId>,
@@ -45,37 +56,60 @@ impl Gate {
         self.open.as_ref().map(|o| o.view.clone())
     }
 
-    pub fn begin(
+    /// Opens a project picker: its choices come from the invoking view, so it
+    /// waits in the preparing stage for them.
+    pub fn begin_project(
         &mut self,
         owner: &str,
         command: SharedCommand,
         captured: Option<UiRowId>,
     ) -> Result<String, Refused> {
-        self.begin_at(
-            owner,
-            command,
+        self.open(
+            Opening {
+                kind: InteractionKind::Project,
+                owner: owner.into(),
+                command,
+                stage: InteractionStage::Preparing,
+                prompt: None,
+                losses: Vec::new(),
+            },
             captured,
-            InteractionKind::Project,
             None,
-            Vec::new(),
-            None,
-            InteractionStage::Preparing,
         )
     }
 
-    /// Opens an interaction in a given stage: a confirmation has nothing to
-    /// prepare, so it starts awaiting an answer.
-    #[allow(clippy::too_many_arguments)]
-    pub fn begin_at(
+    /// Opens a confirmation over an effect that is already frozen. A confirmation
+    /// has nothing to prepare, so it is claimable as soon as it opens.
+    pub fn begin_confirmation(
         &mut self,
         owner: &str,
         command: SharedCommand,
         captured: Option<UiRowId>,
-        kind: InteractionKind,
         prompt: Option<String>,
         losses: Vec<String>,
+        plan: super::targets::Plan,
+    ) -> Result<String, Refused> {
+        self.open(
+            Opening {
+                kind: InteractionKind::Confirm,
+                owner: owner.into(),
+                command,
+                stage: InteractionStage::AwaitingResult,
+                prompt,
+                losses,
+            },
+            captured,
+            Some(plan),
+        )
+    }
+
+    /// Opens one interaction. The two workflows above differ in which stage they
+    /// start in and whether an effect is already frozen; both need this.
+    fn open(
+        &mut self,
+        opening: Opening,
+        captured: Option<UiRowId>,
         plan: Option<super::targets::Plan>,
-        stage: InteractionStage,
     ) -> Result<String, Refused> {
         if self.open.is_some() {
             return refused(RefusalCode::Blocked, "another interaction is open");
@@ -85,12 +119,12 @@ impl Gate {
         self.open = Some(Open {
             view: Blocking {
                 interaction_id: interaction_id.clone(),
-                command,
-                owner: owner.into(),
-                stage,
-                kind,
-                prompt,
-                losses,
+                command: opening.command,
+                owner: opening.owner,
+                stage: opening.stage,
+                kind: opening.kind,
+                prompt: opening.prompt,
+                losses: opening.losses,
                 presenter: None,
                 choices: Vec::new(),
                 note: None,
@@ -101,6 +135,7 @@ impl Gate {
         });
         Ok(interaction_id)
     }
+
     fn named(&mut self, id: &str) -> Result<&mut Open, Refused> {
         match self.open.as_mut() {
             Some(o) if o.view.interaction_id == id => Ok(o),

@@ -47,9 +47,12 @@ pub(crate) enum Selected {
 /// and what the operator is asked before it happens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
-    pub method: &'static str,
+    /// What the effect does. A focus is a runtime command the daemon runs; a
+    /// domain request goes through admission under `request_id`. The two are
+    /// mutually exclusive, so they are one value rather than a method and a
+    /// possible focus beside it.
+    pub effect: Effect,
     pub request_id: String,
-    pub params: Value,
     /// The question, naming the exact target.
     pub prompt: String,
     pub losses: Vec<String>,
@@ -59,10 +62,17 @@ pub struct Plan {
     /// The container a refused deletion was held for, so a repeat can ask the
     /// daemon to close it anyway.
     pub held_key: Option<String>,
-    /// Set when the effect is a focus rather than a domain request: the daemon
-    /// moves the serving client to this target, which is a runtime command and
-    /// not something a request record describes.
-    pub focus: Option<crate::runtime::Target>,
+}
+
+/// What a frozen effect does when it reaches the daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// A domain request, dispatched through admission under the plan's identity.
+    Domain { method: &'static str, params: Value },
+    /// A runtime command that moves the client serving a location. Not a request
+    /// record: nothing about it is durable, and the daemon is the only place the
+    /// location is known.
+    Focus(crate::runtime::Target),
 }
 
 /// Where a row is focused, from the tree and observation the session holds.
@@ -98,14 +108,12 @@ pub(crate) fn describe(row: &crate::tree::RowId) -> String {
 /// takes nothing away.
 pub(crate) fn focus_plan(target: crate::runtime::Target, request_id: String) -> Plan {
     Plan {
-        method: "",
+        effect: Effect::Focus(target.clone()),
         request_id,
-        params: serde_json::Value::Null,
         prompt: format!("Focus {}", target.description()),
         losses: Vec::new(),
         confirms: false,
         held_key: None,
-        focus: Some(target),
     }
 }
 
@@ -323,13 +331,14 @@ fn close_plan(
         "requester": REQUESTER,
     });
     Ok(Plan {
-        method: "mux.close",
+        effect: Effect::Domain {
+            method: "mux.close",
+            params: request,
+        },
         request_id: request_id.to_string(),
-        params: request,
         prompt: described,
         losses,
         confirms: true,
-        focus: None,
         held_key: None,
     })
 }
@@ -351,17 +360,18 @@ fn subject_plan(
         _ => "lifecycle.cancel",
     };
     Ok(Plan {
-        method,
+        effect: Effect::Domain {
+            method,
+            params: json!({
+                "request": {"subject_id": subject.subject_id, "claim_id": subject.claim_id},
+                "requester": REQUESTER,
+            }),
+        },
         request_id: request_id.to_string(),
-        params: json!({
-            "request": {"subject_id": subject.subject_id, "claim_id": subject.claim_id},
-            "requester": REQUESTER,
-        }),
         prompt: described,
         losses,
         confirms: true,
         held_key: None,
-        focus: None,
     })
 }
 
@@ -385,21 +395,22 @@ fn container_plan(
             ));
         }
         return Ok(Plan {
-            method: "topology.delete",
+            effect: Effect::Domain {
+                method: "topology.delete",
+                params: json!({
+                    "request": {
+                        "container_id": container.container_id,
+                        "force": force,
+                        "frozen": Value::Null,
+                    },
+                    "requester": REQUESTER,
+                }),
+            },
             request_id: request_id.to_string(),
-            params: json!({
-                "request": {
-                    "container_id": container.container_id,
-                    "force": force,
-                    "frozen": Value::Null,
-                },
-                "requester": REQUESTER,
-            }),
             prompt: described,
             losses: Vec::new(),
             confirms: true,
             held_key: Some(container.container_id.clone()),
-            focus: None,
         });
     }
     let target = container.kind.target(&container.handle);
@@ -459,20 +470,21 @@ fn container_plan(
         _ => return Err("that is not a container control".into()),
     };
     Ok(Plan {
-        method: match operation {
-            Operation::Delete => "topology.delete",
-            Operation::ReloadContainer => "topology.reload",
-            _ => "topology.create",
+        effect: Effect::Domain {
+            method: match operation {
+                Operation::Delete => "topology.delete",
+                Operation::ReloadContainer => "topology.reload",
+                _ => "topology.create",
+            },
+            params: request,
         },
         request_id: request_id.to_string(),
-        params: request,
         prompt: described,
         // A deletion nothing is running in is the standard case and loses no
         // work, so it is not a question.
         confirms: !(operation == Operation::Delete && running.is_empty()),
         losses,
         held_key: (operation == Operation::Delete).then(|| container.container_id.clone()),
-        focus: None,
     })
 }
 
@@ -539,14 +551,15 @@ pub(crate) fn launch_plan(
     let recipe =
         crate::topology::target_shell_recipe(&spec.command, &spec.shell, path, directory.as_str())?;
     Ok(Plan {
-        focus: None,
-        method: "topology.create",
+        effect: Effect::Domain {
+            method: "topology.create",
+            params: json!({
+                "request": {"kind": "tab", "workspace_id": workspace_id, "focus": false},
+                "requester": REQUESTER,
+                "recipe": recipe,
+            }),
+        },
         request_id: request_id.to_string(),
-        params: json!({
-            "request": {"kind": "tab", "workspace_id": workspace_id, "focus": false},
-            "requester": REQUESTER,
-            "recipe": recipe,
-        }),
         prompt: format!("Launch in {directory}"),
         losses: Vec::new(),
         // A launch adds a place; it takes nothing away, so it is not a question.
@@ -784,6 +797,13 @@ mod tests {
             tab: None,
             losses: Vec::new(),
         };
+        /// The request a plan would dispatch.
+        fn request(plan: &Plan) -> (&'static str, Value) {
+            match &plan.effect {
+                Effect::Domain { method, params } => (method, params.clone()),
+                Effect::Focus(_) => panic!("a deletion is a domain request"),
+            }
+        }
         let first = plan(
             Operation::Delete,
             selected(),
@@ -793,9 +813,10 @@ mod tests {
             "r1",
         )
         .expect("a container deletion is freezable");
-        assert_eq!(first.method, "topology.delete");
+        let (method, params) = request(&first);
+        assert_eq!(method, "topology.delete");
         assert_eq!(
-            first.params.pointer("/request/force"),
+            params.pointer("/request/force"),
             Some(&serde_json::Value::Bool(false)),
             "the first attempt does not force anything"
         );
@@ -808,14 +829,15 @@ mod tests {
             "r2",
         )
         .expect("a forced repeat is freezable");
+        let (_, repeat_params) = request(&repeat);
         assert_eq!(
-            repeat.params.pointer("/request/force"),
+            repeat_params.pointer("/request/force"),
             Some(&serde_json::Value::Bool(true)),
             "the repeat carries the force it was authorised with"
         );
         assert_eq!(
-            repeat.params.pointer("/request/container_id"),
-            first.params.pointer("/request/container_id"),
+            repeat_params.pointer("/request/container_id"),
+            params.pointer("/request/container_id"),
             "the repeat targets the same container"
         );
         assert_ne!(

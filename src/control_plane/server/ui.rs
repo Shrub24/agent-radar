@@ -138,7 +138,10 @@ pub(super) fn execute(
     // A focus plan names a runtime location, not a request record: the daemon
     // moves the client serving that location, which is the one place the target
     // is known without asking the frontend.
-    if let Some(target) = job.plan.as_ref().and_then(|plan| plan.focus.clone()) {
+    if let Some(target) = job.plan.as_ref().and_then(|plan| match &plan.effect {
+        crate::ui_session::targets::Effect::Focus(target) => Some(target.clone()),
+        crate::ui_session::targets::Effect::Domain { .. } => None,
+    }) {
         let Some(core) = core.upgrade() else {
             return dto::CommandOutcome {
                 request_id: job.request_id,
@@ -186,7 +189,19 @@ pub(super) fn execute(
     // identity it was frozen with; a project answer names the directory the
     // daemon creates a workspace in.
     let (method, params) = match &job.plan {
-        Some(plan) => (plan.method.to_string(), plan.params.clone()),
+        Some(plan) => match &plan.effect {
+            crate::ui_session::targets::Effect::Domain { method, params } => {
+                (method.to_string(), params.clone())
+            }
+            // A focus never reaches this branch: it is served above.
+            crate::ui_session::targets::Effect::Focus(_) => {
+                return dto::CommandOutcome {
+                    request_id: job.request_id,
+                    status: dto::CommandStatus::DispatchRefused,
+                    answer: None,
+                };
+            }
+        },
         None => {
             let dto::InteractionResult::Project { path } = &job.result else {
                 return dto::CommandOutcome {
