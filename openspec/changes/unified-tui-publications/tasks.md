@@ -46,3 +46,4 @@ Planning only. Build on the shared-UI implementation; do not migrate pi-radar or
 - 4.2 stays open: stalled-writer isolation is tested; a burst-of-heads test is not.
 - Not verified: live Kitty/tmux acceptance (owner); Nix build; Rust/TypeScript cross-decode (fixtures are independently authored bytes decoded in Rust only).
 - Archive: daemon-transport and ui-session deltas modify requirements that exist only after `shared-ui-session` is synced.
+- TypeScript decoding is owned by the pi-radar/event-feed migration (`plan.md`), which will consume these golden bytes and specify BigInt handling for `u64`. It is not a gap in this change.
