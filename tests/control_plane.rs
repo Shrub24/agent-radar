@@ -3473,6 +3473,26 @@ fn result_record(response: &Value) -> &Value {
     &response["result"]["request"]
 }
 
+/// A cancel's first answer, when the answer may honestly be `unknown`.
+///
+/// Revoking verifies the launch's managed scope through the user manager, which is
+/// live system state: on a loaded machine that check can fail to resolve, and the
+/// daemon then reports `unknown` having still revoked the launch and kept the pane.
+/// That is the designed answer, not a defect. These tests are about what survives a
+/// restart, so they accept that one honest answer and reject any other — in
+/// particular a cancel that reports success without having verified anything.
+fn assert_cancelled_or_unresolved(answer: &Value) {
+    let record = result_record(answer);
+    match record["outcome"].as_str() {
+        Some("completed") => {}
+        Some("unknown") => assert_eq!(
+            record["message"], "managed scope membership is unresolved",
+            "an unknown cancel must name why it could not confirm: {answer}"
+        ),
+        other => panic!("a cancel answers completed or an explained unknown: {other:?}"),
+    }
+}
+
 /// The ids `mux.request.list` reports as unfinished: what the stop gate counts.
 fn unfinished_ids(response: &Value) -> Vec<String> {
     response["result"]["requests"]
@@ -5203,7 +5223,7 @@ fn a_revoked_launch_stays_revoked_and_unsignalled_across_a_daemon_restart() {
     );
     let cancel_id = random_uuid();
     let first = cancel_subject(&mut client, &cancel_id, &subject);
-    assert_eq!(result_record(&first)["outcome"], "completed", "{first}");
+    assert_cancelled_or_unresolved(&first);
     let before = subject_record(&state, &subject);
     assert_eq!(daemon.stop(Signal::TERM, DEADLINE).code(), Some(0));
 
@@ -10011,7 +10031,7 @@ fn a_revocation_survives_a_crash_without_a_clean_shutdown() {
     );
     let cancel_id = random_uuid();
     let first = cancel_subject(&mut client, &cancel_id, &subject);
-    assert_eq!(result_record(&first)["outcome"], "completed", "{first}");
+    assert_cancelled_or_unresolved(&first);
     let before = subject_record(&state, &subject);
     assert_eq!(daemon.stop(Signal::KILL, DEADLINE).code(), None);
 

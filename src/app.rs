@@ -686,12 +686,6 @@ impl App {
         Self::drawn(self.mirror_ref().map(|mirror| &**mirror), &self.nav)
     }
 
-    /// Index of the selected row within [`Self::draw_rows`].
-    pub fn draw_selected_index(&self) -> Option<usize> {
-        let selected = self.nav.selected_id()?;
-        self.draw_rows().iter().position(|row| row.id() == selected)
-    }
-
     /// The shared state this view has adopted, if it is attached.
     fn mirror_ref(&self) -> Option<&std::sync::Arc<crate::ui_session::client::Mirror>> {
         self.session.as_ref()?.mirror.as_ref()
@@ -749,12 +743,44 @@ impl App {
             self.set_focus_message(Some("this command requires the shared UI session".into()));
             return None;
         }
-        let row = self
-            .nav
-            .selected_id()
-            .map(crate::ui_session::session::ui_row_id);
-        self.submit_session(UiAction::RunCommand { command, row });
+        let shared = match Self::shared_row(
+            self.mirror_ref().map(|mirror| &**mirror),
+            self.nav.selected_id(),
+        ) {
+            Ok(row) => row,
+            Err(refusal) => {
+                self.set_focus_message(Some(refusal.into()));
+                return None;
+            }
+        };
+        self.submit_session(UiAction::RunCommand {
+            command,
+            row: shared,
+        });
         None
+    }
+
+    /// The row a shared command names: the session's selection, or this view's
+    /// own when no session is attached.
+    ///
+    /// The shared selection is the operator's cursor; this view's navigation is
+    /// its best local reading of it. When the two disagree, the session has
+    /// selected a row this view cannot describe — a projected row its observation
+    /// has not caught up with — and naming the stale local row would silently
+    /// retarget the command at whatever this view still had selected. So the
+    /// disagreement is refused rather than resolved locally.
+    fn shared_row(
+        mirror: Option<&crate::ui_session::client::Mirror>,
+        local: Option<&RowId>,
+    ) -> Result<Option<crate::control_plane::public_contracts::ui_session::UiRowId>, &'static str>
+    {
+        let local = local.map(crate::ui_session::session::ui_row_id);
+        if let Some(shared) = mirror.and_then(|mirror| mirror.state.selected.as_ref())
+            && local.as_ref() != Some(shared)
+        {
+            return Err("that row is selected in the session but not described by this view yet");
+        }
+        Ok(local)
     }
 
     /// Joins the shared session through `client`.
@@ -2386,6 +2412,52 @@ mod tests {
 
         app.toggle_history();
         assert!(agent_rows(&app).is_empty(), "{:?}", row_ids(&app));
+    }
+
+    #[test]
+    fn a_command_is_refused_rather_than_retargeted_when_the_shared_selection_is_unexplained() {
+        use crate::control_plane::public_contracts::ui_session as dto;
+        use crate::ui_session::client::Mirror;
+
+        let app = app_with_fixture();
+        let local = app.nav.selected_id().cloned().expect("a selection");
+        let agreed = Mirror {
+            attachment_id: "a".into(),
+            update_id: 1,
+            state: dto::SessionState {
+                selected: Some(crate::ui_session::session::ui_row_id(&local)),
+                ..dto::SessionState::default()
+            },
+            rows: std::sync::Arc::new(Vec::new()),
+        };
+        assert_eq!(
+            App::shared_row(Some(&agreed), Some(&local)),
+            Ok(Some(crate::ui_session::session::ui_row_id(&local))),
+            "the session and this view agree, so the command names that row"
+        );
+
+        // The session selects a row this view's observation cannot describe.
+        let elsewhere = Mirror {
+            attachment_id: "a".into(),
+            update_id: 2,
+            state: dto::SessionState {
+                selected: Some(dto::UiRowId::Pane {
+                    pane_id: "elsewhere:p1".into(),
+                }),
+                ..dto::SessionState::default()
+            },
+            rows: std::sync::Arc::new(Vec::new()),
+        };
+        assert_eq!(
+            App::shared_row(Some(&elsewhere), Some(&local)),
+            Err("that row is selected in the session but not described by this view yet"),
+            "nothing acts on the stale local row"
+        );
+        assert_eq!(
+            App::shared_row(None, Some(&local)),
+            Ok(Some(crate::ui_session::session::ui_row_id(&local))),
+            "a view with no session names its own row"
+        );
     }
 
     #[test]

@@ -186,6 +186,32 @@ pub(super) fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
 ///
 /// Membership is the edge's recorded location, never a pane name guessed from a
 /// report: an agent is inside the place the create that produced it named.
+/// Why a deletion waits, when agents it could not stop are still inside.
+///
+/// Radar does not close a place over an agent that is still alive unless the
+/// operator asks twice: the first deletion whose stop window left survivors is
+/// refused with this message, and the repeat is authorised to close anyway. The
+/// decision is here rather than inline so the branch can be exercised without a
+/// live process inside the place.
+pub(super) fn surviving_agents(
+    alive: &[String],
+    force: bool,
+    target: &crate::CloseTarget,
+) -> Option<String> {
+    if alive.is_empty() || force {
+        return None;
+    }
+    let mut held = alive.to_vec();
+    held.sort();
+    held.dedup();
+    Some(format!(
+        "{} agent(s) inside {} did not exit: {} — nothing was closed; delete again to close anyway",
+        held.len(),
+        target.description(),
+        held.join(", ")
+    ))
+}
+
 pub(super) fn subjects_inside(registry: &Registry, target: &crate::CloseTarget) -> Vec<String> {
     let inside = |location: &crate::control_plane::registry::RegistryLocation| match target {
         crate::CloseTarget::Pane(pane) => location.pane.as_deref() == Some(pane.as_str()),
@@ -806,20 +832,12 @@ pub(super) fn execute_container_delete(
         );
         stopped = cancelled.stopped;
         alive = cancelled.survivors;
-        let mut held = alive.clone();
-        if !held.is_empty() && !delete.force {
-            held.sort();
-            held.dedup();
+        if let Some(message) = surviving_agents(&alive, delete.force, &frozen.target) {
             return write_refused_with(
                 request,
                 record,
                 store::Category::AGENTS_ALIVE,
-                &format!(
-                    "{} agent(s) inside {} did not exit: {} — nothing was closed; delete again to close anyway",
-                    held.len(),
-                    frozen.target.description(),
-                    held.join(", ")
-                ),
+                &message,
                 core,
             );
         }
@@ -1202,4 +1220,31 @@ pub(super) fn write_deleted(
         }),
         core,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_deletion_over_a_surviving_agent_waits_only_until_it_is_forced() {
+        let target = crate::CloseTarget::Workspace("wA".into());
+        let alive = vec!["b".to_string(), "a".to_string(), "b".to_string()];
+        let held = surviving_agents(&alive, false, &target).expect("the first deletion waits");
+        assert_eq!(
+            held,
+            "2 agent(s) inside workspace wA did not exit: a, b — nothing was closed; delete again to close anyway",
+            "the message counts distinct survivors in a stable order"
+        );
+        assert_eq!(
+            surviving_agents(&alive, true, &target),
+            None,
+            "the repeat the operator authorised closes anyway"
+        );
+        assert_eq!(
+            surviving_agents(&[], false, &target),
+            None,
+            "nothing survived, so nothing waits"
+        );
+    }
 }

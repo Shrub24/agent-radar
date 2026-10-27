@@ -38,16 +38,23 @@ Target-dependent invocation SHALL identify the target displayed by the originati
 - **WHEN** execution identity changes while confirmation is open
 - **THEN** confirming refuses with a reason and sends no operation for the replacement
 
-### Requirement: Presentation delivery is addressed and acknowledged
-Popup presentation requests SHALL have stable effect identity and a designated host attachment. They SHALL remain available until acknowledged or superseded. Host acceptance and actual presenter claim SHALL be distinguished and accepted in either arrival order. Duplicate delivery SHALL NOT grant a second presenter authority. Reconnection SHALL NOT blindly reopen historical effects.
+### Requirement: Presentation delivery is addressed and claimed
+Popup presentation requests SHALL have stable effect identity and a designated host attachment, and SHALL remain available until a presenter claims them, they are cancelled, or the bounded presentation wait expires. A claim SHALL be recorded when a presenter attaches; the session SHALL NOT track a separate acceptance by the host.
 
-#### Scenario: Popup claims before host acknowledgement
-- **WHEN** a fast presenter attaches before the host's acknowledgement arrives
-- **THEN** the valid claim is accepted without waiting for the tmux command to exit
+#### Scenario: Host cannot present
+- **WHEN** the designated host reports that it could not open a presenter
+- **THEN** the interaction closes as a cancellation does and no domain operation claims to have run
 
-#### Scenario: Host accepted but no presenter
-- **WHEN** a host accepts dispatch but no presenter claims within the bounded presentation wait
-- **THEN** the session reports abandoned or failed presentation, releases its gate and does not claim a domain operation ran
+### Requirement: One presenter holds an interaction
+Duplicate delivery SHALL NOT grant a second presenter authority, and reconnection SHALL NOT blindly reopen historical effects.
+
+#### Scenario: Presenter claims immediately
+- **WHEN** a presenter attaches before the host's launching command has exited
+- **THEN** the claim is accepted without waiting for that command to exit
+
+#### Scenario: No presenter
+- **WHEN** no presenter claims within the bounded presentation wait, or the host reports that it could not present
+- **THEN** the session records the interaction as abandoned or failed, releases its gate and does not claim a domain operation ran
 
 ### Requirement: Presenters submit typed results directly
 Inline owners and detached presenters SHALL submit interaction-ID-addressed typed results to the shared session. A detached presenter SHALL obtain its fixed specification, claim the interaction and await result acknowledgement. Tmux exit status and parent-process callbacks SHALL NOT carry choices or continue the operation. Incompatible or conflicting results SHALL be refused.

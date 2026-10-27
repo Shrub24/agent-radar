@@ -564,6 +564,100 @@ mod tests {
         );
     }
 
+    /// A peer that answers the attach and then never answers the subscription.
+    ///
+    /// This is the one shape a real daemon will not produce on demand: a
+    /// subscription it accepts and leaves silent. It is the case that used to park
+    /// the attach thread until the reply timeout, and it is why the socket is
+    /// registered for cancellation before the handshake rather than after it.
+    fn silent_subscription_peer(
+        socket: &std::path::Path,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&served);
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                served += 1;
+                count.store(served, std::sync::atomic::Ordering::SeqCst);
+                if served == 1 {
+                    // The attach answer: enough of a publication for the client to
+                    // proceed to the subscription it will never get.
+                    let attach = dto::AttachResult {
+                        attachment_id: "a".into(),
+                        publication: dto::Publication {
+                            update_id: 1,
+                            tree: dto::TreeProjection {
+                                hash: "h".into(),
+                                rows: Some(Vec::new()),
+                            },
+                            state_hash: "s".into(),
+                            session: dto::SessionState::default(),
+                        },
+                    };
+                    let id = line
+                        .split("\"id\":\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or_default()
+                        .to_string();
+                    let answer = serde_json::json!({"id": id, "result": attach});
+                    let mut writer = stream;
+                    use std::io::Write;
+                    let _ = writer.write_all(format!("{answer}\n").as_bytes());
+                    continue;
+                }
+                // The subscription: accepted by silence, for as long as the test
+                // leaves this thread alive.
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                return;
+            }
+        });
+        (handle, served)
+    }
+
+    #[test]
+    fn a_stalled_subscription_can_be_abandoned_by_dropping_the_client() {
+        let directory = std::env::temp_dir().join(format!("radar-stalled-{}", random_uuid()));
+        std::fs::create_dir_all(&directory).expect("dir");
+        let socket = directory.join("sock");
+        let (peer, served) = silent_subscription_peer(&socket);
+        let client = UiClient::start(
+            socket.clone(),
+            dto::AttachmentRole::Dashboard,
+            Wake::default(),
+        );
+        // Both connections have been made, so the client is past its attach and is
+        // waiting on a subscription the peer will never answer.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while served.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the client never reached its subscription"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let started = std::time::Instant::now();
+        drop(client);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "dropping a client must end a stalled handshake, not wait out its timeout: {:?}",
+            started.elapsed()
+        );
+        drop(peer);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn ordinary_delivery_waits_for_the_floor_and_skips_what_was_seen() {
         assert!(

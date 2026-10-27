@@ -75,7 +75,7 @@ Use the existing socket and generated contracts. The server already reads repeat
 | `ui.detach` | Best-effort release of attachment/editor/presentation ownership |
 | `ui.subscribe` | Accept an attachment-bound subscription, send an authoritative baseline, then push latest coherent publications and addressed pending deliveries until disconnect/detach |
 | `ui.content.get` | Retrieve retained immutable content or explicit expiry |
-| `ui.action` | Ordered typed command, editor acquisition/update/release, host acknowledgement, presenter claim, typed result or cancellation |
+| `ui.action` | Ordered typed command, editor acquisition/update/release, presenter claim, typed result or cancellation |
 
 Group these under a proposed `ui.session.v1` advertised contract; do not add one capability per verb. Action results distinguish applied, semantically refused, replayed retained receipt, receipt expired/reconciliation required, busy, gap and detached. Specify exact names/fields/errors through public schema generation, not ad-hoc JSON; this is a soft contract, not a prohibition on necessary changes. Keep existing authentication/framing and no unsupported/legacy fallback. One namespace does not authorize agent registrations to acquire operator presentation authority; preserve existing caller-role checks.
 
@@ -107,7 +107,7 @@ A project workflow is:
 
 The generic Picker does not need a socket or a mandatory intermediate event bus. Its session-aware owner sends the result. Tmux only supplies the popup terminal; exit codes and parent callbacks carry no choice. Do not serialize closures or execute domain work inside the picker.
 
-Retain addressed requests until acknowledgement/supersession. HostAccepted and PresenterClaimed are separate observations, allowed in either arrival order; do not wait for a popup command's eventual exit to establish readiness. A claim grants one valid presenter, not exactly-once OS-window creation under arbitrary failure. Duplicate presenters refuse/close. A valid presenter can outlive its origin. Explicit detach, subscription lifecycle and bounded attachment expiry provide abandonment handling; losing the origin's subscription does not invalidate a separately claimed presenter, and socket closure alone is not process-exit proof. Cancellation from another dashboard closes the presenter; a late conflicting result cannot dispatch.
+A presenter claims an interaction by attaching to it, and that claim is the only presentation fact recorded: there is no separate host-acceptance observation, because nothing read it and a host that could not present reports `presentation_failed`, which closes the interaction as any cancellation does. Do not wait for a popup command's eventual exit to establish readiness. A claim grants one valid presenter, not exactly-once OS-window creation under arbitrary failure. Duplicate presenters refuse/close. A valid presenter can outlive its origin. Explicit detach, subscription lifecycle and bounded attachment expiry provide abandonment handling; losing the origin's subscription does not invalidate a separately claimed presenter, and socket closure alone is not process-exit proof. Cancellation from another dashboard closes the presenter; a late conflicting result cannot dispatch.
 
 Local help/error/outcome overlays and palette browsing do not create a shared gate. Selecting a command may do so. Existing host focus/zoom/hide remains local/addressed; shared selection never broadcasts physical focus. One physical workspace host remains the supported focus assumption.
 
