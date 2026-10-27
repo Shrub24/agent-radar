@@ -44,6 +44,8 @@
 
 ## L
 
+- [lifecycle.md](lifecycle.md) — stop, cancel and deletion verdicts: what counts as an exit, and when a place is held
+
 ## M
 
 ## N

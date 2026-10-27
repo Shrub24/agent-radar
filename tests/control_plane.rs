@@ -10681,64 +10681,66 @@ fn a_deletion_ends_the_place_whatever_is_registered_in_it() {
     daemon.stop();
 }
 
-/// A bound agent that ignores SIGTERM keeps its place: the first deletion is
-/// refused `agents_alive` with nothing closed, and only a repeat that names `force`
-/// closes it, once.
-#[test]
-fn a_deletion_is_held_by_a_surviving_agent_until_it_is_repeated_with_force() {
+/// A bound agent that ignores SIGTERM, recorded inside `wA`, so a deletion of
+/// that workspace has something in it that does not exit.
+///
+/// With `keep_scope` the recorded launch keeps its managed-scope descriptor, as a
+/// real managed launch does; without one the agent is a bare process the stop
+/// window can signal and outlive.
+fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
     use agent_radar::control_plane::lifecycle::{self as managed, LaunchContext, ManagedMetadata};
     use agent_radar::control_plane::registry::{
         LocalProcfsVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnRequest,
     };
     use agent_radar::process_control::Effective;
 
-    let sandbox = Sandbox::new("topology-delete-survivor");
-    // An agent that cannot be stopped by the window: it ignores SIGTERM.
-    let mut child = std::process::Command::new("/bin/sh")
+    let child = std::process::Command::new("/bin/sh")
         .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .expect("a stubborn process");
     let identity = LocalProcfsVerifier
         .inspect(child.id() as i32)
         .expect("procfs")
         .expect("the process exists");
-    {
-        let registry = Registry::open(&sandbox.state()).expect("a registry");
-        let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
-        let parent = registry_parent(&registry, session);
-        let request_id = random_uuid();
-        registry
-            .record_spawn(
-                &SpawnRequest {
-                    request_id: request_id.clone(),
-                    parent: parent.registration_id.clone(),
-                    parent_session_id: session.into(),
-                    parent_subject_id: None,
-                },
-                1_000,
-            )
-            .expect("an edge");
-        let ticket = managed::create_with_intent(
-            &registry,
-            &request_id,
-            LaunchContext {
-                executable: "/bin/sh".into(),
-                argv: Vec::new(),
-                cwd: None,
-                env: BTreeMap::new(),
+    let registry = Registry::open(&sandbox.state()).expect("a registry");
+    let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let parent = registry_parent(&registry, session);
+    let request_id = random_uuid();
+    registry
+        .record_spawn(
+            &SpawnRequest {
+                request_id: request_id.clone(),
+                parent: parent.registration_id.clone(),
+                parent_session_id: session.into(),
+                parent_subject_id: None,
             },
-            None,
-            None,
-            ManagedMetadata::default(),
             1_000,
         )
-        .expect("a reservation");
-        registry
-            .attach_subject(&request_id, &ticket.claim_id, &ticket.registration_id)
-            .expect("attached");
-        // The fixture is about the signal path, not a systemd scope: drop the
-        // scope descriptor exactly as the lifecycle unit tests do.
-        let file = format!("{}.json", ticket.registration_id);
+        .expect("an edge");
+    let ticket = managed::create_with_intent(
+        &registry,
+        &request_id,
+        LaunchContext {
+            executable: "/bin/sh".into(),
+            argv: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        },
+        None,
+        None,
+        ManagedMetadata::default(),
+        1_000,
+    )
+    .expect("a reservation");
+    registry
+        .attach_subject(&request_id, &ticket.claim_id, &ticket.registration_id)
+        .expect("attached");
+    if !keep_scope {
+        // Nothing here is a unit: drop the descriptor the unit tests drop.
+        let name = format!("{}.json", ticket.registration_id);
         let mut pending = vec![sandbox.state()];
         let mut found = None;
         while let Some(dir) = pending.pop() {
@@ -10746,7 +10748,7 @@ fn a_deletion_is_held_by_a_surviving_agent_until_it_is_repeated_with_force() {
                 let path = entry.path();
                 if path.is_dir() {
                     pending.push(path);
-                } else if path.file_name().is_some_and(|name| *name == *file)
+                } else if path.file_name().is_some_and(|n| *n == *name)
                     && path.parent().is_some_and(|p| p.ends_with("private"))
                 {
                     found = Some(path);
@@ -10755,68 +10757,85 @@ fn a_deletion_is_held_by_a_surviving_agent_until_it_is_repeated_with_force() {
         }
         let recipe = found.expect("the launch recipe");
         let mut body: Value =
-            serde_json::from_slice(&std::fs::read(&recipe).expect("recipe")).expect("json");
+            serde_json::from_slice(&fs::read(&recipe).expect("recipe")).expect("json");
         body.as_object_mut().expect("object").remove("scope");
-        std::fs::write(&recipe, serde_json::to_vec(&body).unwrap()).expect("rewrite");
-        registry
-            .record_spawn_created(
-                &request_id,
-                RequestOutcome::Completed,
-                Some(RegistryLocation {
-                    backend: "fake".into(),
-                    instance: None,
-                    workspace: Some("wA".into()),
-                    tab: None,
-                    pane: None,
-                }),
-                None,
-            )
-            .expect("a located create");
-        managed::capture(
-            &registry,
-            &ticket.claim_id,
-            &ticket.correlation,
-            &identity,
-            &Effective {
-                cmdline: vec!["sh".into(), "run".into(), "--launch".into()],
-                cwd: None,
-                env: BTreeMap::new(),
-            },
-            1_001,
+        fs::write(&recipe, serde_json::to_vec(&body).expect("encode")).expect("rewrite");
+    }
+    registry
+        .record_spawn_created(
+            &request_id,
+            RequestOutcome::Completed,
+            Some(RegistryLocation {
+                backend: "fake".into(),
+                instance: None,
+                workspace: Some("wA".into()),
+                tab: None,
+                pane: None,
+            }),
+            None,
         )
-        .expect("captured");
-        let edge = registry
+        .expect("a located create");
+    managed::capture(
+        &registry,
+        &ticket.claim_id,
+        &ticket.correlation,
+        &identity,
+        &Effective {
+            cmdline: vec!["sh".into(), "run".into(), "--launch".into()],
+            cwd: None,
+            env: BTreeMap::new(),
+        },
+        1_001,
+    )
+    .expect("captured");
+    let edge = registry
+        .spawn_edge(&request_id)
+        .expect("read")
+        .expect("edge");
+    registry
+        .register(
+            &RegistrationRequest {
+                source: "stubborn".into(),
+                incarnation: random_uuid(),
+                session: None,
+                owner: None,
+                run: None,
+                label: None,
+                location: None,
+                process: Some(identity),
+                launch: None,
+                spawn_token: Some(edge.token.clone()),
+            },
+            1_002,
+        )
+        .expect("the child binds");
+    assert!(
+        registry
             .spawn_edge(&request_id)
             .expect("read")
-            .expect("edge");
-        registry
-            .register(
-                &RegistrationRequest {
-                    source: "stubborn".into(),
-                    incarnation: random_uuid(),
-                    session: None,
-                    owner: None,
-                    run: None,
-                    label: None,
-                    location: None,
-                    process: Some(identity.clone()),
-                    launch: None,
-                    spawn_token: Some(edge.token.clone()),
-                },
-                1_002,
-            )
-            .expect("the child binds");
-        assert!(
-            registry
-                .spawn_edge(&request_id)
-                .expect("read")
-                .expect("edge")
-                .bound
-                .is_some(),
-            "the edge is bound, so the agent counts as inside the place"
-        );
-    }
+            .expect("edge")
+            .bound
+            .is_some(),
+        "the edge is bound, so the agent counts as inside the place"
+    );
+    child
+}
 
+/// A workspace container over a backend that can close it, with one stubborn
+/// agent already recorded inside.
+fn deletion_over_a_surviving_agent(
+    name: &str,
+    keep_scope: bool,
+) -> (
+    Sandbox,
+    Arc<MuxBackend>,
+    Daemon,
+    Client,
+    std::process::Child,
+    String,
+) {
+    let sandbox = Sandbox::new(name);
+    let child = surviving_agent(&sandbox, keep_scope);
     let backend = MuxBackend::new(SPAWN_PRIMITIVES)
         .naming(CreatedLocation {
             workspace_id: Some("wA".into()),
@@ -10825,9 +10844,26 @@ fn a_deletion_is_held_by_a_surviving_agent_until_it_is_repeated_with_force() {
         })
         .with_inventory(workspace_inventory("wA"));
     backend.served_by(std::process::id() as i32);
-    let mut daemon = sandbox.daemon_with(backend.clone());
+    let daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let (id, request) = created_workspace(&mut client, "wA");
+    (sandbox, backend, daemon, client, child, {
+        let _ = request;
+        id
+    })
+}
+
+/// A bound agent that ignores SIGTERM keeps its place: the first deletion is
+/// refused `agents_alive` with nothing closed, and only a repeat that names `force`
+/// closes it, once.
+#[test]
+fn a_deletion_is_held_by_a_surviving_agent_until_it_is_repeated_with_force() {
+    let (_sandbox, backend, mut daemon, mut client, mut child, id) =
+        deletion_over_a_surviving_agent("topology-delete-survivor", false);
+    let request = json!({
+        "request": {"container_id": id, "frozen": frozen_workspace("wA")},
+        "requester": "test",
+    });
 
     let held = client.call("topology.delete", request.clone());
     assert_eq!(result_record(&held)["outcome"], "refused", "{held}");
@@ -10848,7 +10884,40 @@ fn a_deletion_is_held_by_a_surviving_agent_until_it_is_repeated_with_force() {
     assert_eq!(
         backend.closed_targets(),
         vec![CloseTarget::Workspace("wA".to_string())],
-        "the forced repeat closes the place once ({id})"
+        "the forced repeat closes the place once"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    daemon.stop();
+}
+
+/// An exit the daemon could not verify is not an exit: a managed launch whose
+/// scope cannot be confirmed holds the deletion exactly as an agent that outlived
+/// the stop window does, and the place is not closed over it until `force`.
+#[test]
+fn a_deletion_is_held_when_an_agents_exit_cannot_be_verified() {
+    let (_sandbox, backend, mut daemon, mut client, mut child, id) =
+        deletion_over_a_surviving_agent("topology-delete-unverified", true);
+    let request = json!({
+        "request": {"container_id": id, "frozen": frozen_workspace("wA")},
+        "requester": "test",
+    });
+
+    let held = client.call("topology.delete", request);
+    assert_eq!(
+        result_record(&held)["outcome"],
+        "refused",
+        "an unverifiable exit is not an exit: {held}"
+    );
+    assert_eq!(result_record(&held)["category"], "agents_alive", "{held}");
+    assert!(
+        backend.closed_targets().is_empty(),
+        "nothing is closed while an agent is unaccounted for"
+    );
+    assert!(
+        child.try_wait().expect("child state").is_none(),
+        "the agent was never signalled and is still running"
     );
 
     let _ = child.kill();
