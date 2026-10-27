@@ -44,6 +44,8 @@
 
 ## L
 
+- [lifecycle.md](lifecycle.md) — stop, cancel and deletion verdicts: what counts as an exit, and when a place is held
+
 ## M
 
 ## N
@@ -61,6 +63,8 @@
 ## T
 
 ## U
+
+- [ui-session.md](ui-session.md) — shared UI ownership, presenters, filtering, content identity, ordering, latency, inspection, host choices, the duplex attachment transport and connection admission
 
 ## V
 

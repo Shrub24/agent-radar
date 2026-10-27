@@ -151,9 +151,6 @@ impl Category {
     /// The daemon refused the operation itself: an ineligible target, a frozen
     /// target that no longer matches, or an effect it will not dispatch.
     pub const REFUSED: &'static str = "refused";
-    /// A deletion was held because an agent inside the place did not exit. The
-    /// place stands until the operator asks again.
-    pub const AGENTS_ALIVE: &'static str = "agents_alive";
 }
 
 /// What has happened to a request so far. Written in order; `Completed` is
@@ -1178,6 +1175,68 @@ mod tests {
         let (page, next) = page_after(&ids, Some(&ids[4]), 2);
         assert!(page.is_empty());
         assert!(next.is_none());
+    }
+
+    /// A settled managed operation replays its own answer from disk.
+    ///
+    /// A managed operation keeps its private seed in its record file and records
+    /// the outcome in the event log, so what a caller reads back is the seed with
+    /// the log's projection applied. This reopens the store, so nothing in this
+    /// test survives except what reached the disk: it is the same-ID retry
+    /// contract (a lost answer reads back the answer, it does not re-run).
+    #[test]
+    fn a_settled_managed_operation_replays_the_same_answer() {
+        let directory = tempdir("managed-replay");
+        let id = random_uuid();
+        let target = random_uuid();
+        let params = serde_json::json!({"request": {"subject_id": target, "claim_id": target}});
+        let store = Store::open(&directory).expect("store");
+        let pending = RequestRecord::new(
+            &id,
+            "lifecycle.cancel",
+            Some("radar".into()),
+            Some(target.clone()),
+            0,
+        )
+        .with_params(params.clone());
+        store.create(&pending).expect("the private seed");
+        let started = pending.claim().start();
+        store.write(&started).expect("the started projection");
+        let settled = started.clone().complete(
+            RequestOutcome::Completed,
+            None,
+            None,
+            vec!["launch revoked".into()],
+            5,
+        );
+        store.write(&settled).expect("the settled projection");
+        let first = store.get(&id).expect("read").expect("the record");
+        assert_eq!(first.state, RecordState::Completed, "it settled on disk");
+        // A later answer cannot walk a settled outcome backwards: the recovery
+        // path must not be able to invent an `unknown` where a verdict exists.
+        let regressed = started.clone().complete(
+            RequestOutcome::Unknown,
+            None,
+            Some("managed scope membership is unresolved"),
+            Vec::new(),
+            6,
+        );
+        assert!(
+            store.write(&regressed).is_err(),
+            "a completed operation may not be re-settled as unknown"
+        );
+        drop(store);
+
+        let reopened = Store::open(&directory).expect("reopen");
+        let replayed = reopened.get(&id).expect("read").expect("the record");
+        assert_eq!(replayed.state, first.state);
+        assert_eq!(replayed.outcome, first.outcome);
+        assert_eq!(replayed.effects, first.effects);
+        assert_eq!(replayed.completed_at, first.completed_at);
+        assert_eq!(
+            replayed.params, first.params,
+            "the private seed is the same seed"
+        );
     }
 
     #[test]

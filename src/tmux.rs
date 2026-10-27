@@ -675,16 +675,57 @@ impl TmuxRuntime {
             .map_err(Failure::unknown)
     }
 
-    /// Refuses a focus when no client is attached to the server: there is nothing
-    /// to show it to, and nothing has been changed, so a caller can attach one.
-    fn require_client(&self, cancel: &AtomicBool) -> Result<(), Failure> {
-        let clients = self
-            .run(&["list-clients", "-F", "#{client_name}"], cancel)
+    /// The client to move, named explicitly.
+    ///
+    /// tmux resolves "the current client" from the environment of the command,
+    /// which a daemon does not have. Radar's model is one client per workspace, so
+    /// the client attached to the server is the one to move: a client already
+    /// showing the target's session wins, otherwise there is only the one. More
+    /// than one client on a server is outside the model; the most recently active
+    /// is chosen so the command still has a definite answer, and a server with
+    /// nothing attached has none.
+    fn client_for(&self, target: &str, cancel: &AtomicBool) -> Result<String, Failure> {
+        // A server that cannot answer says nothing about whether the focus
+        // happened: only an empty client list is a definite answer.
+        let session = self
+            .run(
+                &["display-message", "-p", "-t", target, "#{session_name}"],
+                cancel,
+            )
             .map_err(Failure::unknown)?;
-        if clients.text.trim().is_empty() {
+        let session = session.text.trim().to_string();
+        let clients = self
+            .run(
+                &[
+                    "list-clients",
+                    "-F",
+                    "#{client_name}|#{client_session}|#{client_activity}",
+                ],
+                cancel,
+            )
+            .map_err(Failure::unknown)?;
+        let mut parsed: Vec<(String, String, i64)> = clients
+            .text
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('|');
+                let name = parts.next()?.to_string();
+                let attached = parts.next().unwrap_or_default().to_string();
+                let activity = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+                Some((name, attached, activity))
+            })
+            .collect();
+        if parsed.is_empty() {
             return Err(Failure::refused(crate::runtime::NO_CLIENT));
         }
-        Ok(())
+        if let Some((name, _, _)) = parsed.iter().find(|(_, attached, _)| *attached == session) {
+            return Ok(name.clone());
+        }
+        parsed.sort_by_key(|(_, _, activity)| *activity);
+        parsed
+            .pop()
+            .map(|(name, _, _)| name)
+            .ok_or_else(|| Failure::refused(crate::runtime::NO_CLIENT))
     }
 
     /// Moves a pane's window into view and then makes the pane active in it.
@@ -698,8 +739,8 @@ impl TmuxRuntime {
     /// later command leaves the earlier ones applied, so either is `unknown`.
     fn focus_pane(&self, handle: &str, cancel: &AtomicBool) -> Result<(), Failure> {
         let pane = self.address(handle, Kind::Pane).map_err(Failure::refused)?;
-        self.require_client(cancel)?;
-        self.run(&["switch-client", "-t", &pane], cancel)
+        let client = self.client_for(&pane, cancel)?;
+        self.run(&["switch-client", "-c", &client, "-t", &pane], cancel)
             .map_err(|message| {
                 // Racing the last client's detach changes nothing: a definite
                 // refusal, not an effect that may have happened.
@@ -727,8 +768,8 @@ impl TmuxRuntime {
         let session = self
             .address(handle, Kind::Session)
             .map_err(Failure::refused)?;
-        self.require_client(cancel)?;
-        self.run(&["switch-client", "-t", &session], cancel)
+        let client = self.client_for(&session, cancel)?;
+        self.run(&["switch-client", "-c", &client, "-t", &session], cancel)
             .map_err(|message| {
                 // With no client there is nothing to switch and nothing changed:
                 // a definite refusal, not an effect that may have happened.

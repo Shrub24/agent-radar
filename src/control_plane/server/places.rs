@@ -179,9 +179,6 @@ pub(super) fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
     write_settled(request, done, core)
 }
 
-/// The frozen normalized request a create or input carries under `request`,
-/// or the refusal to answer with. `extra` names further params this method
-/// accepts beside it.
 /// The launch subjects created inside a place, from the daemon's own spawn edges.
 ///
 /// Membership is the edge's recorded location, never a pane name guessed from a
@@ -789,12 +786,12 @@ pub(super) fn execute_container_delete(
     }
     // Every agent launched inside this place ends the way a single `D` on its own
     // row ends it: fenced, SIGTERM, one shared window for the exit, and the exit
-    // recorded. Radar does not close the place over an agent that is still alive
-    // unless the operator asks twice.
+    // recorded. The operator's confirmation named the agents it would end, so a
+    // survivor does not hold the close: the outcome says whose exit was never verified.
     let inside = subjects_inside(&registry, &frozen.target);
     let mut stopped = Vec::new();
-    // Agents left alive by the window. On a repeat deletion the place closes
-    // anyway, and the outcome says which exits were never verified.
+    // Agents left alive by the window. The place still closes, and the outcome
+    // says which exits were never verified.
     let mut alive: Vec<String> = Vec::new();
     if !inside.is_empty() {
         let verifier = Arc::clone(&locked(core).verifier);
@@ -806,23 +803,6 @@ pub(super) fn execute_container_delete(
         );
         stopped = cancelled.stopped;
         alive = cancelled.survivors;
-        let mut held = alive.clone();
-        if !held.is_empty() && !delete.force {
-            held.sort();
-            held.dedup();
-            return write_refused_with(
-                request,
-                record,
-                store::Category::AGENTS_ALIVE,
-                &format!(
-                    "{} agent(s) inside {} did not exit: {} — nothing was closed; delete again to close anyway",
-                    held.len(),
-                    frozen.target.description(),
-                    held.join(", ")
-                ),
-                core,
-            );
-        }
     }
     let settled = match lifecycle::close_for_deletion(backend.as_ref(), &frozen, &cancel) {
         DirectClose::Completed => {

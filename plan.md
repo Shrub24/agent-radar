@@ -7,6 +7,80 @@ The queue behind the OpenSpec changes. An item lives here with the decision it
 still needs, and leaves when it becomes a change worth specifying. What is
 already settled is in `README.md` and `openspec/`; this file is the future.
 
+## Priority debt — typed contracts across the Rust daemon
+
+High-priority architectural cleanup, ahead of further feature expansion: sweep
+Rust-owned operation, response, state and error structures across the daemon and
+its Rust consumers. Closed domain vocabularies must be enums and typed payloads,
+not strings or `serde_json::Value` inspected with key paths. Reuse existing
+outcome/error types; do not introduce another parallel vocabulary or a generic
+operation framework. Use typing/error crates only where they remove real work
+beyond ordinary Rust types.
+
+The problem is broader than the TUI's `outcome_status`: operation handlers build
+JSON results, and internal consumers reconstruct state from wire strings.
+Serialization must be a boundary adapter, not the internal domain contract.
+Keep genuinely open extension data and human-readable diagnostics as such; this
+is not a ban on strings or JSON at external boundaries.
+
+Scope the sweep across admission, execution, durable/public operation records,
+reconciliation, Rust clients, and other daemon handlers with the same pattern.
+Use typed request/result DTOs and structured errors end to end, with one explicit
+mapping at each persistence or wire boundary. Preserve distinctions between
+pre-admission refusal, pending/admitted work, execution uncertainty and settled
+domain outcomes; these are not interchangeable states to collapse for brevity.
+The previous illustrative `OpResult` is not an approved contract: establish the
+actual state model before choosing its variants.
+
+Deliver through complete handler/consumer paths, deleting replaced JSON probing,
+string comparisons, duplicate state representations and hand-built envelopes in
+the same slices. Aim for unchanged wire/persistence compatibility; identify any
+necessary contract change explicitly rather than hiding it inside the refactor.
+Validate owned semantics and boundary compatibility with existing checks plus
+focused missing evidence, not a new exhaustive test matrix. Done when Rust-owned
+closed contracts no longer require reparsing serialized state to recover meaning.
+
+## Unified publication and transport direction
+
+The TUI change is proposed in
+[`unified-tui-publications`](openspec/changes/unified-tui-publications/proposal.md).
+It replaces the TUI's independent observation fetch with one coherent actor
+publication head referencing three immutable payloads: observation, tree
+projection and UI-session state. One head sequence orders publications; XXH3-128
+hashes identify MessagePack payload bytes. Publication counters/timestamps and
+delivery bookkeeping do not enter payload hashes; genuine domain identities,
+source freshness and sample times retain their meaning. The TUI holds only its
+current head plus a bounded in-progress replacement, not historical content.
+
+Build reusable, domain-agnostic encoding, content-reference/store and bounded
+framing/subscription functions as part of that implementation. Keep typed
+producers and three explicit lane fields rather than an arbitrary lane/plugin
+framework. Reuse unchanged immutable encoded objects, serialize changed
+candidates once, and centralise publication coalescing; no frontend smoothing.
+
+### Follow-on: pi-radar and other daemon lanes
+
+Extend the same MessagePack conventions, XXH3-128 content machinery where useful,
+and bounded, event-driven subscription transport to pi-radar and other daemon
+consumers in separate changes. Use Tokio for appropriate Rust socket tasks and
+the native event loop in TypeScript; do not create a second runtime or actor
+framework. Cross-language fixtures must pin named fields, enum tags, exact
+integer handling, hash representation and deterministic map encoding.
+
+Snapshot feeds may coalesce to latest state and use content references. Ordered
+lifecycle/event feeds instead need cursors, retention gaps and recovery; commands
+retain request identity, domain admission and acknowledgement semantics, while
+presence/ingest retain their own backpressure contracts. Do not add hashes to
+messages without a content-identity use. Migrate each consumer completely and
+remove its replaced path rather than maintain duplicate codecs/delivery paths.
+
+These other lanes, their clients and the observation sampler's domain semantics
+are NOT migrated by the TUI change. It may adapt the existing observation hub,
+UI actor and serving transport only as required to deliver the three TUI
+payloads; no speculative wiring for later consumers. Observation smoothing,
+compression, chunking, deltas and broader connection-admission redesign remain
+out of scope until separately justified.
+
 ## Accepted baseline
 
 The operator accepted the live smoke on 2026-10-06. The initial fleet overview,
@@ -41,65 +115,50 @@ for their control inboxes.
 
 ## Next
 
-The `foldable-process-descendants` change is landed: verified per-member
-samples, the collapsed Processes table and its local selection/folding mode are
-implemented, verified and archived. Its gates are recorded in that change's
-`verification.md`. Keep the next work separate from lifecycle and state
-contracts.
+Current queue as of 2026-10-24, after `managed-scoped-launch` landed on `main`
+(`7804971f`) and pi-radar moved to daemon wire revision 6. Managed launch is the
+first-class lifecycle; adoption is the observed fallback. The sections after
+this one predate that posture. They are backlog to prune (item 7), not the queue.
 
-`mux-control-plane`, `daemon-agent-lifecycle` and `mutable-session-context` are
-implemented, verified, pushed, synced and archived. The daemon foundations are
-at `92ea9d37`; mutable session context is `4e376978`. See each archived change's
-verification record and `docs/daemon.md`. The daemon provides physical mux
-wrappers plus independent durable registration, execution/assignment channels,
-fenced mutable session context, process verification, private inert launch
-specifications and daemon-authored managed-child spawn edges.
-See `docs/daemon.md` for the consumer entry point and linked wire references.
-`managed-child-stop` is implemented, verified and archived: safe pane closure
-for an exact bound daemon-spawned child with durable outcomes. It is not process
-termination, resume, restart or assignment completion.
+1. **Finish `managed-scoped-launch`.** Its section 9 holds the defects the
+   review found: `radar run` always refuses (9.1), admitted processes have no
+   birth identity (9.2), the two launch chains differ (9.3), units are never
+   cleaned up (9.4), and tests create real units on the user manager (9.5).
+   Then the operator's acceptance of 5.1 and 5.4, the agreed reset scope, and
+   archive.
+2. **Close `unified-pi-registration`.** Task 4.1, the composed flow, then
+   archive. First check that its deltas still read correctly now that
+   managed-scoped-launch revised its adoption policy.
+3. **Close the topology pair.** `managed-topology` 6.2 (PTY coverage) and 6.4
+   (tmux acceptance), archive, then `adopted-topology`.
+4. **Finish `daemon-service`.** 2.4 and 5.2, plus the operator's live
+   checks 9.1–9.5.
+5. **`tmux-control-mode`.** The tmux 3.8 floor first (section 0), then
+   verify coverage on 3.8 before building the observer. Observation only: no
+   evidence moves to notifications.
+6. **Model consolidation.** One pass so the code reads in the
+   subject/claim/registration model:
+   - `SUBJECT_ENV` (`PI_RADAR_LAUNCH_SUBJECT`) carries a claim id.
+   - `process_for_control` accepts either key.
+   - Processes admitted by `radar run` are recorded as `Origin::Spawned`.
+   - `successor`, `bound_registration_id`, `correlation` and the reuse of
+     `spawn_request_id` look like lifecycle-authority leftovers. Confirm each
+     has no reader before removing it.
 
-`child-launch-binding` is implemented and verified (7/7 tasks), archived and
-pushed with the daemon launch-context work (`65f3e8e3`, docs `9d3df7f5`). Spawn
-carries cwd/environment overlays, validates support before effects, keeps
-environment values private, and exposes the exact token-bound child `agent_id`
-for registry lookup. New spawn edges also carry the explicitly named parent
-registration and its verified session UUID; legacy edges are not assigned
-inferred session parentage. Herdsman launch migration remains external; binding
-is not application or assignment readiness.
+   Split `src/control_plane/server.rs` (about 8.5k lines) into per-area
+   handler modules in the same pass, following `public_contracts/`.
+7. **Planning hygiene.** Reduce this file to the current queue plus decisions
+   still open, and move parked detail to `ideas.md` or drop it. `ideas.md`
+   still lists live Pi marker persistence, which no longer exists.
+8. **Herdr.** Decide whether it stays a supported backend or survives only as
+   fixture shape for the tree/app/ui tests, which still use `decode_snapshot`.
+9. **Growth limits.** The lifecycle event log replays every file on open, and
+   observation snapshots cap at 512 KiB. Measure both at realistic fleet sizes
+   before either becomes a wall. Never prune authoritative lifecycle events
+   like a notification ring.
 
-`agent-facts-channels` and `registry-backed-dashboard` are implemented and
-accepted, synced and archived under `openspec/changes/archive/2026-10-13-*`.
-Their verification records accompany the archives. The daemon path
-displays registry execution, assignment and self facts with independent
-provenance/freshness, joined by exact location and process birth identity.
-Unjoined registrations remain visible but own no pane or controls. Direct mode
-shows ordinary panes without Herdr agent-state fallback; legacy metadata is
-retained only for destructive containment safety. Real disposable tmux acceptance
-passed with Herdr unavailable and zero Herdr calls. Publisher adoption of the
-new facts and assignment fields remains external. General launch, process
-termination, resume and restart remain unimplemented. Existing managed controls
-remain owner-routed except the daemon's opt-in close for its own bound children;
-the direct adapter remains an explicit mode/startup fallback, never a retry after
-uncertain dispatch.
-Linux-only is accepted; cross-platform support is not a prerequisite.
-
-`daemon-managed-lifecycle` is committed and pushed (`a0a7f97f`): the daemon owns
-managed-launch lifecycle — tracked launches whose process is captured with a
-pidfd, cancel and verified stop through one exact-process path, enrollment and
-restart, a durable typed event log whose projections are rebuilt by replay, and
-an unbound launch's pane cleaned up as a recorded cancel effect fenced to the
-creating server instance. `managed-topology` is implemented in the same line:
-durable containers with a separate backend binding, `topology.create` (a labelled
-container that may carry a private recipe, run in the created pane by the daemon),
-`topology.delete` (the guarded close of a container's place, which refuses to end
-a live managed worker and names it), `topology.reload` (a pane's recorded recipe
-run again, only over a typed retained exit), and a tree whose rows carry the
-container identity of their place, with `a`/`D`/`R` in the TUI confirmed against a
-frozen container and dispatched to the daemon by request id. See each change's
-verification record. `managed-topology` is not archived yet: the TUI's tab-level
-controls, a recipe input field, PTY coverage of the container actions and the live
-tmux acceptance of the container verbs remain open.
+Deferred: gather-children, cross-tab topology, automatic freezing, resource
+budgets and UI, background-task scopes, typed OSC 133 facts, and the sidebar.
 
 ## Adoption-first execution queue
 
@@ -177,6 +236,18 @@ client targeting and session/window sharing together; a client ID alone is not
 acceptance. Switching one view must leave the other unchanged. Closing the shell
 must leave running agents intact. Keep selection and layout preferences local
 to the view and logical parentage independent of pane arrangement.
+
+### Workspace host: attach on demand
+
+`radar workspace` attaches to the agents' server before anything is chosen and,
+when that server has no session, fabricates one named `main`. Neither is wanted.
+The host should open with the sidebar alone and show the full dashboard until an
+agent area exists; choosing a workspace attaches it, and the sidebar compacts at
+that moment. Expansion then has a single source of truth — whether the host
+holds an agent area — and auto-collapse on selecting a workspace or pane falls
+out of the same rule rather than fighting the explicit toggle. This needs an
+attach action carrying a session name, which the current argument-free
+`[sidebar]` command shape cannot express.
 
 ### Priority 2 — Shared daemon-owned sampled observation
 

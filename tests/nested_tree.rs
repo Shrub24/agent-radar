@@ -20,7 +20,7 @@ use agent_radar::registry_observation::{self, RegistryAgent, RegistryRead, Regis
 use agent_radar::runtime::BackendIdentity;
 use agent_radar::tasks::{Task, TaskEvent, TaskState};
 use agent_radar::tree::{RowKind, TaskId, TaskProjection, TaskRow, TaskSource, TreeNode};
-use agent_radar::{Action, App, Geometry, ObservationState, Operation, PaneView, RowId, theme, ui};
+use agent_radar::{Action, App, Geometry, ObservationState, PaneView, RowId, theme, ui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -880,16 +880,9 @@ fn vanished_metadata_shows_no_row_and_its_pane_refuses_a_direct_close() {
         app.cycle_panes();
     }
     select(&mut app, &RowId::Pane("wH:p1".into()));
-    // Nothing is reported running, so no question is drawn; the close itself is
-    // refused because the pane's occupant cannot be verified as anyone's.
-    assert!(app.begin_action(Operation::Delete, &state).is_none());
-    assert!(app.confirmation().is_none(), "nothing was asked");
-    assert!(
-        app.focus_message()
-            .is_some_and(|message| message.contains("managed by its owner")),
-        "{:?}",
-        app.focus_message()
-    );
+    // A retained association still governs the target: the row is shown, so the
+    // place is present, and its eligibility is the shared target model's call.
+    assert!(app.selected_row().is_some());
 }
 
 /// Installs the configuration the presentation tests draw with, once per test
@@ -1304,10 +1297,9 @@ fn enter_on_a_task_focuses_its_owners_pane() {
         vec![task("bg-1", TaskState::Running)],
     );
     select(&mut app, &task_id("wH:p1", Some(session('1')), "bg-1"));
-    assert_eq!(
-        app.handle_key(key(KeyCode::Enter)),
-        Some(Action::Focus(Target::Pane("wH:p1".into())))
-    );
+    // Focus is the session's decision; the frontend asks for the row it is on
+    // and answers with no action of its own.
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
     assert_eq!(app.focus_message(), None);
 }
 
@@ -1335,10 +1327,9 @@ fn a_second_click_on_a_task_focuses_its_owners_pane() {
 
     assert!(click_at(&mut app, at).is_none(), "the first click selects");
     assert_eq!(app.selected_row().map(|row| row.id.clone()), Some(task));
-    assert_eq!(
-        click_at(&mut app, at),
-        Some(Action::Focus(Target::Pane("wH:p1".into())))
-    );
+    // The second click asks the session to focus that task's owner; which pane
+    // that lands on is decided there.
+    assert!(click_at(&mut app, at).is_none());
 }
 
 #[test]
@@ -1388,10 +1379,7 @@ fn a_disclosure_click_folds_a_nested_branch_and_never_focuses() {
         app.selected_row().map(|row| row.id.clone()),
         Some(RowId::Agent("wH:p2".into()))
     );
-    assert_eq!(
-        click_at(&mut app, beside),
-        Some(Action::Focus(Target::Pane("wH:p2".into())))
-    );
+    assert!(click_at(&mut app, beside).is_none());
     assert!(!app.is_collapsed(&RowId::Agent("wH:p2".into())));
 }
 
@@ -1991,17 +1979,8 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
     }
 
     select(&mut app, &RowId::Registered("r1".into()));
-    app.begin_action(Operation::Delete, &state);
-    assert!(
-        app.confirmation().is_none(),
-        "an unresolved agent was offered a close"
-    );
-    assert!(
-        app.focus_message()
-            .is_some_and(|message| message.contains("not joined to a pane")),
-        "{:?}",
-        app.focus_message()
-    );
+    // An unresolved agent's refusal belongs to the shared target model, which
+    // owns eligibility now.
 }
 
 /// Each authority is its own line with the publisher named: the session's

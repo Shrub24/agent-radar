@@ -101,42 +101,6 @@ pub struct TaskSnapshot {
 /// who asked.
 const REQUESTER: &str = "radar";
 
-/// What one observation read returned.
-#[derive(Clone, Debug)]
-pub enum ObservationRead {
-    /// The daemon's current revision.
-    Snapshot(Box<crate::control_plane::observation::Snapshot>),
-    /// The caller already holds the current revision.
-    NotModified { epoch: String, revision: u64 },
-    /// The caller named a revision or epoch this daemon does not hold; it must
-    /// restart from the current revision rather than merge the two.
-    Expired { epoch: String, revision: u64 },
-    /// The snapshot is larger than one response may carry: the caller asked for
-    /// more classes than it can receive in one read.
-    TooLarge,
-}
-
-fn decode_observation_result(result: Value) -> Result<ObservationRead, serde_json::Error> {
-    use crate::control_plane::public_contracts::observation::ObservationGetResponse;
-
-    Ok(
-        match serde_json::from_value::<ObservationGetResponse>(result)? {
-            ObservationGetResponse::Snapshot(response) => {
-                ObservationRead::Snapshot(Box::new(response.snapshot.into()))
-            }
-            ObservationGetResponse::NotModified(response) => ObservationRead::NotModified {
-                epoch: response.not_modified.epoch,
-                revision: response.not_modified.revision,
-            },
-            ObservationGetResponse::Expired(response) => ObservationRead::Expired {
-                epoch: response.snapshot_expired.epoch,
-                revision: response.snapshot_expired.revision,
-            },
-            ObservationGetResponse::TooLarge(_) => ObservationRead::TooLarge,
-        },
-    )
-}
-
 /// The daemon as a [`RuntimeProvider`].
 pub struct DaemonRuntime {
     socket: PathBuf,
@@ -148,6 +112,11 @@ pub struct DaemonRuntime {
 }
 
 impl DaemonRuntime {
+    /// The socket this client dials.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
     /// Whether the daemon advertised `contract`.
     fn serves(&self, contract: ops::Contract) -> bool {
         self.declared.iter().any(|name| name == contract.as_str())
@@ -317,43 +286,6 @@ impl DaemonRuntime {
         let params = json!({"request": request, "requester": REQUESTER});
         self.call(method, params, cancel)
             .and_then(|result| Settled::of(&result))
-    }
-
-    /// Reads the daemon's shared observation snapshot.
-    ///
-    /// `since_revision` is the epoch-qualified revision the caller already
-    /// holds: naming it lets the daemon answer `not_modified`, and `wait_ms`
-    /// holds the read open for a newer one. The classes asked for are demanded
-    /// of the sampler for as long as this reader keeps asking.
-    pub fn observation_get(
-        &self,
-        epoch: Option<&str>,
-        since_revision: Option<u64>,
-        wait_ms: u64,
-        classes: &[&str],
-        cancel: &AtomicBool,
-    ) -> Result<ObservationRead, String> {
-        if !self.serves(ops::Contract::ObservationGet) {
-            return Err(self.describe(format!(
-                "does not provide `{}`",
-                ops::Contract::ObservationGet.as_str()
-            )));
-        }
-        let mut params = json!({"classes": classes});
-        if let Some(epoch) = epoch {
-            params["epoch"] = json!(epoch);
-        }
-        if let Some(revision) = since_revision {
-            params["since_revision"] = json!(revision);
-        }
-        if wait_ms > 0 {
-            params["wait_ms"] = json!(wait_ms);
-        }
-        let result = self
-            .call("observation.get", params, cancel)
-            .map_err(|failure| failure.message)?;
-        decode_observation_result(result)
-            .map_err(|error| self.describe(format!("sent an unreadable observation: {error}")))
     }
 }
 
@@ -617,21 +549,4 @@ fn location_of(identity: CreatedIdentity) -> CreatedLocation {
         CreatedKind::Pane => location.pane_id = Some(identity.id),
     }
     location
-}
-
-#[cfg(test)]
-mod observation_result_tests {
-    use super::*;
-
-    #[test]
-    fn not_modified_reads_the_nested_revision_from_the_public_response() {
-        let result = decode_observation_result(json!({
-            "not_modified": {"epoch": "epoch-1", "revision": 12}
-        }))
-        .expect("decode response");
-        assert!(matches!(
-            result,
-            ObservationRead::NotModified { epoch, revision: 12 } if epoch == "epoch-1"
-        ));
-    }
 }

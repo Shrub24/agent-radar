@@ -1,20 +1,18 @@
 use std::io;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_radar::control_plane::observation::Snapshot;
-use agent_radar::managed_control as radar;
-use agent_radar::snapshot_fetch::{Fetched, SnapshotFetcher};
-use agent_radar::topology::ContainerControl;
-use agent_radar::tree::RowId;
+use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
+use agent_radar::ui_session::client::{UiClient, Wake};
+use agent_radar::ui_session::publication::Observation;
 use agent_radar::{
-    Action, App, Closer, Config, Confirmed, Focuser, Geometry, ObservationState, PaneView,
-    control_plane, theme, ui,
+    Action, App, Config, Geometry, ObservationState, PaneView, control_plane, theme, ui,
 };
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
+use futures_util::StreamExt;
 use ratatui::widgets::ListState;
 
 fn main() -> io::Result<()> {
@@ -23,24 +21,18 @@ fn main() -> io::Result<()> {
         print!("{}", load_config().to_document());
         return Ok(());
     }
-    let dashboard = match &cli.invocation {
-        None => Some((false, None)),
-        Some(agent_radar::cli::Invocation::Sidebar) => Some((true, None)),
-        Some(agent_radar::cli::Invocation::Modal { key, row }) => {
-            let row = match row.as_deref().map(serde_json::from_str) {
-                None => None,
-                Some(Ok(row)) => Some(row),
-                Some(Err(error)) => {
-                    eprintln!("radar modal: the row is not an identity: {error}");
-                    std::process::exit(2);
-                }
-            };
-            Some((false, Some((KeyCode::Char(*key), row))))
-        }
+    if let Some(agent_radar::cli::Invocation::Present { interaction }) = &cli.invocation {
+        let result = run_presenter(interaction);
+        disable_mouse_capture();
+        return result.and(ratatui::try_restore());
+    }
+    let sidebar = match &cli.invocation {
+        None => Some(false),
+        Some(agent_radar::cli::Invocation::Sidebar) => Some(true),
         Some(_) => None,
     };
-    if let Some((sidebar, modal)) = dashboard {
-        let result = run(sidebar, modal);
+    if let Some(sidebar) = sidebar {
+        let result = run(sidebar);
         disable_mouse_capture();
         let restored = ratatui::try_restore();
         return result.and(restored);
@@ -73,7 +65,7 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
                 }
             }
         }
-        Invocation::Sidebar | Invocation::Modal { .. } => {
+        Invocation::Sidebar | Invocation::Present { .. } => {
             unreachable!("these are dashboards, not printing commands")
         }
         Invocation::Server(action) => {
@@ -455,7 +447,7 @@ fn await_daemon(
 ///
 /// A source that is stale or unavailable names why, and the footer shows that
 /// rather than a fleet-wide verdict the source did not make.
-fn source_diagnostic(snapshot: &Snapshot, name: &str) -> Option<String> {
+fn source_diagnostic(snapshot: &Observation, name: &str) -> Option<String> {
     snapshot
         .sources
         .iter()
@@ -491,7 +483,185 @@ fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
     );
 }
 
-fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()> {
+fn run_presenter(interaction: &str) -> io::Result<()> {
+    use agent_radar::control_plane::public_contracts::ui_session::{InteractionResult, UiAction};
+    use agent_radar::picker::{Item, Picker, Step};
+    theme::install(load_config());
+    // Apply the same socket-path trust check as the dashboard before attaching.
+    let selected = control_plane::client::connect().map_err(io::Error::other)?;
+    let daemon = selected
+        .observation
+        .ok_or_else(|| io::Error::other("daemon has no observation service"))?;
+    let wake = Wake::default();
+    let mut terminal = ratatui::try_init()?;
+    let runtime = session_runtime()?;
+    runtime.block_on(async {
+    let mut client = UiClient::presenter(
+        &tokio::runtime::Handle::current(),
+        daemon.socket().to_path_buf(),
+        interaction.into(),
+        wake.clone(),
+    );
+    let result = async {
+    let mut events = EventStream::new();
+    let mut picker = None::<Picker<String>>;
+    let mut confirm = None::<agent_radar::ui_session::confirm::Confirm>;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    let mut submitting = false;
+    let mut attached = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(mirror) = client.poll() {
+            let Some(b) = mirror
+                .state
+                .blocking
+                .as_ref()
+                .filter(|b| b.interaction_id == interaction)
+            else {
+                return Ok(());
+            };
+            if b.presenter.as_deref() == Some(&mirror.attachment_id) {
+                attached = true;
+                if b.kind == agent_radar::control_plane::public_contracts::ui_session::InteractionKind::Confirm
+                    && confirm.is_none()
+                    && !submitting
+                {
+                    confirm = Some(agent_radar::ui_session::confirm::Confirm::new(
+                        b.interaction_id.clone(),
+                        "Confirm",
+                        b.prompt.clone().unwrap_or_default(),
+                        b.losses.clone(),
+                    ));
+                    picker = None;
+                } else if picker.is_none() && !submitting && confirm.is_none() {
+                    let items = b
+                        .choices
+                        .iter()
+                        .map(|p| Item::new(p.clone(), None::<String>, p.clone()))
+                        .collect();
+                    picker = Some(Picker::new(
+                        "Workspace",
+                        b.note
+                            .as_ref()
+                            .map(|note| format!("{note} · enter open · esc cancel"))
+                            .unwrap_or_else(|| "enter open · esc cancel".into()),
+                        items,
+                    ));
+                }
+            }
+        }
+        if attached && !client.connected() {
+            return Err(io::Error::other(
+                "presenter connection lost; result may have been accepted",
+            ));
+        }
+        if !attached && Instant::now() >= deadline {
+            return Err(io::Error::other("interaction is closed or already claimed"));
+        }
+        terminal.draw(|frame| {
+            if let Some(confirm) = &confirm {
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        format!("{}  {}", confirm.title, confirm.prompt),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("This may lose:"),
+                ];
+                for loss in &confirm.losses {
+                    lines.push(Line::from(format!("  {loss}")));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(format!(
+                    "{}[ Confirm ]{}",
+                    if confirm.confirm_selected {
+                        ""
+                    } else {
+                        "[ Cancel ]   "
+                    },
+                    if confirm.confirm_selected {
+                        "   [ Cancel ]"
+                    } else {
+                        ""
+                    },
+                )));
+                lines.push(Line::from("tab switch · enter answer · esc cancel"));
+                frame.render_widget(ratatui::widgets::Paragraph::new(lines), frame.area());
+            } else if let Some(picker) = &picker {
+                ui::picker::draw(frame, picker, true);
+            } else {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("Waiting for interaction acknowledgement…"),
+                    frame.area(),
+                );
+            }
+        })?;
+        let event = tokio::select! {
+            event = events.next() => Some(event),
+            () = wake.woken() => None,
+            () = tokio::time::sleep(Duration::from_secs(1)) => None,
+        };
+        match &event {
+            Some(None) => return Ok(()),
+            Some(Some(Err(error))) => return Err(io::Error::other(error.to_string())),
+            _ => {}
+        }
+        if let Some(Some(Ok(Event::Key(key)))) = event
+            && key.kind != KeyEventKind::Release
+            && !submitting
+        {
+            if let Some(pending) = confirm.as_mut()
+                && let Some(answer) = pending.handle_key(key)
+            {
+                let action = match answer {
+                    agent_radar::ui_session::confirm::Answer::Confirm => {
+                        UiAction::ResolveInteraction {
+                            interaction_id: interaction.into(),
+                            result: InteractionResult::Confirm { accepted: true },
+                        }
+                    }
+                    agent_radar::ui_session::confirm::Answer::Cancel => {
+                        UiAction::CancelInteraction {
+                            interaction_id: interaction.into(),
+                        }
+                    }
+                };
+                client.submit(action);
+                submitting = true;
+                confirm = None;
+                continue;
+            }
+            let step = if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                Step::Close
+            } else if let Some(picker) = &mut picker {
+                picker.handle_key(key)
+            } else {
+                continue;
+            };
+            let action = match step {
+                Step::Continue => continue,
+                Step::Close => UiAction::CancelInteraction {
+                    interaction_id: interaction.into(),
+                },
+                Step::Choose(path) => UiAction::ResolveInteraction {
+                    interaction_id: interaction.into(),
+                    result: InteractionResult::Project { path },
+                },
+            };
+            client.submit(action);
+            submitting = true;
+            picker = None;
+        }
+    }
+    }.await;
+    client.shutdown().await;
+    result
+    })
+}
+
+fn run(sidebar: bool) -> io::Result<()> {
     let mut config = load_config();
     let workspace_host = sidebar
         .then(agent_radar::workspace::sidebar_commands)
@@ -515,51 +685,26 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
     let Some(selected) = await_daemon(&mut terminal)? else {
         return Ok(());
     };
-    let (runtime, container_controls, lifecycle_controls, observation, task_diagnostic) = (
-        selected.provider,
-        selected.containers,
-        selected.lifecycle,
-        selected.observation,
-        selected.task_diagnostic,
-    );
-    // One runtime, shared: the focuser and the closer read and act on the same
-    // adapter through the same seam. The dashboard collects nothing itself: the
-    // daemon's sampler owns that, and this reads its snapshot.
-    let mut focuser = Focuser::new(Arc::clone(&runtime));
-    let mut closer = Closer::new(Arc::clone(&runtime));
+    let (observation, task_diagnostic) = (selected.observation, selected.task_diagnostic);
+    // One runtime, shared: the focuser and the session's dispatcher read and act
+    // on the same adapter. The dashboard collects nothing itself: the daemon's
+    // sampler owns that, and this reads its snapshot.
     // Managed lifecycle actions target daemon-owned subjects and run off the UI thread.
-    let mut managed = radar::LifecycleControl::new(lifecycle_controls);
     // A confirmed container control goes to the daemon, one at a time and off the
     // UI thread. A run without a daemon has no container to act on and says so.
-    let mut containers = ContainerControl::new(container_controls);
     let mut state = ObservationState::new();
-    let mut app = if modal.is_some() {
-        App::modal()
-    } else if sidebar {
-        App::sidebar()
-    } else {
-        App::new()
-    };
-    app.set_modal_host(in_workspace);
+    let mut app = if sidebar { App::sidebar() } else { App::new() };
     // Which presentation this process was started in. A sidebar that draws the
     // full dashboard and a dashboard that was asked for look the same on screen,
     // so the log states the mode, the argv that chose it and the width it was
     // given, and the two can be told apart afterwards.
     tracing::info!(
-        mode = match (app.is_modal_only(), app.is_sidebar()) {
-            (true, _) => "modal",
-            (false, true) => "sidebar",
-            (false, false) => "dashboard",
-        },
+        mode = if app.is_sidebar() { "sidebar" } else { "dashboard" },
         expanded = app.is_expanded(),
         workspace_host = in_workspace,
         argv = ?std::env::args().collect::<Vec<_>>(),
         "dashboard started"
     );
-    // The popup opens its modal once the first snapshot has arrived, because the
-    // row it was started for is selected by identity in that snapshot.
-    let mut pending_modal = modal;
-    let mut queued_key = None;
     if let Some(reason) = log_note {
         app.set_focus_message(Some(format!("no dashboard log: {reason}")));
     }
@@ -568,413 +713,229 @@ fn run(sidebar: bool, modal: Option<(KeyCode, Option<RowId>)>) -> io::Result<()>
     // The daemon samples for every display; this fetcher is how the dashboard
     // reads what it published, and it is absent only from a daemon that does not
     // serve the observation contract, which the diagnostic screen refuses.
-    let fetcher = observation.map(SnapshotFetcher::new);
-    // The animation frame, and the clock it is derived from: a mark has to move
-    // at the same rate whether or not anything else made the loop redraw.
-    let started = Instant::now();
-    let mut phase: usize = 0;
-    let mut dirty = true;
-    // A focus with no client attached opens a terminal and asks again, because a
-    // client has to exist before a focus can show anything.
-    let mut attach = Attach::default();
-    let mut sidebar_command = None;
-    let mut flip_on_success = false;
-
-    loop {
-        dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);
-        // Foreground evidence is swept while a pane view is showing panes, and
-        // while finished sessions are listed: telling a session that has gone
-        // from a pane in use again needs the foreground either way.
-        let sweeping = app.pane_view() != PaneView::Hidden || app.shows_history();
-        if let Some(fetcher) = &fetcher {
-            fetcher.wants(sweeping);
-            match fetcher.poll() {
-                Some(Fetched::Snapshot(snapshot)) => {
-                    // Task sessions arrive as one source of the same revision, so
-                    // the dashboard no longer reads them separately.
-                    if let Some(tasks) = snapshot.tasks.as_ref() {
-                        match control_plane::client::tasks_from_snapshot(tasks) {
-                            Ok(events) => app.replace_task_snapshot(events),
-                            Err(problem) => app.set_task_diagnostic(Some(problem)),
-                        }
-                    }
-                    app.set_task_diagnostic(source_diagnostic(&snapshot, "tasks"));
-                    state = snapshot.observation.clone();
-                    app.refresh(&state);
-                    if let Some((code, row)) = pending_modal.take() {
-                        app.show_everything();
-                        match row {
-                            // A row that is gone is refused, never replaced: the
-                            // action was chosen for that one.
-                            Some(row) if !app.select_exact(&row) => app.set_focus_message(Some(
-                                "that row is gone; nothing was changed".into(),
-                            )),
-                            _ => {
-                                queued_key =
-                                    Some(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
-                            }
-                        }
-                    }
-                    dirty = true;
-                }
-                // The previous view stands, and the reason it is not moving is
-                // on the footer rather than in a half-updated screen.
-                Some(Fetched::Stale(reason)) => {
-                    app.set_focus_message(Some(reason));
-                    dirty = true;
-                }
-                None => {}
-            }
-        }
-        // A focus request is answered on its own thread; applying the outcome
-        // here is what puts a failure on the footer, and never waits on the backend.
-        if let Some(outcome) = focuser.poll() {
-            let message = attach.answered(&outcome, &config.tui);
-            app.set_focus_message(message.or_else(|| outcome.diagnostic().map(str::to_string)));
-            dirty = true;
-        }
-        if let Some(message) = attach.poll(&mut focuser) {
-            app.set_focus_message(Some(message));
-            dirty = true;
-        }
-        // A confirmed close is answered on its own thread too: input, collection
-        // and quitting stay responsive while it waits on the runtime.
-        if let Some(outcome) = closer.poll() {
-            app.set_focus_message(Some(outcome.unwrap_or_else(|message| message)));
-            dirty = true;
-        }
-        // A container control is answered on its own thread too, and its outcome
-        // keeps the request id it was dispatched under so a lost answer leaves an
-        // operation to read back.
-        if let Some(finished) = containers.poll() {
-            app.apply_container_outcome(finished);
-            dirty = true;
-        }
-        // A daemon lifecycle operation is read back and displayed by request id.
-        if let Some(finished) = managed.poll() {
-            app.apply_subject_outcome(finished);
-            dirty = true;
-        }
-
-        // A message that has been up long enough goes away by itself: the
-        // footer is the hint line again without the user having to press a key.
-        if app.expire_focus_message(Instant::now()) {
-            dirty = true;
-        }
-        // Animation runs on the clock and only while something is working, so
-        // a quiet dashboard redraws when it changed and nothing moves on its
-        // own; a busy one redraws at the configured rate.
-        let fps = theme::config().appearance.fps.max(1);
-        let animating = app.animates();
-        if animating {
-            let next = (started.elapsed().as_millis() as usize * fps as usize) / 1000;
-            if next != phase {
-                phase = next;
-                dirty = true;
-            }
-        } else {
-            phase = 0;
-        }
-        if dirty {
-            let mut geometry = Geometry::default();
-            app.note_width(terminal.size()?.width);
-            terminal.draw(|frame| {
-                geometry = ui::render(frame, &state, &app, &mut list, phase);
-            })?;
-            app.note_layout(geometry);
-            dirty = false;
-        }
-        let timeout = if animating {
-            Duration::from_millis(1000 / fps as u64)
-        } else {
-            // A fetch that is waiting for a newer revision is answered off this
-            // thread; polling a little more often keeps a published revision
-            // from sitting unapplied behind the idle interval.
-            Duration::from_millis(50)
-        };
-        // The popup is done once its modal is answered, its work has finished and
-        // the answer has been read.
-        if app.is_modal_only()
-            && pending_modal.is_none()
-            && queued_key.is_none()
-            && !app.picker_open()
-            && app.confirmation().is_none()
-            && app.focus_message().is_none()
-            && !app.holds_deletion()
-            && !closer.is_busy()
-            && !managed.is_busy()
-            && !containers.is_busy()
-        {
-            break;
-        }
-        let event = match queued_key.take() {
-            Some(key) => Event::Key(key),
-            None => {
-                if !event::poll(timeout)? {
-                    continue;
-                }
-                event::read()?
-            }
-        };
-        match event {
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if (key.code == KeyCode::Char('q')
-                    && !app.is_filter_editing()
-                    && !app.picker_open()
-                    && app.confirmation().is_none())
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
-                {
-                    break;
-                }
-                if let Some(action) = app.handle_key(key) {
-                    match action {
-                        Action::Focus(target) => {
-                            attach.ask(&target);
-                            focuser.start(target);
-                        }
-                        Action::BeginAction(operation) => dispatch(
-                            app.begin_action(operation, &state),
-                            &mut app,
-                            &mut closer,
-                            &mut managed,
-                            &mut containers,
-                        ),
-                        Action::ToggleSidebar => {
-                            let (key, command) = sidebar_resize(&config, &app);
-                            let _ = run_host_command(key, command, &mut app, &mut sidebar_command);
-                        }
-                        // The mode follows the host: it flips when the command
-                        // reports success, so a missing or failing one leaves it.
-                        Action::ToggleZoom => {
-                            let (key, command) = sidebar_zoom(&config, &app);
-                            flip_on_success =
-                                run_host_command(key, command, &mut app, &mut sidebar_command);
-                        }
-                        Action::LaunchSidebar => {
-                            let _ = run_host_command(
-                                "launch_command",
-                                &config.sidebar.launch_command,
-                                &mut app,
-                                &mut sidebar_command,
-                            );
-                        }
-                        Action::Modal { key, row } => {
-                            let row = row.and_then(|row| serde_json::to_string(&row).ok());
-                            let radar = std::env::current_exe()
-                                .map(|path| path.to_string_lossy().into_owned())
-                                .unwrap_or_else(|_| "radar".into());
-                            let command = match key {
-                                KeyCode::Char(key) => agent_radar::workspace::popup_command(
-                                    &radar,
-                                    key,
-                                    row.as_deref(),
-                                ),
-                                _ => None,
-                            };
-                            let _ =
-                                run_host_command("modal", &command, &mut app, &mut sidebar_command);
-                        }
-                        Action::LaunchConfigured => {
-                            let shell = std::env::var("SHELL").ok();
-                            let path = std::env::var_os("PATH");
-                            let confirmed = app.launch_configured(
-                                &state,
-                                &config.tui.launch_command,
-                                shell.as_deref(),
-                                path.as_deref(),
-                            );
-                            dispatch(
-                                confirmed,
-                                &mut app,
-                                &mut closer,
-                                &mut managed,
-                                &mut containers,
-                            );
-                        }
-                        Action::NewWorkspace => open_workspace_picker(&config.tui, &mut app)?,
-                        Action::NewWorkspaceIn(directory) => {
-                            let control = Some(app.new_workspace(Some(&directory)));
-                            dispatch(
-                                control,
-                                &mut app,
-                                &mut closer,
-                                &mut managed,
-                                &mut containers,
-                            );
-                        }
-                        Action::ConfirmAction => {
-                            let confirmed = app.confirm(&state);
-                            dispatch(
-                                confirmed,
-                                &mut app,
-                                &mut closer,
-                                &mut managed,
-                                &mut containers,
-                            );
-                        }
-                    }
-                }
-                dirty = true;
-            }
-            Event::Mouse(mouse) => {
-                if let Some(action) = app.handle_mouse(mouse) {
-                    match action {
-                        Action::Focus(target) => {
-                            attach.ask(&target);
-                            focuser.start(target);
-                        }
-                        Action::BeginAction(operation) => dispatch(
-                            app.begin_action(operation, &state),
-                            &mut app,
-                            &mut closer,
-                            &mut managed,
-                            &mut containers,
-                        ),
-                        Action::ToggleSidebar => {
-                            let (key, command) = sidebar_resize(&config, &app);
-                            let _ = run_host_command(key, command, &mut app, &mut sidebar_command);
-                        }
-                        // The mode follows the host: it flips when the command
-                        // reports success, so a missing or failing one leaves it.
-                        Action::ToggleZoom => {
-                            let (key, command) = sidebar_zoom(&config, &app);
-                            flip_on_success =
-                                run_host_command(key, command, &mut app, &mut sidebar_command);
-                        }
-                        Action::LaunchSidebar => {
-                            let _ = run_host_command(
-                                "launch_command",
-                                &config.sidebar.launch_command,
-                                &mut app,
-                                &mut sidebar_command,
-                            );
-                        }
-                        // Only a key opens a popup; a click reaches no action here.
-                        Action::Modal { .. } => {}
-                        Action::LaunchConfigured => {
-                            let shell = std::env::var("SHELL").ok();
-                            let path = std::env::var_os("PATH");
-                            let confirmed = app.launch_configured(
-                                &state,
-                                &config.tui.launch_command,
-                                shell.as_deref(),
-                                path.as_deref(),
-                            );
-                            dispatch(
-                                confirmed,
-                                &mut app,
-                                &mut closer,
-                                &mut managed,
-                                &mut containers,
-                            );
-                        }
-                        Action::NewWorkspace => open_workspace_picker(&config.tui, &mut app)?,
-                        Action::NewWorkspaceIn(directory) => {
-                            let control = Some(app.new_workspace(Some(&directory)));
-                            dispatch(
-                                control,
-                                &mut app,
-                                &mut closer,
-                                &mut managed,
-                                &mut containers,
-                            );
-                        }
-                        Action::ConfirmAction => {
-                            let confirmed = app.confirm(&state);
-                            dispatch(
-                                confirmed,
-                                &mut app,
-                                &mut closer,
-                                &mut managed,
-                                &mut containers,
-                            );
-                        }
-                    }
-                }
-                if let Some(offset) = app.take_scroll() {
-                    *list.offset_mut() = offset;
-                }
-                dirty = true;
-            }
-            Event::Resize(_, _) => dirty = true,
-            _ => {}
-        }
-    }
-    focuser.shutdown();
-    closer.shutdown();
-    managed.shutdown();
-    containers.shutdown();
-    Ok(())
-}
-
-/// Carries out one confirmed action.
-///
-/// Unmanaged closes use the runtime; managed lifecycle and topology controls use
-/// daemon request IDs. A possibly accepted operation is read back by that ID,
-/// never repeated through a different control path.
-fn dispatch(
-    confirmed: Option<Confirmed>,
-    app: &mut App,
-    closer: &mut Closer,
-    managed: &mut radar::LifecycleControl,
-    containers: &mut ContainerControl,
-) {
-    match confirmed {
-        Some(Confirmed::Direct(request)) => closer.start(request),
-        Some(Confirmed::Subject {
-            operation,
-            request_id,
-            subject_id,
-            claim_id,
-            child_close,
-            close_request_id,
-        }) => {
-            let operation = match operation {
-                agent_radar::app::Operation::Restart => radar::Operation::Restart,
-                agent_radar::app::Operation::Delete => radar::Operation::Cancel,
-                _ => {
-                    app.set_focus_message(Some("unsupported managed lifecycle action".into()));
-                    return;
-                }
+    // Every producer wakes the one event loop: terminal input, the daemon's
+    // snapshot and the shared UI session.
+    let wake = Wake::default();
+    let session_socket = observation
+        .as_ref()
+        .map(|daemon| daemon.socket().to_path_buf());
+    let mut displayed_observation: Option<std::sync::Arc<Observation>> = None;
+    let runtime = session_runtime()?;
+    runtime.block_on(async {
+        if let Some(socket) = session_socket {
+            let role = if sidebar {
+                AttachmentRole::Sidebar
+            } else {
+                AttachmentRole::Dashboard
             };
-            if let Err(message) = managed.start(radar::Control {
-                operation,
-                request_id,
-                subject_id,
-                claim_id,
-                child_close,
-                close_request_id,
-                enrollment: None,
-            }) {
-                app.set_focus_message(Some(message));
-            }
+            app.attach_session(UiClient::start(
+                &tokio::runtime::Handle::current(),
+                socket,
+                role,
+                wake.clone(),
+            ));
         }
-        Some(Confirmed::Container(control)) => {
-            if let Err(message) = containers.start(control) {
-                app.set_focus_message(Some(message));
+        let result = async {
+            let mut events = EventStream::new();
+            // The animation frame, and the clock it is derived from: a mark has to move
+            // at the same rate whether or not anything else made the loop redraw.
+            let started = Instant::now();
+            let mut phase: usize = 0;
+            let mut dirty = true;
+            // A focus with no client attached opens a terminal and asks again, because a
+            // client has to exist before a focus can show anything.
+            let mut attach = Attach::default();
+            let mut sidebar_command = None;
+            let mut flip_on_success = false;
+            let mut presentation = agent_radar::ui_session::presentation::Presentation::default();
+
+            loop {
+                dirty |= app.apply_session_update();
+                let detached = sidebar && in_workspace && app.sidebar_compact();
+                dirty |= presentation.poll(&mut app, &config.tui, detached, &wake);
+                dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);
+                // Foreground evidence is swept while a pane view is showing panes, and
+                // while finished sessions are listed: telling a session that has gone
+                // from a pane in use again needs the foreground either way.
+                let sweeping = app.pane_view() != PaneView::Hidden || app.shows_history();
+                app.wants_processes(sweeping);
+                if let Some(observation) = app.session_observation()
+                    && displayed_observation
+                        .as_ref()
+                        .is_none_or(|old| !std::sync::Arc::ptr_eq(old, &observation))
+                {
+                    app.set_task_diagnostic(source_diagnostic(&observation, "tasks"));
+                    state = observation.observation.clone();
+                    displayed_observation = Some(observation);
+                    dirty = true;
+                }
+                // The session answers a focus. A server with no client attached is the one
+                // answer this process acts on: it opens a terminal for the place it named
+                // and asks again, so the retry stays one session command.
+                if let Some((row, target)) = app.take_focus_recovery() {
+                    attach.ask(&target, row);
+                    if let Some(message) = attach.answered(true, &config.tui) {
+                        app.set_focus_message(Some(message));
+                    }
+                    dirty = true;
+                }
+                if let Some(message) = attach.poll(&mut app) {
+                    app.set_focus_message(Some(message));
+                    dirty = true;
+                }
+                // Animation runs on the clock and only while something is working, so
+                // a quiet dashboard redraws when it changed and nothing moves on its
+                // own; a busy one redraws at the configured rate.
+                let fps = theme::config().appearance.fps.max(1);
+                let animating = app.animates();
+                if animating {
+                    let next = (started.elapsed().as_millis() as usize * fps as usize) / 1000;
+                    if next != phase {
+                        phase = next;
+                        dirty = true;
+                    }
+                } else {
+                    phase = 0;
+                }
+                if dirty {
+                    let mut geometry = Geometry::default();
+                    app.note_width(terminal.size()?.width);
+                    terminal.draw(|frame| {
+                        geometry = ui::render(frame, &state, &app, &mut list, phase);
+                    })?;
+                    app.note_layout(geometry);
+                    dirty = false;
+                }
+                let timeout = if animating {
+                    Duration::from_millis(1000 / fps as u64)
+                } else {
+                    // Snapshots, session updates and input wake the loop themselves.
+                    // What remains is work that only answers on its own thread, and
+                    // clocks: messages that expire, an attach that retries.
+                    let working = attach.waiting.is_some() || sidebar_command.is_some();
+                    Duration::from_millis(if working { 50 } else { 250 })
+                };
+                let event = {
+                    let next = tokio::select! {
+                        event = events.next() => Some(event),
+                        () = wake.woken() => None,
+                        () = tokio::time::sleep(timeout) => None,
+                    };
+                    match next {
+                        // Woken by a producer or by the clock: loop to apply it.
+                        None => continue,
+                        Some(Some(event)) => event?,
+                        // The terminal's input ended; nothing more can be asked of it.
+                        Some(None) => break,
+                    }
+                };
+                match event {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        if (key.code == KeyCode::Char('q')
+                            && !app.is_filter_editing()
+                            && !app.picker_open()
+                            && app.session_confirm().is_none())
+                            || (key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL))
+                        {
+                            break;
+                        }
+                        if let Some(action) = app.handle_key(key)
+                            && let Some(flip) =
+                                perform(action, &mut app, &config, &state, &mut sidebar_command)
+                        {
+                            flip_on_success = flip;
+                        }
+                        dirty = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        if let Some(action) = app.handle_mouse(mouse) {
+                            // The pointer has no mode to flip: the host state it shows is
+                            // the one the keys report.
+                            let _ =
+                                perform(action, &mut app, &config, &state, &mut sidebar_command);
+                        }
+                        if let Some(offset) = app.take_scroll() {
+                            *list.offset_mut() = offset;
+                        }
+                        dirty = true;
+                    }
+                    Event::Resize(_, _) => dirty = true,
+                    _ => {}
+                }
             }
+            Ok(())
         }
-        None => {}
-    }
+        .await;
+        app.shutdown_session().await;
+        result
+    })
 }
 
-/// Lets the operator pick the directory a new workspace starts in, and returns the
-/// creation for it. The picker draws its own screen, so the dashboard gives the
-/// terminal back first and takes it again after, whatever the picker answered.
-/// Cancelling creates nothing.
-/// Opens the workspace chooser over the directories a new workspace may start
-/// in. It draws inside the dashboard rather than taking the terminal over, so the
-/// fleet stays visible and `Esc` costs nothing.
-fn open_workspace_picker(tui: &agent_radar::config::TuiConfig, app: &mut App) -> io::Result<()> {
-    let cwd = std::env::current_dir()?;
-    let found =
-        agent_radar::project::candidates(tui.project_source.as_deref(), tui.project_filter, &cwd);
-    if let Some(note) = found.note {
-        app.set_focus_message(Some(note));
+/// What the dashboard asked the host to do.
+///
+/// Keys and the pointer produce the same actions, so they go through one
+/// executor: two matches would drift, and only one of them would learn a new
+/// command.
+/// One runtime for a window and the attachment it reads: the client's tasks live
+/// inside the loop that owns the terminal.
+fn session_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+fn perform(
+    action: Action,
+    app: &mut App,
+    config: &Config,
+    state: &ObservationState,
+    sidebar_command: &mut Option<std::process::Child>,
+) -> Option<bool> {
+    match action {
+        Action::ToggleSidebar => {
+            let (key, command) = sidebar_resize(config, app);
+            let _ = run_host_command(key, command, app, sidebar_command);
+        }
+        // The mode follows the host: it flips when the command reports success, so
+        // a missing or failing one leaves it.
+        Action::ToggleZoom => {
+            let (key, command) = sidebar_zoom(config, app);
+            return Some(run_host_command(key, command, app, sidebar_command));
+        }
+        Action::LaunchSidebar => {
+            let _ = run_host_command(
+                "launch_command",
+                &config.sidebar.launch_command,
+                app,
+                sidebar_command,
+            );
+        }
+        Action::LaunchConfigured => {
+            // The shell, PATH and command are the invoking terminal's; the place
+            // and directory are the session's.
+            let spec = agent_radar::control_plane::public_contracts::ui_session::LaunchSpec {
+                command: config.tui.launch_command.clone(),
+                shell: std::env::var("SHELL").unwrap_or_default(),
+                path: std::env::var_os("PATH").map(|path| path.to_string_lossy().into_owned()),
+            };
+            if let Some(row) = app.command_row() {
+                app.submit_session(
+                    agent_radar::control_plane::public_contracts::ui_session::UiAction::PrepareLaunch {
+                        row,
+                        spec,
+                    },
+                );
+            }
+        }
+        // The session froze the effect, so the answer names the interaction rather
+        // than re-deriving a target.
+        Action::ConfirmAction => {
+            app.answer_session_confirm(agent_radar::ui_session::confirm::Answer::Confirm);
+        }
+        Action::PresenceStatus => app.show_presence_status(state),
     }
-    app.open_workspace_picker(found.directories);
-    Ok(())
+    None
 }
 
 /// Turns mouse capture on. A wheel turn and a click only arrive while it is on,
@@ -995,10 +956,22 @@ fn disable_mouse_capture() {
 struct Attach {
     /// The place being focused, from the request the user made.
     asked: Option<agent_radar::Target>,
-    /// Set once a terminal was opened for `asked`, with when to look again.
-    waiting: Option<(Instant, u32)>,
+    /// The row that asked for it, so the retry goes through the session rather
+    /// than a second implementation of the same decision.
+    row: Option<agent_radar::control_plane::public_contracts::ui_session::UiRowId>,
+    /// Set once a terminal was opened for `asked`: what the recovery is doing.
+    waiting: Option<Waiting>,
     /// What the terminal thread says when it ends.
     ended: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+}
+
+/// Where a focus recovery stands, once a terminal has been opened for it.
+#[derive(Clone, Copy)]
+enum Waiting {
+    /// It is time to ask again when this elapses.
+    Retry { at: Instant, tries: u32 },
+    /// The focus was just asked again; nothing happens until its answer arrives.
+    Reply { tries: u32 },
 }
 
 /// How often, and how many times, a focus is asked again once a terminal is open.
@@ -1007,8 +980,13 @@ const ATTACH_TRIES: u32 = 24;
 
 impl Attach {
     /// A new focus request replaces whatever was waiting.
-    fn ask(&mut self, target: &agent_radar::Target) {
+    fn ask(
+        &mut self,
+        target: &agent_radar::Target,
+        row: agent_radar::control_plane::public_contracts::ui_session::UiRowId,
+    ) {
         self.asked = Some(target.clone());
+        self.row = Some(row);
         self.waiting = None;
     }
 
@@ -1016,24 +994,25 @@ impl Attach {
     /// then asks again until the server has one; any other answer ends the wait.
     fn answered(
         &mut self,
-        outcome: &agent_radar::FocusOutcome,
+        no_client: bool,
         tui: &agent_radar::config::TuiConfig,
     ) -> Option<String> {
-        let no_client = matches!(
-            outcome,
-            agent_radar::FocusOutcome::Refused(message)
-                if message == agent_radar::runtime::NO_CLIENT
-        );
         let Some(target) = self.asked.clone().filter(|_| no_client) else {
             self.waiting = None;
             return None;
         };
-        if let Some((_, tries)) = self.waiting {
+        if let Some(asked_again) = self.waiting {
+            let tries = match asked_again {
+                Waiting::Retry { tries, .. } | Waiting::Reply { tries } => tries,
+            };
             if tries >= ATTACH_TRIES {
                 self.waiting = None;
                 return Some("no terminal attached to the tmux server in time".to_string());
             }
-            self.waiting = Some((Instant::now() + ATTACH_RETRY, tries + 1));
+            self.waiting = Some(Waiting::Retry {
+                at: Instant::now() + ATTACH_RETRY,
+                tries: tries + 1,
+            });
             return None;
         }
         let environment = std::env::var("TERMINAL").ok();
@@ -1054,26 +1033,29 @@ impl Attach {
         std::thread::spawn(move || {
             let _ = sender.send(agent_radar::attach::open_terminal(&prefix, &handle));
         });
-        self.waiting = Some((Instant::now() + ATTACH_RETRY, 0));
+        self.waiting = Some(Waiting::Retry {
+            at: Instant::now() + ATTACH_RETRY,
+            tries: 0,
+        });
         Some("no tmux client attached: opening a terminal".to_string())
     }
 
     /// Asks the focus again when it is time, and reports a terminal that failed.
-    fn poll(&mut self, focuser: &mut Focuser) -> Option<String> {
+    fn poll(&mut self, app: &mut App) -> Option<String> {
         if let Some(Err(message)) = self.ended.as_ref().and_then(|ended| ended.try_recv().ok()) {
             self.waiting = None;
             self.ended = None;
             return Some(message);
         }
-        let (at, _) = self.waiting?;
+        let Waiting::Retry { at, tries } = self.waiting? else {
+            // Waiting on the answer to the focus just asked again.
+            return None;
+        };
         if Instant::now() >= at
-            && let Some(target) = self.asked.clone()
+            && let Some(row) = self.row.clone()
         {
-            focuser.start(target);
-            // Not asked again until its answer sets the next time.
-            self.waiting = self
-                .waiting
-                .map(|(_, tries)| (Instant::now() + Duration::from_secs(3600), tries));
+            app.submit_focus_row(row);
+            self.waiting = Some(Waiting::Reply { tries });
         }
         None
     }

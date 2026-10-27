@@ -7,6 +7,7 @@ pub mod bus;
 pub mod cli;
 pub mod collector;
 pub mod config;
+pub mod content;
 pub mod control;
 pub mod control_plane;
 pub mod focus;
@@ -25,8 +26,9 @@ pub mod registry_observation;
 pub mod reset;
 pub mod runtime;
 pub mod service;
-pub mod snapshot_fetch;
 pub mod tasks;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod theme;
 pub mod title;
 pub mod tmux;
@@ -36,9 +38,7 @@ pub mod ui;
 pub mod ui_session;
 pub mod workspace;
 
-pub use app::{
-    Action, App, Confirmation, Confirmed, Geometry, Notice, Operation, PaneView, RowOrder,
-};
+pub use app::{Action, App, Geometry, Operation, PaneView, RowOrder};
 pub use collector::{Collector, CollectorConfig, RegistrySource};
 pub use config::{Config, Palette};
 pub use control::{
@@ -49,7 +49,6 @@ pub use control_plane::{
     Refusal, Request, RequestOutcome, RequestRecord, Response, Store, decode_request,
     install_signal_handlers, socket_path, state_dir,
 };
-pub use focus::Focuser;
 pub use lifecycle::{
     CloseRequest, Closer, Containment, ManagedActions, ManagedRequest, Update, UpdateKind,
 };

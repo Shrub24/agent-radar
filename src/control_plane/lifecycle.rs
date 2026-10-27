@@ -1825,10 +1825,10 @@ pub fn cancel_many(
     for id in subject_ids {
         match stage(registry, id, verifier, now_ms) {
             Ok(Stage::Settled(Exit::Exited)) => report.stopped.push(id.clone()),
-            Ok(Stage::Settled(_)) => match record_exit(registry, id, now_ms) {
-                Ok(()) => report.stopped.push(id.clone()),
-                Err(_) => report.survivors.push(id.clone()),
-            },
+            // Only a verified exit is an exit. An unresolved or unverified verdict
+            // says the daemon could not establish one, so the agent is a survivor:
+            // recording an exit here would authorise closing the place over it.
+            Ok(Stage::Settled(_)) => report.survivors.push(id.clone()),
             Ok(Stage::Watch {
                 descriptor,
                 signal,

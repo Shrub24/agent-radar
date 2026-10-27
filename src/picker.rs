@@ -41,17 +41,17 @@ pub enum Step<T> {
 #[derive(Debug)]
 pub struct Picker<T> {
     title: &'static str,
-    hint: &'static str,
+    hint: String,
     query: String,
     index: usize,
     items: Vec<Item<T>>,
 }
 
 impl<T> Picker<T> {
-    pub fn new(title: &'static str, hint: &'static str, items: Vec<Item<T>>) -> Self {
+    pub fn new(title: &'static str, hint: impl Into<String>, items: Vec<Item<T>>) -> Self {
         Self {
             title,
-            hint,
+            hint: hint.into(),
             query: String::new(),
             index: 0,
             items,
@@ -62,8 +62,8 @@ impl<T> Picker<T> {
         self.title
     }
 
-    pub fn hint(&self) -> &'static str {
-        self.hint
+    pub fn hint(&self) -> &str {
+        &self.hint
     }
 
     pub fn query(&self) -> &str {

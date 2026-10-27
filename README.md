@@ -203,7 +203,7 @@ preserving durable subjects and handoffs.
 | `j` / `↓`, `k` / `↑` | Select the next / previous visible row |
 | `space` or `←` / `→` | Fold or unfold the selected branch |
 | `/` | Enter a case-insensitive filter; Backspace edits |
-| `Enter` | Focus the selected row's pane (or workspace) in the backend; while entering filter text, keeps the filter instead |
+| `Enter` | Ask the session to focus the selected row's pane (or workspace); the daemon moves the client attached to it, and with none attached the dashboard opens a terminal for that place and asks again; while entering filter text, keeps the filter instead |
 | `Escape` | Clear the filter and leave text entry |
 | `p` | Cycle the pane view: agents → running → all |
 | `s` | Cycle the order: source → state → name |
@@ -217,7 +217,7 @@ preserving durable subjects and handoffs.
 | `R` | Reload the selected container's recorded recipe |
 | `L` | Launch the configured managed agent in a new tab or pane |
 | `E` | Report the selected Pi session's claim standing (granted, duplicate, reserved, pending or released); sends nothing |
-| `!` | Open the full text of what was last reported; `c` dismisses it |
+| `!` | Open the full text of the last outcome and the last message |
 | `c` | Dismiss the lifecycle outcome lines |
 | `e` | Show or hide finished sessions (panes whose label is a session that has gone) |
 | `b` | Show or hide background-task children in the current view |
@@ -548,7 +548,9 @@ Radar never retries a request, never treats its own timeout as a verdict, and
 never cancels one on quitting. Outcomes derive from the owner's files, and a
 request already written stays executable whether or not Radar is still running.
 Results are shown on the footer's lifecycle line, kept apart from the source
-freshness, until `c` dismisses them. A row is never removed optimistically, and a
+freshness, and `!` shows the current one whole. A view keeps no history of its
+own: the daemon retains every request, readable by the id the line names. A row
+is never removed optimistically, and a
 `closed` result reports the effects the owner actually applied — a lost
 generation's close names `process_ended` and leaves its surviving shell pane, so
 Radar never infers a pane close from the outcome alone.
@@ -922,7 +924,13 @@ pane title and label, which describe the pane rather than an agent.
   server is never shown, and one that names no pane, or a pane the inventory
   lacks, is shown only while a publisher holds a live lease or the daemon
   recorded a spawn edge for it, so a dead agent's record ages out of the tree.
-  `A` opens a workspace picker in a popup over the dashboard — the same element the `?` command palette uses — offering the start directory, then `[tui] project_source`, default `zoxide query -l`, filtered to git projects by `project_filter` — and creates a workspace named for the chosen project whatever row is selected. `L` immediately launches the configured `[tui] launch_command` argv (default `["pi"]`) as a managed agent in a new tab of the selected place's workspace — from a pane it opens its own window rather than splitting that pane — and it uses the selected pane's directory (or the workspace's) and starts the resolved command through the user's login/interactive shell, applying the target directory's direnv environment without copying the TUI's environment. Use `a` to add an empty shell for arbitrary commands. A lead started with `L` is enrolled as a lifecycle subject when it registers, so it can be stopped and restarted; `E` enrolls any other registered lead after a confirmation.
+  `A` creates a workspace named for a chosen project, whatever row is selected.
+  One private picker blocks shared tree input across all views: inline in the
+  dashboard or detached over a compact workspace sidebar. Candidates come from
+  `[tui] project_source` (default `zoxide query -l`), filtered to git projects by
+  `project_filter`. An empty or failed source falls back to `[tui] project_base`
+  (default home), with a diagnostic. The invoking start directory is not prepended.
+  `L` immediately launches the configured `[tui] launch_command` argv (default `["pi"]`) as a managed agent in a new tab of the selected place's workspace — from a pane it opens its own window rather than splitting that pane — and it uses the selected pane's directory (or the workspace's) and starts the resolved command through the user's login/interactive shell, applying the target directory's direnv environment without copying the TUI's environment. Use `a` to add an empty shell for arbitrary commands. A lead started with `L` is enrolled as a lifecycle subject when it registers, so it can be stopped and restarted; `E` enrolls any other registered lead after a confirmation.
   Enter on a row focuses it; with no tmux client attached it opens a terminal
   attached to the server (`[tui] terminal`, else `$TERMINAL -e`) and asks again. Children are not nested under their
   parent: the exact spawn edge is shown in the details. An ordinary pane never
@@ -1041,9 +1049,12 @@ One Cargo package, with `radar` as its binary:
   than proof that a pane went away.
 - `src/control_plane/observation.rs`: the daemon's one observation sampler and
   the immutable revisioned snapshot every reader shares. It samples only while a
-  reader has asked, and publishing a revision appends nothing to the journal.
-- `src/snapshot_fetch.rs`: the dashboard's read of that snapshot. The dashboard
-  collects nothing itself and has no local fallback.
+  reader or active TUI attachment has asked, and publishing appends nothing to the journal.
+- `src/ui_session/publication.rs` and `src/ui_session/client.rs`: observation,
+  tree and UI-session payloads adopted under one coherent push head. The TUI
+  collects nothing itself and has no parallel observation-fetch connection.
+- `src/content.rs`: shared bounded MessagePack encoding, XXH3-128 content,
+  immutable byte retention and segmented framing; no UI-domain dependencies.
 - `src/bus.rs` and `src/control_plane/ingest.rs`: publisher protocol decoding and daemon-owned volatile task ingestion; `src/control_plane/transport/` provides the shared bounded socket runtime.
 - `src/model.rs` / `src/observation.rs`: normalized facts and reconciliation.
 - `src/config.rs` / `src/theme.rs`: the colours, where they come from, and the

@@ -64,6 +64,15 @@ F10–F12 are prototype bindings, not a settled hotkey scheme.
 
 ## Pickers and confirmations float over the whole workspace
 
+> **Superseded by the shared UI session.** The sidebar no longer starts a
+> `radar modal` popup and never re-runs a key: a shared command is submitted to
+> the daemon-hosted session, which freezes its target, and a compact sidebar asks
+> the host to run `radar present --interaction <ID>` in a popup, which claims that
+> interaction and answers it. The account below describes the prototype as it was
+> built; [the control plane](control-plane.md#frozen-command-targets) describes the
+> current behaviour.
+
+
 In the sidebar, `r`, `a`, `A`, `E`, `D`, `R` and `?` do not draw in the narrow
 pane. The sidebar asks the outer tmux for a centred popup on the outer client,
 so it covers the sidebar and the agent area, and runs `radar modal` in it:

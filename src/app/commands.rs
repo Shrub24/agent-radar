@@ -65,21 +65,6 @@ impl Command {
         self.id == CommandId::OpenSidebar
     }
 
-    /// Whether this command opens a picker or a confirmation, which is all the
-    /// workspace popup is for: the rest act on a view the popup does not show.
-    pub fn opens_modal(&self) -> bool {
-        matches!(
-            self.id,
-            CommandId::LaunchConfigured
-                | CommandId::Restart
-                | CommandId::CreateContainer
-                | CommandId::NewWorkspace
-                | CommandId::PresenceStatus
-                | CommandId::ReloadContainer
-                | CommandId::Delete
-        )
-    }
-
     /// Both presentations manage the same fleet. Only commands for absent
     /// panels and the sidebar's own host controls differ.
     pub fn offered(&self, sidebar: bool, compact: bool) -> bool {
@@ -175,7 +160,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         id: CommandId::Notices,
-        label: "Show or dismiss notices",
+        label: "Show the last outcome whole",
         chords: &["!"],
     },
     Command {
@@ -235,11 +220,10 @@ pub fn resolve(code: KeyCode) -> Option<CommandId> {
 
 /// The commands a picker offers, in its own order. Filtering and ranking are the
 /// picker's; this only decides what is on offer where.
-pub fn items(sidebar: bool, compact: bool, modal: bool) -> Vec<Item<CommandId>> {
+pub fn items(sidebar: bool, compact: bool) -> Vec<Item<CommandId>> {
     COMMANDS
         .iter()
         .filter(|command| command.offered(sidebar, compact))
-        .filter(|command| !modal || command.opens_modal())
         .map(|command| Item::new(command.label, command.chords.first().copied(), command.id))
         .collect()
 }
@@ -286,7 +270,7 @@ mod tests {
     }
 
     fn offered_at(sidebar: bool, compact: bool, query: &str) -> Vec<String> {
-        let mut picker = Picker::new("Commands", "", items(sidebar, compact, false));
+        let mut picker = Picker::new("Commands", "", items(sidebar, compact));
         for ch in query.chars() {
             picker.handle_key(TermKeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
@@ -324,24 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn the_workspace_popup_lists_only_the_commands_that_open_a_modal() {
-        let picker = Picker::new("Commands", "", items(false, false, true));
-        let labels: Vec<String> = picker
-            .rows()
-            .into_iter()
-            .map(|(label, _)| label.to_string())
-            .collect();
-        assert!(labels.iter().any(|label| label.contains("Restart")));
-        assert!(labels.iter().any(|label| label.contains("Delete")));
-        assert!(
-            !labels
-                .iter()
-                .any(|label| label.contains("Fold") || label.contains("pane view")),
-            "a view the popup does not show has nothing to fold: {labels:?}"
-        );
-    }
-
-    #[test]
     fn the_sidebar_offers_only_what_it_draws() {
         let sidebar = offered(true, "");
         assert!(sidebar.contains(&"Hide or unhide the sidebar".to_string()));
@@ -368,7 +334,7 @@ mod tests {
 
     #[test]
     fn choosing_a_command_answers_with_its_identity() {
-        let mut picker = Picker::new("Commands", "", items(false, false, false));
+        let mut picker = Picker::new("Commands", "", items(false, false));
         for ch in "fold".chars() {
             picker.handle_key(TermKeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }

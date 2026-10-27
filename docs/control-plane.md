@@ -106,6 +106,7 @@ Daemon contracts are versioned promises that the daemon serves the methods its i
 | `events.v1` | — | `events.read` |
 | `communication.handoff.v1` | — | `communication.publish`, `communication.inbox`, `communication.get`, `communication.ack` |
 | `observation.get.v1` | `mux.observe` | `observation.get`: the daemon's shared observation snapshot |
+| `ui.session.v1` | — | `ui.open`: one duplex MessagePack attachment per TUI, carrying actions, content and publications |
 | `tasks.list.v1` | task ingest configured | volatile publisher task snapshots via `tasks.list` |
 | `spawn.v1` | `mux.create` + `mux.launch` | `spawn.create` |
 | `spawn.close.v1` | `mux.observe` + `mux.close` | `spawn.close` |
@@ -213,6 +214,145 @@ Verification is not atomic with dispatch: the daemon verifies the pane and then 
 
 The durable record stores the request ID, edge, bound child, recorded pane and intent before dispatch. The result carries the outcome, the intent and the pane. `completed` is a backend-confirmed pane closure. `already_exited` says the pane's command had exited, the edge recorded that exit, and the retained pane was now cleaned up: it confirms retained-pane cleanup, never that the registered process itself exited, and it never authorizes session relaunch. A positive backend refusal is `refused`; a possibly dispatched close without confirmation is `outcome_unknown`. A result is returned only for a close that happened; `refused` and `outcome_unknown` are error objects, so a consumer cannot mistake them for a completed close, and no consumer may read `outcome_unknown` as "nothing was dispatched". Identical same-ID replay returns the stored result without re-verification or redispatch; different content under the same ID refuses. An unknown result is never retried automatically or through another backend. The result reports the mux pane closure only: it never claims foreground-process or process-group exit and never writes assignment or execution facts. The spawn edge and binding remain; a pane that disappears after an unknown result stays unresolved, not confirmed closed. To reconcile a lost reply, resend the exact same `spawn.close` request ID and params; it returns the stored close outcome without another effect. `mux.request.get`/`mux.request.list` read ordinary mux-operation records, not these separate managed-close records.
 
+### Shared UI session
+
+`ui.session.v1` serves one daemon-hosted navigation session that every dashboard and sidebar shares: the tree, selection, folds, pane view, order, task and finished-session visibility, and the filter. Terminal geometry, details panels and process readings stay with each frontend. The session holds no lifecycle truth; it projects the observation the daemon already publishes. It lives in memory, so a daemon restart starts a new one.
+
+**Wire opening.** UI delivery uses MessagePack, not the JSON domain-RPC codec.
+One duplex connection serves one attachment. A bounded JSON `ui.open` names it:
+`{"attachment_id":"<UUID>","role":"dashboard"|"sidebar"|"presenter","interaction_id":"<UUID>"|null}`.
+The ordinary JSON reply confirms `{"codec":"messagepack","framing":"u32-be"}`;
+after its newline both directions carry four-byte big-endian lengths followed by
+MessagePack bodies, and no further JSON is read on that connection. Bytes the
+reader already buffered past the opener line are the peer's first frames and are
+honoured, not discarded. Non-TUI RPCs, `observation.get`, events, presence,
+ingest and pi-radar are unchanged. There are no legacy JSON UI-method aliases,
+and no separate action or subscription connections.
+
+**Establishment.** The opener registers the attachment and takes its publication
+receiver in one actor operation, so a publication generated at that moment is
+either the baseline or a newer head, never lost between two registrations. The
+first complete head — not the opener's acknowledgement — establishes readiness.
+A presenter claims its interaction at establishment, without consuming an action
+number; a claim for an interaction that does not exist is refused by the session,
+not reported as a capacity problem.
+
+**Actions.** Send `{id, request:{kind:"action", action_id, gate?, action}}`.
+`id` is this connection's request identity and correlates any reply; `action_id`
+is the attachment's ordered action number. The reply is
+`{id, reply:{kind:"action", outcome:<ActionOutcome>}}` with the existing outcome
+tags `applied`, `replayed`, `refused`, `receipt_expired`, `gap`, `busy` and
+`detached`. Sixty-four receipts per attachment preserve original
+interaction/request identities. A conflicting payload under a retained ID is
+refused; an uncertain action is never automatically replayed under a new ID. One
+action is in flight per attachment: its reply slot stays taken until the reply is
+on the wire, so a second action is refused `busy` rather than silently dropped.
+Ordinary input requires its interpretation-time gate stamp and is refused
+`bad_params` before any action number is consumed. Content and demand requests use
+at most two auxiliary slots and are answered through the same reply correlation.
+Attach, action numbers and receipts, and request ids are three distinct
+identities and are never interchanged.
+
+**Heads and content.** A publication frame is
+`{metadata:{kind:"publication", head:{update_id, observation, tree, session, gate, diagnostic}}, content:[{hash,bytes},...]}`.
+The three reference fields are hashes; `bytes` is a MessagePack BIN, not a JSON
+byte array or base64 string. The baseline includes the requested payloads.
+Later frames inline changed content relative to the last frame *fully written* on
+that connection. A presenter's role means it receives session state only and need
+not download fleet observations. The full head always names all three lanes.
+
+Each hash is the XXH3-128 value of the exact encoded payload, written as 32
+lowercase hexadecimal digits. Named struct fields, explicit string enum tags,
+ordered map keys and domain-defined list order give deterministic bytes.
+Unsigned 64-bit integers are exact: future TypeScript consumers must decode
+large values as BigInt, not silently coerce them into JavaScript numbers.
+Publication sequence/time and hub delivery revisions are outside payload hashes;
+real sample times, domain identities, source failures and freshness remain facts.
+Portable byte fixtures live in `tests/fixtures/tui/`.
+
+A client displays only a complete head and holds current payloads plus bounded
+handover work, not an LRU/history. The receiver invalidates stale input promptly
+even while its materialiser waits for content or an action reply. Its pending
+target is latest-wins; already-executing recovery is bounded and fenced before
+adoption. Immutable encoded payload slices are reused by connection writers; they
+are not serialized or copied afresh per attachment.
+
+**Fairness and progress.** One writer serves the connection. It writes at most
+four replies back to back, then offers the newest publication, and never starts a
+second frame while one is being written: a partially written frame cannot be
+overtaken, so ordering is preserved without a queue of frames. A publication
+advances the connection's content cursor only after it is fully written, so an
+unsent head is still sent in full rather than assumed known.
+
+**Recovery and limits.** `{id, request:{kind:"content",hash}}` returns
+`{id, reply:{kind:"content",hash}}` carrying the payload, or
+`{id, reply:{kind:"expired",head:<current head>}}`. Expiry causes
+current-baseline recovery, never substitution of different content for a
+requested hash. The daemon pins current content and retains at most 16 MiB / 32
+historical entries. Encoded payloads are limited to 1 MiB, frames to 4 MiB and
+decoding depth to 64. Lengths are checked before body allocation. Established UI
+connections may remain silent indefinitely; once the first byte arrives, the
+frame must complete within ten seconds, including its remaining length prefix.
+Size failure is `diagnostic:{code:"content_too_large"}`: the last coherent head
+remains available, a persistent stale diagnostic is shown, and no reconnect
+loop is used to retry the same rejected candidate. A newer usable candidate
+clears it. Encoding failures carry `{code:"encoding",message}`.
+
+**Capacity and release.** Connections are admitted by class. Eight openings may
+be in flight, 32 ordinary connections exist, and at most 16 UI attachments are
+established; one further slot is reserved for a presenter that names an
+interaction, so a full dashboard budget cannot strand a modal. Admission is
+decided once the first line names the class, and a refusal is a typed `busy`
+reply rather than a silently closed socket. A UI attachment is released when its
+connection ends — an explicit detach is not required — and the lease is also
+reaped by the session if a connection dies without its task ending. A stalled
+write has a two-second deadline and costs only its connection. Any essential
+connection task ending cancels its siblings and releases capacity; an idle reader
+cannot keep a failed writer's connection alive. Ordinary non-UI connections
+retain their existing control admission and idle limits. Losing a connection never
+cancels an admitted domain operation, and an action whose result was lost with
+the connection is reported unknown, never replayed.
+`{request:"demand",attachment_id,processes}` sets local process-panel demand,
+aggregated with other attachments and existing readers and released on loss.
+
+#### Shared command interactions
+
+A command that changes the world is a session command: the frontend sends what the operator asked for and which row they were looking at, and never the target. `delete`, `restart`, `create_container` and `reload_container` run this way, as does `new_workspace`. An action such as:
+
+```json
+{"request":"action","attachment_id":"<origin UUID>","action_id":1,"gate":0,"action":{"action":"run_command","command":"new_workspace","row":null}}
+```
+
+returns an applied receipt containing the new `interaction_id`. The session state retains a `blocking` specification: preparing/awaiting-result stage, owner attachment, fixed choices and diagnostic, and the presenting attachment. The owner runs the configured project source off the terminal loop and submits `provide_choices`. Only the owner prepares it. The main tree is blocked, but observations and cancellation keep progressing. There is one presentation per interaction, and it is identified by the interaction ID.
+
+The dashboard claims and renders the existing picker inline. A compact workspace sidebar requests a tmux popup running `radar present --interaction=<UUID>`; an expanded sidebar can present inline. The detached process attaches with the interaction ID, then submits `resolve_interaction` with `{"result":"project","path":"<offered path>"}`, or `cancel_interaction`. Only the claimed presenter can resolve. The first accepted result or cancellation wins. The presenter waits for acknowledgement in the session publication before exiting; its exit status carries no project data.
+
+A presenter claims the interaction by attaching to it, and a host that could not present reports `presentation_failed`, which closes the interaction as any cancellation does. No claim within 30 seconds abandons preparation/presentation and publishes a diagnostic. Losing a claimed presenter's primary subscription cancels the unresolved interaction. Losing the invoking view after a different presenter has claimed does not cancel it. Any dashboard can cancel by interaction ID; the presenter then closes. None of these events cancels an operation whose result was already accepted.
+
+Ordinary input without a gate stamp is refused as bad parameters. Input is stamped with the displayed gate generation when queued, not when written to the socket. Opening/closing an interaction advances that generation. The outbound worker discards stale unnumbered input before assigning an action number; the actor also refuses stale numbered input. Reconnect discards actions from the previous attachment. Gate transitions clear local filter-editing mode, palette and obsolete picker/confirmation state. There is no multi-key pending buffer yet.
+
+An accepted project result freezes a domain request UUID, returned in its receipt and reused by duplicate receipts. A bounded daemon worker invokes the existing `topology.create` admission service, never a self-RPC. `session.operation` distinguishes `dispatcher_accepted`, `dispatch_refused`, `submission_uncertain`, `admitted`, and authoritative `completed`/`refused`/`unknown`, carrying the original response when established. A missing completion is queried by the same request ID every five seconds, not re-executed. Queue rejection claims no admission; a daemon restart loses volatile UI state but preserves whatever the domain service durably recorded.
+
+Project candidates keep source order, validation and deduplication. The invoking frontend supplies its own configured source/environment; no source process runs in the daemon. `[tui] project_base` must be absolute and defaults to `$HOME`; it is offered only if no source directory passes the filter. A missing/unusable base yields an empty picker and a diagnostic. No invoking start-directory entry is prepended.
+
+#### Focus
+
+`run_command` with `focus` names the row the operator wants moved to, and nothing else. The session derives the target from the tree and observation it holds — a task row is read through its owner's pane — and freezes one effect. No question is asked, because moving a terminal takes nothing away. The daemon executes that effect on its runtime backend: it resolves the client attached to the target's session and switches that client, so focus does not depend on the environment of the process that asked. A session with no client attached is a definite refusal, not an effect that may have happened: it answers `no_client` with the `target` it could not show, and the frontend that asked opens a terminal for that place and re-asks the same command for the same row. A row the observation no longer places is refused before anything is sent, naming the row.
+
+Whether the observation a view last drew is current stays that view's own reading: it refuses to ask for a focus it cannot trust, and the daemon never re-derives it.
+
+#### Frozen command targets
+
+A destructive command carries `row`, the identity the invoking view displayed. The session looks it up in the tree it already holds, decides what the command acts on from the observation it publishes, and freezes the request — method, parameters, request identity, question and losses — before anything is asked or sent. Another view's selection cannot retarget it, and a row that is gone is refused rather than replaced.
+
+Eligibility is evidence, not the cursor: a stale inventory, a target that has disappeared, a managed location (routed to its owner) and an unresolved container each refuse or redirect before a question is opened. A deletion that loses nothing — an idle shell, a container with nothing running — is dispatched without asking; anything else opens a `confirm` interaction whose prompt names the exact target and whose losses list what goes with it.
+
+A confirmation is presented by whichever view claims it: the dashboard inline, or `radar present` in a detached terminal. It answers `resolve_interaction` with `{"result":"confirm","accepted":true}`, or `cancel_interaction`. The session dispatches the effect it already froze, through the same admission path a client request reaches, under the same request identity; a retried acknowledgement cannot become a second effect. A deletion that would end running agents asks first, and the question names them; the daemon is then sent one plain `topology.delete`. The session holds no consent state and the request carries no `force`: if an agent ignores its stop window the place still closes, and the outcome lists the exits that could not be verified.
+
+`run_command` for `launch_configured` is the one command the frontend prepares: the shell, `PATH` and command line are its own environment, so it submits `prepare_launch` with them and the session derives the workspace, directory and recipe. No prepared launch asks a question, because it adds a place instead of taking one away.
+
+User-run checks are in [UI-session acceptance](ui-session-acceptance.md). This A–C interface milestone makes the dependent UX work possible; it is not completion of the remaining command migration or a claim of live tmux acceptance.
+
 ## Vocabulary audit
 
 The daemon uses one word for one concept across the surface. This is the
@@ -283,7 +423,6 @@ Durable request state, and what each word means:
 | `in_flight` | `category` | An unresolved request for the same target and method already exists |
 | `backend_unavailable` | `category` | The backend could not satisfy the operation: it lacks the capability, or it gave no usable answer (the record's `outcome` says which) |
 | `backend_refused` | `category` | The backend gave an explicit refusal before reporting success |
-| `agents_alive` | `category` | A container deletion was held because an agent inside it did not exit; the place stands until the operator repeats the deletion |
 
 State and outcome are deliberately separate: `state` says how far the durable
 record got, `outcome` says what the operation did. Neither is derived from the

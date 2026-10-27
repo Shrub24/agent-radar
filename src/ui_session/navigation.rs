@@ -6,7 +6,11 @@
 //! The frontend that shows them keeps them, and resets them when the selected
 //! row changes.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Matcher, Utf32Str};
 
 use crate::model::AgentState;
 use crate::tasks::TaskBoard;
@@ -30,6 +34,65 @@ pub struct Navigation {
     /// Index of the selected row in the last visible-row list, used as the
     /// fallback position when the selected row disappears.
     anchor: usize,
+    /// Scratch space for the fuzzy matcher, reused across every row and call.
+    matcher: RefCell<Matcher>,
+}
+
+/// One change to the shared navigation state. The session applies these for
+/// every attachment, and a frontend applies the same step to its own replica
+/// before the published state arrives, so both run one implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NavStep {
+    Select(RowId),
+    Move(i32),
+    Collapse,
+    Expand,
+    ToggleFold,
+    /// A fold toggle for one named branch, as a click on its marker makes.
+    ToggleBranch(RowId),
+    CyclePanes,
+    CycleOrder,
+    ToggleFinished,
+    ToggleTasks,
+    ShowEverything,
+    JumpAttention(bool),
+    JumpWorking(bool),
+    SetFilter(String),
+    ClearFilter,
+}
+
+/// Everything about the navigation that two views must agree on, apart from the
+/// tree itself: what a published session state carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavState {
+    pub selected: Option<RowId>,
+    pub order: RowOrder,
+    pub view: PaneView,
+    pub finished_shown: bool,
+    pub task_rows: TaskRows,
+    pub filter: String,
+    /// Sorted, so equal states compare and serialize equally.
+    pub collapsed: Vec<RowId>,
+}
+
+/// A compiled filter query and the matcher that applies it.
+pub(crate) struct Needle<'a> {
+    pattern: Pattern,
+    matcher: &'a RefCell<Matcher>,
+}
+
+impl Needle<'_> {
+    /// Whether `text` matches every word of the query, fuzzily and without
+    /// regard to case, as the substring filter it replaces was.
+    pub(crate) fn hit(&self, text: &str) -> bool {
+        let mut buffer = Vec::new();
+        self.pattern
+            .score(
+                Utf32Str::new(text, &mut buffer),
+                &mut self.matcher.borrow_mut(),
+            )
+            .is_some()
+    }
 }
 
 impl Navigation {
@@ -86,6 +149,21 @@ impl Navigation {
         self.collapsed.contains(id)
     }
 
+    /// The projected node for a row identity, whatever the current view shows.
+    /// A captured target is looked up by identity, never by position.
+    pub fn node(&self, id: &RowId) -> Option<&TreeNode> {
+        fn find<'a>(nodes: &'a [TreeNode], id: &RowId) -> Option<&'a TreeNode> {
+            nodes.iter().find_map(|node| {
+                if &node.row.id == id {
+                    Some(node)
+                } else {
+                    find(&node.children, id)
+                }
+            })
+        }
+        find(&self.tree.roots, id)
+    }
+
     /// Rows currently displayed, in source order, honouring folds, the
     /// ordinary-pane toggle and the filter.
     pub fn visible_rows(&self) -> Vec<VisibleRow<'_>> {
@@ -139,6 +217,57 @@ impl Navigation {
     pub fn selected_row(&self) -> Option<VisibleRow<'_>> {
         let index = self.selected_index()?;
         self.visible_rows().into_iter().nth(index)
+    }
+
+    /// Applies one step. Returns whether a [`NavStep::Select`] found its row;
+    /// every other step reports `true`.
+    pub fn apply(&mut self, step: &NavStep) -> bool {
+        match step {
+            NavStep::Select(id) => return self.select_exact(id),
+            NavStep::Move(delta) => self.move_selection(*delta),
+            NavStep::Collapse => self.collapse_selected(),
+            NavStep::Expand => self.expand_selected(),
+            NavStep::ToggleFold => self.toggle_fold(),
+            NavStep::ToggleBranch(id) => self.toggle_branch(id),
+            NavStep::CyclePanes => self.cycle_panes(),
+            NavStep::CycleOrder => self.cycle_order(),
+            NavStep::ToggleFinished => self.toggle_history(),
+            NavStep::ToggleTasks => self.toggle_tasks(),
+            NavStep::ShowEverything => self.show_everything(),
+            NavStep::JumpAttention(forward) => self.jump_attention(*forward),
+            NavStep::JumpWorking(forward) => self.jump_working(*forward),
+            NavStep::SetFilter(query) => self.set_filter(query),
+            NavStep::ClearFilter => self.clear_filter(),
+        }
+        true
+    }
+
+    /// The agreed state, for publication.
+    pub fn state(&self) -> NavState {
+        let mut collapsed: Vec<RowId> = self.collapsed.iter().cloned().collect();
+        collapsed.sort();
+        NavState {
+            selected: self.selected.clone(),
+            order: self.order,
+            view: self.view,
+            finished_shown: self.finished_shown,
+            task_rows: self.task_rows,
+            filter: self.filter.clone(),
+            collapsed,
+        }
+    }
+
+    /// Takes on a published state wholesale. The selection is kept as published
+    /// when it is visible; otherwise the usual fallback picks a row.
+    pub fn adopt(&mut self, state: NavState) {
+        self.order = state.order;
+        self.view = state.view;
+        self.finished_shown = state.finished_shown;
+        self.task_rows = state.task_rows;
+        self.filter = state.filter;
+        self.collapsed = state.collapsed.into_iter().collect();
+        self.selected = state.selected;
+        self.reconcile();
     }
 
     /// Replaces the projected tree and keeps the selection on a visible row.
@@ -202,13 +331,11 @@ impl Navigation {
         self.reconcile();
     }
 
-    pub fn push_filter(&mut self, ch: char) {
-        self.filter.push(ch);
-        self.reconcile();
-    }
-
-    pub fn pop_filter(&mut self) {
-        self.filter.pop();
+    /// Replaces the whole query: the shared filter is edited by complete
+    /// strings, never by character.
+    pub fn set_filter(&mut self, query: &str) {
+        self.filter.clear();
+        self.filter.push_str(query);
         self.reconcile();
     }
 
@@ -331,12 +458,20 @@ impl Navigation {
         }
     }
 
-    fn needle(&self) -> Option<String> {
+    fn needle(&self) -> Option<Needle<'_>> {
         let query = self.filter.trim();
         if query.is_empty() {
             return None;
         }
-        Some(query.to_lowercase())
+        Some(Needle {
+            pattern: Pattern::new(
+                query,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+            ),
+            matcher: &self.matcher,
+        })
     }
 
     /// The rows the tree currently lists.
@@ -428,7 +563,177 @@ pub struct Connectors {
     pub has_following_sibling: bool,
 }
 
-/// The prefix a child row draws: its parent's continuation columns, then the
+/// One row of the tree as drawn.
+///
+/// The session's projection decides which rows exist and in what order; this
+/// view's own observation explains them. A projected row it cannot explain is
+/// still drawn, because the session says the row is there — it is only without
+/// the detail that lives on this side of the wire.
+pub enum DrawRow<'a> {
+    Known(VisibleRow<'a>),
+    Structure {
+        /// This view's own row identity for the projected row. Owned, because a
+        /// row the local tree does not hold has nothing to borrow it from.
+        id: RowId,
+        /// The projected row, for the little this side of the wire can say.
+        row: &'a crate::control_plane::public_contracts::ui_session::TreeRow,
+        connectors: Connectors,
+    },
+}
+
+impl<'a> DrawRow<'a> {
+    pub fn id(&self) -> &RowId {
+        match self {
+            Self::Known(row) => row.id,
+            Self::Structure { id, .. } => id,
+        }
+    }
+
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::Known(row) => row.depth,
+            Self::Structure { row, .. } => row.depth as usize,
+        }
+    }
+
+    /// Whether the row has children this view can show.
+    pub fn has_children(&self) -> bool {
+        match self {
+            Self::Known(row) => row.has_children,
+            Self::Structure { row, .. } => row.has_children,
+        }
+    }
+
+    /// Where the disclosure marker begins, in cells from the panel's left edge.
+    pub fn marker_column(&self) -> u16 {
+        match self {
+            Self::Known(row) => row.marker_column(),
+            Self::Structure { connectors, .. } => {
+                (connectors.continuation.len() as u16 + u16::from(self.depth() > 0)) * 2
+            }
+        }
+    }
+}
+
+/// The session's ordered rows, joined to the local tree for everything the wire
+/// does not carry.
+///
+/// The join is by row identity, never by position: a row the local observation
+/// lacks is drawn from the projection alone, and one the projection dropped is
+/// not drawn at all, however this view's tree happens to look.
+pub fn projected<'a>(
+    rows: &'a [crate::control_plane::public_contracts::ui_session::TreeRow],
+    nav: &'a Navigation,
+) -> Vec<DrawRow<'a>> {
+    // One pass over the local tree rather than a search per row: the projection is
+    // the same size as the tree on any settled fleet, and a render must not be
+    // quadratic in it. A view that has observed nothing yet explains nothing, so
+    // it does not pay for an index it cannot use.
+    let mut local: std::collections::HashMap<&RowId, &TreeNode> = std::collections::HashMap::new();
+    if nav.tree().roots.is_empty() {
+        let connectors = flat_connectors_all(&depths_of(rows));
+        return rows
+            .iter()
+            .enumerate()
+            .map(|(index, wire)| DrawRow::Structure {
+                id: super::session::row_id(&wire.id),
+                row: wire,
+                connectors: connectors[index].clone(),
+            })
+            .collect();
+    }
+    fn collect<'a>(
+        nodes: &'a [TreeNode],
+        into: &mut std::collections::HashMap<&'a RowId, &'a TreeNode>,
+    ) {
+        for node in nodes {
+            into.insert(&node.row.id, node);
+            collect(&node.children, into);
+        }
+    }
+    collect(&nav.tree().roots, &mut local);
+
+    let depths = depths_of(rows);
+    let ids: Vec<RowId> = rows
+        .iter()
+        .map(|row| super::session::row_id(&row.id))
+        .collect();
+    let connectors = flat_connectors_all(&depths);
+    let mut drawn = Vec::with_capacity(rows.len());
+    for (index, wire) in rows.iter().enumerate() {
+        match local.get(&ids[index]) {
+            Some(node) => drawn.push(DrawRow::Known(VisibleRow {
+                id: &node.row.id,
+                depth: depths[index],
+                node,
+                has_children: wire.has_children,
+                collapsed: wire.collapsed,
+                connectors: connectors[index].clone(),
+            })),
+            None => drawn.push(DrawRow::Structure {
+                id: ids[index].clone(),
+                row: wire,
+                connectors: connectors[index].clone(),
+            }),
+        }
+    }
+    drawn
+}
+
+fn depths_of(rows: &[crate::control_plane::public_contracts::ui_session::TreeRow]) -> Vec<usize> {
+    rows.iter().map(|row| row.depth as usize).collect()
+}
+
+/// The branch prefix of every row of a flat, depth-annotated listing.
+///
+/// Two linear passes: one right-to-left answering "does a sibling follow" for
+/// every row, one left-to-right resolving each row's ancestor columns from the
+/// most recent row at each shallower depth.
+fn flat_connectors_all(depths: &[usize]) -> Vec<Connectors> {
+    let mut connectors = vec![
+        Connectors {
+            continuation: Vec::new(),
+            has_following_sibling: false,
+        };
+        depths.len()
+    ];
+    // A sibling follows when the nearest row to the right whose depth is not
+    // deeper has this row's depth: that is the first row to look at after this
+    // row's subtree.
+    let mut stack: Vec<usize> = Vec::new();
+    for index in (0..depths.len()).rev() {
+        while stack
+            .last()
+            .is_some_and(|&deeper| depths[deeper] > depths[index])
+        {
+            stack.pop();
+        }
+        connectors[index].has_following_sibling = stack
+            .last()
+            .is_some_and(|&next| depths[next] == depths[index]);
+        stack.push(index);
+    }
+    // An ancestor's column continues when that ancestor has a following sibling.
+    let deepest = depths.iter().copied().max().unwrap_or(0);
+    let mut last_at: Vec<Option<usize>> = vec![None; deepest + 1];
+    for index in 0..depths.len() {
+        let depth = depths[index];
+        // Nothing deeper can be an ancestor of this row or of anything after it.
+        for slot in last_at.iter_mut().skip(depth + 1) {
+            *slot = None;
+        }
+        connectors[index].continuation = (1..depth)
+            .filter_map(|level| last_at.get(level).copied().flatten())
+            .map(|ancestor| connectors[ancestor].has_following_sibling)
+            .collect();
+        if let Some(slot) = last_at.get_mut(depth) {
+            *slot = Some(index);
+        }
+    }
+    connectors
+}
+
+/// The prefix a child row draws:/// The prefix a child row draws:/// The prefix a child row draws: its parent's continuation columns, then the
 /// parent's own column when the parent is itself nested. A workspace root draws
 /// no connector, so its children start with an empty prefix and it leaves no
 /// continuation behind them.
@@ -530,10 +835,10 @@ impl Visibility {
 /// view of outstanding work and start with them shown. Each view keeps its own
 /// answer, so `b` in one view cannot change what another lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TaskRows {
-    agents: bool,
-    running: bool,
-    all: bool,
+pub struct TaskRows {
+    pub agents: bool,
+    pub running: bool,
+    pub all: bool,
 }
 
 impl Default for TaskRows {
@@ -664,8 +969,13 @@ fn collect_visible<'a>(
 /// Whether this subtree contributes a row to the filtered view: the row itself
 /// matches, or a visible descendant does. What the filter keeps, so the
 /// connectors are built from the rows that are drawn.
-fn subtree_matches(node: &TreeNode, needle: &str, visible: Visibility, order: RowOrder) -> bool {
-    node.row.matches(needle)
+fn subtree_matches(
+    node: &TreeNode,
+    needle: &Needle<'_>,
+    visible: Visibility,
+    order: RowOrder,
+) -> bool {
+    node.row.matches(|text| needle.hit(text))
         || ordered(&node.children, order).into_iter().any(|child| {
             visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
         })
@@ -746,7 +1056,7 @@ const RETAINED_RANK: u8 = 9;
 
 /// Whether a row is one a human should look at: stuck, unanswered, or in a
 /// state no source could name.
-fn needs_attention(row: &VisibleRow<'_>) -> bool {
+pub(crate) fn needs_attention(row: &VisibleRow<'_>) -> bool {
     matches!(
         &row.node.row.kind,
         RowKind::Agent(agent)
@@ -759,7 +1069,7 @@ fn needs_attention(row: &VisibleRow<'_>) -> bool {
 }
 
 /// Whether a row is moving: an agent in the working state.
-fn is_working(row: &VisibleRow<'_>) -> bool {
+pub(crate) fn is_working(row: &VisibleRow<'_>) -> bool {
     matches!(
         &row.node.row.kind,
         RowKind::Agent(agent) if agent.state == AgentState::Working
@@ -772,7 +1082,7 @@ fn is_working(row: &VisibleRow<'_>) -> bool {
 fn collect_filtered<'a>(
     node: &'a TreeNode,
     depth: usize,
-    needle: &str,
+    needle: &Needle<'_>,
     visible: Visibility,
     order: RowOrder,
     connectors: Connectors,
@@ -805,5 +1115,115 @@ fn collect_filtered<'a>(
             child_connectors(&connectors, depth, index + 1 < count),
             out,
         );
+    }
+}
+
+#[cfg(test)]
+mod projected_tests {
+    use super::*;
+    use crate::control_plane::public_contracts::ui_session as dto;
+
+    fn wire(id: dto::UiRowId, depth: u32, has_children: bool) -> dto::TreeRow {
+        dto::TreeRow {
+            id,
+            depth,
+            label: "row".into(),
+            state: None,
+            has_children,
+            collapsed: false,
+            needs_attention: false,
+            working: false,
+        }
+    }
+
+    fn nav_with_fixture() -> Navigation {
+        let mut state = crate::observation::ObservationState::new();
+        state.apply_success(crate::model::testing::fleet());
+        let mut nav = Navigation::default();
+        nav.replace_tree(FleetTree::build(&state));
+        nav
+    }
+
+    #[test]
+    fn the_projection_decides_order_and_nesting_and_the_tree_only_explains_it() {
+        let nav = nav_with_fixture();
+        let local: Vec<dto::UiRowId> = nav
+            .visible_rows()
+            .iter()
+            .take(3)
+            .map(|row| crate::ui_session::session::ui_row_id(row.id))
+            .collect();
+        assert_eq!(local.len(), 3, "the fixture has rows");
+        let mut rows: Vec<dto::TreeRow> =
+            local.iter().cloned().map(|id| wire(id, 0, false)).collect();
+        // A row this view's observation does not hold: the session says it is
+        // there, so it is drawn as structure.
+        let stranger = dto::UiRowId::Pane {
+            pane_id: "gone:p9".into(),
+        };
+        rows.push(wire(stranger, 0, false));
+        // A nested row, to read the branch prefix from the flat listing.
+        rows.push(wire(local[0].clone(), 1, false));
+
+        let drawn = super::projected(&rows, &nav);
+        assert_eq!(drawn.len(), rows.len(), "every projected row is drawn");
+        match &drawn[0] {
+            // The next row is at the same depth, so this branch continues.
+            DrawRow::Known(row) => assert!(row.connectors.has_following_sibling),
+            DrawRow::Structure { .. } => panic!("a fixture row is in this view's tree"),
+        }
+        assert_eq!(
+            drawn[0].id(),
+            &crate::ui_session::session::row_id(&local[0]),
+            "order is the projection's"
+        );
+        match &drawn[3] {
+            DrawRow::Structure { id, .. } => {
+                assert_eq!(id, &RowId::Pane("gone:p9".into()), "drawn by identity");
+            }
+            DrawRow::Known(_) => panic!("a row the tree lacks must not borrow detail"),
+        }
+        match &drawn[4] {
+            DrawRow::Known(row) => {
+                assert_eq!(row.depth, 1, "nesting comes from the projection");
+                assert!(
+                    row.connectors.continuation.is_empty(),
+                    "a child of a root draws no continuation column"
+                );
+            }
+            DrawRow::Structure { .. } => panic!("a fixture row is in this view's tree"),
+        }
+    }
+
+    #[test]
+    fn a_deeper_row_keeps_the_ancestor_column_that_continues_past_it() {
+        let nav = nav_with_fixture();
+        let local =
+            |index: usize| crate::ui_session::session::ui_row_id(nav.visible_rows()[index].id);
+        // root, child, grandchild, then another child: the first child's line
+        // continues past the grandchild.
+        let rows = vec![
+            wire(local(0), 0, true),
+            wire(local(0), 1, true),
+            wire(local(0), 2, false),
+            wire(local(1), 1, false),
+        ];
+        let drawn = super::projected(&rows, &nav);
+        match &drawn[2] {
+            DrawRow::Known(row) => {
+                assert_eq!(row.connectors.continuation, vec![true]);
+                assert!(!row.connectors.has_following_sibling);
+            }
+            DrawRow::Structure { .. } => panic!("a fixture row is in this view's tree"),
+        }
+    }
+
+    #[test]
+    fn a_row_the_projection_dropped_is_not_drawn() {
+        let nav = nav_with_fixture();
+        let first = crate::ui_session::session::ui_row_id(nav.visible_rows()[0].id);
+        let rows = vec![wire(first, 0, false)];
+        let drawn = super::projected(&rows, &nav);
+        assert_eq!(drawn.len(), 1, "the tree's extra rows are not drawn");
     }
 }

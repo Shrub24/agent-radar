@@ -13,16 +13,20 @@ impl App {
     /// focuses a row that was already selected. A position holding no row does
     /// nothing.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<Action> {
+        if self.shared_blocking() {
+            return None;
+        }
         let at = (event.column, event.row);
         // A picker is modal for the pointer too: a click behind it reaches
         // nothing.
         if self.picker_open() {
             return None;
         }
-        if self.confirmation.is_some() {
-            // The dialog is modal: the tree behind it answers no pointer event.
+        if self.session_confirm().is_some() {
+            // The question is modal for the pointer too: only its own buttons
+            // answer, and a click behind it reaches nothing.
             return match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => self.confirmation_click(at),
+                MouseEventKind::Down(MouseButton::Left) => self.session_confirm_click(at),
                 _ => None,
             };
         }
@@ -52,7 +56,7 @@ impl App {
             return;
         }
         let visible = self.layout.tree_content.height as usize;
-        let max = self.visible_rows().len().saturating_sub(visible);
+        let max = self.draw_rows().len().saturating_sub(visible);
         let offset = self.layout.offset;
         let next = if down {
             (offset + STEP as usize).min(max)
@@ -100,8 +104,7 @@ impl App {
         let (id, disclosure) = self.row_under(at)?;
         if matches!(id, RowId::Workspace(_)) {
             self.select(Some(id));
-            self.toggle_fold();
-            return None;
+            return self.run(CommandId::Fold);
         }
         if disclosure {
             // The pointer said where, not which row to act on: the disclosure
@@ -112,7 +115,7 @@ impl App {
         let already = self.nav.selected_id() == Some(&id);
         self.select(Some(id));
         if already {
-            return self.focus_selected();
+            return self.run(CommandId::Focus);
         }
         None
     }
@@ -134,17 +137,19 @@ impl App {
             return None;
         }
         let index = self.layout.offset + (at.1 - content.y) as usize;
-        let row = self.visible_rows().into_iter().nth(index)?;
+        let rows = self.draw_rows();
+        let row = rows.get(index)?;
         let column = at.0.saturating_sub(content.x);
         let marker = row.marker_column();
-        let disclosure = row.has_children && (marker..marker + DISCLOSURE_WIDTH).contains(&column);
-        Some((row.id.clone(), disclosure))
+        let disclosure =
+            row.has_children() && (marker..marker + DISCLOSURE_WIDTH).contains(&column);
+        Some((row.id().clone(), disclosure))
     }
 
     /// Folds or unfolds one branch by identity, without moving the selection.
     /// Ignored while a filter is active, as the fold keys are: the filtered
     /// view shows matching ancestry on purpose, so a fold could not take effect.
     pub(super) fn toggle_branch(&mut self, id: &RowId) {
-        self.navigate(|nav| nav.toggle_branch(id));
+        self.step(NavStep::ToggleBranch(id.clone()));
     }
 }

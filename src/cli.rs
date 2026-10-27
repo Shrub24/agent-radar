@@ -21,7 +21,7 @@ else `~/.config/radar/config.toml`. Radar draws without one.";
 /// The crate version and the control-plane wire revision this build speaks. The
 /// revision is the compatibility contract pi-radar checks; the version is for
 /// people. A test pins the literal to [`crate::control_plane::ops::PROTOCOL_REVISION`].
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (wire 10)");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (wire 11)");
 
 /// Everything Radar can be asked to do.
 #[derive(Debug, Parser)]
@@ -55,16 +55,11 @@ pub enum Invocation {
         #[arg(long)]
         session: Option<String>,
     },
-    /// The popup behind a sidebar's picker or confirmation. Started by the
-    /// sidebar, not by hand.
+    /// Present one daemon-owned interaction in a detached terminal.
     #[command(hide = true)]
-    Modal {
-        /// The key whose picker or confirmation to open.
+    Present {
         #[arg(long)]
-        key: char,
-        /// The selected row's identity, as JSON.
-        #[arg(long)]
-        row: Option<String>,
+        interaction: String,
     },
     /// Control the daemon's user units; with no action, serve in the foreground.
     Daemon {

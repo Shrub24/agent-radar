@@ -175,10 +175,9 @@ impl TreeRow {
         }
     }
 
-    /// Case-insensitive match against the displayed label and any available
-    /// role, assignment or task-id text. `needle_lower` must already be
-    /// lowercase.
-    pub fn matches(&self, needle_lower: &str) -> bool {
+    /// Whether `hit` accepts the displayed label or any available role,
+    /// assignment or task-id text. The caller owns the matching rule.
+    pub fn matches(&self, hit: impl FnMut(&str) -> bool) -> bool {
         let extra: [Option<&str>; 2] = match &self.kind {
             RowKind::Agent(agent) => [
                 agent.facts.role.as_deref(),
@@ -196,7 +195,7 @@ impl TreeRow {
         std::iter::once(Some(self.title()))
             .chain(extra)
             .flatten()
-            .any(|text| text.to_lowercase().contains(needle_lower))
+            .any(hit)
     }
 }
 

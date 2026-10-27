@@ -65,6 +65,8 @@ pub enum Contract {
     ObservationGet,
     #[serde(rename = "communication.handoff.v1")]
     CommunicationHandoff,
+    #[serde(rename = "ui.session.v1")]
+    UiSession,
     #[serde(other)]
     Unknown,
 }
@@ -93,6 +95,7 @@ impl Contract {
         Self::LifecycleAbandon,
         Self::ObservationGet,
         Self::CommunicationHandoff,
+        Self::UiSession,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -120,6 +123,7 @@ impl Contract {
             Self::LifecycleAbandon => "lifecycle.abandon.v1",
             Self::ObservationGet => "observation.get.v1",
             Self::CommunicationHandoff => "communication.handoff.v1",
+            Self::UiSession => "ui.session.v1",
             Self::Unknown => "unknown",
         }
     }
@@ -153,6 +157,9 @@ impl Contract {
             // The snapshot is built from the same observation a `mux.observe`
             // read is, so a backend that cannot observe has nothing to publish.
             Self::ObservationGet | Self::CommunicationHandoff => P::NONE,
+            // The session reads the daemon's own observation snapshot and holds
+            // volatile state; it asks nothing of the backend itself.
+            Self::UiSession => P::NONE,
             Self::Unknown => P::NONE,
         }
     }
@@ -165,7 +172,7 @@ impl Contract {
 /// Bumped 4 to 5 when lifecycle reads republished the agent as `subject_id` and
 /// the attempt as `claim_id`, and stopped publishing a generation. A revision-4
 /// client reads those names with the old meanings, so it must not connect.
-pub const PROTOCOL_REVISION: u32 = 10;
+pub const PROTOCOL_REVISION: u32 = 11;
 
 /// What the handshake advertises: the daemon contracts the backend's primitive set
 /// can serve, which is the list an external consumer pins. The backend's own
@@ -575,6 +582,8 @@ mod tests {
                 Contract::ObservationGet,
                 // Communication records are daemon-owned and need no mux primitive.
                 Contract::CommunicationHandoff,
+                // The UI session is daemon-owned volatile state, not a backend read.
+                Contract::UiSession,
             ]
         );
     }

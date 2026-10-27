@@ -236,21 +236,35 @@ fn commands(tmux: &str, host: &str, pane: &str) -> SidebarConfig {
     }
 }
 
-/// The tmux command that floats `radar modal` over the whole workspace: the
-/// outer client, so the sidebar and the agent area both lie behind it. A picker
-/// is a list and gets the larger block; a confirmation is a few lines.
-pub fn popup_command(radar: &str, key: char, row: Option<&str>) -> Option<Vec<String>> {
+/// Launches a presenter addressed by interaction identity, never by a synthetic key.
+pub fn presenter_command(radar: &str, interaction: &str) -> Option<Vec<String>> {
     let host = std::env::var("RADAR_WORKSPACE_SERVER").ok()?;
     let pane = std::env::var("RADAR_WORKSPACE_SIDEBAR").ok()?;
     let tmux = crate::service::program("RADAR_TMUX", "tmux");
-    Some(popup(
+    Some(presenter_popup(
         &tmux.to_string_lossy(),
         &host,
         &pane,
         radar,
-        key,
-        row,
+        interaction,
     ))
+}
+
+fn presenter_popup(
+    tmux: &str,
+    host: &str,
+    pane: &str,
+    radar: &str,
+    interaction: &str,
+) -> Vec<String> {
+    let mut argv = popup(tmux, host, pane, radar, 'A', None);
+    argv.truncate(argv.len() - 3);
+    argv.extend([
+        radar.to_owned(),
+        "present".into(),
+        format!("--interaction={interaction}"),
+    ]);
+    argv
 }
 
 fn popup(
@@ -348,6 +362,42 @@ mod tests {
         assert!(
             f12[3].contains("-F \"#{window_zoomed_flag}\""),
             "an unquoted format is expanded when the key is bound, leaving if-shell no argument"
+        );
+    }
+
+    #[test]
+    fn a_presenter_popup_carries_only_its_interaction_not_a_key_or_row() {
+        let argv = presenter_popup(
+            "/bin/tmux",
+            "outer",
+            "%7",
+            "/path with space/radar",
+            "interaction-42",
+        );
+        assert_eq!(
+            &argv[..7],
+            [
+                "/bin/tmux",
+                "-L",
+                "outer",
+                "display-popup",
+                "-B",
+                "-E",
+                "-t"
+            ]
+        );
+        assert_eq!(
+            &argv[argv.len() - 3..],
+            [
+                "/path with space/radar",
+                "present",
+                "--interaction=interaction-42"
+            ]
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.starts_with("--key") || arg.starts_with("--row"))
         );
     }
 
