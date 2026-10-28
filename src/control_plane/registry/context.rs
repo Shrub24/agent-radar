@@ -309,7 +309,9 @@ pub(crate) fn report_presence(
             launch_identity: None,
         },
     };
-    publish(registry, &request, now_ms).map(|_| ())
+    publish(registry, &request, now_ms)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Publish one agent record's current session.
@@ -325,19 +327,24 @@ pub fn publish(
     registry: &Registry,
     request: &ContextRequest,
     now_ms: i64,
-) -> Result<ContextWrite, String> {
+) -> Result<ContextWrite, super::Error> {
     request.validate()?;
     let _transition = registry.transition();
     // The context is a fact about an agent record, so the subject must exist.
-    registry
-        .get(&request.registration_id)?
-        .ok_or_else(|| format!("agent {} is not registered", request.registration_id))?;
+    registry.get(&request.registration_id)?.ok_or_else(|| {
+        super::Error::NotFound(format!(
+            "agent {} is not registered",
+            request.registration_id
+        ))
+    })?;
     let existing = read_record(registry, &request.registration_id)?;
 
     let (writer, sequence) = match existing {
         None => {
             if request.writer_handle.is_some() || request.replace.is_some() {
-                return Err("context has no writer yet: the first publish binds one".into());
+                return Err(super::Error::NotFound(
+                    "context has no writer yet: the first publish binds one".into(),
+                ));
             }
             (new_binding(&request.publisher, 1), request.sequence)
         }
@@ -350,14 +357,15 @@ pub fn publish(
                     return Err(refusal(
                         "incumbent writer changed; replacement does not apply",
                         incumbent,
-                    ));
+                    )
+                    .into());
                 }
                 if incumbent_live(
                     incumbent,
                     Some((record.context.generation, &record.context.expires_at)),
                     now_ms,
                 ) {
-                    return Err(refusal("fresh writer takeover is refused", incumbent));
+                    return Err(refusal("fresh writer takeover is refused", incumbent).into());
                 }
                 (
                     new_binding(&request.publisher, incumbent.generation + 1),
@@ -372,17 +380,19 @@ pub fn publish(
                         return Err(refusal(
                             "context writer handle is stale or belongs to another generation",
                             incumbent,
-                        ));
+                        )
+                        .into());
                     }
                     None => {
                         return Err(refusal(
                             "context has a writer this publisher did not present",
                             incumbent,
-                        ));
+                        )
+                        .into());
                     }
                 }
                 if incumbent.retired_at.is_some() {
-                    return Err(refusal("writer is retired", incumbent));
+                    return Err(refusal("writer is retired", incumbent).into());
                 }
                 if request.sequence < incumbent.sequence {
                     return Err("sequence is older than stored sequence".into());
@@ -446,16 +456,17 @@ pub fn retire(
     registration_id: &str,
     writer_handle: &str,
     now_ms: i64,
-) -> Result<SessionContext, String> {
+) -> Result<SessionContext, super::Error> {
     validate_registration_id(writer_handle)?;
     let _transition = registry.transition();
     let record = read_record(registry, registration_id)?
-        .ok_or_else(|| "context has no writer".to_string())?;
+        .ok_or_else(|| super::Error::NotFound("context has no writer".into()))?;
     if record.writer.handle != writer_handle {
         return Err(refusal(
             "context writer handle is stale or belongs to another generation",
             &record.writer,
-        ));
+        )
+        .into());
     }
     if record.writer.retired_at.is_some() {
         return Ok(record);

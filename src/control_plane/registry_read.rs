@@ -6,7 +6,7 @@
 //! the `*.list` requests serve. The wire shapes are built here and shared with
 //! those requests, so a snapshot cannot disagree with what a client reads.
 
-use serde_json::{Value, json};
+use serde::Serialize;
 
 use crate::control_plane::containers;
 use crate::control_plane::lifecycle as subjects;
@@ -49,7 +49,7 @@ pub(crate) fn agent_entry(
     registration: &Registration,
     verification: crate::control_plane::registry::ProcessVerification,
     now_ms: i64,
-) -> Result<Value, String> {
+) -> Result<AgentEntry, String> {
     let execution =
         registry.published_facts(&registration.registration_id, Channel::Execution, now_ms)?;
     let assignment =
@@ -66,22 +66,52 @@ pub(crate) fn agent_entry(
     if let Some(location) = attachment.as_ref().and_then(|claim| claim.location.clone()) {
         public.location = Some(location);
     }
-    Ok(json!({
-        "registration": public,
-        "claim_standing": attachment.map(|claim| claim.standing),
-        "scoped": match crate::control_plane::lifecycle::read_process(registry, &registration.registration_id) {
+    Ok(AgentEntry {
+        registration: public,
+        claim_standing: attachment.map(|claim| claim.standing),
+        scoped: match crate::control_plane::lifecycle::read_process(
+            registry,
+            &registration.registration_id,
+        ) {
             Ok(Some(process)) => Some(process.scope.is_some()),
-            // A process Radar did not admit has no scope to state.
             Ok(None) => Some(false),
-            // An unreadable record is unknown, not unscoped.
             Err(_) => None,
         },
-        "process": process_evidence(registration, verification),
-        "execution": execution,
-        "assignment": assignment,
-        "facts": facts,
-        "context": context,
-    }))
+        process: process_evidence(registration, verification),
+        execution,
+        assignment,
+        facts,
+        context,
+    })
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AgentEntry {
+    pub registration: crate::control_plane::registry::PublicRegistration,
+    pub claim_standing: Option<crate::control_plane::registry::presence::Standing>,
+    pub scoped: Option<bool>,
+    pub process: ProcessEvidence,
+    pub execution: Option<crate::control_plane::registry::PublicChannelFacts>,
+    pub assignment: Option<crate::control_plane::registry::PublicChannelFacts>,
+    pub facts: Option<crate::control_plane::registry::PublicChannelFacts>,
+    pub context: Option<crate::control_plane::registry::PublicContext>,
+}
+
+impl From<AgentEntry> for RegistryAgent {
+    fn from(entry: AgentEntry) -> Self {
+        Self {
+            registration: entry.registration,
+            claim_standing: entry.claim_standing,
+            scoped: entry.scoped,
+            process: crate::registry_observation::ProcessEvidence {
+                claim: entry.process.claim,
+            },
+            context: entry.context,
+            execution: entry.execution,
+            assignment: entry.assignment,
+            facts: entry.facts,
+        }
+    }
 }
 
 /// The process evidence served beside a registration.
@@ -99,7 +129,7 @@ pub(crate) fn process_evidence(
 /// What a registration claimed about its process, and what the daemon verified.
 ///
 /// The claim is same-UID process evidence for matching a pane, not a credential.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct ProcessEvidence {
     claimed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,9 +177,7 @@ fn agents(registry: &Registry, now_ms: i64) -> Result<Vec<RegistryAgent>, String
                 crate::control_plane::registry::ProcessVerification::Unavailable,
                 now_ms,
             )?;
-            agents.push(serde_json::from_value(entry).map_err(|error| {
-                format!("an agent record this daemon built is unreadable: {error}")
-            })?);
+            agents.push(entry.into());
         }
         if page.len() < PAGE {
             return Ok(agents);
@@ -195,9 +223,7 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
                 continue;
             };
             let view = subjects::public_view(&current);
-            subjects_seen.push(serde_json::from_value(view).map_err(|error| {
-                format!("a lifecycle record this daemon built is unreadable: {error}")
-            })?);
+            subjects_seen.push(view.into());
         }
         if page.len() < PAGE {
             return Ok(subjects_seen);

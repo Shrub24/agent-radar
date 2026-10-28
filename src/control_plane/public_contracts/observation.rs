@@ -87,7 +87,8 @@ pub struct ObservationSnapshot {
     pub revision: u64,
     pub collected_at: Option<String>,
     pub sources: Vec<ObservationSource>,
-    pub tasks: Option<Value>,
+    #[schemars(with = "Option<Value>")]
+    pub tasks: Option<crate::control_plane::answer::TaskSnapshotData>,
     pub observation: ObservationProjection,
 }
 
@@ -351,7 +352,10 @@ mod tests {
                 },
                 last_success_at: Some("2026-10-19T23:59:59.000Z".into()),
             }],
-            tasks: Some(json!({"revision": 3, "sessions": []})),
+            tasks: Some(crate::control_plane::answer::TaskSnapshotData {
+                revision: 3,
+                sessions: Vec::new(),
+            }),
             observation,
         };
         let internal_json = serde_json::to_value(&internal).expect("serialize internal snapshot");

@@ -65,6 +65,7 @@ fn ui_session_with(
 use agent_radar::Daemon;
 use agent_radar::control_plane::ops::Operation;
 use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
+use agent_radar::control_plane::registry::child_close::{CloseIntent, CloseOutcome as ClosedAs};
 use agent_radar::control_plane::registry::{MAX_LISTED, ProcessVerifier};
 use agent_radar::control_plane::{
     Category, DaemonRuntime, Derived, MAX_LINE_BYTES, MAX_VERIFICATION_JOBS, PROTOCOL_VERSION,
@@ -5034,15 +5035,19 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
             &AtomicBool::new(false),
         )
         .expect("lifecycle.cancel socket control");
-    assert_eq!(cancelled.outcome(), "completed", "{cancelled:?}");
     assert_eq!(
-        cancelled.request["effects"],
-        json!([
+        cancelled.outcome(),
+        RequestOutcome::Completed,
+        "{cancelled:?}"
+    );
+    assert_eq!(
+        cancelled.request.effects,
+        [
             "launch revoked",
             "sigterm dispatched",
             "pane cleaned up",
             "process exit verified"
-        ]),
+        ],
         "{cancelled:?}"
     );
     assert!(
@@ -7405,9 +7410,9 @@ fn child_close_dispatches_only_the_verified_spawn_child_pane() {
             &AtomicBool::new(false),
         )
         .expect("spawn.close through dashboard client");
-    assert_eq!(first.outcome(), "completed", "{first:?}");
-    assert_eq!(first.request["intent"], "cancel");
-    assert_eq!(first.request["pane"], "wA:p2");
+    assert_eq!(first.close.outcome, ClosedAs::Completed, "{first:?}");
+    assert_eq!(first.close.intent, CloseIntent::Cancel);
+    assert_eq!(first.close.pane.as_deref(), Some("wA:p2"));
     assert_eq!(
         backend.closed_targets(),
         vec![CloseTarget::Pane("wA:p2".into())]
@@ -9145,6 +9150,7 @@ fn scripted_ping(request: &Value) -> Value {
         "backend": "herdr",
         "instance": null,
         "contracts": CLIENT_CONTRACTS,
+        "tasks": {"available": true},
     }})
 }
 
@@ -11274,6 +11280,11 @@ fn a_recipe_creation_holds_the_command_privately_and_runs_it_in_its_pane() {
     let container = created["result"]["container"].clone();
     assert_eq!(container["recipe"], json!(true), "{created}");
     assert_eq!(container["label"], json!("runner"), "{created}");
+    no_secret(&created, "sentinel-value");
+    no_secret(&created, "sentinel-argv");
+    let request = client.call("mux.request.get", json!({"id": created["id"]}));
+    no_secret(&request, "sentinel-value");
+    no_secret(&request, "sentinel-argv");
     let id = container["container_id"]
         .as_str()
         .expect("a container id")
@@ -11613,7 +11624,7 @@ fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
             &AtomicBool::new(false),
         )
         .expect("the daemon serves a creation");
-    assert_eq!(created.outcome(), "completed", "{created:?}");
+    assert_eq!(created.outcome(), RequestOutcome::Completed, "{created:?}");
     let container = created.container.clone().expect("the container it made");
     assert_eq!(container.label.as_deref(), Some("work"));
     assert_eq!(backend.creates().len(), 1);
@@ -11655,7 +11666,7 @@ fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
             &AtomicBool::new(false),
         )
         .expect("the daemon serves a deletion");
-    assert_eq!(deleted.outcome(), "completed", "{deleted:?}");
+    assert_eq!(deleted.outcome(), RequestOutcome::Completed, "{deleted:?}");
     assert_eq!(
         backend.closed_targets(),
         vec![CloseTarget::Pane("wA:p2".into())]
@@ -11685,7 +11696,11 @@ fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
             &AtomicBool::new(false),
         )
         .expect("the daemon still answers");
-    assert_eq!(replayed.outcome(), "completed", "{replayed:?}");
+    assert_eq!(
+        replayed.outcome(),
+        RequestOutcome::Completed,
+        "{replayed:?}"
+    );
     assert_eq!(backend.closed_targets().len(), 1, "a replay closes nothing");
 
     // A reload of the container that was just deleted is refused by name, and
@@ -11699,7 +11714,7 @@ fn the_dashboard_client_dispatches_container_controls_under_the_callers_id() {
             &AtomicBool::new(false),
         )
         .expect("the daemon answers a reload");
-    assert_eq!(reloaded.outcome(), "refused", "{reloaded:?}");
+    assert_eq!(reloaded.outcome(), RequestOutcome::Refused, "{reloaded:?}");
     assert!(
         reloaded
             .message()
@@ -12271,8 +12286,12 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         )
         .expect("lifecycle.restart socket control");
     let record = &restarted.request;
-    assert_eq!(record["outcome"], "completed", "{restarted:?}");
-    let effects = record["effects"].as_array().expect("effects");
+    assert_eq!(
+        restarted.outcome(),
+        RequestOutcome::Completed,
+        "{restarted:?}"
+    );
+    let effects = &record.effects;
     assert_eq!(effects[0], "signalled previous process", "{restarted:?}");
     assert_eq!(effects[1], "previous process exited", "{restarted:?}");
     assert!(!process_exists(lead.pid), "the previous lead still runs");

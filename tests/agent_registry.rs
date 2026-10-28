@@ -611,15 +611,17 @@ fn acquire(
     publisher: PublisherIdentity,
     now_ms: i64,
 ) -> Result<WriterBinding, String> {
-    registry.acquire_writer(
-        &AcquireRequest {
-            target_id: registration_id.into(),
-            channel,
-            publisher,
-            replace: None,
-        },
-        now_ms,
-    )
+    registry
+        .acquire_writer(
+            &AcquireRequest {
+                target_id: registration_id.into(),
+                channel,
+                publisher,
+                replace: None,
+            },
+            now_ms,
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn replace(
@@ -630,18 +632,20 @@ fn replace(
     expected: &WriterBinding,
     now_ms: i64,
 ) -> Result<WriterBinding, String> {
-    registry.acquire_writer(
-        &AcquireRequest {
-            target_id: registration_id.into(),
-            channel,
-            publisher,
-            replace: Some(ExpectedWriter {
-                generation: expected.generation,
-                handle: expected.handle.clone(),
-            }),
-        },
-        now_ms,
-    )
+    registry
+        .acquire_writer(
+            &AcquireRequest {
+                target_id: registration_id.into(),
+                channel,
+                publisher,
+                replace: Some(ExpectedWriter {
+                    generation: expected.generation,
+                    handle: expected.handle.clone(),
+                }),
+            },
+            now_ms,
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn channel_snapshot(activity: &str, outcome: Option<&str>) -> Snapshot {
@@ -879,6 +883,7 @@ fn sequence_replay_conflicts_and_daemon_clock_expiry_are_distinct() {
         registry
             .publish(&conflict, 9_001)
             .unwrap_err()
+            .to_string()
             .contains("conflicting")
     );
     assert_eq!(
@@ -1010,6 +1015,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
                 1_005
             )
             .unwrap_err()
+            .to_string()
             .contains("stale")
     );
     let updated = registry
@@ -1774,7 +1780,10 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
             1_002,
         )
         .expect_err("a conflict");
-    assert!(conflicting.contains("conflicting"), "{conflicting}");
+    assert!(
+        conflicting.to_string().contains("conflicting"),
+        "{conflicting}"
+    );
     let lease_conflict = ContextRequest {
         lease_ms: Some(20_000),
         ..context_request(
@@ -1789,6 +1798,7 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
         registry
             .publish_context(&lease_conflict, 1_003)
             .expect_err("a conflict")
+            .to_string()
             .contains("conflicting")
     );
 
@@ -1799,7 +1809,10 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
             1_004,
         )
         .expect_err("a refusal");
-    assert!(older.contains("older than stored sequence"), "{older}");
+    assert!(
+        older.to_string().contains("older than stored sequence"),
+        "{older}"
+    );
 
     let read = context_of(&registry, &agent.registration_id, 1_005);
     assert_eq!(read.context.sequence, 2);
@@ -1840,10 +1853,12 @@ fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
         )
         .expect_err("a refusal");
     assert!(
-        stale.contains("stale or belongs to another generation"),
+        stale
+            .to_string()
+            .contains("stale or belongs to another generation"),
         "{stale}"
     );
-    assert!(stale.contains(&incumbent), "{stale}");
+    assert!(stale.to_string().contains(&incumbent), "{stale}");
     let unreported = registry
         .publish_context(
             &context_request(
@@ -1856,8 +1871,11 @@ fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
             2_000,
         )
         .expect_err("a refusal");
-    assert!(unreported.contains("did not present"), "{unreported}");
-    assert!(unreported.contains(&incumbent), "{unreported}");
+    assert!(
+        unreported.to_string().contains("did not present"),
+        "{unreported}"
+    );
+    assert!(unreported.to_string().contains(&incumbent), "{unreported}");
 
     // Naming the incumbent is not enough while its lease is live.
     let takeover = registry
@@ -1873,10 +1891,12 @@ fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
         )
         .expect_err("a refusal");
     assert!(
-        takeover.contains("fresh writer takeover is refused"),
+        takeover
+            .to_string()
+            .contains("fresh writer takeover is refused"),
         "{takeover}"
     );
-    assert!(takeover.contains(&incumbent), "{takeover}");
+    assert!(takeover.to_string().contains(&incumbent), "{takeover}");
 
     assert_eq!(
         fs::read(&path).expect("the stored record"),
@@ -1937,11 +1957,13 @@ fn context_replacement_after_retirement_advances_the_generation() {
         )
         .expect_err("a refusal");
     assert!(
-        mismatch.contains("replacement does not apply"),
+        mismatch.to_string().contains("replacement does not apply"),
         "{mismatch}"
     );
     assert!(
-        mismatch.contains(&format!("generation 1 handle {}", old.handle)),
+        mismatch
+            .to_string()
+            .contains(&format!("generation 1 handle {}", old.handle)),
         "{mismatch}"
     );
 
@@ -1981,7 +2003,9 @@ fn context_replacement_after_retirement_advances_the_generation() {
         )
         .expect_err("a refusal");
     assert!(
-        fenced.contains("stale or belongs to another generation"),
+        fenced
+            .to_string()
+            .contains("stale or belongs to another generation"),
         "{fenced}"
     );
     let delayed = registry
@@ -1990,7 +2014,10 @@ fn context_replacement_after_retirement_advances_the_generation() {
             1_700,
         )
         .expect_err("a refusal");
-    assert!(delayed.contains("replacement does not apply"), "{delayed}");
+    assert!(
+        delayed.to_string().contains("replacement does not apply"),
+        "{delayed}"
+    );
 
     let read = context_of(&registry, &agent.registration_id, 1_700);
     assert_eq!(read.writer.generation, 2);
@@ -2032,7 +2059,9 @@ fn context_replacement_after_lease_expiry_advances_the_generation() {
         )
         .expect_err("a refusal");
     assert!(
-        fresh.contains("fresh writer takeover is refused"),
+        fresh
+            .to_string()
+            .contains("fresh writer takeover is refused"),
         "{fresh}"
     );
 
@@ -2203,6 +2232,7 @@ fn an_absent_context_and_an_explicit_null_stay_distinguishable() {
     assert!(
         stranger
             .expect_err("a refusal")
+            .to_string()
             .contains("is not registered")
     );
     let nothing = registry.publish_context(
@@ -2218,6 +2248,7 @@ fn an_absent_context_and_an_explicit_null_stay_distinguishable() {
     assert!(
         nothing
             .expect_err("a refusal")
+            .to_string()
             .contains("first publish binds one")
     );
     drop_root(&root);
@@ -3943,7 +3974,9 @@ fn a_malformed_or_symlinked_or_oversized_child_close_is_not_read() {
 fn publish_wire(registry: &Registry, wire: Value, now_ms: i64) -> Result<ChannelRecord, String> {
     let request: PublishRequest =
         serde_json::from_value(wire).map_err(|error| error.to_string())?;
-    registry.publish(&request, now_ms)
+    registry
+        .publish(&request, now_ms)
+        .map_err(|error| error.to_string())
 }
 
 fn facts_wire(registration_id: &str, handle: &str, sequence: u64, snapshot: Value) -> Value {

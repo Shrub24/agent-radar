@@ -42,6 +42,31 @@ use serde::{Deserialize, Serialize};
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
 use crate::model::{ProcessIdentity, SessionUuid};
 
+/// Missing registry authority is distinct from a rejected write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    NotFound(String),
+    Refused(String),
+}
+impl From<String> for Error {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+impl From<&str> for Error {
+    fn from(message: &str) -> Self {
+        Self::Refused(message.to_owned())
+    }
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(message) | Self::Refused(message) => f.write_str(message),
+        }
+    }
+}
+impl std::error::Error for Error {}
+
 /// The record shape this build writes and reads. A record naming another version
 /// fails explicitly rather than being read as this one.
 pub const REGISTRATION_VERSION: u32 = 1;
@@ -700,7 +725,7 @@ impl Registry {
         &self,
         request: &AcquireRequest,
         now_ms: i64,
-    ) -> Result<WriterBinding, String> {
+    ) -> Result<WriterBinding, Error> {
         publication::acquire_writer(self, request, now_ms)
     }
 
@@ -735,7 +760,7 @@ impl Registry {
     }
 
     /// Replace one channel's complete snapshot under its writer handle.
-    pub fn publish(&self, request: &PublishRequest, now_ms: i64) -> Result<ChannelRecord, String> {
+    pub fn publish(&self, request: &PublishRequest, now_ms: i64) -> Result<ChannelRecord, Error> {
         publication::publish(self, request, now_ms)
     }
 
@@ -746,7 +771,7 @@ impl Registry {
         channel: Channel,
         writer_handle: &str,
         now_ms: i64,
-    ) -> Result<ChannelRecord, String> {
+    ) -> Result<ChannelRecord, Error> {
         publication::retire(self, registration_id, channel, writer_handle, now_ms)
     }
 
@@ -756,7 +781,7 @@ impl Registry {
         &self,
         request: &ContextRequest,
         now_ms: i64,
-    ) -> Result<ContextWrite, String> {
+    ) -> Result<ContextWrite, Error> {
         context::publish(self, request, now_ms)
     }
 
@@ -766,7 +791,7 @@ impl Registry {
         registration_id: &str,
         writer_handle: &str,
         now_ms: i64,
-    ) -> Result<SessionContext, String> {
+    ) -> Result<SessionContext, Error> {
         context::retire(self, registration_id, writer_handle, now_ms)
     }
 

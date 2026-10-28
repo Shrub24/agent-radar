@@ -7,40 +7,31 @@ use super::*;
 /// here, at the wire boundary, before anything is recorded or dispatched; what
 /// survives validation is input this seam can carry without deciding for the
 /// caller what a terminal would do with it.
-pub(super) fn execute_input(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
-    let frozen = match frozen_params(request, &[]) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
+pub(super) fn execute_input(request: &Request, core: &Arc<Mutex<Core>>) -> Reply {
+    let frozen = frozen_params(request, &[])?;
     let input: InputRequest = match serde_json::from_value(frozen) {
         Ok(input) => input,
         Err(error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`request` is not an input request: {error}"),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                format!("`request` is not an input request: {error}"),
+            ));
         }
     };
     if let Err(message) = input.validate() {
-        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+        return Err(Refusal::new(Code::BadParams, message));
     }
     let effect = match &input.payload {
         InputPayload::Text { .. } => "sent text",
         InputPayload::Keys { .. } => "sent keys",
     };
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let requester = request.optional_string("requester")?;
     let target = input.pane_id.clone();
     let now = store::now_ms();
     let operation = ops::Operation::Input;
     let method = operation.as_str();
     let (backend, cancel) = match admit(operation, request, Some(&target), &requester, now, core) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
         }
@@ -60,7 +51,7 @@ pub(super) fn execute_input(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
             record.complete(Settlement::backend_unknown(&message), store::now_ms())
         }
     };
-    write_settled(request, done, core)
+    write_settled(done, core)
 }
 
 /// Validates, records and dispatches one publisher's report.
@@ -75,36 +66,27 @@ pub(super) fn execute_input(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
 ///
 /// Where the backend cannot report, the primitive gate refuses before dispatch
 /// and the record says so, rather than the daemon substituting an operation.
-pub(super) fn execute_report(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
-    let frozen = match frozen_params(request, &[]) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
+pub(super) fn execute_report(request: &Request, core: &Arc<Mutex<Core>>) -> Reply {
+    let frozen = frozen_params(request, &[])?;
     let report: ReportRequest = match serde_json::from_value(frozen) {
         Ok(report) => report,
         Err(error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`request` is not a report: {error}"),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                format!("`request` is not a report: {error}"),
+            ));
         }
     };
     if let Err(message) = report.validate() {
-        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+        return Err(Refusal::new(Code::BadParams, message));
     }
     let target = report.target().to_string();
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let requester = request.optional_string("requester")?;
     let now = store::now_ms();
     let operation = ops::Operation::Report;
     let method = operation.as_str();
     let (backend, cancel) = match admit(operation, request, Some(&target), &requester, now, core) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
         }
@@ -124,5 +106,5 @@ pub(super) fn execute_report(request: &Request, core: &Arc<Mutex<Core>>) -> Resp
             record.complete(Settlement::backend_unknown(&message), store::now_ms())
         }
     };
-    write_settled(request, done, core)
+    write_settled(done, core)
 }

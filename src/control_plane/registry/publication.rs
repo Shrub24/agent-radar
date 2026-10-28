@@ -824,7 +824,7 @@ pub fn acquire_writer(
     registry: &Registry,
     request: &AcquireRequest,
     now_ms: i64,
-) -> Result<WriterBinding, String> {
+) -> Result<WriterBinding, super::Error> {
     request.validate()?;
     let _transition = registry.transition();
     if request.channel == Channel::Assignment {
@@ -833,7 +833,7 @@ pub fn acquire_writer(
     } else {
         registry
             .get(&request.target_id)?
-            .ok_or("process is not registered")?;
+            .ok_or_else(|| super::Error::NotFound("process is not registered".into()))?;
     }
     let existing = read_record(registry, &request.target_id, request.channel)?;
     let is_new = existing.is_none();
@@ -927,11 +927,11 @@ pub fn publish(
     registry: &Registry,
     request: &PublishRequest,
     now_ms: i64,
-) -> Result<ChannelRecord, String> {
+) -> Result<ChannelRecord, super::Error> {
     let report = request.validate()?;
     let _transition = registry.transition();
     let record = read_record(registry, &request.target_id, request.channel)?
-        .ok_or_else(|| "channel has no writer".to_string())?;
+        .ok_or_else(|| super::Error::NotFound("channel has no writer".into()))?;
     if record.writer.handle != request.update.writer_handle {
         return Err("writer handle is stale or belongs to another channel generation".into());
     }
@@ -997,11 +997,11 @@ pub fn retire(
     channel: Channel,
     writer_handle: &str,
     now_ms: i64,
-) -> Result<ChannelRecord, String> {
+) -> Result<ChannelRecord, super::Error> {
     validate_registration_id(writer_handle)?;
     let _transition = registry.transition();
     let record = read_record(registry, registration_id, channel)?
-        .ok_or_else(|| "channel has no writer".to_string())?;
+        .ok_or_else(|| super::Error::NotFound("channel has no writer".into()))?;
     if record.writer.handle != writer_handle {
         return Err("writer handle is stale or belongs to another channel generation".into());
     }

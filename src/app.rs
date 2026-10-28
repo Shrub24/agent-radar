@@ -872,10 +872,9 @@ impl App {
         }
         if observation_changed {
             if let Some(tasks) = &mirror.observation.tasks {
-                match crate::control_plane::client::tasks_from_snapshot(tasks) {
-                    Ok(events) => self.replace_task_snapshot(events),
-                    Err(error) => self.set_task_diagnostic(Some(error)),
-                }
+                self.replace_task_snapshot(crate::control_plane::client::tasks_from_snapshot(
+                    tasks,
+                ));
             }
             self.refresh(&mirror.observation.observation);
         }
@@ -910,23 +909,14 @@ impl App {
             self.set_focus_message(Some(format!("{} · request {}", op.status, op.request_id)));
             // A focus with no client attached names the place: this view opens a
             // terminal for it and asks the session again once one is attached.
-            let no_client = op.status
-                == crate::control_plane::public_contracts::ui_session::CommandStatus::Refused
-                && op
-                    .answer
-                    .as_ref()
-                    .and_then(|answer| answer.pointer("/error/code"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("no_client");
-            if no_client
+            if let Some(crate::control_plane::public_contracts::ui_session::OutcomeError {
+                code: crate::control_plane::protocol::Code::NoClient,
+                target: Some(target),
+                ..
+            }) = op.failure()
                 && let Some(row) = self.focus_request.clone()
-                && let Some(target) = op
-                    .answer
-                    .as_ref()
-                    .and_then(|answer| answer.pointer("/error/target"))
-                    .and_then(|target| serde_json::from_value(target.clone()).ok())
             {
-                self.focus_recovery = Some((row, target));
+                self.focus_recovery = Some((row, target.clone()));
             }
         }
         true

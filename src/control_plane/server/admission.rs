@@ -11,7 +11,7 @@ pub(super) fn execute_unsupported(
     message: &str,
     target: Option<String>,
     core: &Arc<Mutex<Core>>,
-) -> Response {
+) -> Reply {
     let now = store::now_ms();
     let requester = request.optional_string("requester").ok().flatten();
     let core = locked(core);
@@ -20,16 +20,16 @@ pub(super) fn execute_unsupported(
             if record.method == operation.as_str()
                 && record.params.as_ref() == Some(&request.params) =>
         {
-            return Response::ok(&request.id, json!({"request": record.public()}));
+            return Ok(Answer::of(record));
         }
         Ok(Some(_)) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::Refused, "request id already names different contents"),
-            );
+            return Err(Refusal::new(
+                Code::Refused,
+                "request id already names different contents",
+            ));
         }
         Ok(None) => {}
-        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+        Err(error) => return Err(Refusal::new(Code::Internal, error)),
     }
     match core.store.unresolved(target.as_deref(), now) {
         Ok(Some(held)) => {
@@ -47,13 +47,13 @@ pub(super) fn execute_unsupported(
             .with_params(request.params.clone())
             .complete(Settlement::refused(Category::InFlight, &message), now);
             if let Err(error) = core.store.create(&record) {
-                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+                return Err(Refusal::new(Code::Internal, error));
             }
-            return Response::refused(&request.id, &Refusal::new(Code::Refused, message));
+            return Err(Refusal::new(Code::Refused, message));
         }
         Ok(None) => {}
         Err(error) => {
-            return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+            return Err(Refusal::new(Code::Internal, error));
         }
     }
     let record = RequestRecord::new(&request.id, operation.as_str(), requester, target, now)
@@ -63,9 +63,9 @@ pub(super) fn execute_unsupported(
             now,
         );
     if let Err(error) = core.store.create(&record) {
-        return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+        return Err(Refusal::new(Code::Internal, error));
     }
-    Response::ok(&request.id, json!({"request": record.public()}))
+    Ok(Answer::of(record))
 }
 
 /// Validates, records and dispatches one effectful operation without holding
@@ -75,7 +75,7 @@ pub(super) fn execute(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Response {
+) -> Reply {
     match operation {
         ops::Operation::Focus => execute_focus(request, core),
         ops::Operation::Close => execute_close(request, core),
@@ -103,26 +103,20 @@ pub(super) fn execute(
 /// must not consult it. No backend is touched, no outcome is established, and no
 /// effect is dispatched — every independent process and pane safety check is
 /// unchanged and still refuses on its own evidence.
-pub(super) fn execute_abandon(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
+pub(super) fn execute_abandon(request: &Request, core: &Arc<Mutex<Core>>) -> Reply {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Params {
         request_id: String,
     }
-    let params: Params = match decode_params(request) {
-        Ok(params) => params,
-        Err(response) => return response,
-    };
+    let params: Params = decode_params(request)?;
     if SessionUuid::parse(&params.request_id).is_none() {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(Code::BadParams, "`request_id` must be a canonical UUID"),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "`request_id` must be a canonical UUID",
+        ));
     }
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let requester = request.optional_string("requester")?;
     let now = store::now_ms();
     // The record being released is the target, not the daemon: naming it keeps the
     // in-flight check per record, so releasing one record does not refuse releasing
@@ -146,17 +140,14 @@ pub(super) fn execute_abandon(request: &Request, core: &Arc<Mutex<Core>>) -> Res
         now,
         core,
     ) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message)
             if !wired && ops::Operation::Abandon.needs() == ops::Primitives::NONE =>
         {
             tracing::debug!(%message, %released, "abandoning a record with no backend wired");
         }
         Admission::Unsupported(message) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::BackendUnavailable, message),
-            );
+            return Err(Refusal::new(Code::BackendUnavailable, message));
         }
         Admission::Dispatch(_, _) => {}
     }
@@ -194,14 +185,14 @@ pub(super) fn execute_abandon(request: &Request, core: &Arc<Mutex<Core>>) -> Res
             store::now_ms(),
         ),
     };
-    write_settled(request, done, core)
+    write_settled(done, core)
 }
 
 /// What the admission every effectful request shares decided.
 pub(super) enum Admission {
     /// The request is already answered: a replay, a content conflict, an
     /// in-flight refusal, or a store error.
-    Answered(Response),
+    Answered(Box<Reply>),
     /// The operation cannot be served: no backend is wired, or the wired backend
     /// does not provide the primitive it needs. The message says which.
     Unsupported(String),
@@ -223,8 +214,8 @@ pub(super) fn replay_existing_operation(
     target: Option<&str>,
     requester: &Option<String>,
     core: &Arc<Mutex<Core>>,
-) -> Option<Response> {
-    replay_existing_operation_inner(operation, request, target, true, requester, core)
+) -> Option<Reply> {
+    replay_existing(operation, request, Some(target), requester, core)
 }
 
 pub(super) fn replay_existing_operation_contents(
@@ -232,43 +223,59 @@ pub(super) fn replay_existing_operation_contents(
     request: &Request,
     requester: &Option<String>,
     core: &Arc<Mutex<Core>>,
-) -> Option<Response> {
-    replay_existing_operation_inner(operation, request, None, false, requester, core)
+) -> Option<Reply> {
+    replay_existing(operation, request, None, requester, core)
 }
 
-pub(super) fn replay_existing_operation_inner(
+/// The answer a request id already has, if it has one. `target` is compared only
+/// when the caller names one.
+fn replay_existing(
     operation: ops::Operation,
     request: &Request,
-    target: Option<&str>,
-    check_target: bool,
+    target: Option<Option<&str>>,
     requester: &Option<String>,
     core: &Arc<Mutex<Core>>,
-) -> Option<Response> {
+) -> Option<Reply> {
     let core = locked(core);
-    let record = match core.store.get(&request.id) {
-        Ok(record) => record,
-        Err(error) => {
-            return Some(Response::refused(
-                &request.id,
-                &Refusal::new(Code::Internal, error),
-            ));
+    match core.store.get(&request.id) {
+        Ok(record) => {
+            record.map(|record| replay(&core, record, operation, request, target, requester))
         }
-    }?;
+        Err(error) => Some(Err(Refusal::new(Code::Internal, error))),
+    }
+}
+
+/// An existing record, answered: the first answer again when the request repeats
+/// it exactly, a conflict when the same id names different contents.
+///
+/// A replayed creation names the container its first answer named, so a caller
+/// recovering from a lost answer reads the identity it already made instead of
+/// searching the tree for it. No other operation's answer carries a container.
+fn replay(
+    core: &Core,
+    record: RequestRecord,
+    operation: ops::Operation,
+    request: &Request,
+    target: Option<Option<&str>>,
+    requester: &Option<String>,
+) -> Reply {
     let same = record.method == operation.as_str()
-        && (!check_target || record.target.as_deref() == target)
+        && target.is_none_or(|target| record.target.as_deref() == target)
         && record.requester == *requester
         && record.params.as_ref() == Some(&request.params);
-    if same {
-        Some(Response::ok(
-            &request.id,
-            json!({ "request": record.public() }),
-        ))
-    } else {
-        Some(Response::refused(
-            &request.id,
-            &Refusal::new(Code::Refused, "request id already names different contents"),
-        ))
+    if !same {
+        return Err(Refusal::new(
+            Code::Refused,
+            "request id already names different contents",
+        ));
     }
+    let answer = Answer::of(record);
+    Ok(if operation == ops::Operation::CreateContainer {
+        let container = containers::created_by(&core.registry, &request.id);
+        answer.with_container(container.map(|container| container.public()))
+    } else {
+        answer
+    })
 }
 
 pub(super) fn admit(
@@ -285,42 +292,23 @@ pub(super) fn admit(
         let existing = match core.store.get(&request.id) {
             Ok(record) => record,
             Err(error) => {
-                return Admission::Answered(Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::Internal, error),
-                ));
+                return Admission::Answered(Box::new(Err(Refusal::new(Code::Internal, error))));
             }
         };
-        if let Some(record) = &existing {
-            let same = record.method == method
-                && record.target.as_deref() == target
-                && record.requester == *requester
-                && record.params.as_ref() == Some(&request.params);
-            if same {
-                let mut result = json!({ "request": record.clone().public() });
-                // A replayed creation names the container its first answer named,
-                // so a caller recovering from a lost answer reads the identity it
-                // already made instead of searching the tree for it. No other
-                // operation's answer carries a container, so a replay of one stays
-                // the answer the first call gave.
-                if let ops::Operation::CreateContainer = operation {
-                    let container = containers::created_by(&core.registry, &request.id);
-                    result["container"] = json!(container.map(|container| container.public()));
-                }
-                return Admission::Answered(Response::ok(&request.id, result));
-            }
-            return Admission::Answered(Response::refused(
-                &request.id,
-                &Refusal::new(Code::Refused, "request id already names different contents"),
-            ));
+        if let Some(record) = existing {
+            return Admission::Answered(Box::new(replay(
+                &core,
+                record,
+                operation,
+                request,
+                Some(target),
+                requester,
+            )));
         }
         let held = match core.store.unresolved(target, now) {
             Ok(held) => held,
             Err(error) => {
-                return Admission::Answered(Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::Internal, error),
-                ));
+                return Admission::Answered(Box::new(Err(Refusal::new(Code::Internal, error))));
             }
         };
         let backend = core.backend.clone();
@@ -343,17 +331,11 @@ pub(super) fn admit(
             )
             .with_params(request.params.clone());
             if let Err(error) = core.store.create(&pending) {
-                return Admission::Answered(Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::Internal, error),
-                ));
+                return Admission::Answered(Box::new(Err(Refusal::new(Code::Internal, error))));
             }
             let started = pending.claim().start();
             if let Err(error) = core.store.write(&started) {
-                return Admission::Answered(Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::Internal, error),
-                ));
+                return Admission::Answered(Box::new(Err(Refusal::new(Code::Internal, error))));
             }
         }
         (held, backend, Arc::clone(&core.stopping))
@@ -374,15 +356,9 @@ pub(super) fn admit(
         .complete(Settlement::refused(Category::InFlight, &message), now);
         let core = locked(core);
         if let Err(error) = core.store.create(&record) {
-            return Admission::Answered(Response::refused(
-                &request.id,
-                &Refusal::new(Code::Internal, error),
-            ));
+            return Admission::Answered(Box::new(Err(Refusal::new(Code::Internal, error))));
         }
-        return Admission::Answered(Response::refused(
-            &request.id,
-            &Refusal::new(Code::Refused, message),
-        ));
+        return Admission::Answered(Box::new(Err(Refusal::new(Code::Refused, message))));
     }
     match backend {
         None => Admission::Unsupported(operation.unavailable_message()),
@@ -390,5 +366,75 @@ pub(super) fn admit(
             Ok(()) => Admission::Dispatch(backend, cancel),
             Err(message) => Admission::Unsupported(message),
         },
+    }
+}
+
+/// The UI already has typed, frozen arguments. Only the retry record needs the
+/// wire-shaped copy; execution never decodes it again.
+pub(super) fn execute_command(
+    id: &str,
+    command: crate::control_plane::command::Command,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Reply {
+    use crate::control_plane::command::Action;
+    let request = command.record_request(id);
+    let requester = Some(command.requester);
+    match command.action {
+        Action::Close(close) => run_close(&request, close, requester, core),
+        Action::Cancel(subject) => run_subject_control(
+            &request,
+            SubjectParams {
+                subject_id: Some(subject.subject_id),
+                claim_id: subject.claim_id,
+                spawn_request_id: None,
+            },
+            requester,
+            core,
+            ops::Operation::Cancel,
+            verification,
+        ),
+        Action::Restart(subject) => run_restart(
+            &request,
+            RestartParams {
+                subject_id: subject.subject_id,
+                claim_id: Some(subject.claim_id),
+                parent: None,
+                executable: None,
+                argv: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+            },
+            requester,
+            core,
+            verification,
+        ),
+        Action::Delete(delete) => {
+            run_container_delete(&request, delete, requester, core, verification)
+        }
+        Action::Reload(reload) => {
+            run_container_reload(&request, reload, requester, core, verification)
+        }
+        Action::Create {
+            request: create,
+            label,
+            recipe,
+        } => {
+            match run_creation(
+                ops::Operation::CreateContainer,
+                &request,
+                CreateInput {
+                    create,
+                    label,
+                    recipe,
+                    requester,
+                },
+                core,
+                verification,
+            ) {
+                Ok(creation) => write_created(creation, core),
+                Err(reply) => *reply,
+            }
+        }
     }
 }

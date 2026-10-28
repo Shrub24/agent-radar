@@ -1,4 +1,5 @@
 use super::*;
+use crate::control_plane::answer as answers;
 
 pub(super) fn presence_request(
     core: &Arc<Mutex<Core>>,
@@ -173,7 +174,7 @@ pub(super) fn presence_request(
         Ok(claim)
     })();
     match result {
-        Ok(claim) => Response::ok(&request.id, json!(presence::Answer::from(&claim))),
+        Ok(claim) => respond(&request.id, Ok(presence::Answer::from(&claim))),
         Err(error) => registry_error(request, error),
     }
 }
@@ -201,18 +202,23 @@ pub(super) fn registry_request(
         "agent.register" => {
             let registration: RegistrationRequest = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let core = locked(core);
             match core.registry.register(&registration, store::now_ms()) {
-                Ok(record) => Response::ok(&request.id, json!({"registration": record.public()})),
+                Ok(record) => respond(
+                    &request.id,
+                    Ok(answers::Registration {
+                        registration: record.public(),
+                    }),
+                ),
                 Err(error) => registry_error(request, error),
             }
         }
         "agent.acquire" => {
             let acquire: AcquireRequest = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let core = locked(core);
             if acquire.channel == Channel::Assignment {
@@ -222,14 +228,14 @@ pub(super) fn registry_request(
                 );
             }
             match core.registry.acquire_writer(&acquire, store::now_ms()) {
-                Ok(binding) => Response::ok(&request.id, json!({"writer": binding})),
+                Ok(binding) => respond(&request.id, Ok(answers::Writer { writer: binding })),
                 Err(error) => registry_error(request, error),
             }
         }
         "agent.publish" => {
             let publish: registry::PublishRequest = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let core = locked(core);
             if publish.channel == Channel::Assignment {
@@ -239,9 +245,11 @@ pub(super) fn registry_request(
                 );
             }
             match core.registry.publish(&publish, store::now_ms()) {
-                Ok(record) => Response::ok(
+                Ok(record) => respond(
                     &request.id,
-                    json!({"channel": record.view(store::now_ms(), core.registry.serving_epoch())}),
+                    Ok(answers::Channel {
+                        channel: record.view(store::now_ms(), core.registry.serving_epoch()),
+                    }),
                 ),
                 Err(error) => registry_error(request, error),
             }
@@ -249,7 +257,7 @@ pub(super) fn registry_request(
         "agent.context" => {
             let publish: registry::ContextRequest = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let core = locked(core);
             let now_ms = store::now_ms();
@@ -268,15 +276,17 @@ pub(super) fn registry_request(
                     {
                         tracing::warn!(%error, "could not record a launched session");
                     }
-                    Response::ok(
+                    respond(
                         &request.id,
-                        json!({
-                            // The write response returns the credential only to its
-                            // publisher; agent.get/list use the credential-free projection.
-                            "writer": result.record.writer,
-                            "context": result.record.public(now_ms, core.registry.serving_epoch()),
-                            "warning": result.warning,
-                            "management": management_view(&core.registry, &publish.registration_id, now_ms),
+                        Ok(answers::Context {
+                            writer: result.record.writer.clone(),
+                            context: result.record.public(now_ms, core.registry.serving_epoch()),
+                            warning: result.warning,
+                            management: management_view(
+                                &core.registry,
+                                &publish.registration_id,
+                                now_ms,
+                            ),
                         }),
                     )
                 }
@@ -286,7 +296,7 @@ pub(super) fn registry_request(
         "agent.retire" => {
             let params: AgentRetireParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let core = locked(core);
             if params.channel == Channel::Assignment {
@@ -301,9 +311,11 @@ pub(super) fn registry_request(
                 &params.writer_handle,
                 store::now_ms(),
             ) {
-                Ok(record) => Response::ok(
+                Ok(record) => respond(
                     &request.id,
-                    json!({"channel": record.view(store::now_ms(), core.registry.serving_epoch())}),
+                    Ok(answers::Channel {
+                        channel: record.view(store::now_ms(), core.registry.serving_epoch()),
+                    }),
                 ),
                 Err(error) => registry_error(request, error),
             }
@@ -311,7 +323,7 @@ pub(super) fn registry_request(
         "process.get" => {
             let params: ProcessGetParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let (registry, verifier, stopping) = {
                 let core = locked(core);
@@ -352,12 +364,12 @@ pub(super) fn registry_request(
                 Ok(entry) => entry,
                 Err(error) => return registry_error(request, error),
             };
-            Response::ok(&request.id, json!({"process": entry}))
+            respond(&request.id, Ok(answers::Process { process: entry }))
         }
         "spawn.get" => {
             let params: SpawnGetParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let stored = {
                 let core = locked(core);
@@ -381,12 +393,17 @@ pub(super) fn registry_request(
             let inventory = observed_inventory(core);
             let evidence =
                 crate::control_plane::registry_read::location_evidence(inventory.as_ref(), &stored);
-            Response::ok(&request.id, json!({"spawn": stored.topology(evidence)}))
+            respond(
+                &request.id,
+                Ok(answers::Spawn {
+                    spawn: stored.topology(evidence),
+                }),
+            )
         }
         "lifecycle.get" => {
             let params: LifecycleGetParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             if SessionUuid::parse(&params.subject_id).is_none() {
                 return Response::refused(
@@ -419,9 +436,12 @@ pub(super) fn registry_request(
                 return registry_error(request, error);
             }
             match subjects::current_attachment(&registry, &params.subject_id) {
-                Ok(Some(subject)) => Response::ok(
+                Ok(Some(subject)) => respond(
                     &request.id,
-                    json!({"subject": subjects::public_view(&subject), "source": observation_source(core)}),
+                    Ok(answers::Subject {
+                        subject: subjects::public_view(&subject),
+                        source: observation_source(core),
+                    }),
                 ),
                 Ok(None) => Response::refused(
                     &request.id,
@@ -433,7 +453,7 @@ pub(super) fn registry_request(
         "lifecycle.list" => {
             let params: LifecycleListParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             match params.limit {
                 Some(0) => {
@@ -510,13 +530,13 @@ pub(super) fn registry_request(
             } else {
                 None
             };
-            Response::ok(
+            respond(
                 &request.id,
-                json!({
-                    "subjects": views,
-                    "has_more": has_more,
-                    "next_after": next_after,
-                    "source": observation_source(core),
+                Ok(answers::Subjects {
+                    subjects: views,
+                    has_more,
+                    next_after,
+                    source: observation_source(core),
                 }),
             )
         }
@@ -539,14 +559,19 @@ pub(super) fn registry_request(
                 reconcile::Trigger::OperatorRequest,
                 unix_millis(),
             ) {
-                Ok(outcome) => Response::ok(&request.id, json!({"reconciled": outcome})),
+                Ok(outcome) => respond(
+                    &request.id,
+                    Ok(answers::Reconciled {
+                        reconciled: outcome,
+                    }),
+                ),
                 Err(error) => registry_error(request, error),
             }
         }
         "topology.get" => {
             let params: ContainerGetParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             if SessionUuid::parse(&params.container_id).is_none() {
                 return Response::refused(
@@ -559,9 +584,12 @@ pub(super) fn registry_request(
                 Arc::clone(&core.registry)
             };
             match containers::read(&registry, &params.container_id) {
-                Ok(Some(container)) => {
-                    Response::ok(&request.id, json!({"container": container.public()}))
-                }
+                Ok(Some(container)) => respond(
+                    &request.id,
+                    Ok(answers::Container {
+                        container: container.public(),
+                    }),
+                ),
                 Ok(None) => Response::refused(
                     &request.id,
                     &Refusal::new(Code::NotFound, "container is not recorded"),
@@ -572,7 +600,7 @@ pub(super) fn registry_request(
         "topology.list" => {
             let params: ContainerListParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             match params.limit {
                 Some(0) => {
@@ -623,15 +651,19 @@ pub(super) fn registry_request(
             } else {
                 None
             };
-            Response::ok(
+            respond(
                 &request.id,
-                json!({"containers": page, "has_more": has_more, "next_after": next_after}),
+                Ok(answers::Containers {
+                    containers: page,
+                    has_more,
+                    next_after,
+                }),
             )
         }
         "topology.reconcile" => {
             let params: ContainerReconcileParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             match params.limit {
                 Some(0) => {
@@ -692,14 +724,19 @@ pub(super) fn registry_request(
             let at = store::format_millis(unix_millis());
             match containers::reconcile(&registry, &inventory, params.after.as_deref(), &at, limit)
             {
-                Ok(outcome) => Response::ok(&request.id, json!({"reconciled": outcome})),
+                Ok(outcome) => respond(
+                    &request.id,
+                    Ok(answers::Reconciled {
+                        reconciled: outcome,
+                    }),
+                ),
                 Err(error) => registry_error(request, error),
             }
         }
         "spawn.close" => {
             let params: ChildCloseParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let close = registry::ChildCloseRequest {
                 request_id: request.id.clone(),
@@ -717,7 +754,7 @@ pub(super) fn registry_request(
             let params: crate::control_plane::public_contracts::spawn_list::SpawnListParams =
                 match decode_params(request) {
                     Ok(value) => value,
-                    Err(response) => return response,
+                    Err(refusal) => return Response::refused(&request.id, &refusal),
                 };
             match params.limit {
                 Some(0) => {
@@ -820,13 +857,13 @@ pub(super) fn registry_request(
                     .request_id
                     .clone()
             });
-            Response::ok(
+            respond(
                 &request.id,
-                json!(
+                Ok(
                     crate::control_plane::public_contracts::spawn_list::SpawnListPage {
                         spawns: edges,
                         next,
-                    }
+                    },
                 ),
             )
         }

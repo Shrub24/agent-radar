@@ -904,10 +904,7 @@ fn focus_moves_the_window_and_makes_the_pane_active() {
     let alone = probe
         .runtime
         .focus_outcome(&Target::Pane(pane_handle.clone()), &cancel());
-    assert_eq!(
-        alone,
-        FocusOutcome::Refused(agent_radar::runtime::NO_CLIENT.to_string())
-    );
+    assert_eq!(alone, FocusOutcome::NoClient);
     assert_eq!(
         before,
         probe.tmux(&["list-panes", "-a", "-F", "#{pane_id} #{pane_active}"]),

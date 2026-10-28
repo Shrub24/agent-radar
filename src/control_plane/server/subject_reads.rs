@@ -1,4 +1,5 @@
 use super::*;
+use crate::control_plane::answer as answers;
 use crate::control_plane::public_contracts::subject::{
     ChildGetParams, ChildrenParams, GetParams, GetResult, ListParams, ListResult, Selection,
 };
@@ -43,7 +44,7 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
         "subject.assignment.acquire" => {
             let params: AssignmentAcquire = match decode_params(request) {
                 Ok(p) => p,
-                Err(r) => return r,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             child!(params);
             match registry.acquire_writer(
@@ -55,14 +56,14 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
                 },
                 now,
             ) {
-                Ok(writer) => Response::ok(&request.id, json!({"writer": writer})),
+                Ok(writer) => respond(&request.id, Ok(answers::Writer { writer })),
                 Err(error) => registry_error(request, error),
             }
         }
         "subject.assignment.publish" => {
             let params: AssignmentPublish = match decode_params(request) {
                 Ok(p) => p,
-                Err(r) => return r,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             child!(params);
             match registry.publish(
@@ -73,9 +74,11 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
                 },
                 now,
             ) {
-                Ok(record) => Response::ok(
+                Ok(record) => respond(
                     &request.id,
-                    json!({"channel": record.view(now, registry.serving_epoch())}),
+                    Ok(answers::Channel {
+                        channel: record.view(now, registry.serving_epoch()),
+                    }),
                 ),
                 Err(error) => registry_error(request, error),
             }
@@ -83,7 +86,7 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
         "subject.assignment.retire" => {
             let params: AssignmentRetire = match decode_params(request) {
                 Ok(p) => p,
-                Err(r) => return r,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             child!(params);
             match registry.retire(
@@ -92,9 +95,11 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
                 &params.writer_handle,
                 now,
             ) {
-                Ok(record) => Response::ok(
+                Ok(record) => respond(
                     &request.id,
-                    json!({"channel": record.view(now, registry.serving_epoch())}),
+                    Ok(answers::Channel {
+                        channel: record.view(now, registry.serving_epoch()),
+                    }),
                 ),
                 Err(error) => registry_error(request, error),
             }
@@ -129,7 +134,7 @@ pub(super) fn subject_read_request(
         let record = if request.method != "subject.get" {
             let params: ChildGetParams = match decode_params(request) {
                 Ok(params) => params,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             match child_record(&registry, &params.registration_id, &params.subject_id) {
                 Ok(record) => record,
@@ -138,7 +143,7 @@ pub(super) fn subject_read_request(
         } else {
             let params: GetParams = match decode_params(request) {
                 Ok(params) => params,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             match subjects::read_subject_record(&registry, &params.subject_id) {
                 Ok(Some(record)) => record,
@@ -178,23 +183,19 @@ pub(super) fn subject_read_request(
                         &Refusal::new(Code::Refused, "child is not live"),
                     );
                 }
-                let output_request = Request {
-                    id: request.id.clone(),
-                    method: protocol::OUTPUT_METHOD.into(),
-                    params: json!({"pane_id": pane, "source": "recent_unwrapped", "lines": 80}),
-                };
-                let output = match read_output(core, &output_request) {
-                    Response::Result { result, .. } => result["output"].clone(),
-                    error => return error,
-                };
-                let foreground = read_backend(
+                let output = match output_read(
                     core,
-                    &Request {
-                        id: request.id.clone(),
-                        method: protocol::PROCESS_INFO_METHOD.into(),
-                        params: json!({"pane_id": pane}),
+                    OutputRequest {
+                        pane_id: pane.clone(),
+                        source: crate::runtime::OutputSource::RecentUnwrapped,
+                        lines: Some(80),
+                        ansi: false,
                     },
-                );
+                ) {
+                    Ok(output) => output,
+                    Err(refusal) => return Response::refused(&request.id, &refusal),
+                };
+                let foreground = foreground_read(core, pane).ok();
                 let latest = match subjects::read_subject_record(&registry, &subject.subject_id) {
                     Ok(Some(record)) if record.current_claim == claim => project(record),
                     _ => {
@@ -211,19 +212,23 @@ pub(super) fn subject_read_request(
                         &Refusal::new(Code::Refused, "child changed during inspection"),
                     );
                 }
-                Response::ok(
+                respond(
                     &request.id,
-                    json!({"subject": subject, "output": output, "foreground": match foreground { Response::Result { result, .. } => Some(result["evidence"].clone()), _ => None }}),
+                    Ok(answers::Inspected {
+                        subject,
+                        output,
+                        foreground,
+                    }),
                 )
             }
-            Ok(subject) => Response::ok(&request.id, json!(GetResult { subject })),
+            Ok(subject) => respond(&request.id, Ok(GetResult { subject })),
             Err(error) => registry_error(request, error),
         };
     }
     let (params, parent) = if request.method == "subject.children" {
         let params: ChildrenParams = match decode_params(request) {
             Ok(params) => params,
-            Err(response) => return response,
+            Err(refusal) => return Response::refused(&request.id, &refusal),
         };
         let attachment = match registry::presence::attachment(&registry, &params.registration_id) {
             Ok(Some(attachment)) => attachment,
@@ -246,7 +251,7 @@ pub(super) fn subject_read_request(
     } else {
         let params = match decode_params::<ListParams>(request) {
             Ok(params) => params,
-            Err(response) => return response,
+            Err(refusal) => return Response::refused(&request.id, &refusal),
         };
         (params, None)
     };
@@ -306,11 +311,11 @@ pub(super) fn subject_read_request(
                         entry.subject_id.clone()
                     },
                 );
-                return Response::ok(
+                return respond(
                     &request.id,
-                    json!(ListResult {
+                    Ok(ListResult {
                         subjects: entries,
-                        next
+                        next,
                     }),
                 );
             }
@@ -318,11 +323,11 @@ pub(super) fn subject_read_request(
             entries.push(entry);
         }
         if complete {
-            return Response::ok(
+            return respond(
                 &request.id,
-                json!(ListResult {
+                Ok(ListResult {
                     subjects: entries,
-                    next: None
+                    next: None,
                 }),
             );
         }

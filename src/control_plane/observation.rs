@@ -26,8 +26,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use super::answer::TaskSnapshotData;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::collector::{Collector, CollectorConfig};
 use crate::control_plane::ingest::TaskIngest;
@@ -121,7 +121,7 @@ pub struct Snapshot {
     /// unreadable registry rather than seeing one fleet-wide verdict.
     pub sources: Vec<SourceState>,
     /// Volatile task sessions with the ingest's own revision.
-    pub tasks: Option<Value>,
+    pub tasks: Option<TaskSnapshotData>,
     /// The daemon's fleet projection: last-good inventory, source freshness and
     /// retained continuity.
     pub observation: ObservationState,
@@ -424,7 +424,7 @@ fn sources(
 fn tasks_snapshot(
     tasks: &Option<Arc<TaskIngest>>,
     error: &Option<String>,
-) -> (Option<Value>, SourceFreshness) {
+) -> (Option<TaskSnapshotData>, SourceFreshness) {
     let Some(ingest) = tasks else {
         let diagnostic = error
             .clone()
@@ -433,7 +433,7 @@ fn tasks_snapshot(
     };
     let (revision, sessions, _) = ingest.list(None, SNAPSHOT_TASK_LIMIT);
     (
-        Some(json!({"revision": revision, "sessions": sessions})),
+        Some(TaskSnapshotData { revision, sessions }),
         SourceFreshness::Current,
     )
 }

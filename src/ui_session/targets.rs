@@ -11,7 +11,9 @@
 //! routed to its owner rather than the runtime, and only positive unmanaged
 //! evidence reaches a direct close.
 
-use serde_json::{Value, json};
+use crate::control_plane::command::{Action as DomainAction, Command, Subject};
+use crate::control_plane::containers::{DeleteRequest, ReloadRequest};
+use crate::runtime::{CreateRequest, SplitDirection};
 
 use crate::control_plane::containers::Kind;
 use crate::lifecycle::{self, Containment};
@@ -65,7 +67,7 @@ pub struct Plan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// A domain request, dispatched through admission under the plan's identity.
-    Domain { method: &'static str, params: Value },
+    Domain(Box<Command>),
     /// A runtime command that moves the client serving a location. Not a request
     /// record: nothing about it is durable, and the daemon is the only place the
     /// location is known.
@@ -320,15 +322,15 @@ fn close_plan(
         return Err(reason);
     }
     losses.extend(losses_under(inventory, state, &target));
-    let request = json!({
-        "request": {"target": target, "identity": lifecycle::identity(inventory, &target)},
-        "requester": REQUESTER,
-    });
+    let request = lifecycle::CloseRequest {
+        target: target.clone(),
+        identity: lifecycle::identity(inventory, &target),
+    };
     Ok(Plan {
-        effect: Effect::Domain {
-            method: "mux.close",
-            params: request,
-        },
+        effect: Effect::Domain(Box::new(Command::new(
+            REQUESTER,
+            DomainAction::Close(request),
+        ))),
         request_id: request_id.to_string(),
         prompt: described,
         losses,
@@ -348,18 +350,16 @@ fn subject_plan(
     if !lifecycle::matches(inventory, &lifecycle::identity(inventory, &target)) {
         return Err(format!("{described} changed: nothing was sent"));
     }
-    let method = match operation {
-        crate::app::Operation::Restart => "lifecycle.restart",
-        _ => "lifecycle.cancel",
+    let subject = Subject {
+        subject_id: subject.subject_id,
+        claim_id: subject.claim_id,
+    };
+    let action = match operation {
+        crate::app::Operation::Restart => DomainAction::Restart(subject),
+        _ => DomainAction::Cancel(subject),
     };
     Ok(Plan {
-        effect: Effect::Domain {
-            method,
-            params: json!({
-                "request": {"subject_id": subject.subject_id, "claim_id": subject.claim_id},
-                "requester": REQUESTER,
-            }),
-        },
+        effect: Effect::Domain(Box::new(Command::new(REQUESTER, action))),
         request_id: request_id.to_string(),
         prompt: described,
         losses,
@@ -386,16 +386,13 @@ fn container_plan(
             ));
         }
         return Ok(Plan {
-            effect: Effect::Domain {
-                method: "topology.delete",
-                params: json!({
-                    "request": {
-                        "container_id": container.container_id,
-                        "frozen": Value::Null,
-                    },
-                    "requester": REQUESTER,
+            effect: Effect::Domain(Box::new(Command::new(
+                REQUESTER,
+                DomainAction::Delete(DeleteRequest {
+                    container_id: container.container_id.clone(),
+                    frozen: None,
                 }),
-            },
+            ))),
             request_id: request_id.to_string(),
             prompt: described,
             losses: Vec::new(),
@@ -412,12 +409,12 @@ fn container_plan(
             } else {
                 losses.extend(running.iter().cloned());
             }
-            json!({
-                "request": {
-                    "container_id": container.container_id,
-                    "frozen": {"target": target, "identity": lifecycle::identity(inventory, &target)},
-                },
-                "requester": REQUESTER,
+            DomainAction::Delete(DeleteRequest {
+                container_id: container.container_id.clone(),
+                frozen: Some(lifecycle::CloseRequest {
+                    target: target.clone(),
+                    identity: lifecycle::identity(inventory, &target),
+                }),
             })
         }
         Operation::ReloadContainer => {
@@ -432,9 +429,8 @@ fn container_plan(
             }
             losses.push("the recorded recipe runs again in this pane".to_string());
             losses.push("a command of its own that has not exited refuses the reload".to_string());
-            json!({
-                "request": {"container_id": container.container_id},
-                "requester": REQUESTER,
+            DomainAction::Reload(ReloadRequest {
+                container_id: container.container_id.clone(),
             })
         }
         Operation::CreateContainer => {
@@ -442,30 +438,34 @@ fn container_plan(
                 match container.kind {
                     Kind::Pane => {
                         losses.push("a new pane is split from this one".to_string());
-                        json!({"pane_id": container.handle, "direction": "right", "focus": false})
+                        CreateRequest::PaneSplit {
+                            pane_id: container.handle.clone(),
+                            direction: SplitDirection::Right,
+                            focus: Some(false),
+                        }
                     }
                     Kind::Workspace => {
                         losses.push("a new tab is created in this workspace".to_string());
-                        json!({"kind": "tab", "workspace_id": container.handle, "focus": false})
+                        CreateRequest::Tab {
+                            workspace_id: container.handle.clone(),
+                            focus: Some(false),
+                        }
                     }
                     Kind::Tab => return Err(
                         "select a pane in this tab to add a pane, or its workspace to add a tab"
                             .into(),
                     ),
                 };
-            json!({"request": kind, "requester": REQUESTER})
+            DomainAction::Create {
+                request: kind,
+                label: None,
+                recipe: None,
+            }
         }
         _ => return Err("that is not a container control".into()),
     };
     Ok(Plan {
-        effect: Effect::Domain {
-            method: match operation {
-                Operation::Delete => "topology.delete",
-                Operation::ReloadContainer => "topology.reload",
-                _ => "topology.create",
-            },
-            params: request,
-        },
+        effect: Effect::Domain(Box::new(Command::new(REQUESTER, request))),
         request_id: request_id.to_string(),
         prompt: described,
         // A deletion nothing is running in is the standard case and loses no
@@ -538,14 +538,17 @@ pub(crate) fn launch_plan(
     let recipe =
         crate::topology::target_shell_recipe(&spec.command, &spec.shell, path, directory.as_str())?;
     Ok(Plan {
-        effect: Effect::Domain {
-            method: "topology.create",
-            params: json!({
-                "request": {"kind": "tab", "workspace_id": workspace_id, "focus": false},
-                "requester": REQUESTER,
-                "recipe": recipe,
-            }),
-        },
+        effect: Effect::Domain(Box::new(Command::new(
+            REQUESTER,
+            DomainAction::Create {
+                request: CreateRequest::Tab {
+                    workspace_id,
+                    focus: Some(false),
+                },
+                label: None,
+                recipe: Some(recipe),
+            },
+        ))),
         request_id: request_id.to_string(),
         prompt: format!("Launch in {directory}"),
         losses: Vec::new(),
@@ -785,10 +788,12 @@ mod tests {
         };
         let delete = plan(Operation::Delete, selected, &state, Some(&container), "r1")
             .expect("a container deletion is freezable");
-        let Effect::Domain { method, params } = &delete.effect else {
+        let Effect::Domain(command) = &delete.effect else {
             panic!("a deletion is a domain request");
         };
-        assert_eq!(*method, "topology.delete");
+        let request = command.record_request(&delete.request_id);
+        let params = &request.params;
+        assert_eq!(request.method, "topology.delete");
         assert_eq!(
             params.pointer("/request/container_id"),
             Some(&serde_json::json!("c1"))

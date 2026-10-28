@@ -1,4 +1,5 @@
 use super::*;
+use crate::control_plane::answer as answers;
 
 /// Serves the daemon's shared observation snapshot.
 ///
@@ -33,7 +34,7 @@ pub(super) fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) 
             let params: crate::control_plane::public_contracts::HandoffPublishParams =
                 match decode_params(request) {
                     Ok(value) => value,
-                    Err(response) => return response,
+                    Err(refusal) => return Response::refused(&request.id, &refusal),
                 };
             let sender = match communication_identity(&registry, &params.sender_registration_id) {
                 Ok(identity) => identity,
@@ -66,9 +67,9 @@ pub(super) fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) 
                             &handoff.sender.registration_id,
                         );
                     }
-                    Response::ok(
+                    respond(
                         &request.id,
-                        serde_json::json!({"handoff": handoff, "created": created}),
+                        Ok(answers::PublishedHandoff { handoff, created }),
                     )
                 }
                 Err(error) => communication_error(request, error),
@@ -77,7 +78,7 @@ pub(super) fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) 
         "communication.inbox" => {
             let params: HandoffInboxParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let identity = match communication_identity(&registry, &params.registration_id) {
                 Ok(identity) => identity,
@@ -88,11 +89,7 @@ pub(super) fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) 
                     let inbox = crate::control_plane::public_contracts::HandoffInbox {
                         handoff_ids: handoffs.into_iter().map(|handoff| handoff.id).collect(),
                     };
-                    Response::ok(
-                        &request.id,
-                        serde_json::to_value(inbox)
-                            .expect("handoff inbox DTO is JSON serializable"),
-                    )
+                    respond(&request.id, Ok(inbox))
                 }
                 Err(error) => communication_error(request, error),
             }
@@ -100,24 +97,23 @@ pub(super) fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) 
         "communication.get" => {
             let params: HandoffReadParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let identity = match communication_identity(&registry, &params.registration_id) {
                 Ok(identity) => identity,
                 Err(error) => return communication_error(request, error),
             };
             match communications.get(&params.handoff_id, &identity) {
-                Ok((handoff, receipt)) => Response::ok(
-                    &request.id,
-                    serde_json::json!({"handoff": handoff, "receipt": receipt}),
-                ),
+                Ok((handoff, receipt)) => {
+                    respond(&request.id, Ok(answers::ReadHandoff { handoff, receipt }))
+                }
                 Err(error) => communication_error(request, error),
             }
         }
         "communication.ack" => {
             let params: HandoffReadParams = match decode_params(request) {
                 Ok(value) => value,
-                Err(response) => return response,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
             };
             let identity = match communication_identity(&registry, &params.registration_id) {
                 Ok(identity) => identity,
@@ -135,9 +131,9 @@ pub(super) fn communication_request(core: &Arc<Mutex<Core>>, request: &Request) 
                             &identity.registration_id,
                         );
                     }
-                    Response::ok(
+                    respond(
                         &request.id,
-                        serde_json::json!({"receipt": receipt, "created": created}),
+                        Ok(answers::AcknowledgedHandoff { receipt, created }),
                     )
                 }
                 Err(error) => communication_error(request, error),
@@ -264,11 +260,5 @@ pub(super) fn communication_error(request: &Request, error: communication::Error
         ),
         communication::Error::Internal(message) => (Code::Internal, message),
     };
-    Response::Error {
-        id: request.id.clone(),
-        error: protocol::ErrorBody {
-            code: code.as_str().to_owned(),
-            message,
-        },
-    }
+    Response::refused(&request.id, &Refusal::new(code, message))
 }

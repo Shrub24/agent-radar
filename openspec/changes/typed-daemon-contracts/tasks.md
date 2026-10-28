@@ -2,36 +2,47 @@
 
 ## 1. First complete path: cancel and stop
 
-- [x] 1.1 Create the method/consumer inventory for the sweep, listing typed and remaining wire contracts, public/private projections and existing compatibility checks. Verify against `ops` classification and server dispatch so every family has an owner and a completion check.
-- [ ] 1.2 Migrate cancel/stop through typed params, admission, execution and record/result handling; introduce the minimal shared result/refusal contracts this production path consumes. Preserve same-ID replay and record-before-dispatch; verify existing cancellation/admission tests and add only missing transition evidence. Open: admission still returns `Response` and the handler still settles through the `Settlement` tuple.
-- [x] 1.3 Construct the typed public operation projection and migrate operation get/reconciliation, UI status mapping and the Rust operation consumer for this path. Delete replaced key-path/state-string interpretation for migrated responses; verify public redaction, pending versus unknown/refused, and same-ID reconciliation without redispatch. Update the inventory and operation docs. Done for the record projection and both consumers (`RequestRecord::public`/`settled`, `store::Answer`, `ErrorBody::code`); operation docs unchanged because the wire is.
+- [x] 1.1 Inventory every operation family, public/private boundary and Rust consumer against `ops` classification and server dispatch. Final ownership and deliberate boundary representations are in `inventory.md`.
+- [x] 1.2 Carry cancel/stop through typed arguments, `Admission`, `Reply` and `Settlement`, preserving same-ID replay and record-before-dispatch.
+- [x] 1.3 Separate `PublicRequestRecord` from private records; migrate get/reconciliation, UI verdict mapping and Rust operation consumers. Remove JSON key-path and state-string interpretation.
 
 ## 2. Remaining lifecycle families
 
-- [ ] 2.1 Migrate spawn and enroll requests, launch context and result handling, including child-close consumers. Keep private launch data out of public responses; verify existing launch/scope/child-close compatibility checks and update the inventory.
-- [ ] 2.2 Migrate restart through stop, replacement launch and durable replacement linkage, including its Rust consumers. Verify existing restart replay and no-duplicate-launch tests, and unchanged public response/record shape.
-- [ ] 2.3 Migrate abandon and lifecycle get/list plus related reconciliation classifications. Verify unknown remains unknown after administrative release and completed records cannot be resettled; update docs and inventory.
+- [x] 2.1 Type spawn/enroll and launch/child-close answers and their consumers. Keep launch data private; retain existing scope and authority checks.
+- [x] 2.2 Carry restart through typed stop/replacement results and durable replacement linkage. Existing replay/no-duplicate-launch tests remain authoritative.
+- [x] 2.3 Type abandon and lifecycle read/reconciliation projections. Administrative release preserves uncertainty; completed records cannot be resettled.
 
 ## 3. Topology and physical operations
 
-- [ ] 3.1 Migrate topology create/delete/reload and created-location results, including UI commands and Rust client controls. Verify existing create-focus override/default, survivor reporting and identity/replay checks; preserve actor-owned consent and quiet successful focus.
-- [ ] 3.2 Migrate mux create/close/focus/input/report through typed execution and result consumers. Replace message-sentinel branches with structured reasons where needed. Verify existing runtime outcome and no-client recovery checks; update inventory and docs.
-- [ ] 3.3 Migrate topology get/list/reconcile read contracts and internal consumers without giving reads operation durability. Verify paging, public record projection and reconciliation behaviour through existing tests.
+- [x] 3.1 Type create/delete/reload, created identities and frozen UI commands. Internal callers invoke the same typed implementations as external callers without JSON self-calls. Actor-owned consent and quiet focus remain unchanged.
+- [x] 3.2 Type mux operation results and Rust consumers. `FocusOutcome::NoClient` replaces message-text classification; target recovery stays typed through the UI answer.
+- [x] 3.3 Type request/topology/spawn pages and reconciliation results without adding read durability.
 
 ## 4. Remaining daemon contracts
 
-- [ ] 4.1 Migrate registration/subject/facts/presence request and result paths still relying on JSON probing or closed string state. Verify existing authority and verified-process binding tests, boundary schemas and inventory coverage.
-- [ ] 4.2 Migrate communication/handoff/inbox/assignment paths and Rust consumers, preserving subject addressing and writer authority. Verify existing delivery/acknowledgement and replay checks; document unchanged guarantees.
-- [ ] 4.3 Migrate observation/process/output, task pages, event pages and capability negotiation to typed producer/consumer contracts where still stringly typed. Preserve bounds, freshness, event cursors/epochs/gaps and unknown-capability handling. Verify existing read/SDK fixtures; do not change codec or delivery policy.
+- [x] 4.1 Type registration, process, subject, channel/context and presence projections. Build observation records directly; classify missing registry authority at its origin rather than by diagnostic text.
+- [x] 4.2 Type communication/handoff/assignment reply envelopes and refusals, preserving addressing, writer authority and acknowledgement semantics.
+- [x] 4.3 Type observation/process/output composition, task producer/consumer data, event cursors/pages and capability negotiation. Preserve existing bounds, freshness, gaps, unknown-capability handling and delivery policies.
 
 ## 5. Persistence and convergence
 
-- [ ] 5.1 Finish the compatible typed vocabulary adapters for operation methods, categories, effects and other owned closed state identified in the inventory. Verify current serialization and supported historical record replay, retaining genuinely open data and exact optional-param retry semantics.
-- [ ] 5.2 Remove transitional wire-returning internal adapters and duplicate state interpreters; audit every inventory row to confirm migrated consumers decode only at real boundaries. Verify a scoped source audit and compiler exhaustiveness, not a blanket ban on JSON/strings.
-- [ ] 5.3 Run fmt, strict all-target Clippy, all Rust targets, SDK compatibility tests, strict OpenSpec validation and whitespace checks. Reconcile daemon docs and the scope inventory with the final tree; list deliberate remaining boundary representations.
+- [x] 5.1 Add string-compatible `Category` adapters; keep genuinely open historical methods, effect diagnostics and data as strings/JSON. A legacy-shaped record test checks unknown vocabulary preservation; existing replay tests check durable transitions.
+- [x] 5.2 Remove transitional wire-returning composition and duplicate interpreters. Retire `Response::typed`, old `managed_control`, response-key-path readers and registry/task JSON round trips. The inventory records the remaining real serialization boundaries.
+- [x] 5.3 Final fmt, strict all-target Clippy, Rust targets (543 library tests, 172 control-plane tests plus the other suites), SDK/schema generation and typechecks/111 tests, all 36 strict OpenSpec items, rationale lint and whitespace checks pass. The Rust command excludes exactly the two baseline tmux failures documented below; the unfiltered suite is not claimed green.
+
+## Verification and corrections
+
+- Existing Rust checks cover admission/replay, scope and process authority, restart linkage, public projection, create-focus policy, survivor reporting, read paging and event epochs. The SDK gate checks generated contracts, TypeScript consumers and 111 tests.
+- The scripted ping fixture now supplies the task-lane status that the real daemon already emits; no production fallback is added for an incomplete stub.
+- The existing recipe test now checks private argv/env are absent from both its creation answer and later operation reads, not only container reads.
+- The no-client tmux assertion now checks the typed runtime reason rather than its old diagnostic-string representation.
+- Two tmux assertions fail unchanged on the baseline acceptance worktree: `a_workspace_that_cannot_be_focused_is_refused_before_creating_anything` and `create_names_the_locations_it_made`. Per the maintainer's test-deferral direction, the final full Rust command excludes exactly these two. They are not weakened, marked passing or hidden by retries.
+- One intermediate systemd-backed lifecycle run could not establish scope membership and returned the existing fail-closed `unknown`. The subsequent full control-plane run passed; no safety assertion was relaxed.
+- Privacy corrections discovered by typed projections: managed context now emits the logical subject ID rather than a private claim object; public operation params omit recipe/root replacement argv/env. A typed pane-split plan also fixes its missing `kind` tag. See `inventory.md`.
+- No Nix build, deployment or live acceptance is included.
 
 ## Workflow follow-up
 
-- Review each vertical change independently; no deployment or main/bookmark advancement without approval.
-- Follow with consumer-specific delivery changes described in `design.md`: snapshot push, durable event subscriptions and pi-radar migration have distinct semantics and acceptance criteria.
-- Workspace recovery and tmux exit/observation work are separate changes, not hidden completion requirements here.
+- Keep this isolated from `main` and leave the local bookmark unmoved until owner review; no push without approval.
+- Consumer-specific snapshot push, durable event subscriptions and pi-radar transport migration remain separate follow-ons in `design.md`.
+- Workspace recovery and tmux exit/observation changes are not hidden requirements of this sweep.

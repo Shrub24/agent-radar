@@ -31,6 +31,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::control_plane::answer::{Admitted, Claimed};
 use crate::control_plane::protocol::{MAX_LINE_BYTES, PROTOCOL_VERSION};
 use crate::control_plane::registry::publication::write_atomic;
 use crate::control_plane::registry::{
@@ -1508,30 +1509,70 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
 
 /// The public projection of a subject: identities, binding and recorded facts.
 /// It carries no launch data and no correlation, which are private.
-pub fn public_view(subject: &Claim) -> Value {
-    // `subject_id` is the agent; `claim_id` is this attempt. Generation is not
-    // published: a claim id identifies the attempt exactly, so an ordinal would
-    // be a second, weaker name for the same thing.
-    json!({
-        "subject_id": subject.subject_id.as_deref().unwrap_or(&subject.claim_id),
-        "claim_id": subject.claim_id,
-        "registration_id": subject.process.registration_id,
-        "managed": subject.managed,
-        "spawn_request_id": subject.process.spawn_request_id,
-        "state": subject.process.state,
-        "process": subject.process.identity,
-        "observation": subject.process.observation,
-        "pane_absence": subject.process.pane_absence,
-        "ended_externally_at": subject.process.ended_externally_at,
-        "ended_evidence": subject.process.ended_evidence,
-        "pane_cleanup": subject.process.pane_cleanup,
-        "bound_registration_id": subject.process.bound_registration_id,
-        "signalled_at": subject.process.signalled_at,
-        "exited_at": subject.process.exited_at,
-        "recorded_at": subject.process.recorded_at,
-        "origin": subject.process.origin,
-        "session": subject.session,
-    })
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublicClaim {
+    pub subject_id: String,
+    pub claim_id: String,
+    pub registration_id: String,
+    pub managed: ManagedMetadata,
+    pub spawn_request_id: String,
+    pub state: State,
+    pub process: Option<ProcessIdentity>,
+    pub observation: Option<Observation>,
+    pub pane_absence: Option<PaneAbsence>,
+    pub ended_externally_at: Option<String>,
+    pub ended_evidence: Option<EndedEvidence>,
+    pub pane_cleanup: Option<PaneCleanup>,
+    pub bound_registration_id: Option<String>,
+    pub signalled_at: Option<String>,
+    pub exited_at: Option<String>,
+    pub recorded_at: String,
+    pub origin: Origin,
+    pub session: Option<String>,
+}
+
+pub fn public_view(subject: &Claim) -> PublicClaim {
+    PublicClaim {
+        subject_id: subject
+            .subject_id
+            .as_deref()
+            .unwrap_or(&subject.claim_id)
+            .to_owned(),
+        claim_id: subject.claim_id.clone(),
+        registration_id: subject.process.registration_id.clone(),
+        managed: subject.managed.clone(),
+        spawn_request_id: subject.process.spawn_request_id.clone(),
+        state: subject.process.state,
+        process: subject.process.identity.clone(),
+        observation: subject.process.observation.clone(),
+        pane_absence: subject.process.pane_absence.clone(),
+        ended_externally_at: subject.process.ended_externally_at.clone(),
+        ended_evidence: subject.process.ended_evidence.clone(),
+        pane_cleanup: subject.process.pane_cleanup.clone(),
+        bound_registration_id: subject.process.bound_registration_id.clone(),
+        signalled_at: subject.process.signalled_at.clone(),
+        exited_at: subject.process.exited_at.clone(),
+        recorded_at: subject.process.recorded_at.clone(),
+        origin: subject.process.origin,
+        session: subject.session.clone(),
+    }
+}
+
+impl From<PublicClaim> for crate::registry_observation::LifecycleSubject {
+    fn from(view: PublicClaim) -> Self {
+        Self {
+            subject_id: view.subject_id,
+            claim_id: Some(view.claim_id),
+            spawn_request_id: Some(view.spawn_request_id),
+            bound_registration_id: view.bound_registration_id,
+            process: view.process,
+            state: view.state,
+            managed: view.managed,
+            session: view.session,
+            exited_at: view.exited_at,
+            ended_externally_at: view.ended_externally_at,
+        }
+    }
 }
 
 /// Subjects in id order after `after`, at most `limit`, for a bounded listing.
@@ -2078,11 +2119,11 @@ pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
             return 1;
         }
     };
-    let Some(registration_id) = answer["registration_id"].as_str() else {
+    let Ok(Admitted { registration_id }) = serde_json::from_value(answer) else {
         eprintln!("radar run: the daemon admitted the launch without a registration");
         return 1;
     };
-    enter_scope(registration_id, &program[0], &program[1..], kind, false)
+    enter_scope(&registration_id, &program[0], &program[1..], kind, false)
 }
 
 /// Becomes `executable argv` inside the registration's scope, so the group exists
@@ -2128,14 +2169,6 @@ fn enter_scope(
     127
 }
 
-/// What the daemon answers a claimed launch: the registration to enter a scope
-/// under, and the program from its own record.
-struct Claimed {
-    registration_id: String,
-    executable: String,
-    argv: Vec<String>,
-}
-
 fn claim(socket: &Path) -> Result<Claimed, String> {
     let claim_id = std::env::var(CLAIM_ENV).map_err(|_| "no launch claim".to_string())?;
     let correlation =
@@ -2148,18 +2181,7 @@ fn claim(socket: &Path) -> Result<Claimed, String> {
         CLAIM_METHOD,
         json!({"claim_id": claim_id, "correlation": correlation, "process": process}),
     )?;
-    let text = |key: &str| {
-        result[key]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| "launch was not released".to_string())
-    };
-    Ok(Claimed {
-        registration_id: text("registration_id")?,
-        executable: text("executable")?,
-        argv: serde_json::from_value(result["argv"].clone())
-            .map_err(|_| "launch was not released".to_string())?,
-    })
+    serde_json::from_value(result).map_err(|_| "launch was not released".to_string())
 }
 
 /// One request on the daemon socket, answered with its result. A refusal is an
@@ -2171,9 +2193,10 @@ fn exchange(socket: &Path, method: &str, params: Value) -> Result<Value, String>
         .set_read_timeout(Some(RELEASE_DEADLINE))
         .and_then(|()| stream.set_write_timeout(Some(RELEASE_DEADLINE)))
         .map_err(|error| error.to_string())?;
+    let id = random_uuid();
     let request = json!({
         "version": PROTOCOL_VERSION,
-        "id": random_uuid(),
+        "id": id,
         "method": method,
         "params": params,
     });
@@ -2184,11 +2207,14 @@ fn exchange(socket: &Path, method: &str, params: Value) -> Result<Value, String>
     BufReader::new((&stream).take(MAX_LINE_BYTES as u64))
         .read_line(&mut line)
         .map_err(|error| format!("no answer from the daemon: {error}"))?;
-    let response: Value =
+    let response: crate::control_plane::protocol::Response =
         serde_json::from_str(&line).map_err(|_| "the daemon's answer is unreadable".to_string())?;
-    match response.get("result") {
-        Some(result) => Ok(result.clone()),
-        None => Err("the daemon refused the request".into()),
+    match response {
+        crate::control_plane::protocol::Response::Result {
+            id: answered,
+            result,
+        } if answered == id => Ok(result),
+        _ => Err("the daemon refused the request".into()),
     }
 }
 
@@ -2519,7 +2545,10 @@ mod tests {
             .expect("read subject")
             .expect("subject");
         assert_eq!(persisted.managed, metadata);
-        assert_eq!(public_view(&persisted)["managed"]["owner"], "extension");
+        assert_eq!(
+            json!(public_view(&persisted))["managed"]["owner"],
+            "extension"
+        );
 
         let successor = create_with_intent(
             &registry,
@@ -2596,7 +2625,7 @@ mod tests {
         assert_eq!(current.claim_id, second.claim_id);
         assert_eq!(current.subject_id.as_deref(), Some(logical_id.as_str()));
         // The agent carries the plain name; the attempt is named by its claim.
-        let view = public_view(&current);
+        let view = json!(public_view(&current));
         assert_eq!(view["subject_id"], logical_id);
         assert_eq!(view["claim_id"], second.claim_id);
         assert!(view.get("execution_id").is_none(), "{view}");

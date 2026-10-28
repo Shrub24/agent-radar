@@ -30,6 +30,8 @@
 
 ## D
 
+- [daemon-contracts.md](daemon-contracts.md) — typed operation answers, where JSON remains the contract, and the open vocabularies kept as strings
+
 ## E
 
 ## F

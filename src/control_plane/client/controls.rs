@@ -4,8 +4,12 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 
+use serde::Deserialize;
+
+use super::super::answer::{Answer, ChildClosed};
 use super::super::containers::PublicContainer;
 use super::super::ops;
+use super::super::store::{Category, PublicRequestRecord, RequestOutcome};
 
 use super::*;
 
@@ -16,18 +20,12 @@ use super::*;
 /// client dispatching a second effect. A control the daemon does not serve is
 /// refused before it is sent, and nothing here falls back to another transport.
 pub trait LifecycleControls: Send + Sync {
-    fn supports_child_close(&self) -> bool;
-    fn read_operation(
-        &self,
-        request_id: &str,
-        cancel: &AtomicBool,
-    ) -> Result<Option<LifecycleAnswer>, String>;
     fn close_child(
         &self,
         request_id: &str,
         target: &crate::registry_observation::ChildCloseTarget,
         cancel: &AtomicBool,
-    ) -> Result<LifecycleAnswer, String>;
+    ) -> Result<ChildClosed, String>;
     fn cancel_subject(
         &self,
         request: &LifecycleControlRequest,
@@ -43,17 +41,6 @@ pub trait LifecycleControls: Send + Sync {
         request: &LifecycleControlRequest,
         cancel: &AtomicBool,
     ) -> Result<LifecycleAnswer, String>;
-    /// Enrolls a registered lead the daemon did not launch as a lifecycle subject.
-    fn enroll_agent(
-        &self,
-        _request_id: &str,
-        _registration_id: &str,
-        _session: &str,
-        _cancel: &AtomicBool,
-    ) -> Result<LifecycleAnswer, String> {
-        Err("this run cannot enroll a lead".to_string())
-    }
-
     /// Ends an unresolved record's recovery obligation, releasing only the
     /// administrative block it holds.
     ///
@@ -81,19 +68,17 @@ pub struct LifecycleControlRequest {
 /// The operation record the daemon committed, without private launch data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LifecycleAnswer {
-    pub request: Value,
+    pub request: PublicRequestRecord,
 }
 
 impl LifecycleAnswer {
-    pub fn outcome(&self) -> &str {
-        self.request
-            .get("outcome")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
+    /// The record's verdict; a record not yet settled is unknown, never refused.
+    pub fn outcome(&self) -> RequestOutcome {
+        self.request.settled().unwrap_or(RequestOutcome::Unknown)
     }
 
     pub fn message(&self) -> Option<&str> {
-        self.request.get("message").and_then(Value::as_str)
+        self.request.message.as_deref()
     }
 }
 
@@ -168,7 +153,7 @@ pub struct ContainerReload {
 /// container it made or acted on, and the containers a deletion removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerAnswer {
-    pub request: Value,
+    pub request: PublicRequestRecord,
     /// The container a creation made, or a reload acted on, unchanged.
     pub container: Option<PublicContainer>,
     /// The containers a deletion marked removed, in id order.
@@ -190,22 +175,19 @@ impl std::fmt::Debug for ContainerCreate {
 }
 
 impl ContainerAnswer {
-    /// The outcome the record carries: `completed`, `refused` or `unknown`.
-    pub fn outcome(&self) -> &str {
-        self.request
-            .get("outcome")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
+    /// The record's verdict; a record not yet settled is unknown, never refused.
+    pub fn outcome(&self) -> RequestOutcome {
+        self.request.settled().unwrap_or(RequestOutcome::Unknown)
     }
 
     /// The category the record grouped its refusal under, when it wrote one.
-    pub fn category(&self) -> Option<&str> {
-        self.request.get("category").and_then(Value::as_str)
+    pub fn category(&self) -> Option<&Category> {
+        self.request.category.as_ref()
     }
 
     /// The record's own message, when it wrote one.
     pub fn message(&self) -> Option<&str> {
-        self.request.get("message").and_then(Value::as_str)
+        self.request.message.as_deref()
     }
 }
 
@@ -228,9 +210,7 @@ impl DaemonRuntime {
             cancel,
         )
         .map_err(|failure| failure.message)?;
-        Ok(LifecycleAnswer {
-            request: result.get("request").cloned().unwrap_or(Value::Null),
-        })
+        self.lifecycle_answer(&result)
     }
 
     /// One container control, sent under the caller's own request id.
@@ -250,64 +230,36 @@ impl DaemonRuntime {
         }
         let result = exchange_with_id_at(&self.socket, request_id, method, params, cancel)
             .map_err(|failure| failure.message)?;
-        let container = self.public_container(result.get("container"))?;
-        let removed = self.public_container_list(result.get("removed"))?;
+        let answer = self.read_answer(&result)?;
         Ok(ContainerAnswer {
-            request: result.get("request").cloned().unwrap_or(Value::Null),
-            container,
-            removed,
+            request: answer.request,
+            container: answer.container.flatten(),
+            removed: answer.removed.unwrap_or_default(),
         })
     }
 }
 
 impl DaemonRuntime {
-    /// One container the daemon named, when it named one.
-    fn public_container(&self, value: Option<&Value>) -> Result<Option<PublicContainer>, String> {
-        value
-            .filter(|value| !value.is_null())
-            .map(|value| serde_json::from_value(value.clone()))
-            .transpose()
-            .map_err(|error| self.describe(format!("answered an unreadable container: {error}")))
+    /// The operation answer the daemon sent, or why it cannot be read.
+    fn read_answer(&self, result: &Value) -> Result<Answer, String> {
+        Answer::deserialize(result)
+            .map_err(|error| self.describe(format!("answered an unreadable result: {error}")))
     }
 
-    /// The containers the daemon named, in the order it named them.
-    fn public_container_list(&self, value: Option<&Value>) -> Result<Vec<PublicContainer>, String> {
-        let Some(values) = value.and_then(Value::as_array) else {
-            return Ok(Vec::new());
-        };
-        values
-            .iter()
-            .map(|value| serde_json::from_value(value.clone()))
-            .collect::<Result<Vec<PublicContainer>, _>>()
-            .map_err(|error| self.describe(format!("answered an unreadable container: {error}")))
+    fn lifecycle_answer(&self, result: &Value) -> Result<LifecycleAnswer, String> {
+        self.read_answer(result).map(|answer| LifecycleAnswer {
+            request: answer.request,
+        })
     }
 }
 
 impl LifecycleControls for DaemonRuntime {
-    fn supports_child_close(&self) -> bool {
-        self.serves(ops::Contract::SpawnClose)
-    }
-
-    fn read_operation(
-        &self,
-        request_id: &str,
-        cancel: &AtomicBool,
-    ) -> Result<Option<LifecycleAnswer>, String> {
-        let result = self
-            .call("mux.request.get", json!({"id": request_id}), cancel)
-            .map_err(|failure| failure.message)?;
-        Ok(result
-            .get("request")
-            .cloned()
-            .map(|request| LifecycleAnswer { request }))
-    }
-
     fn close_child(
         &self,
         request_id: &str,
         target: &crate::registry_observation::ChildCloseTarget,
         cancel: &AtomicBool,
-    ) -> Result<LifecycleAnswer, String> {
+    ) -> Result<ChildClosed, String> {
         if !self.serves(ops::Contract::SpawnClose) {
             return Err(self.describe(format!(
                 "does not provide `{}`",
@@ -327,9 +279,8 @@ impl LifecycleControls for DaemonRuntime {
             cancel,
         )
         .map_err(|failure| failure.message)?;
-        Ok(LifecycleAnswer {
-            request: result.get("close").cloned().unwrap_or(Value::Null),
-        })
+        serde_json::from_value(result)
+            .map_err(|error| self.describe(format!("answered an unreadable close: {error}")))
     }
 
     fn cancel_subject(
@@ -371,16 +322,6 @@ impl LifecycleControls for DaemonRuntime {
         )
     }
 
-    fn enroll_agent(
-        &self,
-        request_id: &str,
-        registration_id: &str,
-        session: &str,
-        cancel: &AtomicBool,
-    ) -> Result<LifecycleAnswer, String> {
-        self.enroll_registered(request_id, registration_id, session, cancel)
-    }
-
     fn abandon_record(
         &self,
         request_id: &str,
@@ -401,38 +342,7 @@ impl LifecycleControls for DaemonRuntime {
             cancel,
         )
         .map_err(|failure| failure.message)?;
-        Ok(LifecycleAnswer {
-            request: result.get("request").cloned().unwrap_or(Value::Null),
-        })
-    }
-}
-
-impl DaemonRuntime {
-    /// One enrollment, sent under the caller's own request id.
-    fn enroll_registered(
-        &self,
-        request_id: &str,
-        registration_id: &str,
-        session: &str,
-        cancel: &AtomicBool,
-    ) -> Result<LifecycleAnswer, String> {
-        if !self.serves(ops::Contract::LifecycleEnroll) {
-            return Err(self.describe(format!(
-                "does not provide `{}`",
-                ops::Contract::LifecycleEnroll.as_str()
-            )));
-        }
-        let result = exchange_with_id_at(
-            &self.socket,
-            request_id,
-            "lifecycle.enroll",
-            json!({"request": {"registration_id": registration_id, "session": session}, "requester": REQUESTER}),
-            cancel,
-        )
-        .map_err(|failure| failure.message)?;
-        Ok(LifecycleAnswer {
-            request: result.get("request").cloned().unwrap_or(Value::Null),
-        })
+        self.lifecycle_answer(&result)
     }
 }
 

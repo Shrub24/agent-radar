@@ -22,35 +22,34 @@ pub(super) fn execute_subject_control(
     core: &Arc<Mutex<Core>>,
     operation: ops::Operation,
     verification: &Arc<VerificationBudget>,
-) -> Response {
-    let frozen = match frozen_params(request, &[]) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
+) -> Reply {
+    let frozen = frozen_params(request, &[])?;
     let params: SubjectParams = match serde_json::from_value(frozen) {
         Ok(params) => params,
         Err(_error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    "`request` is not a valid subject request".to_string(),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                "`request` is not a valid subject request".to_string(),
+            ));
         }
     };
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let requester = request.optional_string("requester")?;
+    run_subject_control(request, params, requester, core, operation, verification)
+}
+
+pub(super) fn run_subject_control(
+    request: &Request,
+    params: SubjectParams,
+    requester: Option<String>,
+    core: &Arc<Mutex<Core>>,
+    operation: ops::Operation,
+    verification: &Arc<VerificationBudget>,
+) -> Reply {
     let registry = Arc::clone(&locked(core).registry);
-    let (subject_id, target) = match cancel_target(&registry, &params) {
-        Ok(target) => target,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let (subject_id, target) = cancel_target(&registry, &params)?;
     let now = store::now_ms();
     match admit(operation, request, Some(&target), &requester, now, core) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
         }
@@ -58,7 +57,7 @@ pub(super) fn execute_subject_control(
     }
     let current_subject = match subjects::read(&registry, &subject_id) {
         Ok(subject) => subject,
-        Err(error) => return registry_error(request, error),
+        Err(error) => return Err(registry_refusal(error)),
     };
     if current_subject
         .as_ref()
@@ -76,7 +75,7 @@ pub(super) fn execute_subject_control(
             Settlement::backend_refused("the Pi session has no current granted presence claim"),
             store::now_ms(),
         );
-        return write_settled(request, record, core);
+        return write_settled(record, core);
     }
     let (verifier, backend, stopping) = {
         let core = locked(core);
@@ -123,7 +122,7 @@ pub(super) fn execute_subject_control(
     )
     .with_params(request.params.clone())
     .complete(settlement, store::now_ms());
-    write_settled(request, record, core)
+    write_settled(record, core)
 }
 
 #[derive(serde::Deserialize)]
@@ -142,35 +141,23 @@ pub(super) fn execute_enroll(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Response {
-    let frozen = match frozen_params(request, &[]) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
+) -> Reply {
+    let frozen = frozen_params(request, &[])?;
     let params: EnrollParams = match serde_json::from_value(frozen) {
         Ok(params) => params,
         Err(_error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    "`request` is not a valid enrollment".to_string(),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                "`request` is not a valid enrollment".to_string(),
+            ));
         }
     };
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let requester = request.optional_string("requester")?;
     if crate::model::SessionUuid::parse(&params.session).is_none() {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                "`session` must be a canonical UUID".to_string(),
-            ),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "`session` must be a canonical UUID".to_string(),
+        ));
     }
     let (registry, verifier, stopping) = {
         let core = locked(core);
@@ -184,12 +171,12 @@ pub(super) fn execute_enroll(
     let registration = match registry.get(&params.registration_id) {
         Ok(Some(registration)) => registration,
         Ok(None) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::NotFound, "registration is not recorded".to_string()),
-            );
+            return Err(Refusal::new(
+                Code::NotFound,
+                "registration is not recorded".to_string(),
+            ));
         }
-        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+        Err(error) => return Err(Refusal::new(Code::Internal, error)),
     };
     let Some(pane) = registration
         .request
@@ -197,37 +184,28 @@ pub(super) fn execute_enroll(
         .as_ref()
         .and_then(|location| location.pane.clone())
     else {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::Refused,
-                "registration names no pane to enroll".to_string(),
-            ),
-        );
+        return Err(Refusal::new(
+            Code::Refused,
+            "registration names no pane to enroll".to_string(),
+        ));
     };
     let Some(claim) = registration.request.process.clone() else {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::Refused,
-                "registration claims no process to enroll".to_string(),
-            ),
-        );
+        return Err(Refusal::new(
+            Code::Refused,
+            "registration claims no process to enroll".to_string(),
+        ));
     };
     match registry.context(&params.registration_id, now) {
         Ok(Some(context))
             if context.context.freshness == registry::Freshness::Fresh
                 && context.context.session.as_deref() == Some(params.session.as_str()) => {}
         Ok(_) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::Refused,
-                    "registration's fresh session context does not match the session".to_string(),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::Refused,
+                "registration's fresh session context does not match the session".to_string(),
+            ));
         }
-        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+        Err(error) => return Err(Refusal::new(Code::Internal, error)),
     }
     let (backend, _cancel) = match admit(
         ops::Operation::Enroll,
@@ -237,7 +215,7 @@ pub(super) fn execute_enroll(
         now,
         core,
     ) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(
                 ops::Operation::Enroll,
@@ -266,7 +244,7 @@ pub(super) fn execute_enroll(
         Ok(subject_id) => Settlement::completed(vec![format!("enrolled subject {subject_id}")]),
         Err(message) => Settlement::backend_refused(message),
     };
-    write_settled(request, record.complete(settlement, store::now_ms()), core)
+    write_settled(record.complete(settlement, store::now_ms()), core)
 }
 
 /// Records the enrolled subject for a verified process. The launch is read only
@@ -352,33 +330,35 @@ pub(super) fn execute_restart(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Response {
-    let frozen = match frozen_params(request, &[]) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
+) -> Reply {
+    let frozen = frozen_params(request, &[])?;
     let params: RestartParams = match serde_json::from_value(frozen) {
         Ok(params) => params,
         Err(_error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    "`request` is not a valid restart request".to_string(),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                "`request` is not a valid restart request".to_string(),
+            ));
         }
     };
+    let requester = request.optional_string("requester")?;
+    run_restart(request, params, requester, core, verification)
+}
+
+pub(super) fn run_restart(
+    request: &Request,
+    params: RestartParams,
+    requester: Option<String>,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Reply {
     if crate::model::SessionUuid::parse(&params.subject_id).is_none() {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(Code::BadParams, "`subject_id` must be a canonical UUID"),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "`subject_id` must be a canonical UUID",
+        ));
     }
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+
     if let Some(response) = replay_existing_operation(
         ops::Operation::Restart,
         request,
@@ -392,28 +372,25 @@ pub(super) fn execute_restart(
     let subject = match subjects::current_attachment(&registry, &params.subject_id) {
         Ok(Some(subject)) => subject,
         Ok(None) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::NotFound, "launch subject is not recorded".to_string()),
-            );
+            return Err(Refusal::new(
+                Code::NotFound,
+                "launch subject is not recorded".to_string(),
+            ));
         }
-        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
+        Err(error) => return Err(Refusal::new(Code::Internal, error)),
     };
     let replacement = match params.parent_launch() {
         Ok(replacement) => replacement,
         Err(message) => {
-            return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+            return Err(Refusal::new(Code::BadParams, message));
         }
     };
     match (&params.claim_id, &params.parent) {
         (Some(claim_id), _) if *claim_id != subject.claim_id => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::Refused,
-                    "the requested claim is not current; nothing was signalled",
-                ),
-            );
+            return Err(Refusal::new(
+                Code::Refused,
+                "the requested claim is not current; nothing was signalled",
+            ));
         }
         (None, Some(parent)) => {
             let owned = match subject.managed.parent_subject_id.as_deref() {
@@ -424,10 +401,10 @@ pub(super) fn execute_restart(
                 None => false,
             };
             if !owned {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::Refused, "the subject is not this parent's child"),
-                );
+                return Err(Refusal::new(
+                    Code::Refused,
+                    "the subject is not this parent's child",
+                ));
             }
         }
         _ => {}
@@ -441,19 +418,16 @@ pub(super) fn execute_restart(
                 .and_then(|location| location.pane),
             Ok(None) => None,
             Err(error) => {
-                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+                return Err(Refusal::new(Code::Internal, error));
             }
         },
         None => None,
     };
     let Some(anchor) = anchor else {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::Refused,
-                "restart needs the lead's own recorded pane as its anchor".to_string(),
-            ),
-        );
+        return Err(Refusal::new(
+            Code::Refused,
+            "restart needs the lead's own recorded pane as its anchor".to_string(),
+        ));
     };
     let now = store::now_ms();
     let subject_key = subject
@@ -468,7 +442,7 @@ pub(super) fn execute_restart(
         now,
         core,
     ) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(
                 ops::Operation::Restart,
@@ -499,12 +473,7 @@ pub(super) fn execute_restart(
         verification,
         &launch_request_id,
     );
-    write_settled_with(
-        request,
-        record.complete(settlement, store::now_ms()),
-        json!({}),
-        core,
-    )
+    write_settled(record.complete(settlement, store::now_ms()), core)
 }
 
 /// The restart's effects after admission, in order: the checks, the verified stop,

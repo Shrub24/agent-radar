@@ -1,4 +1,5 @@
 use super::*;
+use crate::control_plane::answer as answers;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -175,20 +176,23 @@ pub(super) fn management_view(
     registry: &registry::Registry,
     registration_id: &str,
     now_ms: i64,
-) -> serde_json::Value {
+) -> answers::Management {
     let session = match registry.context(registration_id, now_ms) {
         Ok(Some(context)) => context.context.session,
         _ => None,
     };
     let Some(session) = session else {
-        return json!({"state": "unmanaged"});
+        return answers::Management::Unmanaged;
     };
     match subjects::attachment(registry, registration_id, &session, now_ms) {
-        Ok(subjects::Attachment::Own(subject_id)) => {
-            json!({"state": "managed", "subject_id": subject_id})
-        }
-        Ok(subjects::Attachment::Other(_)) => json!({"state": "duplicate"}),
-        Ok(subjects::Attachment::Free) | Err(_) => json!({"state": "unmanaged"}),
+        Ok(subjects::Attachment::Own(subject_id)) => answers::Management::Managed {
+            subject_id: subject_id
+                .subject_id
+                .clone()
+                .unwrap_or_else(|| subject_id.claim_id.clone()),
+        },
+        Ok(subjects::Attachment::Other(_)) => answers::Management::Duplicate,
+        Ok(subjects::Attachment::Free) | Err(_) => answers::Management::Unmanaged,
     }
 }
 
@@ -351,7 +355,7 @@ pub(super) fn wake_request(
 ) -> Response {
     let params: WakeParams = match decode_params(request) {
         Ok(params) => params,
-        Err(response) => return response,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
     };
     let (registry, backend, verifier, stopping) = {
         let core = locked(core);

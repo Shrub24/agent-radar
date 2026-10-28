@@ -138,8 +138,9 @@ pub fn ttl_seconds(method: &str) -> u64 {
 /// the UI and later slices match on, so they are one vocabulary here rather than
 /// a string at each site that writes one. A word this build does not know, read
 /// from an older or newer record, is kept and written back unchanged.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(from = "String", into = "String")]
+#[schemars(with = "String")]
 pub enum Category {
     /// The request was never claimed and its expiry passed: nothing ran.
     NotExecuted,
@@ -238,7 +239,7 @@ impl Settlement {
 
 /// What has happened to a request so far. Written in order; `Completed` is
 /// terminal and carries the outcome.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordState {
     /// Recorded, nothing claimed it yet.
@@ -269,8 +270,54 @@ pub enum RequestOutcome {
 /// same target and method can be refused while this one is unresolved. The
 /// identity itself is a later slice's; what matters here is that a request names
 /// what it is about, and that name does not change while it is in flight.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RequestRecord {
+    pub id: String,
+    pub method: String,
+    /// The caller-supplied label of whoever asked, for a human reading records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Canonical params provide exact semantic equality on same-ID retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    /// RFC 3339 UTC with milliseconds, as [`now`] writes it.
+    pub requested_at: String,
+    pub expires_at: String,
+    pub state: RecordState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RequestOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<Category>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub effects: Vec<String>,
+    /// The identity a creation reported, in the runtime's own words: a kind and
+    /// an id. Absent unless a create completed and its answer named the location
+    /// — a refused or uncertain operation created nothing, and prose a client
+    /// would have to parse is not an answer it can act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<CreatedIdentity>,
+    /// The replacement edge a restart dispatched, retained for same-ID replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Set when an operator abandoned this record's recovery obligation. The
+    /// uncertainty is preserved — an abandoned record still says the daemon
+    /// cannot establish what the operation did — and only its administrative
+    /// block is released. Independent process and pane safety checks never
+    /// consult this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned_at: Option<String>,
+}
+
+/// The public record has no transition or persistence API. Its params are a
+/// compatibility projection, never the private retry contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PublicRequestRecord {
     pub id: String,
     pub method: String,
     /// The caller-supplied label of whoever asked, for a human reading records.
@@ -346,20 +393,8 @@ impl RequestRecord {
 
     /// The record as a caller may read it: launch environment and argv stay in
     /// the stored record, which compares retries exactly, and are not published.
-    pub fn public(mut self) -> Self {
-        if let Some(params) = self.params.as_mut() {
-            if let Some(request) = params
-                .get_mut("request")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                request.remove("env");
-                request.remove("argv");
-            }
-            if let Some(params) = params.as_object_mut() {
-                params.remove("env");
-            }
-        }
-        self
+    pub fn public(self) -> PublicRequestRecord {
+        self.into()
     }
 
     /// The recorded verdict, once there is one. A record that is not completed
@@ -444,6 +479,52 @@ impl RequestRecord {
     /// Whether this record's recovery obligation was abandoned.
     pub fn is_abandoned(&self) -> bool {
         self.abandoned_at.is_some()
+    }
+}
+
+impl From<RequestRecord> for PublicRequestRecord {
+    fn from(record: RequestRecord) -> Self {
+        let mut params = record.params;
+        if let Some(params) = params.as_mut() {
+            for field in ["request", "recipe"] {
+                if let Some(payload) = params
+                    .get_mut(field)
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    payload.remove("env");
+                    payload.remove("argv");
+                }
+            }
+            if let Some(params) = params.as_object_mut() {
+                params.remove("env");
+                params.remove("argv");
+            }
+        }
+        Self {
+            id: record.id,
+            method: record.method,
+            requester: record.requester,
+            target: record.target,
+            params,
+            requested_at: record.requested_at,
+            expires_at: record.expires_at,
+            state: record.state,
+            outcome: record.outcome,
+            category: record.category,
+            message: record.message,
+            effects: record.effects,
+            created: record.created,
+            launch_request_id: record.launch_request_id,
+            completed_at: record.completed_at,
+            abandoned_at: record.abandoned_at,
+        }
+    }
+}
+
+impl PublicRequestRecord {
+    pub fn settled(&self) -> Option<RequestOutcome> {
+        self.outcome
+            .filter(|_| self.state == RecordState::Completed)
     }
 }
 
@@ -1232,6 +1313,27 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_record_vocabulary_remains_readable_and_lossless() {
+        let wire = serde_json::json!({
+            "id": "historical", "method": "retired.operation",
+            "requested_at": "2026-01-01T00:00:00.000Z",
+            "expires_at": "2026-01-01T00:00:30.000Z",
+            "state": "completed", "outcome": "refused",
+            "category": "legacy-category", "effects": ["legacy-effect"]
+        });
+        let record: RequestRecord = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            record.category,
+            Some(Category::Other("legacy-category".into()))
+        );
+        assert_eq!(record.settled(), Some(RequestOutcome::Refused));
+        let public = serde_json::to_value(record.public()).unwrap();
+        for field in ["method", "category", "effects"] {
+            assert_eq!(public[field], wire[field], "{field}");
+        }
+    }
 
     const ID: &str = "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22";
 

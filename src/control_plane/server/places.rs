@@ -1,53 +1,41 @@
 use super::*;
 
 /// Validates, records and dispatches focus.
-pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
+pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Reply {
     let allowed: &[&str] = &["target", "target_kind", "requester"];
     if request
         .params
         .as_object()
         .is_none_or(|params| params.keys().any(|key| !allowed.contains(&key.as_str())))
     {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                "focus accepts only target, target_kind, and requester",
-            ),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "focus accepts only target, target_kind, and requester",
+        ));
     }
-    let target = match request.required_string("target") {
-        Ok(target) => target,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let target = request.required_string("target")?;
     if !valid_identifier(&target) {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(Code::BadParams, "`target` is not a valid identifier"),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "`target` is not a valid identifier",
+        ));
     }
     let runtime_target = match request.params.get("target_kind").and_then(|v| v.as_str()) {
         Some("pane") => Target::Pane(target.clone()),
         Some("workspace") => Target::Workspace(target.clone()),
         _ => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    "`target_kind` must be `pane` or `workspace`",
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                "`target_kind` must be `pane` or `workspace`",
+            ));
         }
     };
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let requester = request.optional_string("requester")?;
     let now = store::now_ms();
     let operation = ops::Operation::Focus;
     let method = operation.as_str();
     let (backend, cancel) = match admit(operation, request, Some(&target), &requester, now, core) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
         }
@@ -60,6 +48,10 @@ pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
         FocusOutcome::Completed => {
             record.complete(Settlement::completed(vec!["focus".into()]), store::now_ms())
         }
+        FocusOutcome::NoClient => record.complete(
+            Settlement::backend_refused(crate::runtime::NO_CLIENT),
+            store::now_ms(),
+        ),
         FocusOutcome::Refused(message) => {
             record.complete(Settlement::backend_refused(&message), store::now_ms())
         }
@@ -67,7 +59,7 @@ pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
             record.complete(Settlement::backend_unknown(&message), store::now_ms())
         }
     };
-    write_settled(request, done, core)
+    write_settled(done, core)
 }
 
 /// Validates, records and dispatches one guarded close.
@@ -77,55 +69,52 @@ pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
 /// frozen-identity match, positive-unmanaged containment — and never a second
 /// implementation of it. A location its owner manages is refused here; there is
 /// no generic close route may signal it; managed close uses subject cancellation followed by spawn.close.
-pub(super) fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Response {
+pub(super) fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Reply {
     let allowed: &[&str] = &["request", "requester"];
     if request
         .params
         .as_object()
         .is_none_or(|params| params.keys().any(|key| !allowed.contains(&key.as_str())))
     {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(Code::BadParams, "close accepts only request and requester"),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "close accepts only request and requester",
+        ));
     }
     let Some(frozen) = request.params.get("request") else {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(Code::BadParams, "`request` is required"),
-        );
+        return Err(Refusal::new(Code::BadParams, "`request` is required"));
     };
     let close_request: CloseRequest = match serde_json::from_value(frozen.clone()) {
         Ok(close_request) => close_request,
         Err(error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`request` is not a frozen close request: {error}"),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                format!("`request` is not a frozen close request: {error}"),
+            ));
         }
     };
+    let requester = request.optional_string("requester")?;
+    run_close(request, close_request, requester, core)
+}
+
+pub(super) fn run_close(
+    request: &Request,
+    close_request: CloseRequest,
+    requester: Option<String>,
+    core: &Arc<Mutex<Core>>,
+) -> Reply {
     let target = close_request.target.id().to_string();
     if !valid_identifier(&target) {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                "the close target is not a valid identifier",
-            ),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "the close target is not a valid identifier",
+        ));
     }
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
     let now = store::now_ms();
     let operation = ops::Operation::Close;
     let method = operation.as_str();
     let (backend, cancel) = match admit(operation, request, Some(&target), &requester, now, core) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
         }
@@ -158,7 +147,7 @@ pub(super) fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
             record.complete(Settlement::backend_unknown(&message), store::now_ms())
         }
     };
-    write_settled(request, done, core)
+    write_settled(done, core)
 }
 
 /// The launch subjects created inside a place, from the daemon's own spawn edges.
@@ -203,26 +192,22 @@ pub(super) fn subjects_inside(registry: &Registry, target: &crate::CloseTarget) 
 pub(super) fn frozen_params(
     request: &Request,
     extra: &[&str],
-) -> Result<serde_json::Value, Response> {
+) -> Result<serde_json::Value, Refusal> {
     if request.params.as_object().is_none_or(|params| {
         params.keys().any(|key| {
             !matches!(key.as_str(), "request" | "requester") && !extra.contains(&key.as_str())
         })
     }) {
-        return Err(Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                format!("{} accepts only request and requester", request.method),
-            ),
+        return Err(Refusal::new(
+            Code::BadParams,
+            format!("{} accepts only request and requester", request.method),
         ));
     }
-    request.params.get("request").cloned().ok_or_else(|| {
-        Response::refused(
-            &request.id,
-            &Refusal::new(Code::BadParams, "`request` is required"),
-        )
-    })
+    request
+        .params
+        .get("request")
+        .cloned()
+        .ok_or_else(|| Refusal::new(Code::BadParams, "`request` is required"))
 }
 
 /// One creation's result: the record to settle, and the container it recorded.
@@ -236,30 +221,20 @@ pub(super) struct Creation {
 /// A label is Radar's own name for a container: it is recorded verbatim and shown
 /// in the tree, and the backend is never told it. It is bounded here, at the wire
 /// boundary, rather than truncated wherever it is displayed.
-pub(super) fn creation_label(request: &Request) -> Result<Option<String>, Response> {
-    let label = match request.optional_string("label") {
-        Ok(label) => label,
-        Err(refusal) => return Err(Response::refused(&request.id, &refusal)),
-    };
+fn validate_label(label: Option<String>) -> Result<Option<String>, Refusal> {
     let Some(label) = label.filter(|label| !label.is_empty()) else {
         return Ok(None);
     };
     if label.chars().count() > MAX_LABEL_CHARS {
-        return Err(Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                format!("a container label is at most {MAX_LABEL_CHARS} characters"),
-            ),
+        return Err(Refusal::new(
+            Code::BadParams,
+            format!("a container label is at most {MAX_LABEL_CHARS} characters"),
         ));
     }
     if label.chars().any(char::is_control) {
-        return Err(Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                "a container label cannot carry control characters",
-            ),
+        return Err(Refusal::new(
+            Code::BadParams,
+            "a container label cannot carry control characters",
         ));
     }
     Ok(Some(label))
@@ -276,10 +251,10 @@ pub(super) fn execute_create(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Response {
+) -> Reply {
     match dispatch_creation(ops::Operation::Create, None, request, core, verification) {
-        Ok(creation) => write_settled(request, creation.record, core),
-        Err(response) => response,
+        Ok(creation) => write_settled(creation.record, core),
+        Err(reply) => *reply,
     }
 }
 
@@ -292,11 +267,8 @@ pub(super) fn execute_container_create(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Response {
-    let label = match creation_label(request) {
-        Ok(label) => label,
-        Err(response) => return response,
-    };
+) -> Reply {
+    let label = request.optional_string("label")?;
     match dispatch_creation(
         ops::Operation::CreateContainer,
         label,
@@ -304,8 +276,8 @@ pub(super) fn execute_container_create(
         core,
         verification,
     ) {
-        Ok(creation) => write_created(request, creation, core),
-        Err(response) => response,
+        Ok(creation) => write_created(creation, core),
+        Err(reply) => *reply,
     }
 }
 
@@ -313,22 +285,16 @@ pub(super) fn execute_container_create(
 ///
 /// The container travels with the record so a caller acts on the identity it made
 /// instead of joining a handle to whatever the tree shows next.
-pub(super) fn write_created(
-    request: &Request,
-    creation: Creation,
-    core: &Arc<Mutex<Core>>,
-) -> Response {
-    let core = locked(core);
-    match core.store.write(&creation.record) {
-        Ok(()) => Response::ok(
-            &request.id,
-            json!({
-                "request": creation.record.public(),
-                "container": creation.container.map(|container| container.public()),
-            }),
-        ),
-        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
-    }
+pub(super) fn write_created(creation: Creation, core: &Arc<Mutex<Core>>) -> Reply {
+    write_settled_with(creation.record, core, |answer| {
+        answer.with_container(creation.container.map(|container| container.public()))
+    })
+}
+
+/// A refusal as the early exit of a creation dispatch, which otherwise yields
+/// the creation it made.
+fn boxed(refusal: Refusal) -> Box<Reply> {
+    Box::new(Err(refusal))
 }
 
 /// Validates, records and dispatches one creation, and records the container it
@@ -346,26 +312,61 @@ pub(super) fn dispatch_creation(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Result<Creation, Response> {
+) -> Result<Creation, Box<Reply>> {
     // The primitive create carries the request alone; the hierarchy verb carries
     // the label its container is recorded under.
     let extra: &[&str] = match operation {
         ops::Operation::CreateContainer => &["label", "recipe"],
         _ => &[],
     };
-    let frozen = frozen_params(request, extra)?;
+    let frozen = frozen_params(request, extra).map_err(boxed)?;
     let create: CreateRequest = match serde_json::from_value(frozen) {
         Ok(create) => create,
         Err(error) => {
-            return Err(Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`request` is not a create request: {error}"),
-                ),
-            ));
+            return Err(boxed(Refusal::new(
+                Code::BadParams,
+                format!("`request` is not a create request: {error}"),
+            )));
         }
     };
+
+    let recipe = creation_recipe(request, &create).map_err(boxed)?;
+    let requester = request.optional_string("requester").map_err(boxed)?;
+    run_creation(
+        operation,
+        request,
+        CreateInput {
+            create,
+            label,
+            recipe,
+            requester,
+        },
+        core,
+        verification,
+    )
+}
+
+pub(super) struct CreateInput {
+    pub(super) create: CreateRequest,
+    pub(super) label: Option<String>,
+    pub(super) recipe: Option<containers::Recipe>,
+    pub(super) requester: Option<String>,
+}
+
+pub(super) fn run_creation(
+    operation: ops::Operation,
+    request: &Request,
+    input: CreateInput,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Result<Creation, Box<Reply>> {
+    let CreateInput {
+        create,
+        label,
+        recipe,
+        requester,
+    } = input;
+    let label = validate_label(label).map_err(boxed)?;
     // The scope is named by the caller, so a create never lands wherever the
     // multiplexer happens to have focus.
     let target = match &create {
@@ -377,18 +378,20 @@ pub(super) fn dispatch_creation(
         .as_deref()
         .is_some_and(|target| !valid_identifier(target))
     {
-        return Err(Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                "the create target is not a valid identifier",
-            ),
-        ));
+        return Err(boxed(Refusal::new(
+            Code::BadParams,
+            "the create target is not a valid identifier",
+        )));
     }
     // The command this creation's slot runs, if it carries one, is parsed and
     // checked here: a recipe this backend cannot carry refuses before a pane
     // exists, exactly as a spawn is preflighted.
-    let recipe = creation_recipe(request, &create)?;
+    if recipe.is_some() && matches!(create, CreateRequest::Workspace { .. }) {
+        return Err(boxed(Refusal::new(
+            Code::BadParams,
+            "a recipe runs in a pane slot: a pane split or a tab creation carries one",
+        )));
+    }
     // What the caller asked for, or the daemon's own choice when it said nothing.
     // A create dispatched unfocused is followed by a focus of what it made, so a
     // backend never moves the operator as a side effect of creating. A workspace
@@ -403,21 +406,17 @@ pub(super) fn dispatch_creation(
     if let Some(recipe) = &recipe
         && let Err(refusal) = preflight_recipe(core, &create, recipe)
     {
-        return Err(Response::refused(&request.id, &refusal));
+        return Err(boxed(refusal));
     }
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Err(Response::refused(&request.id, &refusal)),
-    };
     let now = store::now_ms();
     let method = operation.as_str();
     let (backend, cancel) =
         match admit(operation, request, target.as_deref(), &requester, now, core) {
-            Admission::Answered(response) => return Err(response),
+            Admission::Answered(reply) => return Err(reply),
             Admission::Unsupported(message) => {
-                return Err(execute_unsupported(
+                return Err(Box::new(execute_unsupported(
                     operation, request, &message, target, core,
-                ));
+                )));
             }
             Admission::Dispatch(backend, cancel) => (backend, cancel),
         };
@@ -538,6 +537,12 @@ pub(super) fn dispatch_creation(
                     Some(pane) => {
                         match backend.focus_outcome(&Target::Pane(pane.to_string()), &cancel) {
                             FocusOutcome::Completed => {}
+                            FocusOutcome::NoClient => {
+                                notes.push(format!(
+                                    "the created pane was not focused: {}",
+                                    crate::runtime::NO_CLIENT
+                                ));
+                            }
                             FocusOutcome::Refused(message) => {
                                 notes.push(format!("the created pane was not focused: {message}"));
                             }
@@ -590,42 +595,40 @@ pub(super) fn execute_container_delete(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Response {
-    let frozen = match frozen_params(request, &[]) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
+) -> Reply {
+    let frozen = frozen_params(request, &[])?;
     let delete: containers::DeleteRequest = match serde_json::from_value(frozen) {
         Ok(delete) => delete,
         Err(error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`request` is not a container deletion: {error}"),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                format!("`request` is not a container deletion: {error}"),
+            ));
         }
     };
+    let requester = request.optional_string("requester")?;
+    run_container_delete(request, delete, requester, core, verification)
+}
+
+pub(super) fn run_container_delete(
+    request: &Request,
+    delete: containers::DeleteRequest,
+    requester: Option<String>,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Reply {
     if !valid_identifier(&delete.container_id) {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                "the container id is not a valid identifier",
-            ),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "the container id is not a valid identifier",
+        ));
     }
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
     let now = store::now_ms();
     let operation = ops::Operation::DeleteContainer;
     let method = operation.as_str();
     let target = delete.container_id.clone();
     let (backend, cancel) = match admit(operation, request, Some(&target), &requester, now, core) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
         }
@@ -643,7 +646,6 @@ pub(super) fn execute_container_delete(
         Ok(Some(container)) => container,
         Ok(None) => {
             return write_refused(
-                request,
                 record,
                 &format!(
                     "container {} is not recorded: nothing was deleted",
@@ -652,13 +654,12 @@ pub(super) fn execute_container_delete(
                 core,
             );
         }
-        Err(error) => return write_refused(request, record, &error, core),
+        Err(error) => return write_refused(record, &error, core),
     };
     // A container this daemon already removed is history, and one whose binding
     // names no verified serving instance cannot be fenced: neither is deleted.
     if let Some(at) = container.removed_at.as_deref() {
         return write_refused(
-            request,
             record,
             &format!(
                 "container {} was removed at {at}: nothing was deleted",
@@ -669,7 +670,6 @@ pub(super) fn execute_container_delete(
     }
     let Some(binding) = container.binding.clone() else {
         return write_refused(
-            request,
             record,
             &format!(
                 "container {} records no binding: nothing was deleted",
@@ -691,7 +691,6 @@ pub(super) fn execute_container_delete(
         };
         if !forgotten {
             return write_refused(
-                request,
                 record,
                 &format!(
                     "container {} is still served by its place: nothing was deleted",
@@ -702,7 +701,7 @@ pub(super) fn execute_container_delete(
         }
         let members = match containers::subtree(&registry, &container.id) {
             Ok(members) => members,
-            Err(message) => return write_refused(request, record, &message, core),
+            Err(message) => return write_refused(record, &message, core),
         };
         let now = store::now_ms();
         let at = store::format_millis(now);
@@ -710,7 +709,7 @@ pub(super) fn execute_container_delete(
         for id in &members {
             match containers::record_removed(&registry, id, &at) {
                 Ok(container) => removed.push(container),
-                Err(error) => return write_refused(request, record, &error, core),
+                Err(error) => return write_refused(record, &error, core),
             }
         }
         let settled = record.complete(
@@ -725,12 +724,11 @@ pub(super) fn execute_container_delete(
             ),
             now,
         );
-        return write_deleted(request, settled, removed, core);
+        return write_deleted(settled, removed, core);
     };
     let expected = container.kind.target(&binding.handle);
     if frozen.target != expected {
         return write_refused(
-            request,
             record,
             &format!(
                 "{} is not container {}'s location ({}): nothing was deleted",
@@ -743,7 +741,6 @@ pub(super) fn execute_container_delete(
     }
     let Some(recorded) = binding.incarnation.clone() else {
         return write_refused(
-            request,
             record,
             &format!(
                 "container {} records no verified serving instance: nothing was deleted",
@@ -757,7 +754,7 @@ pub(super) fn execute_container_delete(
     // one of those places.
     let members = match containers::subtree(&registry, &container.id) {
         Ok(members) => members,
-        Err(message) => return write_refused(request, record, &message, core),
+        Err(message) => return write_refused(record, &message, core),
     };
     // The recorded serving instance is gone when the server now serving is a
     // different process, or none is. The places recorded under it went with it:
@@ -796,7 +793,7 @@ pub(super) fn execute_container_delete(
             ),
             now,
         );
-        return write_deleted(request, settled, removed, core);
+        return write_deleted(settled, removed, core);
     }
     // Every agent launched inside this place ends the way a single `D` on its own
     // row ends it: fenced, SIGTERM, one shared window for the exit, and the exit
@@ -862,7 +859,7 @@ pub(super) fn execute_container_delete(
                 ),
                 now,
             );
-            return write_deleted(request, settled, removed, core);
+            return write_deleted(settled, removed, core);
         }
         DirectClose::Refused(message) => {
             record.complete(Settlement::backend_refused(&message), store::now_ms())
@@ -871,7 +868,7 @@ pub(super) fn execute_container_delete(
             record.complete(Settlement::backend_unknown(&message), store::now_ms())
         }
     };
-    write_deleted(request, settled, Vec::new(), core)
+    write_deleted(settled, Vec::new(), core)
 }
 
 /// Reloads one pane container's slot: the recipe it was created with runs again
@@ -885,42 +882,40 @@ pub(super) fn execute_container_reload(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Response {
-    let frozen = match frozen_params(request, &[]) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
+) -> Reply {
+    let frozen = frozen_params(request, &[])?;
     let reload: containers::ReloadRequest = match serde_json::from_value(frozen) {
         Ok(reload) => reload,
         Err(error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`request` is not a container reload: {error}"),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                format!("`request` is not a container reload: {error}"),
+            ));
         }
     };
+    let requester = request.optional_string("requester")?;
+    run_container_reload(request, reload, requester, core, verification)
+}
+
+pub(super) fn run_container_reload(
+    request: &Request,
+    reload: containers::ReloadRequest,
+    requester: Option<String>,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Reply {
     if !valid_identifier(&reload.container_id) {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                "the container id is not a valid identifier",
-            ),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "the container id is not a valid identifier",
+        ));
     }
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
     let now = store::now_ms();
     let operation = ops::Operation::ReloadContainer;
     let method = operation.as_str();
     let target = reload.container_id.clone();
     let (backend, cancel) = match admit(operation, request, Some(&target), &requester, now, core) {
-        Admission::Answered(response) => return response,
+        Admission::Answered(response) => return *response,
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(target), core);
         }
@@ -936,7 +931,6 @@ pub(super) fn execute_container_reload(
         Ok(Some(container)) => container,
         Ok(None) => {
             return reload_refused(
-                request,
                 record,
                 &format!(
                     "container {} is not recorded: nothing was reloaded",
@@ -946,7 +940,7 @@ pub(super) fn execute_container_reload(
                 core,
             );
         }
-        Err(error) => return reload_refused(request, record, &error, None, core),
+        Err(error) => return reload_refused(record, &error, None, core),
     };
     // Everything a reload requires is decided here, and every refusal names what
     // is missing: only a pane slot runs a recipe, only a container Radar created
@@ -994,7 +988,6 @@ pub(super) fn execute_container_reload(
         Ok(ready) => ready,
         Err(message) => {
             return reload_refused(
-                request,
                 record,
                 &format!("{message}: nothing was reloaded"),
                 Some(container),
@@ -1011,7 +1004,6 @@ pub(super) fn execute_container_reload(
         Some(PaneExitObservation::Exited { .. }) => {}
         Some(PaneExitObservation::Running) => {
             return reload_refused(
-                request,
                 record,
                 &format!("pane {pane} is still running its command: stop it first, then reload"),
                 Some(container),
@@ -1020,7 +1012,6 @@ pub(super) fn execute_container_reload(
         }
         _ => {
             return reload_refused(
-                request,
                 record,
                 &format!(
                     "pane {pane} does not report an exited command: not replacing what may still be running"
@@ -1062,20 +1053,18 @@ pub(super) fn execute_container_reload(
             record.complete(Settlement::backend_unknown(&message), store::now_ms())
         }
     };
-    write_reloaded(request, settled, Some(container), core)
+    write_reloaded(settled, Some(container), core)
 }
 
 /// Answers an admitted reload with a refusal that is recorded before it is
 /// written.
 pub(super) fn reload_refused(
-    request: &Request,
     record: RequestRecord,
     message: &str,
     container: Option<containers::Container>,
     core: &Arc<Mutex<Core>>,
-) -> Response {
+) -> Reply {
     write_reloaded(
-        request,
         record.complete(
             Settlement::refused(Category::Refused, message),
             store::now_ms(),
@@ -1087,55 +1076,23 @@ pub(super) fn reload_refused(
 
 /// Answers a settled reload with the container it acted on, unchanged.
 pub(super) fn write_reloaded(
-    request: &Request,
     record: RequestRecord,
     container: Option<containers::Container>,
     core: &Arc<Mutex<Core>>,
-) -> Response {
-    write_settled_with(
-        request,
-        record,
-        json!({
-            "container": container.map(|container| container.public()),
-        }),
-        core,
-    )
-}
-
-/// Writes a settled operation with the public facts its own answer names beside
-/// the record, so a caller acts on what its request did rather than on what the
-/// next read happens to show.
-pub(super) fn write_settled_with(
-    request: &Request,
-    record: RequestRecord,
-    extra: serde_json::Value,
-    core: &Arc<Mutex<Core>>,
-) -> Response {
-    let core = locked(core);
-    match core.store.write(&record) {
-        Ok(()) => {
-            let mut body = json!({ "request": record.public() });
-            if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
-                for (key, value) in extra {
-                    body.insert(key.clone(), value.clone());
-                }
-            }
-            Response::ok(&request.id, body)
-        }
-        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
-    }
+) -> Reply {
+    write_settled_with(record, core, |answer| {
+        answer.with_container(container.map(|container| container.public()))
+    })
 }
 
 /// Answers an admitted deletion with a refusal that is recorded before it is
 /// written, so a caller reads back what the daemon decided.
 pub(super) fn write_refused(
-    request: &Request,
     record: RequestRecord,
     message: &str,
     core: &Arc<Mutex<Core>>,
-) -> Response {
+) -> Reply {
     write_deleted(
-        request,
         record.complete(
             Settlement::refused(Category::Refused, message),
             store::now_ms(),
@@ -1150,20 +1107,16 @@ pub(super) fn write_refused(
 /// The containers travel with the record so a caller reads what its own request
 /// removed rather than joining handles to whatever the tree shows next.
 pub(super) fn write_deleted(
-    request: &Request,
     record: RequestRecord,
     removed: Vec<containers::Container>,
     core: &Arc<Mutex<Core>>,
-) -> Response {
-    write_settled_with(
-        request,
-        record,
-        json!({
-            "removed": removed
+) -> Reply {
+    write_settled_with(record, core, |answer| {
+        answer.with_removed(
+            removed
                 .into_iter()
                 .map(|container| container.public())
-                .collect::<Vec<_>>(),
-        }),
-        core,
-    )
+                .collect(),
+        )
+    })
 }

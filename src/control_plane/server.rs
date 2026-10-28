@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+use crate::control_plane::answer::{Answer, Reply, respond};
 use crate::control_plane::communication::{self, CommunicationStore};
 use crate::control_plane::containers;
 use crate::control_plane::lifecycle::{self as subjects, Bootstrap};
@@ -912,8 +913,8 @@ fn handle_line(
         Method::Wake => answer(writer, wake_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
         Method::Operation(operation) => {
-            let response = execute(operation, &request, core, verification);
-            answer(writer, response);
+            let reply = execute(operation, &request, core, verification);
+            answer(writer, respond(&request.id, reply));
         }
     }
 }
@@ -1002,12 +1003,14 @@ fn unix_millis() -> i64 {
 /// This is steady-state observation, not reconciliation: it runs continuously so
 /// lifecycle coverage stays alive with no client connected. Reconciliation is a
 /// separate mechanism with its own triggers (`reconcile`).
-fn observation_source(core: &Arc<Mutex<Core>>) -> serde_json::Value {
+fn observation_source(core: &Arc<Mutex<Core>>) -> crate::control_plane::answer::ObservationSource {
     let last = locked(core).sweep_at.load(Ordering::SeqCst);
-    json!({"observation": {
-        "interval_ms": SWEEP_INTERVAL.as_millis() as u64,
-        "last_pass_at": (last > 0).then(|| crate::control_plane::store::format_millis(last)),
-    }})
+    crate::control_plane::answer::ObservationSource {
+        observation: crate::control_plane::answer::ObservationProgress {
+            interval_ms: SWEEP_INTERVAL.as_millis() as u64,
+            last_pass_at: (last > 0).then(|| crate::control_plane::store::format_millis(last)),
+        },
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1019,13 +1022,9 @@ struct ChildCloseParams {
     intent: registry::CloseIntent,
 }
 
-fn decode_params<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T, Response> {
-    serde_json::from_value(request.params.clone()).map_err(|error| {
-        Response::refused(
-            &request.id,
-            &Refusal::new(Code::BadParams, format!("params are unusable: {error}")),
-        )
-    })
+fn decode_params<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T, Refusal> {
+    serde_json::from_value(request.params.clone())
+        .map_err(|error| Refusal::new(Code::BadParams, format!("params are unusable: {error}")))
 }
 
 /// Maps a registry failure onto a protocol code.
@@ -1035,13 +1034,17 @@ fn decode_params<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T,
 /// does not exist is `not_found`, and every other failure — a refused transition
 /// or an invalid stored record — is a refusal whose message names the cause. A
 /// corrupt record is never answered as a successful omission.
-fn registry_error(request: &Request, error: String) -> Response {
-    let code = if error.contains("is not registered") || error.contains("has no writer") {
-        Code::NotFound
-    } else {
-        Code::Refused
+fn registry_refusal(error: impl Into<registry::Error>) -> Refusal {
+    let error = error.into();
+    let code = match &error {
+        registry::Error::NotFound(_) => Code::NotFound,
+        registry::Error::Refused(_) => Code::Refused,
     };
-    Response::refused(&request.id, &Refusal::new(code, error))
+    Refusal::new(code, error.to_string())
+}
+
+fn registry_error(request: &Request, error: impl Into<registry::Error>) -> Response {
+    Response::refused(&request.id, &registry_refusal(error))
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -1058,59 +1061,38 @@ fn primitive_refuse(backend: &Arc<dyn RuntimeProvider>, method: &str) -> Option<
     })
 }
 
-/// Writes one settled spawn and answers with both records it authored.
-///
-/// What the request did and the edge it authored are separate durable records,
-/// and the effects a caller acts on are the edge's: created, launched and bound
-/// as they stand.
-fn settle_spawn(
-    request: &Request,
-    record: RequestRecord,
-    edge: &registry::SpawnEdge,
-    core: &Arc<Mutex<Core>>,
-) -> Response {
-    let core = locked(core);
-    match core.store.write(&record) {
-        Ok(()) => Response::ok(
-            &request.id,
-            json!({ "request": record.public(), "spawn": edge.public() }),
-        ),
-        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
-    }
-}
-
 /// A spawn that was already answered: its record, and the edge that request id
 /// authored.
 ///
 /// A replay, an in-flight refusal and a content conflict are all answered from
 /// the records the first attempt wrote, so a caller reads the outcomes it read
-/// the first time. A response carrying no record — a refusal, a store error — is
-/// answered as itself.
-fn spawn_answer(request: &Request, response: Response, core: &Arc<Mutex<Core>>) -> Response {
-    let (id, result) = match response {
-        Response::Result { id, result } => (id, result),
-        other => return other,
-    };
-    let edge = {
-        let core = locked(core);
-        core.registry.spawn_edge(&request.id)
-    };
-    match (edge, result.get("request").cloned()) {
-        (Ok(Some(edge)), Some(record)) => Response::ok(
-            &id,
-            json!({ "request": serde_json::from_value::<RequestRecord>(record).expect("stored public record shape").public(), "spawn": edge.public() }),
-        ),
-        _ => Response::ok(&id, result),
-    }
+/// the first time. A refusal carries no record and is answered as itself.
+fn spawn_answer(request: &Request, reply: Reply, core: &Arc<Mutex<Core>>) -> Reply {
+    let answer = reply?;
+    let edge = locked(core).registry.spawn_edge(&request.id);
+    Ok(match edge {
+        Ok(Some(edge)) => answer.with_spawn(edge.public()),
+        _ => answer,
+    })
 }
 
-/// Writes one settled record and answers with it.
-fn write_settled(request: &Request, record: RequestRecord, core: &Arc<Mutex<Core>>) -> Response {
+/// Writes one settled record and answers with it, plus whatever `extra` adds
+/// from the facts the operation itself names, so a caller acts on what its
+/// request did rather than on what the next read happens to show.
+fn write_settled_with(
+    record: RequestRecord,
+    core: &Arc<Mutex<Core>>,
+    extra: impl FnOnce(Answer) -> Answer,
+) -> Reply {
     let core = locked(core);
-    match core.store.write(&record) {
-        Ok(()) => Response::ok(&request.id, json!({ "request": record.public() })),
-        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
-    }
+    core.store
+        .write(&record)
+        .map_err(|error| Refusal::new(Code::Internal, error))?;
+    Ok(extra(Answer::of(record)))
+}
+
+fn write_settled(record: RequestRecord, core: &Arc<Mutex<Core>>) -> Reply {
+    write_settled_with(record, core, |answer| answer)
 }
 
 /// Writes one response line, under the connection's write lock so two answers

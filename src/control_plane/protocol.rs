@@ -38,7 +38,7 @@ pub const OUTPUT_METHOD: &str = "mux.output";
 
 /// A stable refusal reason. These words are the protocol: a caller switches on
 /// them, so they do not change when a message's wording does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Code {
     /// The request named a protocol version this daemon does not serve.
@@ -60,6 +60,11 @@ pub enum Code {
     OutcomeUnknown,
     /// The named record does not exist.
     NotFound,
+    /// A focus was refused because no terminal client is attached; the target it
+    /// would have shown is still valid.
+    NoClient,
+    /// The existing UI focus diagnostic for an unconfirmed effect.
+    Unknown,
     /// The daemon failed while serving: an unreadable store, a write that did
     /// not land. The request may or may not have had an effect.
     Internal,
@@ -78,6 +83,8 @@ impl Code {
             Self::BackendUnavailable => "backend_unavailable",
             Self::OutcomeUnknown => "outcome_unknown",
             Self::NotFound => "not_found",
+            Self::NoClient => "no_client",
+            Self::Unknown => "unknown",
             Self::Internal => "internal",
         }
     }

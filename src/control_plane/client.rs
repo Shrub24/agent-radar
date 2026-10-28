@@ -37,16 +37,18 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::answer::{Evidence, Inventory, Output, Requests};
 use super::ops;
+use super::public_contracts::PingResult;
 use super::{PROTOCOL_VERSION, socket_path, trusted_socket};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::{FleetObservation, ForegroundEvidence};
 use crate::runtime::{
     BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedIdentity,
     CreatedKind, CreatedLocation, FocusOutcome, InputOutcome, InputRequest, OutputOutcome,
-    OutputRead, OutputRequest, ReportOutcome, ReportRequest, RuntimeProvider, Target,
+    OutputRequest, ReportOutcome, ReportRequest, RuntimeProvider, Target,
 };
-use crate::tasks::{Task, TaskEvent, TaskState};
+use crate::tasks::TaskEvent;
 
 /// How long one exchange with the daemon may take before it is treated as not
 /// answering.
@@ -62,34 +64,7 @@ const TASKS_PAGE_LIMIT: usize = 100;
 /// How long reading every page of one registry or task read may take.
 const REGISTRY_READ_DEADLINE: Duration = Duration::from_secs(10);
 
-#[derive(Deserialize)]
-pub struct TasksPage {
-    pub revision: u64,
-    pub sessions: Vec<TaskSession>,
-    pub next_after: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct TaskSession {
-    session: String,
-    connected: bool,
-    #[allow(dead_code, reason = "the wire carries it; no reader presents it yet")]
-    last_updated_at: u64,
-    tasks: Vec<TaskValue>,
-}
-
-#[derive(Deserialize)]
-struct TaskValue {
-    id: String,
-    state: String,
-    command: Option<String>,
-    cwd: Option<String>,
-    pid: Option<u32>,
-    started_at: Option<u64>,
-    last_output_at: Option<u64>,
-    output_bytes: Option<u64>,
-    exit_code: Option<i32>,
-}
+pub use super::answer::{TaskSession, TasksPage};
 
 #[derive(Clone, Debug)]
 pub struct TaskSnapshot {
@@ -155,10 +130,16 @@ impl DaemonRuntime {
         let cancel = AtomicBool::new(false);
         let answer = exchange_at(socket, "daemon.ping", json!({}), &cancel)
             .map_err(|failure| failure.message)?;
-        let served = answer.get("protocol").and_then(Value::as_u64);
-        if served != Some(PROTOCOL_VERSION as u64) {
+        #[derive(Deserialize)]
+        struct Versions {
+            protocol: Option<u64>,
+            revision: Option<u64>,
+        }
+        let Versions { protocol, revision } = serde_json::from_value(answer.clone())
+            .map_err(|error| format!("the control daemon sent an unreadable ping: {error}"))?;
+        if protocol != Some(PROTOCOL_VERSION as u64) {
             let served =
-                served.map_or_else(|| "no version".to_string(), |v| format!("version {v}"));
+                protocol.map_or_else(|| "no version".to_string(), |v| format!("version {v}"));
             return Err(format!(
                 "the control daemon at {} answers {served}; this build speaks protocol {}",
                 socket.display(),
@@ -167,7 +148,6 @@ impl DaemonRuntime {
         }
         // The daemon and this build ship together; only a daemon that outlived an
         // install is older, and it is told apart by one number, not a name list.
-        let revision = answer.get("revision").and_then(Value::as_u64);
         if revision.is_none_or(|revision| revision < u64::from(ops::PROTOCOL_REVISION)) {
             let revision =
                 revision.map_or_else(|| "no revision".to_string(), |r| format!("revision {r}"));
@@ -178,37 +158,19 @@ impl DaemonRuntime {
                 ops::PROTOCOL_REVISION
             ));
         }
-        let declared: Vec<String> = answer
-            .get("contracts")
-            .and_then(Value::as_array)
-            .map(|names| {
-                names
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let task_diagnostic = answer
-            .get("tasks")
-            .filter(|tasks| tasks.get("available").and_then(Value::as_bool) == Some(false))
-            .and_then(|tasks| tasks.get("error"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let ping: PingResult = serde_json::from_value(answer).map_err(|error| {
+            format!(
+                "the control daemon at {} sent an unreadable ping: {error}",
+                socket.display()
+            )
+        })?;
         Ok(Self {
             socket: socket.to_path_buf(),
-            declared,
-            task_diagnostic,
+            declared: ping.contracts,
+            task_diagnostic: ping.tasks.error.filter(|_| !ping.tasks.available),
             identity: BackendIdentity {
-                name: answer
-                    .get("backend")
-                    .and_then(Value::as_str)
-                    .unwrap_or("none")
-                    .to_string(),
-                instance: answer
-                    .get("instance")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                name: ping.backend,
+                instance: ping.instance,
             },
         })
     }
@@ -306,8 +268,8 @@ impl RuntimeProvider for DaemonRuntime {
         let result = self
             .call("mux.observe", json!({}), cancel)
             .map_err(|failure| failure.message)?;
-        let inventory = result.get("inventory").cloned().unwrap_or(Value::Null);
-        serde_json::from_value(inventory)
+        serde_json::from_value::<Inventory>(result)
+            .map(|read| read.inventory)
             .map_err(|error| self.describe(format!("sent an unreadable inventory: {error}")))
     }
 
@@ -317,13 +279,14 @@ impl RuntimeProvider for DaemonRuntime {
         let Ok(result) = self.call("mux.process_info", json!({"pane_id": pane_id}), cancel) else {
             return ForegroundEvidence::Inconclusive;
         };
-        let evidence = result.get("evidence").cloned().unwrap_or(Value::Null);
-        serde_json::from_value(evidence).unwrap_or(ForegroundEvidence::Inconclusive)
+        serde_json::from_value::<Evidence>(result)
+            .map_or(ForegroundEvidence::Inconclusive, |read| read.evidence)
     }
 
     fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
         match self.focus_outcome(target, cancel) {
             FocusOutcome::Completed => Ok(()),
+            FocusOutcome::NoClient => Err(crate::runtime::NO_CLIENT.into()),
             FocusOutcome::Refused(message) | FocusOutcome::Unknown(message) => Err(message),
         }
     }
@@ -388,9 +351,8 @@ impl RuntimeProvider for DaemonRuntime {
             Ok(result) => result,
             Err(failure) => return failure.into_output(),
         };
-        let read = result.get("output").cloned().unwrap_or(Value::Null);
-        match serde_json::from_value::<OutputRead>(read) {
-            Ok(read) => OutputOutcome::Completed(read),
+        match serde_json::from_value::<Output>(result) {
+            Ok(read) => OutputOutcome::Completed(read.output),
             Err(error) => OutputOutcome::Unknown(
                 self.describe(format!("sent an unreadable output read: {error}")),
             ),
@@ -455,17 +417,9 @@ pub fn unfinished_requests() -> Result<Vec<String>, String> {
         &AtomicBool::new(false),
     )
     .map_err(|failure| failure.message)?;
-    Ok(answer
-        .get("requests")
-        .and_then(Value::as_array)
-        .map(|records| {
-            records
-                .iter()
-                .filter_map(|record| record.get("id").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default())
+    let Requests { requests } = serde_json::from_value(answer)
+        .map_err(|error| format!("the control daemon sent unreadable requests: {error}"))?;
+    Ok(requests.into_iter().map(|record| record.id).collect())
 }
 
 /// [`connect`] at a socket the caller names, held to the same trust rule.
@@ -505,26 +459,7 @@ fn bus_events(sessions: Vec<TaskSession>) -> Vec<TaskEvent> {
         });
         events.push(TaskEvent::Tasks {
             session: session_id,
-            tasks: session
-                .tasks
-                .into_iter()
-                .map(|task| Task {
-                    id: task.id,
-                    state: match task.state.as_str() {
-                        "running" => TaskState::Running,
-                        "flushing" => TaskState::Flushing,
-                        "review" => TaskState::Review,
-                        state => TaskState::Unknown(state.to_string()),
-                    },
-                    command: task.command,
-                    cwd: task.cwd,
-                    pid: task.pid,
-                    started_at: task.started_at,
-                    last_output_at: task.last_output_at,
-                    output_bytes: task.output_bytes,
-                    exit_code: task.exit_code,
-                })
-                .collect(),
+            tasks: session.tasks,
         });
     }
     events
@@ -534,10 +469,8 @@ fn bus_events(sessions: Vec<TaskSession>) -> Vec<TaskEvent> {
 ///
 /// The snapshot's task source is the same `tasks.list` page the standalone read
 /// returns, so both paths present one shape.
-pub fn tasks_from_snapshot(tasks: &Value) -> Result<Vec<TaskEvent>, String> {
-    let page: TasksPage = serde_json::from_value(tasks.clone())
-        .map_err(|error| format!("the snapshot's task source is unreadable: {error}"))?;
-    Ok(bus_events(page.sessions))
+pub fn tasks_from_snapshot(tasks: &super::answer::TaskSnapshotData) -> Vec<TaskEvent> {
+    bus_events(tasks.sessions.clone())
 }
 
 /// The location one record's reported identity describes.

@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 ///
 /// The three known words are the publisher's vocabulary; any other word is a
 /// newer publisher's and is kept verbatim.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "String", into = "String")]
 pub enum TaskState {
     Running,
     Flushing,
@@ -25,9 +26,25 @@ impl std::fmt::Display for TaskState {
     }
 }
 
+impl From<String> for TaskState {
+    fn from(word: String) -> Self {
+        match word.as_str() {
+            "running" => Self::Running,
+            "flushing" => Self::Flushing,
+            "review" => Self::Review,
+            _ => Self::Unknown(word),
+        }
+    }
+}
+impl From<TaskState> for String {
+    fn from(state: TaskState) -> Self {
+        state.to_string()
+    }
+}
+
 /// One unresolved task as published. Every field except `id` and `state` is
 /// optional, and absent is not the same as a zero value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Task {
     pub id: String,
     pub state: TaskState,

@@ -43,6 +43,7 @@ pub const NO_CLIENT: &str = "no tmux client is attached to this server";
 /// The certainty of a focus attempt at the runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FocusOutcome {
+    NoClient,
     /// The backend positively confirmed the requested focus.
     Completed,
     /// The backend positively rejected the request before applying it.
@@ -56,6 +57,7 @@ impl FocusOutcome {
     pub fn diagnostic(&self) -> Option<&str> {
         match self {
             Self::Completed => None,
+            Self::NoClient => Some(NO_CLIENT),
             Self::Refused(message) | Self::Unknown(message) => Some(message),
         }
     }
@@ -63,7 +65,9 @@ impl FocusOutcome {
 
 /// Where `Enter` wants a runtime's focus moved: an existing normalized
 /// location the view already produces.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Target {
     /// A pane row: its workspace, tab and pane in one request.
@@ -227,7 +231,7 @@ impl CreatedLocation {
 }
 
 /// The kind of location a creation made, in the protocol's words.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CreatedKind {
     Workspace,
@@ -241,7 +245,7 @@ pub enum CreatedKind {
 /// This is what a client acts on — the record's structured answer to "what did
 /// I just create". The prose in [`CreatedLocation::effects`] stays for a human
 /// reading the record; nothing parses it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CreatedIdentity {
     pub kind: CreatedKind,
     pub id: String,

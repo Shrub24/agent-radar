@@ -121,7 +121,10 @@ impl Settled {
     /// has accepted the request and may still execute it, so nothing here may be
     /// read as "it did not happen".
     pub(super) fn of(result: &Value) -> Result<Self, Failure> {
-        let Ok(Answer { request: record, .. }) = Answer::deserialize(result) else {
+        let Ok(Answer {
+            request: record, ..
+        }) = Answer::deserialize(result)
+        else {
             return Err(Failure::unknown(
                 "the daemon's answer carried no request record".to_string(),
             ));
@@ -225,45 +228,34 @@ pub(super) fn exchange_with_id(
     let budget = Budget::of(EXCHANGE_TIMEOUT);
     write_request(&mut stream, &line, budget, cancel)?;
     let answer = read_answer(&mut stream, budget, cancel).map_err(Failure::unknown)?;
-    let answer: Value = serde_json::from_str(&answer)
+    let answer: crate::control_plane::protocol::Response = serde_json::from_str(&answer)
         .map_err(|error| Failure::unknown(format!("sent an unreadable answer: {error}")))?;
-    if answer.get("id").and_then(Value::as_str) != Some(id) {
+    use crate::control_plane::protocol::{Code, Response};
+    if answer.id() != id {
         return Err(Failure::unknown("answered a different request".to_string()));
     }
-    if let Some(error) = answer.get("error") {
-        let code = error
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("no reason given");
-        let message = format!("refused `{method}` ({code}): {message}");
-        return Err(match code {
-            // The codes the daemon answers before anything is dispatched.
-            "bad_version"
-            | "bad_request"
-            | "unknown_method"
-            | "bad_params"
-            | "refused"
-            | "busy"
-            | "backend_unavailable"
-            | "not_found" => Failure::refused(message),
-            // A dispatched request whose result was not confirmed is never a
-            // refusal: `outcome_unknown` says the daemon may have acted and
-            // `internal` says it failed while serving.
-            "outcome_unknown" | "internal" => Failure::unknown(message),
-            // A code this build does not know cannot be read as "nothing
-            // happened", so it stays unknown too.
-            _ => Failure::unknown(message),
-        });
-    }
-    match answer.get("result") {
-        Some(result) => Ok(result.clone()),
-        None => Err(Failure::unknown(format!(
-            "answered `{method}` without a result"
-        ))),
+    match answer {
+        Response::Result { result, .. } => Ok(result),
+        Response::Error { error, .. } => {
+            let code = error.code();
+            let message = format!("refused `{method}` ({}): {}", error.code, error.message);
+            Err(match code {
+                Some(
+                    Code::BadVersion
+                    | Code::BadRequest
+                    | Code::UnknownMethod
+                    | Code::BadParams
+                    | Code::Refused
+                    | Code::Busy
+                    | Code::BackendUnavailable
+                    | Code::NotFound
+                    | Code::NoClient,
+                ) => Failure::refused(message),
+                Some(Code::OutcomeUnknown | Code::Unknown | Code::Internal) | None => {
+                    Failure::unknown(message)
+                }
+            })
+        }
     }
 }
 

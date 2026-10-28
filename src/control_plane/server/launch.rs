@@ -1,4 +1,5 @@
 use super::*;
+use crate::control_plane::answer::{Admitted, Claimed};
 
 /// The wire shape of one spawn request: the parent runtime subject, and the
 /// command the caller resolved for the child.
@@ -95,7 +96,7 @@ pub(super) fn preflight_command(
 pub(super) fn creation_recipe(
     request: &Request,
     create: &CreateRequest,
-) -> Result<Option<containers::Recipe>, Response> {
+) -> Result<Option<containers::Recipe>, Refusal> {
     let Some(recipe) = request.params.get("recipe") else {
         return Ok(None);
     };
@@ -103,23 +104,17 @@ pub(super) fn creation_recipe(
         create,
         CreateRequest::PaneSplit { .. } | CreateRequest::Tab { .. }
     ) {
-        return Err(Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                "a recipe runs in a pane slot: a pane split or a tab creation carries one",
-            ),
+        return Err(Refusal::new(
+            Code::BadParams,
+            "a recipe runs in a pane slot: a pane split or a tab creation carries one",
         ));
     }
     serde_json::from_value(recipe.clone())
         .map(Some)
         .map_err(|error| {
-            Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`recipe` is not a container recipe: {error}"),
-                ),
+            Refusal::new(
+                Code::BadParams,
+                format!("`recipe` is not a container recipe: {error}"),
             )
         })
 }
@@ -170,27 +165,18 @@ pub(super) fn execute_spawn(
     request: &Request,
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
-) -> Response {
-    let frozen = match frozen_params(request, &[]) {
-        Ok(frozen) => frozen,
-        Err(response) => return response,
-    };
+) -> Reply {
+    let frozen = frozen_params(request, &[])?;
     let params: SpawnParams = match serde_json::from_value(frozen) {
         Ok(params) => params,
         Err(_error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    "`request` is not a valid spawn request".to_string(),
-                ),
-            );
+            return Err(Refusal::new(
+                Code::BadParams,
+                "`request` is not a valid spawn request".to_string(),
+            ));
         }
     };
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let requester = request.optional_string("requester")?;
     if let Some(response) =
         replay_existing_operation_contents(ops::Operation::Spawn, request, &requester, core)
     {
@@ -199,11 +185,9 @@ pub(super) fn execute_spawn(
     // The command and the parent are validated at the wire boundary, before
     // anything is recorded: a request this seam cannot carry creates no pane.
     if let Err(message) = validate_command(&params.executable, &params.argv) {
-        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+        return Err(Refusal::new(Code::BadParams, message));
     }
-    if let Err(refusal) = preflight_launch(core, &params) {
-        return Response::refused(&request.id, &refusal);
-    }
+    preflight_launch(core, &params)?;
     let intent = registry::SpawnRequest {
         request_id: request.id.clone(),
         parent: params.parent.clone(),
@@ -211,7 +195,7 @@ pub(super) fn execute_spawn(
         parent_subject_id: params.managed.parent_subject_id.clone(),
     };
     if let Err(message) = intent.validate() {
-        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+        return Err(Refusal::new(Code::BadParams, message));
     }
     let tracks_launches = locked(core).backend.as_ref().is_some_and(|backend| {
         backend
@@ -219,19 +203,16 @@ pub(super) fn execute_spawn(
             .contains(Primitives::LIFECYCLE_TRACKING)
     });
     if !tracks_launches && params.managed != subjects::ManagedMetadata::default() {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::Refused,
-                "managed launch metadata requires daemon lifecycle tracking",
-            ),
-        );
+        return Err(Refusal::new(
+            Code::Refused,
+            "managed launch metadata requires daemon lifecycle tracking",
+        ));
     }
     if tracks_launches
         && let Err(message) =
             subjects::check_bounds_with_metadata(&requested_launch(&params), &params.managed)
     {
-        return Response::refused(&request.id, &Refusal::new(Code::BadParams, message));
+        return Err(Refusal::new(Code::BadParams, message));
     }
     // The child is created beside the pane its parent registered: a spawn never
     // lands wherever the multiplexer happens to have focus, and a parent with no
@@ -241,40 +222,34 @@ pub(super) fn execute_spawn(
         let parent = match core.registry.get(&params.parent) {
             Ok(Some(parent)) => parent,
             Ok(None) => {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(
-                        Code::NotFound,
-                        format!("parent {} is not a registered agent", params.parent),
-                    ),
-                );
+                return Err(Refusal::new(
+                    Code::NotFound,
+                    format!("parent {} is not a registered agent", params.parent),
+                ));
             }
             Err(error) => {
-                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+                return Err(Refusal::new(Code::Internal, error));
             }
         };
         let context = match core.registry.context(&params.parent, store::now_ms()) {
             Ok(Some(context)) => context,
             Ok(None) => {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::Refused, "parent has no published session context"),
-                );
+                return Err(Refusal::new(
+                    Code::Refused,
+                    "parent has no published session context",
+                ));
             }
             Err(error) => {
-                return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+                return Err(Refusal::new(Code::Internal, error));
             }
         };
         if context.context.freshness != registry::Freshness::Fresh
             || context.context.session.as_deref() != Some(&params.parent_session_id)
         {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::Refused,
-                    "parent session context is absent, stale or mismatched",
-                ),
-            );
+            return Err(Refusal::new(
+                Code::Refused,
+                "parent session context is absent, stale or mismatched",
+            ));
         }
         match parent
             .request
@@ -284,23 +259,17 @@ pub(super) fn execute_spawn(
         {
             Some(pane) => pane,
             None => {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(
-                        Code::Refused,
-                        format!(
-                            "parent {} names no pane to create the child under",
-                            params.parent
-                        ),
+                return Err(Refusal::new(
+                    Code::Refused,
+                    format!(
+                        "parent {} names no pane to create the child under",
+                        params.parent
                     ),
-                );
+                ));
             }
         }
     };
-    let (params, lineage) = match continuation(core, params) {
-        Ok(continued) => continued,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+    let (params, lineage) = continuation(core, params)?;
     spawn_child(
         request,
         core,
@@ -383,11 +352,8 @@ pub(super) fn spawn_child(
     intent: &registry::SpawnRequest,
     parent_pane: String,
     lineage: SpawnLineage,
-) -> Response {
-    let requester = match request.optional_string("requester") {
-        Ok(requester) => requester,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
+) -> Reply {
+    let requester = request.optional_string("requester")?;
     if let Some(response) =
         replay_existing_operation_contents(ops::Operation::Spawn, request, &requester, core)
     {
@@ -402,21 +368,18 @@ pub(super) fn spawn_child(
                 if parent_subject.process.bound_registration_id.as_deref()
                     == Some(params.parent.as_str()) => {}
             Ok(Some(_)) => {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(
-                        Code::BadParams,
-                        "managed parent_subject_id does not name this registered parent",
-                    ),
-                );
+                return Err(Refusal::new(
+                    Code::BadParams,
+                    "managed parent_subject_id does not name this registered parent",
+                ));
             }
             Ok(None) => {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::NotFound, "managed parent subject is not recorded"),
-                );
+                return Err(Refusal::new(
+                    Code::NotFound,
+                    "managed parent subject is not recorded",
+                ));
             }
-            Err(error) => return registry_error(request, error),
+            Err(error) => return Err(registry_refusal(error)),
         }
     }
     let now = store::now_ms();
@@ -429,7 +392,7 @@ pub(super) fn spawn_child(
         now,
         core,
     ) {
-        Admission::Answered(response) => return spawn_answer(request, response, core),
+        Admission::Answered(response) => return spawn_answer(request, *response, core),
         Admission::Unsupported(message) => {
             return execute_unsupported(operation, request, &message, Some(parent_pane), core);
         }
@@ -451,8 +414,8 @@ pub(super) fn spawn_child(
             Settlement::new(RequestOutcome::Refused, None, Some(&message), Vec::new()),
             store::now_ms(),
         );
-        let _ = write_settled(request, settled, core);
-        return Response::refused(&request.id, &Refusal::new(Code::Refused, message));
+        let _ = write_settled(settled, core);
+        return Err(Refusal::new(Code::Refused, message));
     }
     // A backend that tracks its launches gets the subject before any effect, so
     // the launch's correlation is recorded before the launch can run it.
@@ -477,8 +440,8 @@ pub(super) fn spawn_child(
                     Settlement::new(RequestOutcome::Refused, None, Some(&message), Vec::new()),
                     store::now_ms(),
                 );
-                let _ = write_settled(request, settled, core);
-                return Response::refused(&request.id, &Refusal::new(Code::Internal, message));
+                let _ = write_settled(settled, core);
+                return Err(Refusal::new(Code::Internal, message));
             }
         }
     } else {
@@ -567,8 +530,8 @@ pub(super) fn spawn_child(
                 Settlement::new(RequestOutcome::Unknown, None, Some(&error), effects),
                 store::now_ms(),
             );
-            let _ = write_settled(request, settled, core);
-            return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+            let _ = write_settled(settled, core);
+            return Err(Refusal::new(Code::Internal, error));
         }
     };
     // A command runs only in a pane the create named: with no pane there is
@@ -603,14 +566,11 @@ pub(super) fn spawn_child(
             ),
             store::now_ms(),
         );
-        let _ = write_settled(request, settled, core);
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BackendUnavailable,
-                "no execution scope launcher is configured",
-            ),
-        );
+        let _ = write_settled(settled, core);
+        return Err(Refusal::new(
+            Code::BackendUnavailable,
+            "no execution scope launcher is configured",
+        ));
     }
     let (launched_outcome, launch_message) = match &launched {
         Some(LaunchOutcome::Completed) => (Some(RequestOutcome::Completed), None),
@@ -636,8 +596,8 @@ pub(super) fn spawn_child(
                         Settlement::new(RequestOutcome::Unknown, None, Some(&error), effects),
                         store::now_ms(),
                     );
-                    let _ = write_settled(request, settled, core);
-                    return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
+                    let _ = write_settled(settled, core);
+                    return Err(Refusal::new(Code::Internal, error));
                 }
             }
         }
@@ -684,7 +644,7 @@ pub(super) fn spawn_child(
         Settlement::new(outcome, category, message, effects),
         store::now_ms(),
     );
-    settle_spawn(request, done, &edge, core)
+    write_settled_with(done, core, |answer| answer.with_spawn(edge.public()))
 }
 
 /// The launch chain a tracked launch starts: this binary, serving `socket`. `None`
@@ -751,7 +711,7 @@ pub(super) fn claim_request(
 ) -> Response {
     let params: ClaimParams = match decode_params(request) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
     };
     let (registry, backend, verifier, stopping) = {
         let core = locked(core);
@@ -862,12 +822,12 @@ pub(super) fn claim_request(
         &effective,
         store::now_ms(),
     ) {
-        Ok(()) => Response::ok(
+        Ok(()) => respond(
             &request.id,
-            json!({
-                "registration_id": subject.process.registration_id,
-                "executable": subject.process.launch.executable,
-                "argv": subject.process.launch.argv,
+            Ok(Claimed {
+                registration_id: subject.process.registration_id.clone(),
+                executable: subject.process.launch.executable.clone(),
+                argv: subject.process.launch.argv.clone(),
             }),
         ),
         Err(error) => {
@@ -901,7 +861,7 @@ pub(super) fn admit_request(
 ) -> Response {
     let params: AdmitParams = match decode_params(request) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
     };
     if params.executable.is_empty() {
         return Response::refused(
@@ -999,9 +959,11 @@ pub(super) fn admit_request(
     };
     // The scope is a pure function of the registration, so the client derives it
     // rather than receiving a second copy of the naming rule.
-    Response::ok(
+    respond(
         &request.id,
-        json!({"registration_id": process.registration_id}),
+        Ok(Admitted {
+            registration_id: process.registration_id,
+        }),
     )
 }
 

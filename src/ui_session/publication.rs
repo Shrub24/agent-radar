@@ -21,7 +21,7 @@ pub struct Frame {
 pub struct Observation {
     pub collected_at: Option<String>,
     pub sources: Vec<SourceState>,
-    pub tasks: Option<serde_json::Value>,
+    pub tasks: Option<crate::control_plane::answer::TaskSnapshotData>,
     pub observation: ObservationState,
 }
 

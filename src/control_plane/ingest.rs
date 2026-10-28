@@ -1,10 +1,10 @@
 //! Volatile extension publications owned by the daemon.
 
+use super::answer::TaskSession;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use serde_json::{Value, json};
 
 use crate::bus::{Connection, Message};
 use crate::tasks::{TaskBoard, TaskEvent};
@@ -143,7 +143,7 @@ impl TaskIngest {
         &self,
         after: Option<&str>,
         limit: usize,
-    ) -> (u64, Vec<Value>, Option<String>) {
+    ) -> (u64, Vec<TaskSession>, Option<String>) {
         let state = lock(&self.state);
         let revision = state.revision;
         let mut sessions = Vec::new();
@@ -153,30 +153,17 @@ impl TaskIngest {
                 continue;
             }
             if sessions.len() == limit {
-                next_after = sessions.last().and_then(|value: &Value| {
-                    value
-                        .get("session")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
+                next_after = sessions
+                    .last()
+                    .map(|value: &TaskSession| value.session.clone());
                 break;
             }
-            sessions.push(json!({
-                "session": session,
-                "connected": true,
-                "last_updated_at": state.updated_at.get(session).copied().unwrap_or_default(),
-                "tasks": held.tasks.iter().map(|task| json!({
-                    "id": task.id,
-                    "state": task.state.to_string(),
-                    "command": task.command,
-                    "cwd": task.cwd,
-                    "pid": task.pid,
-                    "started_at": task.started_at,
-                    "last_output_at": task.last_output_at,
-                    "output_bytes": task.output_bytes,
-                    "exit_code": task.exit_code,
-                })).collect::<Vec<_>>(),
-            }));
+            sessions.push(TaskSession {
+                session: session.to_owned(),
+                connected: true,
+                last_updated_at: state.updated_at.get(session).copied().unwrap_or_default(),
+                tasks: held.tasks.clone(),
+            });
         }
         (revision, sessions, next_after)
     }
@@ -210,15 +197,15 @@ mod tests {
         assert!(ingest.ingest(1, &hello("a")).keep_connection);
         assert!(ingest.ingest(2, &hello("b")).keep_connection);
         let (_, first, after) = ingest.list(None, 1);
-        assert_eq!(first[0]["session"], "a");
+        assert_eq!(first[0].session, "a");
         assert_eq!(after.as_deref(), Some("a"));
         let (_, second, next) = ingest.list(after.as_deref(), 1);
-        assert_eq!(second[0]["session"], "b");
+        assert_eq!(second[0].session, "b");
         assert!(next.is_none());
         ingest.disconnect(1);
         let (_, remaining, _) = ingest.list(None, 10);
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0]["session"], "b");
+        assert_eq!(remaining[0].session, "b");
     }
 
     #[test]

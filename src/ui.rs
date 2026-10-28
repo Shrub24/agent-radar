@@ -453,12 +453,9 @@ fn draw_outcomes(frame: &mut Frame, app: &App) {
                 Style::new().fg(palette.subtle),
             ),
         ]));
-        // The answer whole, as the daemon recorded it: this panel is where a
-        // refusal that names a method, a code and a reason becomes readable.
         if let Some(answer) = &outcome.answer {
-            let rendered =
-                serde_json::to_string_pretty(answer).unwrap_or_else(|_| answer.to_string());
-            for row in wrap(&sanitize(&rendered), width) {
+            let detail = serde_json::to_string_pretty(answer).expect("serializable command answer");
+            for row in wrap(&sanitize(&detail), width) {
                 lines.push(Line::from(Span::styled(row, style)));
             }
         }

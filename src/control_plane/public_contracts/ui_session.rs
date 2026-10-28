@@ -7,6 +7,9 @@
 //! internal types can change without changing the published contract.
 
 use crate::content::Content;
+use crate::control_plane::protocol::Code;
+use crate::control_plane::store::PublicRequestRecord;
+use crate::runtime::Target;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -154,7 +157,30 @@ pub struct Blocking {
 pub struct CommandOutcome {
     pub request_id: String,
     pub status: CommandStatus,
-    pub answer: Option<serde_json::Value>,
+    pub answer: Option<Box<CommandAnswer>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum CommandAnswer {
+    Domain {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        result: Box<crate::control_plane::answer::Answer>,
+    },
+    Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        error: OutcomeError,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OutcomeError {
+    pub code: Code,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<Target>,
 }
 
 impl CommandOutcome {
@@ -166,22 +192,51 @@ impl CommandOutcome {
         }
     }
 
-    /// An answer carried with a status: what the caller sees, and what its
-    /// status was read from.
-    pub fn answering(request_id: &str, status: CommandStatus, answer: serde_json::Value) -> Self {
+    pub fn answering(request_id: &str, status: CommandStatus, answer: CommandAnswer) -> Self {
         Self {
-            request_id: request_id.to_owned(),
-            status,
-            answer: Some(answer),
+            answer: Some(Box::new(answer)),
+            ..Self::new(request_id, status)
         }
     }
 
-    pub fn error(request_id: &str, status: CommandStatus, code: &str, message: &str) -> Self {
+    pub fn recorded(request_id: &str, status: CommandStatus, record: PublicRequestRecord) -> Self {
         Self::answering(
             request_id,
             status,
-            serde_json::json!({"error": {"code": code, "message": message}}),
+            CommandAnswer::Domain {
+                id: None,
+                result: Box::new(crate::control_plane::answer::Answer::of(record)),
+            },
         )
+    }
+
+    pub fn error(request_id: &str, status: CommandStatus, code: Code, message: &str) -> Self {
+        Self::answering(
+            request_id,
+            status,
+            CommandAnswer::Error {
+                id: None,
+                error: OutcomeError {
+                    code,
+                    message: message.to_owned(),
+                    target: None,
+                },
+            },
+        )
+    }
+
+    pub fn failure(&self) -> Option<&OutcomeError> {
+        match self.answer.as_deref()? {
+            CommandAnswer::Error { error, .. } => Some(error),
+            CommandAnswer::Domain { .. } => None,
+        }
+    }
+
+    pub fn about(mut self, target: Target) -> Self {
+        if let Some(CommandAnswer::Error { error, .. }) = self.answer.as_deref_mut() {
+            error.target = Some(target);
+        }
+        self
     }
 }
 

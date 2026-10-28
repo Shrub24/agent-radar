@@ -194,6 +194,7 @@ struct Answer {
 
 /// One failed operation, and what its failure establishes.
 enum Failure {
+    NoClient,
     /// Nothing was dispatched: the command was never built.
     Refused(String),
     /// A command was dispatched and its answer could not be used, so the effect
@@ -212,6 +213,7 @@ impl Failure {
 
     fn into_focus(self) -> FocusOutcome {
         match self {
+            Self::NoClient => FocusOutcome::NoClient,
             Self::Refused(message) => FocusOutcome::Refused(message),
             Self::Unknown(message) => FocusOutcome::Unknown(message),
         }
@@ -219,6 +221,7 @@ impl Failure {
 
     fn into_close(self) -> CloseOutcome {
         match self {
+            Self::NoClient => CloseOutcome::Refused(crate::runtime::NO_CLIENT.into()),
             Self::Refused(message) => CloseOutcome::Refused(message),
             Self::Unknown(message) => CloseOutcome::Unknown(message),
         }
@@ -226,6 +229,7 @@ impl Failure {
 
     fn into_create(self) -> CreateOutcome {
         match self {
+            Self::NoClient => CreateOutcome::Refused(crate::runtime::NO_CLIENT.into()),
             Self::Refused(message) => CreateOutcome::Refused(message),
             Self::Unknown(message) => CreateOutcome::Unknown(message),
         }
@@ -233,6 +237,7 @@ impl Failure {
 
     fn into_input(self) -> InputOutcome {
         match self {
+            Self::NoClient => InputOutcome::Refused(crate::runtime::NO_CLIENT.into()),
             Self::Refused(message) => InputOutcome::Refused(message),
             Self::Unknown(message) => InputOutcome::Unknown(message),
         }
@@ -240,6 +245,7 @@ impl Failure {
 
     fn into_output(self) -> OutputOutcome {
         match self {
+            Self::NoClient => OutputOutcome::Refused(crate::runtime::NO_CLIENT.into()),
             Self::Refused(message) => OutputOutcome::Refused(message),
             Self::Unknown(message) => OutputOutcome::Unknown(message),
         }
@@ -719,7 +725,7 @@ impl TmuxRuntime {
             })
             .collect();
         if parsed.is_empty() {
-            return Err(Failure::refused(crate::runtime::NO_CLIENT));
+            return Err(Failure::NoClient);
         }
         if let Some((name, _, _)) = parsed.iter().find(|(_, attached, _)| *attached == session) {
             return Ok(name.clone());
@@ -728,7 +734,7 @@ impl TmuxRuntime {
         parsed
             .pop()
             .map(|(name, _, _)| name)
-            .ok_or_else(|| Failure::refused(crate::runtime::NO_CLIENT))
+            .ok_or(Failure::NoClient)
     }
 
     /// Moves a pane's window into view and then makes the pane active in it.

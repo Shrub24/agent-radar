@@ -1,4 +1,5 @@
 use super::*;
+use crate::control_plane::answer::{ChildClosed, PublicClose};
 
 /// Revalidate the exact managed child against fresh pane and process evidence,
 /// persist the request only after the checks succeed, then dispatch one pane
@@ -209,7 +210,7 @@ pub(super) fn subject_child_close(
     use crate::control_plane::public_contracts::subject::ChildCloseParams;
     let params: ChildCloseParams = match decode_params(request) {
         Ok(params) => params,
-        Err(response) => return response,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
     };
     let registry = Arc::clone(&locked(core).registry);
     let record = match super::subject_reads::child_record(
@@ -302,52 +303,42 @@ fn current_edge(
 /// pane closure and nothing else: no answer here claims a process or process
 /// group exit, and an unknown outcome stays unknown rather than being retried.
 pub(super) fn close_response(request: &Request, close: &registry::ChildClose) -> Response {
-    match close.outcome {
-        CloseOutcome::Completed => Response::ok(
-            &request.id,
-            json!({"close": {
-                "outcome": "completed",
-                "intent": close.intent,
-                "pane": close.location.pane.as_deref(),
-            }}),
-        ),
-        CloseOutcome::AlreadyExited => Response::ok(
-            &request.id,
-            json!({"close": {
-                "outcome": "already_exited",
-                "intent": close.intent,
-                "pane": close.location.pane.as_deref(),
-                "exit_observation": close.exit.clone().map(|exit| {
-                    registry::PublicSpawnExitObservation::Exited {
-                        code: exit.code,
-                        signal: exit.signal,
-                        observed_at: exit.observed_at,
-                    }
-                }),
-            }}),
-        ),
-        CloseOutcome::Refused => Response::refused(
-            &request.id,
-            &Refusal::new(
+    let closed = |exit_observation| ChildClosed {
+        close: PublicClose {
+            outcome: close.outcome,
+            intent: close.intent,
+            pane: close.location.pane.clone(),
+            exit_observation,
+        },
+    };
+    respond(
+        &request.id,
+        match close.outcome {
+            CloseOutcome::Completed => Ok(closed(None)),
+            CloseOutcome::AlreadyExited => Ok(closed(close.exit.clone().map(|exit| {
+                registry::PublicSpawnExitObservation::Exited {
+                    code: exit.code,
+                    signal: exit.signal,
+                    observed_at: exit.observed_at,
+                }
+            }))),
+            CloseOutcome::Refused => Err(Refusal::new(
                 Code::Refused,
                 close
                     .message
                     .as_deref()
                     .unwrap_or("the backend refused the close"),
-            ),
-        ),
-        CloseOutcome::Unknown => Response::refused(
-            &request.id,
+            )),
             // A close that may have been dispatched keeps that uncertainty on the
             // wire: `outcome_unknown` is the code a caller reads as "an effect
             // may exist", so it is never reported as a pre-dispatch refusal.
-            &Refusal::new(
+            CloseOutcome::Unknown => Err(Refusal::new(
                 Code::OutcomeUnknown,
                 close
                     .message
                     .as_deref()
                     .unwrap_or("managed child close outcome is unknown"),
-            ),
-        ),
-    }
+            )),
+        },
+    )
 }

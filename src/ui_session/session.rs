@@ -9,8 +9,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use serde_json::Value;
-
 use super::gate::{Completion, Gate};
 use super::navigation::{self, NavState, NavStep, Navigation, PaneView, RowOrder, TaskRows};
 use super::publication::{Frame, Head, Observation};
@@ -172,7 +170,11 @@ impl Session {
 
     /// Folds a new observation into the tree. Returns whether anything a
     /// presentation shows changed.
-    pub fn observe(&mut self, state: &ObservationState, tasks: Option<&Value>) -> bool {
+    pub fn observe(
+        &mut self,
+        state: &ObservationState,
+        tasks: Option<&crate::control_plane::answer::TaskSnapshotData>,
+    ) -> bool {
         let observation = Observation {
             observation: state.clone(),
             tasks: tasks.cloned(),
@@ -190,9 +192,8 @@ impl Session {
         self.observation_error = None;
         let state = &observation.observation;
         let tasks = observation.tasks.as_ref();
-        if let Some(tasks) = tasks
-            && let Ok(events) = crate::control_plane::client::tasks_from_snapshot(tasks)
-        {
+        if let Some(tasks) = tasks {
+            let events = crate::control_plane::client::tasks_from_snapshot(tasks);
             let mut bus = TaskBoard::default();
             for event in events {
                 bus.apply(event);
@@ -894,7 +895,15 @@ mod tests {
         let mut session = seeded();
         let before = session.current().head();
         let state = session.state.clone().unwrap();
-        let huge = serde_json::json!({"oversized": "x".repeat(crate::content::MAX_PAYLOAD)});
+        let huge = crate::control_plane::answer::TaskSnapshotData {
+            revision: 1,
+            sessions: vec![crate::control_plane::answer::TaskSession {
+                session: "x".repeat(crate::content::MAX_PAYLOAD),
+                connected: true,
+                last_updated_at: 0,
+                tasks: Vec::new(),
+            }],
+        };
         assert!(session.observe(&state, Some(&huge)));
         assert_eq!(session.current().head().observation, before.observation);
         assert_eq!(
@@ -1155,9 +1164,12 @@ mod tests {
         );
         let jobs = session.take_completions();
         let plan = jobs[0].plan.as_ref().expect("a frozen effect");
-        let crate::ui_session::targets::Effect::Domain { method, params } = &plan.effect else {
+        let crate::ui_session::targets::Effect::Domain(command) = &plan.effect else {
             panic!("a deletion is a domain request");
         };
+        let request = command.record_request(&plan.request_id);
+        let method = request.method.as_str();
+        let params = &request.params;
         let frozen = serde_json::to_string(params).unwrap();
         let (dto::UiRowId::Pane { pane_id: shown }, dto::UiRowId::Pane { pane_id: other }) =
             (&shown, &other)
@@ -1166,7 +1178,7 @@ mod tests {
         };
         assert!(frozen.contains(shown.as_str()), "{frozen}");
         assert!(!frozen.contains(other.as_str()), "{frozen}");
-        assert_eq!(method, &"mux.close");
+        assert_eq!(method, "mux.close");
     }
 
     #[test]
@@ -1291,7 +1303,7 @@ mod tests {
         assert_eq!(
             match &jobs[0].plan.as_ref().expect("a frozen effect").effect {
                 crate::ui_session::targets::Effect::Focus(target) => Some(target.clone()),
-                crate::ui_session::targets::Effect::Domain { .. } => None,
+                crate::ui_session::targets::Effect::Domain(_) => None,
             },
             Some(crate::runtime::Target::Pane(pane))
         );
@@ -1306,7 +1318,7 @@ mod tests {
         session.operation(dto::CommandOutcome::error(
             "request-1",
             dto::CommandStatus::Refused,
-            "agents_alive",
+            crate::control_plane::protocol::Code::Refused,
             "an agent inside did not exit",
         ));
         let after = session.current();

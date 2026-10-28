@@ -959,7 +959,7 @@ mod tests {
             dto::CommandOutcome::error(
                 &job.request_id,
                 dto::CommandStatus::Refused,
-                "no_client",
+                crate::control_plane::protocol::Code::NoClient,
                 "no tmux client is attached",
             )
         })));
@@ -984,10 +984,8 @@ mod tests {
         .expect("the refusal is published");
         assert_eq!(published.status, dto::CommandStatus::Refused);
         assert_eq!(
-            published.answer.as_ref().and_then(|answer| {
-                answer.pointer("/error/code").and_then(|code| code.as_str())
-            }),
-            Some("no_client"),
+            published.failure().map(|error| error.code),
+            Some(crate::control_plane::protocol::Code::NoClient),
             "the answer carries why nothing moved"
         );
 
@@ -1059,11 +1057,7 @@ mod tests {
                 let _ = job;
                 panic!("worker completion lost after possible admission");
             }
-            Effect::Reconcile(id) => dto::CommandOutcome::answering(
-                &id,
-                dto::CommandStatus::Completed,
-                serde_json::json!({"recorded": true}),
-            ),
+            Effect::Reconcile(id) => dto::CommandOutcome::new(&id, dto::CommandStatus::Completed),
         })));
         let handle = service.handle();
         let mut stream = handle

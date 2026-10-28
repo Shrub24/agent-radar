@@ -11,6 +11,7 @@
 
 pub mod answer;
 pub mod client;
+pub mod command;
 pub mod communication;
 pub mod containers;
 pub mod events;

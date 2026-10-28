@@ -1,9 +1,11 @@
 use super::*;
+use crate::control_plane::answer as answers;
+use crate::control_plane::answer::{Evidence, Inventory, Output, Requests};
 
 pub(super) fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     let params: ObservationGetParams = match decode_params(request) {
         Ok(params) => params,
-        Err(response) => return response,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
     };
     let wait = params.wait_ms.unwrap_or(0);
     if wait > crate::control_plane::observation::MAX_OBSERVATION_WAIT_MS {
@@ -41,9 +43,9 @@ pub(super) fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Re
     // current, so an old reader never sees a new epoch's revision as its own.
     if params.epoch.as_deref().is_some_and(|named| named != epoch) {
         let (revision, _) = hub.current();
-        return Response::ok(
+        return respond(
             &request.id,
-            json!(ObservationGetResponse::expired(epoch, revision)),
+            Ok(ObservationGetResponse::expired(epoch, revision)),
         );
     }
     // Demand is recorded before the answer, so the class this read asked for is
@@ -54,17 +56,17 @@ pub(super) fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Re
     if revision == 0 && params.since_revision.is_none() {
         // Nothing has ever been sampled: this read is the first demand, and a
         // snapshot is not a thing that can be invented for it.
-        return Response::ok(
+        return respond(
             &request.id,
-            json!(ObservationGetResponse::not_modified(epoch, 0)),
+            Ok(ObservationGetResponse::not_modified(epoch, 0)),
         );
     }
     if let Some(since) = params.since_revision {
         // A revision this epoch never had is expired, not merely old.
         if since > revision {
-            return Response::ok(
+            return respond(
                 &request.id,
-                json!(ObservationGetResponse::expired(epoch, revision)),
+                Ok(ObservationGetResponse::expired(epoch, revision)),
             );
         }
         if since == revision && wait > 0 {
@@ -72,43 +74,31 @@ pub(super) fn read_observation(core: &Arc<Mutex<Core>>, request: &Request) -> Re
             revision = hub.current().0;
         }
         if since == revision {
-            return Response::ok(
+            return respond(
                 &request.id,
-                json!(ObservationGetResponse::not_modified(epoch, revision)),
+                Ok(ObservationGetResponse::not_modified(epoch, revision)),
             );
         }
     }
     let (current, snapshot) = hub.current();
     let Some(snapshot) = snapshot else {
         // Nothing has been sampled yet: that is not a fleet, and not a failure.
-        return Response::ok(
+        return respond(
             &request.id,
-            json!(ObservationGetResponse::not_modified(epoch, current)),
+            Ok(ObservationGetResponse::not_modified(epoch, current)),
         );
     };
     if !snapshot.fits() {
-        return Response::ok(
+        return respond(
             &request.id,
-            json!(ObservationGetResponse::too_large(
+            Ok(ObservationGetResponse::too_large(
                 snapshot.epoch.clone(),
                 snapshot.revision,
                 crate::control_plane::observation::MAX_SNAPSHOT_BYTES,
             )),
         );
     }
-    let value = match serde_json::to_value(ObservationGetResponse::snapshot(&snapshot)) {
-        Ok(value) => value,
-        Err(error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::Internal,
-                    format!("the observation snapshot is not serializable: {error}"),
-                ),
-            );
-        }
-    };
-    Response::ok(&request.id, value)
+    respond(&request.id, Ok(ObservationGetResponse::snapshot(&snapshot)))
 }
 
 /// Serves one mux read from the backend.
@@ -120,8 +110,25 @@ pub(super) fn read_backend(core: &Arc<Mutex<Core>>, request: &Request) -> Respon
     if request.method == protocol::OUTPUT_METHOD {
         return read_output(core, request);
     }
-    if request.method == protocol::OBSERVE_METHOD
-        && !request.params.as_object().is_some_and(|o| o.is_empty())
+    if request.method == protocol::PROCESS_INFO_METHOD {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            pane_id: String,
+        }
+        let params: Params = match decode_params(request) {
+            Ok(params) => params,
+            Err(refusal) => return Response::refused(&request.id, &refusal),
+        };
+        return respond(
+            &request.id,
+            foreground_read(core, &params.pane_id).map(|evidence| Evidence { evidence }),
+        );
+    }
+    if !request
+        .params
+        .as_object()
+        .is_some_and(|object| object.is_empty())
     {
         return Response::refused(
             &request.id,
@@ -131,80 +138,53 @@ pub(super) fn read_backend(core: &Arc<Mutex<Core>>, request: &Request) -> Respon
             ),
         );
     }
-    let pane = if request.method == protocol::PROCESS_INFO_METHOD {
-        let pane = match request.required_string("pane_id") {
-            Ok(pane) => pane,
-            Err(refusal) => return Response::refused(&request.id, &refusal),
-        };
-        if request
-            .params
-            .as_object()
-            .is_none_or(|object| object.keys().any(|key| key != "pane_id"))
-        {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`{}` accepts only pane_id", protocol::PROCESS_INFO_METHOD),
-                ),
-            );
-        }
-        Some(pane)
-    } else {
-        if !request
-            .params
-            .as_object()
-            .is_some_and(|object| object.is_empty())
-        {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::BadParams,
-                    format!("`{}` accepts no params", protocol::OBSERVE_METHOD),
-                ),
-            );
-        }
-        None
-    };
     let (backend, cancel) = {
         let core = locked(core);
         (core.backend.clone(), Arc::clone(&core.stopping))
     };
     let Some(backend) = backend else {
-        let (code, message) = ops::read_unavailable(&request.method);
+        let (code, message) = ops::read_unavailable(protocol::OBSERVE_METHOD);
         return Response::refused(&request.id, &Refusal::new(code, message));
     };
-    if let Some(refusal) = primitive_refuse(&backend, &request.method) {
+    if let Some(refusal) = primitive_refuse(&backend, protocol::OBSERVE_METHOD) {
         return Response::refused(&request.id, &refusal);
     }
-    if let Some(pane_id) = pane {
-        if !valid_identifier(&pane_id) {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(Code::BadParams, "`pane_id` is not a valid identifier"),
-            );
+    let result = match backend.inventory(&cancel) {
+        Ok(_) if cancel.load(Ordering::SeqCst) => {
+            Err(Refusal::new(Code::BackendUnavailable, "daemon is stopping"))
         }
-        let evidence = backend.foreground_evidence(&pane_id, &cancel);
-        if cancel.load(Ordering::SeqCst) {
-            Response::refused(
-                &request.id,
-                &Refusal::new(Code::BackendUnavailable, "daemon is stopping"),
-            )
-        } else {
-            Response::ok(&request.id, json!({"evidence": evidence}))
-        }
-    } else {
-        match backend.inventory(&cancel) {
-            Ok(_) if cancel.load(Ordering::SeqCst) => Response::refused(
-                &request.id,
-                &Refusal::new(Code::BackendUnavailable, "daemon is stopping"),
-            ),
-            Ok(inventory) => Response::ok(&request.id, json!({"inventory": inventory})),
+        Ok(inventory) => Ok(Inventory { inventory }),
+        Err(error) => Err(Refusal::new(Code::BackendUnavailable, error)),
+    };
+    respond(&request.id, result)
+}
 
-            Err(error) => {
-                Response::refused(&request.id, &Refusal::new(Code::BackendUnavailable, error))
-            }
-        }
+pub(super) fn foreground_read(
+    core: &Arc<Mutex<Core>>,
+    pane_id: &str,
+) -> Result<crate::model::ForegroundEvidence, Refusal> {
+    if !valid_identifier(pane_id) {
+        return Err(Refusal::new(
+            Code::BadParams,
+            "`pane_id` is not a valid identifier",
+        ));
+    }
+    let (backend, cancel) = {
+        let core = locked(core);
+        (core.backend.clone(), Arc::clone(&core.stopping))
+    };
+    let backend = backend.ok_or_else(|| {
+        let (code, message) = ops::read_unavailable(protocol::PROCESS_INFO_METHOD);
+        Refusal::new(code, message)
+    })?;
+    if let Some(refusal) = primitive_refuse(&backend, protocol::PROCESS_INFO_METHOD) {
+        return Err(refusal);
+    }
+    let evidence = backend.foreground_evidence(pane_id, &cancel);
+    if cancel.load(Ordering::SeqCst) {
+        Err(Refusal::new(Code::BackendUnavailable, "daemon is stopping"))
+    } else {
+        Ok(evidence)
     }
 }
 
@@ -240,50 +220,49 @@ pub(super) fn read_output(core: &Arc<Mutex<Core>>, request: &Request) -> Respons
             );
         }
     };
+    respond(
+        &request.id,
+        output_read(core, output).map(|output| Output { output }),
+    )
+}
+
+pub(super) fn output_read(
+    core: &Arc<Mutex<Core>>,
+    output: OutputRequest,
+) -> Result<OutputRead, Refusal> {
     if !valid_identifier(&output.pane_id) {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(Code::BadParams, "`pane_id` is not a valid identifier"),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            "`pane_id` is not a valid identifier",
+        ));
     }
     if output
         .lines
         .is_some_and(|lines| lines == 0 || lines > MAX_OUTPUT_LINES)
     {
-        return Response::refused(
-            &request.id,
-            &Refusal::new(
-                Code::BadParams,
-                format!("`lines` must be between 1 and {MAX_OUTPUT_LINES}"),
-            ),
-        );
+        return Err(Refusal::new(
+            Code::BadParams,
+            format!("`lines` must be between 1 and {MAX_OUTPUT_LINES}"),
+        ));
     }
     let (backend, cancel) = {
         let core = locked(core);
         (core.backend.clone(), Arc::clone(&core.stopping))
     };
     let Some(backend) = backend else {
-        let (code, message) = ops::read_unavailable(&request.method);
-        return Response::refused(&request.id, &Refusal::new(code, message));
+        let (code, message) = ops::read_unavailable(protocol::OUTPUT_METHOD);
+        return Err(Refusal::new(code, message));
     };
-    if let Some(refusal) = primitive_refuse(&backend, &request.method) {
-        return Response::refused(&request.id, &refusal);
+    if let Some(refusal) = primitive_refuse(&backend, protocol::OUTPUT_METHOD) {
+        return Err(refusal);
     }
     match backend.output(&output, &cancel) {
-        OutputOutcome::Completed(_) if cancel.load(Ordering::SeqCst) => Response::refused(
-            &request.id,
-            &Refusal::new(Code::BackendUnavailable, "daemon is stopping"),
-        ),
-        OutputOutcome::Completed(read) => {
-            Response::ok(&request.id, json!({ "output": bounded(read) }))
+        OutputOutcome::Completed(_) if cancel.load(Ordering::SeqCst) => {
+            Err(Refusal::new(Code::BackendUnavailable, "daemon is stopping"))
         }
-        OutputOutcome::Refused(message) => {
-            Response::refused(&request.id, &Refusal::new(Code::Refused, message))
-        }
-        OutputOutcome::Unknown(message) => Response::refused(
-            &request.id,
-            &Refusal::new(Code::BackendUnavailable, message),
-        ),
+        OutputOutcome::Completed(read) => Ok(bounded(read)),
+        OutputOutcome::Refused(message) => Err(Refusal::new(Code::Refused, message)),
+        OutputOutcome::Unknown(message) => Err(Refusal::new(Code::BackendUnavailable, message)),
     }
 }
 
@@ -311,7 +290,7 @@ pub(super) fn read_one(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     };
     let core = locked(core);
     match core.store.get(&id) {
-        Ok(Some(record)) => Response::ok(&request.id, json!({ "request": record.public() })),
+        Ok(Some(record)) => respond(&request.id, Ok(Answer::of(record))),
         Ok(None) => Response::refused(
             &request.id,
             &Refusal::new(Code::NotFound, format!("no request {id}")),
@@ -326,7 +305,7 @@ pub(super) const MAX_TASKS_LIMIT: usize = 256;
 pub(super) fn read_tasks(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     let params: TasksListParams = match decode_params(request) {
         Ok(params) => params,
-        Err(response) => return response,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
     };
     let limit = params.limit.unwrap_or(DEFAULT_TASKS_LIMIT);
     if limit == 0 || limit > MAX_TASKS_LIMIT {
@@ -352,9 +331,13 @@ pub(super) fn read_tasks(core: &Arc<Mutex<Core>>, request: &Request) -> Response
         );
     };
     let (revision, sessions, next_after) = ingest.list(params.after.as_deref(), limit);
-    Response::ok(
+    respond(
         &request.id,
-        json!({"revision": revision, "sessions": sessions, "next_after": next_after}),
+        Ok(crate::control_plane::answer::TasksPage {
+            revision,
+            sessions,
+            next_after,
+        }),
     )
 }
 
@@ -405,7 +388,7 @@ pub(super) fn read_events(
 ) -> Response {
     let params: EventsReadParams = match decode_params(request) {
         Ok(params) => params,
-        Err(response) => return response,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
     };
     let limit = params.limit.unwrap_or(DEFAULT_EVENT_LIMIT);
     if limit == 0 || limit > MAX_EVENT_LIMIT {
@@ -448,11 +431,18 @@ pub(super) fn read_events(
             || after > tail
             || after.saturating_add(1) < earliest
         {
-            return Response::ok(
+            return respond(
                 &request.id,
-                json!({"cursor_expired": {
-                    "epoch": epoch, "cursor": {"epoch": epoch, "sequence": tail}, "earliest": earliest
-                }}),
+                Ok(answers::ExpiredEvents {
+                    cursor_expired: answers::CursorExpired {
+                        epoch: epoch.clone(),
+                        cursor: answers::Cursor {
+                            epoch,
+                            sequence: tail,
+                        },
+                        earliest,
+                    },
+                }),
             );
         }
         // The cursor is where a consumer resumes, so it names the last event
@@ -467,10 +457,18 @@ pub(super) fn read_events(
             || stopping.load(Ordering::SeqCst)
             || Instant::now() >= deadline
         {
-            return Response::ok(
+            return respond(
                 &request.id,
-                json!({
-                    "epoch": epoch, "events": available, "cursor": {"epoch": epoch, "sequence": cursor}, "tail": tail, "more": more, "earliest": earliest
+                Ok(answers::Events {
+                    epoch: epoch.clone(),
+                    events: available,
+                    cursor: answers::Cursor {
+                        epoch,
+                        sequence: cursor,
+                    },
+                    tail,
+                    more,
+                    earliest,
                 }),
             );
         }
@@ -521,9 +519,15 @@ pub(super) fn read_many(core: &Arc<Mutex<Core>>, request: &Request) -> Response 
     {
         let core = locked(core);
         return match core.store.unfinished() {
-            Ok(records) => Response::ok(
+            Ok(records) => respond(
                 &request.id,
-                json!({ "requests": records.into_iter().take(MAX_LISTED).map(RequestRecord::public).collect::<Vec<_>>() }),
+                Ok(Requests {
+                    requests: records
+                        .into_iter()
+                        .take(MAX_LISTED)
+                        .map(RequestRecord::public)
+                        .collect(),
+                }),
             ),
             Err(message) => Response::refused(&request.id, &Refusal::new(Code::Internal, message)),
         };
@@ -534,9 +538,11 @@ pub(super) fn read_many(core: &Arc<Mutex<Core>>, request: &Request) -> Response 
     };
     let core = locked(core);
     match core.store.recent(limit) {
-        Ok(records) => Response::ok(
+        Ok(records) => respond(
             &request.id,
-            json!({ "requests": records.into_iter().map(RequestRecord::public).collect::<Vec<_>>() }),
+            Ok(Requests {
+                requests: records.into_iter().map(RequestRecord::public).collect(),
+            }),
         ),
         Err(message) => Response::refused(&request.id, &Refusal::new(Code::Internal, message)),
     }
