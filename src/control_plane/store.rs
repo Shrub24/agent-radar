@@ -134,23 +134,106 @@ pub fn ttl_seconds(method: &str) -> u64 {
     if method == "resume" { 120 } else { 30 }
 }
 
-/// The categories a record's refusals are grouped under. These are the words the
-/// UI and the later slices match on, so they live here rather than at each site
-/// that writes one.
-pub struct Category;
-
-impl Category {
+/// The group a record's refusal or uncertainty falls under. These are the words
+/// the UI and later slices match on, so they are one vocabulary here rather than
+/// a string at each site that writes one. A word this build does not know, read
+/// from an older or newer record, is kept and written back unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum Category {
     /// The request was never claimed and its expiry passed: nothing ran.
-    pub const NOT_EXECUTED: &'static str = "not_executed";
+    NotExecuted,
     /// A request for the same target and method was already unresolved.
-    pub const IN_FLIGHT: &'static str = "in_flight";
+    InFlight,
     /// The operation needs a mux backend this daemon has not been given.
-    pub const BACKEND_UNAVAILABLE: &'static str = "backend_unavailable";
+    BackendUnavailable,
     /// The backend gave an explicit refusal before reporting success.
-    pub const BACKEND_REFUSED: &'static str = "backend_refused";
+    BackendRefused,
     /// The daemon refused the operation itself: an ineligible target, a frozen
     /// target that no longer matches, or an effect it will not dispatch.
-    pub const REFUSED: &'static str = "refused";
+    Refused,
+    Other(String),
+}
+
+impl From<String> for Category {
+    fn from(word: String) -> Self {
+        match word.as_str() {
+            "not_executed" => Self::NotExecuted,
+            "in_flight" => Self::InFlight,
+            "backend_unavailable" => Self::BackendUnavailable,
+            "backend_refused" => Self::BackendRefused,
+            "refused" => Self::Refused,
+            _ => Self::Other(word),
+        }
+    }
+}
+
+impl From<Category> for String {
+    fn from(category: Category) -> Self {
+        match category {
+            Category::NotExecuted => "not_executed".into(),
+            Category::InFlight => "in_flight".into(),
+            Category::BackendUnavailable => "backend_unavailable".into(),
+            Category::BackendRefused => "backend_refused".into(),
+            Category::Refused => "refused".into(),
+            Category::Other(word) => word,
+        }
+    }
+}
+
+/// What a request's execution established, written once as its record's verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settlement {
+    pub outcome: RequestOutcome,
+    pub category: Option<Category>,
+    pub message: Option<String>,
+    pub effects: Vec<String>,
+}
+
+impl Settlement {
+    pub fn new(
+        outcome: RequestOutcome,
+        category: Option<Category>,
+        message: Option<&str>,
+        effects: Vec<String>,
+    ) -> Self {
+        Self {
+            outcome,
+            category,
+            message: message.map(str::to_string),
+            effects,
+        }
+    }
+
+    /// The operation ran and these are the effects it had.
+    pub fn completed(effects: Vec<String>) -> Self {
+        Self::new(RequestOutcome::Completed, None, None, effects)
+    }
+
+    /// The daemon declined before any effect, under a category.
+    pub fn refused(category: Category, message: impl Into<String>) -> Self {
+        Self {
+            outcome: RequestOutcome::Refused,
+            category: Some(category),
+            message: Some(message.into()),
+            effects: Vec::new(),
+        }
+    }
+
+    /// The backend said it would not do it.
+    pub fn backend_refused(message: impl Into<String>) -> Self {
+        Self::refused(Category::BackendRefused, message)
+    }
+
+    /// The backend was asked and cannot say what happened.
+    pub fn backend_unknown(message: impl Into<String>) -> Self {
+        Self {
+            outcome: RequestOutcome::Unknown,
+            category: Some(Category::BackendUnavailable),
+            message: Some(message.into()),
+            effects: Vec::new(),
+        }
+    }
 }
 
 /// What has happened to a request so far. Written in order; `Completed` is
@@ -205,7 +288,7 @@ pub struct RequestRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<RequestOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
+    pub category: Option<Category>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default)]
@@ -261,6 +344,31 @@ impl RequestRecord {
         }
     }
 
+    /// The record as a caller may read it: launch environment and argv stay in
+    /// the stored record, which compares retries exactly, and are not published.
+    pub fn public(mut self) -> Self {
+        if let Some(params) = self.params.as_mut() {
+            if let Some(request) = params
+                .get_mut("request")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                request.remove("env");
+                request.remove("argv");
+            }
+            if let Some(params) = params.as_object_mut() {
+                params.remove("env");
+            }
+        }
+        self
+    }
+
+    /// The recorded verdict, once there is one. A record that is not completed
+    /// has no outcome to read: the daemon may still execute it.
+    pub fn settled(&self) -> Option<RequestOutcome> {
+        self.outcome
+            .filter(|_| self.state == RecordState::Completed)
+    }
+
     /// Stores canonical request params for exact semantic retry comparison.
     pub fn with_params(mut self, params: serde_json::Value) -> Self {
         self.params = Some(params);
@@ -292,23 +400,16 @@ impl RequestRecord {
     /// Records the terminal outcome. A record that is already complete is
     /// returned unchanged: an outcome is written once, and a second writer — a
     /// restarting daemon, say — must not overwrite the first answer.
-    pub fn complete(
-        &self,
-        outcome: RequestOutcome,
-        category: Option<&str>,
-        message: Option<&str>,
-        effects: Vec<String>,
-        now_ms: i64,
-    ) -> Self {
+    pub fn complete(&self, settlement: Settlement, now_ms: i64) -> Self {
         if self.state == RecordState::Completed {
             return self.clone();
         }
         Self {
             state: RecordState::Completed,
-            outcome: Some(outcome),
-            category: category.map(str::to_string),
-            message: message.map(str::to_string),
-            effects,
+            outcome: Some(settlement.outcome),
+            category: settlement.category,
+            message: settlement.message,
+            effects: settlement.effects,
             completed_at: Some(format_millis(now_ms)),
             ..self.clone()
         }
@@ -1202,23 +1303,21 @@ mod tests {
         store.create(&pending).expect("the private seed");
         let started = pending.claim().start();
         store.write(&started).expect("the started projection");
-        let settled = started.clone().complete(
-            RequestOutcome::Completed,
-            None,
-            None,
-            vec!["launch revoked".into()],
-            5,
-        );
+        let settled = started
+            .clone()
+            .complete(Settlement::completed(vec!["launch revoked".into()]), 5);
         store.write(&settled).expect("the settled projection");
         let first = store.get(&id).expect("read").expect("the record");
         assert_eq!(first.state, RecordState::Completed, "it settled on disk");
         // A later answer cannot walk a settled outcome backwards: the recovery
         // path must not be able to invent an `unknown` where a verdict exists.
         let regressed = started.clone().complete(
-            RequestOutcome::Unknown,
-            None,
-            Some("managed scope membership is unresolved"),
-            Vec::new(),
+            Settlement::new(
+                RequestOutcome::Unknown,
+                None,
+                Some("managed scope membership is unresolved"),
+                Vec::new(),
+            ),
             6,
         );
         assert!(
@@ -1293,7 +1392,7 @@ mod tests {
             0,
         );
         store.create(&other).expect("create");
-        let settled = other.complete(RequestOutcome::Completed, None, None, Vec::new(), 1);
+        let settled = other.complete(Settlement::completed(Vec::new()), 1);
         store.write(&settled).expect("settle");
         let refused = store
             .abandon(&other.id, 2)
@@ -1418,10 +1517,12 @@ mod tests {
         let store = Store::open(&directory).expect("a store");
         let mut wanted = record("close", Some("pane:3"), 1_000);
         wanted = wanted.complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some("no backend"),
-            vec!["nothing_run".into()],
+            Settlement::new(
+                RequestOutcome::Refused,
+                Some(Category::BackendUnavailable),
+                Some("no backend"),
+                vec!["nothing_run".into()],
+            ),
             1_100,
         );
         store.create(&wanted).expect("a create");
@@ -1452,10 +1553,12 @@ mod tests {
             let store = Store::open(&directory).expect("a store");
             let record = RequestRecord::new(&id, "close", None, Some("pane:1".into()), 5_000)
                 .complete(
-                    RequestOutcome::Completed,
-                    None,
-                    Some("closed"),
-                    vec!["pane_closed".into()],
+                    Settlement::new(
+                        RequestOutcome::Completed,
+                        None,
+                        Some("closed"),
+                        vec!["pane_closed".into()],
+                    ),
                     5_200,
                 );
             store.create(&record).expect("a create");
@@ -1499,10 +1602,7 @@ mod tests {
         let directory = tempdir("same-id");
         let store = Store::open(&directory).expect("a store");
         let first = record("close", Some("pane:1"), 1_000).complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some("no backend"),
-            Vec::new(),
+            Settlement::refused(Category::BackendUnavailable, "no backend"),
             1_100,
         );
         store.create(&first).expect("create the first record");
@@ -1527,13 +1627,8 @@ mod tests {
     fn an_unknown_focus_never_holds_its_target_against_a_mutation() {
         let directory = tempdir("focus-unknown");
         let store = Store::open(&directory).expect("a store");
-        let focus = record("mux.focus", Some("ws:1"), 1_000).complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some("no current client"),
-            Vec::new(),
-            1_100,
-        );
+        let focus = record("mux.focus", Some("ws:1"), 1_000)
+            .complete(Settlement::backend_unknown("no current client"), 1_100);
         store.create(&focus).expect("a create");
         assert!(
             store
@@ -1543,13 +1638,8 @@ mod tests {
             "a focus that came to unknown blocked a later creation"
         );
         // A mutation that came to unknown still does.
-        let mut close = record("mux.close", Some("ws:2"), 1_000).complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some("lost"),
-            Vec::new(),
-            1_100,
-        );
+        let mut close = record("mux.close", Some("ws:2"), 1_000)
+            .complete(Settlement::backend_unknown("lost"), 1_100);
         close.id = random_uuid();
         store.create(&close).expect("a create");
         assert!(
@@ -1616,10 +1706,7 @@ mod tests {
         assert_eq!(pending.claim().derive(31_000), Derived::Unknown);
         assert_eq!(pending.start().derive(1_100), Derived::Unknown);
         let refused = pending.complete(
-            RequestOutcome::Refused,
-            Some(Category::IN_FLIGHT),
-            Some("already in flight"),
-            Vec::new(),
+            Settlement::refused(Category::InFlight, "already in flight"),
             1_200,
         );
         assert_eq!(
@@ -1667,10 +1754,7 @@ mod tests {
             );
             store.create(&newer).expect("pending record");
             let done = newer.complete(
-                RequestOutcome::Completed,
-                None,
-                Some("done"),
-                Vec::new(),
+                Settlement::new(RequestOutcome::Completed, None, Some("done"), Vec::new()),
                 3_000,
             );
             store.write(&done).expect("completed record");
@@ -1696,13 +1780,17 @@ mod tests {
     #[test]
     fn an_outcome_is_written_once() {
         let pending = record("close", None, 1_000);
-        let refused =
-            pending.complete(RequestOutcome::Refused, None, Some("no"), Vec::new(), 1_100);
+        let refused = pending.complete(
+            Settlement::new(RequestOutcome::Refused, None, Some("no"), Vec::new()),
+            1_100,
+        );
         let again = refused.complete(
-            RequestOutcome::Completed,
-            None,
-            Some("yes"),
-            vec!["pane_closed".into()],
+            Settlement::new(
+                RequestOutcome::Completed,
+                None,
+                Some("yes"),
+                vec!["pane_closed".into()],
+            ),
             1_200,
         );
         assert_eq!(again, refused);

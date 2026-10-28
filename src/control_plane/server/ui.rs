@@ -5,7 +5,10 @@
 use serde_json::json;
 
 use super::Request;
+use crate::control_plane::Code;
 use crate::control_plane::public_contracts::ui_session as dto;
+use crate::control_plane::answer::Answer;
+use crate::control_plane::store::{RequestOutcome, RequestRecord};
 
 /// Reuses domain admission directly, not a self-RPC or a second creation path.
 pub(super) fn execute(
@@ -21,8 +24,9 @@ pub(super) fn execute(
                 .and_then(|core| super::locked(&core).store.get(&id).ok().flatten());
             return match record {
                 Some(record) => {
-                    let answer = json!({"result": { "request": super::public_record(record) }});
-                    dto::CommandOutcome::answering(&id, outcome_status(&answer), answer)
+                    let status = record_status(&record);
+                    let answer = json!({"result": { "request": record.public() }});
+                    dto::CommandOutcome::answering(&id, status, answer)
                 }
                 None => dto::CommandOutcome::new(&id, dto::CommandStatus::SubmissionUncertain),
             };
@@ -119,27 +123,40 @@ pub(super) fn execute(
         }
         _ => return dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::Refused),
     };
+    let status = response_status(&response);
     let answer = serde_json::to_value(response).expect("serialize domain response");
-    dto::CommandOutcome::answering(&job.request_id, outcome_status(&answer), answer)
+    dto::CommandOutcome::answering(&job.request_id, status, answer)
 }
 
-/// Domain operations answer JSON, so the status is read from the answer that will
-/// be sent: one fact, not a parallel judgement about it.
-fn outcome_status(answer: &serde_json::Value) -> dto::CommandStatus {
+/// What a record establishes for the operator: its verdict once settled, and
+/// otherwise only that the daemon has taken it.
+fn record_status(record: &RequestRecord) -> dto::CommandStatus {
     use dto::CommandStatus as S;
-    match answer
-        .pointer("/result/request/outcome")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("completed") => S::Completed,
-        Some("refused") => S::Refused,
-        Some("unknown") => S::Unknown,
-        _ if answer.pointer("/result/request").is_some() => S::Admitted,
-        _ => match answer
-            .pointer("/error/code")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("bad_params" | "refused" | "busy" | "backend_unavailable") => S::Refused,
+    match record.settled() {
+        Some(RequestOutcome::Completed) => S::Completed,
+        Some(RequestOutcome::Refused) => S::Refused,
+        Some(RequestOutcome::Unknown) => S::Unknown,
+        None => S::Admitted,
+    }
+}
+
+/// What a domain response establishes. A refusal before admission is definite
+/// only for the codes that say nothing was recorded; any other error leaves the
+/// outcome unestablished.
+fn response_status(response: &super::Response) -> dto::CommandStatus {
+    use dto::CommandStatus as S;
+    match response {
+        super::Response::Result { result, .. } => {
+            use serde::Deserialize;
+            match Answer::deserialize(result) {
+                Ok(answer) => record_status(&answer.request),
+                Err(_) => S::SubmissionUncertain,
+            }
+        }
+        super::Response::Error { error, .. } => match error.code() {
+            Some(Code::BadParams | Code::Refused | Code::Busy | Code::BackendUnavailable) => {
+                S::Refused
+            }
             _ => S::SubmissionUncertain,
         },
     }

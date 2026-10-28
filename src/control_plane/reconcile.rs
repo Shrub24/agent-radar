@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::lifecycle::{self, State};
 use super::registry::{ProcessVerifier, Registry};
-use super::store::{RecordState, RequestOutcome, RequestRecord, Store};
+use super::store::{RecordState, RequestOutcome, RequestRecord, Settlement, Store};
 
 /// Most unresolved records one pass reports. A pass is bounded so a long history
 /// cannot make one response unbounded; `examined` still counts them all.
@@ -127,7 +127,10 @@ pub fn unresolved(
             );
             continue;
         }
-        store.write(&record.complete(outcome, None, Some(&reason), Vec::new(), now_ms))?;
+        store.write(&record.complete(
+            Settlement::new(outcome, None, Some(&reason), Vec::new()),
+            now_ms,
+        ))?;
         resolved += 1;
     }
     Ok(Outcome {

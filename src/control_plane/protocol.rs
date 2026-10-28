@@ -96,6 +96,17 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+impl ErrorBody {
+    /// The code as the protocol's vocabulary, if this daemon's build knows it.
+    pub fn code(&self) -> Option<Code> {
+        use serde::de::{IntoDeserializer, value::Error};
+        Code::deserialize(IntoDeserializer::<Error>::into_deserializer(
+            self.code.as_str(),
+        ))
+        .ok()
+    }
+}
+
 /// A refusal the daemon can state: the code a caller switches on and the
 /// sentence a human reads.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

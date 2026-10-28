@@ -20,7 +20,7 @@ pub(super) fn execute_unsupported(
             if record.method == operation.as_str()
                 && record.params.as_ref() == Some(&request.params) =>
         {
-            return Response::ok(&request.id, json!({"request": public_record(record)}));
+            return Response::ok(&request.id, json!({"request": record.public()}));
         }
         Ok(Some(_)) => {
             return Response::refused(
@@ -45,13 +45,7 @@ pub(super) fn execute_unsupported(
                 now,
             )
             .with_params(request.params.clone())
-            .complete(
-                RequestOutcome::Refused,
-                Some(Category::IN_FLIGHT),
-                Some(&message),
-                Vec::new(),
-                now,
-            );
+            .complete(Settlement::refused(Category::InFlight, &message), now);
             if let Err(error) = core.store.create(&record) {
                 return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
             }
@@ -65,16 +59,13 @@ pub(super) fn execute_unsupported(
     let record = RequestRecord::new(&request.id, operation.as_str(), requester, target, now)
         .with_params(request.params.clone())
         .complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(message),
-            Vec::new(),
+            Settlement::refused(Category::BackendUnavailable, message),
             now,
         );
     if let Err(error) = core.store.create(&record) {
         return Response::refused(&request.id, &Refusal::new(Code::Internal, error));
     }
-    Response::ok(&request.id, json!({"request": public_record(record)}))
+    Response::ok(&request.id, json!({"request": record.public()}))
 }
 
 /// Validates, records and dispatches one effectful operation without holding
@@ -187,20 +178,19 @@ pub(super) fn execute_abandon(request: &Request, core: &Arc<Mutex<Core>>) -> Res
     // leaves a record that blocks a later attempt.
     let done = match abandoned {
         Ok(abandoned) => record.complete(
-            RequestOutcome::Completed,
-            None,
-            Some(&format!(
-                "released the administrative block of `{}`; its effect remains unestablished",
-                abandoned.id
-            )),
-            vec!["abandon".into()],
+            Settlement::new(
+                RequestOutcome::Completed,
+                None,
+                Some(&format!(
+                    "released the administrative block of `{}`; its effect remains unestablished",
+                    abandoned.id
+                )),
+                vec!["abandon".into()],
+            ),
             store::now_ms(),
         ),
         Err(error) => record.complete(
-            RequestOutcome::Refused,
-            Some(Category::REFUSED),
-            Some(&error),
-            Vec::new(),
+            Settlement::refused(Category::Refused, &error),
             store::now_ms(),
         ),
     };
@@ -271,7 +261,7 @@ pub(super) fn replay_existing_operation_inner(
     if same {
         Some(Response::ok(
             &request.id,
-            json!({ "request": public_record(record) }),
+            json!({ "request": record.public() }),
         ))
     } else {
         Some(Response::refused(
@@ -307,7 +297,7 @@ pub(super) fn admit(
                 && record.requester == *requester
                 && record.params.as_ref() == Some(&request.params);
             if same {
-                let mut result = json!({ "request": public_record(record.clone()) });
+                let mut result = json!({ "request": record.clone().public() });
                 // A replayed creation names the container its first answer named,
                 // so a caller recovering from a lost answer reads the identity it
                 // already made instead of searching the tree for it. No other
@@ -381,13 +371,7 @@ pub(super) fn admit(
             now,
         )
         .with_params(request.params.clone())
-        .complete(
-            RequestOutcome::Refused,
-            Some(Category::IN_FLIGHT),
-            Some(&message),
-            Vec::new(),
-            now,
-        );
+        .complete(Settlement::refused(Category::InFlight, &message), now);
         let core = locked(core);
         if let Err(error) = core.store.create(&record) {
             return Admission::Answered(Response::refused(

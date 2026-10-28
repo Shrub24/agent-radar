@@ -50,26 +50,15 @@ pub(super) fn execute_input(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
         .with_params(request.params.clone());
     let done = match backend.input(&input, &cancel) {
         InputOutcome::Completed => record.complete(
-            RequestOutcome::Completed,
-            None,
-            None,
-            vec![effect.to_string()],
+            Settlement::completed(vec![effect.to_string()]),
             store::now_ms(),
         ),
-        InputOutcome::Refused(message) => record.complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
-        InputOutcome::Unknown(message) => record.complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
+        InputOutcome::Refused(message) => {
+            record.complete(Settlement::backend_refused(&message), store::now_ms())
+        }
+        InputOutcome::Unknown(message) => {
+            record.complete(Settlement::backend_unknown(&message), store::now_ms())
+        }
     };
     write_settled(request, done, core)
 }
@@ -125,26 +114,15 @@ pub(super) fn execute_report(request: &Request, core: &Arc<Mutex<Core>>) -> Resp
         .with_params(request.params.clone());
     let done = match backend.report(&report, &cancel) {
         ReportOutcome::Completed => record.complete(
-            RequestOutcome::Completed,
-            None,
-            None,
-            vec![report.effect()],
+            Settlement::completed(vec![report.effect()]),
             store::now_ms(),
         ),
-        ReportOutcome::Refused(message) => record.complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
-        ReportOutcome::Unknown(message) => record.complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
+        ReportOutcome::Refused(message) => {
+            record.complete(Settlement::backend_refused(&message), store::now_ms())
+        }
+        ReportOutcome::Unknown(message) => {
+            record.complete(Settlement::backend_unknown(&message), store::now_ms())
+        }
     };
     write_settled(request, done, core)
 }

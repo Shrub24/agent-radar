@@ -57,27 +57,15 @@ pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
         .with_params(request.params.clone());
     let outcome = backend.focus_outcome(&runtime_target, &cancel);
     let done = match outcome {
-        FocusOutcome::Completed => record.complete(
-            RequestOutcome::Completed,
-            None,
-            None,
-            vec!["focus".into()],
-            store::now_ms(),
-        ),
-        FocusOutcome::Refused(message) => record.complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
-        FocusOutcome::Unknown(message) => record.complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
+        FocusOutcome::Completed => {
+            record.complete(Settlement::completed(vec!["focus".into()]), store::now_ms())
+        }
+        FocusOutcome::Refused(message) => {
+            record.complete(Settlement::backend_refused(&message), store::now_ms())
+        }
+        FocusOutcome::Unknown(message) => {
+            record.complete(Settlement::backend_unknown(&message), store::now_ms())
+        }
     };
     write_settled(request, done, core)
 }
@@ -155,26 +143,20 @@ pub(super) fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Respo
         registrations,
     ) {
         DirectClose::Completed => record.complete(
-            RequestOutcome::Completed,
-            None,
-            Some("the runtime confirmed the close; its removal was not re-observed"),
-            vec!["close".into()],
+            Settlement::new(
+                RequestOutcome::Completed,
+                None,
+                Some("the runtime confirmed the close; its removal was not re-observed"),
+                vec!["close".into()],
+            ),
             store::now_ms(),
         ),
-        DirectClose::Refused(message) => record.complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
-        DirectClose::Unknown(message) => record.complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
+        DirectClose::Refused(message) => {
+            record.complete(Settlement::backend_refused(&message), store::now_ms())
+        }
+        DirectClose::Unknown(message) => {
+            record.complete(Settlement::backend_unknown(&message), store::now_ms())
+        }
     };
     write_settled(request, done, core)
 }
@@ -341,7 +323,7 @@ pub(super) fn write_created(
         Ok(()) => Response::ok(
             &request.id,
             json!({
-                "request": public_record(creation.record),
+                "request": creation.record.public(),
                 "container": creation.container.map(|container| container.public()),
             }),
         ),
@@ -537,13 +519,13 @@ pub(super) fn dispatch_creation(
                 }
                 Some(LaunchOutcome::Refused(message)) => {
                     notes.push(format!("the recipe was not launched: {message}"));
-                    (RequestOutcome::Refused, Some(Category::BACKEND_REFUSED))
+                    (RequestOutcome::Refused, Some(Category::BackendRefused))
                 }
                 Some(LaunchOutcome::Unknown(message)) => {
                     notes.push(format!(
                         "the recipe launch is unknown and is not retried: {message}"
                     ));
-                    (RequestOutcome::Unknown, Some(Category::BACKEND_UNAVAILABLE))
+                    (RequestOutcome::Unknown, Some(Category::BackendUnavailable))
                 }
                 None => (RequestOutcome::Completed, None),
             };
@@ -573,24 +555,19 @@ pub(super) fn dispatch_creation(
             return Ok(Creation {
                 record: record
                     .created(created.identity(create.created_kind()))
-                    .complete(outcome, category, note.as_deref(), effects, now),
+                    .complete(
+                        Settlement::new(outcome, category, note.as_deref(), effects),
+                        now,
+                    ),
                 container,
             });
         }
-        CreateOutcome::Refused(message) => record.complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
-        CreateOutcome::Unknown(message) => record.complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
+        CreateOutcome::Refused(message) => {
+            record.complete(Settlement::backend_refused(&message), store::now_ms())
+        }
+        CreateOutcome::Unknown(message) => {
+            record.complete(Settlement::backend_unknown(&message), store::now_ms())
+        }
     };
     Ok(Creation {
         record: done,
@@ -737,13 +714,15 @@ pub(super) fn execute_container_delete(
             }
         }
         let settled = record.complete(
-            RequestOutcome::Completed,
-            None,
-            Some(&format!(
-                "no place was recorded for this container; {} record(s) forgotten",
-                removed.len()
-            )),
-            vec!["container.removal".into()],
+            Settlement::new(
+                RequestOutcome::Completed,
+                None,
+                Some(&format!(
+                    "no place was recorded for this container; {} record(s) forgotten",
+                    removed.len()
+                )),
+                vec!["container.removal".into()],
+            ),
             now,
         );
         return write_deleted(request, settled, removed, core);
@@ -809,10 +788,12 @@ pub(super) fn execute_container_delete(
             )
         };
         let settled = record.complete(
-            RequestOutcome::Completed,
-            None,
-            Some(&note),
-            vec!["container.removal".into()],
+            Settlement::new(
+                RequestOutcome::Completed,
+                None,
+                Some(&note),
+                vec!["container.removal".into()],
+            ),
             now,
         );
         return write_deleted(request, settled, removed, core);
@@ -873,28 +854,22 @@ pub(super) fn execute_container_delete(
                 )
             };
             let settled = record.complete(
-                RequestOutcome::Completed,
-                None,
-                Some(&note),
-                vec!["close".into(), "container.removal".into()],
+                Settlement::new(
+                    RequestOutcome::Completed,
+                    None,
+                    Some(&note),
+                    vec!["close".into(), "container.removal".into()],
+                ),
                 now,
             );
             return write_deleted(request, settled, removed, core);
         }
-        DirectClose::Refused(message) => record.complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
-        DirectClose::Unknown(message) => record.complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
+        DirectClose::Refused(message) => {
+            record.complete(Settlement::backend_refused(&message), store::now_ms())
+        }
+        DirectClose::Unknown(message) => {
+            record.complete(Settlement::backend_unknown(&message), store::now_ms())
+        }
     };
     write_deleted(request, settled, Vec::new(), core)
 }
@@ -1070,28 +1045,22 @@ pub(super) fn execute_container_reload(
     );
     let settled = match launched {
         LaunchOutcome::Completed => record.complete(
-            RequestOutcome::Completed,
-            None,
-            Some(&format!(
-                "the recorded recipe was run again in {pane}; the container is unchanged"
-            )),
-            vec!["launch".into()],
+            Settlement::new(
+                RequestOutcome::Completed,
+                None,
+                Some(&format!(
+                    "the recorded recipe was run again in {pane}; the container is unchanged"
+                )),
+                vec!["launch".into()],
+            ),
             store::now_ms(),
         ),
-        LaunchOutcome::Refused(message) => record.complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
-        LaunchOutcome::Unknown(message) => record.complete(
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(&message),
-            Vec::new(),
-            store::now_ms(),
-        ),
+        LaunchOutcome::Refused(message) => {
+            record.complete(Settlement::backend_refused(&message), store::now_ms())
+        }
+        LaunchOutcome::Unknown(message) => {
+            record.complete(Settlement::backend_unknown(&message), store::now_ms())
+        }
     };
     write_reloaded(request, settled, Some(container), core)
 }
@@ -1108,10 +1077,7 @@ pub(super) fn reload_refused(
     write_reloaded(
         request,
         record.complete(
-            RequestOutcome::Refused,
-            Some(Category::REFUSED),
-            Some(message),
-            Vec::new(),
+            Settlement::refused(Category::Refused, message),
             store::now_ms(),
         ),
         container,
@@ -1148,7 +1114,7 @@ pub(super) fn write_settled_with(
     let core = locked(core);
     match core.store.write(&record) {
         Ok(()) => {
-            let mut body = json!({ "request": public_record(record) });
+            let mut body = json!({ "request": record.public() });
             if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
                 for (key, value) in extra {
                     body.insert(key.clone(), value.clone());
@@ -1168,25 +1134,10 @@ pub(super) fn write_refused(
     message: &str,
     core: &Arc<Mutex<Core>>,
 ) -> Response {
-    write_refused_with(request, record, Category::REFUSED, message, core)
-}
-
-/// A refusal filed under its own category, for the callers whose refusal the UI
-/// acts on rather than only reads.
-pub(super) fn write_refused_with(
-    request: &Request,
-    record: RequestRecord,
-    category: &'static str,
-    message: &str,
-    core: &Arc<Mutex<Core>>,
-) -> Response {
     write_deleted(
         request,
         record.complete(
-            RequestOutcome::Refused,
-            Some(category),
-            Some(message),
-            Vec::new(),
+            Settlement::refused(Category::Refused, message),
             store::now_ms(),
         ),
         Vec::new(),

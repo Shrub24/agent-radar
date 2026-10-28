@@ -42,7 +42,9 @@ use crate::control_plane::registry::{
     self, AcquireRequest, Channel, CloseAdmission, CloseOutcome, CloseResult, LocalProcfsVerifier,
     LocationEvidence, ProcessVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
 };
-use crate::control_plane::store::{self, Category, RequestOutcome, RequestRecord, Store};
+use crate::control_plane::store::{
+    self, Category, RequestOutcome, RequestRecord, Settlement, Store,
+};
 use crate::control_plane::transport::{
     Dispatch, EventReady, IngestDispatch, ListenerSource, StreamOpen, Transport,
 };
@@ -1071,7 +1073,7 @@ fn settle_spawn(
     match core.store.write(&record) {
         Ok(()) => Response::ok(
             &request.id,
-            json!({ "request": public_record(record), "spawn": edge.public() }),
+            json!({ "request": record.public(), "spawn": edge.public() }),
         ),
         Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     }
@@ -1096,7 +1098,7 @@ fn spawn_answer(request: &Request, response: Response, core: &Arc<Mutex<Core>>) 
     match (edge, result.get("request").cloned()) {
         (Ok(Some(edge)), Some(record)) => Response::ok(
             &id,
-            json!({ "request": public_record(serde_json::from_value(record).expect("stored public record shape")), "spawn": edge.public() }),
+            json!({ "request": serde_json::from_value::<RequestRecord>(record).expect("stored public record shape").public(), "spawn": edge.public() }),
         ),
         _ => Response::ok(&id, result),
     }
@@ -1106,7 +1108,7 @@ fn spawn_answer(request: &Request, response: Response, core: &Arc<Mutex<Core>>) 
 fn write_settled(request: &Request, record: RequestRecord, core: &Arc<Mutex<Core>>) -> Response {
     let core = locked(core);
     match core.store.write(&record) {
-        Ok(()) => Response::ok(&request.id, json!({ "request": public_record(record) })),
+        Ok(()) => Response::ok(&request.id, json!({ "request": record.public() })),
         Err(error) => Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     }
 }

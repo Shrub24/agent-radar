@@ -219,7 +219,7 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
 
 #[test]
 fn operation_results_replay_while_private_request_inputs_stay_out_of_events() {
-    use crate::control_plane::store::{RequestOutcome, RequestRecord, Store};
+    use crate::control_plane::store::{RequestRecord, Settlement, Store};
     let fixture = Fixture::new();
     let store = Store::open(&fixture.0).unwrap();
     let id = random_uuid();
@@ -242,13 +242,7 @@ fn operation_results_replay_while_private_request_inputs_stay_out_of_events() {
         store.create(&request).is_err(),
         "an interrupted intent remains reserved rather than dispatching again"
     );
-    let result = request.complete(
-        RequestOutcome::Completed,
-        None,
-        None,
-        vec!["process exited".into()],
-        2000,
-    );
+    let result = request.complete(Settlement::completed(vec!["process exited".into()]), 2000);
     store.write(&result).unwrap();
     assert_eq!(store.get(&id).unwrap(), Some(result.clone()));
     drop(store);

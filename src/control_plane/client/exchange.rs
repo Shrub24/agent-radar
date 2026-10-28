@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::super::answer::Answer;
+use super::super::store::RequestOutcome;
 use super::super::{MAX_LINE_BYTES, PROTOCOL_VERSION, random_uuid};
 use crate::runtime::{
     CloseOutcome, CreateOutcome, CreatedIdentity, FocusOutcome, InputOutcome, OutputOutcome,
@@ -119,38 +121,24 @@ impl Settled {
     /// has accepted the request and may still execute it, so nothing here may be
     /// read as "it did not happen".
     pub(super) fn of(result: &Value) -> Result<Self, Failure> {
-        let Some(record) = result.get("request") else {
+        let Ok(Answer { request: record, .. }) = Answer::deserialize(result) else {
             return Err(Failure::unknown(
                 "the daemon's answer carried no request record".to_string(),
             ));
         };
-        let created = record
-            .get("created")
-            .and_then(|value| serde_json::from_value::<CreatedIdentity>(value.clone()).ok());
-        let message = record
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let state = record.get("state").and_then(Value::as_str);
-        let outcome = record.get("outcome").and_then(Value::as_str);
-        match (state, outcome) {
-            (Some("completed"), Some("completed")) => Ok(Self::Completed(created)),
-            (Some("completed"), Some("refused")) => {
-                Ok(Self::Refused(message.unwrap_or_else(|| {
-                    "the daemon refused the operation".to_string()
-                })))
+        let message = |fallback: &str| record.message.clone().unwrap_or_else(|| fallback.into());
+        match record.settled() {
+            Some(RequestOutcome::Completed) => Ok(Self::Completed(record.created.clone())),
+            Some(RequestOutcome::Refused) => {
+                Ok(Self::Refused(message("the daemon refused the operation")))
             }
-            (Some("completed"), Some("unknown")) => {
-                Ok(Self::Unknown(message.unwrap_or_else(|| {
-                    "the daemon cannot say what the operation did".to_string()
-                })))
-            }
-            _ => {
-                let id = record.get("id").and_then(Value::as_str).unwrap_or("it");
-                Err(Failure::unknown(format!(
-                    "{id} is still unresolved: the daemon may yet execute it"
-                )))
-            }
+            Some(RequestOutcome::Unknown) => Ok(Self::Unknown(message(
+                "the daemon cannot say what the operation did",
+            ))),
+            None => Err(Failure::unknown(format!(
+                "{} is still unresolved: the daemon may yet execute it",
+                record.id
+            ))),
         }
     }
 

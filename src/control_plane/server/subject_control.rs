@@ -73,10 +73,7 @@ pub(super) fn execute_subject_control(
         )
         .with_params(request.params.clone())
         .complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some("the Pi session has no current granted presence claim"),
-            Vec::new(),
+            Settlement::backend_refused("the Pi session has no current granted presence claim"),
             store::now_ms(),
         );
         return write_settled(request, record, core);
@@ -108,14 +105,14 @@ pub(super) fn execute_subject_control(
         ),
         _ => None,
     };
-    let (outcome, category, message, effects) = match termination {
+    let settlement = match termination {
         Ok(termination) => {
             if let (subjects::Exit::Exited, Some(backend)) = (&termination.exit, &backend) {
                 retire_wake(backend, &subject_id, &stopping);
             }
             termination_outcome(&termination, operation, cleanup.as_ref())
         }
-        Err(error) => (RequestOutcome::Unknown, None, Some(error), Vec::new()),
+        Err(error) => Settlement::new(RequestOutcome::Unknown, None, Some(&error), Vec::new()),
     };
     let record = RequestRecord::new(
         &request.id,
@@ -125,13 +122,7 @@ pub(super) fn execute_subject_control(
         now,
     )
     .with_params(request.params.clone())
-    .complete(
-        outcome,
-        category,
-        message.as_deref(),
-        effects,
-        store::now_ms(),
-    );
+    .complete(settlement, store::now_ms());
     write_settled(request, record, core)
 }
 
@@ -140,23 +131,6 @@ pub(super) fn execute_subject_control(
 pub(super) struct EnrollParams {
     pub(super) registration_id: String,
     pub(super) session: String,
-}
-
-/// What a lifecycle request reports: its outcome, category, message and effects.
-pub(super) type Settlement = (
-    RequestOutcome,
-    Option<&'static str>,
-    Option<String>,
-    Vec<String>,
-);
-
-pub(super) fn refusal_settlement(message: impl Into<String>) -> Settlement {
-    (
-        RequestOutcome::Refused,
-        Some(Category::BACKEND_REFUSED),
-        Some(message.into()),
-        Vec::new(),
-    )
 }
 
 /// Enrolls a running lead the daemon did not launch as a restartable subject.
@@ -288,26 +262,11 @@ pub(super) fn execute_enroll(
             Err(refusal) => Err(refusal.message),
             Ok(()) => record_enrollment(&registry, &verifier, &params, &claim, &request.id, now),
         };
-    let (outcome, category, message, effects) = match enrolled {
-        Ok(subject_id) => (
-            RequestOutcome::Completed,
-            None,
-            None,
-            vec![format!("enrolled subject {subject_id}")],
-        ),
-        Err(message) => refusal_settlement(message),
+    let settlement = match enrolled {
+        Ok(subject_id) => Settlement::completed(vec![format!("enrolled subject {subject_id}")]),
+        Err(message) => Settlement::backend_refused(message),
     };
-    write_settled(
-        request,
-        record.complete(
-            outcome,
-            category,
-            message.as_deref(),
-            effects,
-            store::now_ms(),
-        ),
-        core,
-    )
+    write_settled(request, record.complete(settlement, store::now_ms()), core)
 }
 
 /// Records the enrolled subject for a verified process. The launch is read only
@@ -531,7 +490,7 @@ pub(super) fn execute_restart(
     .with_params(request.params.clone());
     let launch_request_id = store::random_uuid();
     record.launch_request_id = Some(launch_request_id.clone());
-    let (outcome, category, message, effects) = restart_lead(
+    let settlement = restart_lead(
         core,
         &subject,
         replacement,
@@ -542,13 +501,7 @@ pub(super) fn execute_restart(
     );
     write_settled_with(
         request,
-        record.complete(
-            outcome,
-            category,
-            message.as_deref(),
-            effects,
-            store::now_ms(),
-        ),
+        record.complete(settlement, store::now_ms()),
         json!({}),
         core,
     )
@@ -576,19 +529,21 @@ pub(super) fn restart_lead(
     };
     let stopping = Arc::clone(&locked(core).stopping);
     let Some(backend) = backend else {
-        return refusal_settlement("no backend is wired");
+        return Settlement::backend_refused("no backend is wired");
     };
     if subject.process.state != subjects::State::Bound {
-        return refusal_settlement("the subject is not bound to a live process");
+        return Settlement::backend_refused("the subject is not bound to a live process");
     }
     if !current_presence_grant(&registry, subject).unwrap_or(false) {
-        return refusal_settlement("the Pi session has no current granted presence claim");
+        return Settlement::backend_refused("the Pi session has no current granted presence claim");
     }
     let (Some(agent), Some(session)) = (
         subject.process.bound_registration_id.as_deref(),
         subject.session.as_deref(),
     ) else {
-        return refusal_settlement("the subject has no session to resume; enroll it first");
+        return Settlement::backend_refused(
+            "the subject has no session to resume; enroll it first",
+        );
     };
     match backend.inventory(cancel) {
         Ok(fleet)
@@ -597,32 +552,27 @@ pub(super) fn restart_lead(
                 .iter()
                 .any(|pane| pane.location.pane_id == anchor) => {}
         Ok(_) => {
-            return refusal_settlement(
+            return Settlement::backend_refused(
                 "the lead's pane is no longer present to anchor the replacement",
             );
         }
         Err(error) => {
-            return (
-                RequestOutcome::Refused,
-                Some(Category::BACKEND_UNAVAILABLE),
-                Some(error),
-                Vec::new(),
-            );
+            return Settlement::refused(Category::BackendUnavailable, error);
         }
     }
     match registry.context(agent, now) {
         Ok(Some(context)) if context.context.session.as_deref() == Some(session) => {}
         Ok(_) => {
-            return refusal_settlement(
+            return Settlement::backend_refused(
                 "the lead's published session no longer matches its recipe; enroll it again",
             );
         }
-        Err(error) => return refusal_settlement(error),
+        Err(error) => return Settlement::backend_refused(error),
     }
     let program = replacement.as_ref().unwrap_or(&subject.process.launch);
     let resume = match subjects::resume_launch(program, session) {
         Ok(resume) => resume,
-        Err(message) => return refusal_settlement(message),
+        Err(message) => return Settlement::backend_refused(message),
     };
     let params = SpawnParams {
         parent: agent.to_string(),
@@ -635,15 +585,15 @@ pub(super) fn restart_lead(
         continue_subject_id: None,
     };
     if let Err(message) = validate_command(&params.executable, &params.argv) {
-        return refusal_settlement(message);
+        return Settlement::backend_refused(message);
     }
     if let Err(message) =
         subjects::check_bounds_with_metadata(&requested_launch(&params), &subject.managed)
     {
-        return refusal_settlement(message);
+        return Settlement::backend_refused(message);
     }
     if let Err(refusal) = preflight_launch(core, &params) {
-        return refusal_settlement(refusal.message);
+        return Settlement::backend_refused(refusal.message);
     }
     let intent = registry::SpawnRequest {
         request_id: successor.to_string(),
@@ -652,7 +602,7 @@ pub(super) fn restart_lead(
         parent_subject_id: params.managed.parent_subject_id.clone(),
     };
     if let Err(error) = registry.record_spawn(&intent, now) {
-        return refusal_settlement(error);
+        return Settlement::backend_refused(error);
     }
     let identity = (
         subject
@@ -671,7 +621,7 @@ pub(super) fn restart_lead(
         now,
     ) {
         Ok(prepared) => prepared,
-        Err(error) => return refusal_settlement(error),
+        Err(error) => return Settlement::backend_refused(error),
     };
     let mut effects = Vec::new();
     let termination = subjects::stop(&registry, &subject.claim_id, verifier.as_ref(), now);
@@ -681,22 +631,18 @@ pub(super) fn restart_lead(
         && let Err(error) =
             subjects::cancel_reservation(&registry, &subject.claim_id, &prepared.1.claim_id, now)
     {
-        return (
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(error),
+        return Settlement {
             effects,
-        );
+            ..Settlement::backend_unknown(error)
+        };
     }
     let termination = match termination {
         Ok(termination) => termination,
         Err(error) => {
-            return (
-                RequestOutcome::Unknown,
-                Some(Category::BACKEND_UNAVAILABLE),
-                Some(error),
+            return Settlement {
                 effects,
-            );
+                ..Settlement::backend_unknown(error)
+            };
         }
     };
     if termination.signal_attempted {
@@ -705,25 +651,20 @@ pub(super) fn restart_lead(
     match termination.exit {
         subjects::Exit::Exited => effects.push("previous process exited".to_string()),
         subjects::Exit::Unresolved => {
-            return (
-                RequestOutcome::Refused,
-                Some(Category::BACKEND_REFUSED),
-                Some(
-                    "the previous process could not be identified; no replacement was launched"
-                        .into(),
-                ),
+            return Settlement {
                 effects,
-            );
+                ..Settlement::backend_refused(
+                    "the previous process could not be identified; no replacement was launched",
+                )
+            };
         }
         subjects::Exit::Unverified(reason) => {
-            return (
-                RequestOutcome::Unknown,
-                Some(Category::BACKEND_UNAVAILABLE),
-                Some(format!(
-                    "previous process exit is not verified; no replacement was launched: {reason}"
-                )),
+            return Settlement {
                 effects,
-            );
+                ..Settlement::backend_unknown(format!(
+                    "previous process exit is not verified; no replacement was launched: {reason}"
+                ))
+            };
         }
     }
     effects.push(format!("successor {successor}"));
@@ -778,36 +719,30 @@ pub(super) fn restart_lead(
             RequestOutcome::Completed => {
                 effects.push("launched replacement".to_string());
                 predecessor_pane(&mut effects);
-                (RequestOutcome::Completed, None, None, effects)
+                Settlement::completed(effects)
             }
             RequestOutcome::Unknown => {
                 predecessor_pane(&mut effects);
-                (
-                    RequestOutcome::Unknown,
-                    Some(Category::BACKEND_UNAVAILABLE),
-                    Some("replacement launch is unknown; it will not be retried".into()),
+                Settlement {
                     effects,
-                )
+                    ..Settlement::backend_unknown(
+                        "replacement launch is unknown; it will not be retried",
+                    )
+                }
             }
-            _ => (
-                RequestOutcome::Refused,
-                Some(Category::BACKEND_REFUSED),
-                Some("replacement was not launched".into()),
+            _ => Settlement {
                 effects,
-            ),
+                ..Settlement::backend_refused("replacement was not launched")
+            },
         },
-        Ok(None) => (
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
-            Some("replacement was not recorded".into()),
+        Ok(None) => Settlement {
             effects,
-        ),
-        Err(error) => (
-            RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some(error),
+            ..Settlement::backend_refused("replacement was not recorded")
+        },
+        Err(error) => Settlement {
             effects,
-        ),
+            ..Settlement::backend_unknown(error)
+        },
     }
 }
 
@@ -906,12 +841,7 @@ pub(super) fn termination_outcome(
     termination: &subjects::Termination,
     operation: ops::Operation,
     cleanup: Option<&subjects::PaneCleanup>,
-) -> (
-    RequestOutcome,
-    Option<&'static str>,
-    Option<String>,
-    Vec<String>,
-) {
+) -> Settlement {
     let mut effects = Vec::new();
     if termination.revoked {
         effects.push("launch revoked".to_string());
@@ -928,18 +858,15 @@ pub(super) fn termination_outcome(
     match &termination.exit {
         subjects::Exit::Unresolved => {
             effects.push("process identity unresolved".to_string());
-            (RequestOutcome::Completed, None, None, effects)
+            Settlement::completed(effects)
         }
         subjects::Exit::Exited => {
             effects.push("process exit verified".to_string());
-            (RequestOutcome::Completed, None, None, effects)
+            Settlement::completed(effects)
         }
-        subjects::Exit::Unverified(message) => (
-            RequestOutcome::Unknown,
-            None,
-            Some(message.clone()),
-            effects,
-        ),
+        subjects::Exit::Unverified(message) => {
+            Settlement::new(RequestOutcome::Unknown, None, Some(message), effects)
+        }
     }
 }
 

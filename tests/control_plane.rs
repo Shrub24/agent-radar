@@ -68,7 +68,7 @@ use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
 use agent_radar::control_plane::registry::{MAX_LISTED, ProcessVerifier};
 use agent_radar::control_plane::{
     Category, DaemonRuntime, Derived, MAX_LINE_BYTES, MAX_VERIFICATION_JOBS, PROTOCOL_VERSION,
-    RecordState, RequestOutcome, RequestRecord, Store, connect_at, now_ms, random_uuid,
+    RecordState, RequestOutcome, RequestRecord, Settlement, Store, connect_at, now_ms, random_uuid,
 };
 use agent_radar::lifecycle;
 use agent_radar::model::{
@@ -1156,7 +1156,7 @@ fn a_backend_without_reporting_refuses_it_and_advertises_no_reporting() {
     let refused = client.call("mux.report", state_report("working"));
     let record = result_record(&refused);
     assert_eq!(record["outcome"], "refused");
-    assert_eq!(record["category"], Category::BACKEND_UNAVAILABLE);
+    assert_eq!(record["category"], json!(Category::BackendUnavailable));
     assert!(
         record["message"]
             .as_str()
@@ -1184,7 +1184,7 @@ fn a_backend_report_refusal_is_recorded_as_refused() {
     assert_eq!(result_record(&refused)["outcome"], "refused");
     assert_eq!(
         result_record(&refused)["category"],
-        Category::BACKEND_REFUSED
+        json!(Category::BackendRefused)
     );
     assert_eq!(result_record(&refused)["effects"], json!([]));
     assert_eq!(backend.reports_seen(), 1);
@@ -1207,7 +1207,7 @@ fn an_uncertain_report_stays_unknown_and_suppresses_the_target() {
     assert_eq!(result_record(&first)["outcome"], "unknown");
     assert_eq!(
         result_record(&first)["category"],
-        Category::BACKEND_UNAVAILABLE
+        json!(Category::BackendUnavailable)
     );
     assert_eq!(result_record(&first)["effects"], json!([]));
     assert_eq!(backend.reports_seen(), 1);
@@ -3771,7 +3771,7 @@ fn an_explicit_backend_focus_refusal_is_recorded_as_refused() {
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(
         result_record(&response)["category"],
-        Category::BACKEND_REFUSED
+        json!(Category::BackendRefused)
     );
     daemon.stop();
 }
@@ -3944,7 +3944,7 @@ fn an_operation_is_recorded_before_it_is_refused_and_outlives_the_daemon() {
     assert_eq!(record["target"], "pane:3");
     assert_eq!(record["state"], "completed");
     assert_eq!(record["outcome"], "refused");
-    assert_eq!(record["category"], Category::BACKEND_UNAVAILABLE);
+    assert_eq!(record["category"], json!(Category::BackendUnavailable));
     assert!(
         record["message"]
             .as_str()
@@ -4084,7 +4084,7 @@ fn an_operator_abandonment_releases_the_target_and_keeps_the_record_unresolved()
     );
     assert_eq!(
         result_record(&allowed)["category"],
-        Category::BACKEND_UNAVAILABLE,
+        json!(Category::BackendUnavailable),
         "{allowed}"
     );
     daemon.stop();
@@ -4113,7 +4113,7 @@ fn abandoning_a_record_that_never_ran_or_already_settled_is_refused() {
     let refused = client.call("lifecycle.abandon", json!({"request_id": pending}));
     let record = result_record(&refused);
     assert_eq!(record["outcome"], "refused", "{refused}");
-    assert_eq!(record["category"], Category::REFUSED, "{refused}");
+    assert_eq!(record["category"], json!(Category::Refused), "{refused}");
     assert!(
         record["message"]
             .as_str()
@@ -4136,7 +4136,7 @@ fn abandoning_a_record_that_never_ran_or_already_settled_is_refused() {
         Some("pane:8".into()),
         now_ms(),
     )
-    .complete(RequestOutcome::Completed, None, None, Vec::new(), now_ms());
+    .complete(Settlement::completed(Vec::new()), now_ms());
     state.create(&done).expect("create the settled request");
     state.write(&done).expect("settle the request");
     let refused = client.call("lifecycle.abandon", json!({"request_id": settled}));
@@ -4277,13 +4277,16 @@ fn a_second_request_for_an_unresolved_target_is_refused_as_in_flight() {
     assert_eq!(result_record(&held_record)["state"], "pending");
     let refusal = client.call("mux.request.get", json!({"id": second}));
     assert_eq!(result_record(&refusal)["outcome"], "refused");
-    assert_eq!(result_record(&refusal)["category"], Category::IN_FLIGHT);
+    assert_eq!(
+        result_record(&refusal)["category"],
+        json!(Category::InFlight)
+    );
 
     // Another target is a different request, and is executed normally.
     let other = client.call_id(&random_uuid(), "mux.close", frozen_pane("pane:10"));
     assert_eq!(
         result_record(&other)["category"],
-        Category::BACKEND_UNAVAILABLE
+        json!(Category::BackendUnavailable)
     );
     daemon.stop();
 }
@@ -6164,7 +6167,7 @@ fn an_uncertain_focus_stays_unknown_and_never_holds_its_target() {
     assert_eq!(result_record(&other)["outcome"], "unknown", "{other}");
     assert_ne!(
         result_record(&other)["category"],
-        Category::IN_FLIGHT,
+        json!(Category::InFlight),
         "an unknown focus held its target"
     );
     assert_eq!(backend.focused.lock().unwrap().len(), 2);
@@ -6379,7 +6382,7 @@ fn a_managed_pane_close_is_refused_before_the_backend_is_asked() {
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(
         result_record(&response)["category"],
-        Category::BACKEND_REFUSED
+        json!(Category::BackendRefused)
     );
     assert_eq!(result_record(&response)["effects"], json!([]));
     assert!(
@@ -6533,7 +6536,7 @@ fn an_unreadable_inventory_refuses_the_close() {
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(
         result_record(&response)["category"],
-        Category::BACKEND_REFUSED
+        json!(Category::BackendRefused)
     );
     assert!(
         !backend.told_to_close(&target),
@@ -6622,7 +6625,10 @@ fn an_uncertain_close_stays_unknown_and_suppresses_the_target() {
     );
     assert_eq!(error_code(&other), "refused");
     let refused = client.call("mux.request.get", json!({"id": other_id}));
-    assert_eq!(result_record(&refused)["category"], Category::IN_FLIGHT);
+    assert_eq!(
+        result_record(&refused)["category"],
+        json!(Category::InFlight)
+    );
     assert_eq!(backend.closed.lock().unwrap().len(), 1);
     daemon.stop();
 }
@@ -8629,7 +8635,7 @@ fn an_unimplemented_primitive_is_refused_without_dispatch() {
     assert_eq!(result_record(&create)["outcome"], "refused");
     assert_eq!(
         result_record(&create)["category"],
-        Category::BACKEND_UNAVAILABLE
+        json!(Category::BackendUnavailable)
     );
     assert!(
         result_record(&create)["message"]
@@ -8761,7 +8767,10 @@ fn an_unscoped_create_suppresses_another_unscoped_mutation_but_not_a_pane_one() 
     );
     assert_eq!(error_code(&refused), "refused");
     let record = other.call("mux.request.get", json!({"id": second}));
-    assert_eq!(result_record(&record)["category"], Category::IN_FLIGHT);
+    assert_eq!(
+        result_record(&record)["category"],
+        json!(Category::InFlight)
+    );
 
     let input = other.call(
         "mux.input",

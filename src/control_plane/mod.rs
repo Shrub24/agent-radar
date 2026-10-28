@@ -9,6 +9,7 @@
 //! wire types. [`registry`] is the durable agent registration store served by
 //! independent trusted-socket methods.
 
+pub mod answer;
 pub mod client;
 pub mod communication;
 pub mod containers;
@@ -45,6 +46,6 @@ pub use server::{
     state_dir_in, trusted_socket,
 };
 pub use store::{
-    Category, Derived, Event, RecordState, RequestOutcome, RequestRecord, Store, format_millis,
-    now, now_ms, random_uuid, ttl_seconds,
+    Category, Derived, Event, RecordState, RequestOutcome, RequestRecord, Settlement, Store,
+    format_millis, now, now_ms, random_uuid, ttl_seconds,
 };

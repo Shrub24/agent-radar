@@ -448,10 +448,7 @@ pub(super) fn spawn_child(
     // not nothing to reconcile.
     if let Err(message) = locked(core).registry.record_spawn(intent, now) {
         let settled = record.complete(
-            RequestOutcome::Refused,
-            None,
-            Some(&message),
-            Vec::new(),
+            Settlement::new(RequestOutcome::Refused, None, Some(&message), Vec::new()),
             store::now_ms(),
         );
         let _ = write_settled(request, settled, core);
@@ -477,10 +474,7 @@ pub(super) fn spawn_child(
             Ok(tracking) => Some(tracking),
             Err(message) => {
                 let settled = record.complete(
-                    RequestOutcome::Refused,
-                    None,
-                    Some(&message),
-                    Vec::new(),
+                    Settlement::new(RequestOutcome::Refused, None, Some(&message), Vec::new()),
                     store::now_ms(),
                 );
                 let _ = write_settled(request, settled, core);
@@ -570,10 +564,7 @@ pub(super) fn spawn_child(
             // record still names the pane the create confirmed, so a pane that
             // exists is not an unattributable one.
             let settled = record.created(pane).complete(
-                RequestOutcome::Unknown,
-                None,
-                Some(&error),
-                effects,
+                Settlement::new(RequestOutcome::Unknown, None, Some(&error), effects),
                 store::now_ms(),
             );
             let _ = write_settled(request, settled, core);
@@ -604,10 +595,12 @@ pub(super) fn spawn_child(
     // A launch whose scope cannot be formed at all is refused before anything runs.
     if tracking.is_some() && launched.is_none() {
         let settled = record.created(pane).complete(
-            RequestOutcome::Refused,
-            Some(Category::BACKEND_UNAVAILABLE),
-            Some("no execution scope launcher is configured"),
-            effects,
+            Settlement::new(
+                RequestOutcome::Refused,
+                Some(Category::BackendUnavailable),
+                Some("no execution scope launcher is configured"),
+                effects,
+            ),
             store::now_ms(),
         );
         let _ = write_settled(request, settled, core);
@@ -640,10 +633,7 @@ pub(super) fn spawn_child(
                 Ok(edge) => edge,
                 Err(error) => {
                     let settled = record.created(pane).complete(
-                        RequestOutcome::Unknown,
-                        None,
-                        Some(&error),
-                        effects,
+                        Settlement::new(RequestOutcome::Unknown, None, Some(&error), effects),
                         store::now_ms(),
                     );
                     let _ = write_settled(request, settled, core);
@@ -662,37 +652,38 @@ pub(super) fn spawn_child(
         }
         (RequestOutcome::Completed, Some(RequestOutcome::Refused)) => (
             RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
+            Some(Category::BackendRefused),
             launch_message.as_deref(),
         ),
         // A create that named no pane left nothing to launch into.
         (RequestOutcome::Completed, None) => (
             RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
+            Some(Category::BackendUnavailable),
             created_message.as_deref(),
         ),
         (RequestOutcome::Completed, Some(RequestOutcome::Unknown)) => (
             RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
+            Some(Category::BackendUnavailable),
             launch_message.as_deref(),
         ),
         (RequestOutcome::Refused, _) => (
             RequestOutcome::Refused,
-            Some(Category::BACKEND_REFUSED),
+            Some(Category::BackendRefused),
             created_message.as_deref(),
         ),
         (RequestOutcome::Unknown, _) => (
             RequestOutcome::Unknown,
-            Some(Category::BACKEND_UNAVAILABLE),
+            Some(Category::BackendUnavailable),
             created_message.as_deref(),
         ),
     };
     if launched_outcome == Some(RequestOutcome::Completed) {
         effects.push("launched child".to_string());
     }
-    let done = record
-        .created(pane)
-        .complete(outcome, category, message, effects, store::now_ms());
+    let done = record.created(pane).complete(
+        Settlement::new(outcome, category, message, effects),
+        store::now_ms(),
+    );
     settle_spawn(request, done, &edge, core)
 }
 

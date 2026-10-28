@@ -303,24 +303,6 @@ pub(super) fn bounded(read: OutputRead) -> OutputRead {
     }
 }
 
-/// The public operation projection omits launch environment values while the
-/// private stored record retains them for exact replay comparison.
-pub(super) fn public_record(record: RequestRecord) -> serde_json::Value {
-    let mut value = serde_json::to_value(record).expect("request records serialize");
-    if let Some(params) = value.get_mut("params") {
-        if let Some(request) = params.get_mut("request")
-            && let Some(object) = request.as_object_mut()
-        {
-            object.remove("env");
-            object.remove("argv");
-        }
-        if let Some(object) = params.as_object_mut() {
-            object.remove("env");
-        }
-    }
-    value
-}
-
 /// One record, by id.
 pub(super) fn read_one(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     let id = match request.required_string("id") {
@@ -329,7 +311,7 @@ pub(super) fn read_one(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
     };
     let core = locked(core);
     match core.store.get(&id) {
-        Ok(Some(record)) => Response::ok(&request.id, json!({ "request": public_record(record) })),
+        Ok(Some(record)) => Response::ok(&request.id, json!({ "request": record.public() })),
         Ok(None) => Response::refused(
             &request.id,
             &Refusal::new(Code::NotFound, format!("no request {id}")),
@@ -541,7 +523,7 @@ pub(super) fn read_many(core: &Arc<Mutex<Core>>, request: &Request) -> Response 
         return match core.store.unfinished() {
             Ok(records) => Response::ok(
                 &request.id,
-                json!({ "requests": records.into_iter().take(MAX_LISTED).map(public_record).collect::<Vec<_>>() }),
+                json!({ "requests": records.into_iter().take(MAX_LISTED).map(RequestRecord::public).collect::<Vec<_>>() }),
             ),
             Err(message) => Response::refused(&request.id, &Refusal::new(Code::Internal, message)),
         };
@@ -554,7 +536,7 @@ pub(super) fn read_many(core: &Arc<Mutex<Core>>, request: &Request) -> Response 
     match core.store.recent(limit) {
         Ok(records) => Response::ok(
             &request.id,
-            json!({ "requests": records.into_iter().map(public_record).collect::<Vec<_>>() }),
+            json!({ "requests": records.into_iter().map(RequestRecord::public).collect::<Vec<_>>() }),
         ),
         Err(message) => Response::refused(&request.id, &Refusal::new(Code::Internal, message)),
     }

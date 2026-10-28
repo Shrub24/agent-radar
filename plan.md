@@ -9,6 +9,13 @@ already settled is in `README.md` and `openspec/`; this file is the future.
 
 ## Priority debt — typed contracts across the Rust daemon
 
+Scoped in [`typed-daemon-contracts`](openspec/changes/typed-daemon-contracts/proposal.md)
+on the separate daemon-contracts workspace. The change covers the full typed
+request/admission/execution/record/consumer sweep; its design also scopes the
+subsequent consumer-led delivery migrations. Implement the contract spine first,
+then snapshots and durable event feeds as separate changes, not one transport
+rewrite. Live TUI acceptance need not block work on this isolated branch.
+
 High-priority architectural cleanup, ahead of further feature expansion: sweep
 Rust-owned operation, response, state and error structures across the daemon and
 its Rust consumers. Closed domain vocabularies must be enums and typed payloads,
