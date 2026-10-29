@@ -458,7 +458,7 @@ impl RuntimeProvider for TmuxRuntime {
         // Nothing asks a backend to move the operator as a side effect of
         // creating: a create is dispatched unfocused, and the daemon focuses what
         // it made afterwards, through the same path a focus request takes.
-        self.create_location(request, false, cancel)
+        self.create_location(request, cancel)
             .map_or_else(Failure::into_create, CreateOutcome::Completed)
     }
 
@@ -795,22 +795,10 @@ impl TmuxRuntime {
     fn create_location(
         &self,
         request: &CreateRequest,
-        focus: bool,
         cancel: &AtomicBool,
     ) -> Result<CreatedLocation, Failure> {
         match request {
             CreateRequest::Workspace { directory, .. } => {
-                if focus {
-                    // tmux focuses a session by switching a client to it, and
-                    // this command has no client. Creating first and switching
-                    // after would leave a workspace that exists and a caller
-                    // told the creation was unknown, so nothing is created:
-                    // refusing costs a retry, not a duplicate workspace.
-                    return Err(Failure::refused(
-                        "tmux focuses a session by switching a client, and the daemon's commands \
-                         have no client to switch; create the workspace unfocused and focus a pane",
-                    ));
-                }
                 // `-d` leaves the caller's client where it is, and the name is
                 // tmux's own: this seam names no workspace.
                 let mut args = vec!["new-session", "-d"];
@@ -839,10 +827,7 @@ impl TmuxRuntime {
                 let session = self
                     .address(workspace_id, Kind::Session)
                     .map_err(Failure::refused)?;
-                let mut args = vec!["new-window", "-t", session.as_str()];
-                if !focus {
-                    args.push("-d");
-                }
+                let mut args = vec!["new-window", "-d", "-t", session.as_str()];
                 args.extend(["-P", "-F", CREATED_WINDOW_FORMAT]);
                 let answer = self.run(&args, cancel).map_err(Failure::unknown)?;
                 let [tab, created_workspace, pane] =
@@ -870,12 +855,10 @@ impl TmuxRuntime {
                         SplitDirection::Right => "-h",
                         SplitDirection::Down => "-v",
                     },
+                    "-d",
                     "-t",
                     pane.as_str(),
                 ];
-                if !focus {
-                    args.push("-d");
-                }
                 args.extend(["-P", "-F", CREATED_PANE_FORMAT]);
                 let answer = self.run(&args, cancel).map_err(Failure::unknown)?;
                 let [created_pane, tab, created_workspace] =

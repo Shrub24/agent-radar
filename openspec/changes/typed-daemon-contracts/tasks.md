@@ -28,7 +28,7 @@
 
 - [x] 5.1 Use a closed `Category` enum and require actual subject identity on lifecycle claims. Remove historical-category adapters, legacy fixtures and all subject-to-claim fallbacks. Preserve original retry params and genuinely open diagnostics/data; existing replay tests check current-format durable transitions.
 - [x] 5.2 Remove transitional wire-returning composition and duplicate interpreters. Retire `Response::typed`, old `managed_control`, response-key-path readers and registry/task JSON round trips. The inventory records the remaining real serialization boundaries.
-- [x] 5.3 Final fmt, strict all-target Clippy, Rust targets (542 library tests, 172 control-plane tests plus the other suites), SDK/schema generation and typechecks/111 tests, all 36 strict OpenSpec items, rationale lint and whitespace checks pass. The Rust command excludes exactly the two baseline tmux failures documented below; the unfiltered suite is not claimed green.
+- [x] 5.3 Final fmt, strict all-target Clippy, Rust targets (542 library tests, 172 control-plane tests plus the other suites), SDK/schema generation and typechecks/111 tests, all 36 strict OpenSpec items, rationale lint and whitespace checks pass. The Rust suite is unfiltered.
 
 ## Verification and corrections
 
@@ -36,7 +36,7 @@
 - The scripted ping fixture now supplies the task-lane status that the real daemon already emits; no production fallback is added for an incomplete stub.
 - The existing recipe test now checks private argv/env are absent from both its creation answer and later operation reads, not only container reads.
 - The no-client tmux assertion now checks the typed runtime reason rather than its old diagnostic-string representation.
-- Two tmux assertions fail unchanged on the baseline acceptance worktree: `a_workspace_that_cannot_be_focused_is_refused_before_creating_anything` and `create_names_the_locations_it_made`. Per the maintainer's test-deferral direction, the final full Rust command excludes exactly these two. They are not weakened, marked passing or hidden by retries.
+- Two tmux tests asserted the retired behaviour of a backend that focuses during create (`a66c785b` made create always unfocused; the daemon focuses afterwards). The dead backend focus branch was deleted and the tests removed or restated; focus-after-create stays covered by `a_created_container_is_focused_after_it_is_recorded`. The Rust gate is unfiltered.
 - One intermediate systemd-backed lifecycle run could not establish scope membership and returned the existing fail-closed `unknown`. The subsequent full control-plane run passed; no safety assertion was relaxed.
 - Privacy corrections discovered by typed projections: managed context now emits the logical subject ID rather than a private claim object; public operation params omit recipe/root replacement argv/env. A typed pane-split plan also fixes its missing `kind` tag. See `inventory.md`.
 - No Nix build, deployment or live acceptance is included.

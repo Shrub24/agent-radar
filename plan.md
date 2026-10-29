@@ -10,38 +10,32 @@ already settled is in `README.md` and `openspec/`; this file is the future.
 ## Priority queue — daemon contracts and delivery adoption
 
 **Done:** typed daemon contracts ([`typed-daemon-contracts`](openspec/changes/typed-daemon-contracts/proposal.md)),
-published on `wip/daemon-contracts` (1b102f6d), not merged. Rust-owned closed
+merged to `main`. Rust-owned closed
 contracts no longer round-trip through JSON; claims require `subject_id`;
-categories are closed; no legacy adapters. Two baseline tmux assertions are
-excluded from its gate (note #278).
+categories are closed; no legacy adapters.
 
 Order matters: each step uses the one before it. Delivery changes name a real
 consumer and delete the path they replace. Snapshots, command receipts and
 durable events stay separate delivery classes.
 
-1. **Merge the typing sweep.** Rebase onto current `main`, rerun the gate,
-   merge. Everything below builds on the typed services.
-2. **Close the two baseline tmux failures** (create/focus on tmux 3.8). They
-   hide regressions in create-focus and no-client recovery. Do this with the
-   tmux 3.8 / exit-tracking replan, not as a typing task.
-3. **pi-radar codec foundation.** TypeScript MessagePack decode with u64/BigInt
+1. **pi-radar codec foundation.** TypeScript MessagePack decode with u64/BigInt
    handling, cross-language golden fixtures, and generated-contract coverage for
    the DTOs pi-radar will consume. Reuse `content.rs` framing; no new schema
    pipeline.
-4. **Snapshot subscription for non-TUI consumers.** Replace pi-radar's
+2. **Snapshot subscription for non-TUI consumers.** Replace pi-radar's
    observation/task reads with a coherent push head (latest-wins, bounded,
    supervised). Keep `observation.get` for external users. Delete pi-radar's
    polling in the same change.
-5. **Durable event subscription.** Push `events.read` pages with cursors,
+3. **Durable event subscription.** Push `events.read` pages with cursors,
    epochs and `cursor_expired` gaps; no coalescing. Replaces the 1 s
    long-poll. Reuses framing and connection ownership, not the latest-wins writer.
-6. **Correlated command replies over the same connection** only if a real
+4. **Correlated command replies over the same connection** only if a real
    consumer needs it. Never auto-resubmit after loss.
-7. **Remaining daemon gaps:** class-aware ordinary-connection admission;
+5. **Remaining daemon gaps:** class-aware ordinary-connection admission;
    oversized-observation degraded mode (1 MiB cap); `Exit::Unresolved`
    conflating "no identity" with "uninspectable"; unbounded `Owed`
    reconciliation; multi-tmux-client focus.
-8. **Then product work:** workspace-recovery, tmux naming.
+6. **Then product work:** workspace-recovery, tmux naming.
 
 Not planned: an async rewrite of the domain actor (Tokio is already used for
 transport; the actor's sync loop is measurement-driven only), a generic RPC or

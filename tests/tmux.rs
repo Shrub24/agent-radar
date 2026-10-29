@@ -442,28 +442,6 @@ fn a_workspace_starts_in_the_named_directory_and_refuses_one_that_does_not_exist
 }
 
 #[test]
-fn a_workspace_that_cannot_be_focused_is_refused_before_creating_anything() {
-    let fake = Fake::failing();
-    let runtime = &fake.runtime;
-    let created = runtime.create(
-        &CreateRequest::Workspace {
-            focus: Some(true),
-            directory: None,
-        },
-        &cancel(),
-    );
-    assert!(
-        matches!(created, CreateOutcome::Refused(_)),
-        "a focus tmux cannot apply was not refused: {created:?}"
-    );
-    assert!(
-        fake.calls().is_empty(),
-        "a refused creation still ran a command: {:?}",
-        fake.calls()
-    );
-}
-
-#[test]
 fn a_stalled_command_is_killed_and_reaped_at_its_deadline() {
     let fake = Fake::stalling(Duration::from_millis(300));
     let started = Instant::now();
@@ -1038,61 +1016,6 @@ fn create_names_the_locations_it_made() {
     assert!(split.pane_id.is_some(), "{split:?}");
     assert_eq!(split.tab_id.as_deref(), Some(tab_id.as_str()));
     assert_eq!(split.workspace_id.as_deref(), Some(workspace_id.as_str()));
-
-    // A creation the caller asks to focus is server state for a window and a
-    // pane: the window becomes its session's current one, the pane becomes
-    // active in its window.
-    let created = runtime.create(
-        &CreateRequest::Tab {
-            workspace_id: workspace_id.clone(),
-            focus: Some(true),
-        },
-        &cancel,
-    );
-    let CreateOutcome::Completed(focused_tab) = created else {
-        panic!("a focused tab was not created: {created:?}");
-    };
-    let focused_window = focused_tab.tab_id.expect("the window tmux made");
-    let active = probe.tmux(&["list-windows", "-a", "-F", "#{window_id} #{window_active}"]);
-    assert!(
-        active
-            .lines()
-            .any(|line| line == format!("{} 1", focused_window.rsplit(':').next().expect("an id"))),
-        "a focused creation left its window not current:\n{active}"
-    );
-    let window_pane = probe.tmux(&[
-        "list-panes",
-        "-t",
-        focused_window.rsplit(':').next().expect("an id"),
-        "-F",
-        "#{pane_id}",
-    ]);
-    let created = runtime.create(
-        &CreateRequest::PaneSplit {
-            pane_id: probe.runtime_handle(window_pane.trim()),
-            direction: SplitDirection::Down,
-            focus: Some(true),
-        },
-        &cancel,
-    );
-    let CreateOutcome::Completed(focused_split) = created else {
-        panic!("a focused split was not created: {created:?}");
-    };
-    let active = probe.tmux(&["list-panes", "-a", "-F", "#{pane_id} #{pane_active}"]);
-    assert!(
-        active.lines().any(|line| line
-            == format!(
-                "{} 1",
-                focused_split
-                    .pane_id
-                    .as_deref()
-                    .expect("the pane tmux made")
-                    .rsplit(':')
-                    .next()
-                    .expect("an id")
-            )),
-        "a focused split left its pane not active:\n{active}"
-    );
 
     // Every identity tmux named is a location the inventory then lists.
     let after = runtime.inventory(&cancel).expect("an inventory");
