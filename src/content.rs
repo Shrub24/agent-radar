@@ -246,6 +246,37 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The same cases pi-radar's TypeScript codec reads, written by an independent encoder.
+    #[test]
+    fn independently_written_cases_match_this_codec_both_ways() {
+        let file: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/msgpack/cases.json")).unwrap();
+        for case in file["cases"].as_array().unwrap() {
+            let name = &case["name"];
+            let bytes = encode(&case["json"], MAX_PAYLOAD).unwrap();
+            assert_eq!(hex(&bytes), case["hex"].as_str().unwrap(), "{name}");
+            assert_eq!(
+                decode::<serde_json::Value>(&bytes).unwrap(),
+                case["json"],
+                "{name}"
+            );
+        }
+        for case in file["big"].as_array().unwrap() {
+            let decimal = case["decimal"].as_str().unwrap();
+            let value = decimal
+                .parse::<u64>()
+                .map(serde_json::Value::from)
+                .or_else(|_| decimal.parse::<i64>().map(serde_json::Value::from))
+                .unwrap();
+            let bytes = encode(&value, MAX_PAYLOAD).unwrap();
+            assert_eq!(hex(&bytes), case["hex"].as_str().unwrap(), "{decimal}");
+        }
+    }
+
     #[test]
     fn portable_content_has_stable_bytes_and_exact_integers() {
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
