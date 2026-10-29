@@ -2,16 +2,12 @@ import type { AttentionSerialize } from "./generated-contracts.ts";
 import type { RadarMailboxPort, RadarMessageConsumer } from "./radar-communication.ts";
 import type { RadarScheduler, RadarTimer } from "./radar-client.ts";
 
-/** How long a continuously idle agent keeps its subscription before dropping it. */
+/** How long a continuously idle agent keeps its subscription. */
 export const RADAR_IDLE_HOLD_MS = 30_000;
-/** Retry spacing after a refused or dropped subscription, and for failed drains. */
+/** Retry spacing after a refused or dropped subscription. */
 export const RADAR_ATTENTION_BACKOFF_MS = 2_000;
 
-/**
- * The agent's own activity, as its runtime reports it. Only `idle` starts the
- * hold: waiting on a user, a tool or a child is work in progress, and dropping
- * the subscription then would delay exactly the message being awaited.
- */
+/** Only `idle` starts the hold: waiting for work is not being idle. */
 export type RadarActivity = "idle" | "working" | "waiting";
 
 export type RadarAttentionOptions = {
@@ -28,7 +24,7 @@ export type RadarAttentionOptions = {
 };
 
 export type RadarAttention = {
-	/** Reconcile now: on startup, and on every accepted heartbeat. */
+	/** Reconcile now, and establish the subscription if activity allows. */
 	drain(): void;
 	/** The heartbeat reply's hint, if the daemon supplied one. */
 	hint(attention: AttentionSerialize | undefined): void;
@@ -38,13 +34,10 @@ export type RadarAttention = {
 };
 
 /**
- * One mailbox consumer per process.
- *
  * Every trigger — startup, a heartbeat hint, a pushed update — funnels into one
- * serialized drain with a single rerun flag, so overlapping triggers cannot
- * consume the same message twice or open duplicate subscriptions. The drain
- * acknowledges a message only after its consumer has durably captured it, and a
- * revision that does not change never suppresses a retry.
+ * serialized drain with a rerun flag. A message is received only after its
+ * consumer durably captured it, and an unchanged revision never suppresses a
+ * retry of work that is still pending.
  */
 export function createRadarAttention(options: RadarAttentionOptions): RadarAttention {
 	const holdMs = options.idleHoldMs ?? RADAR_IDLE_HOLD_MS;
@@ -93,14 +86,10 @@ export function createRadarAttention(options: RadarAttentionOptions): RadarAtten
 		}
 		idleTimer = cancel(idleTimer);
 		const start = options.watch;
-		void start((attention) => {
-			// A push is a hint like any other: it never carries content, and a
-			// message body is fetched by the same drain.
-			hint(attention);
-		}).then((opened) => {
+		void start(hint).then((opened) => {
+			// Refused or lost: heartbeats still deliver, so this is a retry, not an
+			// incident.
 			if (opened.ok === false) {
-				// Refused or failed: heartbeats still deliver, so this is a retry,
-				// not an incident.
 				if (!stopped) scheduleRetry();
 				return;
 			}
@@ -148,7 +137,7 @@ export function createRadarAttention(options: RadarAttentionOptions): RadarAtten
 				running = false;
 				if (again) {
 					again = false;
-					scheduleRetry();
+					drain();
 				}
 			});
 	}

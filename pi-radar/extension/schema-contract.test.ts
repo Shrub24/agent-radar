@@ -120,41 +120,51 @@ test("facts input/output schemas match omitted optionals and exact integer limit
 	assert.equal(input({ context_window: { tokens: 2, window: 1 } }), true);
 });
 
-test("handoff schemas expose stable subject addressing and safe-range timestamps", () => {
-	const handoff = ajv.compile(schema("handoff.serialize.schema.json"));
-	const publishParams = ajv.compile(schema("handoff-publish-params.deserialize.schema.json"));
-	const receipt = ajv.compile(schema("handoff-receipt.serialize.schema.json"));
+test("message schemas expose addressed delivery and safe-range timestamps", () => {
+	const message = ajv.compile(schema("message.serialize.schema.json"));
+	const publishParams = ajv.compile(schema("message-publish-params.deserialize.schema.json"));
+	const receipt = ajv.compile(schema("message-receipt.serialize.schema.json"));
+	const identity = {
+		registration_id: "11111111-1111-4111-8111-111111111111",
+		session_id: "22222222-2222-4222-8222-222222222222",
+		subject_id: "44444444-4444-4444-8444-444444444444",
+		claim_id: "55555555-5555-4555-8555-555555555555",
+	};
+	const recipient = "66666666-6666-4666-8666-666666666666";
 	const value = {
 		version: 1,
 		id: "33333333-3333-4333-8333-333333333333",
-		sender: {
-			registration_id: "11111111-1111-4111-8111-111111111111",
-			session_id: "22222222-2222-4222-8222-222222222222",
-			subject_id: "44444444-4444-4444-8444-444444444444",
-			claim_id: "55555555-5555-4555-8555-555555555555",
+		producer: identity,
+		recipients: [recipient],
+		body: {
+			kind: "handoff",
+			correlation_id: "77777777-7777-4777-8777-777777777777",
+			summary: "completed",
+			content: "full result payload",
 		},
-		recipient_subject_id: "66666666-6666-4666-8666-666666666666",
-		correlation_id: "77777777-7777-4777-8777-777777777777",
-		summary: "completed",
-		content: "full handoff payload",
-		published_at_unix_ms: MAX_SAFE_INTEGER,
+		created_at_unix_ms: MAX_SAFE_INTEGER,
 	};
-	assert.equal(handoff(value), true, ajv.errorsText(handoff.errors));
+	assert.equal(message(value), true, ajv.errorsText(message.errors));
 	const params = {
-		sender_registration_id: value.sender.registration_id,
-		recipient_subject_id: value.recipient_subject_id,
-		correlation_id: value.correlation_id,
-		summary: value.summary,
-		content: value.content,
+		sender_registration_id: identity.registration_id,
+		recipient_subject_id: recipient,
+		correlation_id: value.body.correlation_id,
+		summary: value.body.summary,
+		content: value.body.content,
 	};
 	assert.equal(publishParams(params), true, ajv.errorsText(publishParams.errors));
 	assert.equal(publishParams({ ...params, unexpected: true }), false);
-	assert.equal(handoff({ ...value, published_at_unix_ms: MAX_SAFE_INTEGER + 1 }), false);
-	assert.equal(handoff({ ...value, unknown: true }), false);
+	assert.equal(message({ ...value, created_at_unix_ms: MAX_SAFE_INTEGER + 1 }), false);
+	assert.equal(message({ ...value, unknown: true }), false);
+	assert.equal(
+		message({ ...value, body: { ...value.body, kind: "invented" } }),
+		false,
+		"a body kind is closed",
+	);
 	assert.equal(receipt({
 		version: 1,
-		handoff_id: value.id,
-		recipient: value.sender,
+		message_id: value.id,
+		recipient: identity,
 		received_at_unix_ms: MAX_SAFE_INTEGER,
 	}), true, ajv.errorsText(receipt.errors));
 });

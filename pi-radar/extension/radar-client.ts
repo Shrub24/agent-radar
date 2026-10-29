@@ -1348,9 +1348,8 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 
 	/**
 	 * One attention subscription: a JSON opener, then length-prefixed MessagePack
-	 * frames carrying only this recipient's mailbox state. Resolves once the
-	 * baseline has arrived, so a caller never has to distinguish "nothing waiting"
-	 * from "not yet attached".
+	 * frames of mailbox state. Resolves on the baseline, so a caller never tells
+	 * "nothing waiting" from "not yet attached".
 	 */
 	const watch = (
 		path: string,

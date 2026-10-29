@@ -232,9 +232,8 @@ pub(super) fn message_identity(
     })
 }
 
-/// A body kind decides who may be addressed. Only the handoff policy exists:
-/// a managed worker's result goes to its recorded parent and nowhere else, so
-/// the common envelope's recipient set is not a general send permission.
+/// A body kind decides who may be addressed. Handoff stays parent-only: the
+/// envelope's recipient set is not a general send permission.
 pub(super) fn validate_producer_recipients(
     registry: &Registry,
     producer: &AgentIdentity,
@@ -242,24 +241,23 @@ pub(super) fn validate_producer_recipients(
     recipients: &[String],
 ) -> Result<(), messages::Error> {
     let PublishBody::Handoff { .. } = body;
-    if recipients.len() != 1 {
+    let [recipient] = recipients else {
         return Err(messages::Error::Invalid(
             "a handoff names exactly one recipient".into(),
         ));
-    }
+    };
     let parent = subjects::current_attachment(registry, &producer.subject_id)
         .map_err(messages::Error::Internal)?
         .ok_or(messages::Error::NotFound)?
         .managed
         .parent_subject_id;
-    subjects::current_attachment(registry, &recipients[0])
+    if !messages::is_parent_recipient(parent.as_deref(), recipient) {
+        return Err(messages::Error::WrongRecipient);
+    }
+    subjects::current_attachment(registry, recipient)
         .map_err(messages::Error::Internal)?
         .ok_or(messages::Error::NotFound)?;
-    if messages::is_parent_recipient(parent.as_deref(), &recipients[0]) {
-        Ok(())
-    } else {
-        Err(messages::Error::WrongRecipient)
-    }
+    Ok(())
 }
 
 pub(super) fn append_message_event(
@@ -272,7 +270,6 @@ pub(super) fn append_message_event(
     let event = store::Event {
         subject_id,
         claim_id: None,
-
         lifecycle_event_id: None,
         seq: 0,
         kind: kind.to_owned(),
@@ -302,7 +299,6 @@ pub(super) fn message_error(request: &Request, error: messages::Error) -> Respon
             Code::Busy,
             "communication store is at its configured bound".into(),
         ),
-        messages::Error::LegacyStore(message) => (Code::Internal, message),
         messages::Error::Internal(message) => (Code::Internal, message),
     };
     Response::refused(&request.id, &Refusal::new(code, message))

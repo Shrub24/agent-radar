@@ -135,7 +135,7 @@ test("a captured message is received, and an unrecorded one is not", async () =>
 	);
 });
 
-test("overlapping triggers run one drain", async () => {
+test("overlapping triggers never drain concurrently and coalesce into one rerun", async () => {
 	const recorded: Recorded = { captured: [], received: [], failed: new Set() };
 	let drains = 0;
 	const port = mailbox([MESSAGE], recorded);
@@ -156,8 +156,10 @@ test("overlapping triggers run one drain", async () => {
 	attention.hint({ revision: "b", pending: 1 });
 	await settle();
 	await settle();
-	assert.equal(drains, 1, "a second page pass would consume the same message twice");
-	assert.deepEqual(recorded.received, [MESSAGE]);
+	// The first pass, then exactly one rerun for two overlapping triggers: a
+	// trigger that arrives mid-pass means the mailbox may have moved under it.
+	assert.equal(drains, 2);
+	assert.deepEqual(recorded.received, [MESSAGE], "one message is received once");
 });
 
 test("an unchanged revision does not suppress a retry", async () => {

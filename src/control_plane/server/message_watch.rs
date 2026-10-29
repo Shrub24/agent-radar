@@ -1,9 +1,6 @@
 //! One attention subscription: a recipient's mailbox state, pushed while the
-//! connection holds a current grant.
-//!
-//! Only attention travels here: a small opaque revision and a pending count. A
-//! message body is always fetched with `communication.get`, so nothing large is
-//! ever queued for a slow reader, and a missed update is recovered from the next
+//! connection holds a current grant. No message body travels here, so a slow
+//! reader costs one connection, and a missed update is recovered from the next
 //! baseline or heartbeat.
 
 use std::sync::Arc;
@@ -20,11 +17,9 @@ use crate::control_plane::protocol::{Code, Refusal, Response};
 use crate::control_plane::public_contracts::Attention;
 use crate::control_plane::transport::{DuplexFuture, WRITE_TIMEOUT};
 
-/// The frame is two small values; this bound is far above anything they need and
-/// keeps a subscription's memory flat whatever the mailbox holds.
 const MAX_ATTENTION_FRAME: usize = 4 * 1024;
-/// How often an unchanged, quiet subscription re-checks that its grant still
-/// stands. Nothing else about a quiet subscriber expires.
+/// How often a quiet subscription re-checks that its grant still stands. Nothing
+/// else about a quiet subscriber expires.
 const REVALIDATE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(serde::Deserialize)]
@@ -112,9 +107,14 @@ async fn serve(
     revalidate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = changed.recv() => {}
+            // A lagged wake is only a missed hint; the read below is authoritative.
+            received = changed.recv() => if matches!(
+                received,
+                Err(broadcast::error::RecvError::Closed)
+            ) {
+                return;
+            },
             _ = revalidate.tick() => {}
-            else => return,
         }
         match attention(registry.clone(), messages.clone(), &open).await {
             Hint::Waiting(attention) if attention.revision != last.revision => {
@@ -136,8 +136,8 @@ enum Hint {
     Unavailable,
 }
 
-/// Resolving the recipient and reading its mailbox touches the filesystem, so it
-/// runs off the transport's worker.
+/// Reading the mailbox touches the filesystem, so it runs off the transport's
+/// worker.
 async fn attention(registry: Arc<Registry>, messages: Arc<MessageStore>, open: &WatchOpen) -> Hint {
     let registration = open.registration_id.clone();
     let resolved = tokio::task::spawn_blocking(move || {
@@ -162,12 +162,12 @@ async fn attention(registry: Arc<Registry>, messages: Arc<MessageStore>, open: &
 }
 
 async fn push(write: &mut OwnedWriteHalf, attention: &Attention) -> bool {
-    let Ok(body) = content::encode(attention, MAX_ATTENTION_FRAME) else {
+    let Ok(frame) = content::frame(attention) else {
         return false;
     };
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&body);
+    if frame.len() > MAX_ATTENTION_FRAME + 4 {
+        return false;
+    }
     let written = async {
         write.write_all(&frame).await?;
         write.flush().await

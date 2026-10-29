@@ -3,7 +3,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::control_plane::public_contracts::{
     AgentIdentity, Attention, Message, MessageReceipt, PublishBody,
@@ -24,8 +23,6 @@ const MAX_STORED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024;
 const RECEIVED_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
-static INSTANCES: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     Invalid(String),
@@ -33,18 +30,11 @@ pub enum Error {
     NotFound,
     WrongRecipient,
     Capacity,
-    /// Stored communication state predates the message lane. It is never
-    /// migrated or discarded implicitly: an operator drains or resets it first.
-    LegacyStore(String),
     Internal(String),
 }
 
-/// One durable, producer-addressed message lane.
-///
-/// A message is written once, with its whole recipient set, so a crash can never
-/// leave half a fanout published. Receipts are separate records, one per
-/// recipient subject, so each recipient records durable capture independently.
-/// Pending work is derived from those two record kinds, never from a counter.
+/// One durable, producer-addressed message lane: a message is written once with
+/// its whole recipient set, and each recipient's receipt is its own record.
 pub struct MessageStore {
     root: PathBuf,
     /// Distinguishes this daemon instance: a revision earned in an earlier
@@ -68,13 +58,14 @@ impl MessageStore {
         }
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("message store {}: {error}", root.display()))?;
+        // Never reused: a revision earned by an earlier process must not compare
+        // equal to one from this process.
         let instance = format!(
-            "{:016x}{:08x}",
+            "{:016x}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_nanos() as u64)
-                .unwrap_or_default(),
-            INSTANCES.fetch_add(1, Ordering::Relaxed)
+                .unwrap_or_default()
         );
         let store = Self {
             root,
@@ -251,17 +242,21 @@ impl MessageStore {
     }
 
     fn read_all(&self) -> Result<Vec<Message>, Error> {
-        let entries = fs::read_dir(&self.root)
-            .map_err(|error| Error::Internal(format!("list messages: {error}")))?;
         let mut records = Vec::new();
-        for entry in entries {
+        for entry in fs::read_dir(&self.root)
+            .map_err(|error| Error::Internal(format!("list messages: {error}")))?
+        {
             let entry =
                 entry.map_err(|error| Error::Internal(format!("list messages: {error}")))?;
-            let name = entry.file_name();
-            let Some(id) = name.to_str().and_then(parse_message_file) else {
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(parse_message_file)
+                .map(str::to_owned)
+            else {
                 continue;
             };
-            records.push(self.read_message(id)?);
+            records.push(self.read_message(&id)?);
             if records.len() > MAX_STORED_MESSAGES {
                 return Err(Error::Internal(
                     "message store exceeds its configured record bound".into(),
