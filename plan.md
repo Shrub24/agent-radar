@@ -18,24 +18,25 @@ Order matters: each step uses the one before it. Delivery changes name a real
 consumer and delete the path they replace. Snapshots, command receipts and
 durable events stay separate delivery classes.
 
-1. **pi-radar codec foundation.** TypeScript MessagePack decode with u64/BigInt
+1. **pi-radar codec foundation** (landed on `wip/pi-radar-msgpack`). TypeScript MessagePack decode with u64/BigInt
    handling, cross-language golden fixtures, and generated-contract coverage for
    the DTOs pi-radar will consume. Reuse `content.rs` framing; no new schema
    pipeline.
-2. **Snapshot subscription for non-TUI consumers.** Replace pi-radar's
+2. **Agent attention** ([`agent-attention`](openspec/changes/agent-attention/proposal.md), planned): heartbeat hint for idle agents, short-lived wake subscription for working leads. Replaces the snapshot-subscription item for pi-radar, which has no continuous observation consumer.
+3. **Snapshot subscription for non-TUI consumers**, when a dashboard or widget needs it. Replace pi-radar's
    observation/task reads with a coherent push head (latest-wins, bounded,
    supervised). Keep `observation.get` for external users. Delete pi-radar's
    polling in the same change.
-3. **Durable event subscription.** Push `events.read` pages with cursors,
+4. **Ordered event-page subscription**, when a consumer needs event bodies. Push `events.read` pages with cursors,
    epochs and `cursor_expired` gaps; no coalescing. Replaces the 1 s
    long-poll. Reuses framing and connection ownership, not the latest-wins writer.
-4. **Correlated command replies over the same connection** only if a real
+5. **Correlated command replies over the same connection** only if a real
    consumer needs it. Never auto-resubmit after loss.
-5. **Remaining daemon gaps:** class-aware ordinary-connection admission;
+6. **Remaining daemon gaps:** class-aware ordinary-connection admission;
    oversized-observation degraded mode (1 MiB cap); `Exit::Unresolved`
    conflating "no identity" with "uninspectable"; unbounded `Owed`
    reconciliation; multi-tmux-client focus.
-6. **Then product work:** workspace-recovery, tmux naming.
+7. **Then product work:** workspace-recovery, tmux naming.
 
 Not planned: an async rewrite of the domain actor (Tokio is already used for
 transport; the actor's sync loop is measurement-driven only), a generic RPC or
