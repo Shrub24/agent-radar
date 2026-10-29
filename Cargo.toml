@@ -1,6 +1,6 @@
 [package]
 name = "agent-radar"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 # Floor imposed by the dependencies (ratatui 0.30 and ratatui-crossterm 0.1
 # declare rust-version 1.88.0); edition 2024 itself requires 1.85.

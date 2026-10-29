@@ -22,6 +22,11 @@ export type RadarAttentionOptions = {
 	) => Promise<
 		{ ok: true; value: { close(): void } } | { ok: false; code: string; message: string }
 	>;
+	/**
+	 * Why the mailbox is not draining, or `undefined` once it is. Called when the
+	 * answer changes, so a stuck mailbox is visible without a message per heartbeat.
+	 */
+	onDiagnostic?: (problem: string | undefined) => void;
 	idleHoldMs?: number;
 	backoffMs?: number;
 };
@@ -49,7 +54,10 @@ export function createRadarAttention(options: RadarAttentionOptions): RadarAtten
 	let running = false;
 	let again = false;
 	let last = "";
+	let reported: string | undefined;
 	let starting = false;
+	/** Messages whose kind no consumer handles: fetching one again cannot help. */
+	const unsupported = new Set<string>();
 	let watch: { close(): void } | undefined;
 	let idleTimer: RadarTimer | undefined;
 	let retryTimer: RadarTimer | undefined;
@@ -119,27 +127,45 @@ export function createRadarAttention(options: RadarAttentionOptions): RadarAtten
 		});
 	}
 
-	async function pass(): Promise<void> {
+	/** What kept the mailbox from draining, or `undefined` when it drained. */
+	async function pass(): Promise<string | undefined> {
+		let problem: string | undefined;
 		let after: string | undefined;
 		for (;;) {
 			const page = await options.mailbox.page(after);
-			if (page.ok === false) return;
+			if (page.ok === false) return `mailbox page failed: ${page.message}`;
 			for (const id of page.value.message_ids) {
+				if (unsupported.has(id)) {
+					problem ??= `message ${id} has no consumer`;
+					continue;
+				}
 				const fetched = await options.mailbox.get(id);
-				if (fetched.ok === false) return;
-				const consumer = options.consumers.find((one) => one.kind === fetched.value.message.body.kind);
+				if (fetched.ok === false) return `message ${id} unreadable: ${fetched.message}`;
+				const kind = fetched.value.message.body.kind;
+				const consumer = options.consumers.find((one) => one.kind === kind);
 				// An unsupported body stays pending and visible; it is never
 				// dropped to keep the loop moving.
-				if (consumer === undefined) continue;
-				if (!(await consumer.capture(fetched.value.message))) return;
+				if (consumer === undefined) {
+					unsupported.add(id);
+					problem ??= `message ${id} has kind "${kind}" and no consumer`;
+					continue;
+				}
+				if (!(await consumer.capture(fetched.value.message)))
+					return `capture declined message ${id}`;
 				const received = await options.mailbox.receive(id);
 				// A failed receipt means redelivery later, which the consumer's own
 				// deduplication makes safe.
-				if (received.ok === false) return;
+				if (received.ok === false) return `receipt for ${id} failed: ${received.message}`;
 			}
-			if (page.value.next === undefined || page.value.next === null) return;
+			if (page.value.next === undefined || page.value.next === null) return problem;
 			after = page.value.next;
 		}
+	}
+
+	function report(problem: string | undefined): void {
+		if (problem === reported) return;
+		reported = problem;
+		options.onDiagnostic?.(problem);
 	}
 
 	function drain(): void {
@@ -150,7 +176,8 @@ export function createRadarAttention(options: RadarAttentionOptions): RadarAtten
 		}
 		running = true;
 		void pass()
-			.catch(() => undefined)
+			.catch((error) => `drain failed: ${String((error as Error)?.message ?? error)}`)
+			.then(report)
 			.finally(() => {
 				running = false;
 				if (again) {

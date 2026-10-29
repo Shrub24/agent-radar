@@ -65,7 +65,7 @@ function message(id: string): MessageSerialize {
 
 type Recorded = { captured: string[]; received: string[]; failed: Set<string> };
 
-function mailbox(ids: string[], recorded: Recorded, options: { failPage?: boolean } = {}): RadarMailboxPort {
+function mailbox(ids: string[], recorded: Recorded, options: { failPage?: boolean; sticky?: boolean } = {}): RadarMailboxPort {
 	let pageCalls = 0;
 	return {
 		async publish() {
@@ -75,7 +75,7 @@ function mailbox(ids: string[], recorded: Recorded, options: { failPage?: boolea
 			pageCalls += 1;
 			if (options.failPage === true) throw new Error("page failed");
 			// One page, then a continuation the test can ignore.
-			return pageCalls === 1
+			return pageCalls === 1 || options.sticky === true
 				? { ok: true, value: { message_ids: ids, next: null } }
 				: { ok: true, value: { message_ids: [], next: null } };
 		},
@@ -245,4 +245,62 @@ test("a refused subscription falls back to heartbeats and retries", async () => 
 	assert.equal(attempts, 2, "a refusal is retried with backoff");
 	attention.stop();
 	assert.equal(closed, 1, "stopping releases the subscription");
+});
+
+test("a mailbox that cannot drain says why once, and says when it recovers", async () => {
+	const recorded: Recorded = { captured: [], received: [], failed: new Set([MESSAGE]) };
+	const heard: (string | undefined)[] = [];
+	const attention = createRadarAttention({
+		mailbox: mailbox([MESSAGE], recorded, { sticky: true }),
+		consumers: [{ kind: "handoff", capture: () => true }],
+		scheduler: clock().scheduler,
+		activity: () => "working",
+		onDiagnostic: (problem) => heard.push(problem),
+	});
+	attention.drain();
+	await settle();
+	attention.hint(undefined);
+	await settle();
+	assert.equal(heard.length, 1, "a stuck mailbox is reported once, not on every heartbeat");
+	assert.match(heard[0] ?? "", /unreadable/);
+	recorded.failed.clear();
+	attention.hint(undefined);
+	await settle();
+	assert.deepEqual(heard.slice(1), [undefined], "recovery clears the report");
+});
+
+test("a consumer that throws is reported, not swallowed", async () => {
+	const recorded: Recorded = { captured: [], received: [], failed: new Set() };
+	const heard: (string | undefined)[] = [];
+	const attention = createRadarAttention({
+		mailbox: mailbox([MESSAGE], recorded),
+		consumers: [{ kind: "handoff", capture: () => { throw new Error("disk full"); } }],
+		scheduler: clock().scheduler,
+		activity: () => "working",
+		onDiagnostic: (problem) => heard.push(problem),
+	});
+	attention.drain();
+	await settle();
+	assert.match(heard[0] ?? "", /disk full/);
+	assert.deepEqual(recorded.received, [], "nothing is received after a failed capture");
+});
+
+test("a message no consumer handles is fetched once and stays visible", async () => {
+	const recorded: Recorded = { captured: [], received: [], failed: new Set() };
+	let fetches = 0;
+	const base = mailbox([MESSAGE], recorded, { sticky: true });
+	const heard: (string | undefined)[] = [];
+	const attention = createRadarAttention({
+		mailbox: { ...base, async get(id) { fetches += 1; return base.get(id); } },
+		consumers: [{ kind: "other" as never, capture: () => true }],
+		scheduler: clock().scheduler,
+		activity: () => "working",
+		onDiagnostic: (problem) => heard.push(problem),
+	});
+	for (let round = 0; round < 3; round += 1) {
+		attention.hint(undefined);
+		await settle();
+	}
+	assert.equal(fetches, 1, "an unsupported body is not re-downloaded on every heartbeat");
+	assert.match(heard[0] ?? "", /no consumer/, "it is still reported, since it stays pending");
 });

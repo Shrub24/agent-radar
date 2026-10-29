@@ -99,13 +99,10 @@ pub(super) fn message_request(core: &Arc<Mutex<Core>>, request: &Request) -> Res
             };
             let limit = params.limit.unwrap_or(messages::MAX_PAGE);
             match messages.page(&identity.subject_id, params.after.as_deref(), limit) {
-                Ok((page, next)) => {
-                    let page = crate::control_plane::public_contracts::MessagePage {
-                        message_ids: page.into_iter().map(|message| message.id).collect(),
-                        next,
-                    };
-                    respond(&request.id, Ok(page))
-                }
+                Ok((message_ids, next)) => respond(
+                    &request.id,
+                    Ok(crate::control_plane::public_contracts::MessagePage { message_ids, next }),
+                ),
                 Err(error) => message_error(request, error),
             }
         }
@@ -185,10 +182,7 @@ pub(super) fn attention_for(
         ) => return AttentionHint::None,
         Err(_) => return AttentionHint::Unavailable,
     };
-    match messages.attention(&identity.subject_id) {
-        Ok(attention) => AttentionHint::Waiting(attention),
-        Err(_) => AttentionHint::Unavailable,
-    }
+    AttentionHint::Waiting(messages.attention(&identity.subject_id))
 }
 
 pub(super) fn message_identity(

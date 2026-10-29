@@ -136,17 +136,14 @@ enum Hint {
     Unavailable,
 }
 
-/// Reading the mailbox touches the filesystem, so it runs off the transport's
-/// worker.
+/// Resolving the registration reads registry records, so it runs off the
+/// transport's worker.
 async fn attention(registry: Arc<Registry>, messages: Arc<MessageStore>, open: &WatchOpen) -> Hint {
     let registration = open.registration_id.clone();
     let resolved = tokio::task::spawn_blocking(move || {
         let registry = registry;
         match super::message_lane::message_identity(&registry, &registration) {
-            Ok(identity) => match messages.attention(&identity.subject_id) {
-                Ok(attention) => Ok(Some(attention)),
-                Err(_) => Err(()),
-            },
+            Ok(identity) => Ok(Some(messages.attention(&identity.subject_id))),
             Err(crate::control_plane::messages::Error::NotFound)
             | Err(crate::control_plane::messages::Error::Invalid(_))
             | Err(crate::control_plane::messages::Error::WrongRecipient) => Ok(None),

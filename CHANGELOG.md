@@ -2,6 +2,16 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## pi-radar 0.13.3
+
+- `createRadarAttention` takes `onDiagnostic(problem | undefined)`: a mailbox that cannot drain — an unreadable message, a consumer that declines or throws, a failed receipt, a message no consumer handles — is reported when the answer changes and cleared on recovery. Before, every failure was swallowed and a stuck mailbox was invisible to the host.
+- A message whose kind no consumer handles is fetched once, not on every heartbeat. It stays pending and stays reported.
+
+## Radar 0.8.1
+
+- Reading a recipient's attention no longer touches the disk or waits behind a write. `attention` runs on every heartbeat and every subscriber wake; it listed the mailbox directory and parsed every pending message in full under one global lock, which measured 2.4 ms at 128 pending 20 KB messages and 52 ms at 128 pending 380 KB messages. The store now keeps an index rebuilt from the files at start and changed only after the file it mirrors is durable, so a read is a scan of in-memory entries and the lock serialises writers only. Capacity is checked from the same index instead of statting every record. The wire and the stored files are unchanged.
+- Expiry removes a message before its receipts. It used to remove the receipts first, so a crash between the two left a message with no receipts that was pending for every recipient again. A receipt whose message is gone is now swept when the daemon starts.
+
 ## pi-radar 0.13.2
 
 - `extension/radar-attention.ts` is now in the package: `files`, `build`, the `typecheck` list and a `pi-radar/attention` subpath. 0.13.1 exported it from `index.ts` but did not ship the module, so a TypeScript consumer of the published package could not resolve it.
@@ -12,11 +22,12 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 ## pi-radar 0.13.1
 
-- Ships the mailbox consumer the 0.13.0 SDK described but did not export: `createRadarAttention` (with `RADAR_IDLE_HOLD_MS`, `RADAR_ATTENTION_BACKOFF_MS` and `RadarActivity`) is reachable from the package entry point, so one serialized drain with receipt-after-durable-capture, bounded retry and the continuous-idle hold is available to consumers.
+Do not adopt 0.13.1; use 0.13.3. Two of its claims were false, and the corrections are inline below.
+
+- Exports the mailbox consumer the 0.13.0 SDK described but did not export: `createRadarAttention` (with `RADAR_IDLE_HOLD_MS`, `RADAR_ATTENTION_BACKOFF_MS` and `RadarActivity`) is reachable from the package entry point at runtime. Its TypeScript source was not in the tarball, so the package's types did not resolve (fixed in 0.13.2).
 - `publish()` returns the accepted reply's `attention`, so a heartbeat establishes the mailbox hint that an idle agent has no connection to discover otherwise.
-- `watchAttention` reports when a subscription ends (`onEnd`) instead of only exposing `close()`. A socket that dies after establishment was previously held as if it were live, so the consumer never re-subscribed; the loop now clears it and reopens from a fresh baseline with backoff.
+- `watchAttention` accepts `onEnd`, but it was never called, so a socket that died after establishment was still held as if it were live and the loop never re-subscribed (fixed in 0.13.2).
 - `RADAR_RUNTIME_VERSION` is 7: the runtime's communication surface changed incompatibly in 0.13, and a mixed installation must fail explicitly rather than at the first handoff.
-- Superseded by 0.13.2: the "reopens from a fresh baseline" behaviour described here did not work — `onEnd` was never called, and the module was missing from the tarball.
 
 ## 0.8.0
 

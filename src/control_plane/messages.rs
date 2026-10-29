@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::control_plane::public_contracts::{
     AgentIdentity, Attention, Message, MessageReceipt, PublishBody,
@@ -35,12 +36,56 @@ pub enum Error {
 
 /// One durable, producer-addressed message lane: a message is written once with
 /// its whole recipient set, and each recipient's receipt is its own record.
+///
+/// The files are the truth. `index` is what readers consult: rebuilt from them at
+/// open and changed only after the file it mirrors is durable, so a read never
+/// touches the disk and never waits behind a write.
 pub struct MessageStore {
     root: PathBuf,
     /// Distinguishes this daemon instance: a revision earned in an earlier
     /// process never compares equal to one from this process.
     instance: String,
-    lock: Mutex<()>,
+    /// Serialises mutations. Reads never take it.
+    writes: Mutex<()>,
+    index: RwLock<BTreeMap<String, Entry>>,
+}
+
+struct Entry {
+    recipients: Vec<String>,
+    created_at: u64,
+    /// The message file and its receipts, for the storage bound.
+    bytes: u64,
+    /// Receipt time per recipient that has captured the message.
+    received: BTreeMap<String, u64>,
+}
+
+impl Entry {
+    fn of(message: &Message, bytes: u64) -> Self {
+        Self {
+            recipients: message.recipients.clone(),
+            created_at: message.created_at_unix_ms,
+            bytes,
+            received: BTreeMap::new(),
+        }
+    }
+
+    fn pending_for(&self, subject: &str) -> bool {
+        self.recipients.iter().any(|recipient| recipient == subject)
+            && !self.received.contains_key(subject)
+    }
+}
+
+/// A pending message's place in acceptance order; the id makes it total.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Position {
+    created_at: u64,
+    id: String,
+}
+
+impl Position {
+    fn cursor(&self) -> String {
+        format!("{}:{}", self.created_at, self.id)
+    }
 }
 
 impl MessageStore {
@@ -58,8 +103,6 @@ impl MessageStore {
         }
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("message store {}: {error}", root.display()))?;
-        // Never reused: a revision earned by an earlier process must not compare
-        // equal to one from this process.
         let instance = format!(
             "{:016x}",
             std::time::SystemTime::now()
@@ -70,94 +113,93 @@ impl MessageStore {
         let store = Self {
             root,
             instance,
-            lock: Mutex::new(()),
+            writes: Mutex::new(()),
+            index: RwLock::new(BTreeMap::new()),
         };
         store.reject_legacy_records()?;
+        store
+            .load()
+            .map_err(|error| format!("message store {}: {error:?}", store.root.display()))?;
         Ok(store)
     }
 
     /// Accepts one immutable message, addressed to its whole recipient set.
     pub fn publish(&self, message: &Message) -> Result<(Message, bool), Error> {
         validate_message(message)?;
-        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _writes = self.writes();
         self.prune_received(message.created_at_unix_ms as i64)?;
-        let path = self.message_path(&message.id);
-        if path.exists() {
+        if self.index().contains_key(&message.id) {
             let existing = self.read_message(&message.id)?;
-            if same_publication(&existing, message) {
-                return Ok((existing, false));
-            }
-            return Err(Error::Conflict);
-        }
-        let records = self.read_all()?;
-        let stored_bytes = self.stored_bytes(&records);
-        if records.len() >= MAX_STORED_MESSAGES || stored_bytes >= MAX_STORED_BYTES {
-            return Err(Error::Capacity);
-        }
-        for recipient in &message.recipients {
-            if records
-                .iter()
-                .filter(|record| {
-                    record.recipients.contains(recipient)
-                        && !self.receipt_path(&record.id, recipient).exists()
-                })
-                .count()
-                >= MAX_PENDING_PER_SUBJECT
-            {
-                return Err(Error::Capacity);
-            }
+            return if same_publication(&existing, message) {
+                Ok((existing, false))
+            } else {
+                Err(Error::Conflict)
+            };
         }
         let bytes = serde_json::to_vec(message)
             .map_err(|error| Error::Internal(format!("encode message: {error}")))?;
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(Error::Invalid("message record is too large".into()));
         }
-        if stored_bytes.saturating_add(bytes.len() as u64) > MAX_STORED_BYTES {
-            return Err(Error::Capacity);
+        {
+            let index = self.index();
+            let stored: u64 = index.values().map(|entry| entry.bytes).sum();
+            if index.len() >= MAX_STORED_MESSAGES
+                || stored.saturating_add(bytes.len() as u64) > MAX_STORED_BYTES
+                || message.recipients.iter().any(|recipient| {
+                    index
+                        .values()
+                        .filter(|entry| entry.pending_for(recipient))
+                        .count()
+                        >= MAX_PENDING_PER_SUBJECT
+                })
+            {
+                return Err(Error::Capacity);
+            }
         }
-        write_atomic(&self.root, &path, &bytes, MAX_RECORD_BYTES).map_err(Error::Internal)?;
+        write_atomic(
+            &self.root,
+            &self.message_path(&message.id),
+            &bytes,
+            MAX_RECORD_BYTES,
+        )
+        .map_err(Error::Internal)?;
+        self.index_mut()
+            .insert(message.id.clone(), Entry::of(message, bytes.len() as u64));
         Ok((message.clone(), true))
     }
 
-    /// Pending deliveries for one recipient, oldest acceptance first.
-    pub fn pending(&self, subject: &str) -> Result<Vec<Message>, Error> {
-        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
-        self.prune_received(crate::control_plane::store::now_ms())?;
-        self.pending_unlocked(subject)
-    }
-
-    /// One bounded page. The cursor is the last returned acceptance position,
-    /// so a page stays valid even after another recipient receives its copy.
+    /// One bounded page of pending ids. The cursor is the last returned
+    /// acceptance position, so a page stays valid even after another recipient
+    /// receives its copy.
     pub fn page(
         &self,
         subject: &str,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<(Vec<Message>, Option<String>), Error> {
+    ) -> Result<(Vec<String>, Option<String>), Error> {
         let limit = limit.clamp(1, MAX_PAGE);
-        let mut pending = self.pending(subject)?;
-        pending.sort_by(acceptance_order);
-        if let Some(cursor) = after.map(parse_cursor).transpose()? {
-            pending.retain(|message| accept_position(message) > cursor);
+        let after = after.map(parse_cursor).transpose()?;
+        let mut pending = self.pending(subject);
+        if let Some(after) = after {
+            pending.retain(|position| *position > after);
         }
-        let more = pending.len() > limit;
+        let next = (pending.len() > limit).then(|| pending[limit - 1].cursor());
         pending.truncate(limit);
-        let next = more.then(|| pending.last().map(format_cursor).unwrap_or_default());
-        Ok((pending, next))
+        Ok((
+            pending.into_iter().map(|position| position.id).collect(),
+            next,
+        ))
     }
 
     pub fn get(&self, id: &str, subject: &str) -> Result<(Message, Option<MessageReceipt>), Error> {
-        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
-        self.prune_received(crate::control_plane::store::now_ms())?;
+        let captured = self.captured(id, subject)?;
         let message = self.read_message(id)?;
-        if !message
-            .recipients
-            .iter()
-            .any(|recipient| recipient == subject)
-        {
-            return Err(Error::WrongRecipient);
-        }
-        let receipt = self.read_receipt(id, subject)?;
+        let receipt = if captured {
+            self.read_receipt(id, subject)?
+        } else {
+            None
+        };
         Ok((message, receipt))
     }
 
@@ -169,18 +211,14 @@ impl MessageStore {
         recipient: &AgentIdentity,
         received_at_unix_ms: u64,
     ) -> Result<(MessageReceipt, bool), Error> {
-        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _writes = self.writes();
         self.prune_received(crate::control_plane::store::now_ms())?;
-        let message = self.read_message(id)?;
-        if !message
-            .recipients
-            .iter()
-            .any(|addressed| addressed == &recipient.subject_id)
-        {
-            return Err(Error::WrongRecipient);
-        }
-        if let Some(receipt) = self.read_receipt(id, &recipient.subject_id)? {
-            return Ok((receipt, false));
+        let subject = &recipient.subject_id;
+        if self.captured(id, subject)? {
+            let first = self
+                .read_receipt(id, subject)?
+                .ok_or_else(|| Error::Internal("an indexed message receipt is missing".into()))?;
+            return Ok((first, false));
         }
         if received_at_unix_ms > crate::model::MAX_SAFE_JSON_INTEGER {
             return Err(Error::Invalid(
@@ -197,89 +235,114 @@ impl MessageStore {
             .map_err(|error| Error::Internal(format!("encode message receipt: {error}")))?;
         write_atomic(
             &self.root,
-            &self.receipt_path(id, &recipient.subject_id),
+            &self.receipt_path(id, subject),
             &bytes,
             MAX_RECEIPT_BYTES,
         )
         .map_err(Error::Internal)?;
+        if let Some(entry) = self.index_mut().get_mut(id) {
+            entry.received.insert(subject.clone(), received_at_unix_ms);
+            entry.bytes = entry.bytes.saturating_add(bytes.len() as u64);
+        }
         Ok((receipt, true))
     }
 
     /// What one recipient has waiting. The revision is opaque: it changes when
     /// this subject's pending set changes and never on another subject's work.
-    pub fn attention(&self, subject: &str) -> Result<Attention, Error> {
-        let mut pending = self.pending(subject)?;
-        pending.sort_by(acceptance_order);
+    pub fn attention(&self, subject: &str) -> Attention {
+        let pending = self.pending(subject);
         let mut state = String::new();
-        for message in &pending {
-            let _ = write!(state, "{}:{};", message.id, message.created_at_unix_ms);
+        for position in &pending {
+            let _ = write!(state, "{}:{};", position.id, position.created_at);
         }
-        let revision = format!(
-            "{}:{}",
-            self.instance,
-            crate::content::digest(format!("{subject}\0{state}").as_bytes())
-        );
-        Ok(Attention {
-            revision,
+        Attention {
+            revision: format!(
+                "{}:{}",
+                self.instance,
+                crate::content::digest(format!("{subject}\0{state}").as_bytes())
+            ),
             pending: pending.len() as u64,
-        })
+        }
     }
 
-    fn pending_unlocked(&self, subject: &str) -> Result<Vec<Message>, Error> {
-        let mut records: Vec<Message> = self
-            .read_all()?
-            .into_iter()
-            .filter(|record| {
-                record
-                    .recipients
-                    .iter()
-                    .any(|recipient| recipient == subject)
-                    && !self.receipt_path(&record.id, subject).exists()
+    fn pending(&self, subject: &str) -> Vec<Position> {
+        let mut pending: Vec<Position> = self
+            .index()
+            .iter()
+            .filter(|(_, entry)| entry.pending_for(subject))
+            .map(|(id, entry)| Position {
+                created_at: entry.created_at,
+                id: id.clone(),
             })
             .collect();
-        records.sort_by(acceptance_order);
-        Ok(records)
+        pending.sort();
+        pending
     }
 
-    fn read_all(&self) -> Result<Vec<Message>, Error> {
-        let mut records = Vec::new();
-        for entry in fs::read_dir(&self.root)
-            .map_err(|error| Error::Internal(format!("list messages: {error}")))?
+    /// Whether this recipient already holds the message, once the id is known to
+    /// be one this recipient is addressed by.
+    fn captured(&self, id: &str, subject: &str) -> Result<bool, Error> {
+        if !is_id(id) {
+            return Err(Error::Invalid("message id must be a canonical UUID".into()));
+        }
+        let index = self.index();
+        let entry = index.get(id).ok_or(Error::NotFound)?;
+        if !entry
+            .recipients
+            .iter()
+            .any(|recipient| recipient == subject)
         {
-            let entry =
-                entry.map_err(|error| Error::Internal(format!("list messages: {error}")))?;
-            let Some(id) = entry
-                .file_name()
-                .to_str()
-                .and_then(parse_message_file)
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            records.push(self.read_message(&id)?);
-            if records.len() > MAX_STORED_MESSAGES {
-                return Err(Error::Internal(
-                    "message store exceeds its configured record bound".into(),
-                ));
-            }
+            return Err(Error::WrongRecipient);
         }
-        Ok(records)
+        Ok(entry.received.contains_key(subject))
     }
 
-    fn stored_bytes(&self, records: &[Message]) -> u64 {
-        let mut total = 0u64;
-        for record in records {
-            if let Ok(metadata) = fs::symlink_metadata(self.message_path(&record.id)) {
-                total = total.saturating_add(metadata.len());
-            }
-            for recipient in &record.recipients {
-                if let Ok(metadata) = fs::symlink_metadata(self.receipt_path(&record.id, recipient))
-                {
-                    total = total.saturating_add(metadata.len());
+    /// Rebuilds the index from the files. A receipt whose message is gone is the
+    /// residue of an interrupted expiry, which removes the message first.
+    fn load(&self) -> Result<(), Error> {
+        let listing = |error: std::io::Error| Error::Internal(format!("list messages: {error}"));
+        let mut entries = BTreeMap::new();
+        let mut receipts = Vec::new();
+        for entry in fs::read_dir(&self.root).map_err(listing)? {
+            let name = entry.map_err(listing)?.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(id) = parse_message_file(name) {
+                let message = self.read_message(id)?;
+                entries.insert(
+                    id.to_owned(),
+                    Entry::of(&message, file_len(&self.message_path(id))),
+                );
+                if entries.len() > MAX_STORED_MESSAGES {
+                    return Err(Error::Internal(
+                        "message store exceeds its configured record bound".into(),
+                    ));
                 }
+            } else if let Some((id, subject)) = parse_receipt_file(name) {
+                receipts.push((id.to_owned(), subject.to_owned()));
             }
         }
-        total
+        for (id, subject) in receipts {
+            match entries
+                .get_mut(&id)
+                .filter(|entry| entry.recipients.contains(&subject))
+            {
+                Some(entry) => {
+                    if let Some(receipt) = self.read_receipt(&id, &subject)? {
+                        entry
+                            .received
+                            .insert(subject.clone(), receipt.received_at_unix_ms);
+                        entry.bytes = entry
+                            .bytes
+                            .saturating_add(file_len(&self.receipt_path(&id, &subject)));
+                    }
+                }
+                None => fs::remove_file(self.receipt_path(&id, &subject)).map_err(|error| {
+                    Error::Internal(format!("remove orphaned message receipt: {error}"))
+                })?,
+            }
+        }
+        *self.index_mut() = entries;
+        self.prune_received(crate::control_plane::store::now_ms())
     }
 
     fn read_message(&self, id: &str) -> Result<Message, Error> {
@@ -341,33 +404,41 @@ impl MessageStore {
 
     /// Retires a body only once every recipient has had it for the retention
     /// window. A message pending for anyone is never expired to make room.
+    /// Callers hold `writes`. The message goes first, so a crash leaves receipts
+    /// that `load` sweeps, never a message that looks pending again.
     fn prune_received(&self, now_ms: i64) -> Result<(), Error> {
         let cutoff = now_ms.saturating_sub(RECEIVED_RETENTION_MS).max(0) as u64;
-        for message in self.read_all()? {
-            let mut receipts = Vec::with_capacity(message.recipients.len());
-            for recipient in &message.recipients {
-                match self.read_receipt(&message.id, recipient)? {
-                    Some(receipt) => receipts.push(receipt),
-                    None => break,
-                }
-            }
-            if receipts.len() != message.recipients.len() {
-                continue;
-            }
-            if receipts
-                .iter()
-                .all(|receipt| receipt.received_at_unix_ms < cutoff)
-            {
-                for recipient in &message.recipients {
-                    fs::remove_file(self.receipt_path(&message.id, recipient)).map_err(
-                        |error| Error::Internal(format!("expire message receipt: {error}")),
-                    )?;
-                }
-                fs::remove_file(self.message_path(&message.id))
-                    .map_err(|error| Error::Internal(format!("expire message: {error}")))?;
+        let expired: Vec<(String, Vec<String>)> = self
+            .index()
+            .iter()
+            .filter(|(_, entry)| {
+                entry.received.len() == entry.recipients.len()
+                    && entry.received.values().all(|&at| at < cutoff)
+            })
+            .map(|(id, entry)| (id.clone(), entry.recipients.clone()))
+            .collect();
+        for (id, recipients) in expired {
+            fs::remove_file(self.message_path(&id))
+                .map_err(|error| Error::Internal(format!("expire message: {error}")))?;
+            self.index_mut().remove(&id);
+            for recipient in &recipients {
+                fs::remove_file(self.receipt_path(&id, recipient))
+                    .map_err(|error| Error::Internal(format!("expire message receipt: {error}")))?;
             }
         }
         Ok(())
+    }
+
+    fn writes(&self) -> MutexGuard<'_, ()> {
+        self.writes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn index(&self) -> RwLockReadGuard<'_, BTreeMap<String, Entry>> {
+        self.index.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn index_mut(&self) -> RwLockWriteGuard<'_, BTreeMap<String, Entry>> {
+        self.index.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn reject_legacy_records(&self) -> Result<(), String> {
@@ -406,32 +477,23 @@ impl MessageStore {
     }
 }
 
-/// Acceptance order, with the message id as the tie-break, so paging is total.
-fn acceptance_order(left: &Message, right: &Message) -> std::cmp::Ordering {
-    accept_position(left).cmp(&accept_position(right))
+fn file_len(path: &Path) -> u64 {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
-fn accept_position(message: &Message) -> (u64, &str) {
-    (message.created_at_unix_ms, message.id.as_str())
-}
-
-fn format_cursor(message: &Message) -> String {
-    format!("{}:{}", message.created_at_unix_ms, message.id)
-}
-
-fn parse_cursor(cursor: &str) -> Result<(u64, &str), Error> {
-    let (created, id) = cursor
-        .split_once(':')
-        .ok_or_else(|| Error::Invalid("page cursor is not an acceptance position".into()))?;
-    let created = created
-        .parse::<u64>()
-        .map_err(|_| Error::Invalid("page cursor is not an acceptance position".into()))?;
+fn parse_cursor(cursor: &str) -> Result<Position, Error> {
+    let invalid = || Error::Invalid("page cursor is not an acceptance position".into());
+    let (created, id) = cursor.split_once(':').ok_or_else(invalid)?;
+    let created_at = created.parse::<u64>().map_err(|_| invalid())?;
     if !is_id(id) {
-        return Err(Error::Invalid(
-            "page cursor is not an acceptance position".into(),
-        ));
+        return Err(invalid());
     }
-    Ok((created, id))
+    Ok(Position {
+        created_at,
+        id: id.to_owned(),
+    })
 }
 
 fn parse_message_file(name: &str) -> Option<&str> {
@@ -600,8 +662,8 @@ mod tests {
             !store.publish(&published).unwrap().1,
             "a retry returns the accepted message"
         );
-        assert_eq!(store.pending(P).unwrap().len(), 1);
-        assert_eq!(store.pending(Q).unwrap().len(), 1);
+        assert_eq!(store.pending(P).len(), 1);
+        assert_eq!(store.pending(Q).len(), 1);
         let mut changed = message(M1, &[P, Q], "different body");
         changed.created_at_unix_ms = 1_000;
         assert_eq!(store.publish(&changed), Err(Error::Conflict));
@@ -618,8 +680,8 @@ mod tests {
             receipt,
             "a repeated receipt returns the first one"
         );
-        assert!(store.pending(P).unwrap().is_empty());
-        assert_eq!(store.pending(Q).unwrap().len(), 1);
+        assert!(store.pending(P).is_empty());
+        assert_eq!(store.pending(Q).len(), 1);
         assert_eq!(
             store.get(M1, Q).unwrap().0.body,
             message(M1, &[P, Q], "body").body,
@@ -630,24 +692,24 @@ mod tests {
     #[test]
     fn attention_follows_only_this_recipients_mailbox() {
         let (_state, store) = open();
-        let quiet = store.attention(Q).unwrap();
+        let quiet = store.attention(Q);
         assert_eq!(
             (quiet.pending, quiet.revision.as_str()),
             (0, quiet.revision.as_str())
         );
         store.publish(&message(M1, &[P], "body")).unwrap();
-        let waiting = store.attention(P).unwrap();
+        let waiting = store.attention(P);
         assert_eq!(waiting.pending, 1);
         assert_ne!(waiting.revision, quiet.revision);
         assert_eq!(
-            store.attention(Q).unwrap().revision,
+            store.attention(Q).revision,
             quiet.revision,
             "another subject's delivery is not Q's attention"
         );
         store.receive(M1, &identity(P), 2_000).unwrap();
-        assert_eq!(store.attention(P).unwrap().pending, 0);
+        assert_eq!(store.attention(P).pending, 0);
         assert_ne!(
-            store.attention(P).unwrap().revision,
+            store.attention(P).revision,
             quiet.revision,
             "receipt is a mailbox change"
         );
@@ -657,16 +719,16 @@ mod tests {
     fn a_rebuilt_store_reports_the_same_pending_work_without_an_announcement() {
         let (state, store) = open();
         store.publish(&message(M1, &[P], "body")).unwrap();
-        let before = store.attention(P).unwrap();
+        let before = store.attention(P);
         drop(store);
         let rebuilt = MessageStore::open(&state).unwrap();
-        let after = rebuilt.attention(P).unwrap();
+        let after = rebuilt.attention(P);
         assert_eq!(after.pending, before.pending);
         assert_ne!(
             after.revision, before.revision,
             "a new instance never reuses an earlier revision"
         );
-        assert_eq!(rebuilt.pending(P).unwrap().len(), 1);
+        assert_eq!(rebuilt.pending(P).len(), 1);
     }
 
     #[test]
@@ -679,13 +741,13 @@ mod tests {
         store.publish(&second).unwrap();
         store.publish(&first).unwrap();
         let (page, next) = store.page(P, None, 1).unwrap();
-        assert_eq!(page[0].id, M1);
+        assert_eq!(page[0], M1);
         assert_eq!(
             next.as_deref(),
             Some("1000:44444444-4444-4444-8444-444444444444")
         );
         let (page, next) = store.page(P, next.as_deref(), 1).unwrap();
-        assert_eq!(page[0].id, M2);
+        assert_eq!(page[0], M2);
         assert_eq!(next, None);
     }
 
@@ -699,10 +761,10 @@ mod tests {
         let refused = store.publish(&message(M1, &[P, Q], "body"));
         assert_eq!(refused, Err(Error::Capacity));
         assert!(
-            store.pending(Q).unwrap().is_empty(),
+            store.pending(Q).is_empty(),
             "a refused publication delivers to nobody"
         );
-        assert_eq!(store.pending(P).unwrap().len(), MAX_PENDING_PER_SUBJECT);
+        assert_eq!(store.pending(P).len(), MAX_PENDING_PER_SUBJECT);
     }
 
     #[test]
@@ -719,5 +781,52 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("retired handoff mailbox"), "{error}");
+    }
+
+    #[test]
+    fn a_rebuilt_store_remembers_which_recipients_hold_a_message() {
+        let (state, store) = open();
+        store.publish(&message(M1, &[P, Q], "body")).unwrap();
+        store.receive(M1, &identity(P), 2_000).unwrap();
+        drop(store);
+        let rebuilt = MessageStore::open(&state).unwrap();
+        assert!(rebuilt.pending(P).is_empty());
+        assert_eq!(rebuilt.pending(Q).len(), 1);
+        assert!(rebuilt.get(M1, P).unwrap().1.is_some());
+    }
+
+    #[test]
+    fn a_message_is_retired_once_every_recipient_has_held_it_for_the_window() {
+        let (state, store) = open();
+        store.publish(&message(M1, &[P], "body")).unwrap();
+        store.receive(M1, &identity(P), 2_000).unwrap();
+        let mut later = message(M2, &[Q], "body");
+        later.created_at_unix_ms = 2_000 + RECEIVED_RETENTION_MS as u64 + 1;
+        store.publish(&later).unwrap();
+        assert_eq!(store.get(M1, P), Err(Error::NotFound));
+        let root = state.join("communications");
+        assert!(!root.join(format!("{M1}.message.json")).exists());
+        assert!(!root.join(format!("{M1}.{P}.receipt.json")).exists());
+        assert_eq!(
+            store.pending(Q).len(),
+            1,
+            "work still pending is never retired"
+        );
+    }
+
+    #[test]
+    fn a_receipt_left_by_an_interrupted_expiry_never_revives_its_message() {
+        let (state, store) = open();
+        store.publish(&message(M1, &[P], "body")).unwrap();
+        store.receive(M1, &identity(P), 2_000).unwrap();
+        drop(store);
+        let root = state.join("communications");
+        fs::remove_file(root.join(format!("{M1}.message.json"))).unwrap();
+        let rebuilt = MessageStore::open(&state).unwrap();
+        assert!(rebuilt.pending(P).is_empty());
+        assert!(
+            !root.join(format!("{M1}.{P}.receipt.json")).exists(),
+            "the orphaned receipt is swept"
+        );
     }
 }

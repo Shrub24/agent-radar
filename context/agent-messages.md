@@ -83,3 +83,42 @@ would guess at a shape it never had, and dropping it would lose the only copy.
 The lane changed and its cutover is explicit.
 
 **See:** lifecycle.md#a-confirmed-deletion-closes-over-a-survivor-and-never-records-an-unverified-exit — 5c0a7f43-9c2e-4d31-8a6b-2f0e5d7c9b14 — as of 2026-10-29
+
+## The mailbox serves reads from an index the files back
+
+**Id:** 96b4a9d0-e26b-4aef-aae1-54e385ed70f7
+**Type:** decision
+**Status:** active
+**Evidence:** inferred
+**Source:** design conversation and a release-build measurement, 2026-10-29
+**See:** agent-messages.md#attention-is-a-mailbox-fact-not-a-read-position — 8c2d7a41-6f5e-4b93-a1d8-5e30b94c7d12 — as of 2026-10-29
+
+`MessageStore` keeps the message and receipt files as the truth and an in-memory
+index of them for reading. The index is rebuilt from the files at start and is
+changed only after the file it mirrors is durable. Attention, paging and the
+capacity checks read it; a separate lock serialises writers, and reads take
+neither it nor the disk. Expiry removes a message before its receipts, and a
+receipt with no message is swept at start.
+
+**Reason:** attention is computed on every heartbeat and every subscriber wake,
+and it used to list the directory and parse every pending message in full under
+one global lock. In a release build that cost 2.4 ms at 128 pending 20 KB
+messages and 52 ms at 128 pending 380 KB messages, and a subscriber wake made
+every watcher pay it. Attention needs only an id and an acceptance time per
+message, so the cost came from re-deriving them from disk, not from the lock.
+A single daemon owns the directory, which is what makes an index safe to
+trust. Expiring the receipts first would leave a message that looks pending
+again if a crash fell between the two deletes.
+
+**Rejected alternatives:** a lock-free scan of the same files (still parses every
+message per call); caching only the revision per subject (every publish and
+receipt must invalidate it, which is the index again, with more cases); an
+index kept as a second source of truth (it would need repair when it disagreed
+with the files, so it is never written to disk and is rebuilt instead).
+
+**Consequences:** the store is no longer safe with a second process writing the
+directory. Edits to `communications/` while the daemon runs are not seen until
+the next start.
+
+**Revisit when:** more than one process needs to write the mailbox, or the
+record bounds are raised far enough that rebuilding at start is slow.
