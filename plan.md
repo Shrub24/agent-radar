@@ -7,52 +7,45 @@ The queue behind the OpenSpec changes. An item lives here with the decision it
 still needs, and leaves when it becomes a change worth specifying. What is
 already settled is in `README.md` and `openspec/`; this file is the future.
 
-## Priority debt — typed contracts across the Rust daemon
+## Priority queue — daemon contracts and delivery adoption
 
-Implemented in [`typed-daemon-contracts`](openspec/changes/typed-daemon-contracts/proposal.md)
-on the isolated `wip/daemon-contracts` branch, pending merge. This covers the typed
-request/admission/execution/record/consumer sweep, not the daemon-wide transport
-migration. Claims require actual subject identity and categories are closed; no
-legacy adapters are retained.
+**Done:** typed daemon contracts ([`typed-daemon-contracts`](openspec/changes/typed-daemon-contracts/proposal.md)),
+published on `wip/daemon-contracts` (1b102f6d), not merged. Rust-owned closed
+contracts no longer round-trip through JSON; claims require `subject_id`;
+categories are closed; no legacy adapters. Two baseline tmux assertions are
+excluded from its gate (note #278).
 
-Next, scope consumer-led delivery adoption: coherent snapshot subscriptions and
-pi-radar MessagePack/framing first, then durable event subscriptions with cursors,
-epochs and gaps. Reuse the TUI's content/framing and supervised-connection machinery
-where it fits. Keep command receipts reliable and independent of coalesced state.
-Do not infer an async actor rewrite from using Tokio for transport. The existing
-Rust-derived JSON Schema/TypeScript generation remains the contract pipeline;
-a binary codec also needs TypeScript runtime decoding and cross-language fixtures.
+Order matters: each step uses the one before it. Delivery changes name a real
+consumer and delete the path they replace. Snapshots, command receipts and
+durable events stay separate delivery classes.
 
-High-priority architectural cleanup, ahead of further feature expansion: sweep
-Rust-owned operation, response, state and error structures across the daemon and
-its Rust consumers. Closed domain vocabularies must be enums and typed payloads,
-not strings or `serde_json::Value` inspected with key paths. Reuse existing
-outcome/error types; do not introduce another parallel vocabulary or a generic
-operation framework. Use typing/error crates only where they remove real work
-beyond ordinary Rust types.
+1. **Merge the typing sweep.** Rebase onto current `main`, rerun the gate,
+   merge. Everything below builds on the typed services.
+2. **Close the two baseline tmux failures** (create/focus on tmux 3.8). They
+   hide regressions in create-focus and no-client recovery. Do this with the
+   tmux 3.8 / exit-tracking replan, not as a typing task.
+3. **pi-radar codec foundation.** TypeScript MessagePack decode with u64/BigInt
+   handling, cross-language golden fixtures, and generated-contract coverage for
+   the DTOs pi-radar will consume. Reuse `content.rs` framing; no new schema
+   pipeline.
+4. **Snapshot subscription for non-TUI consumers.** Replace pi-radar's
+   observation/task reads with a coherent push head (latest-wins, bounded,
+   supervised). Keep `observation.get` for external users. Delete pi-radar's
+   polling in the same change.
+5. **Durable event subscription.** Push `events.read` pages with cursors,
+   epochs and `cursor_expired` gaps; no coalescing. Replaces the 1 s
+   long-poll. Reuses framing and connection ownership, not the latest-wins writer.
+6. **Correlated command replies over the same connection** only if a real
+   consumer needs it. Never auto-resubmit after loss.
+7. **Remaining daemon gaps:** class-aware ordinary-connection admission;
+   oversized-observation degraded mode (1 MiB cap); `Exit::Unresolved`
+   conflating "no identity" with "uninspectable"; unbounded `Owed`
+   reconciliation; multi-tmux-client focus.
+8. **Then product work:** workspace-recovery, tmux naming.
 
-The problem is broader than the TUI's `outcome_status`: operation handlers build
-JSON results, and internal consumers reconstruct state from wire strings.
-Serialization must be a boundary adapter, not the internal domain contract.
-Keep genuinely open extension data and human-readable diagnostics as such; this
-is not a ban on strings or JSON at external boundaries.
-
-Scope the sweep across admission, execution, durable/public operation records,
-reconciliation, Rust clients, and other daemon handlers with the same pattern.
-Use typed request/result DTOs and structured errors end to end, with one explicit
-mapping at each persistence or wire boundary. Preserve distinctions between
-pre-admission refusal, pending/admitted work, execution uncertainty and settled
-domain outcomes; these are not interchangeable states to collapse for brevity.
-The previous illustrative `OpResult` is not an approved contract: establish the
-actual state model before choosing its variants.
-
-Deliver through complete handler/consumer paths, deleting replaced JSON probing,
-string comparisons, duplicate state representations and hand-built envelopes in
-the same slices. Aim for unchanged wire/persistence compatibility; identify any
-necessary contract change explicitly rather than hiding it inside the refactor.
-Validate owned semantics and boundary compatibility with existing checks plus
-focused missing evidence, not a new exhaustive test matrix. Done when Rust-owned
-closed contracts no longer require reparsing serialized state to recover meaning.
+Not planned: an async rewrite of the domain actor (Tokio is already used for
+transport; the actor's sync loop is measurement-driven only), a generic RPC or
+operation framework, or one transport for every method.
 
 ## Unified publication and transport direction
 
