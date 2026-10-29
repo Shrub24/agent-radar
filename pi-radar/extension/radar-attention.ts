@@ -16,7 +16,10 @@ export type RadarAttentionOptions = {
 	scheduler: RadarScheduler;
 	activity: () => RadarActivity;
 	/** Present only for a process that opted into the push tier. */
-	watch?: (onAttention: (attention: AttentionSerialize) => void) => Promise<
+	watch?: (
+		onAttention: (attention: AttentionSerialize) => void,
+		onEnd: () => void,
+	) => Promise<
 		{ ok: true; value: { close(): void } } | { ok: false; code: string; message: string }
 	>;
 	idleHoldMs?: number;
@@ -86,7 +89,12 @@ export function createRadarAttention(options: RadarAttentionOptions): RadarAtten
 		}
 		idleTimer = cancel(idleTimer);
 		const start = options.watch;
-		void start(hint).then((opened) => {
+		const ended = (): void => {
+			if (stopped) return;
+			watch = undefined;
+			scheduleRetry();
+		};
+		void start(hint, ended).then((opened) => {
 			// Refused or lost: heartbeats still deliver, so this is a retry, not an
 			// incident.
 			if (opened.ok === false) {

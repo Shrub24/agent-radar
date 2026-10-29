@@ -1086,7 +1086,7 @@ export type RadarClient = {
 		lease_ms?: number;
 		observed_at?: string;
 		snapshot: RadarChannelSnapshot;
-	}): Promise<RadarResult<{ sequence: number }>>;
+	}): Promise<RadarResult<{ sequence: number; attention?: AttentionSerialize }>>;
 	presence(request: RadarPresenceReport): Promise<RadarResult<RadarPresenceAnswer>>;
 	releasePresence(request: RadarPresenceRelease): Promise<RadarResult<RadarPresenceAnswer>>;
 	context(request: {
@@ -1181,6 +1181,8 @@ export type RadarClient = {
 	watchAttention(request: {
 		registration_id: string;
 		onAttention(attention: AttentionSerialize): void;
+		/** Ends when the subscription does, however it ends: the loop reopens from a baseline. */
+		onEnd?: () => void;
 	}): Promise<RadarResult<{ close(): void }>>;
 	events(request: {
 		after: number;
@@ -1355,6 +1357,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 		path: string,
 		params: { registration_id: string },
 		onAttention: (attention: AttentionSerialize) => void,
+		onEnd?: () => void,
 	): Promise<RadarResult<{ close(): void }>> => {
 		const line = `${JSON.stringify({
 			version: RADAR_PROTOCOL_VERSION,
@@ -1818,7 +1821,20 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				const writer = (channel as { writer?: unknown } | undefined)?.writer;
 				const sequence = numberAt(writer, "sequence");
 				if (sequence === undefined) return protocol("publish reply carries no accepted sequence");
-				return { ok: true, value: { sequence } };
+				// The reply is where an idle process learns that work is waiting: drop
+				// it here and only a subscription could ever deliver.
+				const attention = recordAt(answer.value, "attention");
+				const revision = stringAt(attention, "revision");
+				const pending = numberAt(attention, "pending");
+				return {
+					ok: true,
+					value: {
+						sequence,
+						...(revision === undefined || pending === undefined
+							? {}
+							: { attention: { revision, pending } }),
+					},
+				};
 			});
 		},
 		async context(request) {
@@ -2175,7 +2191,12 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				const path = currentPath();
 				const refused = untrustedControlSocket(path, uid);
 				if (refused !== undefined) return { ok: false, code: "absent", message: refused };
-				const opened = await watch(path, { registration_id: request.registration_id }, request.onAttention);
+				const opened = await watch(
+					path,
+					{ registration_id: request.registration_id },
+					request.onAttention,
+					request.onEnd,
+				);
 				if (opened.ok === false) return opened;
 				return { ok: true, value: { close: opened.value.close } };
 			});

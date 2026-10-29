@@ -2,13 +2,20 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## pi-radar 0.13.1
+
+- Ships the mailbox consumer the 0.13.0 SDK described but did not export: `createRadarAttention` (with `RADAR_IDLE_HOLD_MS`, `RADAR_ATTENTION_BACKOFF_MS` and `RadarActivity`) is reachable from the package entry point, so one serialized drain with receipt-after-durable-capture, bounded retry and the continuous-idle hold is available to consumers.
+- `publish()` returns the accepted reply's `attention`, so a heartbeat establishes the mailbox hint that an idle agent has no connection to discover otherwise.
+- `watchAttention` reports when a subscription ends (`onEnd`) instead of only exposing `close()`. A socket that dies after establishment was previously held as if it were live, so the consumer never re-subscribed; the loop now clears it and reopens from a fresh baseline with backoff.
+- `RADAR_RUNTIME_VERSION` is 7: the runtime's communication surface changed incompatibly in 0.13, and a mixed installation must fail explicitly rather than at the first handoff.
+
 ## 0.8.0
 
 - The handoff mailbox becomes one addressed message lane. A message has an immutable id, producer provenance, one tagged body and a frozen set of subject recipients, written once so a crash cannot expose half a fanout; each recipient's receipt is its own record and attests only to durable capture. `communication.publish|inbox|get|ack` keep their names and take `message`/`message_ids`/`next`/`message_id` on the wire. Receipt is per recipient and idempotent, and a body is retired only once every recipient has held it for the retention window. Capacity is checked before acceptance and refuses: pending work is never evicted to admit a publication.
 - Handoff is now the first body kind (`body: {kind: "handoff", …}`) with its parent-only routing unchanged: a worker may address only its resolved recorded parent, so the envelope's recipient set is not a general send permission.
 - An idle agent needs no connection. `agent.publish` replies carry `attention: {revision, pending}` for the caller's verified subject, with `attention_unavailable` when the mailbox could not be read and no field for an unmanaged caller. `messages.watch` opens the optional push tier: a JSON opener, then length-prefixed MessagePack frames of that same state, a gap-free baseline first, latest-wins after, at most 4 KiB each. Subscriptions get their own 16-connection budget, so agent watches cannot take a UI attachment slot or a control connection.
 - The contract is `communication.messages.v1`; `communication.handoff.v1` is gone. Wire revision 12 — restart the daemon with pi-radar 0.13.0.
-- Stored communication records from the retired mailbox are refused rather than migrated: the daemon will not start while `communications/` holds them. Drain them with the previous daemon, or discard them with `radar reset --hard` — a plain `radar reset` keeps `communications` deliberately — before starting this build.
+- Stored communication records from the retired mailbox are refused rather than migrated: the daemon will not start while `communications/` holds them, and an empty inbox does not clear it — acknowledged records are retained for 30 days. Upgrade in this order: capture any pending handoff with the previous build, stop the daemon, then either archive `communications/` elsewhere or discard it. `radar reset --hard` discards pending and acknowledged records alike and is destructive; a plain `radar reset` deliberately keeps `communications`, so it does not clear the refusal.
 
 ## 0.7.0
 

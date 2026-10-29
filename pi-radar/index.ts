@@ -1,5 +1,6 @@
 export * as children from "./extension/radar-children.ts";
 export * as client from "./extension/radar-client.ts";
+export * as attention from "./extension/radar-attention.ts";
 export * as communication from "./extension/radar-communication.ts";
 export * as execution from "./extension/radar-execution.ts";
 export * as inspection from "./extension/radar-inspection.ts";
