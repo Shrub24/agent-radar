@@ -24,3 +24,35 @@ alone cannot explain.
 **Rejected alternative:** have the actor re-ask after seeing the survivor. That keeps a second prompt and actor state for no safety the first confirmation lacked.
 
 **Consequence:** the actor's decision to ask is advisory. An agent can start between observation and execution; the daemon still stops and verifies every agent inside the place, and reports rather than refuses. The confirmation is the operator's consent to what it named, not a guarantee about what runs at the instant of the delete.
+
+## Adding from the dashboard is always a tab and never a question
+
+**Id:** f8b2b370-c442-42a8-a071-3c1b59e6a0f6
+**Type:** decision
+**Type:** workaround
+**Status:** active
+**Evidence:** confirmed
+**Source:** acceptance feedback on the live build, 2026-10-29
+
+`a` creates an empty tab in the selected row's workspace whichever row is
+selected, and asks nothing. The tmux adapter names the new window's directory as
+the session's (`new-window -c '#{session_path}'`).
+
+**Reason:** an earlier build split a pane when a pane row was selected and asked
+"this may lose …" before creating a tab from a workspace row. An addition ends no
+process, so a confirmation had nothing to protect, and a split from whichever row
+the cursor happened to be on made the result depend on where the operator
+looked. The confirmed tab then opened in the home directory: tmux gives a new
+window the working directory of the process that ran `new-window`, which is the
+daemon's, unless `-c` is given. Reproduced on tmux 3.8 against a session created
+in another directory. Workspace creation already passed its directory; tab
+creation did not.
+
+**Rejected alternatives:** keeping the split for pane rows (a second behaviour
+for one key, and the operator asked for tabs); keeping a confirmation (it listed
+a "loss" that was the thing being created); using the selected pane's current
+path instead of the workspace's (a pane that has since changed directory would
+move the tab's start with it).
+
+**Consequences:** `PaneSplit` stays in the runtime contract for `spawn`, which
+creates beside its parent; only the dashboard no longer reaches it.

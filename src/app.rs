@@ -1545,7 +1545,7 @@ impl App {
                 return self.shared_command(SharedCommand::Restart);
             }
             // Container controls act on a container Radar records rather than on an
-            // owner: `a` adds a place inside it, `D` deletes it, `R` reloads its slot.
+            // owner: `a` adds a tab to its workspace, `D` deletes it, `R` reloads its slot.
             CommandId::CreateContainer => {
                 return self.shared_command(SharedCommand::CreateContainer);
             }
@@ -1750,7 +1750,7 @@ fn title_of(command: SharedCommand) -> &'static str {
     match command {
         SharedCommand::Delete => "Delete",
         SharedCommand::Restart => "Restart worker",
-        SharedCommand::CreateContainer => "Add to container",
+        SharedCommand::CreateContainer => "Add a tab",
         SharedCommand::ReloadContainer => "Reload pane",
         SharedCommand::NewWorkspace => "New workspace",
         SharedCommand::Focus | SharedCommand::LaunchConfigured => "Confirm",

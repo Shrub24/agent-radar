@@ -13,7 +13,7 @@
 
 use crate::control_plane::command::{Action as DomainAction, Command, Subject};
 use crate::control_plane::containers::{DeleteRequest, ReloadRequest};
-use crate::runtime::{CreateRequest, SplitDirection};
+use crate::runtime::CreateRequest;
 
 use crate::control_plane::containers::Kind;
 use crate::lifecycle::{self, Containment};
@@ -288,6 +288,24 @@ fn verb(operation: crate::app::Operation) -> &'static str {
     }
 }
 
+/// The workspace a container lives in, which is where an addition goes: a new
+/// tab belongs to a workspace whichever row the operator was on.
+fn workspace_of(inventory: &FleetObservation, container: &ContainerRef) -> Option<String> {
+    match container.kind {
+        Kind::Workspace => Some(container.handle.clone()),
+        Kind::Tab => inventory
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == container.handle)
+            .map(|tab| tab.workspace_id.clone()),
+        Kind::Pane => inventory
+            .panes
+            .iter()
+            .find(|pane| pane.location.pane_id == container.handle)
+            .map(|pane| pane.location.workspace_id.clone()),
+    }
+}
+
 fn close_plan(
     operation: crate::app::Operation,
     target: CloseTarget,
@@ -434,30 +452,13 @@ fn container_plan(
             })
         }
         Operation::CreateContainer => {
-            let kind =
-                match container.kind {
-                    Kind::Pane => {
-                        losses.push("a new pane is split from this one".to_string());
-                        CreateRequest::PaneSplit {
-                            pane_id: container.handle.clone(),
-                            direction: SplitDirection::Right,
-                            focus: Some(false),
-                        }
-                    }
-                    Kind::Workspace => {
-                        losses.push("a new tab is created in this workspace".to_string());
-                        CreateRequest::Tab {
-                            workspace_id: container.handle.clone(),
-                            focus: Some(false),
-                        }
-                    }
-                    Kind::Tab => return Err(
-                        "select a pane in this tab to add a pane, or its workspace to add a tab"
-                            .into(),
-                    ),
-                };
+            let workspace_id = workspace_of(inventory, container)
+                .ok_or_else(|| format!("{described} is gone: nothing was sent"))?;
             DomainAction::Create {
-                request: kind,
+                request: CreateRequest::Tab {
+                    workspace_id,
+                    focus: Some(false),
+                },
                 label: None,
                 recipe: None,
             }
@@ -468,9 +469,13 @@ fn container_plan(
         effect: Effect::Domain(Box::new(Command::new(REQUESTER, request))),
         request_id: request_id.to_string(),
         prompt: described,
-        // A deletion nothing is running in is the standard case and loses no
-        // work, so it is not a question.
-        confirms: !(operation == Operation::Delete && running.is_empty()),
+        // Only an action that can end work asks. A deletion nothing is running
+        // in, and an addition, lose nothing.
+        confirms: match operation {
+            Operation::Delete => !running.is_empty(),
+            Operation::CreateContainer => false,
+            _ => true,
+        },
         losses,
     })
 }
@@ -802,5 +807,63 @@ mod tests {
             params.pointer("/request/force").is_none(),
             "consent is the confirmation the operator gave, never a request field"
         );
+    }
+
+    fn container(kind: Kind, handle: &str) -> crate::tree::ContainerRef {
+        crate::tree::ContainerRef {
+            container_id: "c1".into(),
+            kind,
+            provenance: crate::control_plane::containers::Provenance::Created,
+            handle: handle.into(),
+            recipe: false,
+            unresolved: None,
+        }
+    }
+
+    /// Adding is a tab in the row's workspace and asks nothing: it loses no work,
+    /// and a pane row is no reason to split instead.
+    #[test]
+    fn adding_from_any_row_is_an_unquestioned_tab_in_its_workspace() {
+        use crate::app::Operation;
+
+        let mut state = ObservationState::new();
+        let fleet = crate::model::testing::fleet();
+        let pane = fleet.panes[0].location.clone();
+        state.apply_success(fleet);
+        for container in [
+            container(Kind::Workspace, &pane.workspace_id),
+            container(Kind::Tab, &pane.tab_id),
+            container(Kind::Pane, &pane.pane_id),
+        ] {
+            let selected = Selected::Pane {
+                pane_id: pane.pane_id.clone(),
+                tab: None,
+                losses: Vec::new(),
+            };
+            let add = plan(
+                Operation::CreateContainer,
+                selected,
+                &state,
+                Some(&container),
+                "r1",
+            )
+            .expect("an addition is freezable");
+            assert!(!add.confirms, "{:?} asks nothing", container.kind);
+            assert!(add.losses.iter().all(|loss| !loss.contains("new")));
+            let Effect::Domain(command) = &add.effect else {
+                panic!("an addition is a domain request");
+            };
+            let request = command.record_request(&add.request_id);
+            assert_eq!(
+                request.params.pointer("/request/kind"),
+                Some(&serde_json::json!("tab")),
+                "{:?} adds a tab, never a split",
+                container.kind
+            );
+            assert_eq!(
+                request.params.pointer("/request/workspace_id"),
+                Some(&serde_json::json!(pane.workspace_id))
+            );
+        }
     }
 }

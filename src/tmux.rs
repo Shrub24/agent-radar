@@ -827,8 +827,11 @@ impl TmuxRuntime {
                 let session = self
                     .address(workspace_id, Kind::Session)
                     .map_err(Failure::refused)?;
+                // Named explicitly: left out, tmux starts the window in the
+                // working directory of the process that ran this command, which
+                // is the daemon's and not the workspace's.
                 let mut args = vec!["new-window", "-d", "-t", session.as_str()];
-                args.extend(["-P", "-F", CREATED_WINDOW_FORMAT]);
+                args.extend(["-c", "#{session_path}", "-P", "-F", CREATED_WINDOW_FORMAT]);
                 let answer = self.run(&args, cancel).map_err(Failure::unknown)?;
                 let [tab, created_workspace, pane] =
                     self.created(&answer.text, &[Kind::Window, Kind::Session, Kind::Pane])?;

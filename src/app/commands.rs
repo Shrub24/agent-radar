@@ -190,7 +190,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         id: CommandId::CreateContainer,
-        label: "Create a managed container",
+        label: "Add an empty tab to this workspace",
         chords: &["a"],
     },
     Command {

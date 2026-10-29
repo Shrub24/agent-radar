@@ -182,11 +182,15 @@ Radar SHALL refuse a launch without creating a pane or tab when its argv is empt
 - **THEN** the target shell reports the command failure in the launched place; the dashboard does not pre-resolve it using its own `PATH`
 
 ### Requirement: An empty shell remains available
-The `a` action SHALL create an empty shell in the selected place for arbitrary interactive commands; it SHALL NOT require those commands to be configured as managed-agent launches.
+The `a` action SHALL create an empty shell in a new tab of the selected row's workspace, starting in that workspace's directory, for arbitrary interactive commands. It SHALL create a tab whichever row is selected, never a split, and SHALL ask for no confirmation, since an addition loses no work. It SHALL NOT require those commands to be configured as managed-agent launches.
 
 #### Scenario: Run an arbitrary command
 - **WHEN** the user wants an interactive command instead of the configured managed agent
 - **THEN** the user can create an empty shell with `a` and run the command there
+
+#### Scenario: Adding from a pane row
+- **WHEN** the user presses `a` with a pane row selected
+- **THEN** a new tab is created in that pane's workspace, in the workspace directory, with no confirmation
 
 ### Requirement: The standing of a Pi session is readable in place
 Radar SHALL answer `E` on a selected Pi session with a one-line message naming its claim standing (granted, duplicate, reserved, pending or released), or stating that it is waiting for the next presence report when none is recorded. It SHALL send no request, open no dialog and change nothing.

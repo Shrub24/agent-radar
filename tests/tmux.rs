@@ -442,6 +442,50 @@ fn a_workspace_starts_in_the_named_directory_and_refuses_one_that_does_not_exist
 }
 
 #[test]
+fn a_tab_starts_in_its_workspaces_directory_not_the_callers() {
+    let Some(probe) = Probe::start("tab directory") else {
+        return;
+    };
+    let directory = std::env::temp_dir()
+        .canonicalize()
+        .expect("a temp dir")
+        .join(format!("radar-tab-dir-{}-{}", std::process::id(), unique()));
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let cancel = AtomicBool::new(false);
+    let created = probe.runtime.create(
+        &CreateRequest::Workspace {
+            focus: Some(false),
+            directory: Some(directory.to_str().unwrap().to_string()),
+        },
+        &cancel,
+    );
+    let CreateOutcome::Completed(workspace) = created else {
+        panic!("a workspace was not created: {created:?}");
+    };
+    let tab = probe.runtime.create(
+        &CreateRequest::Tab {
+            workspace_id: workspace.workspace_id.expect("a workspace id"),
+            focus: Some(false),
+        },
+        &cancel,
+    );
+    assert!(matches!(tab, CreateOutcome::Completed(_)), "{tab:?}");
+    let in_directory = |expected: usize| {
+        let paths = probe.tmux(&["list-panes", "-s", "-t", "$1", "-F", "#{pane_current_path}"]);
+        let paths: Vec<&str> = paths.lines().collect();
+        paths.len() == expected
+            && paths
+                .iter()
+                .all(|path| *path == directory.to_str().unwrap())
+    };
+    assert!(
+        eventually(DEADLINE, || in_directory(2)),
+        "the new tab did not start in the workspace's directory"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
 fn a_stalled_command_is_killed_and_reaped_at_its_deadline() {
     let fake = Fake::stalling(Duration::from_millis(300));
     let started = Instant::now();

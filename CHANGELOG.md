@@ -7,6 +7,11 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 - `createRadarAttention` takes `onDiagnostic(problem | undefined)`: a mailbox that cannot drain — an unreadable message, a consumer that declines or throws, a failed receipt, a message no consumer handles — is reported when the answer changes and cleared on recovery. Before, every failure was swallowed and a stuck mailbox was invisible to the host.
 - A message whose kind no consumer handles is fetched once, not on every heartbeat. It stays pending and stays reported.
 
+## Radar 0.8.2
+
+- `a` adds an empty tab to the selected row's workspace and asks nothing. It used to split the pane when a pane row was selected, and it asked "this may lose …" before creating a tab from a workspace row, though an addition ends no process.
+- A tab starts in its workspace's directory. tmux started it in the working directory of the daemon, so a confirmed `a` opened in the home directory.
+
 ## Radar 0.8.1
 
 - Reading a recipient's attention no longer touches the disk or waits behind a write. `attention` runs on every heartbeat and every subscriber wake; it listed the mailbox directory and parsed every pending message in full under one global lock, which measured 2.4 ms at 128 pending 20 KB messages and 52 ms at 128 pending 380 KB messages. The store now keeps an index rebuilt from the files at start and changed only after the file it mirrors is durable, so a read is a scan of in-memory entries and the lock serialises writers only. Capacity is checked from the same index instead of statting every record. The wire and the stored files are unchanged.

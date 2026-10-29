@@ -212,7 +212,7 @@ preserving durable subjects and handoffs.
 | `d` | Show or hide the details panel |
 | `D` | Delete the selected row: its container when Radar records one, else end what the row is. On an agent row a managed worker is stopped through its owner, so the exit is reported; the row a tab is drawn as ends the whole tab, every other row ends its own pane. Ends a container whose place is gone, closing a place that is still served is refused unless it was confirmed | 
 | `r` | Restart the selected managed agent in its recorded session: the daemon stops it with a verified exit, then relaunches it. Offered for a bound daemon subject with a session |
-| `a` | Add a place inside the selected container Radar records |
+| `a` | Add an empty tab, in the workspace directory, to the selected row's workspace; it asks nothing |
 | `A` | Start a new workspace; nothing is selected, replaced or confirmed |
 | `R` | Reload the selected container's recorded recipe |
 | `L` | Launch the configured managed agent in a new tab or pane |
