@@ -18,15 +18,31 @@ Why the daemon's operation answers are typed Rust values and where JSON is still
 
 **Rejected alternative:** one universal `OpResult` envelope for every operation. The operations differ in what they add beside the record (a container, removed containers, a spawn edge, a close), and a union of them is the hand-built JSON again with an extra layer.
 
-**Rejected alternative:** typing every string. `RequestRecord.method` and `effects` stay strings: they are open sets that older records already hold, and a closed enum would refuse a stored record this build cannot name. `Category` keeps an `Other(String)` for the same reason.
+**Rejected alternative:** typing every string. `RequestRecord.method` preserves exact retry identity; effect messages and extension data remain free text, not machine-state selectors. The historical-category exception originally used here was removed in the current-model-only decision below.
 
 ## A refusal's group is stored as its wire word and read through `Category`
 
 **Id:** 0f6a9c51-2d7e-4b83-9a14-6c3e8d5b7f20
 **Type:** constraint
-**Status:** active
+**Status:** superseded
+**Superseded by:** 1652121e-ad7b-47df-a521-6e6a1959922a
 **Evidence:** confirmed
 **Source:** `typed-daemon-contracts` design, 2026-10-28
-**Verification:** corroborated — `legacy_record_vocabulary_remains_readable_and_lossless` checks an old-shaped record with an unknown category, method and effect; the existing store reopen/replay tests cover persisted operation transitions. No older binary was run against a new store.
+**Verification:** contradicted — the maintainer rejected legacy support in the final review; the category adapter and its legacy fixture were removed.
 
-`Category` serialises as a string and an unknown word survives a read and a write unchanged. Do not turn it into a closed enum deserialised by name: a record an older or newer build wrote would stop loading, and the store reads every record at start.
+This decision preserved unknown category words through a string adapter so historical records could still load. It was superseded by the explicit rejection of legacy support below.
+
+## Required subject identity and current category vocabulary
+
+**Id:** 1652121e-ad7b-47df-a521-6e6a1959922a
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer final-review correction rejecting legacy support, 2026-10-29
+**Verification:** corroborated — required identities and the closed enum pass all Rust targets with the two documented baseline tmux exclusions; the SDK generator/typecheck and all 111 tests pass without generated-file changes.
+
+A lifecycle claim requires its actual `subject_id`; reads and public projections never substitute `claim_id`. `Category` is a closed snake-case enum without a historical-value catch-all. Current-format serialization stays the same. Unsupported old records fail validation; no automatic migration or store deletion is added.
+
+**Reason:** subject and execution-attempt identity have different meanings. Treating one as the other hides invalid data, while preserving obsolete category forms adds a second supported model the maintainer does not want.
+
+**Rejected alternative:** optional subject identity with a claim-ID fallback, plus an `Other(String)` category adapter for historical records. Rejected as legacy support, not a requirement of the current model. Unknown external error codes still establish uncertainty rather than safe non-execution; that is a transport safety rule, not legacy decoding.

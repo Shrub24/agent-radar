@@ -157,7 +157,7 @@ pub(super) fn presence_request(
                 subjects::read(&registry, &id)?.ok_or("enrolled subject is missing")?
             }
         };
-        let subject_id = subject.subject_id.unwrap_or(subject.claim_id);
+        let subject_id = subject.subject_id;
         if report
             .subject_id
             .as_deref()
@@ -501,15 +501,7 @@ pub(super) fn registry_request(
             let page: Vec<(String, String)> = read
                 .iter()
                 .take(limit)
-                .map(|subject| {
-                    (
-                        subject
-                            .subject_id
-                            .clone()
-                            .unwrap_or_else(|| subject.claim_id.clone()),
-                        subject.claim_id.clone(),
-                    )
-                })
+                .map(|subject| (subject.subject_id.clone(), subject.claim_id.clone()))
                 .collect();
             let now = unix_millis();
             let mut views = Vec::with_capacity(page.len());

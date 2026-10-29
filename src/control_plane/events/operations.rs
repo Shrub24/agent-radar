@@ -148,7 +148,7 @@ pub fn apply(projection: &RequestRecord, seed: &mut RequestRecord) -> Result<(),
     }
     seed.state = projection.state;
     seed.outcome = projection.outcome;
-    seed.category = projection.category.clone();
+    seed.category = projection.category;
     seed.message = projection.message.clone();
     seed.effects = projection.effects.clone();
     seed.created = projection.created.clone();

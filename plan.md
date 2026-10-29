@@ -9,12 +9,19 @@ already settled is in `README.md` and `openspec/`; this file is the future.
 
 ## Priority debt — typed contracts across the Rust daemon
 
-Scoped in [`typed-daemon-contracts`](openspec/changes/typed-daemon-contracts/proposal.md)
-on the separate daemon-contracts workspace. The change covers the full typed
-request/admission/execution/record/consumer sweep; its design also scopes the
-subsequent consumer-led delivery migrations. Implement the contract spine first,
-then snapshots and durable event feeds as separate changes, not one transport
-rewrite. Live TUI acceptance need not block work on this isolated branch.
+Implemented in [`typed-daemon-contracts`](openspec/changes/typed-daemon-contracts/proposal.md)
+on the isolated `wip/daemon-contracts` branch, pending merge. This covers the typed
+request/admission/execution/record/consumer sweep, not the daemon-wide transport
+migration. Claims require actual subject identity and categories are closed; no
+legacy adapters are retained.
+
+Next, scope consumer-led delivery adoption: coherent snapshot subscriptions and
+pi-radar MessagePack/framing first, then durable event subscriptions with cursors,
+epochs and gaps. Reuse the TUI's content/framing and supervised-connection machinery
+where it fits. Keep command receipts reliable and independent of coalesced state.
+Do not infer an async actor rewrite from using Tokio for transport. The existing
+Rust-derived JSON Schema/TypeScript generation remains the contract pipeline;
+a binary codec also needs TypeScript runtime decoding and cross-language fixtures.
 
 High-priority architectural cleanup, ahead of further feature expansion: sweep
 Rust-owned operation, response, state and error structures across the daemon and
@@ -49,9 +56,10 @@ closed contracts no longer require reparsing serialized state to recover meaning
 
 ## Unified publication and transport direction
 
-The TUI change is proposed in
-[`unified-tui-publications`](openspec/changes/unified-tui-publications/proposal.md).
-It replaces the TUI's independent observation fetch with one coherent actor
+The TUI foundation is implemented in
+[`unified-tui-publications`](openspec/changes/unified-tui-publications/proposal.md)
+and [`duplex-tui-attachments`](openspec/changes/duplex-tui-attachments/proposal.md).
+It replaced the TUI's independent observation fetch with one coherent actor
 publication head referencing three immutable payloads: observation, tree
 projection and UI-session state. One head sequence orders publications; XXH3-128
 hashes identify MessagePack payload bytes. Publication counters/timestamps and

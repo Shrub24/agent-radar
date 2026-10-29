@@ -216,10 +216,9 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
     let mut after: Option<String> = None;
     loop {
         let page = subjects::list_subjects_after(registry, after.as_deref(), PAGE)?;
-        let last = page.last().map(subject_of);
+        let last = page.last().map(|subject| subject.subject_id.clone());
         for subject in &page {
-            let Some(current) = subjects::current_attachment(registry, &subject_of(subject))?
-            else {
+            let Some(current) = subjects::current_attachment(registry, &subject.subject_id)? else {
                 continue;
             };
             let view = subjects::public_view(&current);
@@ -230,14 +229,6 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
         }
         after = Some(next_cursor(after, last, "lifecycle subject")?);
     }
-}
-
-/// The subject a lifecycle read pages by.
-fn subject_of(subject: &crate::control_plane::lifecycle::Claim) -> String {
-    subject
-        .subject_id
-        .clone()
-        .unwrap_or_else(|| subject.claim_id.clone())
 }
 
 /// Every container the daemon records, read to the end of its pages.

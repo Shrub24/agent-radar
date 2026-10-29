@@ -136,11 +136,9 @@ pub fn ttl_seconds(method: &str) -> u64 {
 
 /// The group a record's refusal or uncertainty falls under. These are the words
 /// the UI and later slices match on, so they are one vocabulary here rather than
-/// a string at each site that writes one. A word this build does not know, read
-/// from an older or newer record, is kept and written back unchanged.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(from = "String", into = "String")]
-#[schemars(with = "String")]
+/// a string at each site that writes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum Category {
     /// The request was never claimed and its expiry passed: nothing ran.
     NotExecuted,
@@ -153,33 +151,6 @@ pub enum Category {
     /// The daemon refused the operation itself: an ineligible target, a frozen
     /// target that no longer matches, or an effect it will not dispatch.
     Refused,
-    Other(String),
-}
-
-impl From<String> for Category {
-    fn from(word: String) -> Self {
-        match word.as_str() {
-            "not_executed" => Self::NotExecuted,
-            "in_flight" => Self::InFlight,
-            "backend_unavailable" => Self::BackendUnavailable,
-            "backend_refused" => Self::BackendRefused,
-            "refused" => Self::Refused,
-            _ => Self::Other(word),
-        }
-    }
-}
-
-impl From<Category> for String {
-    fn from(category: Category) -> Self {
-        match category {
-            Category::NotExecuted => "not_executed".into(),
-            Category::InFlight => "in_flight".into(),
-            Category::BackendUnavailable => "backend_unavailable".into(),
-            Category::BackendRefused => "backend_refused".into(),
-            Category::Refused => "refused".into(),
-            Category::Other(word) => word,
-        }
-    }
 }
 
 /// What a request's execution established, written once as its record's verdict.
@@ -1313,27 +1284,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn legacy_record_vocabulary_remains_readable_and_lossless() {
-        let wire = serde_json::json!({
-            "id": "historical", "method": "retired.operation",
-            "requested_at": "2026-01-01T00:00:00.000Z",
-            "expires_at": "2026-01-01T00:00:30.000Z",
-            "state": "completed", "outcome": "refused",
-            "category": "legacy-category", "effects": ["legacy-effect"]
-        });
-        let record: RequestRecord = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(
-            record.category,
-            Some(Category::Other("legacy-category".into()))
-        );
-        assert_eq!(record.settled(), Some(RequestOutcome::Refused));
-        let public = serde_json::to_value(record.public()).unwrap();
-        for field in ["method", "category", "effects"] {
-            assert_eq!(public[field], wire[field], "{field}");
-        }
-    }
 
     const ID: &str = "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b22";
 

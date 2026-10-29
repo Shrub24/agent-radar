@@ -35,8 +35,8 @@ The sweep follows `ops::classify` and `Operation`. Effectful operations still re
 ## Deliberate boundary representations
 
 - Raw canonical params remain JSON in the retry record. Re-encoding external params before comparison would collapse meaningful omitted/null distinctions.
-- Stored method words, effect diagnostics, provenance and advertised contract names remain strings: historical/unknown values must survive, and effects are not machine-state selectors.
-- `Category` uses a string-compatible adapter with `Other(String)`; historical words remain readable and reserialize unchanged.
+- Stored method words preserve exact request identity; effect diagnostics and extension provenance remain open text, not machine-state selectors. Unknown advertised contract names are ignored rather than enabling unsupported features.
+- `Category` is a closed snake-case enum. Claims require `subject_id`; no projection or execution path substitutes `claim_id`. No legacy decoder or historical-category catch-all is retained.
 - `ErrorBody` retains an unknown code word at the socket boundary; consumers classify known words through `Code` and treat unknown ones conservatively.
 - Publication/report payloads and genuinely open facts remain JSON. The typed snapshot task field keeps its existing open schema annotation; its wire shape is unchanged.
 - JSON/MessagePack encoding, request validation, public projection and persistence remain boundaries. This is not a ban on serde or JSON literals in boundary code or tests.

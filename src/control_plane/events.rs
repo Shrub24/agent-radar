@@ -109,7 +109,7 @@ impl Facts {
         Self {
             attachment: AttachmentFacts {
                 registration_id: subject.process.registration_id.clone(),
-                subject_id: subject.subject_id.clone(),
+                subject_id: Some(subject.subject_id.clone()),
                 managed: subject.managed.clone(),
                 session: subject.session.clone(),
             },

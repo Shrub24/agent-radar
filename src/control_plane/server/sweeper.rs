@@ -186,10 +186,7 @@ pub(super) fn management_view(
     };
     match subjects::attachment(registry, registration_id, &session, now_ms) {
         Ok(subjects::Attachment::Own(subject_id)) => answers::Management::Managed {
-            subject_id: subject_id
-                .subject_id
-                .clone()
-                .unwrap_or_else(|| subject_id.claim_id.clone()),
+            subject_id: subject_id.subject_id.clone(),
         },
         Ok(subjects::Attachment::Other(_)) => answers::Management::Duplicate,
         Ok(subjects::Attachment::Free) | Err(_) => answers::Management::Unmanaged,

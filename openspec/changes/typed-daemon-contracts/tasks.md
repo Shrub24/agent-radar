@@ -26,9 +26,9 @@
 
 ## 5. Persistence and convergence
 
-- [x] 5.1 Add string-compatible `Category` adapters; keep genuinely open historical methods, effect diagnostics and data as strings/JSON. A legacy-shaped record test checks unknown vocabulary preservation; existing replay tests check durable transitions.
+- [x] 5.1 Use a closed `Category` enum and require actual subject identity on lifecycle claims. Remove historical-category adapters, legacy fixtures and all subject-to-claim fallbacks. Preserve original retry params and genuinely open diagnostics/data; existing replay tests check current-format durable transitions.
 - [x] 5.2 Remove transitional wire-returning composition and duplicate interpreters. Retire `Response::typed`, old `managed_control`, response-key-path readers and registry/task JSON round trips. The inventory records the remaining real serialization boundaries.
-- [x] 5.3 Final fmt, strict all-target Clippy, Rust targets (543 library tests, 172 control-plane tests plus the other suites), SDK/schema generation and typechecks/111 tests, all 36 strict OpenSpec items, rationale lint and whitespace checks pass. The Rust command excludes exactly the two baseline tmux failures documented below; the unfiltered suite is not claimed green.
+- [x] 5.3 Final fmt, strict all-target Clippy, Rust targets (542 library tests, 172 control-plane tests plus the other suites), SDK/schema generation and typechecks/111 tests, all 36 strict OpenSpec items, rationale lint and whitespace checks pass. The Rust command excludes exactly the two baseline tmux failures documented below; the unfiltered suite is not claimed green.
 
 ## Verification and corrections
 
@@ -43,6 +43,6 @@
 
 ## Workflow follow-up
 
-- Keep this isolated from `main` and leave the local bookmark unmoved until owner review; no push without approval.
+- Keep this isolated from `main`. The maintainer approved the final quality pass and publishing to `wip/daemon-contracts`; do not move main or the acceptance branch.
 - Consumer-specific snapshot push, durable event subscriptions and pi-radar transport migration remain separate follow-ons in `design.md`.
 - Workspace recovery and tmux exit/observation changes are not hidden requirements of this sweep.

@@ -430,10 +430,7 @@ pub(super) fn run_restart(
         ));
     };
     let now = store::now_ms();
-    let subject_key = subject
-        .subject_id
-        .clone()
-        .unwrap_or_else(|| subject.claim_id.clone());
+    let subject_key = subject.subject_id.clone();
     let cancel = match admit(
         ops::Operation::Restart,
         request,
@@ -573,13 +570,7 @@ pub(super) fn restart_lead(
     if let Err(error) = registry.record_spawn(&intent, now) {
         return Settlement::backend_refused(error);
     }
-    let identity = (
-        subject
-            .subject_id
-            .clone()
-            .unwrap_or_else(|| subject.claim_id.clone()),
-        subject.claim_id.clone(),
-    );
+    let identity = (subject.subject_id.clone(), subject.claim_id.clone());
     let prepared = match track_launch(
         core,
         successor,
@@ -735,7 +726,7 @@ pub(super) fn current_presence_grant(
     let Some(claim) = registry::presence::current(registry, registration_id)? else {
         return Ok(false);
     };
-    let expected_subject = subject.subject_id.as_deref().unwrap_or(&subject.claim_id);
+    let expected_subject = subject.subject_id.as_str();
     Ok(claim.standing == registry::presence::Standing::Granted
         && claim.claim_id == subject.claim_id
         && claim.session_id.as_deref() == Some(session)
@@ -762,12 +753,9 @@ pub(super) fn cancel_target(
             let launched = subjects::read(registry, &subject_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
-            let subject = subjects::current_attachment(
-                registry,
-                launched.subject_id.as_deref().unwrap_or(&launched.claim_id),
-            )
-            .map_err(internal)?
-            .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
+            let subject = subjects::current_attachment(registry, launched.subject_id.as_str())
+                .map_err(internal)?
+                .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
             if subject.process.registration_id != launched.process.registration_id {
                 return Err(Refusal::new(
                     Code::Refused,
@@ -783,11 +771,8 @@ pub(super) fn cancel_target(
             ));
         }
     };
-    let current = subjects::read_subject_record(
-        registry,
-        subject.subject_id.as_deref().unwrap_or(&subject.claim_id),
-    )
-    .map_err(internal)?;
+    let current =
+        subjects::read_subject_record(registry, subject.subject_id.as_str()).map_err(internal)?;
     if params.claim_id != subject.claim_id
         || current
             .is_none_or(|record| record.current_claim.as_deref() != Some(subject.claim_id.as_str()))
@@ -797,10 +782,7 @@ pub(super) fn cancel_target(
             "the requested claim is not current; nothing was signalled",
         ));
     }
-    Ok((
-        subject.claim_id.clone(),
-        subject.subject_id.unwrap_or(subject.claim_id),
-    ))
+    Ok((subject.claim_id.clone(), subject.subject_id))
 }
 
 /// What a cancel's or stop's effects read as on its record: the outcome the caller

@@ -706,8 +706,7 @@ fn bind_locked(
     let mut subject = None;
     if let Some(claim_id) = &stored.claim_id {
         lifecycle::fence_registration(registry, claim_id, process, Some(registration_id), now_ms)?;
-        subject = lifecycle::read(registry, claim_id)?
-            .map(|launch| launch.subject_id.unwrap_or(launch.claim_id));
+        subject = lifecycle::read(registry, claim_id)?.map(|launch| launch.subject_id);
     }
     if let Some(bound) = &stored.bound {
         if bound.source == request.source && bound.incarnation == request.incarnation {

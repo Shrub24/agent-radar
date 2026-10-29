@@ -186,10 +186,7 @@ pub(super) fn communication_identity(
     Ok(crate::control_plane::public_contracts::HandoffIdentity {
         registration_id: registration_id.to_owned(),
         session_id,
-        subject_id: subject
-            .subject_id
-            .clone()
-            .unwrap_or_else(|| subject.claim_id.clone()),
+        subject_id: subject.subject_id.clone(),
         claim_id: subject.claim_id,
     })
 }

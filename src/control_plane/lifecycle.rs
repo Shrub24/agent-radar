@@ -224,8 +224,7 @@ pub struct SubjectRecord {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub claim_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<String>,
+    pub subject_id: String,
     #[serde(default)]
     pub managed: ManagedMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,7 +375,7 @@ fn draft(
         .unwrap_or_else(|| execution_id.clone());
     Claim {
         claim_id: execution_id,
-        subject_id: Some(subject_id),
+        subject_id,
         managed,
         session,
         process: draft_process(spawn_request_id, launch, random_uuid(), now_ms),
@@ -573,10 +572,7 @@ pub fn create_with_intent(
     }
     let subject = draft(spawn_request_id, launch, session, identity, managed, now_ms);
     write(registry, &subject)?;
-    let id = subject
-        .subject_id
-        .as_deref()
-        .ok_or("claim has no subject")?;
+    let id = subject.subject_id.as_str();
     crate::control_plane::registry::presence::reserve(
         registry,
         &subject.process.registration_id,
@@ -592,7 +588,7 @@ pub fn create_with_intent(
     Ok(Ticket {
         registration_id: subject.process.registration_id,
         claim_id: subject.claim_id,
-        subject_id: subject.subject_id.unwrap_or_default(),
+        subject_id: subject.subject_id,
         launch_id: subject.process.spawn_request_id,
         parent_subject_id: subject.managed.parent_subject_id,
         correlation: subject.process.correlation.unwrap_or_default(),
@@ -616,7 +612,11 @@ pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Claim>, Stri
     let execution = load_process(registry, registration_id, &facts.execution)?;
     let subject = Claim {
         claim_id: subject_id.into(),
-        subject_id: facts.attachment.subject_id.clone(),
+        subject_id: facts
+            .attachment
+            .subject_id
+            .clone()
+            .ok_or("execution has no subject identity")?,
         managed: facts.attachment.managed.clone(),
         session: facts.attachment.session.clone(),
         process: execution,
@@ -739,7 +739,7 @@ fn subject_record_for_session(
 /// Records which attempt is current for its subject, and which facts the subject
 /// carries. Called by the attempt writer, so every attempt change maintains it.
 fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
-    let id = claim.subject_id.as_deref().unwrap_or(&claim.claim_id);
+    let id = claim.subject_id.as_str();
     let existing = read_subject_record(registry, id)?;
     let mut record = match existing {
         Some(record) if record.current_claim.as_deref() != Some(&claim.claim_id) => return Ok(()),
@@ -1039,7 +1039,7 @@ pub enum Attachment {
 /// because absence of a pane is not proof that the process is gone; a stale
 /// heartbeat does not release it either.
 pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<bool, String> {
-    let id = subject.subject_id.as_deref().unwrap_or(&subject.claim_id);
+    let id = subject.subject_id.as_str();
     if read_subject_record(registry, id)?
         .is_none_or(|record| record.current_claim.as_deref() != Some(&subject.claim_id))
     {
@@ -1114,9 +1114,9 @@ pub fn record_launch_session(
             {
                 return Err("the reported session does not match the continued subject".into());
             }
-            if subject_record_for_session(registry, session)?.is_some_and(|record| {
-                Some(record.subject_id.as_str()) != found.subject_id.as_deref()
-            }) {
+            if subject_record_for_session(registry, session)?
+                .is_some_and(|record| record.subject_id != found.subject_id)
+            {
                 return Err(
                     "this session belongs to an existing subject; continue it explicitly".into(),
                 );
@@ -1258,7 +1258,7 @@ pub fn enroll_subject(
     });
     let mut subject = Claim {
         claim_id: subject_id.clone(),
-        subject_id: Some(logical),
+        subject_id: logical,
         managed,
         session: Some(session.to_string()),
         process: execution,
@@ -1269,10 +1269,7 @@ pub fn enroll_subject(
     subject.process.bound_registration_id = Some(registration_id.to_string());
     subject.process.recorded_at = format_millis(now_ms);
     write(registry, &subject)?;
-    let logical_id = subject
-        .subject_id
-        .as_deref()
-        .ok_or("claim has no subject")?;
+    let logical_id = subject.subject_id.as_str();
     let mut record = read_subject_record(registry, logical_id)?.ok_or("subject is not recorded")?;
     record.current_claim = Some(subject.claim_id.clone());
     record.last_claim = Some(subject.claim_id.clone());
@@ -1295,7 +1292,7 @@ pub fn cancel_reservation(
             "the successor may have dispatched; its reservation cannot be withdrawn".into(),
         );
     }
-    let id = next.subject_id.as_deref().ok_or("claim has no subject")?;
+    let id = next.subject_id.as_str();
     let mut record = read_subject_record(registry, id)?.ok_or("subject is not recorded")?;
     if record.current_claim.as_deref() != Some(pending) {
         return Err("the subject's claim changed while stopping its previous process".into());
@@ -1381,7 +1378,7 @@ pub fn withdraw_unpresented(
     if !stopped || !cleanup(claim_id)? {
         return Ok(None);
     }
-    release_attachment(registry, claim_id, claim.subject_id.as_deref())?;
+    release_attachment(registry, claim_id, Some(claim.subject_id.as_str()))?;
     registry.record_spawn_withdrawn(&edge.request_id, reason, now_ms)?;
     Ok(Some(claim_id.to_string()))
 }
@@ -1533,11 +1530,7 @@ pub struct PublicClaim {
 
 pub fn public_view(subject: &Claim) -> PublicClaim {
     PublicClaim {
-        subject_id: subject
-            .subject_id
-            .as_deref()
-            .unwrap_or(&subject.claim_id)
-            .to_owned(),
+        subject_id: subject.subject_id.as_str().to_owned(),
         claim_id: subject.claim_id.clone(),
         registration_id: subject.process.registration_id.clone(),
         managed: subject.managed.clone(),
@@ -2623,7 +2616,7 @@ mod tests {
             .expect("read logical subject")
             .expect("current execution");
         assert_eq!(current.claim_id, second.claim_id);
-        assert_eq!(current.subject_id.as_deref(), Some(logical_id.as_str()));
+        assert_eq!(current.subject_id, logical_id);
         // The agent carries the plain name; the attempt is named by its claim.
         let view = json!(public_view(&current));
         assert_eq!(view["subject_id"], logical_id);
@@ -2729,7 +2722,7 @@ mod tests {
         let claim = read(&registry, &claim_id)
             .expect("read claim")
             .expect("new claim");
-        assert_eq!(claim.subject_id.as_deref(), Some(subject_id));
+        assert_eq!(claim.subject_id, subject_id);
         assert_eq!(claim.managed.parent_subject_id.as_deref(), Some(parent_id));
     }
 

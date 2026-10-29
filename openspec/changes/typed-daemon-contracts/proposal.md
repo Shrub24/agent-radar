@@ -9,7 +9,7 @@ The daemon already owns admission, durable execution and reconciliation, but exc
 - Decode closed request vocabularies once at ingress; direct internal callers use the same typed service entry points without self-RPC or JSON round trips.
 - Carry typed admission decisions, operation results, public record projections and errors through handlers and Rust consumers. Reuse existing domain enums and retain genuinely open data.
 - Sweep all operation families, then registry, communication, observation, task and event read contracts; remove replaced JSON probing and string-state interpretation in each complete path.
-- Preserve wire shapes, optional-field semantics, persisted data, same-ID replay, public redaction, execution certainty and shutdown guarantees. Contract changes require separate explicit approval.
+- Preserve current wire shapes, optional-field semantics, same-ID replay, public redaction, execution certainty and shutdown guarantees. Do not support legacy record forms: claims require subject identity and categories are a closed vocabulary. Other contract changes require explicit approval.
 - Scope later subscription/transport adoption in the design without bundling new codecs, endpoints or delivery policies into this refactor.
 
 ## Capabilities

@@ -66,11 +66,11 @@ Why: these distinctions control whether retry or dispatch is safe. Rejected: the
 
 Construct a typed public projection from the stored record; do not serialize the private record and redact keys afterward. Preserve exactly the current omissions of private launch `env`/`argv`, including method-specific forms. Explicit projections share field types, not duplicate transition logic.
 
-Canonical retry contents remain owned by the admission/persistence boundary. They may retain JSON as a compatibility representation; service logic must not inspect them to rediscover domain state. Do not change same-ID comparison by normalizing an omitted option into an explicit value. Keep legacy records readable, including historical values that current code no longer emits.
+Canonical retry contents remain owned by the admission/persistence boundary. They retain the original JSON for exact request identity; service logic must not inspect it to rediscover domain state. Do not change same-ID comparison by normalizing an omitted option into an explicit value.
 
-Closed current categories/effects use typed vocabularies. Historical unknown values, if encountered in supported stored records, remain representable at the persistence boundary rather than being relabelled or dropped. No new unknown-value policy is introduced for the current wire protocol.
+Lifecycle claims require their actual subject identity. No read or projection substitutes a claim ID for a missing subject ID. Categories use a closed, snake-case enum; there is no historical-value adapter or catch-all category. Current-format records remain unchanged, but older or malformed records are not silently adapted. Effect messages remain free diagnostics, not machine state. Unknown external error codes still mean uncertain delivery, never proof of refusal.
 
-Why: public privacy and private replay have different responsibilities. Rejected: serializing the private record to every consumer, which risks leaks, and rejecting legacy state to make a new enum convenient.
+Why: public privacy and private replay have different responsibilities. Missing identity is invalid data, not permission to use a different identity. Rejected: serializing private records to public consumers, identity fallbacks, and carrying legacy decoding paths alongside the current model. The no-legacy policy was confirmed in the final maintainer review.
 
 ### 4. Domain errors are structured where a caller branches
 
@@ -104,7 +104,7 @@ Why: mixing new delivery semantics with a large type migration obscures causalit
 
 Use the separate `agent-radar-daemon-contracts` workspace based on accepted-code `main`; do not move `main` or `wip/shared-ui-session`. No deployed service or live acceptance environment changes.
 
-Land independently compiling vertical changes. Preserve existing protocol and persistence encoding, so rollback means using the previous binary, not rolling back state. Any necessary incompatible schema/storage change stops that slice for explicit review; it is not silently absorbed into this refactor. Keep the owner-visible scope inventory current as each family is migrated.
+Land independently compiling vertical changes. Preserve current protocol and persistence encoding; do not add legacy migrations or fallback identities. The final maintainer review explicitly removed historical-category decoding and made claim subject identity required. Unsupported old records fail validation rather than being rewritten, and no store reset is performed. Other incompatible schema/storage changes require explicit review. Keep the owner-visible inventory current.
 
 ## Validation
 
@@ -117,6 +117,6 @@ Routine gates: formatting, strict all-target Clippy, Rust targets, SDK tests, st
 - Broad scope can become endless cleanup → family inventory, complete slice boundaries and explicit exclusions.
 - Typed defaults can alter retry equivalence → preserve raw canonical retry contents and optional-field semantics at the boundary.
 - Public DTO conversion can leak launch data → preserve redaction evidence and never derive public responses from a private record serializer.
-- An unknown old category can break startup → compatible persistence adapter; no blanket enum deserialization of historical files.
+- An unsupported old category or missing claim identity can fail loading → explicit current-model validation; no legacy adaptation or automatic store deletion.
 - A new result shape can imply false refusal → explicit distinction between pending, unavailable evidence and execution uncertainty.
 - Socket supervision can be regressed by adjacent cleanup → retain existing transport ownership; change delivery in a separate reviewed slice.
