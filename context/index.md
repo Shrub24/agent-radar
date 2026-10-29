@@ -22,6 +22,8 @@
 
 ## A
 
+- [agent-messages.md](agent-messages.md) — addressed message lane, mailbox attention, idle-only subscription release, explicit cutover
+
 ## B
 
 ## C

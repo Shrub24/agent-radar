@@ -969,21 +969,21 @@ test("daemon.ping requires protocol 2, the minimum revision, and registry.v1", a
 	}
 });
 
-test("handoff inbox returns stable IDs and rejects malformed IDs", async () => {
+test("a mailbox page returns stable IDs and rejects malformed IDs", async () => {
 	let malformed = false;
 	const fixture = makeFixture((request) => {
 		if (request.method === "daemon.ping")
-			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["communication.handoff.v1"] });
-		return reply(request, { handoff_ids: [malformed ? "not-a-uuid" : UUID_A] });
+			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["communication.messages.v1"] });
+		return reply(request, { message_ids: [malformed ? "not-a-uuid" : UUID_A], next: null });
 	});
 	try {
 		await listen(fixture);
 		const client = fixture.client();
-		const valid = await client.communicationInbox({ registration_id: UUID_A });
+		const valid = await client.messagePage({ registration_id: UUID_A });
 		assert.equal(valid.ok, true, JSON.stringify(valid));
-		assert.deepEqual(valid.ok ? valid.value.handoff_ids : undefined, [UUID_A]);
+		assert.deepEqual(valid.ok ? valid.value.message_ids : undefined, [UUID_A]);
 		malformed = true;
-		const invalid = await client.communicationInbox({ registration_id: UUID_A });
+		const invalid = await client.messagePage({ registration_id: UUID_A });
 		assert.equal(invalid.ok, false);
 		assert.equal(invalid.ok ? "" : invalid.code, "protocol");
 	} finally {
@@ -991,27 +991,27 @@ test("handoff inbox returns stable IDs and rejects malformed IDs", async () => {
 	}
 });
 
-test("handoff content and receipts decode the claim identity without execution ordinals", async () => {
+test("message content and receipts decode the claim identity without execution ordinals", async () => {
 	const identity = { registration_id: UUID_A, session_id: UUID_A, subject_id: UUID_A, claim_id: UUID_A };
-	const handoff = { version: 1, id: UUID_A, sender: identity, recipient_subject_id: UUID_A,
-		summary: "complete", content: "result", published_at_unix_ms: 1 };
-	const receipt = { version: 1, handoff_id: UUID_A, recipient: identity, received_at_unix_ms: 2 };
+	const message = { version: 1, id: UUID_A, producer: identity, recipients: [UUID_A],
+		body: { kind: "handoff", summary: "complete", content: "result" }, created_at_unix_ms: 1 };
+	const receipt = { version: 1, message_id: UUID_A, recipient: identity, received_at_unix_ms: 2 };
 	const fixture = makeFixture((request) => {
 		if (request.method === "daemon.ping")
-			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["communication.handoff.v1"] });
-		return reply(request, request.method === "communication.get" ? { handoff, receipt } : { receipt, created: true });
+			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["communication.messages.v1"] });
+		return reply(request, request.method === "communication.get" ? { message, receipt } : { receipt, created: true });
 	});
 	try {
 		await listen(fixture);
 		const client = fixture.client();
-		const fetched = await client.communicationGet({ registration_id: UUID_A, handoff_id: UUID_A });
+		const fetched = await client.messageGet({ registration_id: UUID_A, message_id: UUID_A });
 		assert.equal(fetched.ok, true, JSON.stringify(fetched));
-		const acked = await client.communicationAck({ registration_id: UUID_A, handoff_id: UUID_A });
-		assert.equal(acked.ok, true, JSON.stringify(acked));
+		const received = await client.messageReceive({ registration_id: UUID_A, message_id: UUID_A });
+		assert.equal(received.ok, true, JSON.stringify(received));
 	} finally { cleanup(fixture); }
 });
 
-test("handoff contract absence disables only handoff calls", async () => {
+test("message contract absence disables only message calls", async () => {
 	const fixture = makeFixture((request) =>
 		reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["registry.v1"] }),
 	);
@@ -1019,7 +1019,7 @@ test("handoff contract absence disables only handoff calls", async () => {
 		await listen(fixture);
 		const client = fixture.client();
 		assert.equal((await client.ping()).ok, true);
-		const result = await client.communicationInbox({ registration_id: UUID_A });
+		const result = await client.messagePage({ registration_id: UUID_A });
 		assert.equal(result.ok, false);
 		assert.equal(result.ok ? "" : result.code, "unsupported");
 		assert.ok(fixture.requests.every(({ method }) => method === "daemon.ping"));
@@ -1053,7 +1053,7 @@ test("every repository daemon.ping fixture is understood unchanged", async () =>
 		"spawn.v1",
 		"spawn.close.v1",
 		"spawn.launch_context.v1",
-		"communication.handoff.v1",
+		"communication.messages.v1",
 	])
 		assert.ok(seen.has(contract), `the repository fixtures cover ${contract}`);
 	for (const expected of answers) {

@@ -11,7 +11,8 @@ use agent_radar::control_plane::public_contracts::observation::{
     ObservationGetParams, ObservationGetResponse, ObservationSnapshot,
 };
 use agent_radar::control_plane::public_contracts::{
-    Handoff, HandoffInbox, HandoffPublishParams, HandoffReceipt, ManagedLaunchMetadata, PingResult,
+    Attention, ManagedLaunchMetadata, Message, MessagePage, MessagePublishParams, MessageReceipt,
+    PingResult,
 };
 use agent_radar::control_plane::registry::publication::FactsSnapshot;
 use agent_radar::control_plane::registry::spawn::PublicSpawnExitObservation;
@@ -177,10 +178,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         &output,
         "presence-release",
     )?;
-    write_pair::<HandoffPublishParams>(&output, "handoff-publish-params")?;
-    write_pair::<HandoffInbox>(&output, "handoff-inbox")?;
-    write_pair::<Handoff>(&output, "handoff")?;
-    write_pair::<HandoffReceipt>(&output, "handoff-receipt")?;
+    write_pair::<MessagePublishParams>(&output, "message-publish-params")?;
+    write_pair::<MessagePage>(&output, "message-page")?;
+    write_pair::<Message>(&output, "message")?;
+    write_pair::<MessageReceipt>(&output, "message-receipt")?;
+    write_pair::<Attention>(&output, "attention")?;
     write_pair::<ManagedLaunchMetadata>(&output, "managed-launch-metadata")?;
     write_pair::<FactsSnapshot>(&output, "facts-snapshot")?;
     write_pair::<PublicSpawnExitObservation>(&output, "spawn-exit-observation")?;

@@ -2,24 +2,31 @@
 
 ## ADDED Requirements
 
-### Requirement: Idle agents learn of pending work through the heartbeat
-An idle Pi process SHALL hold no daemon connection between requests and SHALL learn of pending work from the attention hint on its heartbeat reply. It SHALL deduplicate wakes by journal position and reconcile from current reads.
+### Requirement: One mailbox consumer owns message incorporation
+pi-radar SHALL reconcile pending messages on startup and from heartbeat or push attention through one serialized drain. The typed consumer SHALL confirm durable capture before receipt. Unsupported bodies and consumer failures SHALL remain pending; receipt SHALL NOT itself prompt the model or settle domain work.
 
-#### Scenario: Idle agent
-- **WHEN** a process is idle and a handoff arrives for it
-- **THEN** it holds no connection and learns of the handoff within one heartbeat
+#### Scenario: Concurrent triggers
+- **WHEN** startup, heartbeat and push overlap
+- **THEN** one drain incorporates messages and records a bounded rerun rather than starting overlapping consumers
 
-### Requirement: Active agents may hold a short-lived wake subscription
-A process whose activity is working or blocked MAY hold a wake subscription, SHALL close it after a bounded idle hold, and SHALL reopen it when activity resumes. Correctness SHALL NOT depend on it: a missed or refused push SHALL be recovered by the next heartbeat hint. Only this connection SHALL use MessagePack, with integers beyond the safe range preserved exactly.
+#### Scenario: Retry without attention change
+- **WHEN** capture fails and the mailbox revision does not change
+- **THEN** the pending message remains eligible for bounded retry
 
-#### Scenario: Active lead
-- **WHEN** a working lead's subscription receives a newer position
-- **THEN** it reconciles from reads without waiting for the heartbeat
+### Requirement: Only continuous Herdsman idle releases the optional push tier
+An opted-in consumer SHALL close its subscription after 30 seconds continuously in Herdsman's literal idle status. Waiting or other non-idle statuses SHALL NOT count as idle. Activity resumption SHALL cancel the hold and establish current recipient attention; shutdown and identity replacement SHALL release old work.
 
-#### Scenario: Idle hold
-- **WHEN** the process has been idle for the hold
-- **THEN** it closes the subscription and reopens it from the stored position when activity resumes
+#### Scenario: Waiting for children
+- **WHEN** the agent remains waiting for a child for longer than 30 seconds
+- **THEN** its optional subscription is not closed as idle
 
-#### Scenario: Refused or lost subscription
-- **WHEN** the subscription is refused or drops
-- **THEN** the process continues on heartbeat hints and retries after a backoff
+#### Scenario: Idle then resumed
+- **WHEN** an agent passes the idle hold and later becomes active
+- **THEN** it holds no socket during idle and obtains a new baseline on resubscription
+
+### Requirement: Heartbeat fallback preserves delivery
+Idle or disconnected consumers SHALL continue discovering pending messages through successful heartbeat replies. Subscription refusal or failure SHALL use bounded backoff, not disable delivery. Revisions SHALL be opaque strings in both codecs; daemon restart SHALL establish a new baseline, not compare unrelated revisions.
+
+#### Scenario: Message arrives without a subscription
+- **WHEN** a recipient has no push connection and receives a message
+- **THEN** its next successful heartbeat exposes pending work and invokes the same mailbox drain

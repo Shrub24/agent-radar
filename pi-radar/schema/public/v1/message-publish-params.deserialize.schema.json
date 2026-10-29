@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "Inputs for publishing an immutable handoff. The wire request ID carries the\nstable communication identity; the daemon derives the sender execution.",
+  "description": "Inputs for publishing a message. The wire request ID carries the stable\nmessage identity; the daemon derives the producer execution.",
   "properties": {
     "content": {
       "type": "string"
@@ -28,6 +28,6 @@
     "summary",
     "content"
   ],
-  "title": "handoff-publish-params-deserialize",
+  "title": "message-publish-params-deserialize",
   "type": "object"
 }

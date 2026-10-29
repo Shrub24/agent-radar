@@ -2,24 +2,24 @@
 
 ## ADDED Requirements
 
-### Requirement: Wake subscriptions push the latest journal position
-The trusted socket SHALL accept a bounded JSON wake-subscription opener that upgrades the connection to length-prefixed MessagePack and pushes the current event epoch and sequence whenever either moves past the last position written to that connection. Delivery SHALL be latest-wins and carry no event content.
+### Requirement: Attention subscriptions are recipient scoped
+The trusted socket SHALL accept a verified process opener that upgrades to bounded length-prefixed MessagePack and sends a gap-free recipient attention baseline followed by latest attention updates. Raw events, event cursors and message bodies SHALL NOT be sent on this connection. Loss of the recipient grant SHALL end access.
 
-#### Scenario: Position advances
-- **WHEN** the journal sequence advances while a subscription is open
-- **THEN** the subscriber receives the newest epoch and sequence
+#### Scenario: Message arrives during subscription establishment
+- **WHEN** a recipient message is accepted while the baseline watch is established
+- **THEN** the baseline or a subsequent update reports it without a missed transition
 
-#### Scenario: Slow reader
-- **WHEN** several advances occur while the subscriber is not reading
-- **THEN** it receives only the newest position when it resumes, and other subscribers are unaffected
+#### Scenario: A stale execution retains a socket
+- **WHEN** a subscriber loses its verified subject grant
+- **THEN** it receives no further recipient information and its subscription ends
 
-### Requirement: Wake subscriptions are separately bounded
-Wake subscriptions SHALL have their own small connection budget, refuse beyond it with a typed `busy`, and SHALL NOT consume ordinary or UI capacity. A stalled write SHALL end that connection only, and pushed frames SHALL have a hard size bound.
+### Requirement: Attention delivery is bounded independently of messages
+Only attention updates MAY coalesce. Established subscriptions SHALL use a separate budget of 16, a 4 KiB frame cap and bounded writes. Exhaustion SHALL return typed busy without consuming ordinary or UI established capacity. Quiet subscribers SHALL have no silence deadline.
 
-#### Scenario: Budget exhausted
-- **WHEN** the wake-subscription budget is full
-- **THEN** a new opener is refused with `busy` and ordinary and UI connections remain admissible
+#### Scenario: Slow subscriber
+- **WHEN** a subscriber stalls beyond the write deadline
+- **THEN** its tasks, connection and permit are released without affecting other subscribers or durable pending messages
 
-#### Scenario: Stalled write
-- **WHEN** one subscriber stops reading past the write deadline
-- **THEN** only its connection closes
+#### Scenario: Quiet or capacity-limited subscriber
+- **WHEN** all 16 established attention slots are occupied by quiet recipients
+- **THEN** they remain attached, another attention opener is refused, and ordinary/UI established capacity remains separate

@@ -29,9 +29,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use crate::control_plane::answer::{Answer, Reply, respond};
-use crate::control_plane::communication::{self, CommunicationStore};
 use crate::control_plane::containers;
 use crate::control_plane::lifecycle::{self as subjects, Bootstrap};
+use crate::control_plane::messages::MessageStore;
 use crate::control_plane::ops::{self, Method};
 use crate::control_plane::protocol::{self, Code, PROTOCOL_VERSION, Refusal, Request, Response};
 use crate::control_plane::public_contracts::observation::{
@@ -63,9 +63,10 @@ use crate::{TmuxConfig, TmuxRuntime};
 
 mod admission;
 mod child_close;
-mod handoff;
 mod input;
 mod launch;
+mod message_lane;
+mod message_watch;
 mod places;
 mod reads;
 mod registration;
@@ -77,9 +78,10 @@ mod ui_duplex;
 mod verification;
 use admission::*;
 use child_close::*;
-use handoff::*;
 use input::*;
 use launch::*;
+use message_lane::*;
+use message_watch as watch;
 use places::*;
 use reads::*;
 use registration::*;
@@ -377,7 +379,10 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Core {
     store: Store,
     registry: Arc<Registry>,
-    communications: Arc<CommunicationStore>,
+    messages: Arc<MessageStore>,
+    /// Wakes attention subscriptions; a message accepted or received is the only
+    /// thing that can change a recipient's mailbox state.
+    messages_changed: tokio::sync::broadcast::Sender<()>,
     task_ingest: Option<Arc<crate::control_plane::ingest::TaskIngest>>,
     task_ingest_error: Option<String>,
     backend: Option<Arc<dyn RuntimeProvider>>,
@@ -539,7 +544,7 @@ impl Daemon {
                 return Err(error);
             }
         };
-        let communications = match CommunicationStore::open(state) {
+        let messages = match MessageStore::open(state) {
             Ok(store) => Arc::new(store),
             Err(error) => {
                 let _ = remove_socket_if_owned(socket, socket_identity);
@@ -616,12 +621,14 @@ impl Daemon {
             active: Mutex::new(0),
             workers: Mutex::new(Vec::new()),
         });
+        let (messages_changed, _) = tokio::sync::broadcast::channel(16);
         let bootstrap = bootstrap_for(socket);
         let registry = Arc::new(registry);
         let core = Arc::new(Mutex::new(Core {
             store,
             registry: Arc::clone(&registry),
-            communications,
+            messages,
+            messages_changed,
             task_ingest: task_ingest.clone(),
             task_ingest_error,
             backend,
@@ -678,6 +685,9 @@ impl Daemon {
         });
         let stream_core = Arc::clone(&core);
         let streams: Arc<StreamOpen> = Arc::new(move |request, read, write| {
+            if request.method == "messages.watch" {
+                return watch::open(&stream_core, request, write);
+            }
             let handle = locked(&stream_core).ui.clone();
             ui_duplex::open(handle.as_ref(), request, read, write)
         });
@@ -905,7 +915,7 @@ fn handle_line(
         Method::Requests => answer(writer, read_many(core, &request)),
         Method::Events => answer(writer, read_events(core, &request, stopping)),
         Method::Observation => answer(writer, read_observation(core, &request)),
-        Method::Communication => answer(writer, communication_request(core, &request)),
+        Method::Communication => answer(writer, message_request(core, &request)),
         Method::Tasks => answer(writer, read_tasks(core, &request)),
         Method::Registry => answer(writer, registry_request(core, &request, verification)),
         Method::Claim => answer(writer, claim_request(core, &request, verification)),

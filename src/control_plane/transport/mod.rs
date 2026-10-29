@@ -33,6 +33,10 @@ const WAITING_LIMIT: usize = 8;
 const OPENING_SLOTS: usize = 8;
 const ORDINARY_SLOTS: usize = 32;
 const UI_ATTACHMENT_SLOTS: usize = 16;
+/// Recipient attention subscriptions. Separate from both ordinary connections
+/// and UI attachments, so an agent's watch can neither take a control slot nor
+/// hold out the dashboard.
+const MESSAGE_ATTACHMENT_SLOTS: usize = 16;
 /// Held for a presenter that already names an interaction, so a full attachment
 /// budget cannot strand a modal that is waiting to be answered.
 const UI_PRESENTER_SLOTS: usize = 1;
@@ -441,12 +445,14 @@ struct Admission {
     ordinary: Arc<Semaphore>,
     attachments: Arc<Semaphore>,
     presenters: Arc<Semaphore>,
+    messages: Arc<Semaphore>,
 }
 
 /// The class a connection is established as, once its opener has said so.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
     Ui { presenter: bool },
+    Messages,
     Ordinary,
 }
 
@@ -460,6 +466,7 @@ impl Admission {
             ordinary: Arc::new(Semaphore::new(ORDINARY_SLOTS)),
             attachments: Arc::new(Semaphore::new(UI_ATTACHMENT_SLOTS)),
             presenters: Arc::new(Semaphore::new(UI_PRESENTER_SLOTS)),
+            messages: Arc::new(Semaphore::new(MESSAGE_ATTACHMENT_SLOTS)),
         }
     }
 
@@ -476,6 +483,7 @@ impl Admission {
         let semaphore = match class {
             Class::Ui { presenter: true } => &self.presenters,
             Class::Ui { presenter: false } => &self.attachments,
+            Class::Messages => &self.messages,
             Class::Ordinary => &self.ordinary,
         };
         Arc::clone(semaphore).try_acquire_owned().ok()
@@ -626,19 +634,21 @@ async fn serve(
                 // request the handler serves.
                 let request = protocol::decode_request(&line).ok();
                 let opener = match (service.clone(), request.clone()) {
-                    (Service::Control { .. }, Some(request)) if request.method == "ui.open" => {
+                    (Service::Control { .. }, Some(request))
+                        if opens_stream(request.method.as_str()) =>
+                    {
                         Some(request)
                     }
                     _ => None,
                 };
                 let attachment = opener.is_some();
                 if opening.is_some() {
-                    let class = if attachment {
-                        Class::Ui {
-                            presenter: opener.as_ref().is_some_and(names_interaction),
-                        }
-                    } else {
-                        Class::Ordinary
+                    let class = match (&opener, attachment) {
+                        (Some(request), true) if request.method == "ui.open" => Class::Ui {
+                            presenter: names_interaction(request),
+                        },
+                        (Some(_), true) => Class::Messages,
+                        _ => Class::Ordinary,
                     };
                     match admission.establish(class) {
                         Some(permit) => {
@@ -648,6 +658,7 @@ async fn serve(
                         None => {
                             let reason = match class {
                                 Class::Ui { .. } => "the UI attachment limit is reached",
+                                Class::Messages => "the attention subscription limit is reached",
                                 Class::Ordinary => "the connection limit is reached",
                             };
                             if matches!(&service, Service::Ingest { .. }) {
@@ -757,6 +768,12 @@ async fn serve(
 
 /// A presenter names the interaction it will claim; that is what earns the
 /// reserved capacity, and the actor still validates the claim.
+/// The openers that hand a connection to a stream handler rather than answering
+/// it as a request.
+fn opens_stream(method: &str) -> bool {
+    matches!(method, "ui.open" | "messages.watch")
+}
+
 fn names_interaction(request: &protocol::Request) -> bool {
     request
         .params

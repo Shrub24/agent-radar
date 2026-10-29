@@ -475,10 +475,10 @@ export interface TaskLaneStatus {
   error: string | null;
 }
 /**
- * Inputs for publishing an immutable handoff. The wire request ID carries the
- * stable communication identity; the daemon derives the sender execution.
+ * Inputs for publishing a message. The wire request ID carries the stable
+ * message identity; the daemon derives the producer execution.
  */
-export interface HandoffPublishParamsDeserialize {
+export interface MessagePublishParamsDeserialize {
   content: string;
   correlation_id?: string | null;
   recipient_subject_id: string;
@@ -486,55 +486,75 @@ export interface HandoffPublishParamsDeserialize {
   summary: string;
 }
 /**
- * A bounded inbox page by stable handoff ID. Payloads are fetched one at a
- * time with `communication.get`, keeping each response within the wire bound.
+ * A bounded page of pending message ids, with the acceptance position to
+ * continue from. Payloads are fetched one at a time with `communication.get`.
  */
-export interface HandoffInboxSerialize {
-  handoff_ids: string[];
+export interface MessagePageSerialize {
+  message_ids: string[];
+  next?: string | null;
 }
 /**
- * Immutable handoff content. The request id is the stable communication id.
+ * One message body. Closed and tagged: a kind is added with its producer,
+ * routing policy and consumer, never as an open notification payload.
  */
-export interface HandoffSerialize {
+export type PublishBody = {
   content: string;
   correlation_id?: string | null;
-  id: string;
-  published_at_unix_ms: number;
-  recipient_subject_id: string;
-  sender: HandoffIdentity;
+  kind: "handoff";
   summary: string;
+};
+
+/**
+ * Immutable producer-addressed content. The request id is the message id, and
+ * the recipient set is frozen at acceptance.
+ */
+export interface MessageSerialize {
+  body: PublishBody;
+  created_at_unix_ms: number;
+  id: string;
+  producer: AgentIdentity;
+  recipients: string[];
   version: number;
 }
 /**
- * The current managed Pi execution that published or received a handoff.
- * `subject_id` is stable across verified successors; `execution_id` and
- * generation identify the exact execution that took the action.
+ * The managed Pi execution that produced or received a message. `subject_id` is
+ * the address that survives replacement; the rest is provenance for the
+ * execution that acted.
  */
-export interface HandoffIdentity {
+export interface AgentIdentity {
   claim_id: string;
   registration_id: string;
   session_id: string;
   subject_id: string;
 }
 /**
- * Durable recipient-consumer receipt, stored separately from immutable content.
+ * One recipient's durable capture. Stored separately from content, and it
+ * means only that: not delivery, not understanding, not settlement.
  */
-export interface HandoffReceiptSerialize {
-  handoff_id: string;
+export interface MessageReceiptSerialize {
+  message_id: string;
   received_at_unix_ms: number;
-  recipient: HandoffIdentity;
+  recipient: AgentIdentity;
   version: number;
 }
 /**
- * The current managed Pi execution that published or received a handoff.
- * `subject_id` is stable across verified successors; `execution_id` and
- * generation identify the exact execution that took the action.
+ * The managed Pi execution that produced or received a message. `subject_id` is
+ * the address that survives replacement; the rest is provenance for the
+ * execution that acted.
  */
-export interface HandoffIdentity {
+export interface AgentIdentity {
   claim_id: string;
   registration_id: string;
   session_id: string;
   subject_id: string;
+}
+/**
+ * One recipient's mailbox state. `revision` is opaque and comparable only
+ * within one daemon instance; `pending` is what still needs capture.
+ */
+export interface AttentionSerialize {
+  pending: number;
+  revision: string;
 }
 /**
  * Managed owner/parent metadata accepted with a spawn intent. Domain validation

@@ -372,7 +372,7 @@ subject UUID, not receipt time. Pages are current reads, not a frozen fleet snap
 before a cursor can be seen on a subsequent full scan. Corrupt records fail the
 read explicitly. Retirement does not prune registrations.
 
-For process-owned channels, use the exact `registration_id`; durable lifecycle and handoff identity use `subject_id`, not a session lookup or pane. If a process changes sessions, it keeps the same registration and sends a fresh `claim_id` through `agent.presence`. The receipt reports `granted`, `duplicate` or `pending`, and includes `subject_id` only on a grant. A duplicate stays rejected until a fresh session load; reconnecting the same claim does not promote it. No session entry or marker is written or read for identity. Process channels remain source-labelled, leased, replaceable evidence and carry no paths, recipes, spawn tokens or environment.
+For process-owned channels, use the exact `registration_id`; durable lifecycle and message identity use `subject_id`, not a session lookup or pane. If a process changes sessions, it keeps the same registration and sends a fresh `claim_id` through `agent.presence`. The receipt reports `granted`, `duplicate` or `pending`, and includes `subject_id` only on a grant. A duplicate stays rejected until a fresh session load; reconnecting the same claim does not promote it. No session entry or marker is written or read for identity. Process channels remain source-labelled, leased, replaceable evidence and carry no paths, recipes, spawn tokens or environment.
 
 ### One channel is one record
 
@@ -525,14 +525,14 @@ The JSON Schemas under `pi-radar/schema/public/v1/` are the machine-readable con
 | `process.get` | `registry.v1` | — | — (diagnostics) |
 | `agent.presence` | `registry.v1` | `presence-report.*`, `presence-answer.*` | `publication.presence.report(session)` |
 | `agent.release` | `registry.v1` | `presence-release.*`, `presence-answer.*` | `publication.presence.release()` |
-| `communication.handoff` publish/read/ack | `communication.handoff.v1` | `handoff-publish-params.*`, `handoff.*`, `handoff-inbox.*`, `handoff-receipt.*` | `createRadarHandoffPort(client, publication)` |
+| `communication.*` message lane publish/page/read/receipt, and `messages.watch` attention | `communication.messages.v1` | `message-publish-params.*`, `message.*`, `message-page.*`, `message-receipt.*`, `attention.*` | `createRadarMailboxPort(client, publication)`, `createRadarAttention(...)` |
 | `spawn.create` with managed metadata, optionally `continue_subject_id` | `spawn.v1` | `managed-launch-metadata.*` | `launchRadarWorker` |
 | `spawn.list` (launch topology) | `registry.v1` | `spawn-list-params.*`, `spawn-list-page.*` | `spawnGet`/launch readiness |
 | `lifecycle.restart` by the recorded parent | `lifecycle.restart.v1` | — | `runtime.children.restart` |
 | `subject.child.close` by the recorded parent | `spawn.close.v1` | `subject-child-close-params.*` | `runtime.children.close` |
 | `observation.get` | `registry.v1` | `observation-get-response.*`, `observation-snapshot.*` | `client.observe()` |
 
-The public process identifier is `registration_id`; durable agent identity is `subject_id`. Consumer child operations name only the subject: a child record, a child assignment and a child inspection never carry a registration or claim id. `HandoffIdentity` still carries both plus the execution it names, because a handoff is between processes.
+The public process identifier is `registration_id`; durable agent identity is `subject_id`. Consumer child operations name only the subject: a child record, a child assignment and a child inspection never carry a registration or claim id. `AgentIdentity` still carries both plus the execution it names, because a message is between processes.
 
 ### Sequences, leases and freshness
 

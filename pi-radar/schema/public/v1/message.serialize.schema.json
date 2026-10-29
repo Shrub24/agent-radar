@@ -1,0 +1,103 @@
+{
+  "$defs": {
+    "AgentIdentity": {
+      "additionalProperties": false,
+      "description": "The managed Pi execution that produced or received a message. `subject_id` is\nthe address that survives replacement; the rest is provenance for the\nexecution that acted.",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "registration_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "subject_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "registration_id",
+        "session_id",
+        "subject_id",
+        "claim_id"
+      ],
+      "type": "object"
+    },
+    "PublishBody": {
+      "description": "One message body. Closed and tagged: a kind is added with its producer,\nrouting policy and consumer, never as an open notification payload.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A managed worker's result for its recorded parent.",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "correlation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "handoff",
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "summary",
+            "content"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Immutable producer-addressed content. The request id is the message id, and\nthe recipient set is frozen at acceptance.",
+  "properties": {
+    "body": {
+      "$ref": "#/$defs/PublishBody"
+    },
+    "created_at_unix_ms": {
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "id": {
+      "type": "string"
+    },
+    "producer": {
+      "$ref": "#/$defs/AgentIdentity"
+    },
+    "recipients": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "id",
+    "producer",
+    "recipients",
+    "body",
+    "created_at_unix_ms"
+  ],
+  "title": "message-serialize",
+  "type": "object"
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A bounded page of pending message ids, with the acceptance position to\ncontinue from. Payloads are fetched one at a time with `communication.get`.",
+  "properties": {
+    "message_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "next": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "message_ids"
+  ],
+  "title": "message-page-serialize",
+  "type": "object"
+}

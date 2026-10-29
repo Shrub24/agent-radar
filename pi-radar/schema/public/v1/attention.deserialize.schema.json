@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One recipient's mailbox state. `revision` is opaque and comparable only\nwithin one daemon instance; `pending` is what still needs capture.",
+  "properties": {
+    "pending": {
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "revision": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "revision",
+    "pending"
+  ],
+  "title": "attention-deserialize",
+  "type": "object"
+}

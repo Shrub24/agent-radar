@@ -2083,8 +2083,12 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
     assert_eq!(publish["result"]["created"], true, "{publish}");
     // The sender names its attempt, not an ordinal position in a chain.
     assert_eq!(
-        publish["result"]["handoff"]["sender"]["claim_id"],
+        publish["result"]["message"]["producer"]["claim_id"],
         worker_claim
+    );
+    assert_eq!(
+        publish["result"]["message"]["recipients"],
+        json!([parent_subject])
     );
     let replay = client.call_id(
         &handoff_id,
@@ -2109,33 +2113,44 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         }),
     );
     assert_eq!(wrong_target["error"]["code"], "refused", "{wrong_target}");
+    // The recipient holds one subscription: the baseline says what is waiting
+    // now, and a later change is pushed rather than polled for.
+    let mut watcher = Client::dial(&socket);
+    let baseline = watcher.watch_attention(&parent_agent);
+    assert_eq!(baseline["pending"], 1, "{baseline}");
     let inbox = client.call(
         "communication.inbox",
         json!({"registration_id":parent_agent}),
     );
     assert_eq!(
-        inbox["result"]["handoff_ids"].as_array().unwrap(),
+        inbox["result"]["message_ids"].as_array().unwrap(),
         &[json!(handoff_id)]
     );
+    assert!(inbox["result"]["next"].is_null(), "{inbox}");
     let retrieved = client.call(
         "communication.get",
-        json!({"registration_id":parent_agent,"handoff_id":handoff_id}),
+        json!({"registration_id":parent_agent,"message_id":handoff_id}),
     );
+    assert_eq!(retrieved["result"]["message"]["body"]["kind"], "handoff");
     assert_eq!(
-        retrieved["result"]["handoff"]["content"],
+        retrieved["result"]["message"]["body"]["content"],
         "full immutable handoff"
     );
     let ack = client.call(
         "communication.ack",
-        json!({"registration_id":parent_agent,"handoff_id":handoff_id}),
+        json!({"registration_id":parent_agent,"message_id":handoff_id}),
     );
     assert_eq!(ack["result"]["created"], true, "{ack}");
+    // Receipt is a mailbox change, so it is pushed too: the subscriber is not
+    // left holding a count it already drained.
+    let after_receipt = watcher.next_attention();
+    assert_eq!(after_receipt["pending"], 0, "{after_receipt}");
     let read_after_ack = client.call(
         "communication.get",
-        json!({"registration_id":parent_agent,"handoff_id":handoff_id}),
+        json!({"registration_id":parent_agent,"message_id":handoff_id}),
     );
     assert_eq!(
-        read_after_ack["result"]["handoff"]["content"],
+        read_after_ack["result"]["message"]["body"]["content"],
         "full immutable handoff"
     );
     assert!(
@@ -3079,6 +3094,27 @@ impl Client {
         }
     }
 
+    /// Opens one recipient-attention subscription and returns the baseline it
+    /// sends before any update: the caller never has to tell "nothing waiting"
+    /// from "not yet attached".
+    fn watch_attention(&mut self, registration_id: &str) -> Value {
+        self.send(&request_line(
+            &random_uuid(),
+            "messages.watch",
+            json!({"registration_id": registration_id}),
+        ));
+        let answer = self.read();
+        assert!(answer.get("result").is_some(), "{answer}");
+        self.next_attention()
+    }
+
+    /// The next attention frame on an open subscription.
+    fn next_attention(&mut self) -> Value {
+        let attention: agent_radar::control_plane::public_contracts::Attention =
+            agent_radar::content::read_frame(&mut self.reader).expect("read an attention frame");
+        json!({"revision": attention.revision, "pending": attention.pending})
+    }
+
     /// The first snapshot this daemon publishes, asking until it has one.
     ///
     /// A first read is demand alone: the revision it is answered with is the one
@@ -3675,7 +3711,7 @@ fn ping_answers_the_revision_and_backend_contracts_without_a_mux() {
             // Abandonment and observation are daemon-owned and need no mux.
             "lifecycle.abandon.v1",
             "observation.get.v1",
-            "communication.handoff.v1",
+            "communication.messages.v1",
             "ui.session.v1"
         ])
     );

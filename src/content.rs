@@ -114,7 +114,7 @@ impl Content {
     }
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub fn digest(bytes: &[u8]) -> String {
     format!("{:032x}", xxhash_rust::xxh3::xxh3_128(bytes))
 }
 

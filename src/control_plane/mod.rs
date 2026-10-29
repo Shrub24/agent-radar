@@ -12,11 +12,11 @@
 pub mod answer;
 pub mod client;
 pub(crate) mod command;
-pub mod communication;
 pub mod containers;
 pub mod events;
 pub mod ingest;
 pub mod lifecycle;
+pub mod messages;
 pub mod observation;
 pub mod ops;
 pub mod protocol;

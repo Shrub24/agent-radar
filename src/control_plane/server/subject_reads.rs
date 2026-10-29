@@ -76,9 +76,9 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
             ) {
                 Ok(record) => respond(
                     &request.id,
-                    Ok(answers::Channel {
-                        channel: record.view(now, registry.serving_epoch()),
-                    }),
+                    Ok(answers::Channel::new(
+                        record.view(now, registry.serving_epoch()),
+                    )),
                 ),
                 Err(error) => registry_error(request, error),
             }
@@ -97,9 +97,9 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
             ) {
                 Ok(record) => respond(
                     &request.id,
-                    Ok(answers::Channel {
-                        channel: record.view(now, registry.serving_epoch()),
-                    }),
+                    Ok(answers::Channel::new(
+                        record.view(now, registry.serving_epoch()),
+                    )),
                 ),
                 Err(error) => registry_error(request, error),
             }

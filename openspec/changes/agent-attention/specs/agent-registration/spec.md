@@ -2,17 +2,17 @@
 
 ## ADDED Requirements
 
-### Requirement: Publication replies carry an attention hint
-The daemon SHALL include an optional `attention` object in a successful publication reply for the writing registration, naming its pending handoff count and the current event journal position (epoch and sequence). The hint SHALL describe only the replying registration's subject, SHALL carry no content, and SHALL be additive: a client that ignores it SHALL behave as before.
+### Requirement: Heartbeats expose recipient mailbox attention
+A successful managed publication reply SHALL expose attention for the caller's verified subject: pending delivery count and an opaque mailbox revision. Unrelated mailbox or raw-journal activity SHALL NOT change that attention. Unmanaged callers SHALL receive no subject mailbox hint.
 
-#### Scenario: Pending handoff
-- **WHEN** a registration has an undelivered handoff and publishes its next heartbeat
-- **THEN** the reply names a non-zero handoff count and the journal position
+#### Scenario: One recipient has pending work
+- **WHEN** a message is accepted for subject P but not Q
+- **THEN** P's next successful heartbeat reports pending delivery
+- **AND** Q's attention does not change because of that message
 
-#### Scenario: Other subjects
-- **WHEN** handoffs are pending for a different subject
-- **THEN** this registration's hint does not count them
+### Requirement: Attention failure does not undo presence
+An attention-read failure SHALL NOT invalidate an already accepted presence publication or be reported as an empty mailbox. The reply SHALL distinguish unavailable attention, and the client SHALL preserve its pending state for retry.
 
-#### Scenario: Older client
-- **WHEN** a client that does not read the hint publishes
-- **THEN** its publication behaviour is unchanged
+#### Scenario: Mailbox read fails after presence acceptance
+- **WHEN** presence was accepted but attention cannot be read
+- **THEN** presence remains accepted and attention is explicitly unavailable

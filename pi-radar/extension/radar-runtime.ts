@@ -1,6 +1,6 @@
 import type { RadarExecutionAdapter } from "./radar-execution.ts";
 import type { RadarChildren } from "./radar-children.ts";
-import type { RadarHandoffPort } from "./radar-communication.ts";
+import type { RadarMailboxPort } from "./radar-communication.ts";
 import type { RadarPublication } from "./radar-publication.ts";
 
 /** The event channel through which Pi extensions obtain the baseline runtime. */
@@ -12,7 +12,7 @@ export type RadarRuntimeServices = {
 	/** The one baseline publication; Herdsman contributes through its channels. */
 	publication: RadarPublication;
 	/** Durable handoffs bound to this process's registration and managed parent. */
-	communication: RadarHandoffPort;
+	communication: RadarMailboxPort;
 	/** This process's own children, addressed by subject. */
 	children: RadarChildren;
 	execution: RadarExecutionAdapter;

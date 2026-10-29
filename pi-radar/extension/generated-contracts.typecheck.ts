@@ -9,9 +9,9 @@ import type {
 	RadarClient,
 	RadarResult,
 	RadarFactsSnapshot,
-	RadarHandoff,
-	RadarHandoffInbox,
-	RadarHandoffReceipt,
+	RadarMessage,
+	RadarMessagePage,
+	RadarMessageReceipt,
 	RadarHandshake,
 	RadarSpawnExitObservation,
 } from "./radar-client.ts";
@@ -63,25 +63,24 @@ const observationResponse: ObservationGetResponseSerialize = {
 	revision: observationSnapshot.revision,
 	snapshot: observationSnapshot,
 };
-const handoff: RadarHandoff = {
+const message: RadarMessage = {
 	version: 1,
 	id: "22222222-2222-4222-8222-222222222222",
-	sender: {
+	producer: {
 		registration_id: "33333333-3333-4333-8333-333333333333",
 		session_id: "44444444-4444-4444-8444-444444444444",
 		subject_id: "55555555-5555-4555-8555-555555555555",
 		claim_id: "66666666-6666-4666-8666-666666666666",
 	},
-	recipient_subject_id: "11111111-1111-4111-8111-111111111111",
-	summary: "worker complete",
-	content: "full handoff",
-	published_at_unix_ms: 1_800_000_000_000,
+	recipients: ["11111111-1111-4111-8111-111111111111"],
+	body: { kind: "handoff", summary: "worker complete", content: "full result" },
+	created_at_unix_ms: 1_800_000_000_000,
 };
-const inbox: RadarHandoffInbox = { handoff_ids: [handoff.id] };
-const receipt: RadarHandoffReceipt = {
+const page: RadarMessagePage = { message_ids: [message.id], next: null };
+const receipt: RadarMessageReceipt = {
 	version: 1,
-	handoff_id: handoff.id,
-	recipient: handoff.sender,
+	message_id: message.id,
+	recipient: message.producer,
 	received_at_unix_ms: 1_800_000_000_100,
 };
 
@@ -92,8 +91,8 @@ void [
 	unknown,
 	observationParams,
 	observationResponse,
-	handoff,
-	inbox,
+	message,
+	page,
 	receipt,
 ];
 

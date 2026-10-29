@@ -169,6 +169,36 @@ pub(crate) struct Writer {
 #[derive(Serialize)]
 pub(crate) struct Channel {
     pub channel: super::registry::publication::PublicChannel,
+    /// This recipient's mailbox state. Absent when the caller has no managed
+    /// subject, and `attention_unavailable` when it could not be read: an
+    /// accepted publication is never undone by a hint failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention: Option<super::public_contracts::Attention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention_unavailable: Option<bool>,
+}
+
+impl Channel {
+    /// A channel answer for a caller with no recipient mailbox.
+    pub(crate) fn new(channel: super::registry::publication::PublicChannel) -> Self {
+        Self {
+            channel,
+            attention: None,
+            attention_unavailable: None,
+        }
+    }
+
+    pub(crate) fn with_attention(
+        self,
+        attention: Option<super::public_contracts::Attention>,
+        unavailable: Option<bool>,
+    ) -> Self {
+        Self {
+            attention,
+            attention_unavailable: unavailable,
+            ..self
+        }
+    }
 }
 #[derive(Serialize)]
 pub(crate) struct Process {
@@ -234,18 +264,18 @@ pub(crate) struct Inspected {
     pub foreground: Option<ForegroundEvidence>,
 }
 #[derive(Serialize)]
-pub(crate) struct PublishedHandoff {
-    pub handoff: super::public_contracts::Handoff,
+pub(crate) struct PublishedMessage {
+    pub message: super::public_contracts::Message,
     pub created: bool,
 }
 #[derive(Serialize)]
-pub(crate) struct ReadHandoff {
-    pub handoff: super::public_contracts::Handoff,
-    pub receipt: Option<super::public_contracts::HandoffReceipt>,
+pub(crate) struct ReadMessage {
+    pub message: super::public_contracts::Message,
+    pub receipt: Option<super::public_contracts::MessageReceipt>,
 }
 #[derive(Serialize)]
-pub(crate) struct AcknowledgedHandoff {
-    pub receipt: super::public_contracts::HandoffReceipt,
+pub(crate) struct AcknowledgedMessage {
+    pub receipt: super::public_contracts::MessageReceipt,
     pub created: bool,
 }
 #[derive(Serialize)]

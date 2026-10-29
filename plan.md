@@ -22,11 +22,8 @@ durable events stay separate delivery classes.
    handling, cross-language golden fixtures, and generated-contract coverage for
    the DTOs pi-radar will consume. Reuse `content.rs` framing; no new schema
    pipeline.
-2. **Agent attention** ([`agent-attention`](openspec/changes/agent-attention/proposal.md), planned): heartbeat hint for idle agents, short-lived wake subscription for working leads. Replaces the snapshot-subscription item for pi-radar, which has no continuous observation consumer.
-3. **Snapshot subscription for non-TUI consumers**, when a dashboard or widget needs it. Replace pi-radar's
-   observation/task reads with a coherent push head (latest-wins, bounded,
-   supervised). Keep `observation.get` for external users. Delete pi-radar's
-   polling in the same change.
+2. **Addressed agent messages and attention** ([`agent-attention`](openspec/changes/agent-attention/proposal.md), implemented through the handoff body): one durable subject mailbox with typed bodies and per-recipient receipts; handoff is its first consumer. The daemon owns routing/delivery; pi-radar and Herdsman own incorporation and agent-wake policy. Heartbeats and optional active subscriptions expose recipient attention, never raw-journal movement. Continuous literal Herdsman idle releases the socket; waiting does not. No parallel handoff mailbox.
+3. **Snapshot subscription for non-TUI consumers**, when a dashboard or widget needs it. Give that consumer a coherent push head (latest-wins, bounded, supervised), deleting the delivery path it replaces. Keep `observation.get` for external users. pi-radar has no continuous observation consumer today; do not invent one for this migration.
 4. **Ordered event-page subscription**, when a consumer needs event bodies. Push `events.read` pages with cursors,
    epochs and `cursor_expired` gaps; no coalescing. Replaces the 1 s
    long-poll. Reuses framing and connection ownership, not the latest-wins writer.

@@ -63,8 +63,8 @@ pub enum Contract {
     LifecycleAbandon,
     #[serde(rename = "observation.get.v1")]
     ObservationGet,
-    #[serde(rename = "communication.handoff.v1")]
-    CommunicationHandoff,
+    #[serde(rename = "communication.messages.v1")]
+    CommunicationMessages,
     #[serde(rename = "ui.session.v1")]
     UiSession,
     #[serde(other)]
@@ -94,7 +94,7 @@ impl Contract {
         Self::LifecycleRestart,
         Self::LifecycleAbandon,
         Self::ObservationGet,
-        Self::CommunicationHandoff,
+        Self::CommunicationMessages,
         Self::UiSession,
     ];
 
@@ -122,7 +122,7 @@ impl Contract {
             Self::LifecycleRestart => "lifecycle.restart.v1",
             Self::LifecycleAbandon => "lifecycle.abandon.v1",
             Self::ObservationGet => "observation.get.v1",
-            Self::CommunicationHandoff => "communication.handoff.v1",
+            Self::CommunicationMessages => "communication.messages.v1",
             Self::UiSession => "ui.session.v1",
             Self::Unknown => "unknown",
         }
@@ -156,7 +156,7 @@ impl Contract {
             Self::LifecycleAbandon => P::NONE,
             // The snapshot is built from the same observation a `mux.observe`
             // read is, so a backend that cannot observe has nothing to publish.
-            Self::ObservationGet | Self::CommunicationHandoff => P::NONE,
+            Self::ObservationGet | Self::CommunicationMessages => P::NONE,
             // The session reads the daemon's own observation snapshot and holds
             // volatile state; it asks nothing of the backend itself.
             Self::UiSession => P::NONE,
@@ -581,7 +581,7 @@ mod tests {
                 Contract::LifecycleAbandon,
                 Contract::ObservationGet,
                 // Communication records are daemon-owned and need no mux primitive.
-                Contract::CommunicationHandoff,
+                Contract::CommunicationMessages,
                 // The UI session is daemon-owned volatile state, not a backend read.
                 Contract::UiSession,
             ]

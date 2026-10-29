@@ -245,12 +245,25 @@ pub(super) fn registry_request(
                 );
             }
             match core.registry.publish(&publish, store::now_ms()) {
-                Ok(record) => respond(
-                    &request.id,
-                    Ok(answers::Channel {
-                        channel: record.view(store::now_ms(), core.registry.serving_epoch()),
-                    }),
-                ),
+                Ok(record) => {
+                    // The reply is where an idle process learns that something is
+                    // waiting for it. A hint failure leaves the accepted
+                    // publication intact and says so, rather than reporting an
+                    // empty mailbox.
+                    let (attention, unavailable) =
+                        match attention_for(&core.registry, &core.messages, &publish.target_id) {
+                            AttentionHint::Waiting(attention) => (Some(attention), None),
+                            AttentionHint::None => (None, None),
+                            AttentionHint::Unavailable => (None, Some(true)),
+                        };
+                    respond(
+                        &request.id,
+                        Ok(answers::Channel::new(
+                            record.view(store::now_ms(), core.registry.serving_epoch()),
+                        )
+                        .with_attention(attention, unavailable)),
+                    )
+                }
                 Err(error) => registry_error(request, error),
             }
         }
@@ -313,9 +326,9 @@ pub(super) fn registry_request(
             ) {
                 Ok(record) => respond(
                     &request.id,
-                    Ok(answers::Channel {
-                        channel: record.view(store::now_ms(), core.registry.serving_epoch()),
-                    }),
+                    Ok(answers::Channel::new(
+                        record.view(store::now_ms(), core.registry.serving_epoch()),
+                    )),
                 ),
                 Err(error) => registry_error(request, error),
             }
