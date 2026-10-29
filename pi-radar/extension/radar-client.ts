@@ -46,7 +46,7 @@ export const RADAR_PROTOCOL_VERSION = 2;
  * parent continue or restart its own child by subject.
  * Earlier daemons expose different identity fields; require a coordinated update.
  */
-export const RADAR_MINIMUM_REVISION = 11;
+export const RADAR_MINIMUM_REVISION = 12;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";

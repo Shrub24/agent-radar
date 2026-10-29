@@ -2,6 +2,14 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## 0.8.0
+
+- The handoff mailbox becomes one addressed message lane. A message has an immutable id, producer provenance, one tagged body and a frozen set of subject recipients, written once so a crash cannot expose half a fanout; each recipient's receipt is its own record and attests only to durable capture. `communication.publish|inbox|get|ack` keep their names and take `message`/`message_ids`/`next`/`message_id` on the wire. Receipt is per recipient and idempotent, and a body is retired only once every recipient has held it for the retention window. Capacity is checked before acceptance and refuses: pending work is never evicted to admit a publication.
+- Handoff is now the first body kind (`body: {kind: "handoff", …}`) with its parent-only routing unchanged: a worker may address only its resolved recorded parent, so the envelope's recipient set is not a general send permission.
+- An idle agent needs no connection. `agent.publish` replies carry `attention: {revision, pending}` for the caller's verified subject, with `attention_unavailable` when the mailbox could not be read and no field for an unmanaged caller. `messages.watch` opens the optional push tier: a JSON opener, then length-prefixed MessagePack frames of that same state, a gap-free baseline first, latest-wins after, at most 4 KiB each. Subscriptions get their own 16-connection budget, so agent watches cannot take a UI attachment slot or a control connection.
+- The contract is `communication.messages.v1`; `communication.handoff.v1` is gone. Wire revision 12 — restart the daemon with pi-radar 0.13.0.
+- Stored communication records from the retired mailbox are refused rather than migrated: the daemon will not start while `communications/` holds them. Drain them with the previous daemon or run `radar reset` once, before starting this build.
+
 ## 0.7.0
 
 - `subject.child.close {registration_id,subject_id,intent}` closes a child's pane by subject. The recorded parent names only the subject; Radar resolves the child's current launch and verifies the pane's occupant by birth identity, exactly as `spawn.close` does, and answers `completed`, `already_exited`, `refused` or `unknown`. A retry under the same request id settles against the target its first admission recorded. The agent stays retained for continue.

@@ -113,6 +113,17 @@ evaluated only). The lifecycle `verification.md` separates stub-owner verificati
 from the unperformed live destructive smoke, and existing Herdsman owners must reload
 for their control inboxes.
 
+## Message lane follow-ups
+
+Recorded while landing the addressed message lane; none blocks the handoff body.
+
+1. **Heartbeat cost of attention.** `MessageStore::attention` builds its revision from `pending()`, which deserializes every pending record in full — up to 128 records of 384 KiB content to produce a count and a hash, on every heartbeat. A per-subject pending index (`pending/<subject>/<message id>`), rebuilt from the message and receipt records at startup, would make `attention`, `page` and the capacity check O(pending) instead of O(store). Do this when message volume justifies it, and measure the current cost first.
+2. **Justify `MAX_RECIPIENTS`.** 32 is a round bound, not a measurement; nothing in production addresses more than one subject. Either derive it from a real producer (a lead messaging its children) or take it to the body-kind policy, which already restricts handoff to exactly one.
+3. **Admission classes as one table.** Opening 8 / ordinary 32 / UI attachment 16 / message subscription 16 / presenter 1 are now five constants with prose reasons. Worth a table plus a test per class proving its exhaustion does not starve another — the dashboard's reconnect under a full message budget is the case that matters.
+4. **Collapse `pending()` into `page()`.** `page` is `pending` plus a cursor and a truncation; a single `page(subject, after, limit) -> (Vec<MessageHead>, next)` with `attention` reading the same head scan would remove the intermediate full-record vectors.
+5. **One wire revision.** `ops::PROTOCOL_REVISION` is the authority (ping, the client's minimum check), but `cli::VERSION` repeats it as a literal, and only the CLI test pins them equal — a release that bumps one and not the other is a compile-clean mistake. Derive the printed version from the constant.
+6. **Generated-contract de-duplication.** `AgentIdentity` is emitted twice into `generated-contracts.ts` because every root schema is compiled independently and re-emits the `$defs` it references (it was `HandoffIdentity` twice before). Fix by compiling one protocol bundle schema with `$ref: true` and re-exporting the per-type names, keeping the per-method schemas that external consumers validate params with.
+
 ## Next
 
 Current queue as of 2026-10-24, after `managed-scoped-launch` landed on `main`

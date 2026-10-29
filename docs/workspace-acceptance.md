@@ -1,6 +1,6 @@
 # Workspace host: live acceptance runbook
 
-Run this after switching the machine to the new build (Radar 0.7.0, wire 10). It
+Run this after switching the machine to the new build (Radar 0.8.0, wire 12). It
 is the operator's check for task 4.2 of `sidebar-mode`; the agent cannot run it.
 Record each step as pass, fail, or a note. A failure needs the step number, what
 you pressed, and what you saw.
@@ -12,7 +12,7 @@ pane. In the workspace there is no tmux prefix and no status bar.
 
 | # | Do | Expect |
 |---|---|---|
-| 0.1 | `radar --version` | `radar 0.7.0 (wire 10)` |
+| 0.1 | `radar --version` | `radar 0.8.0 (wire 12)` |
 | 0.2 | `radar daemon restart`, then `radar daemon status` | both units active, from the same store path as `radar` |
 | 0.3 | `radar server status` | the `radar` tmux server runs; if not, `radar server start` |
 | 0.4 | Start two or three agents in it (a Pi, and anything else you run) | they appear in plain `radar` |
