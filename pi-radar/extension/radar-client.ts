@@ -1368,10 +1368,13 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 		return new Promise<RadarResult<{ close(): void }>>((resolve) => {
 			let settled = false;
 			let socket: RadarSocket | undefined;
+			let timer: RadarTimer | undefined;
 			let buffered = Buffer.alloc(0);
 			let binary = false;
 			let baseline = false;
+			let requested = false;
 			const close = (): void => {
+				requested = true;
 				try {
 					socket?.destroy();
 				} catch {
@@ -1381,8 +1384,22 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 			const finish = (result: RadarResult<{ close(): void }>): void => {
 				if (settled) return;
 				settled = true;
+				if (timer !== undefined) scheduler.clearTimeout(timer);
 				if (result.ok === false) close();
 				resolve(result);
+			};
+			/**
+			 * The subscription is over, however it ended. Before the baseline there is
+			 * nothing to report: the opener failed. After it, an end the caller did not
+			 * ask for is news, and a consumer that is not told holds a dead handle.
+			 */
+			const end = (failure: RadarResult<{ close(): void }>): void => {
+				if (!baseline) {
+					finish(failure);
+					return;
+				}
+				finish({ ok: true, value: { close } });
+				if (!requested) onEnd?.();
 			};
 			const deliver = (attention: AttentionSerialize): void => {
 				onAttention(attention);
@@ -1392,6 +1409,14 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					finish({ ok: true, value: { close } });
 				}
 			};
+			timer = scheduler.setTimeout(() => {
+				finish({
+					ok: false,
+					code: "timeout",
+					message: `messages.watch got no baseline within ${timeoutMs}ms`,
+				});
+			}, timeoutMs);
+			timer.unref?.();
 			let connection: RadarSocket;
 			try {
 				connection = dial(path);
@@ -1404,16 +1429,20 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				});
 			}
 			connection.on("error", (error) =>
-				finish({
+				end({
 					ok: false,
 					code: "transport",
 					message: String((error as Error)?.message ?? error),
 				}),
 			);
 			connection.on("close", () => {
-				// A closed watch ends delivery, never pending work: the mailbox keeps
-				// it and the next heartbeat reports it.
-				finish({ ok: true, value: { close } });
+				// A closed watch ends delivery, never pending work: the mailbox keeps it
+				// and the next heartbeat reports it.
+				end({
+					ok: false,
+					code: "transport",
+					message: "messages.watch closed before its baseline",
+				});
 			});
 			connection.on("connect", () => {
 				try {

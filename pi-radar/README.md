@@ -9,7 +9,7 @@ const radar = client.createRadarClient();
 const handshake = await radar.ping();
 ```
 
-Focused subpaths are also exported: `pi-radar/client`, `pi-radar/communication`, `pi-radar/execution`, `pi-radar/publication`, `pi-radar/runtime`, `pi-radar/launch`, `pi-radar/location`, and `pi-radar/inspection`. The shared `runtime` handle exposes `services.communication`, a handoff port bound to the baseline's existing client, this process's current registration, and the managed parent injected by Radar. Callers do not choose sender or recipient identity; `communication.createRadarHandoffPort` is the underlying SDK factory. The runtime subpath provides a versioned `pi.events` request/reply handoff so multiple extensions can consume one baseline publication without sharing bundled module singletons. Existing extension deep imports under `pi-radar/extension/` remain exported.
+Focused subpaths are also exported: `pi-radar/client`, `pi-radar/communication`, `pi-radar/attention`, `pi-radar/execution`, `pi-radar/publication`, `pi-radar/runtime`, `pi-radar/launch`, `pi-radar/location`, and `pi-radar/inspection`. The shared `runtime` handle exposes `services.communication`, a handoff port bound to the baseline's existing client, this process's current registration, and the managed parent injected by Radar. Callers do not choose sender or recipient identity; `communication.createRadarHandoffPort` is the underlying SDK factory. The runtime subpath provides a versioned `pi.events` request/reply handoff so multiple extensions can consume one baseline publication without sharing bundled module singletons. Existing extension deep imports under `pi-radar/extension/` remain exported.
 
 ## Pi baseline extension
 
@@ -26,6 +26,34 @@ pi-radar speaks protocol 2 and runs with the daemon it was released with. A mana
 The client uses `registry.v1` for registry operations and additionally requires `registry.facts.v1` for the facts channel and assignment extensions. Managed children require `spawn.v1`, child-pane removal requires `spawn.close.v1`, event reads require `events.v1`, and the message lane (publish, inbox, retrieve, receipt) requires `communication.messages.v1`. The expected wire examples are maintained in this repository's `docs/control-plane.fixture.jsonl` and `docs/agent-registration.fixture.jsonl` and are exercised by the package tests.
 
 `RadarFactsSnapshot` matches the daemon facts channel: optional model/provider/thinking/session name, `context_window: { tokens, window }`, typed `background_tasks: { id, phase }[]`, and `background_started_unix_ms`. Context counts and the timestamp are JSON numbers bounded by JavaScript's safe-integer limit. The old text `context_usage` field is not accepted; Rust retains cross-field validation such as a positive window and tokens not exceeding it.
+
+## Addressing a message, and learning there is one
+
+A message is one immutable body with a frozen set of recipient subjects, and a separate receipt per recipient. `page()` returns pending IDs only; retrieve each payload with `get()` and record it durably before `receive()`, so a batch cannot exceed the RPC response bound.
+
+Two things tell a process that work is waiting, and both report the same mailbox state — `{ revision, pending }` for its own subject:
+
+- **Heartbeat.** An accepted `agent.publish` reply carries `attention`. This is the only path an idle process needs, and it holds no socket.
+- **Subscription.** `messages.watch` opens a JSON opener, then length-prefixed MessagePack frames of that state, a gap-free baseline first and latest-wins after. It is opt-in and short-lived.
+
+`createRadarAttention` is the consumer: startup, a heartbeat hint and a pushed update all funnel into one serialized drain that calls `receive()` only after a registered consumer durably captured the message, then releases the subscription after 30 seconds of continuous idle. `waiting` does not count; waiting for a child is when a message matters most.
+
+```ts
+import * as attention from "pi-radar/attention";
+
+const loop = attention.createRadarAttention({
+	mailbox,                                   // createRadarMailboxPort(...)
+	consumers: [{ kind: "handoff", capture }], // capture returns true once recorded durably
+	scheduler,
+	activity: () => herdsmanActivity(),        // "idle" | "working" | "waiting"
+	watch: (onAttention, onEnd) =>
+		client.watchAttention({ registration_id, onAttention, onEnd }),
+});
+publication.facts.onAttention((hint) => loop.hint(hint));
+loop.drain();                                  // reconcile what a previous process left
+```
+
+`capture` must return `false` only for a transient failure: the drain stops so the message is retried, and a permanently rejected message would block every later one. Record the rejection and return `true`. A subscription that ends after its baseline is reported through `onEnd`, so a consumer reconnects from a fresh baseline instead of holding a dead handle.
 
 ## Durable handoffs
 
@@ -64,7 +92,7 @@ no socket, framing, IDs, error envelope or durable state:
 | Port | Methods | Where |
 | --- | --- | --- |
 | `RadarPublicationClient` | `ping`, `presence`, `releasePresence`, `acquire`, `publish`, `retire` | `pi-radar/publication` |
-| `RadarHandoffPort` | `publish`, `inbox`, `get`, `ack` | `pi-radar/communication` |
+| `RadarMailboxPort` | `publish`, `page`, `get`, `receive` | `pi-radar/communication` |
 | anything else | `Pick<RadarClient, ...>` of the reads you call | `pi-radar/client` |
 
 ```ts

@@ -1,6 +1,6 @@
 {
   "name": "pi-radar",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "type": "module",
   "description": "Radar daemon client, communication, publication, execution, location, launch and inspection surface for Pi extensions.",
   "license": "Apache-2.0",
@@ -22,6 +22,10 @@
     ".": {
       "types": "./index.ts",
       "import": "./dist/index.js"
+    },
+    "./attention": {
+      "types": "./extension/radar-attention.ts",
+      "import": "./dist/extension/radar-attention.js"
     },
     "./children": {
       "types": "./extension/radar-children.ts",
@@ -76,6 +80,7 @@
     "README.md",
     "schema/public/v1/**",
     "extension/generated-contracts.ts",
+    "extension/radar-attention.ts",
     "extension/radar-children.ts",
     "extension/radar-client.ts",
     "extension/radar-communication.ts",
@@ -83,16 +88,18 @@
     "extension/radar-inspection.ts",
     "extension/radar-launch.ts",
     "extension/radar-location.ts",
+    "extension/radar-msgpack.ts",
     "extension/radar-publication.ts",
     "extension/radar-runtime.ts",
     "extension/baseline.ts"
   ],
   "scripts": {
-    "build": "esbuild index.ts extension/generated-contracts.ts extension/radar-children.ts extension/radar-client.ts extension/radar-communication.ts extension/radar-execution.ts extension/radar-inspection.ts extension/radar-launch.ts extension/radar-location.ts extension/radar-publication.ts extension/radar-runtime.ts extension/baseline.ts --outbase=. --outdir=dist --bundle --platform=node --format=esm --target=node22",
+    "build": "esbuild index.ts extension/generated-contracts.ts extension/radar-attention.ts extension/radar-children.ts extension/radar-client.ts extension/radar-communication.ts extension/radar-execution.ts extension/radar-inspection.ts extension/radar-launch.ts extension/radar-location.ts extension/radar-publication.ts extension/radar-runtime.ts extension/baseline.ts --outbase=. --outdir=dist --bundle --platform=node --format=esm --target=node22",
     "generate:contracts": "node tools/generate-contracts.mjs",
     "check:contracts": "node tools/generate-contracts.mjs --check",
     "typecheck:contracts": "tsc --noEmit --strict --skipLibCheck --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --types node index.ts extension/baseline.ts extension/generated-contracts.ts extension/generated-contracts.typecheck.ts extension/radar-children.ts extension/radar-client.ts extension/radar-communication.ts extension/radar-execution.ts extension/radar-launch.test.ts extension/radar-msgpack.ts extension/radar-msgpack.test.ts extension/radar-publication.ts extension/radar-runtime.ts extension/radar-runtime.test.ts",
-    "prepack": "npm run build",
+    "prepack": "npm run build && npm run check:package",
+    "check:package": "node tools/check-package.mjs",
     "test": "npm run check:contracts && npm run typecheck:contracts && node --experimental-strip-types --test extension/*.test.ts"
   },
   "devDependencies": {

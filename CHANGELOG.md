@@ -2,12 +2,21 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## pi-radar 0.13.2
+
+- `extension/radar-attention.ts` is now in the package: `files`, `build`, the `typecheck` list and a `pi-radar/attention` subpath. 0.13.1 exported it from `index.ts` but did not ship the module, so a TypeScript consumer of the published package could not resolve it.
+- `messages.watch` reports its own end. A socket that closed after its baseline resolved `ok: true` with a dead handle that `onEnd` never reported, so a consumer never reconnected; a socket that closed *before* its baseline resolved `ok: true` as well, which the loop then stored as a live subscription. A pre-baseline close is now a `transport` failure, an unexpected end after the baseline calls `onEnd`, and a close the consumer asked for reports nothing.
+- The watch opener has a deadline: a daemon that accepts the connection and never answers fails with `timeout` instead of hanging.
+- `createRadarAttention` no longer opens duplicate subscriptions: repeated `activity()` calls while the first start was still in flight each dialled the daemon separately, leaking every handle but the last.
+- `publication.facts.onAttention(listener)` forwards the mailbox hint from an accepted publish and returns an unsubscribe. Without it the client's `attention` had no consumer, and no host could wire the heartbeat to the loop.
+
 ## pi-radar 0.13.1
 
 - Ships the mailbox consumer the 0.13.0 SDK described but did not export: `createRadarAttention` (with `RADAR_IDLE_HOLD_MS`, `RADAR_ATTENTION_BACKOFF_MS` and `RadarActivity`) is reachable from the package entry point, so one serialized drain with receipt-after-durable-capture, bounded retry and the continuous-idle hold is available to consumers.
 - `publish()` returns the accepted reply's `attention`, so a heartbeat establishes the mailbox hint that an idle agent has no connection to discover otherwise.
 - `watchAttention` reports when a subscription ends (`onEnd`) instead of only exposing `close()`. A socket that dies after establishment was previously held as if it were live, so the consumer never re-subscribed; the loop now clears it and reopens from a fresh baseline with backoff.
 - `RADAR_RUNTIME_VERSION` is 7: the runtime's communication surface changed incompatibly in 0.13, and a mixed installation must fail explicitly rather than at the first handoff.
+- Superseded by 0.13.2: the "reopens from a fresh baseline" behaviour described here did not work — `onEnd` was never called, and the module was missing from the tarball.
 
 ## 0.8.0
 

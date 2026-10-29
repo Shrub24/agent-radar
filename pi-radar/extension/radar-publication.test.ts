@@ -822,3 +822,48 @@ test("process start ticks parse around a command name with spaces", () => {
 test("the daemon's lease outlives the heartbeat that renews it", () => {
 	assert.ok(RADAR_LEASE_MS > RADAR_HEARTBEAT_MS);
 });
+
+test("an accepted publish hands its mailbox attention to the facts writer", async () => {
+	const { root, store, cleanup } = makeRoot();
+	try {
+		let hint: { revision: string; pending: number } | undefined = { revision: "r-1", pending: 3 };
+		const daemon = fakeDaemon({
+			"agent.publish": (params) =>
+				ok({ sequence: params.sequence, ...(hint === undefined ? {} : { attention: hint }) }),
+		});
+		const publication = publicationFor(daemon, { root, store });
+		const heard: { revision: string; pending: number }[] = [];
+		publication.facts.onAttention((attention) => heard.push(attention));
+		publication.facts.update({ model: "claude", provider: "anthropic" });
+		await settle();
+		assert.deepEqual(heard, [{ revision: "r-1", pending: 3 }], "a hint reaches the consumer");
+
+		hint = undefined;
+		publication.facts.update({ model: "gpt" });
+		await settle();
+		assert.equal(heard.length, 1, "an unmanaged-absence of attention is not an error");
+	} finally {
+		cleanup();
+	}
+});
+
+test("a facts attention listener can be detached", async () => {
+	const { root, store, cleanup } = makeRoot();
+	try {
+		const daemon = fakeDaemon({
+			"agent.publish": (params) => ok({ sequence: params.sequence, attention: { revision: "r-2", pending: 1 } }),
+		});
+		const publication = publicationFor(daemon, { root, store });
+		let heard = 0;
+		const detach = publication.facts.onAttention(() => { heard += 1; });
+		publication.facts.update({ model: "claude", provider: "anthropic" });
+		await settle();
+		assert.equal(heard, 1);
+		detach();
+		publication.facts.update({ model: "gpt" });
+		await settle();
+		assert.equal(heard, 1, "a detached listener hears nothing");
+	} finally {
+		cleanup();
+	}
+});

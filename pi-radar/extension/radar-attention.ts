@@ -49,6 +49,7 @@ export function createRadarAttention(options: RadarAttentionOptions): RadarAtten
 	let running = false;
 	let again = false;
 	let last = "";
+	let starting = false;
 	let watch: { close(): void } | undefined;
 	let idleTimer: RadarTimer | undefined;
 	let retryTimer: RadarTimer | undefined;
@@ -81,20 +82,29 @@ export function createRadarAttention(options: RadarAttentionOptions): RadarAtten
 		idleTimer.unref?.();
 	}
 
+	/**
+	 * A socket that ends after its baseline is gone, not idle: the mailbox is still
+	 * there and the next baseline reports it.
+	 */
+	function ended(): void {
+		if (stopped) return;
+		watch = undefined;
+		scheduleRetry();
+	}
+
 	function open(): void {
-		if (stopped || watch !== undefined || options.watch === undefined) return;
+		// The handle only exists once the baseline arrives, so an in-flight start has
+		// to be tracked or repeated activity would open duplicate subscriptions.
+		if (stopped || starting || watch !== undefined || options.watch === undefined) return;
 		if (options.activity() === "idle") {
 			holdWatch();
 			return;
 		}
 		idleTimer = cancel(idleTimer);
 		const start = options.watch;
-		const ended = (): void => {
-			if (stopped) return;
-			watch = undefined;
-			scheduleRetry();
-		};
+		starting = true;
 		void start(hint, ended).then((opened) => {
+			starting = false;
 			// Refused or lost: heartbeats still deliver, so this is a retry, not an
 			// incident.
 			if (opened.ok === false) {

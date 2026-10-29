@@ -128,7 +128,7 @@ function unavailablePublication(): RadarPublication {
 	};
 	return {
 		execution: writer,
-		facts: { ...writer, update: () => undefined },
+		facts: { ...writer, update: () => undefined, onAttention: () => () => undefined },
 		presence: {
 			report: () => undefined,
 			stop: () => undefined,

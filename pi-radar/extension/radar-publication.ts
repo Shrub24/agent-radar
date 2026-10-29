@@ -13,6 +13,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
+import type { AttentionSerialize } from "./generated-contracts.ts";
 import type { RadarLocationResolution } from "./radar-location.ts";
 import {
 	boundedRadarAssignment,
@@ -575,6 +576,11 @@ function pendingAt(
 
 export type RadarFactsWriter = Omit<RadarChannelWriter, "update"> & {
 	update(snapshot: RadarFactsSnapshot): void;
+	/**
+	 * The mailbox hint an accepted `agent.publish` reply carried, if any. An
+	 * unmanaged process has no mailbox, so absence is normal and nothing fires.
+	 */
+	onAttention(listener: (attention: AttentionSerialize) => void): () => void;
 };
 
 export type RadarChannelWriter = {
@@ -607,7 +613,10 @@ type ChannelWriterInput = {
 	heartbeatMs: number;
 };
 
-function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
+/** A writer whose accepted publish replies may carry a mailbox hint. */
+type AttentionWriter = RadarChannelWriter & Pick<RadarFactsWriter, "onAttention">;
+
+function createChannelWriter(input: ChannelWriterInput): AttentionWriter {
 	const { store, client, scheduler, recordName, channel, publisher } = input;
 	const codec = input.codec ?? executionCodec;
 	let record = loadRecord();
@@ -786,6 +795,8 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 		if (answer.ok === true) {
 			recovering = false;
 			record.sequence = Math.max(record.sequence, answer.value.sequence);
+			if (answer.value.attention !== undefined)
+				for (const listener of attention) listener(answer.value.attention);
 			record.accepted = { ...pending, sent_at: scheduler.now() };
 			record.pending = undefined;
 			save();
@@ -866,6 +877,8 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 		}
 	}
 
+	const attention = new Set<(attention: AttentionSerialize) => void>();
+
 	function kick(): void {
 		if (stopped || fenced || retired) return;
 		startPump();
@@ -913,6 +926,10 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 		reopen() {
 			stopped = false;
 			if (desired !== undefined || record.pending !== undefined) kick();
+		},
+		onAttention(listener) {
+			attention.add(listener);
+			return () => void attention.delete(listener);
 		},
 		diagnostic: () => record.diagnostic,
 	};
@@ -1168,11 +1185,12 @@ export function createRadarPublication(
 
 function unavailablePublication(error?: unknown): RadarPublication {
 	const diagnostic = `Radar publication unavailable${error ? `: ${String(error).slice(0, 180)}` : ""}`;
-	const writer: RadarChannelWriter = {
+	const writer: AttentionWriter = {
 		update: () => undefined,
 		retire: () => undefined,
 		stop: () => undefined,
 		reopen: () => undefined,
+		onAttention: () => () => undefined,
 		diagnostic: () => diagnostic,
 	};
 	return {
