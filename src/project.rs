@@ -1,11 +1,11 @@
 //! The directories a new workspace can start in, and the picker that chooses one.
 //!
 //! Candidates come from a configurable command that prints one directory per
-//! line (by default `zoxide query -l`), filtered to git projects unless the
-//! operator turns that off. A configured base directory is offered only when
-//! the source yields nothing. The command runs in
-//! the dashboard, never in the daemon, and its output is only ever a list of
-//! paths to choose from: nothing it prints is run.
+//! line (by default `zoxide query -l`). A configured base directory is offered
+//! only when the source yields nothing. The command runs in the dashboard,
+//! never in the daemon, and its output is only ever a list of paths to choose
+//! from: nothing it prints is run. The picker shows git projects first and
+//! reveals the rest on request.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::config::ProjectFilter;
+use crate::picker::{Item, Picker};
 
 /// How long a source command may take before the picker opens without it.
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -30,14 +30,14 @@ pub struct Candidates {
 }
 
 /// Source-ordered absolute directories, with `base` as the empty-source fallback.
-pub fn candidates(source: Option<&[String]>, filter: ProjectFilter, base: &Path) -> Candidates {
+pub fn candidates(source: Option<&[String]>, base: &Path) -> Candidates {
     let default: Vec<String> = DEFAULT_SOURCE.iter().map(|word| word.to_string()).collect();
     let source = source.unwrap_or(&default);
     let (lines, mut note) = match run_source(source) {
         Ok(lines) => (lines, None),
         Err(message) => (Vec::new(), Some(message)),
     };
-    let mut directories = select(&lines, filter);
+    let mut directories = select(&lines);
     if directories.is_empty() {
         if note.is_none() {
             note = Some("project source yielded no accepted directories".into());
@@ -59,15 +59,13 @@ pub fn candidates(source: Option<&[String]>, filter: ProjectFilter, base: &Path)
     Candidates { directories, note }
 }
 
-/// Keeps source order and removes duplicates; the fallback bypasses the git filter.
-fn select(lines: &[String], filter: ProjectFilter) -> Vec<PathBuf> {
+/// Keeps source order and removes duplicates and anything that is not an
+/// existing absolute directory.
+fn select(lines: &[String]) -> Vec<PathBuf> {
     let mut directories = Vec::new();
     for line in lines {
         let path = PathBuf::from(line.trim());
         if !path.is_absolute() || !path.is_dir() || directories.contains(&path) {
-            continue;
-        }
-        if filter == ProjectFilter::Git && !path.join(".git").exists() {
             continue;
         }
         directories.push(path);
@@ -118,6 +116,19 @@ fn run_source(source: &[String]) -> Result<Vec<String>, String> {
     }
 }
 
+/// The workspace picker over `choices`: git projects, with `Ctrl+g` to reveal
+/// every directory. The caller's value type is built from the path.
+pub fn picker<T: From<String>>(choices: &[String], hint: String) -> Picker<T> {
+    let items = choices
+        .iter()
+        .map(|path| {
+            Item::new(path.clone(), None::<String>, T::from(path.clone()))
+                .secondary(!Path::new(path).join(".git").exists())
+        })
+        .collect();
+    Picker::new("Workspace", hint, items).scoped("git only", "all")
+}
+
 /// The name a project workspace shows: the folder of the git root that contains
 /// `directory`, or the directory's own folder when it is in no repository.
 pub fn project_name(directory: &Path) -> String {
@@ -145,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn source_order_is_cwd_independent_and_the_filter_keeps_only_git_projects() {
+    fn source_order_is_cwd_independent_and_every_directory_is_kept() {
         let root = scratch("select");
         let repo = root.join("repo");
         let plain = root.join("plain");
@@ -161,11 +172,31 @@ mod tests {
         .map(str::to_string)
         .to_vec();
         assert_eq!(
-            select(&lines, ProjectFilter::Git),
-            std::slice::from_ref(&repo),
+            select(&lines),
+            [repo, plain],
             "no leading cwd; repeats, relative paths and missing directories are dropped"
         );
-        assert_eq!(select(&lines, ProjectFilter::None), [repo, plain]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_picker_starts_on_git_projects_and_ctrl_g_reveals_the_rest() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = scratch("scope");
+        let repo = root.join("repo");
+        let plain = root.join("plain");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&plain).unwrap();
+        let choices = [plain.to_str().unwrap(), repo.to_str().unwrap()].map(str::to_string);
+        let mut picker: Picker<String> = picker(&choices, "enter open".into());
+        assert_eq!(picker.rows().len(), 1);
+        assert!(picker.hint().ends_with("ctrl+g all"));
+        picker.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(picker.rows().len(), 2);
+        assert!(picker.hint().ends_with("ctrl+g git only"));
+
+        let only_plain: Picker<String> = super::picker(&choices[..1], String::new());
+        assert_eq!(only_plain.rows().len(), 1, "never starts on an empty view");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -188,7 +219,7 @@ mod tests {
     fn a_missing_or_failing_source_uses_the_base_and_says_why() {
         let cwd = scratch("source");
         let missing = ["radar-no-such-program-xyz".to_string()];
-        let found = candidates(Some(&missing), ProjectFilter::Git, &cwd);
+        let found = candidates(Some(&missing), &cwd);
         assert_eq!(found.directories, std::slice::from_ref(&cwd));
         assert!(
             found
@@ -196,11 +227,11 @@ mod tests {
                 .is_some_and(|note| note.contains("did not start"))
         );
         let failing = ["false".to_string()];
-        let found = candidates(Some(&failing), ProjectFilter::Git, &cwd);
+        let found = candidates(Some(&failing), &cwd);
         assert_eq!(found.directories, std::slice::from_ref(&cwd));
         assert!(found.note.is_some());
         let printing = ["echo".to_string(), cwd.to_string_lossy().into_owned()];
-        let found = candidates(Some(&printing), ProjectFilter::None, &cwd);
+        let found = candidates(Some(&printing), &cwd);
         assert_eq!(
             found.directories,
             std::slice::from_ref(&cwd),
@@ -208,10 +239,10 @@ mod tests {
         );
         assert!(found.note.is_none());
         let unusable = cwd.join("missing");
-        let found = candidates(Some(&failing), ProjectFilter::Git, &unusable);
+        let found = candidates(Some(&failing), &unusable);
         assert!(found.directories.is_empty());
         assert!(found.note.unwrap().contains("project base"));
-        assert!(select(&[], ProjectFilter::Git).is_empty());
+        assert!(select(&[]).is_empty());
         fs::remove_dir_all(&cwd).unwrap();
     }
 }

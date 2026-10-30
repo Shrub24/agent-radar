@@ -39,17 +39,10 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             "no tmux server '{backend}' is running; start it with `radar server start`"
         )));
     }
-    // Attach to the named session, or the first one, creating it only when the
-    // server has none, so opening a workspace works from a fresh server.
-    let first = String::from_utf8_lossy(&sessions.stdout)
-        .lines()
-        .next()
-        .map(str::to_string);
-    let session = session
-        .map(str::to_string)
-        .or(first)
-        .unwrap_or_else(|| "main".into());
-    let session = session.as_str();
+    // A server with no session is offered a workspace picker rather than a
+    // placeholder session nobody asked for: the inner pane waits for the first
+    // session to exist, and the sidebar opens the picker.
+    let empty = String::from_utf8_lossy(&sessions.stdout).trim().is_empty();
     let result = (|| {
         run(&[
             "new-session",
@@ -64,6 +57,8 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             &format!("RADAR_WORKSPACE_SERVER={host}"),
             "-e",
             "RADAR_WORKSPACE_SIDEBAR=%0",
+            "-e",
+            &format!("RADAR_WORKSPACE_EMPTY={}", u8::from(empty)),
             &radar,
             "sidebar",
         ])?;
@@ -106,15 +101,8 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             "TMUX",
         ];
         let tmux_word = tmux.to_string_lossy();
-        attach.extend([
-            &tmux_word,
-            "-L",
-            backend,
-            "new-session",
-            "-A",
-            "-s",
-            session,
-        ]);
+        attach.extend(["sh", "-c", WAIT_THEN_ATTACH, "sh", &tmux_word, backend]);
+        attach.extend(session);
         run(&attach)?;
         for binding in bindings() {
             run(&binding)?;
@@ -146,6 +134,17 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
     // it: one launch, one name, and nothing left in the socket directory.
     let _ = std::fs::remove_file(crate::service::server_socket(&host));
     result.and(cleanup)
+}
+
+/// Runs in the inner pane: waits until the agents' server has the session (any
+/// session when none is named), then attaches to it. A fresh server has none
+/// until the operator creates a workspace.
+const WAIT_THEN_ATTACH: &str = r#"printf 'waiting for a workspace\n'; until "$1" -L "$2" has-session ${3:+-t "$3"} 2>/dev/null; do sleep 0.5; done; exec "$1" -L "$2" attach-session ${3:+-t "$3"}"#;
+
+/// Whether this sidebar was started over a server with no workspace, so it opens
+/// the workspace picker once.
+pub fn opens_empty() -> bool {
+    std::env::var("RADAR_WORKSPACE_EMPTY").is_ok_and(|value| value == "1")
 }
 
 /// The host's own key bindings.

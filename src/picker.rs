@@ -14,6 +14,7 @@ pub struct Item<T> {
     label: String,
     keys: Option<String>,
     value: T,
+    secondary: bool,
 }
 
 impl<T> Item<T> {
@@ -22,8 +23,23 @@ impl<T> Item<T> {
             label: label.into(),
             keys: keys.map(Into::into),
             value,
+            secondary: false,
         }
     }
+
+    /// Marks an item that a narrowed picker hides.
+    pub fn secondary(mut self, secondary: bool) -> Self {
+        self.secondary = secondary;
+        self
+    }
+}
+
+/// What `Ctrl+g` toggles: the hint says which view a press switches to.
+#[derive(Debug)]
+struct Scope {
+    narrowed: bool,
+    narrow: &'static str,
+    wide: &'static str,
 }
 
 /// What a key did to the picker.
@@ -45,6 +61,7 @@ pub struct Picker<T> {
     query: String,
     index: usize,
     items: Vec<Item<T>>,
+    scope: Option<Scope>,
 }
 
 impl<T> Picker<T> {
@@ -55,15 +72,39 @@ impl<T> Picker<T> {
             query: String::new(),
             index: 0,
             items,
+            scope: None,
         }
+    }
+
+    /// Lets `Ctrl+g` switch between every item and the non-secondary ones. It
+    /// starts narrowed, unless that would show nothing.
+    pub fn scoped(mut self, narrow: &'static str, wide: &'static str) -> Self {
+        let narrowed = self.items.iter().any(|item| !item.secondary);
+        self.scope = Some(Scope {
+            narrowed,
+            narrow,
+            wide,
+        });
+        self
     }
 
     pub fn title(&self) -> &'static str {
         self.title
     }
 
-    pub fn hint(&self) -> &str {
-        &self.hint
+    pub fn hint(&self) -> String {
+        match &self.scope {
+            Some(scope) => format!(
+                "{} · ctrl+g {}",
+                self.hint,
+                if scope.narrowed {
+                    scope.wide
+                } else {
+                    scope.narrow
+                }
+            ),
+            None => self.hint.clone(),
+        }
     }
 
     pub fn query(&self) -> &str {
@@ -77,7 +118,8 @@ impl<T> Picker<T> {
 
     /// The items the query selects, best first.
     pub fn visible(&self) -> Vec<usize> {
-        matching(&self.items, &self.query)
+        let narrowed = self.scope.as_ref().is_some_and(|scope| scope.narrowed);
+        matching(&self.items, &self.query, narrowed)
     }
 
     /// The displayed rows: a label and, when it has one, the shortcut beside it.
@@ -113,6 +155,12 @@ impl<T> Picker<T> {
                 self.query.pop();
                 self.index = 0;
             }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(scope) = &mut self.scope {
+                    scope.narrowed = !scope.narrowed;
+                    self.index = 0;
+                }
+            }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.index += 1,
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.index = self.index.saturating_sub(1);
@@ -131,14 +179,16 @@ impl<T> Picker<T> {
 /// The items a query selects, best first: a label that starts with the query
 /// ranks above one whose word starts line up, and that above one that merely
 /// holds the letters in order. Ties keep the order the items were given in.
-fn matching<T>(items: &[Item<T>], query: &str) -> Vec<usize> {
+fn matching<T>(items: &[Item<T>], query: &str, narrowed: bool) -> Vec<usize> {
     let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return (0..items.len()).collect();
-    }
-    let mut scored: Vec<(u8, usize)> = items
+    let shown = items
         .iter()
         .enumerate()
+        .filter(|(_, item)| !(narrowed && item.secondary));
+    if query.is_empty() {
+        return shown.map(|(index, _)| index).collect();
+    }
+    let mut scored: Vec<(u8, usize)> = shown
         .filter_map(|(index, item)| score(&item.label, &query).map(|score| (score, index)))
         .collect();
     scored.sort_by_key(|(score, _)| *score);

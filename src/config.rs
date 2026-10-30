@@ -247,18 +247,6 @@ pub struct ProjectsConfig {
     pub source: Option<Vec<String>>,
     /// Empty-source fallback. Relative paths are rejected.
     pub base: Option<std::path::PathBuf>,
-    /// Which of the source's directories are offered.
-    pub filter: ProjectFilter,
-}
-
-/// Which candidate directories a new-workspace picker offers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ProjectFilter {
-    /// Only directories that contain a `.git` entry.
-    #[default]
-    Git,
-    /// Every existing directory the source prints.
-    None,
 }
 
 /// The host commands `radar sidebar` runs to hide and unhide itself. The terminal
@@ -492,14 +480,6 @@ impl Config {
             }
             config.projects.base = Some(base);
         }
-        match projects.filter.as_deref() {
-            None => {}
-            Some("git") => config.projects.filter = ProjectFilter::Git,
-            Some("none") => config.projects.filter = ProjectFilter::None,
-            Some(other) => {
-                return Err(format!("projects.filter: `{other}` is not `git` or `none`"));
-            }
-        }
         if let Some(terminal) = tui.terminal {
             // A blank program would run nothing, which is worse than no setting.
             if terminal
@@ -693,12 +673,6 @@ impl Config {
         out.push_str("# Empty-source fallback; unset uses $HOME. Must be absolute.\n");
         if let Some(base) = &self.projects.base {
             out.push_str(&format!("base = {:?}\n", base.to_string_lossy()));
-        }
-        out.push_str(
-            "# `git` offers only directories containing `.git`; `none` offers every directory.\n",
-        );
-        if self.projects.filter == ProjectFilter::None {
-            out.push_str("filter = \"none\"\n");
         }
         out.push_str(
             "\n# What the dashboard is on the desktop.\n\
@@ -925,7 +899,6 @@ struct FileAgents {
 struct FileProjects {
     source: Option<Vec<String>>,
     base: Option<std::path::PathBuf>,
-    filter: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -969,7 +942,7 @@ impl<'de> Deserialize<'de> for FileTui {
 fn moved_to(key: &str) -> Option<&'static str> {
     match key {
         "launch_command" => Some("agents"),
-        "project_source" | "project_base" | "project_filter" => Some("projects"),
+        "project_source" | "project_base" => Some("projects"),
         _ => None,
     }
 }
@@ -1369,7 +1342,6 @@ htop = "none"
             ("launch_command = [\"pi\"]", "agents"),
             ("project_source = [\"zoxide\"]", "projects"),
             ("project_base = \"/tmp\"", "projects"),
-            ("project_filter = \"none\"", "projects"),
             ("term = []", "tui"),
         ] {
             let error = Config::parse(&format!("[tui]\n{key}\n")).expect_err("not a tui key");

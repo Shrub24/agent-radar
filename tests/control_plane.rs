@@ -13383,7 +13383,6 @@ fn the_inline_project_picker_creates_through_the_session_and_can_be_cancelled_re
             "%s\n".into(),
             sandbox.root.to_string_lossy().into_owned(),
         ]),
-        filter: agent_radar::config::ProjectFilter::None,
         ..ProjectsConfig::default()
     };
     let until = |app: &mut App, host: &mut Presentation, predicate: &dyn Fn(&App) -> bool| {

@@ -485,7 +485,7 @@ fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
 
 fn run_presenter(interaction: &str) -> io::Result<()> {
     use agent_radar::control_plane::public_contracts::ui_session::{InteractionResult, UiAction};
-    use agent_radar::picker::{Item, Picker, Step};
+    use agent_radar::picker::{Picker, Step};
     theme::install(load_config());
     // Apply the same socket-path trust check as the dashboard before attaching.
     let selected = control_plane::client::connect().map_err(io::Error::other)?;
@@ -535,18 +535,12 @@ fn run_presenter(interaction: &str) -> io::Result<()> {
                     ));
                     picker = None;
                 } else if picker.is_none() && !submitting && confirm.is_none() {
-                    let items = b
-                        .choices
-                        .iter()
-                        .map(|p| Item::new(p.clone(), None::<String>, p.clone()))
-                        .collect();
-                    picker = Some(Picker::new(
-                        "Workspace",
+                    picker = Some(agent_radar::project::picker(
+                        &b.choices,
                         b.note
                             .as_ref()
                             .map(|note| format!("{note} · enter open · esc cancel"))
                             .unwrap_or_else(|| "enter open · esc cancel".into()),
-                        items,
                     ));
                 }
             }
@@ -748,9 +742,15 @@ fn run(sidebar: bool) -> io::Result<()> {
             let mut sidebar_command = None;
             let mut flip_on_success = false;
             let mut presentation = agent_radar::ui_session::presentation::Presentation::default();
+            let mut offer_workspace = in_workspace && agent_radar::workspace::opens_empty();
 
             loop {
                 dirty |= app.apply_session_update();
+                if offer_workspace && app.session_mirror().is_some() {
+                    offer_workspace = false;
+                    app.new_workspace();
+                    dirty = true;
+                }
                 let detached = sidebar && in_workspace && app.sidebar_compact();
                 dirty |= presentation.poll(&mut app, &config.projects, detached, &wake);
                 dirty |= poll_sidebar_command(&mut sidebar_command, &mut flip_on_success, &mut app);

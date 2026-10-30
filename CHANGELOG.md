@@ -2,6 +2,11 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Radar 0.9.0
+
+- The workspace picker (`A`) lists git projects and `Ctrl+g` reveals every directory the project source prints. **Breaking:** `[projects] filter` is removed, since the toggle replaces it; a config that still sets it is refused as an unknown key. Delete the line.
+- `radar workspace` on a server with no session no longer creates a `main` session. The agent area waits for the first workspace and the sidebar opens the workspace picker. Without `--session` it attaches to tmux's most recent session, not the first listed.
+
 ## pi-radar 0.13.3
 
 - `createRadarAttention` takes `onDiagnostic(problem | undefined)`: a mailbox that cannot drain — an unreadable message, a consumer that declines or throws, a failed receipt, a message no consumer handles — is reported when the answer changes and cleared on recovery. Before, every failure was swallowed and a stuck mailbox was invisible to the host.

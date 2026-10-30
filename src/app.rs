@@ -31,7 +31,7 @@ use self::commands::CommandId;
 use crate::control_plane::public_contracts::ui_session::SharedCommand;
 use crate::control_plane::public_contracts::ui_session::UiAction;
 use crate::observation::{ObservationState, SourceFreshness};
-use crate::picker::{Item, Picker, Step};
+use crate::picker::{Picker, Step};
 use crate::tasks::{Task, TaskBoard, TaskEvent};
 use crate::theme;
 use crate::ui_session::client::UiClient;
@@ -850,19 +850,11 @@ impl App {
             self.present_session_confirm(b);
         } else if let Some(b) = presented {
             if self.interaction_picker.as_deref() != Some(&b.interaction_id) {
-                self.open_workspace_picker(b.choices.iter().map(PathBuf::from).collect());
-                if let Some(note) = &b.note {
-                    let items = b
-                        .choices
-                        .iter()
-                        .map(|p| Item::new(p.clone(), None::<String>, PathBuf::from(p)))
-                        .collect();
-                    self.workspace_picker = Some(Picker::new(
-                        "Workspace",
-                        format!("{note} · enter open · esc cancel"),
-                        items,
-                    ));
-                }
+                let hint = match &b.note {
+                    Some(note) => format!("{note} · enter open · esc cancel"),
+                    None => "enter open · esc cancel".into(),
+                };
+                self.workspace_picker = Some(crate::project::picker(&b.choices, hint));
                 self.interaction_picker = Some(b.interaction_id.clone());
             }
         } else if self.interaction_picker.is_some() || self.session_confirm.is_some() {
@@ -1291,22 +1283,24 @@ impl App {
         self.workspace_picker.as_ref()
     }
 
+    /// Starts the shared new-workspace interaction.
+    pub fn new_workspace(&mut self) {
+        if self.session.is_some() {
+            self.submit_session(UiAction::RunCommand {
+                command:
+                    crate::control_plane::public_contracts::ui_session::SharedCommand::NewWorkspace,
+                row: None,
+            });
+        } else {
+            self.set_focus_message(Some(
+                "workspace creation requires the shared UI session".into(),
+            ));
+        }
+    }
+
     /// Whether a picker holds the keyboard.
     pub fn picker_open(&self) -> bool {
         self.palette.is_some() || self.workspace_picker.is_some()
-    }
-
-    /// Opens the workspace chooser over `directories`. The first entry starts as
-    /// the highlight, so a bare `Enter` takes the source's first directory.
-    pub fn open_workspace_picker(&mut self, directories: Vec<PathBuf>) {
-        let items = directories
-            .into_iter()
-            .map(|directory| {
-                let label = directory.to_string_lossy().into_owned();
-                Item::new(label, None::<String>, directory)
-            })
-            .collect();
-        self.workspace_picker = Some(Picker::new("Workspace", "enter open · esc cancel", items));
     }
 
     /// One picker key. Answers with the effect of a chosen command or workspace,
@@ -1527,18 +1521,7 @@ impl App {
             CommandId::HideSidebar => return self.sidebar.then_some(Action::ToggleSidebar),
             // `A` starts a workspace from nowhere: nothing is selected, replaced or
             // confirmed, because an addition cannot take anything away.
-            CommandId::NewWorkspace => {
-                if self.session.is_some() {
-                    self.submit_session(UiAction::RunCommand {
-                        command: crate::control_plane::public_contracts::ui_session::SharedCommand::NewWorkspace,
-                        row: None,
-                    });
-                } else {
-                    self.set_focus_message(Some(
-                        "workspace creation requires the shared UI session".into(),
-                    ));
-                }
-            }
+            CommandId::NewWorkspace => self.new_workspace(),
             // `L` launches the configured managed agent in a new tab or pane.
             CommandId::LaunchConfigured => return Some(Action::LaunchConfigured),
             CommandId::Restart => {
@@ -2681,33 +2664,5 @@ mod tests {
         press(&mut app, KeyCode::Char('?'));
         assert_eq!(press(&mut app, KeyCode::Esc), None);
         assert!(app.palette().is_none(), "Escape closes it");
-    }
-
-    #[test]
-    fn the_workspace_picker_answers_with_its_directory() {
-        let (_, mut app) = fixture();
-        let directories = vec![
-            std::path::PathBuf::from("/home/one/agent-radar"),
-            std::path::PathBuf::from("/home/one/notes"),
-        ];
-        app.open_workspace_picker(directories.clone());
-        let picker = app.workspace_picker().expect("open");
-        assert_eq!(picker.rows().len(), 2);
-        assert!(
-            picker.rows()[0].0.contains("agent-radar"),
-            "the paths are what a query matches"
-        );
-
-        // A query narrows it, and Enter answers with the highlighted directory.
-        for ch in "notes".chars() {
-            assert_eq!(press(&mut app, KeyCode::Char(ch)), None);
-        }
-        assert_eq!(press(&mut app, KeyCode::Enter), None);
-        assert!(app.workspace_picker().is_none());
-
-        app.open_workspace_picker(directories);
-        assert_eq!(press(&mut app, KeyCode::Esc), None);
-        assert!(app.workspace_picker().is_none(), "Escape cancels");
-        assert!(app.focus_message().is_none());
     }
 }

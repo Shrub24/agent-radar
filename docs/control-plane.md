@@ -354,7 +354,7 @@ Ordinary input without a gate stamp is refused as bad parameters. Input is stamp
 
 An accepted project result freezes a domain request UUID, returned in its receipt and reused by duplicate receipts. A bounded daemon worker invokes the existing `topology.create` admission service, never a self-RPC. `session.operation` distinguishes `dispatcher_accepted`, `dispatch_refused`, `submission_uncertain`, `admitted`, and authoritative `completed`/`refused`/`unknown`, carrying the original response when established. A missing completion is queried by the same request ID every five seconds, not re-executed. Queue rejection claims no admission; a daemon restart loses volatile UI state but preserves whatever the domain service durably recorded.
 
-Project candidates keep source order, validation and deduplication. The invoking frontend supplies its own configured source/environment; no source process runs in the daemon. `[projects] base` must be absolute and defaults to `$HOME`; it is offered only if no source directory passes the filter. A missing/unusable base yields an empty picker and a diagnostic. No invoking start-directory entry is prepended.
+Project candidates keep source order, validation and deduplication. The invoking frontend supplies its own configured source/environment; no source process runs in the daemon. `[projects] base` must be absolute and defaults to `$HOME`; it is offered only if the source prints no usable directory. The picker offers every usable directory; it opens on those containing `.git` and `Ctrl+g` reveals the rest. A missing/unusable base yields an empty picker and a diagnostic. No invoking start-directory entry is prepended.
 
 #### Focus
 

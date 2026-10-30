@@ -96,8 +96,7 @@ impl Presentation {
                     .clone()
                     .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
                     .unwrap_or_default();
-                let found =
-                    crate::project::candidates(projects.source.as_deref(), projects.filter, &base);
+                let found = crate::project::candidates(projects.source.as_deref(), &base);
                 let _ = tx.send(found);
                 wake.notify();
             });

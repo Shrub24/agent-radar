@@ -66,21 +66,24 @@ for word in "$@"; do printf '<%s>' "$word"; done >> "$RADAR_TEST_LOG"
 printf '\n' >> "$RADAR_TEST_LOG"
 if [ "$3" = list-sessions ]; then
     [ "$RADAR_TEST_MISSING" = yes ] && { echo 'no server running' >&2; exit 1; }
-    echo 'chosen session'
+    [ "$RADAR_TEST_EMPTY" = yes ] || echo 'chosen session'
 fi
 "#,
     )
     .unwrap();
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let run = |missing| {
+    let run_with = |missing, empty, session: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_radar"))
-            .args(["workspace", "--session", "chosen session"])
+            .arg("workspace")
+            .args(session)
+            .env("RADAR_TEST_EMPTY", empty)
             .env("RADAR_TMUX", &tmux)
             .env("RADAR_TEST_LOG", &log)
             .env("RADAR_TEST_MISSING", missing)
             .output()
             .unwrap()
     };
+    let run = |missing| run_with(missing, "no", &["--session", "chosen session"]);
     let output = run("no");
     assert!(
         output.status.success(),
@@ -102,8 +105,15 @@ fi
     );
     assert!(
         calls.iter().any(|line| line.contains("<env><-u><TMUX>")
-            && line.ends_with("<new-session><-A><-s><chosen session>")),
-        "the agent area attaches to the requested session, creating it if absent"
+            && line.contains("<sh><-c>")
+            && line.ends_with("<chosen session>")),
+        "the agent area waits for and attaches to the requested session"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|line| line.contains("<RADAR_WORKSPACE_EMPTY=0>")),
+        "a server with a session does not offer the picker"
     );
     assert!(calls.last().unwrap().ends_with("<kill-server>"));
 
@@ -114,6 +124,18 @@ fi
         std::fs::read_to_string(&log).unwrap().lines().count(),
         1,
         "a missing server creates no host"
+    );
+    std::fs::write(&log, "").unwrap();
+    let output = run_with("no", "yes", &[]);
+    assert!(output.status.success());
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains("<RADAR_WORKSPACE_EMPTY=1>"),
+        "an empty server opens the picker: {calls}"
+    );
+    assert!(
+        !calls.contains("<main>") && !calls.contains("new-session><-A"),
+        "no placeholder session is created: {calls}"
     );
     std::fs::remove_dir_all(root).unwrap();
 }
