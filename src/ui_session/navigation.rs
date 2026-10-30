@@ -7,14 +7,14 @@
 //! row changes.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
 use crate::model::{AgentState, ForegroundEvidence};
 use crate::tasks::TaskBoard;
-use crate::tree::{FleetTree, RowId, RowKind, TaskRow, TreeNode};
+use crate::tree::{FleetTree, RowId, RowKind, TaskRow, TreeNode, TreeRow};
 
 /// The navigation state a frontend reads and changes. Its selection follows a
 /// row identity; its anchor is the position it last held, for when that row
@@ -34,6 +34,9 @@ pub struct Navigation {
     /// Index of the selected row in the last visible-row list, used as the
     /// fallback position when the selected row disappears.
     anchor: usize,
+    /// Rows that stopped qualifying for the listing when the tree last changed,
+    /// with the whole seconds they remain drawn.
+    lingering: HashMap<RowId, u64>,
     /// Scratch space for the fuzzy matcher, reused across every row and call.
     matcher: RefCell<Matcher>,
 }
@@ -118,14 +121,20 @@ impl Navigation {
             return 0;
         }
         let listed = self.visibility();
+        let no_grace = HashMap::new();
         let with_history = Visibility {
             finished: true,
+            lingering: &no_grace,
+            ..listed
+        };
+        let listed = Visibility {
+            lingering: &no_grace,
             ..listed
         };
         let mut count = 0;
         let mut pending: Vec<&TreeNode> = self.tree.roots.iter().collect();
         while let Some(node) = pending.pop() {
-            if with_history.includes(&node.row.kind) && !listed.includes(&node.row.kind) {
+            if with_history.includes(&node.row) && !listed.includes(&node.row) {
                 count += 1;
             }
             pending.extend(node.children.iter());
@@ -274,6 +283,56 @@ impl Navigation {
     pub fn replace_tree(&mut self, tree: FleetTree) {
         self.tree = tree;
         self.reconcile();
+    }
+
+    /// [`Self::replace_tree`] for the session, which owns the clock the grace
+    /// period runs on. A frontend's replica has no clock, so it never lingers: the
+    /// rows the session publishes are the ones drawn.
+    pub fn replace_tree_graced(&mut self, tree: FleetTree) {
+        let listed: HashSet<RowId> = self
+            .visible_rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        self.tree = tree;
+        self.linger_departed(&listed);
+        self.reconcile();
+    }
+
+    /// Lets a row that left the listing because its tree changed stay drawn for
+    /// [`GRACE_SECONDS`], so a row that finished is seen finishing instead of
+    /// vanishing. Changing the view or the filter is the operator's own request
+    /// and never reaches here, so it removes rows at once.
+    fn linger_departed(&mut self, listed: &HashSet<RowId>) {
+        let mut present = HashSet::new();
+        let mut departed = Vec::new();
+        let visible = self.visibility();
+        let mut pending: Vec<&TreeNode> = self.tree.roots.iter().collect();
+        while let Some(node) = pending.pop() {
+            present.insert(node.row.id.clone());
+            if listed.contains(&node.row.id) && !visible.includes(&node.row) {
+                departed.push(node.row.id.clone());
+            }
+            pending.extend(node.children.iter());
+        }
+        self.lingering.retain(|id, _| present.contains(id));
+        for id in departed {
+            self.lingering.entry(id).or_insert(GRACE_SECONDS);
+        }
+    }
+
+    /// Ages the rows being kept; true when one expired, so the listing changed.
+    pub fn tick(&mut self, seconds: u64) -> bool {
+        let before = self.lingering.len();
+        self.lingering.retain(|_, left| {
+            *left = left.saturating_sub(seconds);
+            *left > 0
+        });
+        let expired = self.lingering.len() != before;
+        if expired {
+            self.reconcile();
+        }
+        expired
     }
 
     /// Attaches the task bus to the projected tree and re-validates selection.
@@ -475,11 +534,12 @@ impl Navigation {
     }
 
     /// The rows the tree currently lists.
-    fn visibility(&self) -> Visibility {
+    fn visibility(&self) -> Visibility<'_> {
         Visibility {
             view: self.view,
             finished: self.finished_shown,
             tasks: self.task_rows.shown(self.view),
+            lingering: &self.lingering,
         }
     }
 
@@ -787,17 +847,25 @@ impl PaneView {
 /// Which rows the tree lists: the pane view, plus whether finished sessions are
 /// listed while ordinary panes are hidden and whether background tasks are
 /// listed in this view.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Visibility {
+#[derive(Clone, Copy, Debug)]
+struct Visibility<'a> {
     view: PaneView,
     finished: bool,
     tasks: bool,
+    lingering: &'a HashMap<RowId, u64>,
 }
 
-impl Visibility {
-    /// Workspaces stay visible; pane, history and task controls govern their contents.
-    fn includes(self, kind: &RowKind) -> bool {
-        match kind {
+/// How long a row that left the listing stays drawn.
+const GRACE_SECONDS: u64 = 5;
+
+impl Visibility<'_> {
+    /// Workspaces stay visible; pane, history and task controls govern their
+    /// contents. A row in its grace period is listed whatever its kind says.
+    fn includes(self, row: &TreeRow) -> bool {
+        if self.lingering.contains_key(&row.id) {
+            return true;
+        }
+        match &row.kind {
             RowKind::Task(_) => self.tasks,
             RowKind::Pane(pane) => {
                 let history = self.finished && pane.exited.is_some() && pane.command().is_none();
@@ -898,7 +966,7 @@ impl RowOrder {
 }
 
 fn subtree_has_visible(node: &TreeNode, visible: Visibility) -> bool {
-    visible.includes(&node.row.kind)
+    visible.includes(&node.row)
         || node
             .children
             .iter()
@@ -908,7 +976,7 @@ fn subtree_has_visible(node: &TreeNode, visible: Visibility) -> bool {
 fn has_visible_children(node: &TreeNode, visible: Visibility) -> bool {
     node.children
         .iter()
-        .any(|child| visible.includes(&child.row.kind))
+        .any(|child| visible.includes(&child.row))
 }
 
 /// Collects the unfolded view, skipping hidden ordinary panes. A branch's
@@ -937,7 +1005,7 @@ fn collect_visible<'a>(
     }
     let children: Vec<&TreeNode> = ordered(&node.children, order)
         .into_iter()
-        .filter(|child| visible.includes(&child.row.kind))
+        .filter(|child| visible.includes(&child.row))
         .collect();
     let count = children.len();
     for (index, child) in children.into_iter().enumerate() {
@@ -963,7 +1031,7 @@ fn subtree_matches(
     matches!(node.row.kind, RowKind::Workspace { .. })
         || node.row.matches(|text| needle.hit(text))
         || ordered(&node.children, order).into_iter().any(|child| {
-            visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
+            visible.includes(&child.row) && subtree_matches(child, needle, visible, order)
         })
 }
 
@@ -1077,7 +1145,7 @@ fn collect_filtered<'a>(
     let children: Vec<&TreeNode> = ordered(&node.children, order)
         .into_iter()
         .filter(|child| {
-            visible.includes(&child.row.kind) && subtree_matches(child, needle, visible, order)
+            visible.includes(&child.row) && subtree_matches(child, needle, visible, order)
         })
         .collect();
     out.push(VisibleRow {

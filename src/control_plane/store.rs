@@ -971,6 +971,28 @@ impl Store {
             .collect())
     }
 
+    /// Settles every request that expired without being claimed as refused
+    /// `not_executed`, and returns how many. A claim is written before any effect
+    /// is dispatched, so an unclaimed request past its expiry provably ran
+    /// nothing; left as it is, it would stay unfinished forever and `abandon`
+    /// refuses it, so it would block a server stop with no way out.
+    pub fn settle_unclaimed(&self, now_ms: i64) -> Result<usize, String> {
+        let mut settled = 0;
+        for record in self.unfinished()? {
+            if record.derive(now_ms) == Derived::NotExecuted {
+                self.write(&record.complete(
+                    Settlement::refused(
+                        Category::NotExecuted,
+                        "the request expired before it was claimed; nothing ran",
+                    ),
+                    now_ms,
+                ))?;
+                settled += 1;
+            }
+        }
+        Ok(settled)
+    }
+
     /// The newest unresolved mutation, regardless of method, over `target`.
     ///
     /// A request that has been claimed or started has no recorded outcome yet,
@@ -1827,6 +1849,43 @@ mod tests {
             .map(|record| record.id)
             .collect();
         assert_eq!(unfinished, vec![old.id.clone()]);
+    }
+
+    #[test]
+    fn an_unclaimed_request_past_its_expiry_is_settled_and_stops_blocking() {
+        let directory = tempdir("unclaimed");
+        let store = Store::open(&directory).expect("store");
+        let id = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let expired = RequestRecord::new(&id(1), "topology.create", None, None, 1_000);
+        let live = RequestRecord::new(&id(2), "topology.create", None, None, 100_000);
+        let created = RequestRecord::new(&id(3), "topology.create", None, None, 1_000);
+        for record in [&expired, &live, &created] {
+            store.create(record).expect("record");
+        }
+        let claimed = created.claim();
+        store.write(&claimed).expect("claim");
+        assert_eq!(store.settle_unclaimed(50_000).unwrap(), 1);
+        let unfinished: Vec<String> = store
+            .unfinished()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(
+            unfinished,
+            [live.id.clone(), claimed.id.clone()],
+            "a live request and a claimed one stay unfinished"
+        );
+        let settled = store
+            .recent(10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == expired.id)
+            .unwrap();
+        assert_eq!(settled.outcome, Some(RequestOutcome::Refused));
+        assert_eq!(settled.category, Some(Category::NotExecuted));
+        assert_eq!(store.settle_unclaimed(50_000).unwrap(), 0, "once");
+        drop_store(directory);
     }
 
     #[test]

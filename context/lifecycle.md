@@ -56,3 +56,23 @@ move the tab's start with it).
 
 **Consequences:** `PaneSplit` stays in the runtime contract for `spawn`, which
 creates beside its parent; only the dashboard no longer reaches it.
+
+## An unclaimed request that expired is settled, not left unfinished
+
+**Decision:** reconciliation settles a request that expired before it was claimed
+as refused `not_executed`. `Store::settle_unclaimed` does it, and
+`reconcile::unresolved` calls it first.
+
+**Reason:** a claim is written before any effect is dispatched, so an unclaimed
+request past its expiry provably ran nothing. Nothing settled it, so it stayed in
+the unfinished set forever, blocked `radar server stop`, and `lifecycle.abandon`
+refused it as "never claimed". The operator had no way out. The settlement is
+definite, needs no evidence source, and is the outcome the record's own
+derivation already named.
+
+**Rejected alternatives:** letting `abandon` accept it (it would record `unknown`
+for a request known to have run nothing); filtering it out of the unfinished read
+(the stop gate would pass, but the record would still read as pending everywhere
+else).
+
+**Evidence:** confirmed

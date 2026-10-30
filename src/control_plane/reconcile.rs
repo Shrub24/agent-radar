@@ -89,6 +89,7 @@ pub fn unresolved(
     trigger: Trigger,
     now_ms: i64,
 ) -> Result<Outcome, String> {
+    store.settle_unclaimed(now_ms)?;
     let records = store.unfinished()?;
     let examined = records.len();
     let mut resolved = 0;

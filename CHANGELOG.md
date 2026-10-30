@@ -5,6 +5,8 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 ## Radar 0.9.0
 
 - The workspace picker (`A`) lists git projects and `Ctrl+g` reveals every directory the project source prints. **Breaking:** `[projects] filter` is removed, since the toggle replaces it; a config that still sets it is refused as an unknown key. Delete the line.
+- A row that stops qualifying for the listing because the fleet changed (an agent or session finishing, a pane leaving the running view) stays drawn for five seconds, so a finish is seen rather than a row vanishing. Changing the view, the filter or the history toggle still removes rows at once. The count in the footer includes lingering rows.
+- A request that expired before it was claimed is settled as refused `not_executed` by the next reconciliation. It used to stay unfinished forever, block `radar server stop`, and be refused by `radar lifecycle abandon`. The stop refusal now names `radar lifecycle reconcile` and `abandon`.
 - `radar workspace` on a server with no session no longer creates a `main` session. The agent area waits for the first workspace and the sidebar opens the workspace picker. Without `--session` it attaches to tmux's most recent session, not the first listed.
 
 ## pi-radar 0.13.3

@@ -203,7 +203,7 @@ impl Session {
         self.state = Some(state.clone());
         let mut tree = FleetTree::build(state);
         tree.attach_tasks(&self.bus);
-        self.nav.replace_tree(tree);
+        self.nav.replace_tree_graced(tree);
         self.project()
     }
 
@@ -608,6 +608,9 @@ impl Session {
     }
 
     pub fn tick(&mut self, seconds: u64) {
+        if self.nav.tick(seconds) {
+            self.project();
+        }
         if self.gate.tick(seconds) {
             self.interaction_notice =
                 Some("project picker abandoned: no presenter claimed within 30 seconds".into());

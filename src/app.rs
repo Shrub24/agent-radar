@@ -2493,6 +2493,50 @@ mod tests {
     }
 
     #[test]
+    fn a_row_that_becomes_history_stays_drawn_for_the_grace_period_in_the_session_only() {
+        use crate::tree::FleetTree;
+        use crate::ui_session::Navigation;
+
+        let build = |ended| {
+            let state = managed_state_ending(
+                managed_facts(),
+                RuntimeStatus::Idle,
+                Some(MANAGED_OWNER),
+                ended,
+            );
+            FleetTree::build(&state)
+        };
+        let agents = |nav: &Navigation| {
+            nav.visible_rows()
+                .iter()
+                .filter(|row| matches!(row.id, RowId::Agent(_) | RowId::Registered(_)))
+                .count()
+        };
+
+        let mut session = Navigation::default();
+        session.replace_tree_graced(build(false));
+        assert_eq!(agents(&session), 1);
+        session.replace_tree_graced(build(true));
+        assert_eq!(agents(&session), 1, "it was seen finishing, not dropped");
+        assert!(!session.tick(2), "still inside the grace period");
+        assert_eq!(agents(&session), 1);
+        assert!(session.tick(3), "the period ended and the listing changed");
+        assert_eq!(agents(&session), 0);
+
+        let mut replica = Navigation::default();
+        replica.replace_tree(build(false));
+        replica.replace_tree(build(true));
+        assert_eq!(agents(&replica), 0, "a frontend replica has no clock");
+
+        // The operator's own request removes rows at once.
+        let mut asked = Navigation::default();
+        asked.replace_tree_graced(build(true));
+        asked.toggle_history();
+        asked.toggle_history();
+        assert_eq!(agents(&asked), 0);
+    }
+
+    #[test]
     fn a_command_is_refused_rather_than_retargeted_when_the_shared_selection_is_unexplained() {
         use crate::control_plane::public_contracts::ui_session as dto;
         use crate::ui_session::client::Mirror;

@@ -528,3 +528,25 @@ Two review findings were heard and not adopted, and the reasons belong here rath
 
 **The client's synchronisation flags are not accidental state.** `floor` is the minimum publication reflecting this view's acknowledged action; `delivered` is delivery dedupe; `resync` forces one re-delivery after a refusal; `incarnation` fences actions queued across attachments; `connected` and `pending` feed readiness. They answer different questions and have different lifetimes, so grouping them behind one value is welcome and collapsing them into fewer states is not.
 
+
+## A row that finishes lingers five seconds, in the session only
+
+**Decision:** when a tree change moves a row out of the listing (it became
+history, or left the running view), `Navigation::replace_tree_graced` keeps it
+drawn for `GRACE_SECONDS` (5). The session calls it and ages the rows from its
+existing one-second tick. A frontend's replica calls `replace_tree`, which never
+lingers. Changing the view, the filter or the history toggle removes rows at once.
+
+**Reason:** an agent leaving the fleet should be seen leaving, not vanish. The
+session already owns membership of the drawn set, and a frontend has no clock to
+expire a grace period against, so a replica that lingered would hold rows the
+session had dropped.
+
+**Consequence:** for those seconds a lingering row is drawn but not selectable
+through the replica's local navigation, the same as a structure-only row.
+
+**Rejected alternatives:** a per-frontend timer (two clocks, rows that disagree
+between views); a grace for every removal including the operator's own toggles
+(pressing `e` would appear to do nothing for five seconds).
+
+**Evidence:** confirmed

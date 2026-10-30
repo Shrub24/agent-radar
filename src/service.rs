@@ -211,7 +211,9 @@ fn refuse_while_busy(server: &str, verb: &str) -> Result<(), String> {
         let pending = crate::control_plane::client::unfinished_requests()?;
         if !pending.is_empty() {
             return Err(format!(
-                "tmux server `{server}` has {} durable operation(s) pending, so it is not {verb}:\n  {}",
+                "tmux server `{server}` has {} durable operation(s) pending, so it is not {verb}:\n  {}\n\
+                 `radar lifecycle reconcile` settles what evidence can establish; \
+                 `radar lifecycle abandon <id>` releases one that never will.",
                 pending.len(),
                 pending.join("\n  ")
             ));
