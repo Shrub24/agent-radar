@@ -265,6 +265,7 @@ impl RuntimeProvider for GatedBackend {
     }
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
@@ -308,6 +309,7 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
         pane_id: pane_id.into(),
     };
     FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
@@ -775,6 +777,7 @@ impl MuxBackend {
             report: self.report.clone(),
             launch: self.launch.clone(),
             inventory: FleetObservation {
+                focus: Default::default(),
                 metadata_agents: Vec::new(),
                 containers: Vec::new(),
                 lifecycle_subjects: Vec::new(),
@@ -1276,6 +1279,7 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
         pane_id: "wA:p1".into(),
     };
     let inventory = FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
@@ -8857,6 +8861,7 @@ fn a_populated_normalized_graph_round_trips_including_unknown_states() {
 /// An empty normalized inventory, for backends that only exercise one path.
 fn empty_inventory() -> FleetObservation {
     FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
@@ -10729,6 +10734,7 @@ fn the_snapshot_carries_the_containers_the_daemon_records() {
 /// An inventory that reports one workspace and nothing inside it.
 fn workspace_inventory(workspace_id: &str) -> FleetObservation {
     FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),

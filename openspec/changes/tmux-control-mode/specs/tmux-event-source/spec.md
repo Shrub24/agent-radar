@@ -11,8 +11,8 @@ The daemon SHALL read the serving tmux server's version and refuse versions olde
 - **WHEN** the owned server reports 3.8 or newer
 - **THEN** its version permits service
 
-### Requirement: One read-only observer covers the server
-Radar SHALL use one server-wide read-only control-mode observer that ignores size and receives no pane output. Attaching SHALL NOT change terminal size, active window or active pane. Any additional Radar hooks SHALL use owned slots without replacing user hooks.
+### Requirement: One no-output observer covers the server
+Radar SHALL use one server-wide control-mode observer that ignores size and receives no pane output. It SHALL NOT be read-only, because tmux resolves a command's target client to the best attached client and a read-only one would refuse Radar's own writes. Attaching SHALL NOT change terminal size, active window or active pane. Any additional Radar hooks SHALL use owned slots without replacing user hooks.
 
 #### Scenario: Another session changes
 - **WHEN** topology changes in a session other than the observer's attached session
@@ -59,11 +59,11 @@ Radar SHALL report observer connection state, last notification time and loss re
 - **WHEN** the observer exits unexpectedly
 - **THEN** its health reports the loss, timer reads remain available and reconnect uses bounded backoff
 
-### Requirement: Control clients are not operator clients
-Radar SHALL exclude control-mode clients from operator-client counts, focus-client choice and attachment-dependent guards.
+### Requirement: The observer is not an operator client
+Radar SHALL exclude its own observer, the client that asks for no output, from operator-client counts, focus-client choice and attachment-dependent guards. An operator's own control-mode client is still an operator, because only the observer asks for no output.
 
 #### Scenario: Only the observer is attached
-- **WHEN** the only attached client is a control-mode observer
+- **WHEN** the only attached client is Radar's observer
 - **THEN** Radar reports no operator client and never selects that observer for a focus command
 
 ### Requirement: Focus is one typed observed terminal location

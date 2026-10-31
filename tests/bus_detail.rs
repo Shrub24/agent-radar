@@ -95,6 +95,7 @@ fn task_session_view(pane_id: &str, session: &str) -> RegistryView {
 fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
     let mut state = ObservationState::new();
     state.apply_success(FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),

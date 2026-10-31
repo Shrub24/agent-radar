@@ -14,7 +14,7 @@ Preserve the existing shared distribution and command machinery while separating
 
 ### 1. One server-wide observer, attached lazily
 
-Use one control-mode child with read-only, ignore-size and no-output, supervised on the daemon's async runtime. Wait when there are no sessions; never create a placeholder. Reattach when its session disappears, with bounded backoff after failure. Verify the owned serving incarnation before attachment and discard old-incarnation work on replacement. Shutdown cancels and reaps the child.
+Use one control-mode child with ignore-size and no-output (not read-only: tmux resolves the target client of an external `send-keys` to the best attached client, and a read-only one makes every Radar write fail with "client is read-only"), supervised on the daemon's async runtime. Wait when there are no sessions; never create a placeholder. Reattach when its session disappears, with bounded backoff after failure. Verify the owned serving incarnation before attachment and discard old-incarnation work on replacement. Shutdown cancels and reaps the child.
 
 Disposable tmux 3.8 experiments demonstrated server-wide notifications from an observer attached to one session. This chooses one observer rather than a per-session fallback. Finish lifecycle and flag verification before depending on it. Ordinary control notifications are the initial mechanism; do not install speculative monitors or extra hooks. Any necessary additional hook must use an owned slot without replacing user hooks.
 
@@ -30,7 +30,7 @@ Alternative rejected: reduce notifications directly into terminal facts. They om
 
 Represent available focus with workspace, window and pane identities and zoom state. Distinguish no operator, unreadable/unavailable evidence and unsupported multiple operators; none licenses an implicit target. Retain last-good information only as explicitly stale display data.
 
-Filter control-mode clients before operator counts and focus-client selection. More than one operator client refuses focus-changing operations rather than choosing the most active or target-session client. Explicit non-focus commands remain governed by their normal evidence and eligibility checks. A server read, not an observer's attached session, identifies operator focus.
+Filter the observer (the one client whose `#{client_flags}` include `no-output`) before operator counts and focus-client selection; an operator's own control-mode client still counts. More than one operator client refuses focus-changing operations rather than choosing the most active or target-session client. Explicit non-focus commands remain governed by their normal evidence and eligibility checks. A server read, not an observer's attached session, identifies operator focus.
 
 Alternative rejected: per-client maps and follow selectors. They expand the product beyond its supported single-client model.
 
@@ -92,7 +92,7 @@ These are experiment findings, not a claim that the observer exists. Record repr
 - State changes across reads → validate the sampled client/location relationship, rerun on dirty hints, and report unavailable rather than synthesize a mixed location.
 - Shared filtering hides focus → explicit outside-listing indication, no forced global filter mutation.
 - Canonical rows may not have local detail → preserve row identity; never retarget through a neighbour.
-- Observer-only attachment affects tmux lifecycle → verification gate before building on attachment semantics.
+- Observer-only attachment affects tmux lifecycle (it also keeps `destroy-unattached` sessions alive) → verification gate before building on attachment semantics.
 - Older frontend contract → wire revision change and coordinated daemon/frontend upgrade, not legacy adapters.
 
 ## Migration Plan

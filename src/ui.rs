@@ -1911,6 +1911,7 @@ mod tests {
         };
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
@@ -1998,6 +1999,7 @@ mod tests {
             .collect();
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
@@ -2328,6 +2330,7 @@ mod tests {
             })
             .collect();
         let mut observation = FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
@@ -6835,6 +6838,7 @@ mod tests {
             .expect("a UUID");
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),

@@ -947,6 +947,7 @@ mod tests {
     #[test]
     fn an_inventory_carries_the_current_instance_for_every_handle() {
         let observation = FleetObservation {
+            focus: Default::default(),
             workspaces: vec![Workspace {
                 workspace_id: "wA".into(),
                 label: None,

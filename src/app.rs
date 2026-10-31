@@ -2203,6 +2203,7 @@ mod tests {
 
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
@@ -2224,6 +2225,7 @@ mod tests {
     #[test]
     fn filter_matches_reported_role_and_assignment_when_available() {
         let observation = FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
@@ -2394,6 +2396,7 @@ mod tests {
         });
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),

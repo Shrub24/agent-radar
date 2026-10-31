@@ -338,6 +338,7 @@ fn registered_assignment(
 
 fn inventory(pane_ids: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
     FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
@@ -363,6 +364,32 @@ fn state_with_retention() -> ObservationState {
     state.apply_success(inventory(&["wA:p1"], vec![]));
     assert_eq!(state.continuity_candidates(), vec!["wA:p1".to_string()]);
     state
+}
+
+#[test]
+fn a_requested_refresh_runs_now_instead_of_waiting_out_the_interval() {
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.set_inventory(inventory(&["wA:p1"], vec![]));
+    let mut state = ObservationState::new();
+    let mut collector = Collector::new(
+        CollectorConfig {
+            poll_interval: Duration::from_secs(60),
+        },
+        Arc::clone(&runtime),
+        registry_source(&runtime),
+    );
+    assert!(refresh_until(&mut collector, &mut state, |state| state
+        .inventory()
+        .is_some_and(|inventory| inventory.panes.len() == 1)));
+
+    runtime.set_inventory(inventory(&["wA:p1", "wA:p2"], vec![]));
+    collector.refresh_now();
+    assert!(
+        refresh_until(&mut collector, &mut state, |state| state
+            .inventory()
+            .is_some_and(|inventory| inventory.panes.len() == 2)),
+        "the change was read without waiting a minute"
+    );
 }
 
 #[test]

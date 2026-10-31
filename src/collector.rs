@@ -124,7 +124,7 @@ pub enum FailedSource {
 /// One finished collection cycle, ready to be applied to the reconciler.
 enum RefreshOutcome {
     Success {
-        observation: FleetObservation,
+        observation: Box<FleetObservation>,
         /// Foreground evidence per continuity-candidate pane. A candidate with
         /// no usable answer carries [`ForegroundEvidence::Inconclusive`].
         evidence: Vec<(String, ForegroundEvidence)>,
@@ -168,6 +168,9 @@ pub struct Collector {
     sampler: Arc<Mutex<Sampler>>,
     /// When the next refresh may start; already due at construction.
     next_refresh: Instant,
+    /// A change was announced since the running refresh began, so it may not
+    /// have seen it: one more refresh follows it immediately.
+    refresh_requested: bool,
     in_flight: Option<Refresh>,
     stopped: bool,
 }
@@ -196,6 +199,7 @@ impl Collector {
             registry,
             sampler: Arc::new(Mutex::new(sampler)),
             next_refresh: Instant::now(),
+            refresh_requested: false,
             in_flight: None,
             stopped: false,
         }
@@ -227,6 +231,13 @@ impl Collector {
             self.start_refresh(candidates);
         }
         applied
+    }
+
+    /// Brings the next refresh forward to now, or to straight after the one
+    /// running, which began before whatever prompted this.
+    pub fn refresh_now(&mut self) {
+        self.refresh_requested = true;
+        self.next_refresh = Instant::now();
     }
 
     /// Applies a finished refresh and enforces the in-flight deadline, without
@@ -295,7 +306,7 @@ impl Collector {
             } => {
                 // Inventory first: it rebuilds the retained set that the
                 // evidence then refines.
-                state.apply_success(observation);
+                state.apply_success(*observation);
                 for (pane_id, evidence) in evidence {
                     state.apply_evidence(&pane_id, evidence);
                 }
@@ -305,7 +316,11 @@ impl Collector {
                 FailedSource::Registry => state.apply_registry_failure(diagnostic),
             },
         }
-        self.next_refresh = Instant::now() + self.config.poll_interval;
+        self.next_refresh = if self.refresh_requested {
+            Instant::now()
+        } else {
+            Instant::now() + self.config.poll_interval
+        };
         true
     }
 
@@ -319,6 +334,7 @@ impl Collector {
 
     /// Starts one refresh off the calling thread.
     fn start_refresh(&mut self, candidates: Vec<String>) {
+        self.refresh_requested = false;
         let cancel = Arc::new(AtomicBool::new(false));
         let deadline = Instant::now() + REFRESH_DEADLINE;
         let (sender, outcomes) = mpsc::channel();
@@ -473,7 +489,7 @@ fn collect(
     observation.lifecycle_subjects = lifecycle_subjects;
     stamp_assignment_ages(&mut observation);
     RefreshOutcome::Success {
-        observation,
+        observation: Box::new(observation),
         evidence,
     }
 }
@@ -552,6 +568,7 @@ mod tests {
 
         fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
             Ok(FleetObservation {
+                focus: Default::default(),
                 metadata_agents: Vec::new(),
                 containers: Vec::new(),
                 lifecycle_subjects: Vec::new(),

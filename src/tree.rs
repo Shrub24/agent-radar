@@ -1325,6 +1325,7 @@ mod tests {
     #[test]
     fn a_recorded_container_names_its_group_and_a_removed_one_names_nothing() {
         let mut observation = FleetObservation {
+            focus: Default::default(),
             workspaces: vec![Workspace {
                 workspace_id: "wA".into(),
                 label: Some("backend-name".into()),
@@ -1400,6 +1401,7 @@ mod tests {
     #[test]
     fn rows_carry_the_container_radar_records_for_their_place() {
         let mut observation = FleetObservation {
+            focus: Default::default(),
             workspaces: vec![Workspace {
                 workspace_id: "wA".into(),
                 label: None,
@@ -1573,6 +1575,7 @@ mod tests {
     fn two_agent_window(agents: Vec<AgentObservation>) -> ObservationState {
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
+            focus: Default::default(),
             workspaces: vec![Workspace {
                 workspace_id: "wA".into(),
                 label: Some("work".into()),
@@ -1801,6 +1804,7 @@ mod tests {
             registry: None,
         };
         let observation = FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),

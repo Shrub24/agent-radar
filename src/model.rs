@@ -638,6 +638,36 @@ pub struct LifecycleObservation {
     pub ended: bool,
 }
 
+/// Where the unified operator's tmux client is looking, read with the inventory
+/// so the two describe one moment.
+///
+/// Only a read establishes it; a notification that focus moved never does. A
+/// failed read fails the inventory, so focus is never reported for a server that
+/// could not be read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Focus {
+    /// This backend reports no focus.
+    #[default]
+    Unreported,
+    /// No operator client is attached.
+    NoOperator,
+    /// More than one operator client is attached, which Radar does not support:
+    /// no focus is chosen among them.
+    Ambiguous { operators: usize },
+    Focused {
+        location: Location,
+        /// The focused pane's window is zoomed.
+        zoomed: bool,
+    },
+}
+
+impl Focus {
+    pub fn is_unreported(&self) -> bool {
+        *self == Self::Unreported
+    }
+}
+
 /// One successful inventory: workspaces, tabs, panes, reported agents and
 /// daemon lifecycle subjects not represented by a joined agent row.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -662,6 +692,8 @@ pub struct FleetObservation {
     /// tree suppresses subjects already represented by a joined agent row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_subjects: Vec<LifecycleObservation>,
+    #[serde(default, skip_serializing_if = "Focus::is_unreported")]
+    pub focus: Focus,
 }
 
 impl FleetObservation {

@@ -567,6 +567,7 @@ mod tests {
 
     fn inventory(panes: Vec<Pane>) -> FleetObservation {
         FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),

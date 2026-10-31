@@ -99,6 +99,7 @@ impl FakeRuntime {
             _ => Vec::new(),
         };
         FleetObservation {
+            focus: Default::default(),
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),

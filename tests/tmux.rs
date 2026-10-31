@@ -14,6 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -909,6 +910,117 @@ fn an_inventory_lists_the_server_with_handles_that_survive_reordering() {
     let mut tabs_after: Vec<String> = after.tabs.iter().map(|tab| tab.tab_id.clone()).collect();
     tabs_after.sort();
     assert_eq!(tabs, tabs_after, "a reordered window kept its handle");
+}
+
+#[test]
+fn the_observer_wakes_on_native_changes_is_no_operator_and_ends_with_its_stop_flag() {
+    let Some(probe) = Probe::start("the_observer_wakes_on_native_changes") else {
+        return;
+    };
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut source = probe
+        .runtime
+        .observe(
+            Arc::new({
+                let wakes = Arc::clone(&wakes);
+                move || {
+                    wakes.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+            Arc::clone(&stop),
+        )
+        .expect("the tmux adapter observes");
+    assert!(
+        eventually(DEADLINE, || source.lost().is_none()),
+        "the observer attaches to the server's session"
+    );
+
+    let seen = wakes.load(Ordering::SeqCst);
+    probe.tmux(&["new-window", "-d", "-t", "main:"]);
+    assert!(
+        eventually(DEADLINE, || wakes.load(Ordering::SeqCst) > seen),
+        "a native change woke the sampler"
+    );
+
+    let pane = probe.ids(&["list-panes", "-a", "-F", "#{pane_id}"])[0].clone();
+    assert_eq!(
+        probe
+            .runtime
+            .focus_outcome(&Target::Pane(probe.runtime_handle(&pane)), &cancel()),
+        FocusOutcome::NoClient,
+        "the observer is not an operator client"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    source.join();
+    assert!(
+        eventually(DEADLINE, || probe.tmux(&["list-clients"]).trim().is_empty()),
+        "no control client outlives the observer"
+    );
+}
+
+#[test]
+fn an_observer_started_before_any_session_attaches_once_one_exists() {
+    if !has_tmux() {
+        return;
+    }
+    let name = format!("radar-test-{}-{}", std::process::id(), unique());
+    let runtime = TmuxRuntime::new(TmuxConfig::for_server(name.clone())).expect("a usable name");
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut source = runtime
+        .observe(Arc::new(|| {}), Arc::clone(&stop))
+        .expect("the tmux adapter observes");
+    assert!(source.lost().is_some(), "nothing to attach to yet");
+    let server = Command::new("tmux")
+        .args(["-f", "/dev/null", "-L", &name])
+        .env_remove("TMUX")
+        .args(["new-session", "-d", "-s", "first", "-x", "80", "-y", "24"])
+        .status()
+        .expect("start a server");
+    assert!(server.success());
+    assert!(
+        eventually(DEADLINE, || source.lost().is_none()),
+        "it attached without having created a session"
+    );
+    stop.store(true, Ordering::SeqCst);
+    source.join();
+    let _ = Command::new("tmux")
+        .args(["-f", "/dev/null", "-L", &name, "kill-server"])
+        .env_remove("TMUX")
+        .status();
+    if let Some(dir) = socket_dir() {
+        let _ = fs::remove_file(dir.join(&name));
+    }
+}
+
+#[test]
+fn an_inventory_reports_the_one_operators_focus_and_refuses_to_choose_among_several() {
+    use agent_radar::model::Focus;
+
+    let Some(probe) = Probe::start("an_inventory_reports_the_one_operators_focus") else {
+        return;
+    };
+    let focus = || probe.runtime.inventory(&cancel()).expect("inventory").focus;
+    assert_eq!(focus(), Focus::NoOperator);
+
+    let _first = probe.attach_client();
+    let pane = probe.runtime_handle(&probe.ids(&["list-panes", "-a", "-F", "#{pane_id}"])[0]);
+    let Focus::Focused { location, zoomed } = focus() else {
+        panic!("one attached client is the operator");
+    };
+    assert_eq!(location.pane_id, pane);
+    assert!(!zoomed);
+
+    probe.tmux(&["split-window", "-d", "-t", "main:"]);
+    probe.tmux(&["resize-pane", "-Z", "-t", "main:"]);
+    let Focus::Focused { zoomed, .. } = focus() else {
+        panic!("still one operator");
+    };
+    assert!(zoomed, "zoom is read from the focused window");
+
+    let _second = probe.attach_client();
+    assert_eq!(focus(), Focus::Ambiguous { operators: 2 });
 }
 
 #[test]

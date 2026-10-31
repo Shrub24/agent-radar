@@ -33,7 +33,7 @@ use crate::collector::{Collector, CollectorConfig};
 use crate::control_plane::ingest::TaskIngest;
 use crate::control_plane::store::{Store, format_millis};
 use crate::observation::{ObservationState, SourceFreshness};
-use crate::runtime::RuntimeProvider;
+use crate::runtime::{ChangeSource, RuntimeProvider};
 
 /// How long one reader's request keeps a data class demanded.
 ///
@@ -138,6 +138,8 @@ impl Snapshot {
 pub struct Hub {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
+    /// The backend's change hints, if it has any.
+    changes: Option<Box<dyn ChangeSource>>,
 }
 
 struct Shared {
@@ -145,6 +147,10 @@ struct Shared {
     /// Signalled whenever a revision is published or demand arrives.
     changed: Condvar,
     demand: Mutex<Demand>,
+    /// The backend announced a change that no completed read is known to include.
+    hinted: std::sync::atomic::AtomicBool,
+    /// Ends the backend's hint source; set whenever the sampler or hub stops.
+    stop_observer: Arc<std::sync::atomic::AtomicBool>,
     /// The daemon's stop flag: the sampler stops with the daemon.
     stopping: Arc<std::sync::atomic::AtomicBool>,
     /// This hub's own stop flag, so dropping a hub stops its sampler without
@@ -193,17 +199,35 @@ impl Hub {
             }),
             changed: Condvar::new(),
             demand: Mutex::new(Demand::default()),
+            hinted: std::sync::atomic::AtomicBool::new(false),
+            stop_observer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stopping: Arc::clone(stopping),
             stopped: std::sync::atomic::AtomicBool::new(false),
         });
+        let changes = {
+            let hinted = Arc::clone(&shared);
+            let stop = Arc::clone(&shared.stop_observer);
+            provider.observe(
+                Arc::new(move || {
+                    hinted.hinted.store(true, Ordering::SeqCst);
+                    hinted.changed.notify_all();
+                }),
+                stop,
+            )
+        };
         let worker = {
             let shared = Arc::clone(&shared);
+            let provider = Arc::clone(&provider);
             thread::Builder::new()
                 .name("radar-observation".to_string())
                 .spawn(move || sample_loop(shared, provider, registry, tasks, task_error, store))
                 .ok()
         };
-        Self { shared, worker }
+        Self {
+            shared,
+            worker,
+            changes,
+        }
     }
 
     /// The epoch of this daemon's revisions.
@@ -266,6 +290,7 @@ impl Hub {
     /// Stops the sampler and wakes it so it notices.
     pub fn shutdown(&self) {
         self.shared.stopped.store(true, Ordering::SeqCst);
+        self.shared.stop_observer.store(true, Ordering::SeqCst);
         self.shared.changed.notify_all();
     }
 
@@ -273,6 +298,10 @@ impl Hub {
     pub fn join(&mut self) {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        self.shared.stop_observer.store(true, Ordering::SeqCst);
+        if let Some(changes) = &mut self.changes {
+            changes.join();
         }
     }
 }
@@ -344,7 +373,18 @@ fn sample_loop(
             };
             shared.publish_through(&snapshot);
         }
-        let wait = if events_woke {
+        // A hint brings the next read forward under the same gap as events; with
+        // nobody reading there is nothing to bring forward.
+        let hinted = shared.hinted.load(Ordering::SeqCst)
+            && demand.0
+            && last_pass.is_none_or(|at| at.elapsed() >= EVENT_WAKE_GAP);
+        if hinted {
+            shared.hinted.store(false, Ordering::SeqCst);
+            collector.refresh_now();
+        } else if !demand.0 {
+            shared.hinted.store(false, Ordering::SeqCst);
+        }
+        let wait = if events_woke || hinted {
             Duration::from_millis(1)
         } else if demand.0 {
             BUSY_POLL
@@ -357,6 +397,7 @@ fn sample_loop(
             .wait_timeout(published, wait)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
+    shared.stop_observer.store(true, Ordering::SeqCst);
     collector.shutdown();
 }
 

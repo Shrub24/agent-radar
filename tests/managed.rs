@@ -105,6 +105,7 @@ fn managed_inventory() -> FleetObservation {
     let session = SessionUuid::parse(SESSION).expect("a UUID");
     let owner = SessionUuid::parse(OWNER).expect("a UUID");
     FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),

@@ -92,6 +92,7 @@ impl<'a> Agent<'a> {
 /// inventory reports beside them.
 fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
     FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
@@ -1873,6 +1874,7 @@ fn node_of<'a>(nodes: &'a [TreeNode], id: &RowId) -> Option<&'a TreeNode> {
 
 fn wa_inventory(pane_ids: &[&str]) -> FleetObservation {
     FleetObservation {
+        focus: Default::default(),
         metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),

@@ -7,8 +7,8 @@ Radar needs observed tmux focus for a sidebar that follows native terminal navig
 ## What Changes
 
 - Require a serving tmux server at version 3.8 or newer; audit existing packaging before adding any override.
-- Add one supervised, read-only, server-wide control-mode observer. Notifications request coalesced reads; reads establish focus and topology. Timer sampling remains the recovery path.
-- Publish typed focus availability and the unified operator client's focused workspace, window, pane and zoom state. Exclude control clients; report multiple operator clients as unsupported and refuse ambiguous focus changes.
+- Add one supervised, no-output, server-wide control-mode observer. Notifications request coalesced reads; reads establish focus and topology. Timer sampling remains the recovery path.
+- Publish typed focus availability and the unified operator client's focused workspace, window, pane and zoom state. Exclude the observer; report multiple operator clients as unsupported and refuse ambiguous focus changes.
 - **BREAKING:** evolve shared-selection publication/adoption into shared focus, and extract browsing selection into each frontend. Remove shared browsing-move submission and authoritative-selection adoption; do not keep a compatibility cursor.
 - Keep filters, folds, ordering, projection membership and command interactions shared. View-local selection reconciles against the canonical projection.
 - Every row-dependent TUI command supplies its selected row. An omitted row resolves observed focus; an invalid explicit row never falls back. Freeze resolved intent before preparation, confirmation or execution.

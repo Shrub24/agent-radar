@@ -12,6 +12,8 @@ case "$*" in
   *list-sessions*) printf '%s\n' '$0\037/tmp/herdr\037herdsman' ;;
   *list-windows*) printf '%s\n' '@1\037$0\0372\037editor' ;;
   *list-panes*) printf '%s\n' '%1\037@1\037$0\037/tmp/herdr\037a title' ;;
+  *'#{version}'*) printf '%s\n' '3.8' ;;
+  *list-clients*) printf '%s\n' 'client-1\037attached\037$0\037@1\037%1\0370' ;;
   *display-message*) printf '%s\n' '4242\037pi' ;;
   *new-window*) printf '%s\n' '@2\037$0\037%4' ;;
   *split-window*) printf '%s\n' '%3\037@2\037$0' ;;

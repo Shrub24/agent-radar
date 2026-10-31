@@ -20,20 +20,23 @@
 //! Dead panes expose typed exit status through a bounded format read. A missing
 //! or unreadable pane remains unknown; it is not proof of process exit.
 
+mod observer;
+
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::model::{FleetObservation, ForegroundEvidence, Location, Pane, Tab, Workspace};
+use crate::model::{FleetObservation, Focus, ForegroundEvidence, Location, Pane, Tab, Workspace};
 use crate::runtime::{
-    BackendIdentity, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest, CreatedLocation,
-    FocusOutcome, InputOutcome, InputPayload, InputRequest, LAUNCH_TOKEN_ENV, LaunchOutcome,
-    LaunchRequest, OutputOutcome, OutputRead, OutputRequest, OutputSource, PaneExitObservation,
-    Primitives, RuntimeProvider, SplitDirection, Target,
+    BackendIdentity, ChangeSource, CloseOutcome, CloseTarget, CreateOutcome, CreateRequest,
+    CreatedLocation, FocusOutcome, InputOutcome, InputPayload, InputRequest, LAUNCH_TOKEN_ENV,
+    LaunchOutcome, LaunchRequest, OutputOutcome, OutputRead, OutputRequest, OutputSource,
+    PaneExitObservation, Primitives, RuntimeProvider, SplitDirection, Target, Wake,
 };
 
 /// The backend word in every handle this adapter names.
@@ -71,6 +74,27 @@ const WINDOW_FORMAT: &str =
 /// One `list-panes` record: the pane, its window, its session, its title.
 const PANE_FORMAT: &str =
     "#{pane_id}\u{1f}#{window_id}\u{1f}#{session_id}\u{1f}#{pane_current_path}\u{1f}#{pane_title}";
+
+/// The oldest tmux Radar's observation design supports.
+const MINIMUM_VERSION: (u32, u32) = (3, 8);
+
+/// Whether a tmux version word such as `3.8`, `3.7c` or `next-3.9` is new enough.
+/// A word that names no version is refused.
+fn at_least_minimum(version: &str) -> bool {
+    let digits = version.trim_start_matches(|c: char| !c.is_ascii_digit());
+    let mut parts = digits.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = parts.next().and_then(|part| {
+        part.trim_end_matches(|c: char| c.is_ascii_alphabetic())
+            .parse::<u32>()
+            .ok()
+    });
+    matches!((major, minor), (Some(major), Some(minor)) if (major, minor) >= MINIMUM_VERSION)
+}
+
+/// One attached client with where it is looking. `window_id`, `pane_id` and the
+/// zoom flag are the client's own session's current ones, read in one answer.
+const CLIENT_FORMAT: &str = "#{client_name}\u{1f}#{client_flags}\u{1f}#{session_id}\u{1f}#{window_id}\u{1f}#{pane_id}\u{1f}#{window_zoomed_flag}";
 
 /// What one `display-message` answer reports about a pane's foreground.
 const FOREGROUND_FORMAT: &str = "#{pane_pid}\u{1f}#{pane_current_command}";
@@ -148,6 +172,9 @@ impl TmuxConfig {
 /// tmux behind the daemon's backend seam.
 pub struct TmuxRuntime {
     config: TmuxConfig,
+    /// The serving server was read as a supported version. Kept once true: a
+    /// server's version does not change while it runs.
+    supported: AtomicBool,
 }
 
 impl TmuxRuntime {
@@ -159,7 +186,10 @@ impl TmuxRuntime {
         if let Some(problem) = server_name_problem(&config.server) {
             return Err(problem);
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            supported: AtomicBool::new(false),
+        })
     }
 }
 
@@ -377,6 +407,7 @@ impl RuntimeProvider for TmuxRuntime {
         // pane whose window or session record is missing, which the tree
         // tolerates rather than inventing a label for it.
         let sessions = self.run_whole(&["list-sessions", "-F", SESSION_FORMAT], cancel)?;
+        self.require_supported_server(cancel)?;
         // A server the daemon owns starts with no session, and `list-windows -a`
         // and `list-panes -a` fail with "no current target" there. An empty
         // session list is an empty fleet, not an unreachable server; a session
@@ -384,6 +415,7 @@ impl RuntimeProvider for TmuxRuntime {
         // stale like any other failed read.
         if sessions.trim().is_empty() {
             return Ok(FleetObservation {
+                focus: Focus::NoOperator,
                 metadata_agents: Vec::new(),
                 containers: Vec::new(),
                 lifecycle_subjects: Vec::new(),
@@ -395,7 +427,9 @@ impl RuntimeProvider for TmuxRuntime {
         }
         let windows = self.run_whole(&["list-windows", "-a", "-F", WINDOW_FORMAT], cancel)?;
         let panes = self.run_whole(&["list-panes", "-a", "-F", PANE_FORMAT], cancel)?;
+        let clients = self.run_whole(&["list-clients", "-F", CLIENT_FORMAT], cancel)?;
         Ok(FleetObservation {
+            focus: self.decode_focus(&clients)?,
             metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
@@ -482,6 +516,14 @@ impl RuntimeProvider for TmuxRuntime {
         }
     }
 
+    fn observe(&self, wake: Wake, stop: Arc<AtomicBool>) -> Option<Box<dyn ChangeSource>> {
+        Some(Box::new(observer::Observer::start(
+            self.config.clone(),
+            wake,
+            stop,
+        )))
+    }
+
     /// The tmux server's own PID, for the daemon to read the birth identity of.
     ///
     /// It is the one tmux fact that does not survive a restart under the same
@@ -542,6 +584,26 @@ impl RuntimeProvider for TmuxRuntime {
 }
 
 impl TmuxRuntime {
+    /// Refuses a server older than [`MINIMUM_VERSION`], judged by the version the
+    /// serving process reports: the installed executable can be newer than a
+    /// server that has been running since before an upgrade.
+    fn require_supported_server(&self, cancel: &AtomicBool) -> Result<(), String> {
+        if self.supported.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let version = self.run_whole(&["display-message", "-p", "#{version}"], cancel)?;
+        let version = version.trim();
+        if !at_least_minimum(version) {
+            return Err(format!(
+                "the tmux server at `{}` reports version {version}; Radar needs {}.{} or newer. \
+                 Set `tmuxPackage` to a newer tmux and restart the server",
+                self.config.server, MINIMUM_VERSION.0, MINIMUM_VERSION.1
+            ));
+        }
+        self.supported.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Reads retained exit status for the requested pane handles in one bounded
     /// server query. Unlisted, malformed, or unreadable panes remain unknown.
     fn read_exit_observations(
@@ -687,54 +749,25 @@ impl TmuxRuntime {
     /// The client to move, named explicitly.
     ///
     /// tmux resolves "the current client" from the environment of the command,
-    /// which a daemon does not have. Radar's model is one client per workspace, so
-    /// the client attached to the server is the one to move: a client already
-    /// showing the target's session wins, otherwise there is only the one. More
-    /// than one client on a server is outside the model; the most recently active
-    /// is chosen so the command still has a definite answer, and a server with
-    /// nothing attached has none.
-    fn client_for(&self, target: &str, cancel: &AtomicBool) -> Result<String, Failure> {
+    /// which a daemon does not have. Radar's model is one operator client per
+    /// server, so that client is the one to move. Radar's own observer is not an
+    /// operator and never counts; with more than one operator there is no
+    /// definite answer, so the command is refused rather than guessing, and a
+    /// server with nothing attached has none.
+    fn client_for(&self, cancel: &AtomicBool) -> Result<String, Failure> {
         // A server that cannot answer says nothing about whether the focus
         // happened: only an empty client list is a definite answer.
-        let session = self
-            .run(
-                &["display-message", "-p", "-t", target, "#{session_name}"],
-                cancel,
-            )
-            .map_err(Failure::unknown)?;
-        let session = session.text.trim().to_string();
         let clients = self
-            .run(
-                &[
-                    "list-clients",
-                    "-F",
-                    "#{client_name}|#{client_session}|#{client_activity}",
-                ],
-                cancel,
-            )
+            .run(&["list-clients", "-F", CLIENT_FORMAT], cancel)
             .map_err(Failure::unknown)?;
-        let mut parsed: Vec<(String, String, i64)> = clients
-            .text
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.split('|');
-                let name = parts.next()?.to_string();
-                let attached = parts.next().unwrap_or_default().to_string();
-                let activity = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-                Some((name, attached, activity))
-            })
-            .collect();
-        if parsed.is_empty() {
-            return Err(Failure::NoClient);
+        let operators = operators(&clients.text).map_err(Failure::unknown)?;
+        match operators.as_slice() {
+            [] => Err(Failure::NoClient),
+            [only] => Ok(only.name.to_string()),
+            _ => Err(Failure::refused(
+                "more than one tmux client is attached; Radar supports one",
+            )),
         }
-        if let Some((name, _, _)) = parsed.iter().find(|(_, attached, _)| *attached == session) {
-            return Ok(name.clone());
-        }
-        parsed.sort_by_key(|(_, _, activity)| *activity);
-        parsed
-            .pop()
-            .map(|(name, _, _)| name)
-            .ok_or(Failure::NoClient)
     }
 
     /// Moves a pane's window into view and then makes the pane active in it.
@@ -748,7 +781,7 @@ impl TmuxRuntime {
     /// later command leaves the earlier ones applied, so either is `unknown`.
     fn focus_pane(&self, handle: &str, cancel: &AtomicBool) -> Result<(), Failure> {
         let pane = self.address(handle, Kind::Pane).map_err(Failure::refused)?;
-        let client = self.client_for(&pane, cancel)?;
+        let client = self.client_for(cancel)?;
         self.run(&["switch-client", "-c", &client, "-t", &pane], cancel)
             .map_err(|message| {
                 // Racing the last client's detach changes nothing: a definite
@@ -777,7 +810,7 @@ impl TmuxRuntime {
         let session = self
             .address(handle, Kind::Session)
             .map_err(Failure::refused)?;
-        let client = self.client_for(&session, cancel)?;
+        let client = self.client_for(cancel)?;
         self.run(&["switch-client", "-c", &client, "-t", &session], cancel)
             .map_err(|message| {
                 // With no client there is nothing to switch and nothing changed:
@@ -978,6 +1011,24 @@ impl TmuxRuntime {
         Ok(tabs)
     }
 
+    fn decode_focus(&self, text: &str) -> Result<Focus, String> {
+        let operators = operators(text)?;
+        Ok(match operators.as_slice() {
+            [] => Focus::NoOperator,
+            [only] => Focus::Focused {
+                location: Location {
+                    workspace_id: self.handle(only.session),
+                    tab_id: self.handle(only.window),
+                    pane_id: self.handle(only.pane),
+                },
+                zoomed: only.zoomed,
+            },
+            many => Focus::Ambiguous {
+                operators: many.len(),
+            },
+        })
+    }
+
     fn decode_panes(&self, text: &str) -> Result<Vec<Pane>, String> {
         let mut panes = Vec::new();
         for line in records(text) {
@@ -1062,6 +1113,41 @@ impl TmuxRuntime {
         }
         Ok(read.text)
     }
+}
+
+/// An operator's client: anything attached except Radar's own observer, the one
+/// client that asks tmux for no output.
+///
+/// The observer cannot be read-only: tmux resolves a command's target client to
+/// the best attached one, and a read-only client makes `send-keys` refuse.
+struct Operator<'a> {
+    name: &'a str,
+    session: &'a str,
+    window: &'a str,
+    pane: &'a str,
+    zoomed: bool,
+}
+
+fn operators(listing: &str) -> Result<Vec<Operator<'_>>, String> {
+    let mut found = Vec::new();
+    for line in records(listing) {
+        let [name, flags, session, window, pane, zoomed] =
+            split_record::<6>(line).ok_or_else(|| malformed("client list", line))?;
+        if flags.split(',').any(|flag| flag == "no-output") {
+            continue;
+        }
+        if !Kind::Session.names(session) || !Kind::Window.names(window) || !Kind::Pane.names(pane) {
+            return Err(malformed("client list", line));
+        }
+        found.push(Operator {
+            name,
+            session,
+            window,
+            pane,
+            zoomed: zoomed == "1",
+        });
+    }
+    Ok(found)
 }
 
 /// The arguments every tmux invocation carries: the server first, so no command
@@ -1599,6 +1685,63 @@ mod tests {
         let (text, dropped) = last_lines("one\ntwo\n", 5);
         assert_eq!(text, "one\ntwo\n");
         assert!(!dropped, "asking for more rows than exist drops none");
+    }
+
+    #[test]
+    fn only_a_server_reporting_3_8_or_newer_is_supported() {
+        for version in ["3.8", "3.8a", "3.10", "4.0", "next-3.9"] {
+            assert!(at_least_minimum(version), "{version}");
+        }
+        for version in ["3.7c", "3.5a", "2.9", "master", "", "3"] {
+            assert!(!at_least_minimum(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn focus_is_the_one_operators_view_and_the_observer_never_counts() {
+        let runtime = runtime("srv");
+        let focus = |listing: &str| runtime.decode_focus(listing).expect("decodes");
+        let operator = "c1\u{1f}attached\u{1f}$1\u{1f}@2\u{1f}%3\u{1f}1\n";
+        assert_eq!(
+            focus(operator),
+            Focus::Focused {
+                location: Location {
+                    workspace_id: runtime.handle("$1"),
+                    tab_id: runtime.handle("@2"),
+                    pane_id: runtime.handle("%3"),
+                },
+                zoomed: true,
+            }
+        );
+        assert_eq!(
+            focus(&format!(
+                "obs\u{1f}attached,control-mode,no-output\u{1f}$0\u{1f}@0\u{1f}%0\u{1f}0\n{operator}"
+            )),
+            focus(operator),
+            "the observer is not an operator"
+        );
+        assert_eq!(
+            focus("c1\u{1f}attached,control-mode\u{1f}$1\u{1f}@2\u{1f}%3\u{1f}0\n"),
+            focus("c1\u{1f}attached\u{1f}$1\u{1f}@2\u{1f}%3\u{1f}0\n"),
+            "an operator's own control-mode client is still an operator"
+        );
+        assert_eq!(focus(""), Focus::NoOperator);
+        assert_eq!(
+            focus("obs\u{1f}attached,control-mode,no-output\u{1f}$0\u{1f}@0\u{1f}%0\u{1f}0\n"),
+            Focus::NoOperator
+        );
+        assert_eq!(
+            focus(
+                "c1\u{1f}attached\u{1f}$1\u{1f}@2\u{1f}%3\u{1f}0\nc2\u{1f}attached\u{1f}$1\u{1f}@2\u{1f}%3\u{1f}0\n"
+            ),
+            Focus::Ambiguous { operators: 2 },
+            "no focus is chosen among several operators"
+        );
+        assert!(
+            runtime
+                .decode_focus("c1\u{1f}attached\u{1f}1\u{1f}@2\u{1f}%3\u{1f}0")
+                .is_err()
+        );
     }
 
     #[test]

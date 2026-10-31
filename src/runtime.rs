@@ -985,6 +985,18 @@ impl BackendIdentity {
     }
 }
 
+/// Asks the sampler to read now.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// A running source of change hints.
+pub trait ChangeSource: Send + Sync {
+    /// Why the source is not delivering hints, or `None` while it is.
+    fn lost(&self) -> Option<String>;
+
+    /// Waits for the source to end after its stop flag was set.
+    fn join(&mut self);
+}
+
 /// What Radar asks of one runtime: its facts, the one action on it, and the mux
 /// primitives a client asks for by name.
 pub trait RuntimeProvider: Send + Sync {
@@ -1008,6 +1020,13 @@ pub trait RuntimeProvider: Send + Sync {
     /// a process of its own answers none, and nothing that needs an instance
     /// identity may proceed on a guess.
     fn server_process(&self, _cancel: &AtomicBool) -> Option<i32> {
+        None
+    }
+
+    /// Starts a source of hints that this backend's state changed, calling
+    /// `wake` for each, until `stop` is set. A hint only brings the next read
+    /// forward; a backend without one is read on the timer alone.
+    fn observe(&self, _wake: Wake, _stop: Arc<AtomicBool>) -> Option<Box<dyn ChangeSource>> {
         None
     }
 
@@ -1158,6 +1177,10 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn server_process(&self, cancel: &AtomicBool) -> Option<i32> {
         (**self).server_process(cancel)
+    }
+
+    fn observe(&self, wake: Wake, stop: Arc<AtomicBool>) -> Option<Box<dyn ChangeSource>> {
+        (**self).observe(wake, stop)
     }
 
     fn install_exit_wake(
