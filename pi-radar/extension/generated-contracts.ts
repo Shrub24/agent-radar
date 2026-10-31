@@ -778,6 +778,33 @@ export type Kind = "workspace" | "tab" | "pane";
  */
 export type Provenance = "created" | "observed";
 /**
+ * Where the unified operator's tmux client is looking, read with the inventory
+ * so the two describe one moment.
+ *
+ * Only a read establishes it; a notification that focus moved never does. A
+ * failed read fails the inventory, so focus is never reported for a server that
+ * could not be read.
+ */
+export type Focus =
+  | {
+      state: "unreported";
+    }
+  | {
+      state: "no_operator";
+    }
+  | {
+      operators: number;
+      state: "ambiguous";
+    }
+  | {
+      location: Location;
+      state: "focused";
+      /**
+       * The focused pane's window is zoomed.
+       */
+      zoomed: boolean;
+    };
+/**
  * Source freshness included in an observation response.
  */
 export type ObservationFreshness =
@@ -823,6 +850,7 @@ export interface ObservationProjection {
     [k: string]: ForegroundEvidence;
   };
   inventory: FleetObservation | null;
+  observer?: ObserverHealth | null;
   /**
    * Source freshness included in an observation response.
    */
@@ -1645,6 +1673,7 @@ export interface FleetObservation {
    * container was read — not that none exists.
    */
   containers?: PublicContainer[];
+  focus?: Focus;
   /**
    * Public lifecycle records from the same daemon read as agent facts. The
    * tree suppresses subjects already represented by a joined agent row.
@@ -1749,6 +1778,11 @@ export interface Workspace {
    */
   session_path?: string | null;
   workspace_id: string;
+}
+export interface ObserverHealth {
+  attached: boolean;
+  last_notification_ms: number | null;
+  loss_reason: string | null;
 }
 /**
  * One source's freshness in a snapshot revision.

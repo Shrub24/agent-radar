@@ -23,9 +23,19 @@ Observer flags: `attach-session -f ignore-size,no-output` under `-C`. `read-only
 
 ## Covered by tests
 
-- `the_observer_wakes_on_native_changes_is_no_operator_and_ends_with_its_stop_flag`: a native `new-window` wakes the observer; focus is refused `NoClient` with only the observer attached; no control client remains after stop.
+- `the_observer_wakes_on_native_changes_is_no_operator_and_ends_with_its_stop_flag`: a native `new-window` wakes the observer and records a notification time; destroying its attached session makes the supervisor reattach to the surviving one; focus is refused `NoClient` with only the observer attached; no control client remains after stop.
 - `an_inventory_reports_the_one_operators_focus_and_refuses_to_choose_among_several`: `NoOperator`, one `Focused` (with zoom), then `Ambiguous` for two operators.
+- `only_a_server_reporting_3_8_or_newer_is_supported`: version-word parsing either side of the floor.
 - `a_requested_refresh_runs_now_instead_of_waiting_out_the_interval` (collector).
+
+## Observer health
+
+The observer reports attachment, the time of the last notification it accepted and
+why an attempt ended. The sampler publishes those with each observation revision and
+publishes again when they change, so a loss is visible without unrelated input; a
+lost observer leaves the timer as the only wake, never an inference that nothing
+changed. When the inventory read itself fails, the session withdraws its focus
+instead of presenting the last-good one as current.
 
 ## Measured against an attached operator
 
@@ -36,4 +46,4 @@ Observer flags: `attach-session -f ignore-size,no-output` under `-C`. `read-only
 ## Not yet verified
 
 - `detach-on-destroy` with only the observer attached.
-- The supervisor's reattach after session loss, end to end against the daemon.
+- A baseline-time transition becoming visible without unrelated input.

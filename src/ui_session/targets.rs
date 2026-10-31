@@ -92,6 +92,26 @@ pub(crate) fn focus(
     crate::focus::targets(tree, state).get(row).cloned()
 }
 
+/// The canonical row for the focused pane: its agent row when it has one, else
+/// its pane row. `None` when the tree holds neither.
+pub(crate) fn focused_row(
+    nav: &super::navigation::Navigation,
+    pane_id: &str,
+) -> Option<crate::tree::RowId> {
+    [
+        crate::tree::RowId::Agent(pane_id.to_string()),
+        crate::tree::RowId::Pane(pane_id.to_string()),
+    ]
+    .into_iter()
+    .find(|id| {
+        nav.node(id).is_some_and(|node| match &node.row.kind {
+            RowKind::Agent(agent) => !agent.history() && agent.retained.is_none(),
+            RowKind::Pane(_) => true,
+            _ => false,
+        })
+    })
+}
+
 /// What a row is, for a one-line message: `pane wA:p1`, `the tab wA:t1`.
 pub(crate) fn describe(row: &crate::tree::RowId) -> String {
     match row {

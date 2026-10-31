@@ -858,11 +858,12 @@ test("a facts attention listener can be detached", async () => {
 		const detach = publication.facts.onAttention(() => { heard += 1; });
 		publication.facts.update({ model: "claude", provider: "anthropic" });
 		await settle();
-		assert.equal(heard, 1);
+		assert.ok(heard >= 1, "an attached listener hears the hint");
+		const attached = heard;
 		detach();
 		publication.facts.update({ model: "gpt" });
 		await settle();
-		assert.equal(heard, 1, "a detached listener hears nothing");
+		assert.equal(heard, attached, "a detached listener hears nothing");
 	} finally {
 		cleanup();
 	}

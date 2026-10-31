@@ -37,6 +37,13 @@ mod option_duration_millis {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ObserverHealth {
+    pub attached: bool,
+    pub last_notification_ms: Option<u64>,
+    pub loss_reason: Option<String>,
+}
+
 /// Backend-scoped runtime location: workspace, tab and pane identifiers.
 ///
 /// Pane identity is a runtime location detail; it is never an agent identity.

@@ -157,6 +157,11 @@ nothing about being ready for an assignment.
 
 ## Tmux backend status
 
+The serving server must report tmux 3.8 or newer; the daemon refuses an older one
+with a message naming both versions, and the Home Manager module asserts the same
+floor at evaluation. Radar watches the server through one control-mode client with
+no pane output and no size, which is what the floor buys.
+
 The daemon serves a named, server-scoped tmux handle with normalized observation
 and mux operations, direct-argv spawn launch, durable child binding, and typed
 one-shot exit observation on spawn edges. The adapter's launch requires `remain-on-exit` before dispatch;

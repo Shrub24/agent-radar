@@ -919,7 +919,7 @@ fn the_observer_wakes_on_native_changes_is_no_operator_and_ends_with_its_stop_fl
     };
     let wakes = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let mut source = probe
+    let source = probe
         .runtime
         .observe(
             Arc::new({
@@ -932,15 +932,28 @@ fn the_observer_wakes_on_native_changes_is_no_operator_and_ends_with_its_stop_fl
         )
         .expect("the tmux adapter observes");
     assert!(
-        eventually(DEADLINE, || source.lost().is_none()),
+        eventually(DEADLINE, || source.health().attached),
         "the observer attaches to the server's session"
     );
 
     let seen = wakes.load(Ordering::SeqCst);
     probe.tmux(&["new-window", "-d", "-t", "main:"]);
     assert!(
-        eventually(DEADLINE, || wakes.load(Ordering::SeqCst) > seen),
+        eventually(DEADLINE, || source.health().last_notification_ms.is_some()
+            && wakes.load(Ordering::SeqCst) > seen),
         "a native change woke the sampler"
+    );
+
+    probe.tmux(&["new-session", "-d", "-s", "survivor"]);
+    probe.tmux(&["set-option", "-g", "detach-on-destroy", "on"]);
+    probe.tmux(&["kill-session", "-t", "main"]);
+    assert!(
+        eventually(DEADLINE, || source.health().attached
+            && probe
+                .tmux(&["list-clients", "-F", "#{client_session}"])
+                .trim()
+                == "survivor"),
+        "the supervisor reattaches after its session is destroyed"
     );
 
     let pane = probe.ids(&["list-panes", "-a", "-F", "#{pane_id}"])[0].clone();
@@ -968,10 +981,13 @@ fn an_observer_started_before_any_session_attaches_once_one_exists() {
     let name = format!("radar-test-{}-{}", std::process::id(), unique());
     let runtime = TmuxRuntime::new(TmuxConfig::for_server(name.clone())).expect("a usable name");
     let stop = Arc::new(AtomicBool::new(false));
-    let mut source = runtime
+    let source = runtime
         .observe(Arc::new(|| {}), Arc::clone(&stop))
         .expect("the tmux adapter observes");
-    assert!(source.lost().is_some(), "nothing to attach to yet");
+    assert!(
+        source.health().loss_reason.is_some(),
+        "nothing to attach to yet"
+    );
     let server = Command::new("tmux")
         .args(["-f", "/dev/null", "-L", &name])
         .env_remove("TMUX")
@@ -980,7 +996,7 @@ fn an_observer_started_before_any_session_attaches_once_one_exists() {
         .expect("start a server");
     assert!(server.success());
     assert!(
-        eventually(DEADLINE, || source.lost().is_none()),
+        eventually(DEADLINE, || source.health().attached),
         "it attached without having created a session"
     );
     stop.store(true, Ordering::SeqCst);

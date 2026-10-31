@@ -644,10 +644,7 @@ mod tests {
         let mut leases = HashMap::from([("a".to_owned(), Arc::downgrade(&lease))]);
         drop(lease);
         reap_attachment(&mut session, &mut leases, "a");
-        assert!(matches!(
-            session.act("a", 1, A::Move { delta: 1 }),
-            Out::Detached
-        ));
+        assert!(matches!(session.act("a", 1, A::CycleOrder), Out::Detached));
     }
 
     #[tokio::test]
@@ -665,7 +662,7 @@ mod tests {
         drop(lease);
         crate::testing::eventually("released attachment", || (!*alive.borrow()).then_some(()));
         let outcome = handle
-            .enqueue_action("duplex", 1, None, A::Move { delta: 1 })
+            .enqueue_action("duplex", 1, None, A::CycleOrder)
             .unwrap()
             .await
             .unwrap();
@@ -684,7 +681,7 @@ mod tests {
         let first = stream.prepare_frame(false).await.unwrap();
         assert_eq!(first.content.len(), 3);
         handle
-            .enqueue_action("duplex", 1, None, A::Move { delta: 1 })
+            .enqueue_action("duplex", 1, None, A::CycleOrder)
             .unwrap()
             .await
             .unwrap();
@@ -706,9 +703,7 @@ mod tests {
             .open_duplex("a", dto::AttachmentRole::Dashboard, None)
             .await
             .unwrap();
-        let answer = handle
-            .enqueue_action("a", 1, None, A::Move { delta: 1 })
-            .unwrap();
+        let answer = handle.enqueue_action("a", 1, None, A::CycleOrder).unwrap();
         assert!(matches!(answer.await.unwrap(), Out::Applied { .. }));
     }
 
@@ -726,7 +721,7 @@ mod tests {
             processes: Arc::new(AtomicBool::new(false)),
         };
         assert!(matches!(
-            handle.enqueue_action("a", 1, None, A::Move { delta: 1 }),
+            handle.enqueue_action("a", 1, None, A::CycleOrder),
             Err(UiError::Busy)
         ));
     }
@@ -747,7 +742,7 @@ mod tests {
         // Actions travel a different path from the publication and never wait on it.
         assert!(matches!(
             handle
-                .enqueue_action("a", 1, None, A::Move { delta: 1 })
+                .enqueue_action("a", 1, None, A::BeginFilterEdit)
                 .unwrap()
                 .await
                 .unwrap(),

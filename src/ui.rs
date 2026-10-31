@@ -125,21 +125,38 @@ pub fn render(
         );
     } else {
         let current = matches!(state.source_freshness(), SourceFreshness::Current);
+        let focused = app.focused_row();
         let items: Vec<ListItem> = rows
             .iter()
-            .map(|row| match row {
-                crate::ui_session::navigation::DrawRow::Known(row) => {
-                    if rail {
-                        rail_item(row, tick)
-                    } else {
-                        row_item(row, tick, tree_content.width as usize, current, compact)
+            .map(|row| {
+                let item = match row {
+                    crate::ui_session::navigation::DrawRow::Known(row) => {
+                        if rail {
+                            rail_item(row, tick)
+                        } else {
+                            row_item(
+                                row,
+                                tick,
+                                tree_content.width as usize,
+                                current,
+                                compact,
+                                focused.as_ref() == Some(row.id),
+                            )
+                        }
                     }
+                    crate::ui_session::navigation::DrawRow::Structure {
+                        row: wire,
+                        connectors,
+                        ..
+                    } => structure_item(wire, connectors, tree_content.width as usize, compact),
+                };
+                // Where the terminal is, apart from where this view's cursor is:
+                // the selection fill moves with browsing, this does not.
+                if focused.as_ref() == Some(row.id()) {
+                    item.style(Style::new().add_modifier(Modifier::UNDERLINED))
+                } else {
+                    item
                 }
-                crate::ui_session::navigation::DrawRow::Structure {
-                    row: wire,
-                    connectors,
-                    ..
-                } => structure_item(wire, connectors, tree_content.width as usize, compact),
             })
             .collect();
         list_state.select(app.selected_index());
@@ -978,6 +995,15 @@ fn tree_title(state: &ObservationState, app: &App) -> Line<'static> {
         Span::raw("Fleet "),
         Span::styled(format!("· {word}"), style),
     ];
+    if app.is_following() {
+        spans.push(Span::styled(" · following", Style::new().fg(palette.muted)));
+    }
+    if let Some(status) = app.focus_status() {
+        spans.push(Span::styled(
+            format!(" · {status}"),
+            Style::new().fg(palette.retained),
+        ));
+    }
     if !app.filter_query().is_empty() {
         spans.push(Span::styled(
             format!(" — filter: {}", sanitize(app.filter_query())),
@@ -1068,6 +1094,7 @@ fn row_item(
     width: usize,
     source_current: bool,
     compact: bool,
+    focused: bool,
 ) -> ListItem<'static> {
     let palette = theme::palette();
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1358,6 +1385,11 @@ fn row_item(
                 ));
             }
         }
+    }
+    // The focused row is marked at its end, so no row's columns move when focus
+    // does and text this panel draws for a row is unchanged by it.
+    if focused {
+        spans.push(Span::styled(" ◆", Style::new().fg(palette.heading)));
     }
     ListItem::new(Line::from(fit(spans, flex, width)))
 }

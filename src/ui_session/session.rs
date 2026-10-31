@@ -381,23 +381,15 @@ impl Session {
         let owns = self.editor.as_deref() == Some(id);
         let foreign = self.editor.is_some() && !owns;
         match action {
-            A::SelectRow { row } => {
-                if !self.nav.apply(&NavStep::Select(row_id(&row))) {
-                    return refuse(dto::RefusalCode::UnknownRow, "that row is not visible");
-                }
-            }
-            A::Move { delta } => self.step(NavStep::Move(delta)),
-            A::Collapse { row } => self.on_row(row, NavStep::Collapse)?,
-            A::Expand { row } => self.on_row(row, NavStep::Expand)?,
-            A::ToggleFold { row } => self.on_row(row, NavStep::ToggleFold)?,
+            A::Collapse { row } => self.step(NavStep::Collapse(row_id(&row))),
+            A::Expand { row } => self.step(NavStep::Expand(row_id(&row))),
+            A::ToggleFold { row } => self.step(NavStep::ToggleFold(row_id(&row))),
             A::ToggleBranch { row } => self.step(NavStep::ToggleBranch(row_id(&row))),
             A::CyclePaneView => self.step(NavStep::CyclePanes),
             A::CycleOrder => self.step(NavStep::CycleOrder),
             A::ToggleFinished => self.step(NavStep::ToggleFinished),
             A::ToggleTasks => self.step(NavStep::ToggleTasks),
             A::ShowEverything => self.step(NavStep::ShowEverything),
-            A::NextAttention { forward } => self.step(NavStep::JumpAttention(forward)),
-            A::NextWorking { forward } => self.step(NavStep::JumpWorking(forward)),
             A::BeginFilterEdit => {
                 if foreign {
                     return refuse(
@@ -488,9 +480,9 @@ impl Session {
                     self.interaction_notice = Some("no fleet inventory: nothing was sent".into());
                     return Ok(None);
                 };
-                let Some(node) = row
-                    .as_ref()
-                    .and_then(|id| self.nav.node(&super::session::row_id(id)))
+                let Some(node) = self
+                    .target_row(row)
+                    .and_then(|id| self.nav.node(&row_id(&id)))
                 else {
                     self.interaction_notice = Some("that row is gone; nothing was changed".into());
                     self.project();
@@ -529,14 +521,17 @@ impl Session {
     ) -> Result<Option<String>, (dto::RefusalCode, String)> {
         let Some(state) = self.state.as_ref() else {
             self.interaction_notice = Some("no fleet inventory: nothing was sent".into());
+            self.project();
             return Ok(None);
         };
-        let Some(captured) = row else {
-            self.interaction_notice = Some("nothing selected: no action target".into());
+        let Some(captured) = self.target_row(row) else {
+            self.interaction_notice = Some("no row and no observed focus: no action target".into());
+            self.project();
             return Ok(None);
         };
         let Some(node) = self.nav.node(&super::session::row_id(&captured)) else {
             self.interaction_notice = Some("that row is gone; nothing was changed".into());
+            self.project();
             return Ok(None);
         };
         if command == dto::SharedCommand::Focus {
@@ -546,6 +541,7 @@ impl Session {
                     "{} is not observed: nothing to focus",
                     super::targets::describe(&row_id)
                 ));
+                self.project();
                 return Ok(None);
             };
             // No question: moving a terminal takes nothing away. The session owns
@@ -627,21 +623,38 @@ impl Session {
         self.nav.apply(&step);
     }
 
-    fn on_row(
-        &mut self,
-        row: Option<dto::UiRowId>,
-        step: NavStep,
-    ) -> Result<(), (dto::RefusalCode, String)> {
-        if let Some(row) = row
-            && !self.nav.apply(&NavStep::Select(row_id(&row)))
-        {
-            return Err((
-                dto::RefusalCode::UnknownRow,
-                "that row is not visible".into(),
-            ));
+    /// The row a command acts on: the one its view named, or, when it named
+    /// none, the observed focus. A named row that is gone is never replaced by
+    /// the focus: it is looked up, and refused, where the command is frozen.
+    fn target_row(&self, row: Option<dto::UiRowId>) -> Option<dto::UiRowId> {
+        row.or_else(|| match self.focus() {
+            dto::FocusDto::Focused { row } => row,
+            _ => None,
+        })
+    }
+
+    /// Where the operator's terminal is, as the observation the session holds
+    /// places it. A focused pane the tree has no row for is still focus.
+    fn focus(&self) -> dto::FocusDto {
+        use crate::model::Focus;
+        let Some(inventory) = self.state.as_ref().and_then(ObservationState::inventory) else {
+            return dto::FocusDto::Unreported;
+        };
+        if !matches!(
+            self.state.as_ref().map(ObservationState::source_freshness),
+            Some(crate::observation::SourceFreshness::Current)
+        ) {
+            return dto::FocusDto::Unavailable;
         }
-        self.nav.apply(&step);
-        Ok(())
+        match &inventory.focus {
+            Focus::Unreported => dto::FocusDto::Unreported,
+            Focus::NoOperator => dto::FocusDto::NoOperator,
+            Focus::Ambiguous { .. } => dto::FocusDto::Ambiguous,
+            Focus::Focused { location, .. } => dto::FocusDto::Focused {
+                row: super::targets::focused_row(&self.nav, &location.pane_id)
+                    .map(|id| ui_row_id(&id)),
+            },
+        }
     }
 
     /// Rebuilds the published projection from the model. Content that did not
@@ -649,7 +662,7 @@ impl Session {
     fn project(&mut self) -> bool {
         let nav = self.nav.state();
         let state = dto::SessionState {
-            selected: nav.selected.as_ref().map(ui_row_id),
+            focus: self.focus(),
             order: match nav.order {
                 RowOrder::Source => dto::RowOrderDto::Source,
                 RowOrder::State => dto::RowOrderDto::State,
@@ -814,7 +827,6 @@ pub fn row_id(id: &dto::UiRowId) -> RowId {
 /// The navigation state a published [`dto::SessionState`] describes.
 pub fn nav_state(state: &dto::SessionState) -> NavState {
     NavState {
-        selected: state.selected.as_ref().map(row_id),
         order: match state.order {
             dto::RowOrderDto::Source => RowOrder::Source,
             dto::RowOrderDto::State => RowOrder::State,
@@ -840,19 +852,15 @@ pub fn nav_state(state: &dto::SessionState) -> NavState {
 pub fn action_of(step: &NavStep) -> dto::UiAction {
     use dto::UiAction as A;
     match step {
-        NavStep::Select(id) => A::SelectRow { row: ui_row_id(id) },
-        NavStep::Move(delta) => A::Move { delta: *delta },
-        NavStep::Collapse => A::Collapse { row: None },
-        NavStep::Expand => A::Expand { row: None },
-        NavStep::ToggleFold => A::ToggleFold { row: None },
+        NavStep::Collapse(id) => A::Collapse { row: ui_row_id(id) },
+        NavStep::Expand(id) => A::Expand { row: ui_row_id(id) },
+        NavStep::ToggleFold(id) => A::ToggleFold { row: ui_row_id(id) },
         NavStep::ToggleBranch(id) => A::ToggleBranch { row: ui_row_id(id) },
         NavStep::CyclePanes => A::CyclePaneView,
         NavStep::CycleOrder => A::CycleOrder,
         NavStep::ToggleFinished => A::ToggleFinished,
         NavStep::ToggleTasks => A::ToggleTasks,
         NavStep::ShowEverything => A::ShowEverything,
-        NavStep::JumpAttention(forward) => A::NextAttention { forward: *forward },
-        NavStep::JumpWorking(forward) => A::NextWorking { forward: *forward },
         NavStep::SetFilter(query) => A::SetFilterQuery {
             query: query.clone(),
         },
@@ -877,11 +885,11 @@ mod tests {
     }
 
     #[test]
-    fn selection_moves_without_republishing_the_tree() {
+    fn an_editor_change_republishes_only_the_session_lane() {
         let mut session = seeded();
         let before = session.current().clone();
         assert!(matches!(
-            session.act("a", 1, A::Move { delta: 1 }),
+            session.act("a", 1, A::BeginFilterEdit),
             Out::Applied { .. }
         ));
         let after = session.current();
@@ -916,7 +924,7 @@ mod tests {
         let failed_id = session.current().update_id;
         assert!(!session.observe(&state, Some(&huge)));
         assert_eq!(session.current().update_id, failed_id);
-        session.act("a", 1, A::Move { delta: 1 });
+        session.act("a", 1, A::CycleOrder);
         assert_eq!(
             session.current().diagnostic.as_ref(),
             Some(&dto::PublicationFailure::ContentTooLarge)
@@ -967,10 +975,6 @@ mod tests {
             .unwrap()
             .read()
             .unwrap();
-        assert!(
-            rows.iter()
-                .any(|row| Some(&row.id) == session.selected.as_ref())
-        );
         assert_eq!(session.gate, frame.head.gate);
     }
 
@@ -1114,14 +1118,6 @@ mod tests {
             .collect();
         let (shown, other) = (panes[0].clone(), panes[1].clone());
         let mut id = 2;
-        // The shared selection is elsewhere when the command is ordered: the row
-        // the invoking view displayed is what it acts on, never this one.
-        session.act("a", id, A::SelectRow { row: other.clone() });
-        assert_eq!(
-            session.current().state.selected.clone(),
-            Some(other.clone())
-        );
-        id += 1;
         let out = session.act(
             "a",
             id,
@@ -1141,9 +1137,9 @@ mod tests {
         let blocking = session.current().state.blocking.clone().expect("blocking");
         assert_eq!(blocking.kind, dto::InteractionKind::Confirm);
         assert_eq!(blocking.stage, dto::InteractionStage::AwaitingResult);
-        // The gate holds the session, so the other view cannot move the selection.
+        // The gate holds the session, so the other view cannot change what the screens agree on.
         assert!(matches!(
-            session.act("b", 1, A::Move { delta: 1 }),
+            session.act("b", 1, A::CycleOrder),
             Out::Refused {
                 code: RefusalCode::Blocked,
                 ..
@@ -1211,6 +1207,90 @@ mod tests {
                 .as_deref()
                 .is_some_and(|notice| notice.contains("row is gone"))
         );
+    }
+
+    /// A session whose observation places the one operator on `pane_id`.
+    fn focused_on(pane_id: &str) -> Session {
+        let mut fleet = crate::model::testing::fleet();
+        let pane = fleet.pane(pane_id).expect("a pane of the fixture").clone();
+        fleet.focus = crate::model::Focus::Focused {
+            location: pane.location,
+            zoomed: false,
+        };
+        let mut state = ObservationState::new();
+        state.apply_success(fleet);
+        let mut session = Session::new();
+        session.observe(&state, None);
+        session.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        session.act("a", 1, A::ShowEverything);
+        session
+    }
+
+    fn a_pane_id(session: &Session) -> String {
+        session
+            .state
+            .as_ref()
+            .and_then(ObservationState::inventory)
+            .and_then(|inventory| inventory.panes.first())
+            .map(|pane| pane.location.pane_id.clone())
+            .expect("the fixture has a pane")
+    }
+
+    #[test]
+    fn the_focus_the_session_publishes_is_the_one_the_observation_reports() {
+        let pane = a_pane_id(&seeded());
+        let session = focused_on(&pane);
+        let dto::FocusDto::Focused { row: Some(row) } = &session.current().state.focus else {
+            panic!("{:?}", session.current().state.focus);
+        };
+        assert!(
+            matches!(row, dto::UiRowId::Agent { pane_id } | dto::UiRowId::Pane { pane_id } if *pane_id == pane),
+            "{row:?}"
+        );
+        assert_eq!(seeded().current().state.focus, dto::FocusDto::Unreported);
+    }
+
+    #[test]
+    fn a_command_without_a_row_acts_on_the_focus_and_a_missing_row_never_falls_back_to_it() {
+        let pane = a_pane_id(&seeded());
+        let mut session = focused_on(&pane);
+        let focus = |row| A::RunCommand {
+            command: dto::SharedCommand::Focus,
+            row,
+        };
+        session.act("a", 2, focus(None));
+        let jobs = session.take_completions();
+        assert_eq!(jobs.len(), 1, "an omitted row resolved to the focus");
+
+        session.act(
+            "a",
+            3,
+            focus(Some(dto::UiRowId::Pane {
+                pane_id: "missing".into(),
+            })),
+        );
+        assert!(
+            session.take_completions().is_empty(),
+            "a row that is gone is refused, not replaced by the focused one"
+        );
+        assert!(
+            session
+                .current()
+                .state
+                .interaction_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("row is gone"))
+        );
+    }
+
+    #[test]
+    fn a_stale_inventory_withdraws_the_focus_it_carries() {
+        let pane = a_pane_id(&seeded());
+        let mut session = focused_on(&pane);
+        let mut state = session.state.clone().unwrap();
+        state.apply_failure("tmux is gone");
+        session.observe(&state, None);
+        assert_eq!(session.current().state.focus, dto::FocusDto::Unavailable);
     }
 
     #[test]
@@ -1336,29 +1416,6 @@ mod tests {
     }
 
     #[test]
-    fn a_row_that_is_not_visible_is_refused_not_substituted() {
-        let mut session = seeded();
-        let selected = session.current().state.selected.clone();
-        let out = session.act(
-            "a",
-            1,
-            A::SelectRow {
-                row: dto::UiRowId::Pane {
-                    pane_id: "nope".into(),
-                },
-            },
-        );
-        assert!(matches!(
-            out,
-            Out::Refused {
-                code: RefusalCode::UnknownRow,
-                ..
-            }
-        ));
-        assert_eq!(session.current().state.selected, selected);
-    }
-
-    #[test]
     fn the_shared_filter_is_fuzzy_and_keeps_the_ancestry_of_matches() {
         let mut session = seeded();
         let labels = |session: &Session| -> Vec<String> {
@@ -1431,8 +1488,7 @@ mod tests {
         let mut moves = Vec::new();
         for number in 1..=300u64 {
             let started = Instant::now();
-            let delta = if number % 2 == 0 { 1 } else { -1 };
-            session.act("a", number, A::Move { delta });
+            session.act("a", number, A::CycleOrder);
             moves.push(started.elapsed());
         }
         let mut filters = Vec::new();

@@ -139,7 +139,7 @@ pub struct Hub {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
     /// The backend's change hints, if it has any.
-    changes: Option<Box<dyn ChangeSource>>,
+    changes: Option<Arc<dyn ChangeSource>>,
 }
 
 struct Shared {
@@ -204,23 +204,30 @@ impl Hub {
             stopping: Arc::clone(stopping),
             stopped: std::sync::atomic::AtomicBool::new(false),
         });
-        let changes = {
+        let changes: Option<Arc<dyn ChangeSource>> = {
             let hinted = Arc::clone(&shared);
             let stop = Arc::clone(&shared.stop_observer);
-            provider.observe(
-                Arc::new(move || {
-                    hinted.hinted.store(true, Ordering::SeqCst);
-                    hinted.changed.notify_all();
-                }),
-                stop,
-            )
+            provider
+                .observe(
+                    Arc::new(move || {
+                        hinted.hinted.store(true, Ordering::SeqCst);
+                        hinted.changed.notify_all();
+                    }),
+                    stop,
+                )
+                .map(Arc::from)
         };
         let worker = {
             let shared = Arc::clone(&shared);
             let provider = Arc::clone(&provider);
+            let changes = changes.clone();
             thread::Builder::new()
                 .name("radar-observation".to_string())
-                .spawn(move || sample_loop(shared, provider, registry, tasks, task_error, store))
+                .spawn(move || {
+                    sample_loop(
+                        shared, provider, registry, tasks, task_error, store, changes,
+                    )
+                })
                 .ok()
         };
         Self {
@@ -327,6 +334,7 @@ fn sample_loop(
     tasks: Option<Arc<TaskIngest>>,
     task_error: Option<String>,
     store: Store,
+    changes: Option<Arc<dyn ChangeSource>>,
 ) {
     // The daemon's own registry, read in process with the fleet this refresh
     // collected. Nothing here verifies a claimed process: a registration's claim
@@ -358,7 +366,10 @@ fn sample_loop(
             // and applied, so its worker never outlives the demand that asked.
             collector.drain(&mut state)
         };
-        if applied {
+        let health = changes.as_ref().map(|changes| changes.health());
+        let health_changed = state.observer != health;
+        state.observer = health;
+        if applied || health_changed {
             last_pass = Some(Instant::now());
             last_generation = generation;
             let (task_value, task_state) = tasks_snapshot(&tasks, &task_error);

@@ -29,7 +29,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
 
 use self::commands::CommandId;
 use crate::control_plane::public_contracts::ui_session::SharedCommand;
-use crate::control_plane::public_contracts::ui_session::UiAction;
+use crate::control_plane::public_contracts::ui_session::{FocusDto, UiAction};
 use crate::observation::{ObservationState, SourceFreshness};
 use crate::picker::{Picker, Step};
 use crate::tasks::{Task, TaskBoard, TaskEvent};
@@ -448,6 +448,13 @@ pub struct App {
     /// Drawn as `radar sidebar`: compressed rows while the split is narrow, and
     /// the whole dashboard once the host has zoomed it.
     sidebar: bool,
+    /// Selection copies the terminal's focus whenever focus changes. The sidebar
+    /// starts following; the dashboard browses on its own. Following never asks
+    /// tmux to move: it only reads what tmux reports.
+    following: bool,
+    /// The focused row this view last followed, so only a change of focus moves
+    /// the selection and browsing is never undone by an unrelated publication.
+    followed: Option<RowId>,
     /// The sidebar has been expanded into the whole dashboard. An explicit mode,
     /// not a width: the toggle asks the host to give it the window, and the host
     /// cannot take the mode back by resizing.
@@ -599,6 +606,7 @@ impl App {
     pub fn sidebar() -> Self {
         Self {
             sidebar: true,
+            following: true,
             ..Self::default()
         }
     }
@@ -620,7 +628,7 @@ impl App {
     /// Selects `id` exactly, or nothing: a row that is gone is not replaced by a
     /// neighbour, because the action it was chosen for must not land elsewhere.
     pub fn select_exact(&mut self, id: &RowId) -> bool {
-        self.step(NavStep::Select(id.clone()))
+        self.browse(|nav| nav.select_exact(id)).unwrap_or(false)
     }
 
     /// Records the width this draw was given, so the sidebar's layout can follow
@@ -660,7 +668,6 @@ impl App {
         let mut tree = FleetTree::build(state);
         tree.attach_tasks(&self.bus);
         self.navigate(|nav| nav.replace_tree(tree));
-        self.readopt_session_state();
         self.source_current = matches!(state.source_freshness(), SourceFreshness::Current);
         self.prune_disclosures();
         self.reconcile_process();
@@ -713,7 +720,7 @@ impl App {
     fn select(&mut self, id: Option<RowId>) {
         match id {
             Some(id) => {
-                self.step(NavStep::Select(id));
+                self.select_exact(&id);
             }
             None => self.navigate(|nav| nav.select(None)),
         }
@@ -722,18 +729,31 @@ impl App {
     /// Makes one shared navigation step here at once and asks the session to
     /// make it too. The session's answer arrives as the next published state and
     /// replaces this view's copy, so both run [`Navigation::apply`] and agree.
-    /// Returns whether a selection step found its row.
-    fn step(&mut self, step: NavStep) -> bool {
+    fn step(&mut self, step: NavStep) {
         if self.shared_blocking() {
-            return false;
+            return;
         }
-        let found = self.navigate(|nav| nav.apply(&step));
-        // A step that found nothing changed nothing, and is not worth ordering.
-        if found && let Some(link) = &self.session {
+        self.navigate(|nav| nav.apply(&step));
+        if let Some(link) = &self.session {
             link.client
                 .submit(crate::ui_session::session::action_of(&step));
         }
-        found
+    }
+
+    /// Moves this view's own selection. Selection is never shared, so nothing is
+    /// sent; while a shared interaction blocks the screen it does not move.
+    fn browse<R>(&mut self, step: impl FnOnce(&mut Navigation) -> R) -> Option<R> {
+        if self.shared_blocking() {
+            return None;
+        }
+        Some(self.navigate(step))
+    }
+
+    /// The selected row, when there is one, as a fold step names it.
+    fn fold(&mut self, step: fn(RowId) -> NavStep) {
+        if let Some(id) = self.nav.selected_id().cloned() {
+            self.step(step(id));
+        }
     }
 
     /// Submits a command whose target and question belong to the shared session.
@@ -747,38 +767,25 @@ impl App {
         let shared = self.command_row()?;
         self.submit_session(UiAction::RunCommand {
             command,
-            row: shared,
+            row: Some(shared),
         });
         None
     }
 
+    /// The row a row-dependent command acts on: the one selected here. A view
+    /// with nothing selected says so instead of letting the command fall back to
+    /// the terminal's focus.
     pub fn command_row(
         &mut self,
-    ) -> Option<Option<crate::control_plane::public_contracts::ui_session::UiRowId>> {
-        match Self::shared_row(&self.nav, self.mirror_ref().map(|mirror| &**mirror)) {
-            Ok(row) => Some(row),
-            Err(refusal) => {
-                self.set_focus_message(Some(refusal.into()));
-                None
-            }
+    ) -> Option<crate::control_plane::public_contracts::ui_session::UiRowId> {
+        let row = self
+            .nav
+            .selected_id()
+            .map(crate::ui_session::session::ui_row_id);
+        if row.is_none() {
+            self.set_focus_message(Some("nothing is selected".into()));
         }
-    }
-
-    fn shared_row(
-        nav: &crate::ui_session::navigation::Navigation,
-        mirror: Option<&crate::ui_session::client::Mirror>,
-    ) -> Result<Option<crate::control_plane::public_contracts::ui_session::UiRowId>, &'static str>
-    {
-        if mirror
-            .and_then(|mirror| mirror.state.selected.as_ref())
-            .is_some_and(|shared| {
-                nav.node(&crate::ui_session::session::row_id(shared))
-                    .is_none()
-            })
-        {
-            return Err("that row is selected in the session but not described by this view yet");
-        }
-        Ok(nav.selected_id().map(crate::ui_session::session::ui_row_id))
+        row
     }
 
     pub async fn shutdown_session(&mut self) {
@@ -827,6 +834,10 @@ impl App {
             .mirror
             .as_ref()
             .is_none_or(|last| last.state.operation != mirror.state.operation);
+        let new_attachment = link
+            .mirror
+            .as_ref()
+            .is_none_or(|last| last.attachment_id != mirror.attachment_id);
         let state = crate::ui_session::session::nav_state(&mirror.state);
         link.mirror = Some(std::sync::Arc::clone(&mirror));
         if gate_changed {
@@ -881,6 +892,10 @@ impl App {
         }
         let before = self.nav.selected_id().cloned();
         self.nav.adopt(state);
+        if new_attachment {
+            self.followed = None;
+        }
+        self.follow_focus();
         self.reset_reading_if_moved(before);
         if changed_notice && let Some(note) = &mirror.state.interaction_notice {
             self.set_focus_message(Some(note.clone()));
@@ -921,20 +936,66 @@ impl App {
         self.session.as_ref().is_some_and(|link| link.client.idle())
     }
 
-    /// Re-takes the last adopted state after the local tree changed, so a
-    /// selection the session named before this view had that row is restored
-    /// once the row exists. Only when nothing of this view's own is in flight.
-    fn readopt_session_state(&mut self) {
-        let Some(link) = &self.session else {
+    /// The row the terminal is focused on, when the session places it in the
+    /// tree.
+    pub fn focused_row(&self) -> Option<RowId> {
+        if !self.session.as_ref()?.connected {
+            return None;
+        }
+        match &self.mirror_ref()?.state.focus {
+            FocusDto::Focused { row: Some(row) } => Some(crate::ui_session::session::row_id(row)),
+            _ => None,
+        }
+    }
+
+    /// Selects the focused row when focus has changed since this view last
+    /// followed it. A focus the listing cannot show yet is tried again on the
+    /// next publication, and is followed once.
+    fn follow_focus(&mut self) {
+        let focus = self.focused_row();
+        self.follow(focus);
+    }
+
+    fn follow(&mut self, focus: Option<RowId>) {
+        if !self.following {
             return;
-        };
-        if link.client.idle()
-            && let Some(mirror) = &link.mirror
-        {
-            let before = self.nav.selected_id().cloned();
-            self.nav
-                .adopt(crate::ui_session::session::nav_state(&mirror.state));
-            self.reset_reading_if_moved(before);
+        }
+        if focus == self.followed {
+            return;
+        }
+        if focus.as_ref().is_none_or(|row| self.select_exact(row)) {
+            self.followed = focus;
+        }
+    }
+
+    /// `o`: follows the terminal's focus, or goes back to browsing alone.
+    pub fn toggle_following(&mut self) {
+        self.following = !self.following;
+        self.followed = None;
+        self.follow_focus();
+    }
+
+    pub fn is_following(&self) -> bool {
+        self.following
+    }
+
+    pub fn focus_status(&self) -> Option<&'static str> {
+        let link = self.session.as_ref()?;
+        if !link.connected {
+            return Some("focus unavailable");
+        }
+        match &self.mirror_ref()?.state.focus {
+            FocusDto::Focused { .. } => {
+                let focused = self.focused_row();
+                (!self
+                    .draw_rows()
+                    .iter()
+                    .any(|row| Some(row.id()) == focused.as_ref()))
+                .then_some("focus outside listing")
+            }
+            FocusDto::NoOperator => Some("no operator"),
+            FocusDto::Ambiguous => Some("multiple operators"),
+            FocusDto::Unreported | FocusDto::Unavailable => Some("focus unavailable"),
         }
     }
 
@@ -1492,17 +1553,18 @@ impl App {
             }
             CommandId::Filter => self.begin_filter_edit(),
             CommandId::NextAttention => {
-                self.step(NavStep::JumpAttention(true));
+                self.browse(|nav| nav.jump_attention(true));
             }
             CommandId::PreviousAttention => {
-                self.step(NavStep::JumpAttention(false));
+                self.browse(|nav| nav.jump_attention(false));
             }
             CommandId::NextWorking => {
-                self.step(NavStep::JumpWorking(true));
+                self.browse(|nav| nav.jump_working(true));
             }
             CommandId::PreviousWorking => {
-                self.step(NavStep::JumpWorking(false));
+                self.browse(|nav| nav.jump_working(false));
             }
+            CommandId::FollowFocus => self.toggle_following(),
             CommandId::Fold => self.toggle_fold(),
             CommandId::Collapse => self.collapse_selected(),
             CommandId::Expand => self.expand_selected(),
@@ -1692,26 +1754,26 @@ impl App {
 
     /// Moves the selection by `delta` visible rows, clamped to the view.
     pub fn move_selection(&mut self, delta: i32) {
-        self.step(NavStep::Move(delta));
+        self.browse(|nav| nav.move_selection(delta));
     }
 
     /// Folds the selected branch when it is open and unfolds it when it is
     /// closed: one key for the whole gesture, whichever way the branch points.
     pub fn toggle_fold(&mut self) {
-        self.step(NavStep::ToggleFold);
+        self.fold(NavStep::ToggleFold);
     }
 
     /// Folds the selected branch. No-op on a row without visible children, and
     /// while a filter is active: the filtered view keeps matching ancestors
     /// visible by design, so a fold could not take effect.
     pub fn collapse_selected(&mut self) {
-        self.step(NavStep::Collapse);
+        self.fold(NavStep::Collapse);
     }
 
     /// Unfolds the selected branch. No-op when it is already unfolded, and while
     /// a filter is active, like [`Self::collapse_selected`].
     pub fn expand_selected(&mut self) {
-        self.step(NavStep::Expand);
+        self.fold(NavStep::Expand);
     }
 
     /// Moves to the next pane view: agents, then what is running, then every
@@ -2540,67 +2602,88 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_refused_rather_than_retargeted_when_the_shared_selection_is_unexplained() {
-        use crate::control_plane::public_contracts::ui_session as dto;
-        use crate::ui_session::client::Mirror;
-
-        let app = app_with_fixture();
-        let local = app.nav.selected_id().cloned().expect("a selection");
-        let agreed = Mirror {
-            observation: std::sync::Arc::new(crate::ui_session::publication::Observation::default()),
-            diagnostic: None,
-            attachment_id: "a".into(),
-            update_id: 1,
-            state: dto::SessionState {
-                selected: Some(crate::ui_session::session::ui_row_id(&local)),
-                ..dto::SessionState::default()
-            },
-            rows: std::sync::Arc::new(Vec::new()),
-        };
-        assert_eq!(
-            App::shared_row(&app.nav, Some(&agreed)),
-            Ok(Some(crate::ui_session::session::ui_row_id(&local))),
-            "the session and this view agree, so the command names that row"
-        );
-
-        let other = app
+    fn following_selects_a_changed_focus_once_and_never_snaps_browsing_back() {
+        let mut app = app_with_fixture();
+        app.following = true;
+        let rows: Vec<RowId> = app
             .visible_rows()
             .iter()
-            .find(|row| *row.id != local)
-            .expect("another row")
-            .id
-            .clone();
-        let mut previous = agreed.clone();
-        previous.state.selected = Some(crate::ui_session::session::ui_row_id(&other));
+            .map(|row| row.id.clone())
+            .collect();
+        let (focused, browsed) = (rows[1].clone(), rows[2].clone());
+
+        app.follow(Some(focused.clone()));
         assert_eq!(
-            App::shared_row(&app.nav, Some(&previous)),
-            Ok(Some(crate::ui_session::session::ui_row_id(&local))),
-            "a known older selection must not override the displayed optimistic row"
+            app.selected_id(),
+            Some(focused.clone()),
+            "focus moved the selection"
         );
 
-        // The session selects a row this view's observation cannot describe.
-        let elsewhere = Mirror {
-            observation: std::sync::Arc::new(crate::ui_session::publication::Observation::default()),
-            diagnostic: None,
-            attachment_id: "a".into(),
-            update_id: 2,
-            state: dto::SessionState {
-                selected: Some(dto::UiRowId::Pane {
-                    pane_id: "elsewhere:p1".into(),
-                }),
-                ..dto::SessionState::default()
-            },
-            rows: std::sync::Arc::new(Vec::new()),
-        };
+        app.select_exact(&browsed);
+        app.follow(Some(focused));
         assert_eq!(
-            App::shared_row(&app.nav, Some(&elsewhere)),
-            Err("that row is selected in the session but not described by this view yet"),
-            "nothing acts on the stale local row"
+            app.selected_id(),
+            Some(browsed),
+            "an unchanged focus leaves the operator where they browsed"
         );
+
+        app.following = false;
+        app.followed = None;
+        app.follow(Some(rows[0].clone()));
+        assert_ne!(
+            app.selected_id(),
+            Some(rows[0].clone()),
+            "a view that is not following keeps its own selection"
+        );
+    }
+
+    #[test]
+    fn a_focus_the_listing_cannot_show_yet_is_followed_once_it_can() {
+        let (state, mut app) = fixture();
+        app.following = true;
+        let focused = app.visible_rows()[1].id.clone();
+        app.nav.replace_tree(crate::tree::FleetTree::default());
+        app.follow(Some(focused.clone()));
+        assert_eq!(app.followed, None, "not representable yet");
+
+        app.refresh(&state);
+        app.follow(Some(focused.clone()));
+        assert_eq!(app.selected_id(), Some(focused.clone()));
+        app.move_selection(1);
+        let browsed = app.selected_id();
+        app.follow(Some(focused));
         assert_eq!(
-            App::shared_row(&app.nav, None),
-            Ok(Some(crate::ui_session::session::ui_row_id(&local))),
-            "a view with no session names its own row"
+            app.selected_id(),
+            browsed,
+            "completed follow is not repeated"
+        );
+    }
+
+    #[test]
+    fn shared_view_updates_preserve_independent_selection_and_immediate_command_targets() {
+        let mut dashboard = app_with_fixture();
+        let mut sidebar = app_with_fixture();
+        let original = sidebar.selected_id();
+        dashboard.move_selection(1);
+        let selected = dashboard.selected_id().expect("selected row");
+        assert_ne!(Some(selected.clone()), original);
+        assert_eq!(
+            dashboard.command_row(),
+            Some(crate::ui_session::session::ui_row_id(&selected))
+        );
+
+        let shared = dashboard.nav.state();
+        sidebar.nav.adopt(shared);
+        assert_eq!(
+            sidebar.selected_id(),
+            original,
+            "adoption does not copy another view's selection"
+        );
+        dashboard.nav.adopt(sidebar.nav.state());
+        assert_eq!(
+            dashboard.selected_id(),
+            Some(selected),
+            "shared updates preserve browsing"
         );
     }
 

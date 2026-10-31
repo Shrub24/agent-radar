@@ -200,11 +200,12 @@ preserving durable subjects and handoffs.
 
 | Key | Action |
 | --- | --- |
-| `j` / `↓`, `k` / `↑` | Select the next / previous visible row |
+| `j` / `↓`, `k` / `↑` | Select the next / previous visible row. Selection is this view's own: moving it sends nothing and never moves tmux |
 | `space` or `←` / `→` | Fold or unfold the selected branch |
 | `/` | Enter a case-insensitive filter; Backspace edits |
-| `Enter` | Ask the session to focus the selected row's pane (or workspace); the daemon moves the client attached to it, and with none attached the dashboard opens a terminal for that place and asks again; while entering filter text, keeps the filter instead |
+| `Enter` | Ask the session to focus the selected row's pane (or workspace); the daemon moves the client attached to it, and with none attached the dashboard opens a terminal for that place and asks again; while entering filter text, keeps the filter instead. The row selected here is the target, whatever another view has selected, and a row that has since gone is refused rather than replaced by the focused one |
 | `Escape` | Clear the filter and leave text entry |
+| `o` | Follow the terminal's focus: the sidebar starts on, the dashboard off. While following, a changed focus selects its row once; browsing is not undone, and following never asks tmux to move. `◆` marks the focused row in every view, apart from the selection |
 | `p` | Cycle the pane view: agents → running → all |
 | `s` | Cycle the order: source → state → name |
 | `n` / `N` | Select the next / previous row that needs attention (blocked, lost, waiting, unknown) |

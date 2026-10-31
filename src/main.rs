@@ -922,7 +922,7 @@ fn perform(
             if let Some(row) = app.command_row() {
                 app.submit_session(
                     agent_radar::control_plane::public_contracts::ui_session::UiAction::PrepareLaunch {
-                        row,
+                        row: Some(row),
                         spec,
                     },
                 );

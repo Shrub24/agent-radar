@@ -43,20 +43,12 @@ const HINTS: &[&str] = &[
     "%sessions-changed",
 ];
 
-/// Whether the observer is currently attached.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Health {
-    /// Not attached; `reason` is why the last attempt ended.
-    Lost {
-        reason: String,
-    },
-    Attached,
-}
+use crate::model::ObserverHealth;
 
 /// The running observer.
 pub struct Observer {
-    health: Arc<Mutex<Health>>,
-    worker: Option<JoinHandle<()>>,
+    health: Arc<Mutex<ObserverHealth>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Observer {
@@ -64,8 +56,9 @@ impl Observer {
     /// is set. Each attach and each loss wakes the sampler once, so a change
     /// around either is read rather than lost.
     pub fn start(config: TmuxConfig, wake: Wake, stop: Arc<AtomicBool>) -> Self {
-        let health = Arc::new(Mutex::new(Health::Lost {
-            reason: "not attached yet".into(),
+        let health = Arc::new(Mutex::new(ObserverHealth {
+            loss_reason: Some("not attached yet".into()),
+            ..ObserverHealth::default()
         }));
         let worker = {
             let health = Arc::clone(&health);
@@ -74,30 +67,26 @@ impl Observer {
                 .spawn(move || supervise(&config, &wake, &stop, &health))
                 .ok()
         };
-        Self { health, worker }
+        Self {
+            health,
+            worker: Mutex::new(worker),
+        }
     }
 }
 
 impl ChangeSource for Observer {
-    fn lost(&self) -> Option<String> {
-        match &*self
-            .health
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
-            Health::Lost { reason } => Some(reason.clone()),
-            Health::Attached => None,
-        }
+    fn health(&self) -> ObserverHealth {
+        self.health.lock().expect("observer health").clone()
     }
 
-    fn join(&mut self) {
-        if let Some(worker) = self.worker.take() {
+    fn join(&self) {
+        if let Some(worker) = self.worker.lock().expect("observer worker").take() {
             let _ = worker.join();
         }
     }
 }
 
-fn supervise(config: &TmuxConfig, wake: &Wake, stop: &AtomicBool, health: &Mutex<Health>) {
+fn supervise(config: &TmuxConfig, wake: &Wake, stop: &AtomicBool, health: &Mutex<ObserverHealth>) {
     let mut retry = FIRST_RETRY;
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
@@ -105,9 +94,11 @@ fn supervise(config: &TmuxConfig, wake: &Wake, stop: &AtomicBool, health: &Mutex
             Ok(()) => return,
             Err(reason) => reason,
         };
-        *health
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Health::Lost { reason };
+        {
+            let mut health = health.lock().expect("observer health");
+            health.attached = false;
+            health.loss_reason = Some(reason);
+        }
         wake();
         if started.elapsed() >= STABLE {
             retry = FIRST_RETRY;
@@ -130,7 +121,7 @@ fn attach(
     config: &TmuxConfig,
     wake: &Wake,
     stop: &AtomicBool,
-    health: &Mutex<Health>,
+    health: &Mutex<ObserverHealth>,
 ) -> Result<(), String> {
     let mut child = Command::new(&config.executable)
         .args(server_args(
@@ -152,13 +143,23 @@ fn attach(
     let mut attached = false;
     let outcome = loop {
         match lines.recv_timeout(POLL) {
-            Ok(Line::Hint) if attached => wake(),
+            Ok(Line::Hint) if attached => {
+                health.lock().expect("observer health").last_notification_ms = Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system clock")
+                        .as_millis() as u64,
+                );
+                wake();
+            }
             Ok(Line::Hint) => {}
             Ok(Line::Ready) => {
                 attached = true;
-                *health
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Health::Attached;
+                {
+                    let mut health = health.lock().expect("observer health");
+                    health.attached = true;
+                    health.loss_reason = None;
+                }
                 wake();
             }
             Err(RecvTimeoutError::Timeout) => {}

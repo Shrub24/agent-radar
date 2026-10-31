@@ -65,6 +65,8 @@ pub struct RetainedAgent {
 /// snapshot publishes. Serialization is how a display receives it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObservationState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer: Option<crate::model::ObserverHealth>,
     inventory: Option<FleetObservation>,
     source: SourceFreshness,
     /// Freshness of the registry source alone. A registry read that fails leaves
@@ -240,6 +242,7 @@ impl ObservationState {
         public: crate::control_plane::public_contracts::observation::ObservationProjection,
     ) -> Self {
         Self {
+            observer: public.observer,
             inventory: public.inventory,
             source: public.source.into(),
             registry: public.registry.into(),

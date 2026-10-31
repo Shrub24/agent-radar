@@ -29,6 +29,7 @@ pub enum CommandId {
     Expand,
     PaneView,
     TreeOrder,
+    FollowFocus,
     FinishedSessions,
     BackgroundTasks,
     Details,
@@ -137,6 +138,11 @@ pub const COMMANDS: &[Command] = &[
         id: CommandId::TreeOrder,
         label: "Cycle the tree order",
         chords: &["s"],
+    },
+    Command {
+        id: CommandId::FollowFocus,
+        label: "Follow the terminal's focus, or browse on your own",
+        chords: &["o"],
     },
     Command {
         id: CommandId::FinishedSessions,

@@ -151,6 +151,12 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
+      assertions = [
+        {
+          assertion = lib.versionAtLeast cfg.tmuxPackage.version "3.8";
+          message = "programs.radar.tmuxPackage must be tmux 3.8 or newer.";
+        }
+      ];
       home.packages = [
         cfg.package
       ]

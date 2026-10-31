@@ -12775,16 +12775,11 @@ fn unified_publication_latency_probe() {
     for tick in 0..50 {
         let before = app.session_mirror().unwrap().update_id;
         let started = Instant::now();
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        let target = app
-            .selected_id()
-            .map(|id| agent_radar::ui_session::session::ui_row_id(&id));
+        // A shared change makes the round trip; moving the cursor is local now.
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         loop {
             app.apply_session_update();
-            if app
-                .session_mirror()
-                .is_some_and(|m| m.update_id > before && m.state.selected == target)
-            {
+            if app.session_mirror().is_some_and(|m| m.update_id > before) {
                 break;
             }
             wait();

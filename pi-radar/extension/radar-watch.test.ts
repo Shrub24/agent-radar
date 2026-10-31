@@ -39,7 +39,7 @@ function daemon(behaviour: Behaviour) {
 			const request = JSON.parse(buffered.slice(0, end));
 			if (request.method === "daemon.ping") {
 				socket.end(`${JSON.stringify({ id: request.id, result: {
-					protocol: 2, backend: "tmux", instance: null, revision: 12,
+					protocol: 2, backend: "tmux", instance: null, revision: 13,
 					contracts: ["communication.messages.v1"], tasks: { available: false, error: null },
 				} })}\n`);
 				return;

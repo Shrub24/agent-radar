@@ -563,6 +563,9 @@
           },
           "type": "array"
         },
+        "focus": {
+          "$ref": "#/$defs/Focus"
+        },
         "lifecycle_subjects": {
           "description": "Public lifecycle records from the same daemon read as agent facts. The\ntree suppresses subjects already represented by a joined agent row.",
           "items": {
@@ -603,6 +606,81 @@
         "agents"
       ],
       "type": "object"
+    },
+    "Focus": {
+      "description": "Where the unified operator's tmux client is looking, read with the inventory\nso the two describe one moment.\n\nOnly a read establishes it; a notification that focus moved never does. A\nfailed read fails the inventory, so focus is never reported for a server that\ncould not be read.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "This backend reports no focus.",
+          "properties": {
+            "state": {
+              "const": "unreported",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "No operator client is attached.",
+          "properties": {
+            "state": {
+              "const": "no_operator",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "More than one operator client is attached, which Radar does not support:\nno focus is chosen among them.",
+          "properties": {
+            "operators": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state": {
+              "const": "ambiguous",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "operators"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "location": {
+              "$ref": "#/$defs/Location"
+            },
+            "state": {
+              "const": "focused",
+              "type": "string"
+            },
+            "zoomed": {
+              "description": "The focused pane's window is zoomed.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "state",
+            "location",
+            "zoomed"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "ForegroundEvidence": {
       "description": "Evidence about a pane's foreground, decoded inside the connector.\n\nThe reconciler treats only [`ForegroundEvidence::NonShell`] as positive\nsupersession evidence; absence or ambiguity retains the last observation.",
@@ -1221,6 +1299,16 @@
             }
           ]
         },
+        "observer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ObserverHealth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "registry": {
           "$ref": "#/$defs/ObservationFreshness",
           "default": "pending"
@@ -1267,6 +1355,34 @@
         "name",
         "state",
         "last_success_at"
+      ],
+      "type": "object"
+    },
+    "ObserverHealth": {
+      "additionalProperties": false,
+      "properties": {
+        "attached": {
+          "type": "boolean"
+        },
+        "last_notification_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "loss_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attached",
+        "last_notification_ms",
+        "loss_reason"
       ],
       "type": "object"
     },

@@ -14,7 +14,7 @@ Preserve the existing shared distribution and command machinery while separating
 
 ### 1. One server-wide observer, attached lazily
 
-Use one control-mode child with ignore-size and no-output (not read-only: tmux resolves the target client of an external `send-keys` to the best attached client, and a read-only one makes every Radar write fail with "client is read-only"), supervised on the daemon's async runtime. Wait when there are no sessions; never create a placeholder. Reattach when its session disappears, with bounded backoff after failure. Verify the owned serving incarnation before attachment and discard old-incarnation work on replacement. Shutdown cancels and reaps the child.
+Use one control-mode child with ignore-size and no-output (not read-only: tmux resolves the target client of an external `send-keys` to the best attached client, and a read-only one makes every Radar write fail with "client is read-only"), supervised on a daemon-owned thread. Wait when there are no sessions; never create a placeholder. Reattach when its session disappears, with bounded backoff after failure. Verify the owned serving incarnation before attachment and discard old-incarnation work on replacement. Shutdown cancels and reaps the child.
 
 Disposable tmux 3.8 experiments demonstrated server-wide notifications from an observer attached to one session. This chooses one observer rather than a per-session fallback. Finish lifecycle and flag verification before depending on it. Ordinary control notifications are the initial mechanism; do not install speculative monitors or extra hooks. Any necessary additional hook must use an owned slot without replacing user hooks.
 
@@ -94,6 +94,21 @@ These are experiment findings, not a claim that the observer exists. Record repr
 - Canonical rows may not have local detail → preserve row identity; never retarget through a neighbour.
 - Observer-only attachment affects tmux lifecycle (it also keeps `destroy-unattached` sessions alive) → verification gate before building on attachment semantics.
 - Older frontend contract → wire revision change and coordinated daemon/frontend upgrade, not legacy adapters.
+
+## Selection-consumer audit
+
+| Path | Resulting authority |
+|---|---|
+| `SessionState.selected`, publication and adoption | Replaced by observed `focus`; no published browsing cursor |
+| `UiAction::{SelectRow,Move,NextAttention,NextWorking}` | Deleted; frontend movement and jumps are local |
+| `NavState`, `Navigation::adopt` | Share only filter, folds, ordering and visibility; adoption preserves local selection |
+| Fold actions | Carry the selected branch identity rather than consulting an actor cursor |
+| Keyboard, mouse, palette, details and process navigation | Read or move the frontend selection |
+| `App::command_row`, configured Launch | Pass explicit local identity; no selection stops locally |
+| `Session::target_row` | Omitted identity resolves current observed focus; explicit missing identity never falls back |
+| Confirmation and prepared launch | Existing gate retains the frozen target; later focus does not re-resolve it |
+| Gate adoption and reconnect | Gates fence shared actions, not a shared cursor; reconnect resets only the local follow baseline |
+| Focus marker and follow | Consume observation only; never submit a focus request |
 
 ## Migration Plan
 

@@ -44,13 +44,14 @@ pub struct Navigation {
 /// One change to the shared navigation state. The session applies these for
 /// every attachment, and a frontend applies the same step to its own replica
 /// before the published state arrives, so both run one implementation.
+///
+/// Selection is not shared: moving, jumping and selecting are methods a view
+/// calls on its own replica, and fold steps name the row they act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NavStep {
-    Select(RowId),
-    Move(i32),
-    Collapse,
-    Expand,
-    ToggleFold,
+    Collapse(RowId),
+    Expand(RowId),
+    ToggleFold(RowId),
     /// A fold toggle for one named branch, as a click on its marker makes.
     ToggleBranch(RowId),
     CyclePanes,
@@ -58,8 +59,6 @@ pub enum NavStep {
     ToggleFinished,
     ToggleTasks,
     ShowEverything,
-    JumpAttention(bool),
-    JumpWorking(bool),
     SetFilter(String),
     ClearFilter,
 }
@@ -68,7 +67,6 @@ pub enum NavStep {
 /// tree itself: what a published session state carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NavState {
-    pub selected: Option<RowId>,
     pub order: RowOrder,
     pub view: PaneView,
     pub finished_shown: bool,
@@ -228,27 +226,21 @@ impl Navigation {
         self.visible_rows().into_iter().nth(index)
     }
 
-    /// Applies one step. Returns whether a [`NavStep::Select`] found its row;
-    /// every other step reports `true`.
-    pub fn apply(&mut self, step: &NavStep) -> bool {
+    /// Applies one shared step.
+    pub fn apply(&mut self, step: &NavStep) {
         match step {
-            NavStep::Select(id) => return self.select_exact(id),
-            NavStep::Move(delta) => self.move_selection(*delta),
-            NavStep::Collapse => self.collapse_selected(),
-            NavStep::Expand => self.expand_selected(),
-            NavStep::ToggleFold => self.toggle_fold(),
+            NavStep::Collapse(id) => self.collapse(id),
+            NavStep::Expand(id) => self.expand(id),
+            NavStep::ToggleFold(id) => self.toggle_fold(id),
             NavStep::ToggleBranch(id) => self.toggle_branch(id),
             NavStep::CyclePanes => self.cycle_panes(),
             NavStep::CycleOrder => self.cycle_order(),
             NavStep::ToggleFinished => self.toggle_history(),
             NavStep::ToggleTasks => self.toggle_tasks(),
             NavStep::ShowEverything => self.show_everything(),
-            NavStep::JumpAttention(forward) => self.jump_attention(*forward),
-            NavStep::JumpWorking(forward) => self.jump_working(*forward),
             NavStep::SetFilter(query) => self.set_filter(query),
             NavStep::ClearFilter => self.clear_filter(),
         }
-        true
     }
 
     /// The agreed state, for publication.
@@ -256,7 +248,6 @@ impl Navigation {
         let mut collapsed: Vec<RowId> = self.collapsed.iter().cloned().collect();
         collapsed.sort();
         NavState {
-            selected: self.selected.clone(),
             order: self.order,
             view: self.view,
             finished_shown: self.finished_shown,
@@ -266,8 +257,9 @@ impl Navigation {
         }
     }
 
-    /// Takes on a published state wholesale. The selection is kept as published
-    /// when it is visible; otherwise the usual fallback picks a row.
+    /// Takes on a published state wholesale. The selection is this view's own: it
+    /// stays on its row when that is still visible, and otherwise the usual
+    /// fallback picks one.
     pub fn adopt(&mut self, state: NavState) {
         self.order = state.order;
         self.view = state.view;
@@ -275,7 +267,6 @@ impl Navigation {
         self.task_rows = state.task_rows;
         self.filter = state.filter;
         self.collapsed = state.collapsed.into_iter().collect();
-        self.selected = state.selected;
         self.reconcile();
     }
 
@@ -421,44 +412,43 @@ impl Navigation {
         self.anchor = next;
     }
 
-    /// Folds the selected branch when it is open and unfolds it when it is
-    /// closed: one key for the whole gesture, whichever way the branch points.
-    pub fn toggle_fold(&mut self) {
-        match self.selected_row().map(|row| row.collapsed) {
-            Some(true) => self.expand_selected(),
-            Some(false) => self.collapse_selected(),
+    /// Folds the branch when it is open and unfolds it when it is closed: one key
+    /// for the whole gesture, whichever way the branch points.
+    pub fn toggle_fold(&mut self, id: &RowId) {
+        match self.row(id).map(|row| row.collapsed) {
+            Some(true) => self.expand(id),
+            Some(false) => self.collapse(id),
             None => {}
         }
     }
 
-    /// Folds the selected branch. No-op on a row without visible children, and
-    /// while a filter is active: the filtered view keeps matching ancestors
-    /// visible by design, so a fold could not take effect.
-    pub fn collapse_selected(&mut self) {
+    /// Folds the branch. No-op on a row without visible children, and while a
+    /// filter is active: the filtered view keeps matching ancestors visible by
+    /// design, so a fold could not take effect.
+    pub fn collapse(&mut self, id: &RowId) {
         if self.needle().is_some() {
             return;
         }
-        let Some(row) = self.selected_row() else {
-            return;
-        };
-        if row.has_children {
-            self.collapsed.insert(row.id.clone());
+        if self.row(id).is_some_and(|row| row.has_children) {
+            self.collapsed.insert(id.clone());
             self.reconcile();
         }
     }
 
-    /// Unfolds the selected branch. No-op when it is already unfolded, and while
-    /// a filter is active, like [`Self::collapse_selected`].
-    pub fn expand_selected(&mut self) {
+    /// Unfolds the branch. No-op when it is already unfolded, and while a filter
+    /// is active, like [`Self::collapse`].
+    pub fn expand(&mut self, id: &RowId) {
         if self.needle().is_some() {
             return;
         }
-        let Some(id) = self.selected_row().map(|row| row.id.clone()) else {
-            return;
-        };
-        if self.collapsed.remove(&id) {
+        if self.collapsed.remove(id) {
             self.reconcile();
         }
+    }
+
+    /// The visible row with this identity.
+    fn row(&self, id: &RowId) -> Option<VisibleRow<'_>> {
+        self.visible_rows().into_iter().find(|row| row.id == id)
     }
 
     /// Folds or unfolds one branch by identity, without moving the selection.

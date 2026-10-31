@@ -116,7 +116,9 @@ pub struct FilterState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionState {
-    pub selected: Option<UiRowId>,
+    /// Where the operator's terminal is. Browsing selection is each view's own
+    /// and is not published.
+    pub focus: FocusDto,
     pub order: RowOrderDto,
     pub pane_view: PaneViewDto,
     pub show_finished: bool,
@@ -132,6 +134,24 @@ pub struct SessionState {
     pub blocking: Option<Blocking>,
     pub operation: Option<CommandOutcome>,
     pub interaction_notice: Option<String>,
+}
+
+/// Where tmux's one operator client is looking, as the session derives it from
+/// the observation it holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum FocusDto {
+    /// The backend reports no focus.
+    #[default]
+    Unreported,
+    /// No operator client is attached.
+    NoOperator,
+    /// More than one operator client is attached, so none is chosen.
+    Ambiguous,
+    /// The last inventory read failed, so the focus it held may be stale.
+    Unavailable,
+    /// The focused pane's row; `None` when the canonical tree has no row for it.
+    Focused { row: Option<UiRowId> },
 }
 
 /// A shared interaction in progress, as every view sees it.
@@ -335,22 +355,16 @@ pub struct LaunchSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UiAction {
-    SelectRow {
+    Collapse {
         row: UiRowId,
     },
-    Move {
-        delta: i32,
-    },
-    Collapse {
-        row: Option<UiRowId>,
-    },
     Expand {
-        row: Option<UiRowId>,
+        row: UiRowId,
     },
     ToggleFold {
-        row: Option<UiRowId>,
+        row: UiRowId,
     },
-    /// Folds or unfolds one named branch without moving the selection.
+    /// Folds or unfolds one named branch.
     ToggleBranch {
         row: UiRowId,
     },
@@ -359,18 +373,15 @@ pub enum UiAction {
     ToggleFinished,
     ToggleTasks,
     ShowEverything,
-    NextAttention {
-        forward: bool,
-    },
-    NextWorking {
-        forward: bool,
-    },
     BeginFilterEdit,
     SetFilterQuery {
         query: String,
     },
     EndFilterEdit,
     ClearFilter,
+    /// `row` is the invoking view's selected row. Omitted, the command acts on
+    /// the observed focus; an explicit row that is gone is refused and never
+    /// falls back to it.
     RunCommand {
         command: SharedCommand,
         row: Option<UiRowId>,

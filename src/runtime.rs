@@ -991,10 +991,10 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// A running source of change hints.
 pub trait ChangeSource: Send + Sync {
     /// Why the source is not delivering hints, or `None` while it is.
-    fn lost(&self) -> Option<String>;
+    fn health(&self) -> crate::model::ObserverHealth;
 
     /// Waits for the source to end after its stop flag was set.
-    fn join(&mut self);
+    fn join(&self);
 }
 
 /// What Radar asks of one runtime: its facts, the one action on it, and the mux
