@@ -2,87 +2,109 @@
 
 ## Context
 
-`TmuxRuntime` reads the server with one-shot subprocess commands against the server `radar-tmux@` runs, and the daemon samples it on a timer into the shared observation snapshot. The daemon verifies the serving process at bind (`ensure_tmux_server`) and fences effects to that identity. Launches arm `remain-on-exit` before dispatch, exit evidence is a typed read of `pane_dead`, `pane_dead_status`, `pane_dead_signal` and `pane_dead_time`, and each launch appends a `run-shell -b` wake to the global `pane-died` hook. Pane absence is proven only by a generation mismatch or fresh absence from a readable server. A session's subject is independent of its pane, and a pane may be moved with `join-pane`/`move-pane`/`break-pane`, which keep its id, process and PTY.
+The shared UI session distributes selection, navigation settings, canonical rows and command interactions. Commands already carry displayed row identities and the actor freezes their targets. tmux focus executes through the daemon adapter, but native tmux focus changes are not the shared cursor's authority.
 
-tmux 3.8, from its CHANGES file:
+The supported model is one unified operator tmux client, regardless of the number of Radar views. Nested tmux stays: the agent server contains no sidebar panes. See proposal.md for motivation and scope.
 
-- Hooks and control-mode notifications are events with key/value payloads. `wait-for -v` shows a hook event's keys.
-- Subscriptions generalise into monitors: `set-hook -B` takes the `refresh-client -B` syntax, checks a format every second, and fires a hook when it changes, or with `-T` when it becomes true. `show-hooks -B` lists them.
-- `wait-for -E` waits for hooks, notifications or user events, and `set-hook -E` fires an event immediately.
-- New hooks cover client create/destroy, pane activity, pane mode and prompt changes, pane move and resize, session group changes, and window create, close, swap and zoom.
-- OSC 133 triggers `pane-command-started`, `pane-command-finished` and `pane-shell-prompt`.
-- Layout strings are a JSON subset including floating panes. Control clients keep the old format unless they set `new-layouts`.
-- Control-mode fixes: no hang on exit with queued pty data, no notifications to exiting clients, notifications queued outside `%begin`/`%end`, a stuck client cannot keep the server from exiting, offsets reset on respawn, and buffered replies are bounded for a client that stops reading.
+## Goals / Non-Goals
 
-The changelog does not say which of the new hook events reach a control client as `%` notifications, or whether a global monitor's hook can be observed by one client for every session. Those facts decide the observer's shape, so they are verified before it is built.
+Preserve the existing shared distribution and command machinery while separating terminal focus from inspection. Notifications improve responsiveness but never replace evidence reads. Do not introduce a second shared cursor, per-client focus maps, a general observer framework or a domain-actor rewrite.
 
 ## Decisions
 
-### 1. tmux 3.8 is the floor, enforced at bind
+### 1. One server-wide observer, attached lazily
 
-The daemon reads `#{version}` from the serving server, not `tmux -V` from a binary that may differ from the running server, and refuses to serve one older than 3.8. The refusal names the version found and `programs.radar.tmuxPackage`. The Home Manager module asserts `lib.versionAtLeast tmuxPackage.version "3.8"`. The flake provides tmux 3.8 (the pinned nixpkgs `tmux` with the 3.8 tag as its source) as the module default and in the test environment until nixpkgs carries it; the override is deleted when it does. No capability gate and no 3.7c path, following the earlier decision to require 3.8 rather than gate features on it.
+Use one control-mode child with read-only, ignore-size and no-output, supervised on the daemon's async runtime. Wait when there are no sessions; never create a placeholder. Reattach when its session disappears, with bounded backoff after failure. Verify the owned serving incarnation before attachment and discard old-incarnation work on replacement. Shutdown cancels and reaps the child.
 
-A server already running 3.7c is refused until the operator restarts `radar-tmux@` on 3.8. `keep-old` means a switch alone does not restart it, so the refusal is what tells the operator a restart is needed.
+Disposable tmux 3.8 experiments demonstrated server-wide notifications from an observer attached to one session. This chooses one observer rather than a per-session fallback. Finish lifecycle and flag verification before depending on it. Ordinary control notifications are the initial mechanism; do not install speculative monitors or extra hooks. Any necessary additional hook must use an owned slot without replacing user hooks.
 
-### 2. Wake, never fact
+### 2. Hints trigger reads; timers recover losses
 
-Every notification maps to "sample soon". The sampler's reads establish state, so a lost notification costs latency, not correctness. A burst coalesces into one further sample. The timer and periodic reconciliation stay as the recovery path. This applies equally to placement events: a pane moving between windows wakes the sampler, and the move appears only when the inventory reports the pane in its new window.
+Client, session, pane, window and layout events request coalesced refresh work. A refresh reads operator clients, their active location, zoom and inventory. Keep the existing sampling/demand policy; ensure focus-following views supply the demand they need. Changes during an in-flight read leave one further refresh pending. Subscribe before the baseline read and preserve a dirty hint during it, so establishment does not lose a transition.
 
-### 3. Coverage: verify, then choose
+Parsing and buffering are bounded; unknown notifications are ignored and unexpected pane output is discarded without logging. No layout parser is needed to determine zoom: read its format field. Observer health includes connection state, last notification and loss reason. Loss retains timer-based reads and bounded reconnect, never an inference of no change.
 
-Two shapes:
+Alternative rejected: reduce notifications directly into terminal facts. They omit context, can be lost, and cannot establish process exit or pane absence.
 
-- **Server-wide.** One observer, with global `set-hook -gB` monitors and global hooks for the topology events, if 3.8 delivers those events to a control client attached to any session. One connection, no per-session lifecycle.
-- **Per session.** One observer per session, started and ended from `%sessions-changed` plus the inventory and bounded (starting at 16), if session-scoped `%*`/`@*` subscriptions are still the only reliable delivery.
+### 3. One typed unified focus fact
 
-Task 1.1 settles which. The requirement is shape-independent: every session is either observed or reported as unobserved. Global hooks Radar installs follow the existing `pane-died` rule: appended in Radar's own slots and removed by slot, never by replacing a user's hook.
+Represent available focus with workspace, window and pane identities and zoom state. Distinguish no operator, unreadable/unavailable evidence and unsupported multiple operators; none licenses an implicit target. Retain last-good information only as explicitly stale display data.
 
-### 4. Narrow subscriptions
+Filter control-mode clients before operator counts and focus-client selection. More than one operator client refuses focus-changing operations rather than choosing the most active or target-session client. Explicit non-focus commands remain governed by their normal evidence and eligibility checks. A server read, not an observer's attached session, identifies operator focus.
 
-Monitor `pane_dead`, `pane_current_command`, `pane_id` membership per window, and window and session names. That is enough to wake on exit, foreground change, pane moves and renames. Monitors fire at most once a second, so they are wakes, not measurements. Pane output is never subscribed, and the observer keeps the old layout format because Radar does not parse layouts.
+Alternative rejected: per-client maps and follow selectors. They expand the product beyond its supported single-client model.
 
-### 5. Run on the transport's runtime
+### 4. Evolve shared selection into focus; extract local selection
 
-An observer is a `tmux -C` child process read line by line through `tokio::process`, on the runtime from `consolidate-daemon-ingest`. Line length is bounded and parsing ignores what it does not recognise. Effects, hooks and snapshot reads stay in the synchronous adapter. Observers live in the daemon's service cgroup, not in `radar-tmux@` and not in any `radar.slice` scope, so stopping the daemon ends them and leaves the server, its panes and every managed scope untouched.
+Reuse existing shared-selection publication/adoption wiring for shared focus, changing both names and authority. tmux reads establish focus. Focus requests use the existing daemon executor; request acceptance is not observed success. Adopting a focus observation never executes a focus request.
 
-### 6. Fence to the verified server
+Extract browsing movement, jumps, mouse selection and selection anchoring into the frontend. Details read that local selection. Remove actor-owned browsing-move actions, shared-cursor fallbacks and global-selection reconciliation. No permanent transitional cursor or parallel focus-distribution path.
 
-Before attaching, the daemon re-establishes the verified serving process identity that every generation fence compares against. A changed identity ends the observers and starts new ones after verification. An observer never attaches to a server the daemon did not verify as its own.
+The actor still owns filters, folds, pane mode, ordering, projection and interactions. Each frontend preserves its selected identity through updates and reconciles locally when canonical membership changes. Local navigation uses the canonical row ordering, not a lagging independently rebuilt tree; available row facts supply kind-based jump information. A row not locally explained must never cause selection or command fallback to another identity.
 
-### 7. Observers are not operator clients
+Alternative rejected: universal cursor equals focus. Inspection and details do not imply terminal-switch intent. Also rejected: deleting the distribution path and adding a separate shared-focus path.
 
-A control client appears in `list-clients` and counts toward `session_attached`. The adapter filters on `client_control_mode`, so operator-attachment logic, including the `radar server stop` refusal and any attach-dependent guard, never sees them. Whether a current guard depends on attachment is checked, not assumed.
+### 5. Following is a local event-driven bridge
 
-### 8. Evidence stays where it is
+Sidebar defaults on; dashboard defaults off. Provide a local toggle, expose the mode in help, and use a focus glyph distinct from selection highlight. Enabling following or adopting a reconnect baseline selects the current focus if visible. A subsequent changed focused place selects its row; repeated identical focus, zoom-only changes and unrelated publications do not undo browsing.
 
-Exit evidence stays the typed `pane_dead_*` read over `remain-on-exit`. The per-launch `pane-died` wake stays as the trigger for that read. Absence stays proven by generation mismatch or a fresh read of a live server. Managed stop stays the scope stop. A notification may wake any of these reads and replaces none of them. Retiring the `pane-died` wake is a later change, and only if a monitor proves at least as timely and as reliable.
+Resolve a focused pane to its canonical terminal/agent row, not an arbitrary task or historical subject sharing a place. If it is hidden or cannot be represented, indicate focus outside the listing; do not change shared filters/folds or select a neighbour as though focused. A later projection that makes that same focus representable may complete the pending follow once, but must not repeatedly reset deliberate browsing. Clear stale focus indications on loss.
 
-### 9. OSC 133 events are wakes here
+Following only copies focus into local selection. Local movement never turns into a focus request; this prevents feedback loops. The exact toggle key and glyph follow existing binding and rendering conventions during implementation.
 
-On 3.8, `pane-command-finished` and `pane-shell-prompt` are useful wakes for shell panes: a foreground command ending changes what a delete would lose. Here they only request a sample. Typed shell-boundary facts are their own change, because they introduce new evidence with its own provenance. Pi panes emit no OSC 133, so Pi state stays with its publishers.
+### 6. Resolve once, then freeze
 
-## Audit against the current tree
+All row-dependent TUI actions supply their locally selected row, including configured Launch and palette/mouse commands. If no row is selected, the TUI refuses locally instead of accidentally invoking implicit focus. Missing row in the command contract means use observed focus, for future global hotkeys and other intentional implicit callers. Targetless commands remain targetless.
 
-Checked after the launch chain, deadline sweep and reset landed.
+The actor validates an explicit identity against its canonical tree, or resolves the focused place through the existing command eligibility rules when omitted. It then uses one plan/freezing path. No invalid explicit row falls back to focus. No absent, stale or ambiguous focus licenses implicit execution. If focus has no eligible canonical target, refuse rather than fabricate one.
 
-- **The floor is not implemented.** `ensure_tmux_server` checks only that the unit is active and the server answers. `tmuxPackage` defaults to `pkgs.tmux` with a description and no assertion, the flake has no 3.8 source, and the local server is 3.7c. Section 0 is entirely open.
-- **The wake seam does not exist.** The collector starts a refresh only when `next_refresh` (one second after the last) has passed. A committed event only shortens the sampler's sleep (`EVENT_WAKE_GAP`); it does not pull a refresh forward. An observer therefore needs one new primitive, a coalesced request that makes the next tick refresh now, subject to the same gap. Sampling stays demand-driven, so an idle daemon still reads nothing.
-- **Tokio lacks `process`.** `Cargo.toml` enables `rt-multi-thread`, `net`, `sync`, `time`, `io-util`, and the transport is the only user. Observers need the `process` feature and a handle to the transport's runtime.
-- **Other timers stay.** The two-second spawn sweep (pane evidence, the 30-second launch deadline) and the 60-second scope sweep are not observation latency problems and are outside this change. `radar reset` stops the daemon before it restarts tmux, so observers end with it and need no reset handling beyond the identity fence.
-- **Nothing in the launch chain changes.** `radar run --launch`, scopes, `remain-on-exit` and the `pane-died` wake are unaffected.
-- **The benefit is modest.** Today a topology change reaches a reader within about a second while it reads, and nothing is collected while idle. Control mode improves latency and avoids re-reading the inventory on a quiet server; it adds no new fact. It is worth doing for the sidebar's responsiveness, not as correctness work, and it is cheap to stop after the floor and the verification if 1.1 shows the events do not reach one client.
+Resolve before preparation or confirmation. The plan retains target, execution identities and preconditions; configured Launch supplies command/environment preparation without changing the target. Confirmations and detached presenters show that plan, not anyone's current cursor. Execution revalidates domain preconditions without retargeting.
 
-## Risks
+Preserve frontend-owned no-client terminal recovery for an explicit focus request, retrying the same captured target. An implicit request without observed focus cannot use that recovery to guess a destination.
 
-- **Observer attached to the wrong server.** Mitigated by the identity fence and a test that a foreign server on the configured name is refused.
-- **Output or notification floods.** `no-output` removes pane output, bursts coalesce, lines are bounded, and 3.8 bounds buffered replies.
-- **An observer changing server behaviour.** `read-only` and `ignore-size` are verified to cause no resize or selection change, and `destroy-unattached` and `detach-on-destroy` are checked with an observer attached.
-- **Global hooks colliding with the user's.** Radar's hooks use appended slots and are removed by slot, as `pane-died` already is.
-- **A 3.7c server left running after the upgrade.** Refused at bind with the version named. The operator restarts the server unit.
-- **The nixpkgs override drifting.** It is a source-only override of the pinned package, and is deleted once nixpkgs ships 3.8.
+### 7. Gates fence actions, not independent browsing state
 
-## Open choices
+Keep bounded ordered submission, displayed-gate checks, receipt correlation and coherent publication adoption for shared actions. Local cursor movement needs no actor acknowledgement. A command immediately after local navigation captures the new local identity.
 
-- Server-wide versus per-session observers (decided by 1.1).
-- The observer bound and the retry backoff.
-- Whether renames come from monitors or from `%window-renamed`/`%session-renamed`.
+A newer gate fences stale queued actions and key sequences even while replies/content are pending. Gate adoption does not restore a global browsing selection. Reconcile local selection only for projection validity or the explicit follow policy. Popup target and action receipts survive coalescing as before.
+
+### 8. Keep lifecycle evidence and packaging changes narrow
+
+Require 3.8 from the serving server version, not merely the local executable. Audit current Home Manager and flake support before adding an override; use packaged 3.8+ if already available. No older-version fallback.
+
+Exit hooks, remain-on-exit, process verification, absence proof and scope handling stay unchanged. OSC 133 notifications, if received, are wakes only. Do not add new monitors for foreground state without a demonstrated missing wake requirement.
+
+## Verification evidence and remaining checks
+
+Recorded disposable tmux 3.8 experiments found:
+- zero-session control attach fails; lazy attachment is necessary;
+- notifications cover sessions other than the observer's attached session;
+- client-session-changed names the client and fires for first attach and session switches;
+- client-detached, session-window-changed, window-pane-changed, layout-change (including zoom), renames and sessions-changed provide relevant wakes;
+- control clients appear in list-clients and must be excluded;
+- no pane-exited notification replaces exit hooks.
+
+These are experiment findings, not a claim that the observer exists. Record reproducible commands/results during implementation and finish size/selection invariance, no-output, destroy-unattached, detach-on-destroy and attached-session loss checks. The old audit's local-3.7c and missing-feature claims are stale and must not be treated as current findings.
+
+## Risks / Trade-offs
+
+- Focus may briefly lag input → coalesced reads plus timer recovery; no unbounded focus-command queue.
+- State changes across reads → validate the sampled client/location relationship, rerun on dirty hints, and report unavailable rather than synthesize a mixed location.
+- Shared filtering hides focus → explicit outside-listing indication, no forced global filter mutation.
+- Canonical rows may not have local detail → preserve row identity; never retarget through a neighbour.
+- Observer-only attachment affects tmux lifecycle → verification gate before building on attachment semantics.
+- Older frontend contract → wire revision change and coordinated daemon/frontend upgrade, not legacy adapters.
+
+## Migration Plan
+
+1. Inventory selection writers/readers, row target defaults, gate reconciliation and public DTOs; finish 3.8 verification.
+2. Land observer, refresh seam and typed focus facts with their tests and docs.
+3. Cut over shared selection to focus and extract frontend selection in one coordinated slice. Migrate all callers and delete replaced actions/fields in that slice.
+4. Complete follow controls, markers and behaviour tests; verify from two Radar views sharing one operator tmux client.
+5. Regenerate contracts and update wire revision for the incompatible UI contract. Deploy matching daemon and TUI; rollback requires matching versions too.
+
+Archive dependency: sidebar-mode and shared-ui-session introduce baseline UI capabilities; unified-tui-publications and duplex-tui-attachments modify them. Sync predecessors in dependency order before applying this change's MODIFIED ui-session, ui-interactions and tui-publications requirements. Do not rewrite their historical deltas to disguise this change or archive out of order. Existing main-spec deltas likewise target the post-predecessor state.
+
+## Open Questions
+
+No unresolved product/ownership decisions block planning. Exact refresh gap, retry cap, parser line bound and follow-toggle key are implementation choices to select from existing conventions and verify, not new configuration surfaces.
