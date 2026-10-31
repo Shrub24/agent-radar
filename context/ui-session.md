@@ -531,6 +531,11 @@ Two review findings were heard and not adopted, and the reasons belong here rath
 
 ## A row that finishes lingers five seconds, in the session only
 
+**Id:** a903ddd6-6ec3-42c1-afad-82ccba527c36
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+
 **Decision:** when a tree change moves a row out of the listing (it became
 history, or left the running view), `Navigation::replace_tree_graced` keeps it
 drawn for `GRACE_SECONDS` (5). The session calls it and ages the rows from its
@@ -549,4 +554,30 @@ through the replica's local navigation, the same as a structure-only row.
 between views); a grace for every removal including the operator's own toggles
 (pressing `e` would appear to do nothing for five seconds).
 
+
+## Focus is observed, selection is local
+
+**Id:** 9a4f9701-52e7-4956-bc9a-51e3f22f93e7
+**Type:** decision
+**Status:** active
 **Evidence:** confirmed
+**Source:** maintainer direction that the sidebar be a pure view of tmux client state with the cursor at the tracked focus, that focus and selection be separate concepts per view, and that the existing shared-selection path be evolved rather than duplicated, 2026-10-31
+**Verification:** corroborated — `SessionState` carries `focus` and no `selected`; `UiAction::SelectRow`, `Move`, `NextAttention` and `NextWorking` are gone while fold actions name their branch; `Session::focus` derives the published focus from the inventory the session holds and `Session::target_row` resolves an omitted row to it; `App` keeps `following` and `followed` locally and `App::command_row` sends the selected row; wire revision 13
+**See:** ui-session.md#focus-is-decided-by-the-session-and-performed-by-the-daemon — 5e31bdb0-5694-4f48-884d-d9a1c1182cb3 — as of 2026-10-31
+**Revisit when:** more than one operator tmux client is supported, or a view other than the sidebar needs a cursor that tracks focus
+
+tmux owns where the terminal is looking. The daemon observes it with every inventory read and publishes it to every attachment as focus. Moving, jumping and folding in a view changes only that view's selection; a command carries the row its view selected, and only an omitted row resolves to the observed focus.
+
+**Reason:** the two are different intents. Selection is what an operator is inspecting, and details, filters and destructive commands must follow the row the operator is actually looking at in *their* view; focus is where a terminal is, and only tmux can move it. Sharing one cursor forced those together: a second view's browsing changed what the first view's next command would act on, and every keypress needed an acknowledgement before the screen agreed with the operator.
+
+**Rejected alternative:** keep one shared cursor whose authority is observed focus. It is simpler to describe, but inspecting a row would then be indistinguishable from asking to switch terminals, and holding `j` would flip the terminal on every step.
+
+**Rejected alternative:** bolt a separate shared-focus publication beside the existing shared-selection one. It would leave two cursors on the wire, two adoptions in every view, and a period where both are authoritative — so the existing publication was changed in place and the old actions deleted in the same cutover.
+
+**Rejected alternative:** let a view with no selection fall back to the focused row. It reads as helpful and is wrong after a filter or a fold removes the row: the operator would lose the ability to say "nothing", and a destructive command would act on something they never selected.
+
+**Consequence:** an explicit row is validated where the command is frozen and refused when it is gone; falling back to focus there would silently retarget an irreversible action.
+
+**Consequence:** following is a local bridge, not a shared state. Each view decides whether its selection copies focus, and it copies only when focus changes, so browsing is not undone by unrelated publications. Following never submits a focus request: an observation is never an instruction.
+
+**Open:** only one operator tmux client is supported. Several attached clients make focus ambiguous, which is refused rather than resolved; that is a product boundary, not a defect to paper over.

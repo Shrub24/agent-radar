@@ -59,6 +59,11 @@ creates beside its parent; only the dashboard no longer reaches it.
 
 ## An unclaimed request that expired is settled, not left unfinished
 
+**Id:** c702a18a-258c-4e67-86e7-bfefeb117b5f
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+
 **Decision:** reconciliation settles a request that expired before it was claimed
 as refused `not_executed`. `Store::settle_unclaimed` does it, and
 `reconcile::unresolved` calls it first.
@@ -75,4 +80,3 @@ for a request known to have run nothing); filtering it out of the unfinished rea
 (the stop gate would pass, but the record would still read as pending everywhere
 else).
 
-**Evidence:** confirmed
