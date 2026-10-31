@@ -1780,8 +1780,17 @@ export interface Workspace {
   workspace_id: string;
 }
 export interface ObserverHealth {
+  /**
+   * Whether the control client is attached to the server now.
+   */
   attached: boolean;
-  last_notification_ms: number | null;
+  /**
+   * When the observer last accepted a notification, Unix milliseconds.
+   */
+  last_notification_unix_ms: number | null;
+  /**
+   * Why the last attempt ended, one bounded line. `None` while attached.
+   */
   loss_reason: string | null;
 }
 /**

@@ -1288,10 +1288,13 @@
     "ObserverHealth": {
       "properties": {
         "attached": {
+          "description": "Whether the control client is attached to the server now.",
           "type": "boolean"
         },
-        "last_notification_ms": {
+        "last_notification_unix_ms": {
+          "description": "When the observer last accepted a notification, Unix milliseconds.",
           "format": "uint64",
+          "maximum": 9007199254740991,
           "minimum": 0,
           "type": [
             "integer",
@@ -1299,6 +1302,7 @@
           ]
         },
         "loss_reason": {
+          "description": "Why the last attempt ended, one bounded line. `None` while attached.",
           "type": [
             "string",
             "null"

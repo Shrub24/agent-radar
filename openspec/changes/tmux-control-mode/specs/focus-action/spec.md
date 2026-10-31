@@ -15,8 +15,15 @@ A TUI focus invocation SHALL explicitly identify its locally selected row. Brows
 - **WHEN** the backend refuses focus on B
 - **THEN** observed focus is not changed to B and the failure is reported
 
+### Requirement: Implicit targets need evidence the read still vouches for
+A command that supplies no row SHALL resolve focus only from a current observation. Stale or unavailable evidence SHALL refuse and report that no current focus was available, rather than act on a place that may have moved.
+
+#### Scenario: Focus the read cannot vouch for
+- **WHEN** a row-dependent command supplies no row while the last observation is stale
+- **THEN** nothing is dispatched and the refusal names the missing current focus
+
 ### Requirement: Missing row means observed focus for row-dependent commands
-A row-dependent command with an explicit row SHALL validate and freeze that identity. With no row supplied it SHALL resolve and freeze the current observed focused place. Invalid explicit rows SHALL NOT fall back to focus. No selected row in a TUI SHALL be reported locally rather than accidentally invoking omitted-row semantics. Commands without row targets SHALL remain targetless.
+A row-dependent command with an explicit row SHALL validate and freeze that identity. With no row supplied it SHALL resolve and freeze the currently observed focused place. Invalid explicit rows SHALL NOT fall back to focus. No selected row in a TUI SHALL be reported locally rather than accidentally invoking omitted-row semantics. Commands without row targets SHALL remain targetless.
 
 #### Scenario: Selected row differs from focus
 - **WHEN** a TUI invokes a row-dependent command with selected B while focus is A

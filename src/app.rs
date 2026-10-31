@@ -14,6 +14,10 @@
 //! user where they were. When the selected row disappears, selection moves to
 //! the row that took its place, or to the last row, or becomes empty when no
 //! rows remain.
+//!
+//! Selection belongs to this view alone. What the views and the daemon agree on
+//! is the tree, the folds, the filter and the pane view; the terminal's focus is
+//! a fact the daemon observes, and a view may follow it (see [`App::sidebar`]).
 
 mod actions;
 mod commands;
@@ -436,7 +440,8 @@ impl std::fmt::Debug for SessionLink {
 
 #[derive(Debug, Default)]
 pub struct App {
-    /// The shared navigation: the tree, folds, filter, pane view and selection.
+    /// The navigation model: shared tree, folds, filter and pane view, plus this
+    /// view's own selection.
     nav: Navigation,
     /// The shared UI session this view navigates through, when the daemon
     /// serves one. Without it the view navigates alone, on the same model.
@@ -939,13 +944,20 @@ impl App {
     /// The row the terminal is focused on, when the session places it in the
     /// tree.
     pub fn focused_row(&self) -> Option<RowId> {
-        if !self.session.as_ref()?.connected {
-            return None;
-        }
-        match &self.mirror_ref()?.state.focus {
+        match self.focus()? {
             FocusDto::Focused { row: Some(row) } => Some(crate::ui_session::session::row_id(row)),
             _ => None,
         }
+    }
+
+    /// The focus the session publishes, when this view is attached and nothing
+    /// has disconnected it.
+    pub fn focus(&self) -> Option<&FocusDto> {
+        let link = self.session.as_ref()?;
+        if !link.connected {
+            return None;
+        }
+        Some(&link.mirror.as_ref()?.state.focus)
     }
 
     /// Selects the focused row when focus has changed since this view last
@@ -969,7 +981,7 @@ impl App {
     }
 
     /// `o`: follows the terminal's focus, or goes back to browsing alone.
-    pub fn toggle_following(&mut self) {
+    fn toggle_following(&mut self) {
         self.following = !self.following;
         self.followed = None;
         self.follow_focus();
@@ -977,26 +989,6 @@ impl App {
 
     pub fn is_following(&self) -> bool {
         self.following
-    }
-
-    pub fn focus_status(&self) -> Option<&'static str> {
-        let link = self.session.as_ref()?;
-        if !link.connected {
-            return Some("focus unavailable");
-        }
-        match &self.mirror_ref()?.state.focus {
-            FocusDto::Focused { .. } => {
-                let focused = self.focused_row();
-                (!self
-                    .draw_rows()
-                    .iter()
-                    .any(|row| Some(row.id()) == focused.as_ref()))
-                .then_some("focus outside listing")
-            }
-            FocusDto::NoOperator => Some("no operator"),
-            FocusDto::Ambiguous => Some("multiple operators"),
-            FocusDto::Unreported | FocusDto::Unavailable => Some("focus unavailable"),
-        }
     }
 
     pub fn session_mirror(&self) -> Option<std::sync::Arc<crate::ui_session::client::Mirror>> {
@@ -1143,9 +1135,9 @@ impl App {
             .is_some_and(|link| link.client.connected())
     }
 
-    /// Runs one navigation step. A step that moves the selection starts the new
-    /// row's reading from the top: its scroll, opened blocks and process cursor
-    /// belong to the row they were made in.
+    /// Runs one navigation step, local or shared. A step that moves the
+    /// selection starts the new row's reading from the top: its scroll, opened
+    /// blocks and process cursor belong to the row they were made in.
     fn navigate<R>(&mut self, step: impl FnOnce(&mut Navigation) -> R) -> R {
         let before = self.nav.selected_id().cloned();
         let outcome = step(&mut self.nav);

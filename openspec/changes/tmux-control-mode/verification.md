@@ -27,6 +27,9 @@ Observer flags: `attach-session -f ignore-size,no-output` under `-C`. `read-only
 - `an_inventory_reports_the_one_operators_focus_and_refuses_to_choose_among_several`: `NoOperator`, one `Focused` (with zoom), then `Ambiguous` for two operators.
 - `only_a_server_reporting_3_8_or_newer_is_supported`: version-word parsing either side of the floor.
 - `a_requested_refresh_runs_now_instead_of_waiting_out_the_interval` (collector).
+- `a_stale_read_keeps_the_place_it_last_saw_but_never_acts_on_it`: after a failed read the published focus is unchanged, and an omitted-row command dispatches nothing and reports the missing current focus.
+- `a_fleet_that_was_never_read_reports_no_focus_rather_than_a_lost_one`: a first read that failed reports `Unreported`, so the panel's own freshness word is the one explanation.
+- `a_view_names_following_and_only_speaks_about_a_focus_it_can_place`: the heading/footer words, and the marker predicate over the rows a draw produced.
 
 ## Observer health
 

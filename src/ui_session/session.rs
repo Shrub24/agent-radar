@@ -525,7 +525,7 @@ impl Session {
             return Ok(None);
         };
         let Some(captured) = self.target_row(row) else {
-            self.interaction_notice = Some("no row and no observed focus: no action target".into());
+            self.interaction_notice = Some("no row and no current focus: no action target".into());
             self.project();
             return Ok(None);
         };
@@ -628,24 +628,41 @@ impl Session {
     /// the focus: it is looked up, and refused, where the command is frozen.
     fn target_row(&self, row: Option<dto::UiRowId>) -> Option<dto::UiRowId> {
         row.or_else(|| match self.focus() {
-            dto::FocusDto::Focused { row } => row,
+            dto::FocusDto::Focused { row } if self.focus_current() => row,
             _ => None,
         })
+    }
+
+    /// Whether the observation behind the published focus still vouches for it.
+    /// A stale read is shown, because a view should say where the terminal was
+    /// last seen, but it never decides an effect: the pane may have moved.
+    fn focus_current(&self) -> bool {
+        matches!(
+            self.state.as_ref().map(ObservationState::source_freshness),
+            Some(crate::observation::SourceFreshness::Current)
+        )
     }
 
     /// Where the operator's terminal is, as the observation the session holds
     /// places it. A focused pane the tree has no row for is still focus.
     fn focus(&self) -> dto::FocusDto {
         use crate::model::Focus;
-        let Some(inventory) = self.state.as_ref().and_then(ObservationState::inventory) else {
+        use crate::observation::SourceFreshness;
+        let Some(state) = self.state.as_ref() else {
             return dto::FocusDto::Unreported;
         };
-        if !matches!(
-            self.state.as_ref().map(ObservationState::source_freshness),
-            Some(crate::observation::SourceFreshness::Current)
-        ) {
-            return dto::FocusDto::Unavailable;
+        match state.source_freshness() {
+            // Nothing has been read yet, and a failed first read has no focus to
+            // report: neither is evidence that the terminal moved away, and the
+            // fleet panel already names which one it is.
+            SourceFreshness::Pending | SourceFreshness::Unavailable { .. } => {
+                return dto::FocusDto::Unreported;
+            }
+            SourceFreshness::Current | SourceFreshness::Stale { .. } => {}
         }
+        let Some(inventory) = state.inventory() else {
+            return dto::FocusDto::Unreported;
+        };
         match &inventory.focus {
             Focus::Unreported => dto::FocusDto::Unreported,
             Focus::NoOperator => dto::FocusDto::NoOperator,
@@ -1284,13 +1301,55 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_inventory_withdraws_the_focus_it_carries() {
+    fn a_stale_read_keeps_the_place_it_last_saw_but_never_acts_on_it() {
         let pane = a_pane_id(&seeded());
         let mut session = focused_on(&pane);
+        let before = session.current().state.focus.clone();
+        assert!(
+            matches!(before, dto::FocusDto::Focused { row: Some(_) }),
+            "the fixture places the terminal in the tree: {before:?}"
+        );
         let mut state = session.state.clone().unwrap();
         state.apply_failure("tmux is gone");
         session.observe(&state, None);
-        assert_eq!(session.current().state.focus, dto::FocusDto::Unavailable);
+        assert_eq!(
+            session.current().state.focus,
+            before,
+            "the last place it saw still stands, the panel says why it is stale"
+        );
+
+        session.act(
+            "a",
+            2,
+            A::RunCommand {
+                command: dto::SharedCommand::Focus,
+                row: None,
+            },
+        );
+        assert!(
+            session.take_completions().is_empty(),
+            "a place the read cannot vouch for is not acted on"
+        );
+        assert!(
+            session
+                .current()
+                .state
+                .interaction_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("no current focus")),
+            "{:?}",
+            session.current().state.interaction_notice
+        );
+    }
+
+    #[test]
+    fn a_fleet_that_was_never_read_reports_no_focus_rather_than_a_lost_one() {
+        let mut state = ObservationState::new();
+        state.apply_failure("tmux is not running");
+        let mut session = Session::new();
+        session.observe(&state, None);
+        session.attach("a", dto::AttachmentRole::Dashboard).unwrap();
+        assert_eq!(session.current().state.focus, dto::FocusDto::Unreported);
     }
 
     #[test]

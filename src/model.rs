@@ -39,8 +39,12 @@ mod option_duration_millis {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ObserverHealth {
+    /// Whether the control client is attached to the server now.
     pub attached: bool,
-    pub last_notification_ms: Option<u64>,
+    /// When the observer last accepted a notification, Unix milliseconds.
+    #[schemars(range(max = 9007199254740991u64))]
+    pub last_notification_unix_ms: Option<u64>,
+    /// Why the last attempt ended, one bounded line. `None` while attached.
     pub loss_reason: Option<String>,
 }
 

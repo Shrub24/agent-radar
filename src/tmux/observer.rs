@@ -9,9 +9,9 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{TmuxConfig, server_args};
 use crate::runtime::{ChangeSource, Wake};
@@ -23,6 +23,8 @@ const LAST_RETRY: Duration = Duration::from_secs(5);
 /// An attachment that lasted this long was a working one, so the backoff restarts.
 const STABLE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
+/// Longest published loss reason; the covering text says the rest is elsewhere.
+const MAX_REASON: usize = 200;
 
 /// Notifications that can mean focus or topology moved. Everything else, and
 /// anything unknown, is ignored.
@@ -48,7 +50,26 @@ use crate::model::ObserverHealth;
 /// The running observer.
 pub struct Observer {
     health: Arc<Mutex<ObserverHealth>>,
+    /// Taken once, through the shared handle the sampler also holds.
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// A lock held only for the field updates it protects, so a panic elsewhere
+/// cannot stop health or shutdown from being read.
+fn guarded<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Why a reason is one bounded line: it rides the observation payload.
+fn short(reason: impl AsRef<str>) -> String {
+    let line = reason.as_ref().lines().next().unwrap_or_default();
+    let end = line
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX_REASON)
+        .last()
+        .unwrap_or(0);
+    line[..end].trim().to_string()
 }
 
 impl Observer {
@@ -76,11 +97,11 @@ impl Observer {
 
 impl ChangeSource for Observer {
     fn health(&self) -> ObserverHealth {
-        self.health.lock().expect("observer health").clone()
+        guarded(&self.health).clone()
     }
 
     fn join(&self) {
-        if let Some(worker) = self.worker.lock().expect("observer worker").take() {
+        if let Some(worker) = guarded(&self.worker).take() {
             let _ = worker.join();
         }
     }
@@ -95,9 +116,9 @@ fn supervise(config: &TmuxConfig, wake: &Wake, stop: &AtomicBool, health: &Mutex
             Err(reason) => reason,
         };
         {
-            let mut health = health.lock().expect("observer health");
+            let mut health = guarded(health);
             health.attached = false;
-            health.loss_reason = Some(reason);
+            health.loss_reason = Some(short(&reason));
         }
         wake();
         if started.elapsed() >= STABLE {
@@ -144,19 +165,14 @@ fn attach(
     let outcome = loop {
         match lines.recv_timeout(POLL) {
             Ok(Line::Hint) if attached => {
-                health.lock().expect("observer health").last_notification_ms = Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("system clock")
-                        .as_millis() as u64,
-                );
+                guarded(health).last_notification_unix_ms = Some(unix_ms());
                 wake();
             }
             Ok(Line::Hint) => {}
             Ok(Line::Ready) => {
                 attached = true;
                 {
-                    let mut health = health.lock().expect("observer health");
+                    let mut health = guarded(health);
                     health.attached = true;
                     health.loss_reason = None;
                 }
@@ -178,6 +194,14 @@ fn attach(
     end(&mut child, stdin);
     let _ = reader.join();
     outcome
+}
+
+/// Now, in Unix milliseconds. A clock set before the epoch reports the epoch
+/// rather than stopping the observer.
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 fn end(child: &mut Child, stdin: Option<std::process::ChildStdin>) {

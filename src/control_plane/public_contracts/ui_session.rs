@@ -137,19 +137,19 @@ pub struct SessionState {
 }
 
 /// Where tmux's one operator client is looking, as the session derives it from
-/// the observation it holds.
+/// the observation it holds. Whether that observation is current is the fleet
+/// panel's own fact, and is not repeated here.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum FocusDto {
-    /// The backend reports no focus.
+    /// No focus is reported: nothing has been read yet, or the backend has no
+    /// operator to report.
     #[default]
     Unreported,
     /// No operator client is attached.
     NoOperator,
     /// More than one operator client is attached, so none is chosen.
     Ambiguous,
-    /// The last inventory read failed, so the focus it held may be stale.
-    Unavailable,
     /// The focused pane's row; `None` when the canonical tree has no row for it.
     Focused { row: Option<UiRowId> },
 }

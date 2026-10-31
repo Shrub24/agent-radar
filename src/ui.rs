@@ -24,7 +24,9 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use crate::RowId;
 use crate::app::{App, DetailPage, Disclosure, Geometry, ProcessRow, ProcessTable, VisibleRow};
+use crate::control_plane::public_contracts::ui_session::FocusDto;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -82,10 +84,12 @@ pub fn render(
     } else {
         content_column(frame.area())
     };
+    let rows = app.draw_rows();
+    let focus = Focus::of(app, &rows);
     let hints = if rail && app.focus_message().is_none() && app.session_diagnostic().is_none() {
         Vec::new()
     } else {
-        footer(app, area.width as usize)
+        footer(app, area.width as usize, &focus)
     };
     let (body, hint_area) = regions(area, hints.len() as u16);
     if hint_area.height > 0 {
@@ -107,13 +111,12 @@ pub fn render(
         app,
     );
 
-    let rows = app.draw_rows();
     let block = if compact {
         Block::new()
     } else {
         Block::bordered()
             .border_style(Style::new().fg(panel_border(!app.details_focused())))
-            .title(tree_title(state, app))
+            .title(tree_title(state, app, &focus))
     };
     let tree_content = block.inner(tree_area);
     if rows.is_empty() {
@@ -124,39 +127,26 @@ pub fn render(
             tree_area,
         );
     } else {
-        let current = matches!(state.source_freshness(), SourceFreshness::Current);
-        let focused = app.focused_row();
+        let ink = RowInk {
+            width: tree_content.width as usize,
+            current: matches!(state.source_freshness(), SourceFreshness::Current),
+            compact,
+        };
         let items: Vec<ListItem> = rows
             .iter()
-            .map(|row| {
-                let item = match row {
-                    crate::ui_session::navigation::DrawRow::Known(row) => {
-                        if rail {
-                            rail_item(row, tick)
-                        } else {
-                            row_item(
-                                row,
-                                tick,
-                                tree_content.width as usize,
-                                current,
-                                compact,
-                                focused.as_ref() == Some(row.id),
-                            )
-                        }
+            .map(|row| match row {
+                crate::ui_session::navigation::DrawRow::Known(row) => {
+                    if rail {
+                        rail_item(row, tick)
+                    } else {
+                        row_item(row, tick, ink, focus.marks(row.id))
                     }
-                    crate::ui_session::navigation::DrawRow::Structure {
-                        row: wire,
-                        connectors,
-                        ..
-                    } => structure_item(wire, connectors, tree_content.width as usize, compact),
-                };
-                // Where the terminal is, apart from where this view's cursor is:
-                // the selection fill moves with browsing, this does not.
-                if focused.as_ref() == Some(row.id()) {
-                    item.style(Style::new().add_modifier(Modifier::UNDERLINED))
-                } else {
-                    item
                 }
+                crate::ui_session::navigation::DrawRow::Structure {
+                    row: wire,
+                    connectors,
+                    ..
+                } => structure_item(wire, connectors, ink, focus.marks(row.id())),
             })
             .collect();
         list_state.select(app.selected_index());
@@ -763,7 +753,54 @@ fn elide(text: &str, width: usize) -> String {
 /// A message takes this line rather than the source diagnostic's place: the
 /// freshness of the fleet is a property of everything drawn and stays in the
 /// tree heading and the details.
-fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
+/// Where the terminal is, as the rows this draw produced can show it.
+struct Focus {
+    /// The focused row, when the session places it in the tree.
+    row: Option<RowId>,
+    /// Whether the rows drawn include it: focus can be outside the listing.
+    shown: bool,
+}
+
+impl Focus {
+    fn of(app: &App, rows: &[crate::ui_session::navigation::DrawRow<'_>]) -> Self {
+        let row = app.focused_row();
+        let shown = row
+            .as_ref()
+            .is_some_and(|row| rows.iter().any(|drawn| drawn.id() == row));
+        Self { row, shown }
+    }
+
+    fn marks(&self, id: &RowId) -> bool {
+        self.row.as_ref() == Some(id)
+    }
+
+    /// The words the heading and the sidebar footer share, in the order a reader
+    /// needs them: whether this view follows, then what the focus is.
+    fn words(&self, app: &App) -> Vec<&'static str> {
+        let mut words = Vec::new();
+        if app.is_following() {
+            words.push("following");
+        }
+        if app.session_mirror().is_some() {
+            let state = match app.focus() {
+                Some(FocusDto::Focused { .. }) if self.row.is_none() || !self.shown => {
+                    "focus outside listing"
+                }
+                Some(FocusDto::NoOperator) => "no operator",
+                Some(FocusDto::Ambiguous) => "multiple operators",
+                // Nothing is claimed about focus when the fleet itself is not
+                // known: the panel's own freshness word says why.
+                None | Some(FocusDto::Focused { .. } | FocusDto::Unreported) => "",
+            };
+            if !state.is_empty() {
+                words.push(state);
+            }
+        }
+        words
+    }
+}
+
+fn footer(app: &App, width: usize, focus: &Focus) -> Vec<Line<'static>> {
     let palette = theme::palette();
     if let Some(problem) = app.session_diagnostic() {
         return vec![Line::from(Span::styled(
@@ -834,6 +871,13 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
         return wrap_hints(&pairs, width);
     }
     if app.is_sidebar() {
+        let words = focus.words(app);
+        let note = (!words.is_empty()).then(|| {
+            Line::from(Span::styled(
+                elide(&words.join(" · "), width),
+                Style::new().fg(theme::palette().muted),
+            ))
+        });
         let pairs = vec![
             ("j/k", String::new()),
             ("Enter", "focus".to_string()),
@@ -842,7 +886,8 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
             ("?", "commands".to_string()),
             ("B", "hide".to_string()),
         ];
-        return wrap_hints(&pairs, width);
+        let hints = wrap_hints(&pairs, width);
+        return note.into_iter().chain(hints).collect();
     }
     // The panel that has the keyboard says so by naming its own keys: the
     // details answer to a different set from the tree, and a reader who has just
@@ -973,7 +1018,7 @@ fn wrap_hints(pairs: &[(&str, String)], width: usize) -> Vec<Line<'static>> {
 /// Source freshness belongs here rather than on a line of its own: it is a
 /// property of everything the panel shows. The failure itself is written out in
 /// the details, where there is room for it.
-fn tree_title(state: &ObservationState, app: &App) -> Line<'static> {
+fn tree_title(state: &ObservationState, app: &App, focus: &Focus) -> Line<'static> {
     let palette = theme::palette();
     let (word, style) = match state.source_freshness() {
         SourceFreshness::Pending => ("pending", Style::new().fg(palette.subtle)),
@@ -995,14 +1040,13 @@ fn tree_title(state: &ObservationState, app: &App) -> Line<'static> {
         Span::raw("Fleet "),
         Span::styled(format!("· {word}"), style),
     ];
-    if app.is_following() {
-        spans.push(Span::styled(" · following", Style::new().fg(palette.muted)));
-    }
-    if let Some(status) = app.focus_status() {
-        spans.push(Span::styled(
-            format!(" · {status}"),
-            Style::new().fg(palette.retained),
-        ));
+    for word in focus.words(app) {
+        let ink = if word == "following" {
+            palette.muted
+        } else {
+            palette.retained
+        };
+        spans.push(Span::styled(format!(" · {word}"), Style::new().fg(ink)));
     }
     if !app.filter_query().is_empty() {
         spans.push(Span::styled(
@@ -1047,9 +1091,10 @@ fn empty_message(state: &ObservationState, app: &App) -> String {
 fn structure_item(
     wire: &crate::control_plane::public_contracts::ui_session::TreeRow,
     connectors: &crate::ui_session::navigation::Connectors,
-    width: usize,
-    compact: bool,
+    ink: RowInk,
+    focused: bool,
 ) -> ListItem<'static> {
+    let RowInk { width, compact, .. } = ink;
     let palette = theme::palette();
     let connector = Style::new().fg(palette.subtle);
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1085,17 +1130,27 @@ fn structure_item(
         palette.muted
     };
     spans.push(Span::styled(sanitize(&wire.label), Style::new().fg(ink)));
+    if focused {
+        spans.push(Span::styled(" ◆", Style::new().fg(palette.heading)));
+    }
     ListItem::new(Line::from(fit(spans, None, width)))
 }
 
-fn row_item(
-    row: &VisibleRow<'_>,
-    tick: usize,
+/// What every row builder needs to know about this draw.
+#[derive(Clone, Copy)]
+struct RowInk {
     width: usize,
-    source_current: bool,
+    /// Whether the observation behind these rows is current, or retained facts.
+    current: bool,
     compact: bool,
-    focused: bool,
-) -> ListItem<'static> {
+}
+
+fn row_item(row: &VisibleRow<'_>, tick: usize, ink: RowInk, focused: bool) -> ListItem<'static> {
+    let RowInk {
+        width,
+        current: source_current,
+        compact,
+    } = ink;
     let palette = theme::palette();
     let mut spans: Vec<Span<'static>> = Vec::new();
     // The span that gives way when the row is wider than the panel: the name,
@@ -2557,6 +2612,25 @@ mod tests {
         assert!(cut.ends_with('…'), "{cut}");
         // No width at all must not panic.
         let _ = fit(row(), Some(1), 0);
+    }
+
+    #[test]
+    fn a_view_names_following_and_only_speaks_about_a_focus_it_can_place() {
+        let rows: Vec<crate::ui_session::navigation::DrawRow<'_>> = Vec::new();
+        let focus = Focus::of(&App::sidebar(), &rows);
+        assert_eq!(focus.words(&App::sidebar()), vec!["following"]);
+
+        let dashboard = App::new();
+        assert!(Focus::of(&dashboard, &rows).words(&dashboard).is_empty());
+
+        // A focused row this draw did not produce is outside the listing whether
+        // the projection has no row for it or a filter hid it.
+        let shown = Focus {
+            row: Some(RowId::Workspace("w".into())),
+            shown: false,
+        };
+        assert!(shown.marks(&RowId::Workspace("w".into())));
+        assert!(!shown.marks(&RowId::Workspace("other".into())));
     }
 
     #[test]

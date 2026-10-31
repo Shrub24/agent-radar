@@ -939,7 +939,10 @@ fn the_observer_wakes_on_native_changes_is_no_operator_and_ends_with_its_stop_fl
     let seen = wakes.load(Ordering::SeqCst);
     probe.tmux(&["new-window", "-d", "-t", "main:"]);
     assert!(
-        eventually(DEADLINE, || source.health().last_notification_ms.is_some()
+        eventually(DEADLINE, || source
+            .health()
+            .last_notification_unix_ms
+            .is_some()
             && wakes.load(Ordering::SeqCst) > seen),
         "a native change woke the sampler"
     );

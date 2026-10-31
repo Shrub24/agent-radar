@@ -162,6 +162,13 @@ with a message naming both versions, and the Home Manager module asserts the sam
 floor at evaluation. Radar watches the server through one control-mode client with
 no pane output and no size, which is what the floor buys.
 
+That client's notifications are hints, never facts: each one brings the next read
+forward, and the read decides. The observation carries the observer's own health —
+whether it is attached, when it last accepted a notification, and why an attempt
+ended — so a view can tell a quiet server from a watcher that died. A lost watcher
+leaves the timer as the only wake: readings continue at the normal interval, at the
+cost of freshness latency rather than correctness.
+
 The daemon serves a named, server-scoped tmux handle with normalized observation
 and mux operations, direct-argv spawn launch, durable child binding, and typed
 one-shot exit observation on spawn edges. The adapter's launch requires `remain-on-exit` before dispatch;
