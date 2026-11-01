@@ -39,6 +39,39 @@ Not planned: an async rewrite of the domain actor (Tokio is already used for
 transport; the actor's sync loop is measurement-driven only), a generic RPC or
 operation framework, or one transport for every method.
 
+## Managed lifecycle convergence — proposed
+
+Planning artifacts: [`unified-managed-lifecycle`](openspec/changes/unified-managed-lifecycle/proposal.md).
+Unify managed executions admitted through `L` and `radar run --agent`: the
+lifecycle implementation and capabilities are the same; pane placement and
+completion-evidence sources are explicit differences. One confirmed `D` closes
+the agent and its pane. This supersedes the earlier first-D-preserves-pane idea.
+Spontaneous agent exit still follows shell/tmux persistence; restart composes
+shared termination and launch primitives without requiring public Close. A
+persistence setting remains deferred, not a reason for separate execution paths.
+
+- One underlying managed-execution close workflow, composed by cancel, restart,
+  spawn-close and container deletion. Review their contracts and durable outcomes
+  before consolidating; replace divergent implementations, with no compatibility
+  path. Container deletion must include admitted executions, not only executions
+  discoverable through spawn edges.
+- Capture exit code/signal at completion and before intentional pane removal;
+  delete read-triggered capture. Missing status must never block verified lifecycle
+  progression or requested cleanup. Interrupted-operation recovery is later work.
+- Audit other entrypoints for duplicated orchestration, competing authorities and
+  inconsistent capabilities. Identify concrete convergence candidates before
+  introducing a generic operation framework. Settle execution placement, resource
+  ownership, subtree ordering and partial-outcome semantics in the change design.
+
+### Deferred: lead succession and spawn-edge inheritance
+
+An externally started/admitted lead should be able to inherit existing spawn-edge
+relationships in future. This is undesigned: define authority transfer and identity
+semantics without rewriting historical producer provenance. Include a command or
+trigger that may move the inherited child panes into the lead's tab. Routing,
+placement, failure handling and whether movement is automatic remain open. Lower
+priority than lifecycle convergence; do not infer this behaviour from admission.
+
 ## Unified publication and transport direction
 
 The TUI foundation is implemented in
