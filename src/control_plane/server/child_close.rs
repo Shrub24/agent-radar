@@ -161,6 +161,11 @@ pub(super) fn execute_child_close(
         Err(error) => return registry_error(request, error),
     }
 
+    // A close removes the pane the execution's supervisor reports from, so the
+    // report is given its grace first: the same rule the launch cleanup follows,
+    // because the code is destroyed by the removal that follows it, not by which
+    // path asked for the removal.
+    subjects::await_completion(&registry, &registration.registration_id);
     let result = match bounded_close_dispatch(
         &backend,
         pane_id,

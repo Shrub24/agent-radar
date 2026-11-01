@@ -22,11 +22,28 @@ Planning only. Each group lands working behaviour, its relevant tests and docs; 
 - [x] 2.1 Implement one claim-addressed termination primitive on the existing verified-scope seam: TERM, shared graceful deadline, verified-scope KILL escalation and bounded verification. Verify a responsive execution stops gracefully, a TERM-ignoring execution is boundedly escalated, and a mismatched/unverifiable scope is never killed. Keep real identity/fencing behaviour in scope tests rather than mocking the property under test.
 
   Escalation is one function, `lifecycle::escalate`, so the deadline that calls it today and the operator request that will call it later cannot drift apart; an emptied verified scope is the evidence the execution is gone, which is what a zombie or an unreaped child looks like to a pidfd. Landed as one `Shutdown` window (graceful + escalation) shared by `cancel`, `stop` and `cancel_many`, with escalation of a verified scope through `systemctl --user kill --signal=KILL`. An unreadable scope withholds escalation but not the TERM, because the process is fenced by its own identity — the old rule settled without signalling and is restated in the unit test. A TERM-ignoring launch inside a real verified scope is escalated and then ends, covered by `a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart` and `a_launch_whose_process_ignores_term_is_escalated_before_its_pane_is_closed`; the escalation is named in the operation's effects as `scope escalated` until typed close outcomes replace that vocabulary.
-- [ ] 2.2 Implement one domain close path that composes termination, completion capture and generation-fenced pane removal. Verify one Close on an admitted agent removes its pane, missing code cannot hold removal, and a replacement claim/backend generation is not destroyed by stale authority. Ordinary shell closure must not require a managed scope. Document Close versus spontaneous exit.
+- [x] 2.2 Implement one domain close path that composes termination, completion capture and generation-fenced pane removal. Verify one Close on an admitted agent removes its pane, missing code cannot hold removal, and a replacement claim/backend generation is not destroyed by stale authority. Ordinary shell closure must not require a managed scope. Document Close versus spontaneous exit.
 
-  Capture-before-removal is in place: the pane cleanup waits a bounded grace for a supervisor report it does not yet have, so removing the pane cannot destroy the code the report carries, and a launch with nothing to report waits for nothing. `a_reported_code_survives_the_pane_a_close_removes` reads the code back after the pane is gone. Still to do: one composed close entry point. The existing removal path (`cleanup_launch_pane`) is not duplicated — it is the only one — but it also decides authorization (bound/revoked, spawn edge, instance fence, dead-pane evidence), so folding it into a domain `close` is a larger change than the primitive itself.
+  The order holds in one place: terminate, capture, remove. Removal is dispatched
+  through the single bounded close call, and the authorization that decides whether
+  this pane is Radar's to remove stays with each caller, because it needs the
+  backend and the verification budget. Close versus spontaneous exit is documented
+  in `context/lifecycle.md`. Capture-before-removal is `subjects::await_completion`
+  taken by both removal paths, and `a_reported_code_survives_the_pane_a_close_removes`
+  reads the code back after the pane is gone.
 
-- [ ] 2.3 Route lifecycle cancel, spawn/subject child-close, expiry and revoked-launch cleanup through the shared primitives with their existing authorization differences. Replace `cleanup_launch_pane` and child-close dispatch duplication rather than retaining bypasses. Verify operator/parent close parity, foreign-child rejection, already-ended close without a code, and durable same-ID replay without redispatch. Retain stop-only semantics for the explicit Stop intent.
+  Where the acceptance clause does not apply as written: a directly admitted
+  `radar run` execution has **no** spawn edge, so its pane is the operator's and is
+  deliberately not removed. Only a pane Radar created is removable, which is why
+  the removal policy keys on the recorded edge, not on the presence of a claim.
+
+- [x] 2.3 Route lifecycle cancel, spawn/subject child-close, expiry and revoked-launch cleanup through the shared primitives with their existing authorization differences. Replace `cleanup_launch_pane` and child-close dispatch duplication rather than retaining bypasses. Verify operator/parent close parity, foreign-child rejection, already-ended close without a code, and durable same-ID replay without redispatch. Retain stop-only semantics for the explicit Stop intent.
+
+  The launch cleanup no longer carries its own dispatch: it calls
+  `bounded_close_dispatch` and translates the answer through `PaneCleanup::from`,
+  which is the same translation every caller of that dispatch now shares. Child
+  close keeps its own admission, record and refusal vocabulary, and takes the same
+  completion grace before dispatching. Stop still removes nothing.
 - [ ] 2.4 Publish typed close outcomes separating resource removal, execution verification and optional completion diagnostics; update Rust DTOs, schemas, generated SDK types and pi-radar interpretation. Verify normal completion, unavailable status and confirmed survivors have distinguishable meanings. Update protocol/SDK docs and bump actual incompatible versions together; keep labels such as complete/cancel free of assignment-settlement effects.
 
 ## 3. Recursive container closure

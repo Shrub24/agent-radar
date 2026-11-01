@@ -535,19 +535,14 @@ pub(super) fn cleanup_launch_pane(
     if subject.process.identity.is_some() && subject.process.completion.is_none() {
         subjects::await_completion(registry, subject_id);
     }
-    let reader = Arc::clone(backend);
-    let cancel = Arc::clone(stopping);
-    let outcome = run_bounded(
-        budget,
+    let outcome = match bounded_close_dispatch(
+        backend,
+        &pane,
         stopping,
+        budget,
         Instant::now() + VERIFICATION_TIMEOUT,
-        "radar-pane-cleanup",
-        move || reader.close_outcome(&crate::runtime::CloseTarget::Pane(pane), &cancel),
-    );
-    let outcome = match outcome {
-        Ok(crate::runtime::CloseOutcome::Completed) => PaneCleanup::Cleaned,
-        Ok(crate::runtime::CloseOutcome::Refused(message)) => PaneCleanup::Refused(message),
-        Ok(crate::runtime::CloseOutcome::Unknown(message)) => PaneCleanup::Unknown(message),
+    ) {
+        Ok(outcome) => PaneCleanup::from(outcome),
         // The dispatch may have reached the backend and its answer was lost.
         Err(()) => PaneCleanup::Unknown("the cleanup did not finish inside its deadline".into()),
     };

@@ -104,3 +104,32 @@ What is *not* handled on purpose: a process in uninterruptible sleep, and a kill
 that could not be dispatched at all. Neither is a state an operator can act on —
 one ends when its I/O does, the other is an internal fault — so both are reported
 as an unverified outcome with the reason, and neither grows a retry workflow.
+
+## Close and a spontaneous exit are different events, and only one removes a pane
+
+A **spontaneous exit** is the program ending on its own. The subject settles on a
+verified exit, the pane is deliberately left in place because it is the last place
+the failure or the status can be read (`remain-on-exit`), and nothing is removed.
+
+**Close** is an operator or parent act: terminate the hosted execution, capture how
+it ended, then remove the pane. The order is the contract. Terminating first is
+what makes the pane the daemon's to remove; capturing next is what keeps the
+program's code, because the supervisor that reports it lives in the pane; removing
+last is taken only on a placement whose backend instance is still the one serving.
+
+Two consequences worth keeping straight:
+
+- A **missing code never holds a removal**. The report is given a bounded grace
+  (`subjects::await_completion`), and then the transition proceeds whether or not
+  it arrived. "Exit verified, code unavailable" is a valid end state.
+- The grace lives where removal is dispatched, not where a caller is: a launch
+  cancel (`cleanup_launch_pane`) and a child close (`execute_child_close`) both
+  take it before dispatching, because the code is lost to the removal rather than
+  to whichever path asked for it.
+
+Pane removal is dispatched through one bounded call
+(`verification::bounded_close_dispatch`) and translated into each record's own
+vocabulary (`PaneCleanup` for a launch, `CloseResult` for a child). The
+*authorization* differs on purpose — a launch pane is removable only for a
+bound/revoked launch that has ended, a child pane only with a verified occupant or
+dead-pane evidence — and that difference is the caller's, not the dispatcher's.

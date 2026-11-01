@@ -451,6 +451,17 @@ pub enum PaneCleanup {
     Unknown(String),
 }
 
+impl From<crate::runtime::CloseOutcome> for PaneCleanup {
+    /// A backend's answer to one pane close, in the vocabulary the launch records.
+    fn from(outcome: crate::runtime::CloseOutcome) -> Self {
+        match outcome {
+            crate::runtime::CloseOutcome::Completed => Self::Cleaned,
+            crate::runtime::CloseOutcome::Refused(message) => Self::Refused(message),
+            crate::runtime::CloseOutcome::Unknown(message) => Self::Unknown(message),
+        }
+    }
+}
+
 impl PaneCleanup {
     /// What the outcome reads as on a cancel's effects list.
     pub fn effect(&self) -> String {
