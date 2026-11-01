@@ -270,6 +270,7 @@ pub(super) fn execute_spawn(
         }
     };
     let (params, lineage) = continuation(core, params)?;
+    super::closing::refuse_if_closing(core, &parent_pane)?;
     spawn_child(
         request,
         core,
@@ -961,6 +962,11 @@ pub(super) fn admit_request(
             Arc::clone(&core.stopping),
         )
     };
+    // A pane inside a branch being removed is refused before any evidence is
+    // staged: there is no process to admit into a place that is about to be gone.
+    if let Err(refusal) = super::closing::refuse_if_closing(core, &params.pane) {
+        return Response::refused(&request.id, &refusal);
+    }
     // The caller reports its own placement; what makes the claim credible is that
     // this process is the pane's own descendant, verified here and not taken from
     // the caller's environment. The pane it names is the runtime's own id, so the

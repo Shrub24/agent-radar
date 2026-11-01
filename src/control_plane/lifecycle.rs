@@ -430,7 +430,7 @@ impl Shutdown {
 /// How a managed program ended, as the process supervising it saw it. It is a
 /// fact about the execution, recorded when it happens: a retained pane is not
 /// durable storage for it, and its absence never blocks a lifecycle transition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Completion {
     pub code: Option<i32>,
@@ -444,6 +444,8 @@ pub enum PaneCleanup {
     /// One close was dispatched in the instance that created the pane, and it
     /// answered.
     Cleaned,
+    /// The pane was already gone, so nothing was dispatched.
+    Absent,
     /// Nothing was dispatched, for this reason.
     Refused(String),
     /// A close was dispatched and its answer was lost. It is never dispatched
@@ -462,13 +464,95 @@ impl From<crate::runtime::CloseOutcome> for PaneCleanup {
     }
 }
 
-impl PaneCleanup {
-    /// What the outcome reads as on a cancel's effects list.
-    pub fn effect(&self) -> String {
+/// What one close established, in parts that answer different questions.
+///
+/// Whether the execution ended, what became of the pane that hosted it, and — when
+/// a supervisor reported it — how the program ended. A reader takes the part it
+/// needs; nothing here has to be recovered from prose, and no part is inferred
+/// from another. In particular a removal that completed says nothing about the
+/// program's code, and a verified exit says nothing about the pane, which for a
+/// spontaneous exit is deliberately retained.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClosedExecution {
+    pub execution: ExecutionEnd,
+    /// Absent when the operation removes nothing: a stop ends the process and
+    /// leaves the pane where it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ResourceEnd>,
+    /// How the program ended, when the process supervising it reported. Absent
+    /// means the code was not available, never that none exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<Completion>,
+    /// Whether the graceful window ran out and the verified scope was killed.
+    /// The escalation is a fact an operator may want, and no longer a word in a
+    /// prose list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub escalated: bool,
+}
+
+/// Whether the execution this close addressed is known to have ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "state", content = "reason")]
+pub enum ExecutionEnd {
+    /// The captured process was verified gone.
+    Exited,
+    /// What happened to it could not be established, and this says why.
+    Unverified(String),
+    /// Nothing was signalled: the claim it named is not the execution this
+    /// operation may end.
+    Unsignalled(String),
+}
+
+/// What became of the pane that hosted the execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "state", content = "reason")]
+pub enum ResourceEnd {
+    /// A close was dispatched in the instance that created the pane, and it
+    /// answered.
+    Removed,
+    /// The pane was already gone when the removal was attempted.
+    Absent,
+    /// Nothing was dispatched, for this reason.
+    Kept(String),
+    /// A close was dispatched and its answer was lost. It is never dispatched
+    /// again for this execution.
+    Unverified(String),
+}
+
+impl From<&PaneCleanup> for ResourceEnd {
+    fn from(cleanup: &PaneCleanup) -> Self {
+        match cleanup {
+            PaneCleanup::Cleaned => Self::Removed,
+            PaneCleanup::Absent => Self::Absent,
+            PaneCleanup::Refused(reason) => Self::Kept(reason.clone()),
+            PaneCleanup::Unknown(reason) => Self::Unverified(reason.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceEnd {
+    /// One short phrase, for the effect lists that still name what happened in
+    /// order. Reads from the same vocabulary a typed answer uses, so the two
+    /// cannot describe the same close differently.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cleaned => "pane cleaned up".to_string(),
-            Self::Refused(reason) => format!("pane kept: {reason}"),
-            Self::Unknown(reason) => format!("pane cleanup unverified: {reason}"),
+            Self::Removed => write!(f, "removed"),
+            Self::Absent => write!(f, "already absent"),
+            Self::Kept(_) => write!(f, "kept"),
+            Self::Unverified(_) => write!(f, "cleanup unverified"),
+        }
+    }
+}
+
+impl From<&Exit> for ExecutionEnd {
+    fn from(exit: &Exit) -> Self {
+        match exit {
+            Exit::Exited => Self::Exited,
+            Exit::Unverified(reason) => Self::Unverified(reason.clone()),
+            Exit::Unresolved => Self::Unsignalled(
+                "the recorded process identity could not be resolved to this execution".into(),
+            ),
         }
     }
 }
@@ -1019,35 +1103,54 @@ pub fn place(
 /// is still closed with the container it runs in.
 pub fn placements(registry: &Registry) -> Vec<Placed> {
     let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
-    let subjects: BTreeMap<String, String> = log
-        .ids()
-        .filter_map(|id| {
-            let facts = log.facts(id)?;
-            Some((
-                facts.attachment.registration_id.clone(),
-                facts.attachment.subject_id.clone()?,
-            ))
-        })
-        .collect();
-    log.processes()
-        .filter_map(|(registration_id, facts)| {
-            let placement = facts.placement.clone()?;
-            running(facts).then(|| Placed {
-                registration_id: registration_id.clone(),
-                subject_id: subjects.get(registration_id).cloned(),
+    // Placement is one fact about one execution, and the log holds executions in
+    // two places: the attachment of a registered process and the execution record
+    // itself. Whichever carries the placement is the same execution, so they are
+    // read together and keyed by registration.
+    let mut placements: BTreeMap<String, Placed> = BTreeMap::new();
+    let mut record = |registration_id: &str,
+                      facts: &crate::control_plane::events::ProcessFacts,
+                      subject_id: Option<String>| {
+        let Some(placement) = facts.placement.clone() else {
+            return;
+        };
+        if ended(facts) {
+            return;
+        }
+        // A subject is a fact of the attachment, so an execution read first
+        // without one takes the one its attachment names.
+        let known = placements
+            .entry(registration_id.to_string())
+            .or_insert_with(|| Placed {
+                registration_id: registration_id.to_string(),
+                subject_id: None,
                 placement,
-            })
-        })
-        .collect()
+            });
+        if known.subject_id.is_none() {
+            known.subject_id = subject_id;
+        }
+    };
+    for (registration_id, facts) in log.processes() {
+        record(registration_id, facts, None);
+    }
+    for id in log.ids() {
+        if let Some(facts) = log.facts(id) {
+            record(
+                &facts.attachment.registration_id,
+                &facts.execution,
+                facts.attachment.subject_id.clone(),
+            );
+        }
+    }
+    placements.into_values().collect()
 }
 
-/// Whether this execution has not ended: a revoked launch, a verified exit, an
-/// exit established on other evidence, and a reported completion are each an end.
-fn running(facts: &crate::control_plane::events::ProcessFacts) -> bool {
-    !matches!(facts.state, State::Revoked)
-        && facts.exited_at.is_none()
-        && facts.ended_externally_at.is_none()
-        && facts.completion.is_none()
+/// Whether an execution has ended, on the evidence that says so. Being revoked is
+/// not one of them.
+fn ended(process: &crate::control_plane::events::ProcessFacts) -> bool {
+    process.exited_at.is_some()
+        || process.ended_externally_at.is_some()
+        || process.completion.is_some()
 }
 
 fn live(process: &ProcessRecord) -> bool {
@@ -1345,6 +1448,29 @@ pub fn await_completion(registry: &Registry, key: &str) -> Option<Completion> {
             .and_then(|claim| claim.process.completion);
         if reported.is_some() || std::time::Instant::now() >= until {
             return reported;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits, boundedly, for the supervisor's report of every execution in one place.
+///
+/// One window for the whole set, not one per member: a branch of five agents must
+/// not pay five graces before its root is removed, and the reports are all on their
+/// way at the same time. Reads the records only: nothing here dispatches.
+pub fn await_completions(registry: &Registry, keys: &[String]) {
+    let until = std::time::Instant::now() + COMPLETION_GRACE;
+    loop {
+        let outstanding: Vec<&String> = keys
+            .iter()
+            .filter(|key| {
+                read(registry, key).ok().flatten().is_some_and(|claim| {
+                    claim.process.identity.is_some() && claim.process.completion.is_none()
+                })
+            })
+            .collect();
+        if outstanding.is_empty() || std::time::Instant::now() >= until {
+            return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }

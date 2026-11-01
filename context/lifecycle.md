@@ -133,3 +133,56 @@ vocabulary (`PaneCleanup` for a launch, `CloseResult` for a child). The
 *authorization* differs on purpose — a launch pane is removable only for a
 bound/revoked launch that has ended, a child pane only with a verified occupant or
 dead-pane evidence — and that difference is the caller's, not the dispatcher's.
+
+## A close publishes parts, not prose
+
+`lifecycle.cancel`, `lifecycle.stop` and `topology.delete` publish `closed` on
+their record: `execution`, `resource`, optional `completion`, and `escalated`.
+The split exists because a consumer acts on the parts differently, and because the
+old flat list forced every reader to parse words:
+
+- `execution` says whether the captured process is verified gone. `unsignalled`
+  means nothing was signalled because the claim named is not one this operation
+  may end — a refusal of authority, not an accident.
+- `resource` says what became of the pane, and is **absent** when the operation
+  removes nothing at all. A cancel always reports one, including `kept` for a
+  launch with no pane of this daemon's; that is a different answer from "this
+  operation never removes a pane", and the field's presence carries it.
+- A pane that is already gone is `absent`, and nothing is dispatched for it. It
+  used to be recorded as an unverified cleanup of a pane that plainly was not
+  there, because the backend answered "can't find pane".
+- `completion` is the supervisor's report. Its absence is normal, never an error,
+  and never a reason to hold a transition.
+- `escalated` is a typed fact, not a word: without it, a forced shutdown would be
+  invisible to an operator once the prose went away.
+
+Nothing about a close is inferred from `effects` any more. `effects` remains for
+operations with no typed outcome of their own (creates, reloads, restart), and
+where it names a pane removal it renders the same `ResourceEnd` vocabulary so the
+two cannot describe one close differently.
+
+## A place's contents are its executions' placements, not its spawn edges
+
+Closing a branch finds what runs inside it from where each execution recorded
+itself: the pane, with the instance that made it. A spawn edge records who asked
+for a launch, which is provenance, not where something runs now; a directly
+admitted `radar run --agent` execution has no edge at all, and a branch closed over
+edges alone would leave it running inside a place the operator just removed.
+
+Two traps, both found by building it:
+
+- **Revocation is not an ending.** A revoked launch is cancelled work; revocation
+  alone signals nothing. Filtering revoked executions out of discovery hides a
+  process that is still running inside a place about to be removed, so discovery
+  excludes only the evidence that says an execution ended — a verified exit, an
+  externally established end, or a reported completion.
+- **Placement is stored on the execution, and the log holds executions in more
+  than one projection** — the attachment of a registered process and the process
+  record itself. Reading only one of them silently misses entire classes of
+  execution (a registered agent one way, an admitted one the other), so both are
+  read and keyed by registration. A subject comes from the attachment, because that
+  is the record that has one.
+
+The branch also takes one completion window for the whole set before the root is
+removed: the codes belong to executions whose supervisors live in the panes being
+destroyed, and a per-member grace would make a five-agent branch pay five.

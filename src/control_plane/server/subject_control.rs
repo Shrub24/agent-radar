@@ -104,12 +104,19 @@ pub(super) fn run_subject_control(
         ),
         _ => None,
     };
+    // The supervisor's report is read back here rather than at the pane, so a
+    // close that removed the pane still reports how the program ended. It is
+    // absent when nothing reported: never an error, and never a block.
+    let completion = subjects::read(&registry, &subject_id)
+        .ok()
+        .flatten()
+        .and_then(|claim| claim.process.completion);
     let settlement = match termination {
         Ok(termination) => {
             if let (subjects::Exit::Exited, Some(backend)) = (&termination.exit, &backend) {
                 retire_wake(backend, &subject_id, &stopping);
             }
-            termination_outcome(&termination, operation, cleanup.as_ref())
+            termination_outcome(&termination, operation, cleanup.as_ref(), completion)
         }
         Err(error) => Settlement::new(RequestOutcome::Unknown, None, Some(&error), Vec::new()),
     };
@@ -429,6 +436,10 @@ pub(super) fn run_restart(
             "restart needs the lead's own recorded pane as its anchor".to_string(),
         ));
     };
+    // A successor launched into a branch that is being removed would arrive in a
+    // place about to disappear, so the restart is refused before it signals
+    // anything: the predecessor keeps running until the close decides its fate.
+    super::closing::refuse_if_closing(core, &anchor)?;
     let now = store::now_ms();
     let subject_key = subject.subject_id.clone();
     let cancel = match admit(
@@ -669,7 +680,7 @@ pub(super) fn restart_lead(
                 verification,
                 store::now_ms(),
             ) {
-                Some(cleanup) => cleanup.effect(),
+                Some(cleanup) => format!("pane {}", subjects::ResourceEnd::from(&cleanup)),
                 None => "pane kept".to_string(),
             },
         );
@@ -785,42 +796,44 @@ pub(super) fn cancel_target(
     Ok((subject.claim_id.clone(), subject.subject_id))
 }
 
-/// What a cancel's or stop's effects read as on its record: the outcome the caller
-/// may rely on, the message for it, and each effect named separately. Only a
-/// cancel names the pane, because only a cancel acts on it.
+/// What a cancel or stop established, in the parts a reader acts on.
+///
+/// Nothing is described in prose: whether the execution ended, whether the pane
+/// was removed, and — when a supervisor reported one — how the program ended are
+/// separate answers, because a completed removal says nothing about the code and
+/// a verified exit says nothing about the pane. Only a cancel names a pane,
+/// because only a cancel acts on one.
 pub(super) fn termination_outcome(
     termination: &subjects::Termination,
     operation: ops::Operation,
     cleanup: Option<&subjects::PaneCleanup>,
+    completion: Option<subjects::Completion>,
 ) -> Settlement {
-    let mut effects = Vec::new();
-    if termination.revoked {
-        effects.push("launch revoked".to_string());
-    }
-    if termination.signal_attempted {
-        effects.push("sigterm dispatched".to_string());
-    }
-    if termination.escalated {
-        effects.push("scope escalated".to_string());
-    }
-    if operation == ops::Operation::Cancel {
-        match cleanup {
-            Some(cleanup) => effects.push(cleanup.effect()),
-            None => effects.push("pane kept".to_string()),
-        }
-    }
+    let closed = subjects::ClosedExecution {
+        execution: (&termination.exit).into(),
+        // A cancel always answers for the pane, including when the launch has
+        // none of this daemon's: "nothing was removed" and "this operation never
+        // removes" are different answers.
+        resource: (operation == ops::Operation::Cancel).then(|| {
+            cleanup.map_or_else(
+                || {
+                    subjects::ResourceEnd::Kept(
+                        "the launch records no pane of this daemon's".into(),
+                    )
+                },
+                subjects::ResourceEnd::from,
+            )
+        }),
+        completion,
+        escalated: termination.escalated,
+    };
+    let settlement = Settlement::completed(Vec::new()).closed(closed);
     match &termination.exit {
-        subjects::Exit::Unresolved => {
-            effects.push("process identity unresolved".to_string());
-            Settlement::completed(effects)
-        }
-        subjects::Exit::Exited => {
-            effects.push("process exit verified".to_string());
-            Settlement::completed(effects)
-        }
         subjects::Exit::Unverified(message) => {
-            Settlement::new(RequestOutcome::Unknown, None, Some(message), effects)
+            Settlement::new(RequestOutcome::Unknown, None, Some(message), Vec::new())
+                .closed(settlement.closed.expect("just built"))
         }
+        subjects::Exit::Unresolved | subjects::Exit::Exited => settlement,
     }
 }
 

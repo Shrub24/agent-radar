@@ -2,6 +2,14 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Radar 0.10.0
+
+- **Breaking:** a close now reports what it established as typed parts on its record's `closed` field, and wire revision 14 requires a matching daemon and consumer. A read of `effects` prose to find out whether a pane was closed, or whether the process was verified gone, no longer works for `lifecycle.cancel`, `lifecycle.stop` and `topology.delete`; those operations publish `closed` instead and leave `effects` empty.
+- `closed.execution` is `exited`, or an unverified or unsignalled result with the reason. `closed.resource` says what became of the pane — `removed`, `absent`, `kept` or `unverified` — and is absent for an operation that removes nothing, so a stop no longer has to imply it kept the pane. `closed.completion` carries the program's code and signal when the process supervising it reported, and is absent when it did not: an exit verified without a code is a normal outcome, not a failure.
+- A verified exit and a pane removal are separate answers, and neither implies the other. A spontaneous exit keeps its pane on purpose; a removal may follow an exit whose code was never reported.
+- The SIGKILL step of a shutdown is one function (`lifecycle::escalate`) called by the graceful deadline, so an operator request and a configuration that shorten or disable that deadline later have a single place to act on.
+- `LocalProcfsVerifier` treats an exited-but-unreaped process as absent. It read `/proc/<pid>`, which survives until the parent reaps it, so a killed execution could be reported as still running.
+
 ## Radar 0.9.0
 
 - **Breaking:** the UI session contract changed shape, so wire revision 13 requires a matching daemon and frontend rather than a mixed pair; a pi-radar newer than the SDK floor refuses the daemon, and a frontend left on the previous UI contract finds no `ui.attach`. Upgrade both together, and keep the previous pair if you need to roll back.

@@ -160,6 +160,8 @@ pub struct Settlement {
     pub category: Option<Category>,
     pub message: Option<String>,
     pub effects: Vec<String>,
+    /// What a close established, when this settlement is one.
+    pub closed: Option<crate::control_plane::lifecycle::ClosedExecution>,
 }
 
 impl Settlement {
@@ -174,7 +176,14 @@ impl Settlement {
             category,
             message: message.map(str::to_string),
             effects,
+            closed: None,
         }
+    }
+
+    /// Names what this close established, in place of prose a reader would parse.
+    pub fn closed(mut self, closed: crate::control_plane::lifecycle::ClosedExecution) -> Self {
+        self.closed = Some(closed);
+        self
     }
 
     /// The operation ran and these are the effects it had.
@@ -189,6 +198,7 @@ impl Settlement {
             category: Some(category),
             message: Some(message.into()),
             effects: Vec::new(),
+            closed: None,
         }
     }
 
@@ -204,6 +214,7 @@ impl Settlement {
             category: Some(Category::BackendUnavailable),
             message: Some(message.into()),
             effects: Vec::new(),
+            closed: None,
         }
     }
 }
@@ -265,6 +276,10 @@ pub struct RequestRecord {
     pub message: Option<String>,
     #[serde(default)]
     pub effects: Vec<String>,
+    /// What a close established: whether the execution ended, what became of the
+    /// pane, and the completion when a supervisor reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<crate::control_plane::lifecycle::ClosedExecution>,
     /// The identity a creation reported, in the runtime's own words: a kind and
     /// an id. Absent unless a create completed and its answer named the location
     /// — a refused or uncertain operation created nothing, and prose a client
@@ -311,6 +326,10 @@ pub struct PublicRequestRecord {
     pub message: Option<String>,
     #[serde(default)]
     pub effects: Vec<String>,
+    /// What a close established: whether the execution ended, what became of the
+    /// pane, and the completion when a supervisor reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<crate::control_plane::lifecycle::ClosedExecution>,
     /// The identity a creation reported, in the runtime's own words: a kind and
     /// an id. Absent unless a create completed and its answer named the location
     /// — a refused or uncertain operation created nothing, and prose a client
@@ -351,6 +370,7 @@ impl RequestRecord {
             requested_at: format_millis(now_ms),
             expires_at: format_millis(now_ms + (ttl_seconds(method) as i64) * 1000),
             state: RecordState::Pending,
+            closed: None,
             outcome: None,
             category: None,
             message: None,
@@ -416,6 +436,7 @@ impl RequestRecord {
             category: settlement.category,
             message: settlement.message,
             effects: settlement.effects,
+            closed: settlement.closed,
             completed_at: Some(format_millis(now_ms)),
             ..self.clone()
         }
@@ -480,6 +501,7 @@ impl From<RequestRecord> for PublicRequestRecord {
             requested_at: record.requested_at,
             expires_at: record.expires_at,
             state: record.state,
+            closed: record.closed,
             outcome: record.outcome,
             category: record.category,
             message: record.message,

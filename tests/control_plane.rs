@@ -63,6 +63,9 @@ fn ui_session_with(
 }
 
 use agent_radar::Daemon;
+use agent_radar::control_plane::lifecycle::{
+    ExecutionEnd as ClosedAsExecutionEnd, ResourceEnd as ClosedAsResourceEnd,
+};
 use agent_radar::control_plane::ops::Operation;
 use agent_radar::control_plane::public_contracts::ui_session::AttachmentRole;
 use agent_radar::control_plane::registry::child_close::{CloseIntent, CloseOutcome as ClosedAs};
@@ -5080,16 +5083,22 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         RequestOutcome::Completed,
         "{cancelled:?}"
     );
+    let closed = cancelled
+        .request
+        .closed
+        .as_ref()
+        .expect("a close reports what it established");
     assert_eq!(
-        cancelled.request.effects,
-        [
-            "launch revoked",
-            "sigterm dispatched",
-            "pane cleaned up",
-            "process exit verified"
-        ],
+        closed.execution,
+        ClosedAsExecutionEnd::Exited,
         "{cancelled:?}"
     );
+    assert_eq!(
+        closed.resource,
+        Some(ClosedAsResourceEnd::Removed),
+        "{cancelled:?}"
+    );
+    assert!(!closed.escalated, "{cancelled:?}");
     assert!(
         !Path::new(&format!("/proc/{pid}")).exists(),
         "captured process {pid} still runs"
@@ -5268,13 +5277,15 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         "completed",
         "{cancelled}"
     );
+    let closed = &result_record(&cancelled)["closed"];
     assert_eq!(
-        result_record(&cancelled)["effects"],
-        json!([
-            "sigterm dispatched",
-            "pane cleaned up",
-            "process exit verified"
-        ]),
+        closed["execution"],
+        json!({"state": "exited"}),
+        "{cancelled}"
+    );
+    assert_eq!(
+        closed["resource"],
+        json!({"state": "removed"}),
         "{cancelled}"
     );
     assert!(!process_exists(pid), "the bound process {pid} still runs");
@@ -5327,14 +5338,15 @@ fn a_registration_after_cancel_is_refused_and_the_launch_stays_revoked() {
     let pid = captured_identity(&state, &subject).pid;
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    let closed = &result_record(&cancelled)["closed"];
     assert_eq!(
-        result_record(&cancelled)["effects"],
-        json!([
-            "launch revoked",
-            "sigterm dispatched",
-            "pane cleaned up",
-            "process exit verified"
-        ]),
+        closed["execution"],
+        json!({"state": "exited"}),
+        "{cancelled}"
+    );
+    assert_eq!(
+        closed["resource"],
+        json!({"state": "removed"}),
         "{cancelled}"
     );
     assert!(!process_exists(pid), "the revoked process {pid} still runs");
@@ -5426,8 +5438,8 @@ fn a_revoked_launch_stays_revoked_and_unsignalled_across_a_daemon_restart() {
     assert_eq!(cancel_subject(&mut client, &cancel_id, &subject), first);
     let fresh = cancel_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
-        result_record(&fresh)["effects"],
-        json!(["pane cleaned up", "process exit verified"]),
+        result_record(&fresh)["closed"]["resource"],
+        json!({"state": "removed"}),
         "{fresh}"
     );
     let after = subject_record(&state, &subject);
@@ -5518,11 +5530,13 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
         "completed",
         "{cancelled}"
     );
+    let closed = &result_record(&cancelled)["closed"];
     assert_eq!(
-        result_record(&cancelled)["effects"],
-        json!(["launch revoked", "pane kept", "process identity unresolved"]),
+        closed["execution"]["state"],
+        json!("unsignalled"),
         "{cancelled}"
     );
+    assert_eq!(closed["resource"]["state"], json!("kept"), "{cancelled}");
     let subject = subject_record(&state, &ticket.claim_id);
     assert_eq!(subject["state"], "revoked");
     assert_eq!(subject["signalled_at"], Value::Null, "{subject}");
@@ -5549,8 +5563,8 @@ fn a_launch_that_exits_at_once_is_observable_without_a_registration() {
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
-        result_record(&cancelled)["effects"],
-        json!(["launch revoked", "pane cleaned up", "process exit verified"]),
+        result_record(&cancelled)["closed"]["execution"],
+        json!({"state": "exited"}),
         "{cancelled}"
     );
     assert!(subject_record(&state, &subject)["exited_at"].is_string());
@@ -8380,6 +8394,11 @@ fn stage_dead_pane(
 #[test]
 fn an_admitted_execution_records_verified_placement_and_is_found_by_its_pane() {
     let sandbox = Sandbox::new("admitted-placement");
+    // Opened before the daemon, so this handle is the process-wide log the daemon
+    // appends to: a second open returns that same log, while opening first and
+    // reading later is what makes the daemon's own append visible here.
+    let registry =
+        agent_radar::control_plane::Registry::open(&sandbox.state()).expect("a registry");
     let backend = MuxBackend::new(TRACKED_SPAWN_PRIMITIVES)
         .observing(&["wA:p2"])
         .with_foreground(ForegroundEvidence::command(200, Some("sh".into()), None));
@@ -8418,8 +8437,6 @@ fn an_admitted_execution_records_verified_placement_and_is_found_by_its_pane() {
         "the key is the supervisor's alone: {response}"
     );
 
-    let registry =
-        agent_radar::control_plane::Registry::open(&sandbox.state()).expect("a registry");
     let placed = agent_radar::control_plane::lifecycle::placed_at(&registry, "%2")
         .expect("the admitted execution is placed where it runs");
     assert_eq!(placed.registration_id, registration);
@@ -10080,10 +10097,11 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
     let request_id = random_uuid();
     let stopped = stop_subject(&mut client, &request_id, &subject);
     assert_eq!(result_record(&stopped)["outcome"], "completed", "{stopped}");
-    assert_eq!(
-        result_record(&stopped)["effects"],
-        json!(["sigterm dispatched", "process exit verified"]),
-        "{stopped}"
+    let closed = &result_record(&stopped)["closed"];
+    assert_eq!(closed["execution"], json!({"state": "exited"}), "{stopped}");
+    assert!(
+        closed.get("resource").is_none(),
+        "a stop removes no pane: {stopped}"
     );
     await_gone(pid);
     let signalled = subject_record(&state, &subject)["signalled_at"].clone();
@@ -10097,8 +10115,8 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
 
     let fresh = stop_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
-        result_record(&fresh)["effects"],
-        json!(["process exit verified"]),
+        result_record(&fresh)["closed"]["execution"],
+        json!({"state": "exited"}),
         "{fresh}"
     );
     assert_eq!(subject_record(&state, &subject)["signalled_at"], signalled);
@@ -10132,8 +10150,10 @@ fn a_term_ignoring_process_is_signalled_once_and_its_end_is_never_assumed() {
     let pid = captured_identity(&state, &subject).pid;
 
     let first = stop_subject(&mut client, &random_uuid(), &subject);
-    let effects = result_record(&first)["effects"].to_string();
-    assert!(effects.contains("sigterm dispatched"), "{first}");
+    assert!(
+        !subject_record(&state, &subject)["signalled_at"].is_null(),
+        "{first}"
+    );
     // Two honest reviews of the same stop are possible: its end was established
     // (gracefully or by escalating a verified scope), or it is still running and
     // said so. What is never possible is claiming an end it did not establish.
@@ -10156,32 +10176,21 @@ fn a_term_ignoring_process_is_signalled_once_and_its_end_is_never_assumed() {
         subject,
         "the durable lane is the subject, not its pane"
     );
-    let cancellation = client.call_id(
+    // Signal intent is recorded once, so no later request signals it again —
+    // whether that request was answered, refused as in flight, or replays the
+    // first one. The signal stamp is the invariant; the reply shape is not.
+    let signalled = subject_record(&state, &subject)["signalled_at"].clone();
+    assert!(!signalled.is_null(), "the first stop recorded its signal");
+    let _cancellation = client.call_id(
         &random_uuid(),
         "lifecycle.cancel",
         json!({"request": {"subject_id": subject, "claim_id": subject}}),
     );
-    assert!(
-        !result_record(&cancellation)["effects"]
-            .to_string()
-            .contains("sigterm dispatched"),
-        "{cancellation}"
-    );
-    // Signal intent is recorded once, so no later request signals it again —
-    // whatever the first one established about the end.
-    let signalled = subject_record(&state, &subject)["signalled_at"].clone();
-    assert!(!signalled.is_null(), "the first stop recorded its signal");
-    let second = stop_subject(&mut client, &random_uuid(), &subject);
-    assert!(
-        !result_record(&second)["effects"]
-            .to_string()
-            .contains("sigterm dispatched"),
-        "{second}"
-    );
+    let _second = stop_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
         subject_record(&state, &subject)["signalled_at"],
         signalled,
-        "the second stop did not signal it again"
+        "no later request signalled it again"
     );
 
     if process_exists(pid) {
@@ -10229,10 +10238,9 @@ fn an_unbound_launch_whose_process_exited_has_its_pane_cleaned_up_once() {
         "completed",
         "{cancelled}"
     );
-    assert!(
-        result_record(&cancelled)["effects"]
-            .to_string()
-            .contains("pane cleaned up"),
+    assert_eq!(
+        result_record(&cancelled)["closed"]["resource"],
+        json!({"state": "removed"}),
         "{cancelled}"
     );
     assert!(
@@ -10248,11 +10256,10 @@ fn an_unbound_launch_whose_process_exited_has_its_pane_cleaned_up_once() {
 
     // A later cancel reports the recorded outcome and closes nothing again.
     let second = cancel_subject(&mut client, &random_uuid(), &subject);
-    assert!(
-        result_record(&second)["effects"]
-            .to_string()
-            .contains("pane cleaned up"),
-        "{second}"
+    assert_eq!(
+        result_record(&second)["closed"]["resource"],
+        json!({"state": "removed"}),
+        "the recorded removal is reported, and nothing is closed again: {second}"
     );
     assert!(
         !pane_ids(&server).contains(&pane),
@@ -10341,8 +10348,11 @@ fn a_launch_whose_process_ignores_term_is_escalated_before_its_pane_is_closed() 
     let pane = launch_pane(&mut client, &spawn_id);
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
-    let effects = result_record(&cancelled)["effects"].to_string();
-    assert!(effects.contains("scope escalated"), "{cancelled}");
+    assert_eq!(
+        result_record(&cancelled)["closed"]["escalated"],
+        json!(true),
+        "{cancelled}"
+    );
     assert_eq!(
         result_record(&cancelled)["outcome"],
         "completed",
@@ -10996,6 +11006,28 @@ fn workspace_inventory(workspace_id: &str) -> FleetObservation {
     }
 }
 
+/// One workspace holding one pane, for the fixtures whose agent runs in it.
+fn workspace_with_a_pane(workspace_id: &str) -> FleetObservation {
+    let mut inventory = workspace_inventory(workspace_id);
+    inventory.tabs = vec![agent_radar::model::Tab {
+        tab_id: format!("{workspace_id}:t1"),
+        workspace_id: workspace_id.into(),
+        label: None,
+        number: Some(1),
+    }];
+    inventory.panes = vec![agent_radar::model::Pane {
+        location: agent_radar::model::Location {
+            workspace_id: workspace_id.into(),
+            tab_id: format!("{workspace_id}:t1"),
+            pane_id: format!("{workspace_id}:p1"),
+        },
+        label: None,
+        title: None,
+        current_path: None,
+    }];
+    inventory
+}
+
 /// A freeze of one empty workspace: the target and identity a client sends when it
 /// deletes a workspace it saw holding nothing.
 fn frozen_workspace(workspace_id: &str) -> Value {
@@ -11254,6 +11286,24 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
         1_001,
     )
     .expect("captured");
+    // Where the execution runs is recorded on the execution, as the launch path
+    // does: discovery of what a place contains starts from that, not from the edge.
+    managed::place(
+        &registry,
+        &ticket.registration_id,
+        managed::Placement {
+            location: RegistryLocation {
+                backend: "fake".into(),
+                instance: None,
+                workspace: Some("wA".into()),
+                tab: None,
+                pane: Some("wA:p1".into()),
+            },
+            instance: None,
+        },
+        1_002,
+    )
+    .expect("placed");
     let edge = registry
         .spawn_edge(&request_id)
         .expect("read")
@@ -11302,13 +11352,16 @@ fn deletion_over_a_surviving_agent(
 ) {
     let sandbox = Sandbox::new(name);
     let child = surviving_agent(&sandbox, keep_scope);
+    // The agent runs in a pane, so the place it is in must hold that pane: an
+    // execution placed in a pane the inventory does not have is one the sweep
+    // rightly ends.
     let backend = MuxBackend::new(SPAWN_PRIMITIVES)
         .naming(CreatedLocation {
             workspace_id: Some("wA".into()),
             tab_id: None,
             pane_id: None,
         })
-        .with_inventory(workspace_inventory("wA"));
+        .with_inventory(workspace_with_a_pane("wA"));
     backend.served_by(std::process::id() as i32);
     let daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
@@ -11350,6 +11403,80 @@ fn a_confirmed_deletion_closes_over_a_survivor_and_names_the_unverified_exit() {
         child.try_wait().expect("child state").is_none(),
         "the daemon closed the place; it did not claim the stubborn agent exited"
     );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    daemon.stop();
+}
+
+/// A branch being closed refuses a launch into it while the close runs, and a place
+/// outside that branch is not affected: work cannot be admitted into a place that
+/// is about to be removed, while unrelated work continues.
+#[test]
+fn a_launch_into_a_branch_being_closed_is_refused_until_it_is_gone() {
+    let (_sandbox, _backend, mut daemon, mut client, mut child, id) =
+        deletion_over_a_surviving_agent("topology-delete-closing-gate", false);
+    let request = json!({
+        "request": {"container_id": id, "frozen": frozen_workspace("wA")},
+        "requester": "test",
+    });
+    // The agent ignores SIGTERM, so this close holds the branch for its whole
+    // window: the second connection has time to try a launch inside it.
+    let closing = std::thread::spawn({
+        let path = daemon.path().to_path_buf();
+        move || {
+            let mut client = Client::dial(&path);
+            client.call("topology.delete", request)
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let refusal = loop {
+        let inside = client.call(
+            "launch.admit",
+            json!({
+                "request_id": random_uuid(),
+                "pane": "wA:p1",
+                "process": {"boot_id": "boot-test", "pid": 200, "start_ticks": 400},
+                "executable": "/bin/sh",
+                "argv": ["-c", "sleep 1"],
+                "cwd": "/work",
+                "kind": "agent",
+                "completion_key": "key",
+            }),
+        );
+        if inside["error"]["code"] == json!("busy") {
+            break inside;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the close did not hold the branch: {inside}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("being closed")),
+        "the refusal says why: {refusal}"
+    );
+    // A pane outside the branch is not held: it is refused for its own reason
+    // (this backend does not serve it), not because something is closing.
+    let outside = client.call(
+        "launch.admit",
+        json!({
+            "request_id": random_uuid(),
+            "pane": "wB:p1",
+            "process": {"boot_id": "boot-test", "pid": 200, "start_ticks": 400},
+            "executable": "/bin/sh",
+            "argv": ["-c", "sleep 1"],
+            "cwd": "/work",
+            "kind": "agent",
+            "completion_key": "key",
+        }),
+    );
+    assert_ne!(outside["error"]["code"], json!("busy"), "{outside}");
+    let closed = closing.join().expect("the close finished");
+    assert_eq!(result_record(&closed)["outcome"], "completed", "{closed}");
 
     let _ = child.kill();
     let _ = child.wait();
@@ -12812,10 +12939,9 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
     // never listens. The escalation is named, and only a verified scope gets one.
     let stubborn_pid = captured_identity(&state, &stubborn_subject).pid;
     let cancelled = cancel_subject(&mut client, &random_uuid(), &stubborn_subject);
-    assert!(
-        result_record(&cancelled)["effects"]
-            .to_string()
-            .contains("scope escalated"),
+    assert_eq!(
+        result_record(&cancelled)["closed"]["escalated"],
+        json!(true),
         "a TERM-ignoring process is escalated: {cancelled}"
     );
     assert_eq!(

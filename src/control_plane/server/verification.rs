@@ -535,6 +535,29 @@ pub(super) fn cleanup_launch_pane(
     if subject.process.identity.is_some() && subject.process.completion.is_none() {
         subjects::await_completion(registry, subject_id);
     }
+    // A pane that is already gone needs no removal: the fact is the answer, and
+    // dispatching a close for it would report the backend's "can't find pane" as
+    // an uncertain cleanup of something that plainly is not there.
+    let present = match bounded_inventory(
+        backend,
+        stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(inventory) => inventory.pane(&pane).is_some(),
+        Err(()) => true,
+    };
+    if !present {
+        let outcome = PaneCleanup::Absent;
+        return Some(
+            match subjects::record_pane_cleanup(registry, subject_id, outcome, now_ms) {
+                Ok(recorded) => recorded,
+                Err(error) => PaneCleanup::Unknown(format!(
+                    "the cleanup outcome could not be recorded: {error}"
+                )),
+            },
+        );
+    }
     let outcome = match bounded_close_dispatch(
         backend,
         &pane,

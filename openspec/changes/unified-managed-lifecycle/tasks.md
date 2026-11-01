@@ -44,14 +44,73 @@ Planning only. Each group lands working behaviour, its relevant tests and docs; 
   which is the same translation every caller of that dispatch now shares. Child
   close keeps its own admission, record and refusal vocabulary, and takes the same
   completion grace before dispatching. Stop still removes nothing.
-- [ ] 2.4 Publish typed close outcomes separating resource removal, execution verification and optional completion diagnostics; update Rust DTOs, schemas, generated SDK types and pi-radar interpretation. Verify normal completion, unavailable status and confirmed survivors have distinguishable meanings. Update protocol/SDK docs and bump actual incompatible versions together; keep labels such as complete/cancel free of assignment-settlement effects.
+- [x] 2.4 Publish typed close outcomes separating resource removal, execution verification and optional completion diagnostics; update Rust DTOs, schemas, generated SDK types and pi-radar interpretation. Verify normal completion, unavailable status and confirmed survivors have distinguishable meanings. Update protocol/SDK docs and bump actual incompatible versions together; keep labels such as complete/cancel free of assignment-settlement effects.
+
+  Landed: `closed` on the public record with `execution` (`exited` / `unverified` /
+  `unsignalled` with its reason), `resource` (`removed` / `absent` / `kept` /
+  `unverified`, absent only for an operation that removes nothing) and
+  `completion` (present only when a supervisor reported), plus `escalated` as a
+  typed fact rather than a word in a prose list. Wire revision 14; Radar 0.10.0.
+  An already-absent pane is now reported `absent` instead of dispatching a close
+  that answers "can't find pane" and being recorded as unverified.
+
+  No schema or generated SDK change: `PublicRequestRecord` is not part of the
+  generated contract surface, and pi-radar reads neither `effects` nor the record,
+  so its revision floor stays at 13 rather than forcing an upgrade that gains it
+  nothing.
 
 ## 3. Recursive container closure
 
-- [ ] 3.1 Replace spawn-edge-only `subjects_inside` discovery with verified execution placement and domain topology. Use one recursive close interface for logical children, deduplicating claims. Verify a filtered-out direct-admission agent and a spawned agent are both handled inside the selected container, including verified pane movement; no filtered UI tree or fabricated spawn edge may supply authority.
-- [ ] 3.2 Initiate leaf graceful termination before waiting, share one deadline across the branch and remove leaves after capture attempts. Apply one bounded root-removal fallback if required. Verify a multi-agent branch does not pay a timeout per child, ancestor auto-removal succeeds, and a failed child discovery/unknown leaf removal does not indefinitely block verified root removal. Preserve unverified process outcomes in the result.
+- [x] 3.1 Replace spawn-edge-only `subjects_inside` discovery with verified execution placement and domain topology. Use one recursive close interface for logical children, deduplicating claims. Verify a filtered-out direct-admission agent and a spawned agent are both handled inside the selected container, including verified pane movement; no filtered UI tree or fabricated spawn edge may supply authority.
+
+  Discovery now starts from a verified placement: the pane an execution recorded,
+  with the instance that made it, matched against the place being closed. A
+  directly admitted `radar run --agent` execution has no spawn edge and is found
+  all the same; a bound spawn edge with no placement is no authority at all, so an
+  execution admitted before placement existed is not discovered — the upgrade
+  procedure says to restart such agents rather than to close a place over them.
+
+  Building this exposed a semantic error in the discovery predicate: revocation is
+  cancelled work, not an ended process, so filtering out revoked launches would
+  hide a live process inside a place about to be removed. Placement discovery
+  ignores only the evidence that says an execution ended.
+
+- [x] 3.2 Initiate leaf graceful termination before waiting, share one deadline across the branch and remove leaves after capture attempts. Apply one bounded root-removal fallback if required. Verify a multi-agent branch does not pay a timeout per child, ancestor auto-removal succeeds, and a failed child discovery/unknown leaf removal does not indefinitely block verified root removal. Preserve unverified process outcomes in the result.
+
+  Every member is signalled before any is waited on, and one `Shutdown` window is
+  created for the whole branch, so a five-agent branch pays one grace rather than
+  five. Before the root is removed the branch takes one shared completion window
+  (`await_completions`) for every execution that has an identity and no report, so
+  the codes are captured before the panes carrying their supervisors are removed,
+  and a report that never arrives is a diagnostic rather than a block.
+
 - [ ] 3.3 Add an in-flight closing-branch guard to domain admission and the shared publication. Verify an overlapping Radar launch/restart is promptly refused while unrelated branches and UI observation remain responsive; a changed backend generation cannot be removed through the old root reference. Document that native tmux mutations are handled best effort, not transactionally.
-- [ ] 3.4 Wire `topology.delete` to the common container close implementation and remove its separate cancellation/close orchestration. Verify real entrypoint replay, container-removal recording and confirmed-survivor reporting using existing integration fixtures. Update container-close docs without introducing nested public RPC request records.
+
+  Domain admission is guarded: a close holds the branch it is removing (the target's
+  own handle plus the pane of every execution it found, in memory, for the duration
+  of the close), and `spawn.create`, `launch.admit` and `lifecycle.restart` refuse
+  naming a held place with `busy` before staging any evidence. Overlapping closes
+  hold only what they added, so one close cannot release another's branch. The hold
+  is memory only on purpose: it says what this process is doing now, and a restart
+  mid-close correctly holds nothing, because the durable operation record is what
+  says the outcome is still owed.
+
+  Not done in this slice: publishing the closing state on the shared publication, so
+  a view can show a branch as closing rather than as gone-but-not-yet-removed. That
+  is a wire change of its own; admission — the part that can corrupt topology — is
+  guarded now. Native tmux mutations remain best effort: an operator splitting a pane
+  by hand inside a closing branch is not transactional, and the close removes the
+  enclosing resource regardless.
+- [x] 3.4 Wire `topology.delete` to the common container close implementation and remove its separate cancellation/close orchestration. Verify real entrypoint replay, container-removal recording and confirmed-survivor reporting using existing integration fixtures. Update container-close docs without introducing nested public RPC request records.
+
+  There was no second orchestration left to delete. After 3.1 and 3.2 the delete path
+  already composes the shared pieces — `executions_inside` for discovery,
+  `lifecycle::cancel_many` over one `Shutdown` window, `await_completions` before the
+  root is removed, and `lifecycle::close` for the root itself — and holds no copy of
+  any of them. The separate thing 3.1 did remove was the spawn-edge scan, which was
+  the duplication this task was written for. Replay, container-removal recording and
+  confirmed-survivor reporting are covered by the existing fixtures, which now
+  exercise discovery through placement.
 
 ## 4. Subject restart and TUI cutover
 

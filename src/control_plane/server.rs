@@ -63,6 +63,7 @@ use crate::{TmuxConfig, TmuxRuntime};
 
 mod admission;
 mod child_close;
+mod closing;
 mod input;
 mod launch;
 mod message_lane;
@@ -402,6 +403,9 @@ struct Core {
     /// What Radar serves, as configured: the choice a create that names none of
     /// its own gets.
     config: crate::config::ServerConfig,
+    /// Branches a close is working on right now, so a launch into one is refused
+    /// instead of racing the removal.
+    closing: Arc<closing::Closing>,
 }
 
 /// The control-plane daemon.
@@ -639,6 +643,7 @@ impl Daemon {
             hub: None,
             ui: None,
             config,
+            closing: Arc::new(closing::Closing::default()),
         }));
         let effect_core = Arc::downgrade(&core);
         let effect_verification = Arc::clone(&verification);

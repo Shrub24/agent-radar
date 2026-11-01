@@ -150,11 +150,17 @@ pub(super) fn run_close(
     write_settled(done, core)
 }
 
-/// The launch subjects created inside a place, from the daemon's own spawn edges.
+/// The executions running inside a place, as their own records place them there.
 ///
-/// Membership is the edge's recorded location, never a pane name guessed from a
-/// report: an agent is inside the place the create that produced it named.
-pub(super) fn subjects_inside(registry: &Registry, target: &crate::CloseTarget) -> Vec<String> {
+/// Membership is a verified placement — the pane an execution recorded, with the
+/// instance that made it — never a pane guessed from a report and never a spawn
+/// edge. An execution admitted in place (`radar run --agent`) has no spawn edge at
+/// all, and it still runs inside the place: a branch closed over spawn edges alone
+/// would leave it running.
+pub(super) fn executions_inside(
+    registry: &Registry,
+    target: &crate::CloseTarget,
+) -> Vec<crate::control_plane::lifecycle::Placed> {
     let inside = |location: &crate::control_plane::registry::RegistryLocation| match target {
         crate::CloseTarget::Pane(pane) => location.pane.as_deref() == Some(pane.as_str()),
         crate::CloseTarget::Tab(tab) => location.tab.as_deref() == Some(tab.as_str()),
@@ -162,31 +168,38 @@ pub(super) fn subjects_inside(registry: &Registry, target: &crate::CloseTarget) 
             location.workspace.as_deref() == Some(workspace.as_str())
         }
     };
-    let mut subjects: Vec<String> = Vec::new();
-    let mut cursor: Option<String> = None;
-    while let Ok(edges) = registry.spawn_edges_after(cursor.as_deref(), MAX_PANE_OBSERVATIONS) {
-        let end = edges.len() < MAX_PANE_OBSERVATIONS;
-        cursor = edges.last().map(|edge| edge.request_id.clone());
-        for edge in &edges {
-            // An unbound edge may never have released a program, so it is no
-            // execution to cancel.
-            if edge.bound.is_none() {
-                continue;
-            }
-            let (Some(subject_id), Some(location)) =
-                (edge.claim_id.as_deref(), edge.location.as_ref())
-            else {
-                continue;
-            };
-            if inside(location) && !subjects.iter().any(|known| known == subject_id) {
-                subjects.push(subject_id.to_string());
-            }
+    let mut placed: Vec<crate::control_plane::lifecycle::Placed> = Vec::new();
+    for execution in crate::control_plane::lifecycle::placements(registry) {
+        if !inside(&execution.placement.location) {
+            continue;
         }
-        if end {
-            break;
+        if placed
+            .iter()
+            .any(|known| known.registration_id == execution.registration_id)
+        {
+            continue;
         }
+        placed.push(execution);
     }
-    subjects
+    placed
+}
+
+/// The key that addresses one placed execution for termination: its subject when
+/// it has one, otherwise the registration that names the execution itself.
+/// The handle a launch would name for this target.
+fn target_handle(target: &crate::runtime::CloseTarget) -> String {
+    match target {
+        crate::runtime::CloseTarget::Workspace(handle)
+        | crate::runtime::CloseTarget::Tab(handle)
+        | crate::runtime::CloseTarget::Pane(handle) => handle.clone(),
+    }
+}
+
+pub(super) fn termination_key(placed: &crate::control_plane::lifecycle::Placed) -> String {
+    placed
+        .subject_id
+        .clone()
+        .unwrap_or_else(|| placed.registration_id.clone())
 }
 
 pub(super) fn frozen_params(
@@ -799,21 +812,41 @@ pub(super) fn run_container_delete(
     // row ends it: fenced, SIGTERM, one shared window for the exit, and the exit
     // recorded. The operator's confirmation named the agents it would end, so a
     // survivor does not hold the close: the outcome says whose exit was never verified.
-    let inside = subjects_inside(&registry, &frozen.target);
+    let inside = executions_inside(&registry, &frozen.target);
+    // Held for as long as this close runs: a launch into this branch is refused
+    // instead of arriving in a place that is about to be removed. The place itself
+    // is held too, so a create that names it is refused even before an execution
+    // exists there.
+    let closing = Arc::clone(&locked(core).closing);
+    let _held = closing.begin(
+        std::iter::once(target_handle(&frozen.target))
+            .chain(
+                inside
+                    .iter()
+                    .filter_map(|execution| execution.placement.location.pane.clone()),
+            )
+            .filter(|place| !place.is_empty()),
+    );
+    let keys: Vec<String> = inside.iter().map(termination_key).collect();
     let mut stopped = Vec::new();
     // Agents left alive by the window. The place still closes, and the outcome
     // says which exits were never verified.
     let mut alive: Vec<String> = Vec::new();
-    if !inside.is_empty() {
+    if !keys.is_empty() {
         let verifier = Arc::clone(&locked(core).verifier);
         let cancelled = crate::control_plane::lifecycle::cancel_many(
             &registry,
-            &inside,
+            &keys,
             verifier.as_ref(),
             store::now_ms(),
         );
         stopped = cancelled.stopped;
         alive = cancelled.survivors;
+        // The place is about to be removed, and with it every pane whose supervisor
+        // still holds a reported code. One window for the whole set, so a branch
+        // does not pay a grace per agent, and a report that never comes is a
+        // diagnostic rather than a block.
+        crate::control_plane::lifecycle::await_completions(&registry, &keys);
     }
     let settled = match lifecycle::close_for_deletion(backend.as_ref(), &frozen, &cancel) {
         DirectClose::Completed => {
