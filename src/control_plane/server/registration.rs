@@ -397,19 +397,16 @@ pub(super) fn registry_request(
                     Err(error) => return registry_error(request, error),
                 }
             };
-            let stored = match observe_spawn_exits(core, &[stored]) {
-                Ok(mut edges) => edges.pop().expect("one spawn edge was supplied"),
-                Err(error) => return registry_error(request, error),
-            };
             // Location presence is separate from exit evidence: a missing pane
             // never becomes an exit observation.
             let inventory = observed_inventory(core);
             let evidence =
                 crate::control_plane::registry_read::location_evidence(inventory.as_ref(), &stored);
+            let exit = subjects::spawn_exit(&locked(core).registry, stored.claim_id.as_deref());
             respond(
                 &request.id,
                 Ok(answers::Spawn {
-                    spawn: stored.topology(evidence),
+                    spawn: stored.topology(evidence, exit),
                 }),
             )
         }
@@ -822,20 +819,18 @@ pub(super) fn registry_request(
             };
             let has_more = read.len() > limit;
             let candidates: Vec<_> = read.into_iter().take(limit).collect();
-            let candidates = match observe_spawn_exits(core, &candidates) {
-                Ok(edges) => edges,
-                Err(error) => return registry_error(request, error),
-            };
-            // One inventory serves the whole page, independently of the single
-            // batch exit-status read above.
             let inventory = observed_inventory(core);
+            let registry = Arc::clone(&locked(core).registry);
             let mut edges = Vec::new();
             let mut used = 0usize;
             for edge in &candidates {
-                let entry = edge.topology(crate::control_plane::registry_read::location_evidence(
-                    inventory.as_ref(),
-                    edge,
-                ));
+                let entry = edge.topology(
+                    crate::control_plane::registry_read::location_evidence(
+                        inventory.as_ref(),
+                        edge,
+                    ),
+                    subjects::spawn_exit(&registry, edge.claim_id.as_deref()),
+                );
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
                 if used + size > MAX_LIST_RESPONSE_BYTES {
                     if edges.is_empty() {

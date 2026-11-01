@@ -673,16 +673,6 @@ impl Registry {
         spawn::record_launched(self, request_id, launched)
     }
 
-    pub fn record_spawn_exit(
-        &self,
-        request_id: &str,
-        code: Option<i32>,
-        signal: Option<i32>,
-        now_ms: i64,
-    ) -> Result<SpawnEdge, String> {
-        spawn::record_exit_observation(self, request_id, code, signal, now_ms)
-    }
-
     pub fn record_spawn_granted(&self, request_id: &str, now_ms: i64) -> Result<(), String> {
         spawn::record_granted(self, request_id, now_ms)
     }

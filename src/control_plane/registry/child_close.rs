@@ -127,9 +127,9 @@ pub struct ChildClose {
     /// request claims no effect, and a lost answer leaves it here.
     pub outcome: CloseOutcome,
     /// The exit observation of the already-dead pane this close cleaned up,
-    /// copied from the edge so a replay answers without re-reading state that
-    /// may since have moved. Present exactly when the outcome is
-    /// [`CloseOutcome::AlreadyExited`].
+    /// copied from the claim's recorded completion so a replay answers without
+    /// re-reading state that may since have moved. Only an `already_exited`
+    /// outcome carries it, and then only when a status was ever reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<SpawnExitObservation>,
     /// The backend's own words for a refused or unconfirmed close, kept so a
@@ -149,9 +149,9 @@ pub enum CloseResult {
     /// verified before dispatch.
     Completed,
     /// The backend confirmed the cleanup of a pane whose command had already
-    /// exited. It carries the exit the edge recorded, and claims nothing about
-    /// the agent process beyond it.
-    AlreadyExited(SpawnExitObservation),
+    /// exited. It carries the status the claim recorded, if any, and claims
+    /// nothing about the agent process beyond it.
+    AlreadyExited(Option<SpawnExitObservation>),
     /// The backend refused; nothing was dispatched.
     Refused(String),
     /// The dispatch may have happened and no confirmation came back, with the
@@ -288,7 +288,7 @@ pub fn record_outcome(
     })?;
     let (outcome, exit, message) = match result {
         CloseResult::Completed => (CloseOutcome::Completed, None, None),
-        CloseResult::AlreadyExited(exit) => (CloseOutcome::AlreadyExited, Some(exit), None),
+        CloseResult::AlreadyExited(exit) => (CloseOutcome::AlreadyExited, exit, None),
         CloseResult::Refused(message) => (CloseOutcome::Refused, None, Some(message)),
         CloseResult::Unknown(message) => (CloseOutcome::Unknown, None, message),
     };

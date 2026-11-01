@@ -211,20 +211,18 @@ pub(super) fn verify_live_occupant(
             ));
         }
     };
+    // The pane's own process is the one supervising the claimed program, so the
+    // claim is the foreground or a descendant of it, and its birth identity is
+    // what establishes that it is the process the record names.
     let observed = verify_birth_identity(
-        pid,
+        claim.pid,
         verifier,
         stopping,
         budget,
         Instant::now() + VERIFICATION_TIMEOUT,
     );
     match observed {
-        Ok(observed)
-            if pid == claim.pid
-                && observed.pid == pid
-                && observed.boot_id == claim.boot_id
-                && observed.start_ticks == claim.start_ticks =>
-        {
+        Ok(observed) if observed == *claim && super::launch::descends_from(claim.pid, pid) => {
             Ok(())
         }
         _ => Err(Refusal::new(
@@ -237,8 +235,9 @@ pub(super) fn verify_live_occupant(
 /// What the dead-pane evidence says about a pane the live gate could not verify.
 pub(super) enum DeadPane {
     /// A retained pane of this edge, in the very instance that created it: its
-    /// cleanup is defined.
-    Cleanup(registry::SpawnExitObservation),
+    /// cleanup is defined. Carries the status the program's supervisor reported,
+    /// when it did: a missing status never makes the pane unclosable.
+    Cleanup(Option<registry::SpawnExitObservation>),
     /// Nothing here says the pane is dead and this edge's: the live refusal
     /// stands.
     Unresolved,
@@ -302,16 +301,38 @@ pub(super) fn dead_pane_evidence(
             ));
         }
     }
-    let Some(exit) = edge.exit else {
-        return DeadPane::Unresolved;
-    };
     match bounded_exit_observation(backend, pane_id, stopping, budget) {
-        Ok(PaneExitObservation::Exited { .. }) => DeadPane::Cleanup(exit),
+        Ok(PaneExitObservation::Exited { .. }) => {
+            DeadPane::Cleanup(recorded_exit(registry, edge.claim_id.as_deref()))
+        }
         // A pane reported running, undetermined, or unreadable is not a pane whose
         // command has exited: the live refusal stands.
         Ok(PaneExitObservation::Running | PaneExitObservation::Unknown) | Err(()) => {
             DeadPane::Unresolved
         }
+    }
+}
+
+fn recorded_exit(
+    registry: &Registry,
+    claim_id: Option<&str>,
+) -> Option<registry::SpawnExitObservation> {
+    match subjects::spawn_exit(registry, claim_id) {
+        registry::PublicSpawnExitObservation::Exited {
+            code: None,
+            signal: None,
+            ..
+        }
+        | registry::PublicSpawnExitObservation::Unknown => None,
+        registry::PublicSpawnExitObservation::Exited {
+            code,
+            signal,
+            observed_at,
+        } => Some(registry::SpawnExitObservation {
+            code,
+            signal,
+            observed_at,
+        }),
     }
 }
 
@@ -499,9 +520,7 @@ pub(super) fn cleanup_launch_pane(
     let exited = if subject.process.state == subjects::State::Bound {
         pane_dead
     } else {
-        subject.process.identity.is_none()
-            || subject.process.exited_at.is_some()
-            || (edge.exit.is_some() && pane_dead)
+        subject.process.identity.is_none() || subject.process.exited_at.is_some() || pane_dead
     };
     if !exited {
         return Some(PaneCleanup::Refused(
@@ -601,64 +620,4 @@ pub(super) fn observed_inventory(core: &Arc<Mutex<Core>>) -> Option<FleetObserva
         Ok(inventory) if !cancel.load(Ordering::SeqCst) => Some(inventory),
         _ => None,
     }
-}
-
-/// What one read's observation says about a recorded location.
-///
-/// A pane's absence is evidence about a pane, never about the process that ran
-/// in it, and an edge that recorded no pane has nothing to check — so the read
-/// reports the disagreement, or its lack of confirmation, and claims nothing
-/// else.
-pub(super) fn observe_spawn_exits(
-    core: &Arc<Mutex<Core>>,
-    edges: &[SpawnEdge],
-) -> Result<Vec<SpawnEdge>, String> {
-    let (registry, backend, cancel) = {
-        let core = locked(core);
-        (
-            Arc::clone(&core.registry),
-            core.backend.clone(),
-            Arc::clone(&core.stopping),
-        )
-    };
-    let Some(backend) = backend else {
-        return Ok(edges.to_vec());
-    };
-    if cancel.load(Ordering::SeqCst) || !backend.primitives().contains(Primitives::EXIT_OBSERVATION)
-    {
-        return Ok(edges.to_vec());
-    }
-    let pending: Vec<_> = edges
-        .iter()
-        .filter(|edge| edge.exit.is_none())
-        .filter_map(|edge| {
-            edge.location
-                .as_ref()
-                .and_then(|location| location.pane.as_ref())
-                .cloned()
-        })
-        .collect();
-    if pending.is_empty() {
-        return Ok(edges.to_vec());
-    }
-    let observations = backend.exit_observations(&pending, &cancel);
-    edges
-        .iter()
-        .map(|edge| {
-            if edge.exit.is_some() {
-                return Ok(edge.clone());
-            }
-            let Some(pane) = edge
-                .location
-                .as_ref()
-                .and_then(|location| location.pane.as_ref())
-            else {
-                return Ok(edge.clone());
-            };
-            let Some(PaneExitObservation::Exited { code, signal }) = observations.get(pane) else {
-                return Ok(edge.clone());
-            };
-            registry.record_spawn_exit(&edge.request_id, *code, *signal, store::now_ms())
-        })
-        .collect()
 }

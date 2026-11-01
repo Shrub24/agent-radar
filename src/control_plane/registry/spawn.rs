@@ -32,7 +32,7 @@ use super::{Freshness, Registry, RegistryLocation, bounded_text, read_record_fil
 
 /// The record shape this build writes and reads. A record naming another version
 /// fails explicitly rather than being read as this one.
-pub const SPAWN_VERSION: u32 = 2;
+pub const SPAWN_VERSION: u32 = 3;
 
 /// The largest spawn edge this daemon reads or writes, so a planted file cannot
 /// be read into memory whole.
@@ -144,10 +144,6 @@ pub struct SpawnEdge {
     /// The child this edge's token bound, once one registered with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound: Option<BoundChild>,
-    /// First typed process exit observed while the daemon still had the pane.
-    /// Pane disappearance alone never creates this fact.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit: Option<SpawnExitObservation>,
     /// Set when the daemon withdrew this launch before its process presented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawn: Option<Withdrawn>,
@@ -161,7 +157,7 @@ impl SpawnEdge {
     ///
     /// The token is absent by construction, not by redaction: there is no field
     /// here to forget to strip.
-    pub fn public(&self) -> PublicSpawnEdge {
+    pub fn public(&self, exit_observation: PublicSpawnExitObservation) -> PublicSpawnEdge {
         PublicSpawnEdge {
             version: self.version,
             request_id: self.request_id.clone(),
@@ -175,14 +171,7 @@ impl SpawnEdge {
             bound: self.bound.clone(),
             withdrawn: self.withdrawn.clone(),
             granted_at: self.granted_at.clone(),
-            exit_observation: match &self.exit {
-                Some(exit) => PublicSpawnExitObservation::Exited {
-                    code: exit.code,
-                    signal: exit.signal,
-                    observed_at: exit.observed_at.clone(),
-                },
-                None => PublicSpawnExitObservation::Unknown,
-            },
+            exit_observation,
             recorded_at: self.recorded_at.clone(),
         }
     }
@@ -195,7 +184,11 @@ impl SpawnEdge {
     /// outranks `bound` because a client reading the state alone must not take a
     /// vanished location for a present one — the child is reported beside it
     /// either way.
-    pub fn topology(&self, evidence: LocationEvidence) -> PublicSpawnTopology {
+    pub fn topology(
+        &self,
+        evidence: LocationEvidence,
+        exit_observation: PublicSpawnExitObservation,
+    ) -> PublicSpawnTopology {
         let identity = match self.bound {
             Some(_) => SpawnState::Bound,
             None => SpawnState::Unbound,
@@ -207,7 +200,7 @@ impl SpawnEdge {
             (Some(_), LocationEvidence::Unavailable) => (identity, Some(Freshness::Stale)),
         };
         PublicSpawnTopology {
-            edge: self.public(),
+            edge: self.public(exit_observation),
             state,
             freshness,
         }
@@ -363,7 +356,6 @@ pub fn record(
         created: RequestOutcome::Unknown,
         launched: RequestOutcome::Unknown,
         bound: None,
-        exit: None,
         withdrawn: None,
         granted_at: None,
         recorded_at: format_millis(now_ms),
@@ -452,39 +444,6 @@ pub fn record_launched(
     let edge = SpawnEdge { launched, ..stored };
     write_edge(registry, &edge)?;
     registry.append_event("spawn.launched", None, None, Some(request_id));
-    Ok(edge)
-}
-
-/// Records the first typed exit observed for a spawned pane. Repeated and
-/// concurrent observations return the original fact without rewriting it.
-pub fn record_exit_observation(
-    registry: &Registry,
-    request_id: &str,
-    code: Option<i32>,
-    signal: Option<i32>,
-    now_ms: i64,
-) -> Result<SpawnEdge, String> {
-    canonical_uuid("request_id", request_id)?;
-    match (code, signal) {
-        (Some(code), None) if (0..=255).contains(&code) => {}
-        (None, Some(signal)) if signal > 0 => {}
-        _ => return Err("exit observation must name one valid code or signal".into()),
-    }
-    let _transition = registry.transition();
-    let stored = stored_edge(registry, request_id)?;
-    if stored.exit.is_some() {
-        return Ok(stored);
-    }
-    let edge = SpawnEdge {
-        exit: Some(SpawnExitObservation {
-            code,
-            signal,
-            observed_at: format_millis(now_ms),
-        }),
-        ..stored
-    };
-    write_edge(registry, &edge)?;
-    registry.append_event("spawn.exited", None, None, Some(request_id));
     Ok(edge)
 }
 
@@ -811,16 +770,6 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
             return Err("spawn edge bound_at is not a timestamp".into());
         }
         canonical_uuid("bound.registration_id", &bound.registration_id)?;
-    }
-    if let Some(exit) = &edge.exit {
-        match (exit.code, exit.signal) {
-            (Some(code), None) if (0..=255).contains(&code) => {}
-            (None, Some(signal)) if signal > 0 => {}
-            _ => return Err("spawn edge exit must name one valid code or signal".into()),
-        }
-        if timestamp_millis(&exit.observed_at).is_none() {
-            return Err("spawn edge exit observed_at is not a timestamp".into());
-        }
     }
     if timestamp_millis(&edge.recorded_at).is_none() {
         return Err("spawn edge recorded_at is not a timestamp".into());

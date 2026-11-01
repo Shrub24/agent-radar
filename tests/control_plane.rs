@@ -5928,7 +5928,7 @@ fn a_tmux_pane_from_another_server_generation_is_never_closed() {
         stale_edge["instance"].is_object(),
         "the edge records the instance that served its create: {stale_edge}"
     );
-    assert_eq!(stale_edge["exit"]["code"], json!(23), "{stale_edge}");
+    assert!(stale_edge.get("exit").is_none(), "{stale_edge}");
 
     // The generation that created the pane ends. A fresh server answers to the
     // same name and hands out the same ids again.
@@ -6116,11 +6116,20 @@ fn spawned_exiting_tmux_child(
         .next()
         .expect("raw tmux pane")
         .to_string();
-    let pid = server
+    let supervisor = server
         .tmux(&["display-message", "-p", "-t", &raw_pane, "#{pane_pid}"])
         .trim()
         .parse::<i32>()
-        .expect("child process pid");
+        .expect("supervisor pid");
+    // The pane runs the supervisor; the program it supervises is its one child,
+    // and that is the process an agent registers as.
+    let pid = fs::read_to_string(format!("/proc/{supervisor}/task/{supervisor}/children"))
+        .expect("supervisor children")
+        .split_whitespace()
+        .next()
+        .expect("the supervised program")
+        .parse::<i32>()
+        .expect("program pid");
     let mut child_registration =
         registration_body(incarnation, Some(process_identity_from_proc(pid)), None);
     child_registration["spawn_token"] = json!(token);
@@ -7801,11 +7810,11 @@ fn child_close_refuses_foreground_and_containment_mismatches_without_recording()
     }
 }
 
-/// A retained pane is closed only from evidence read now *and* the exit this edge
-/// recorded: a dead report alone is not a close, and a recorded exit alone is
-/// history.
+/// A retained pane is closed from evidence read now, in the instance that created
+/// it. A recorded status is reported when there is one and never gates the close,
+/// and a pane running again is not a dead pane.
 #[test]
-fn a_dead_child_pane_closes_only_from_a_recorded_exit_and_a_dead_report_now() {
+fn a_dead_child_pane_closes_from_a_dead_report_now_whether_or_not_a_status_was_recorded() {
     let sandbox = Sandbox::new("dead-child-close");
     let backend = MuxBackend::new(DEAD_CLOSE_PRIMITIVES).observing(&["wA:p2"]);
     let verifier = stage_dead_pane(&backend, "wA:p2", Some(900));
@@ -7820,31 +7829,8 @@ fn a_dead_child_pane_closes_only_from_a_recorded_exit_and_a_dead_report_now() {
         .to_owned();
     register_close_child(&mut client, &token, staged_identity(200, 400));
 
-    // The pane is dead now, but this edge never observed the exit: what happened
-    // to a pane is not established by the pane's state alone.
-    let unrecorded_id = random_uuid();
-    let unrecorded = client.call_id(
-        &unrecorded_id,
-        "spawn.close",
-        child_close_params(&edge_id, "test-publisher", CHILD_INCARNATION),
-    );
-    assert!(unrecorded.get("error").is_some(), "{unrecorded}");
-    assert!(
-        !closes_directory(&sandbox.state())
-            .join(format!("{unrecorded_id}.json"))
-            .exists()
-    );
-    assert!(backend.closed_targets().is_empty());
-
-    // The read that observes the exit records it on the edge. A pane running
-    // again — a same-UID respawn, which tmux permits — is not a dead pane to
-    // clean up however recorded its earlier exit is.
-    let topology = client.call("spawn.get", json!({"request_id": edge_id}));
-    assert_eq!(
-        topology["result"]["spawn"]["exit_observation"]["code"],
-        json!(23),
-        "{topology}"
-    );
+    // A pane running again — a same-UID respawn, which tmux permits — is not a
+    // dead pane to clean up, whatever it did before.
     backend.reporting_exit("wA:p2", PaneExitObservation::Running);
     let running_id = random_uuid();
     let running = client.call_id(
@@ -7855,9 +7841,8 @@ fn a_dead_child_pane_closes_only_from_a_recorded_exit_and_a_dead_report_now() {
     assert!(running.get("error").is_some(), "{running}");
     assert!(backend.closed_targets().is_empty());
 
-    // Dead now, with the recorded exit: the retained pane is cleaned up once. The
-    // answer carries the exit the edge recorded, which a later report of the same
-    // pane's state does not rewrite.
+    // Dead now: the retained pane is cleaned up once. No program status was ever
+    // reported, and that never holds a pane in limbo.
     backend.reporting_exit(
         "wA:p2",
         PaneExitObservation::Exited {
@@ -7875,13 +7860,8 @@ fn a_dead_child_pane_closes_only_from_a_recorded_exit_and_a_dead_report_now() {
         closed["result"]["close"]["outcome"], "already_exited",
         "{closed}"
     );
-    assert_eq!(
-        closed["result"]["close"]["exit_observation"]["state"], "exited",
-        "{closed}"
-    );
-    assert_eq!(
-        closed["result"]["close"]["exit_observation"]["code"],
-        json!(23),
+    assert!(
+        closed["result"]["close"].get("exit_observation").is_none(),
         "{closed}"
     );
     assert_eq!(
@@ -8004,11 +7984,6 @@ fn a_dead_pane_close_the_backend_refuses_is_not_reported_as_cleanup() {
         .expect("private spawn token")
         .to_owned();
     register_close_child(&mut client, &token, staged_identity(200, 400));
-    let topology = client.call("spawn.get", json!({"request_id": edge_id}));
-    assert_eq!(
-        topology["result"]["spawn"]["exit_observation"]["state"], "exited",
-        "{topology}"
-    );
 
     let close_id = random_uuid();
     let refused = client.call_id(
@@ -8051,12 +8026,6 @@ fn a_dead_pane_close_refuses_when_the_edge_records_no_instance() {
         .expect("private spawn token")
         .to_owned();
     register_close_child(&mut client, &token, staged_identity(200, 400));
-    let topology = client.call("spawn.get", json!({"request_id": edge_id}));
-    assert_eq!(
-        topology["result"]["spawn"]["exit_observation"]["code"],
-        json!(23),
-        "{topology}"
-    );
     assert!(
         recorded_edge(&sandbox.state(), &edge_id)
             .get("instance")
@@ -8104,12 +8073,6 @@ fn a_dead_pane_close_refuses_when_the_serving_instance_changed() {
         .expect("private spawn token")
         .to_owned();
     register_close_child(&mut client, &token, staged_identity(200, 400));
-    let topology = client.call("spawn.get", json!({"request_id": edge_id}));
-    assert_eq!(
-        topology["result"]["spawn"]["exit_observation"]["code"],
-        json!(23),
-        "{topology}"
-    );
     assert_eq!(
         recorded_edge(&sandbox.state(), &edge_id)["instance"],
         json!({"boot_id": "boot-test", "pid": 900, "start_ticks": 400}),
@@ -11004,6 +10967,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
             cwd: None,
             env: BTreeMap::new(),
         },
+        String::from("key"),
         1_001,
     )
     .expect("captured");

@@ -482,6 +482,38 @@ pub(crate) fn admitted_agent(registry: &Registry, registration_id: &str) -> Resu
     )
 }
 
+/// What a spawn read says about its child's end: the claim's recorded completion,
+/// or a verified exit whose status was never reported, or nothing yet. It reads
+/// what was recorded and asks no backend, so a removed pane changes nothing.
+pub fn spawn_exit(
+    registry: &Registry,
+    claim_id: Option<&str>,
+) -> crate::control_plane::registry::PublicSpawnExitObservation {
+    use crate::control_plane::registry::PublicSpawnExitObservation::{Exited, Unknown};
+    let process = claim_id
+        .and_then(|id| read(registry, id).ok().flatten())
+        .map(|claim| claim.process);
+    match process {
+        Some(ProcessRecord {
+            completion: Some(completion),
+            ..
+        }) => Exited {
+            code: completion.code,
+            signal: completion.signal,
+            observed_at: completion.observed_at,
+        },
+        Some(ProcessRecord {
+            exited_at: Some(observed_at),
+            ..
+        }) => Exited {
+            code: None,
+            signal: None,
+            observed_at,
+        },
+        _ => Unknown,
+    }
+}
+
 /// Records how an admitted program ended, on the report of the supervisor that
 /// holds the key minted for it. The program is found by its captured identity, so
 /// a report names no registration; the key is what makes it that supervisor's.
@@ -990,6 +1022,7 @@ pub fn capture(
     correlation: &str,
     process: &ProcessIdentity,
     effective: &Effective,
+    completion_key: String,
     now_ms: i64,
 ) -> Result<(), String> {
     let _transition = registry.transition();
@@ -1005,7 +1038,9 @@ pub fn capture(
     subject.process.state = State::Captured;
     subject.process.correlation = None;
     subject.process.identity = Some(process.clone());
+    subject.process.completion_key = Some(completion_key);
     subject.process.recorded_at = format_millis(now_ms);
+    store_recipe(registry, &subject.process)?;
     write(registry, &subject)
 }
 
@@ -2117,7 +2152,10 @@ fn parse_server_identity(server: &str) -> Option<ProcessIdentity> {
 ///
 /// Returns only on failure. An unclaimed launch never runs its program.
 pub fn run_launch(socket: &str) -> i32 {
-    let claimed = match claim(Path::new(socket)) {
+    let Ok(key) = std::env::var(SUPERVISION_ENV) else {
+        return supervise(socket);
+    };
+    let claimed = match claim(Path::new(socket), key) {
         Ok(claimed) => claimed,
         Err(message) => {
             eprintln!("radar run: {message}");
@@ -2194,7 +2232,7 @@ fn supervise(socket: &str) -> i32 {
     if let Some(process) = process {
         // A launch refused before admission has no record to report to; neither
         // that nor an unreachable daemon changes how the program's end is shown.
-        let _ = exchange(
+        if let Err(error) = exchange(
             Path::new(socket),
             COMPLETE_METHOD,
             json!({
@@ -2203,7 +2241,9 @@ fn supervise(socket: &str) -> i32 {
                 "code": status.code(),
                 "signal": status.signal(),
             }),
-        );
+        ) {
+            eprintln!("radar run: the program's end was not recorded: {error}");
+        }
     }
     status
         .code()
@@ -2306,7 +2346,7 @@ fn enter_scope(
     127
 }
 
-fn claim(socket: &Path) -> Result<Claimed, String> {
+fn claim(socket: &Path, completion_key: String) -> Result<Claimed, String> {
     let claim_id = std::env::var(CLAIM_ENV).map_err(|_| "no launch claim".to_string())?;
     let correlation =
         std::env::var(CORRELATION_ENV).map_err(|_| "no launch correlation".to_string())?;
@@ -2316,7 +2356,12 @@ fn claim(socket: &Path) -> Result<Claimed, String> {
     let result = exchange(
         socket,
         CLAIM_METHOD,
-        json!({"claim_id": claim_id, "correlation": correlation, "process": process}),
+        json!({
+            "claim_id": claim_id,
+            "correlation": correlation,
+            "process": process,
+            "completion_key": completion_key,
+        }),
     )?;
     serde_json::from_value(result).map_err(|_| "launch was not released".to_string())
 }
@@ -2358,6 +2403,21 @@ fn exchange(socket: &Path, method: &str, params: Value) -> Result<Value, String>
 fn write(registry: &Registry, subject: &Claim) -> Result<(), String> {
     write_attempt(registry, subject)?;
     note_attempt(registry, subject)
+}
+
+/// Replaces the private recipe, which is otherwise written once at creation. A
+/// fact only the claiming process can supply, like its supervisor's key, is
+/// stored here before the transition that depends on it is recorded.
+fn store_recipe(registry: &Registry, process: &ProcessRecord) -> Result<(), String> {
+    let directory = registry.subjects().join("private");
+    let bytes =
+        serde_json::to_vec_pretty(process).map_err(|_| "cannot encode private process recipe")?;
+    write_atomic(
+        &directory,
+        &recipe_path(registry, &process.registration_id),
+        &bytes,
+        MAX_SUBJECT_BYTES,
+    )
 }
 
 fn ensure_process(
@@ -2639,6 +2699,7 @@ mod tests {
             &ticket.correlation,
             &identity(7),
             &started_as(&launch()),
+            random_uuid(),
             3,
         );
         assert_eq!(claim, Err(NOT_AWAITING.to_string()));
@@ -3129,6 +3190,7 @@ mod tests {
             &ticket.correlation,
             &identity(7),
             &started_as(&launch()),
+            random_uuid(),
             2,
         )
         .expect("capture");
@@ -3141,6 +3203,7 @@ mod tests {
                 &ticket.correlation,
                 &identity(7),
                 &started_as(&launch()),
+                random_uuid(),
                 3,
             ),
             Err(NOT_AWAITING.to_string()),
@@ -3220,6 +3283,7 @@ mod tests {
                 &ticket.correlation,
                 &identity(7),
                 &altered,
+                random_uuid(),
                 2
             ),
             Err(LAUNCH_MISMATCH.to_string())
@@ -3251,6 +3315,7 @@ mod tests {
             &ticket.correlation,
             &process,
             &started_as(&launch()),
+            random_uuid(),
             2,
         )
         .expect("capture");
@@ -3551,6 +3616,7 @@ mod tests {
             &ticket.correlation,
             &process,
             &started_as(&launch()),
+            random_uuid(),
             2,
         )
         .expect("capture");
@@ -3981,6 +4047,7 @@ mod tests {
             &ticket.correlation,
             &process,
             &started_as(&launch()),
+            random_uuid(),
             2,
         )
         .expect("capture");
@@ -4025,6 +4092,7 @@ mod tests {
             &ticket.correlation,
             &claimed,
             &started_as(&launch()),
+            random_uuid(),
             2,
         )
         .expect("capture");
@@ -4053,6 +4121,7 @@ mod tests {
             &ticket.correlation,
             &identity(7),
             &started_as(&launch()),
+            random_uuid(),
             2,
         )
         .expect("capture");

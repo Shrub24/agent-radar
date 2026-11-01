@@ -25,9 +25,9 @@ use agent_radar::control_plane::registry::{
     CloseOutcome, CloseResult, ContextRequest, ContextValue, ExpectedWriter, Freshness,
     LaunchSession, LaunchSpec, LocalProcfsVerifier, LocationEvidence, MAX_CHILD_CLOSE_BYTES,
     MAX_CONTEXT_BYTES, MAX_LISTED, MAX_REGISTRATION_BYTES, MAX_SPAWN_BYTES, MAX_TEXT_BYTES,
-    Outcome, ProcessVerification, ProcessVerifier, PublicChannel, PublicContext, PublishRequest,
-    PublisherIdentity, RegistrationRequest, Registry, RegistryLocation, Report, Snapshot,
-    SpawnEdge, SpawnRequest, SpawnState, WriterBinding,
+    Outcome, ProcessVerification, ProcessVerifier, PublicChannel, PublicContext,
+    PublicSpawnExitObservation, PublishRequest, PublisherIdentity, RegistrationRequest, Registry,
+    RegistryLocation, Report, Snapshot, SpawnEdge, SpawnRequest, SpawnState, WriterBinding,
 };
 use agent_radar::control_plane::{RequestOutcome, random_uuid};
 use agent_radar::model::{ProcessIdentity, SessionUuid};
@@ -2391,7 +2391,10 @@ fn a_recorded_spawn_edge_survives_reopening_with_its_private_token() {
         .expect("a read")
         .expect("the record");
     assert_eq!(restored, recorded);
-    assert_eq!(restored.version, 2);
+    assert_eq!(
+        restored.version,
+        agent_radar::control_plane::registry::SPAWN_VERSION
+    );
     assert_eq!(restored.parent_session_id, SESSION);
     assert_eq!(restored.recorded_at, format_millis(2_000));
     assert!(
@@ -2692,7 +2695,7 @@ fn a_spawn_token_never_reaches_a_public_read() {
         .expect("a record");
 
     // A pending edge reads as a parent with no child and no token.
-    let pending = edge.public();
+    let pending = edge.public(PublicSpawnExitObservation::Unknown);
     assert_eq!(pending.request_id, SPAWN_REQUEST);
     assert_eq!(pending.parent, parent);
     assert!(pending.bound.is_none());
@@ -2709,7 +2712,8 @@ fn a_spawn_token_never_reaches_a_public_read() {
     // The bound child is public; the token that bound it is not.
     let bound =
         bind_child(&registry, &edge.token, "herdsman", CHILD_INCARNATION, 3_000).expect("a bind");
-    let json = serde_json::to_string(&bound.public()).expect("an encoding");
+    let json = serde_json::to_string(&bound.public(PublicSpawnExitObservation::Unknown))
+        .expect("an encoding");
     assert!(json.contains(CHILD_INCARNATION), "{json}");
     assert!(
         !json.contains(&edge.token),
@@ -2765,64 +2769,6 @@ fn a_spawn_edge_that_is_not_a_whole_record_fails_explicitly() {
     fs::write(&path, serde_json::to_vec(&garbled).expect("an encoding")).expect("a write");
     let error = registry.spawn_edge(SPAWN_REQUEST).expect_err("a refusal");
     assert!(error.contains("malformed token"), "{error}");
-    drop_root(&root);
-}
-
-#[test]
-fn spawn_exit_is_typed_first_writer_wins_and_survives_reopen() {
-    let root = temp_root("spawn-exit");
-    let registry = Registry::open_at(&root, 1_000).expect("a registry");
-    let parent = spawn_parent(&registry, INCARNATION, 1_000);
-    registry
-        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
-        .expect("a recorded edge");
-    let initial = registry
-        .spawn_edge(SPAWN_REQUEST)
-        .expect("read initial edge")
-        .expect("edge");
-    assert_eq!(
-        serde_json::to_value(initial.public()).unwrap()["exit_observation"]["state"],
-        "unknown"
-    );
-    let first = registry
-        .record_spawn_exit(SPAWN_REQUEST, Some(23), None, 3_000)
-        .expect("typed exit");
-    assert_eq!(first.exit.as_ref().unwrap().code, Some(23));
-    assert_eq!(first.exit.as_ref().unwrap().signal, None);
-    assert_eq!(
-        first.exit.as_ref().unwrap().observed_at,
-        format_millis(3_000)
-    );
-
-    let replay = registry
-        .record_spawn_exit(SPAWN_REQUEST, None, Some(15), 4_000)
-        .expect("replayed exit");
-    assert_eq!(
-        replay.exit, first.exit,
-        "a later observation cannot revise exit"
-    );
-    drop(registry);
-
-    let reopened = Registry::open_at(&root, 5_000).expect("reopen");
-    let restored = reopened
-        .spawn_edge(SPAWN_REQUEST)
-        .expect("read")
-        .expect("edge");
-    assert_eq!(restored.exit, first.exit);
-    assert_eq!(
-        restored.public().exit_observation,
-        first.public().exit_observation
-    );
-    assert!(
-        reopened
-            .record_spawn_exit(SPAWN_REQUEST, Some(1), Some(9), 6_000)
-            .is_err()
-    );
-    assert!(
-        reopened
-            .record_spawn_exit(SPAWN_REQUEST, None, None, 6_000)
-            .is_err()
-    );
     drop_root(&root);
 }
 
@@ -3358,7 +3304,10 @@ fn a_topology_read_derives_state_and_freshness_from_one_observation() {
     let intent = registry
         .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
         .expect("a recorded intent");
-    let read = intent.topology(LocationEvidence::Present);
+    let read = intent.topology(
+        LocationEvidence::Present,
+        PublicSpawnExitObservation::Unknown,
+    );
     assert_eq!(read.state, SpawnState::Unbound);
     assert!(read.freshness.is_none());
     assert!(read.edge.location.is_none());
@@ -3374,20 +3323,29 @@ fn a_topology_read_derives_state_and_freshness_from_one_observation() {
         .expect("the created effect");
 
     // The backend reports the recorded pane now.
-    let confirmed = created.topology(LocationEvidence::Present);
+    let confirmed = created.topology(
+        LocationEvidence::Present,
+        PublicSpawnExitObservation::Unknown,
+    );
     assert_eq!(confirmed.state, SpawnState::Unbound);
     assert_eq!(confirmed.freshness, Some(Freshness::Fresh));
     assert_eq!(confirmed.edge.location.as_ref(), Some(&location));
 
     // The backend answered and the pane is not in its report: the record and the
     // world disagree, and the recorded location is retained rather than dropped.
-    let unresolved = created.topology(LocationEvidence::Absent);
+    let unresolved = created.topology(
+        LocationEvidence::Absent,
+        PublicSpawnExitObservation::Unknown,
+    );
     assert_eq!(unresolved.state, SpawnState::Unresolved);
     assert_eq!(unresolved.freshness, Some(Freshness::Stale));
     assert_eq!(unresolved.edge.location.as_ref(), Some(&location));
 
     // No backend could be asked: unconfirmed, which is not evidence of absence.
-    let unconfirmed = created.topology(LocationEvidence::Unavailable);
+    let unconfirmed = created.topology(
+        LocationEvidence::Unavailable,
+        PublicSpawnExitObservation::Unknown,
+    );
     assert_eq!(unconfirmed.state, SpawnState::Unbound);
     assert_eq!(unconfirmed.freshness, Some(Freshness::Stale));
 
@@ -3402,21 +3360,39 @@ fn a_topology_read_derives_state_and_freshness_from_one_observation() {
     )
     .expect("a binding");
     assert_eq!(
-        bound.topology(LocationEvidence::Present).state,
+        bound
+            .topology(
+                LocationEvidence::Present,
+                PublicSpawnExitObservation::Unknown
+            )
+            .state,
         SpawnState::Bound
     );
     assert_eq!(
-        bound.topology(LocationEvidence::Unavailable).state,
+        bound
+            .topology(
+                LocationEvidence::Unavailable,
+                PublicSpawnExitObservation::Unknown
+            )
+            .state,
         SpawnState::Bound
     );
     assert_eq!(
-        bound.topology(LocationEvidence::Absent).state,
+        bound
+            .topology(
+                LocationEvidence::Absent,
+                PublicSpawnExitObservation::Unknown
+            )
+            .state,
         SpawnState::Unresolved,
         "a vanished location outranks the binding for the state a client reads"
     );
     assert_eq!(
         bound
-            .topology(LocationEvidence::Absent)
+            .topology(
+                LocationEvidence::Absent,
+                PublicSpawnExitObservation::Unknown
+            )
             .edge
             .bound
             .as_ref()
@@ -3432,7 +3408,9 @@ fn a_topology_read_derives_state_and_freshness_from_one_observation() {
         LocationEvidence::Absent,
         LocationEvidence::Unavailable,
     ] {
-        let json = serde_json::to_string(&bound.topology(evidence)).expect("an encoding");
+        let json =
+            serde_json::to_string(&bound.topology(evidence, PublicSpawnExitObservation::Unknown))
+                .expect("an encoding");
         assert!(!json.contains(&bound.token), "{json}");
     }
     drop_root(&root);

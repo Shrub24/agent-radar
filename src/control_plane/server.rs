@@ -41,7 +41,7 @@ use crate::control_plane::public_contracts::{PingResult, TaskLaneStatus};
 use crate::control_plane::reconcile;
 use crate::control_plane::registry::{
     self, AcquireRequest, Channel, CloseAdmission, CloseOutcome, CloseResult, LocalProcfsVerifier,
-    LocationEvidence, ProcessVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnEdge,
+    LocationEvidence, ProcessVerifier, RegistrationRequest, Registry, RegistryLocation,
 };
 use crate::control_plane::store::{
     self, Category, RequestOutcome, RequestRecord, Settlement, Store,
@@ -1080,9 +1080,12 @@ fn primitive_refuse(backend: &Arc<dyn RuntimeProvider>, method: &str) -> Option<
 /// the first time. A refusal carries no record and is answered as itself.
 fn spawn_answer(request: &Request, reply: Reply, core: &Arc<Mutex<Core>>) -> Reply {
     let answer = reply?;
-    let edge = locked(core).registry.spawn_edge(&request.id);
-    Ok(match edge {
-        Ok(Some(edge)) => answer.with_spawn(edge.public()),
+    let registry = Arc::clone(&locked(core).registry);
+    Ok(match registry.spawn_edge(&request.id) {
+        Ok(Some(edge)) => {
+            let exit = subjects::spawn_exit(&registry, edge.claim_id.as_deref());
+            answer.with_spawn(edge.public(exit))
+        }
         _ => answer,
     })
 }

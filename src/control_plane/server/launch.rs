@@ -644,7 +644,8 @@ pub(super) fn spawn_child(
         Settlement::new(outcome, category, message, effects),
         store::now_ms(),
     );
-    write_settled_with(done, core, |answer| answer.with_spawn(edge.public()))
+    let exit = subjects::spawn_exit(&locked(core).registry, edge.claim_id.as_deref());
+    write_settled_with(done, core, |answer| answer.with_spawn(edge.public(exit)))
 }
 
 /// The launch chain a tracked launch starts: this binary, serving `socket`. `None`
@@ -695,6 +696,7 @@ pub(super) struct ClaimParams {
     pub(super) claim_id: String,
     pub(super) correlation: String,
     pub(super) process: ProcessIdentity,
+    pub(super) completion_key: String,
 }
 
 /// Captures the process a tracked launch's `radar run --launch` claims, and answers
@@ -820,6 +822,7 @@ pub(super) fn claim_request(
         &params.correlation,
         &params.process,
         &effective,
+        params.completion_key,
         store::now_ms(),
     ) {
         Ok(()) => respond(

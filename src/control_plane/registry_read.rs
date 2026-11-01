@@ -196,10 +196,12 @@ fn topology(
     loop {
         let page = registry.spawn_edges_after(after.as_deref(), PAGE)?;
         let last = page.last().map(|edge| edge.request_id.clone());
-        topology.extend(
-            page.iter()
-                .map(|edge| edge.topology(location_evidence(inventory, edge))),
-        );
+        topology.extend(page.iter().map(|edge| {
+            edge.topology(
+                location_evidence(inventory, edge),
+                crate::control_plane::lifecycle::spawn_exit(registry, edge.claim_id.as_deref()),
+            )
+        }));
         if page.len() < PAGE {
             return Ok(topology);
         }
