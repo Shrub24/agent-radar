@@ -920,6 +920,7 @@ fn handle_line(
         Method::Registry => answer(writer, registry_request(core, &request, verification)),
         Method::Claim => answer(writer, claim_request(core, &request, verification)),
         Method::Admit => answer(writer, admit_request(core, &request, verification)),
+        Method::Complete => answer(writer, complete_request(core, &request)),
         Method::Wake => answer(writer, wake_request(core, &request, verification)),
         Method::Read => answer(writer, read_backend(core, &request)),
         Method::Operation(operation) => {

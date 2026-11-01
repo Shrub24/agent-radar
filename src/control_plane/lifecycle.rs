@@ -56,6 +56,7 @@ pub const WAKE_METHOD: &str = "lifecycle.wake";
 
 /// Admission of an in-place managed launch into a pane the caller already occupies.
 pub const ADMIT_METHOD: &str = "launch.admit";
+pub const COMPLETE_METHOD: &str = "launch.complete";
 
 /// Refusal for a claim the subject cannot take: unknown, spent, revoked, or no
 /// longer awaiting a process. It says nothing about which.
@@ -275,6 +276,13 @@ pub struct ProcessRecord {
     pub signalled_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exited_at: Option<String>,
+    /// How the program ended, once its supervisor reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<Completion>,
+    /// What authenticates this execution's supervisor. Private, like the
+    /// correlation: it never leaves the recipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_key: Option<String>,
     /// Recorded once, by the cancel that revoked an unbound launch. A bound
     /// launch's pane belongs to its child and is closed through spawn.close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +335,17 @@ pub struct Termination {
 
 /// What a cancel did about the pane an unbound launch left behind. Reported
 /// apart from revocation and from verified process exit, and not an exit claim.
+/// How a managed program ended, as the process supervising it saw it. It is a
+/// fact about the execution, recorded when it happens: a retained pane is not
+/// durable storage for it, and its absence never blocks a lifecycle transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Completion {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub observed_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome", content = "reason")]
 pub enum PaneCleanup {
@@ -414,6 +433,8 @@ fn draft_process(
         signalled_at: None,
         exited_at: None,
         pane_cleanup: None,
+        completion: None,
+        completion_key: None,
         recorded_at: format_millis(now_ms),
     }
 }
@@ -425,11 +446,13 @@ pub fn create_process(
     launch: LaunchContext,
     kind: ProcessKind,
     identity: &ProcessIdentity,
+    completion_key: String,
     now_ms: i64,
 ) -> Result<ProcessRecord, String> {
     check_bounds(&launch)?;
     let mut process = draft_process(spawn_request_id, launch, random_uuid(), now_ms);
     process.kind = kind;
+    process.completion_key = Some(completion_key);
     process.origin = Origin::Admitted;
     process.correlation = None;
     let _transition = registry.transition();
@@ -456,6 +479,46 @@ pub(crate) fn admitted_agent(registry: &Registry, registration_id: &str) -> Resu
                 && process.kind == ProcessKind::Agent
                 && matches!(process.state, State::Captured | State::Bound)
         }),
+    )
+}
+
+/// Records how an admitted program ended, on the report of the supervisor that
+/// holds the key minted for it. The program is found by its captured identity, so
+/// a report names no registration; the key is what makes it that supervisor's.
+/// A second report for the same execution changes nothing.
+pub(crate) fn record_completion(
+    registry: &Registry,
+    process: &ProcessIdentity,
+    key: &str,
+    code: Option<i32>,
+    signal: Option<i32>,
+    now_ms: i64,
+) -> Result<(), String> {
+    let _transition = registry.transition();
+    let registration_id = registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .registration_of(process)
+        .map(str::to_string)
+        .ok_or("no launch holds this process")?;
+    let record = read_process(registry, &registration_id)?.ok_or("launch is not recorded")?;
+    if record.completion_key.as_deref() != Some(key) {
+        return Err("report does not come from this launch's supervisor".into());
+    }
+    if record.completion.is_some() {
+        return Ok(());
+    }
+    record_process_transition(
+        registry,
+        &registration_id,
+        crate::control_plane::events::Source::Launch,
+        crate::control_plane::events::Transition::Completed(Completion {
+            code,
+            signal,
+            observed_at: format_millis(now_ms),
+        }),
+        now_ms,
     )
 }
 
@@ -1520,6 +1583,7 @@ pub struct PublicClaim {
     pub ended_externally_at: Option<String>,
     pub ended_evidence: Option<EndedEvidence>,
     pub pane_cleanup: Option<PaneCleanup>,
+    pub completion: Option<Completion>,
     pub bound_registration_id: Option<String>,
     pub signalled_at: Option<String>,
     pub exited_at: Option<String>,
@@ -1542,6 +1606,7 @@ pub fn public_view(subject: &Claim) -> PublicClaim {
         ended_externally_at: subject.process.ended_externally_at.clone(),
         ended_evidence: subject.process.ended_evidence.clone(),
         pane_cleanup: subject.process.pane_cleanup.clone(),
+        completion: subject.process.completion.clone(),
         bound_registration_id: subject.process.bound_registration_id.clone(),
         signalled_at: subject.process.signalled_at.clone(),
         exited_at: subject.process.exited_at.clone(),
@@ -2068,12 +2133,90 @@ pub fn run_launch(socket: &str) -> i32 {
     )
 }
 
-/// Runs `radar run -- COMMAND [ARG...]`: admits the command in this verified
-/// pane, then becomes it inside the execution's scope.
+/// What passes a supervisor's key to the process it supervises. The process
+/// removes it before the program runs, so the program never holds the key.
+const SUPERVISION_ENV: &str = "RADAR_RUN_SUPERVISION";
+
+/// Runs `radar run -- COMMAND [ARG...]`. This process supervises: it runs the
+/// admitted launch as its child and reports how the program ended, because only
+/// a parent can learn that, and the pane's shell is not the program's parent.
+pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
+    match std::env::var(SUPERVISION_ENV) {
+        Ok(key) => admit_and_enter(socket, kind, program, key),
+        Err(_) => supervise(socket),
+    }
+}
+
+/// Runs this same invocation as a child and reports its end to the daemon.
+///
+/// The child is the one admitted and the one that becomes the program, so the
+/// identity the daemon records is the program's own. A terminal interrupt reaches
+/// both: the supervisor ignores it and carries on to the report.
+fn supervise(socket: &str) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    let key = random_uuid();
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("radar run: {error}");
+            return 1;
+        }
+    };
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT] {
+        if let Err(error) = signal_hook::flag::register(signal, interrupted.clone()) {
+            eprintln!("radar run: {error}");
+            return 1;
+        }
+    }
+    let mut child = match Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(SUPERVISION_ENV, &key)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("radar run: {error}");
+            return 1;
+        }
+    };
+    let process = LocalProcfsVerifier
+        .inspect(child.id() as i32)
+        .ok()
+        .flatten();
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("radar run: {error}");
+            return 1;
+        }
+    };
+    if let Some(process) = process {
+        // A launch refused before admission has no record to report to; neither
+        // that nor an unreachable daemon changes how the program's end is shown.
+        let _ = exchange(
+            Path::new(socket),
+            COMPLETE_METHOD,
+            json!({
+                "process": process,
+                "key": key,
+                "code": status.code(),
+                "signal": status.signal(),
+            }),
+        );
+    }
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+/// Admits the command in this verified pane, then becomes it inside the
+/// execution's scope.
 ///
 /// Returns only on failure. The program is never executed directly: the scope
 /// wrapper is what runs, so a scope that cannot be created runs nothing.
-pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
+fn admit_and_enter(socket: &str, kind: ProcessKind, program: &[String], key: String) -> i32 {
     if program.is_empty() {
         eprintln!("radar run: no command to run");
         return 2;
@@ -2104,6 +2247,7 @@ pub fn run_managed(socket: &str, kind: ProcessKind, program: &[String]) -> i32 {
             "argv": &program[1..],
             "cwd": cwd,
             "kind": kind,
+            "completion_key": key,
         }),
     ) {
         Ok(answer) => answer,
@@ -2145,7 +2289,7 @@ fn enter_scope(
         }
     };
     let mut launch = Command::new(launcher);
-    launch.args(&argv);
+    launch.args(&argv).env_remove(SUPERVISION_ENV);
     if claimed {
         launch.env_remove(CLAIM_ENV).env_remove(CORRELATION_ENV);
     }
@@ -2310,6 +2454,17 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
         )
     } else if previous.execution.exited_at != target.execution.exited_at {
         (Source::ProcessObservation, Transition::ExitVerified)
+    } else if previous.execution.completion != target.execution.completion {
+        (
+            Source::Launch,
+            Transition::Completed(
+                target
+                    .execution
+                    .completion
+                    .clone()
+                    .ok_or("cannot remove a completion")?,
+            ),
+        )
     } else if previous.execution.pane_cleanup != target.execution.pane_cleanup {
         (
             Source::PaneControl,
@@ -2643,6 +2798,7 @@ mod tests {
             launch(),
             ProcessKind::Agent,
             &identity,
+            random_uuid(),
             1,
         )
         .expect("admitted process");
@@ -2674,6 +2830,50 @@ mod tests {
             registry.register(&presenting(other), 3).is_err(),
             "a different process cannot bind the admitted registration"
         );
+    }
+
+    #[test]
+    fn a_completion_is_recorded_once_for_the_supervisor_that_holds_the_key() {
+        let scratch = Scratch::new("completion");
+        let registry = scratch.registry();
+        let identity = ProcessIdentity {
+            boot_id: "boot".into(),
+            pid: 4242,
+            start_ticks: 7,
+        };
+        let key = random_uuid();
+        let process = create_process(
+            &registry,
+            &random_uuid(),
+            launch(),
+            ProcessKind::Agent,
+            &identity,
+            key.clone(),
+            1,
+        )
+        .expect("admitted process");
+        let recorded = |registry: &Registry| {
+            read_process(registry, &process.registration_id)
+                .expect("read")
+                .expect("process")
+                .completion
+        };
+
+        assert!(
+            record_completion(&registry, &identity, "not-the-key", Some(0), None, 2).is_err(),
+            "a report without the supervisor's key records nothing"
+        );
+        let other = ProcessIdentity {
+            pid: 4243,
+            ..identity.clone()
+        };
+        assert!(record_completion(&registry, &other, &key, Some(0), None, 2).is_err());
+        assert_eq!(recorded(&registry), None);
+
+        record_completion(&registry, &identity, &key, Some(7), None, 3).expect("report");
+        record_completion(&registry, &identity, &key, None, Some(9), 4).expect("replay");
+        let completion = recorded(&scratch.registry()).expect("completion survives a reopen");
+        assert_eq!((completion.code, completion.signal), (Some(7), None));
     }
 
     #[test]

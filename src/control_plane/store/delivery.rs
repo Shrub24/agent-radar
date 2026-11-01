@@ -78,6 +78,7 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::AbsencePending(_) => "lifecycle.absence_pending",
         Transition::EndedExternally(_) => "lifecycle.ended_externally",
         Transition::PaneCleanup(_) => "lifecycle.pane_cleanup",
+        Transition::Completed(_) => "lifecycle.completed",
         Transition::SessionRecorded { .. } => "lifecycle.session_recorded",
         Transition::OperationAdmitted(_) => "lifecycle.operation.admitted",
         Transition::OperationStarted(_) => "lifecycle.operation.started",

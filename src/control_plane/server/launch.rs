@@ -849,6 +849,36 @@ pub(super) struct AdmitParams {
     #[serde(default)]
     pub(super) cwd: Option<String>,
     pub(super) kind: subjects::ProcessKind,
+    pub(super) completion_key: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CompleteParams {
+    pub(super) process: crate::model::ProcessIdentity,
+    pub(super) key: String,
+    pub(super) code: Option<i32>,
+    pub(super) signal: Option<i32>,
+}
+
+/// Records how an admitted program ended, on its supervisor's report.
+pub(super) fn complete_request(core: &Arc<Mutex<Core>>, request: &Request) -> Response {
+    let params: CompleteParams = match decode_params(request) {
+        Ok(value) => value,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let registry = Arc::clone(&locked(core).registry);
+    match subjects::record_completion(
+        &registry,
+        &params.process,
+        &params.key,
+        params.code,
+        params.signal,
+        store::now_ms(),
+    ) {
+        Ok(()) => respond(&request.id, Ok(serde_json::json!({}))),
+        Err(error) => Response::refused(&request.id, &Refusal::new(Code::Refused, error)),
+    }
 }
 
 /// Admits an in-place managed launch, then answers with the identity the caller
@@ -950,6 +980,7 @@ pub(super) fn admit_request(
         launch,
         params.kind,
         &params.process,
+        params.completion_key,
         store::now_ms(),
     ) {
         Ok(process) => process,

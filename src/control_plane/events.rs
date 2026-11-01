@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::{
-    Claim, EndedEvidence, Observation, Origin, PaneAbsence, PaneCleanup, ProcessRecord, State,
+    Claim, Completion, EndedEvidence, Observation, Origin, PaneAbsence, PaneCleanup, ProcessRecord,
+    State,
 };
 use crate::control_plane::containers::{Container, ContainerObservation};
 use crate::control_plane::registry::publication::write_atomic;
@@ -98,6 +99,8 @@ pub struct ProcessFacts {
     pub ended_evidence: Option<EndedEvidence>,
     #[serde(default)]
     pub pane_cleanup: Option<PaneCleanup>,
+    #[serde(default)]
+    pub completion: Option<Completion>,
     pub bound_registration_id: Option<String>,
     pub signalled_at: Option<String>,
     pub exited_at: Option<String>,
@@ -130,6 +133,7 @@ impl From<&ProcessRecord> for ProcessFacts {
             ended_externally_at: process.ended_externally_at.clone(),
             ended_evidence: process.ended_evidence.clone(),
             pane_cleanup: process.pane_cleanup.clone(),
+            completion: process.completion.clone(),
             bound_registration_id: process.bound_registration_id.clone(),
             signalled_at: process.signalled_at.clone(),
             exited_at: process.exited_at.clone(),
@@ -147,6 +151,7 @@ impl ProcessFacts {
         process.ended_externally_at = self.ended_externally_at.clone();
         process.ended_evidence = self.ended_evidence.clone();
         process.pane_cleanup = self.pane_cleanup.clone();
+        process.completion = self.completion.clone();
         process.bound_registration_id = self.bound_registration_id.clone();
         process.signalled_at = self.signalled_at.clone();
         process.exited_at = self.exited_at.clone();
@@ -186,6 +191,9 @@ pub enum Transition {
     /// verified process exit records `ExitVerified`.
     EndedExternally(EndedEvidence),
     PaneCleanup(PaneCleanup),
+    /// Records how the program ended, once, as its supervisor saw it. It is
+    /// independent of the verified exit: either may arrive first.
+    Completed(Completion),
     /// Records the Pi session a launched process reported, once, on a bound subject
     /// that was launched without one.
     SessionRecorded {
@@ -387,6 +395,15 @@ impl Log {
     }
     pub fn process(&self, registration_id: &str) -> Option<&ProcessFacts> {
         self.processes.get(registration_id)
+    }
+
+    /// The registration whose captured process is this one. Identities carry the
+    /// boot and start time, so a recycled pid never matches an earlier launch.
+    pub fn registration_of(&self, process: &ProcessIdentity) -> Option<&str> {
+        self.processes
+            .iter()
+            .find(|(_, facts)| facts.process.as_ref() == Some(process))
+            .map(|(id, _)| id.as_str())
     }
 
     pub fn ids(&self) -> impl Iterator<Item = &String> {
@@ -660,6 +677,11 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
         // bound, or one bound and verifiably exited. Its cleanup outcome is
         // recorded once, so a later operation on the same launch reports it
         // rather than closing anything twice.
+        Transition::Completed(completion)
+            if facts.execution.process.is_some() && facts.execution.completion.is_none() =>
+        {
+            facts.execution.completion = Some(completion.clone())
+        }
         Transition::PaneCleanup(outcome)
             if facts.execution.pane_cleanup.is_none()
                 && (facts.execution.state == State::Revoked

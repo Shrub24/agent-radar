@@ -370,6 +370,8 @@ pub enum Method {
     Claim,
     /// Admission of an in-place managed launch into a pane the caller occupies.
     Admit,
+    /// The supervisor of an admitted launch reporting how its program ended.
+    Complete,
     /// The internal notification a launch's pane-death hook sends. It is a hint
     /// that reconciles one launch against exact process evidence.
     Wake,
@@ -418,6 +420,7 @@ pub fn classify(method: &str) -> Option<Method> {
         "mux.observe" | "mux.process_info" | "mux.output" => Method::Read,
         "launch.claim" => Method::Claim,
         "launch.admit" => Method::Admit,
+        "launch.complete" => Method::Complete,
         "lifecycle.wake" => Method::Wake,
         other => Method::Operation(Operation::from_method(other)?),
     })

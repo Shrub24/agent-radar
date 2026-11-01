@@ -44,6 +44,84 @@ fn a_run_outside_a_pane_refuses_before_running_anything() {
 }
 
 #[test]
+fn a_supervised_run_reports_how_its_program_ended_and_keeps_the_key_from_it() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let root = std::env::temp_dir().join(format!("radar-run-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let socket = root.join("control.sock");
+    let _ = std::fs::remove_file(&socket);
+    // Stands in for the scope launcher: it drops the scope's flags and runs the
+    // program, which is all the real one does to the program's identity.
+    let launcher = root.join("launcher");
+    std::fs::write(
+        &launcher,
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str() {
+                Some("launch.admit") => {
+                    serde_json::json!({"registration_id": "00000000-0000-4000-8000-000000000001"})
+                }
+                _ => serde_json::json!({}),
+            };
+            writeln!(
+                &stream,
+                "{}",
+                serde_json::json!({"id": request["id"], "result": result})
+            )
+            .unwrap();
+            seen.push(request);
+        }
+        seen
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_radar"))
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "[ -z \"$RADAR_RUN_SUPERVISION\" ] && exit 7; exit 9",
+        ])
+        .env("RADAR_CONTROL_SOCKET", &socket)
+        .env("RADAR_SYSTEMD_RUN", &launcher)
+        .env("TMUX_PANE", "%1")
+        .output()
+        .expect("run radar run");
+    let seen = daemon.join().unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the run ends as its program did, and the program never held the key: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (admit, complete) = (&seen[0], &seen[1]);
+    assert_eq!(admit["method"], "launch.admit");
+    assert_eq!(complete["method"], "launch.complete");
+    assert_eq!(
+        complete["params"]["process"], admit["params"]["process"],
+        "the report names the admitted program, not the supervisor"
+    );
+    assert_eq!(complete["params"]["key"], admit["params"]["completion_key"]);
+    assert_eq!(complete["params"]["code"], 7);
+}
+
+#[test]
 fn a_run_with_no_command_is_a_usage_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_radar"))
         .args(["run", "--"])
