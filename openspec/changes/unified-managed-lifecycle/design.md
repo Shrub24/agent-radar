@@ -145,16 +145,16 @@ Dispositions against the delivered tree:
 
 | flow | authorization | shared implementation | remaining policy |
 | --- | --- | --- | --- |
-| admission / claim (`launch.admit`, `radar run`) | caller must descend from the named pane, verified here | `launch::admit` → `subjects::capture` + `subjects::place`, the same claim and placement a tracked launch records | plants on the execution; the pane is the operator's, so nothing is removed |
-| configured `L` recipe | container create + recipe validation | `spawn_child` through the supervised launch, so the claim carries the supervisor's key | recipe argv is built in the UI session and sent as a create |
-| spawn / subject child close | child's own pane or dead-pane evidence | `bounded_close_dispatch` + `PaneCleanup::from`; completion grace before dispatch | authorization differs per caller: bound-or-revoked launch vs verified occupant |
-| single and batch cancellation | subject, resolved to its current claim | one `Shutdown` window with verified-scope escalation, `cancel` and `cancel_many` both on it | batch shares one window across the set |
-| container close (`topology.delete`) | frozen target + serving instance + confirmed contents | `executions_inside` (placement discovery) → `cancel_many` → `await_completions` → `lifecycle::close` | the operation record and container removals stay in the server |
+| admission / claim (`launch.admit`, `radar run`) | verified process ancestry in the canonical pane | direct admission calls `create_process`; tracked claim calls `capture` + `place`; both use supervision | direct admission has no subject before registration; explicit-Close pane removal is not yet converged |
+| configured `L` recipe | selected container + recipe validation | `targets::launch_plan` → `DomainAction::Create` with a shell recipe → `run_creation` | managed reservation/release is still missing; this is not the `spawn_child` path |
+| spawn / subject child close | parent/child authorization and verified occupant or dead-pane evidence | shared bounded pane dispatch and completion grace only | child close does not yet terminate the execution before removing the pane |
+| single and batch cancellation | exact claim or execution registration | shared staging and shutdown window | batch escalation is still sequential; verify the hard-deadline behaviour with multiple scopes |
+| container close (`topology.delete`) | frozen target + serving instance | generation-fenced placement discovery → exact registration termination → completion grace → `close_for_deletion` | orchestration remains in `places.rs`; the outcome still uses prose/effects instead of `closed` |
 | restart / continue | child-of-parent rule, then session context | `subjects::stop` → launch on `Exit::Exited` only → `spawn_child` beside the anchor | successor placement beside the anchor; pane reuse deferred |
 | launch expiry / revoke | durable operation record | `subjects::revoke` + the same termination window | revocation is cancelled work, not an ended process |
 | topology reload | selected container's recorded recipe | `ReloadContainer` effect; the reload path was not converged here | recipe-only shell reload, unrelated to managed close |
 
-No helper was left unused and no overwritten comment survived in the delivered diff; `subjects_inside` (the spawn-edge scan) was deleted with its only caller, and `observe_spawn_exits`/`record_spawn_exit` went with the read-time capture this change replaces.
+`subjects_inside` (the spawn-edge scan), `observe_spawn_exits` and `record_spawn_exit` were removed. `placed_at` currently has only test callers; it is not evidence that production row-to-execution resolution is implemented.
 
 Unrelated candidates, listed rather than refactored: `src/control.rs` still derives `pane_closed()` from the `effects` prose that typed operation results replaced, which is a contract change with its producer rather than a daemon sweep; and `src/ui_session/targets.rs` keeps its `containment_of` heuristic for choosing between a pane and a tab target, which is the daemon's row resolution (correct where it lives) but reads like a target derivation at a glance.
 

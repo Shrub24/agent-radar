@@ -6,7 +6,7 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 - **Breaking:** the shared command `delete` is now `close`, and the daemon decides what closing means for the row you selected: an execution is ended and its pane removed, a pane is closed, a container's whole branch is closed. No view derives a target any more, and no view re-resolves the row it selected to whatever is focused.
 - `D` is one gesture with one request. When the row's branch still holds agents it asks first and lists what the answer loses, exactly as before; the answer closes the branch once, signals every execution inside it, and reports what it could not verify instead of assuming it.
-- The status line shows what a close established rather than only that the request settled: an exit nobody verified, a pane that was left alone, a program's exit code, or a shutdown that had to be escalated. A close that went as asked adds no line.
+- For operations carrying a typed close report, the status line names unverified exits, kept panes, uncertain removals and attempted scope escalation. Program completion remains diagnostic detail on the record; a lost removal reply never claims the pane was kept.
 - **Breaking:** a close now reports what it established as typed parts on its record's `closed` field, and wire revision 14 requires a matching daemon and consumer. A read of `effects` prose to find out whether a pane was closed, or whether the process was verified gone, no longer works for `lifecycle.cancel`, `lifecycle.stop` and `topology.delete`; those operations publish `closed` instead and leave `effects` empty.
 - `closed.execution` is `exited`, or an unverified or unsignalled result with the reason. `closed.resource` says what became of the pane — `removed`, `absent`, `kept` or `unverified` — and is absent for an operation that removes nothing, so a stop no longer has to imply it kept the pane. `closed.completion` carries the program's code and signal when the process supervising it reported, and is absent when it did not: an exit verified without a code is a normal outcome, not a failure.
 - A verified exit and a pane removal are separate answers, and neither implies the other. A spontaneous exit keeps its pane on purpose; a removal may follow an exit whose code was never reported.
@@ -15,20 +15,20 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 ### Upgrading to 0.10.0
 
-Stop the daemon and the agents it manages before replacing the binary: this release
-ships a new supervisor, and an execution started by the old one keeps reporting to it.
+Stop managed programs before replacing the daemon and CLI together. Programs started
+by the old launcher do not gain the new completion supervisor when the daemon upgrades.
 
-State shapes that changed are refused rather than reinterpreted — a spawn edge from
-an earlier version, an old child-close record and the pre-`messages` communication
-directory each refuse with their own message and the path that holds them. Nothing
-migrates silently and nothing falls back: the daemon stops and names what it cannot
-read. Archive the state directory (or `radar reset --hard`, which discards recorded
-history too) only once those agents are stopped and their pending work is captured;
-a plain `radar reset` is not a fix for an unreadable record, and none of this is
-needed to "repair" lifecycle state.
+Stored spawn edges now use version 3; an older edge is refused when read, not migrated.
+Before upgrading, preserve an offline copy of the daemon state directory. A tested
+cutover procedure for old lifecycle records is still outstanding; do not work around
+a refusal by deleting individual records. Do not reset `communications/` or use
+`radar reset --hard` merely to upgrade lifecycle records: that discards unrelated
+mailbox state and history.
 
-Rollback means the previous binary with the previous archived state. A newly versioned
-store fed to an older daemon is refused, by design.
+Child-close record versions did not change in this release. The broader record-version
+and downgrade checks remain part of the unfinished lifecycle upgrade audit. To roll
+back, use the previous binary with the preserved pre-upgrade state, not the state
+written by the new daemon.
 
 ## Radar 0.9.0
 

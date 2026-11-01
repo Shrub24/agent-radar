@@ -300,7 +300,7 @@ fn current(state: &ObservationState) -> Result<&FleetObservation, String> {
 fn verb(operation: crate::app::Operation) -> &'static str {
     use crate::app::Operation;
     match operation {
-        Operation::Close => "Delete ",
+        Operation::Close => "Close ",
         Operation::Restart => "Restart ",
         Operation::CreateContainer => "Create in ",
         Operation::ReloadContainer => "Reload ",

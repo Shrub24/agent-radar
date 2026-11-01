@@ -3296,6 +3296,14 @@ fn registry_parent(
     registry: &agent_radar::control_plane::registry::Registry,
     session: &str,
 ) -> agent_radar::control_plane::registry::Registration {
+    registry_parent_at(registry, session, 1)
+}
+
+fn registry_parent_at(
+    registry: &agent_radar::control_plane::registry::Registry,
+    session: &str,
+    now: i64,
+) -> agent_radar::control_plane::registry::Registration {
     let parent = registry
         .register(
             &agent_radar::control_plane::registry::RegistrationRequest {
@@ -3310,7 +3318,7 @@ fn registry_parent(
                 launch: None,
                 spawn_token: None,
             },
-            1,
+            now,
         )
         .expect("a parent registration");
     registry
@@ -3332,7 +3340,7 @@ fn registry_parent(
                     launch_identity: None,
                 },
             },
-            2,
+            now + 1,
         )
         .expect("a session context");
     parent
@@ -11185,6 +11193,7 @@ fn a_deletion_ends_the_place_whatever_is_registered_in_it() {
 /// real managed launch does; without one the agent is a bare process the stop
 /// window can signal and outlive.
 fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
+    let now = agent_radar::control_plane::store::now_ms();
     use agent_radar::control_plane::lifecycle::{self as managed, LaunchContext, ManagedMetadata};
     use agent_radar::control_plane::registry::{
         LocalProcfsVerifier, RegistrationRequest, Registry, RegistryLocation, SpawnRequest,
@@ -11204,7 +11213,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
         .expect("the process exists");
     let registry = Registry::open(&sandbox.state()).expect("a registry");
     let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
-    let parent = registry_parent(&registry, session);
+    let parent = registry_parent_at(&registry, session, now);
     let request_id = random_uuid();
     registry
         .record_spawn(
@@ -11214,7 +11223,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
                 parent_session_id: session.into(),
                 parent_subject_id: None,
             },
-            1_000,
+            now,
         )
         .expect("an edge");
     let ticket = managed::create_with_intent(
@@ -11229,7 +11238,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
         None,
         None,
         ManagedMetadata::default(),
-        1_000,
+        now,
     )
     .expect("a reservation");
     registry
@@ -11283,7 +11292,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
             env: BTreeMap::new(),
         },
         String::from("key"),
-        1_001,
+        now,
     )
     .expect("captured");
     // Where the execution runs is recorded on the execution, as the launch path
@@ -11299,9 +11308,11 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
                 tab: None,
                 pane: Some("wA:p1".into()),
             },
-            instance: None,
+            instance: LocalProcfsVerifier
+                .inspect(std::process::id() as i32)
+                .unwrap(),
         },
-        1_002,
+        now,
     )
     .expect("placed");
     let edge = registry
@@ -11322,7 +11333,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
                 launch: None,
                 spawn_token: Some(edge.token.clone()),
             },
-            1_002,
+            now,
         )
         .expect("the child binds");
     assert!(
@@ -11515,6 +11526,53 @@ fn a_deletion_never_records_an_exit_it_could_not_verify() {
 
     let _ = child.kill();
     let _ = child.wait();
+    daemon.stop();
+}
+
+#[test]
+fn a_branch_close_never_signals_an_execution_placed_under_another_server() {
+    use agent_radar::control_plane::lifecycle;
+
+    let sandbox = Sandbox::new("topology-delete-placement-generation");
+    let mut child = surviving_agent(&sandbox, false);
+    let registry = agent_radar::control_plane::Registry::open(&sandbox.state()).unwrap();
+    let placed = lifecycle::placements(&registry)
+        .into_iter()
+        .find(|execution| execution.placement.location.workspace.as_deref() == Some("wA"))
+        .expect("the agent placed in the workspace");
+    let mut old = placed.placement;
+    old.instance.as_mut().expect("verified server").start_ticks += 1;
+    lifecycle::place(&registry, &placed.registration_id, old, 10).unwrap();
+    let backend = MuxBackend::new(SPAWN_PRIMITIVES)
+        .naming(CreatedLocation {
+            workspace_id: Some("wA".into()),
+            tab_id: None,
+            pane_id: None,
+        })
+        .with_inventory(workspace_with_a_pane("wA"));
+    backend.served_by(std::process::id() as i32);
+    let mut daemon = sandbox.daemon_with(backend);
+    let mut client = Client::dial(daemon.path());
+    let (id, _) = created_workspace(&mut client, "wA");
+
+    let result = client.call(
+        "topology.delete",
+        json!({
+            "request": {"container_id": id, "frozen": frozen_workspace("wA")},
+            "requester": "test",
+        }),
+    );
+    assert_eq!(result_record(&result)["outcome"], "completed", "{result}");
+    let process = lifecycle::read_process(&registry, &placed.registration_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        process.signalled_at.is_none(),
+        "a reused location grants no authority"
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().unwrap();
+    child.wait().unwrap();
     daemon.stop();
 }
 

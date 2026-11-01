@@ -827,14 +827,13 @@ pub(super) fn termination_outcome(
         completion,
         escalated: termination.escalated,
     };
-    let settlement = Settlement::completed(Vec::new()).closed(closed);
     match &termination.exit {
         subjects::Exit::Unverified(message) => {
             Settlement::new(RequestOutcome::Unknown, None, Some(message), Vec::new())
-                .closed(settlement.closed.expect("just built"))
         }
-        subjects::Exit::Unresolved | subjects::Exit::Exited => settlement,
+        subjects::Exit::Unresolved | subjects::Exit::Exited => Settlement::completed(Vec::new()),
     }
+    .closed(closed)
 }
 
 /// Removes a launch's exit wake once its exit is recorded. Best effort: a slot

@@ -1,29 +1,11 @@
 #!/usr/bin/env python3
-"""Acceptance: the managed lifecycle through its real entrypoints.
+"""Real-scope acceptance for shell-hosted admission and pane-container closure.
 
-A disposable tmux server, a disposable daemon, and the real binary. Nothing here
-uses a recording backend or a fake verifier: the assertions are about processes,
-panes and the daemon's own answers.
+Run after `cargo build --locked --bin radar`:
+    python3 tests/lifecycle_acceptance.py [binary] [--keep]
 
-What this run establishes:
-
-- `radar run --agent` in an interactive shell is an admitted execution. Its
-  program's exit code is captured even though the shell survives it, which is what
-  the supervisor exists for.
-- A spontaneous exit ends the execution and keeps the pane: the shell is the
-  operator's, and only a close removes a terminal.
-- One close ends the execution with a verified exit and removes the pane it was
-  hosted in, and says so on its typed report.
-
-Status: the harness around the scenarios works — a disposable tmux server the daemon
-owns, a disposable daemon, and the real `radar run --agent` entrypoint driven from a
-pane's own shell — but the subject that entrypoint creates is not visible through
-`lifecycle.list`, so the assertions cannot yet find it. Whether the listing excludes
-admitted (in-place) subjects or the admission is being refused silently is the open
-question this run leaves for the next pass; the entrypoint wrote nothing to stderr and
-the pane returned to its prompt immediately.
-
-usage: python3 tests/lifecycle_acceptance.py [binary] [--keep]
+This covers completion persistence, shell return and branch closure of an admitted
+execution. Configured L, UI D, restart and nested workspace acceptance remain separate.
 """
 
 import argparse
@@ -31,22 +13,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-import uuid
-
-WORKSPACE = "wacc"
-WAIT = 30.0
-
-
-def check(condition, message):
-    if not condition:
-        raise AssertionError(message)
-
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
@@ -54,225 +27,191 @@ spec = importlib.util.spec_from_file_location(
 publisher = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = publisher
 spec.loader.exec_module(publisher)
+WAIT = 30
 
 
-def call(socket, method, params):
-    """One request on its own connection, framed as the control plane requires."""
-    return publisher.call(socket, method, params)
+def eventually(read, message):
+    deadline = time.monotonic() + WAIT
+    while True:
+        value = read()
+        if value:
+            return value
+        if time.monotonic() >= deadline:
+            raise AssertionError(message)
+        time.sleep(0.05)
 
 
-class Accept:
+class Acceptance:
     def __init__(self, binary, keep):
         self.binary = Path(binary).resolve()
         self.keep = keep
         self.root = Path(tempfile.mkdtemp(prefix="radar-lifecycle-"))
-        # The daemon serves only a tmux server it owns, so the disposable server
-        # runs under the same unit name its own servers use.
         self.server = f"radar-lifecycle-{os.getpid()}"
         self.state = self.root / "state"
         self.socket = self.root / "control.sock"
         self.daemon = None
 
-    # -- processes ---------------------------------------------------------
     def tmux(self, *args):
-        return subprocess.run(
-            ["tmux", "-L", self.server, *args],
-            capture_output=True, text=True, check=True)
+        return subprocess.run(["tmux", "-L", self.server, *args],
+                              capture_output=True, text=True, check=True).stdout
 
-    def env(self):
-        return {**os.environ, "RADAR_CONTROL_BACKEND": "tmux",
-                "RADAR_TMUX_SERVER": str(self.server),
-                "RADAR_CONTROL_SOCKET": str(self.socket),
-                "RADAR_CONTROL_STATE": str(self.state)}
+    def call(self, method, params):
+        return publisher.call(self.socket, method, params)
 
-    def start_tmux(self):
+    def events(self):
+        # Read durable events directly: Registry::open deliberately reuses an
+        # in-process log and cannot observe writes from this separate daemon.
+        return [json.loads(path.read_text())
+                for path in sorted((self.state / "events").glob("*.json"))]
+
+    def start(self):
         unit = f"radar-tmux@{self.server}"
         installed = subprocess.run(
             ["systemctl", "--user", "cat", "radar-tmux@.service"],
             capture_output=True).returncode == 0
         if installed:
-            subprocess.run(["systemctl", "--user", "start", f"{unit}.service"],
-                           check=True)
+            subprocess.run(["systemctl", "--user", "start", f"{unit}.service"], check=True)
         else:
             subprocess.run(
                 ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}",
                  "--property=Type=simple", "--property=KillMode=control-group",
                  "tmux", "-D", "-L", self.server, "-f", "/dev/null"], check=True)
-        deadline = time.monotonic() + WAIT
-        while subprocess.run(["tmux", "-L", self.server, "show-options", "-g"],
-                             capture_output=True).returncode != 0:
-            check(time.monotonic() < deadline, "the tmux server never answered")
-            time.sleep(0.05)
-
-    def start(self):
-        self.start_tmux()
-        # A plain shell in a directory with no project files: the scenario is about
-        # an operator's own shell, and a prompt hook or direnv in the way would be
-        # noise that is not part of what is being accepted.
-        self.tmux("new-session", "-d", "-s", WORKSPACE, "-x", "120", "-y", "40",
-                  "-c", str(self.root), "--", "bash", "--norc", "--noprofile", "-i")
-        self.tmux("split-window", "-d", "-t", WORKSPACE, "-c", str(self.root),
-                  "--", "bash", "--norc", "--noprofile", "-i")
+        eventually(
+            lambda: subprocess.run(["tmux", "-L", self.server, "show-options", "-g"],
+                                   capture_output=True).returncode == 0,
+            "tmux did not start")
+        self.tmux("new-session", "-d", "-s", "accept", "-x", "120", "-y", "40",
+                  "-c", str(self.root), "bash", "--norc", "--noprofile", "-i")
+        self.tmux("split-window", "-d", "-t", "accept", "-c", str(self.root),
+                  "bash", "--norc", "--noprofile", "-i")
+        env = {**os.environ, "RADAR_CONTROL_BACKEND": "tmux",
+               "RADAR_TMUX_SERVER": self.server,
+               "RADAR_CONTROL_SOCKET": str(self.socket),
+               "RADAR_CONTROL_STATE": str(self.state)}
         with open(self.root / "daemon.log", "w") as log:
-            self.daemon = subprocess.Popen(
-                [str(self.binary), "daemon"], env=self.env(),
-                stdout=log, stderr=subprocess.STDOUT)
-        deadline = time.monotonic() + WAIT
-        while time.monotonic() < deadline:
-            check(self.daemon.poll() is None,
-                  f"daemon exited {(self.root / 'daemon.log').read_text()}")
-            if self.socket.exists():
-                try:
-                    call(self.socket, "daemon.ping", {})
-                    return
-                except (OSError, RuntimeError):
-                    pass
-            time.sleep(0.02)
-        raise AssertionError("the daemon socket never appeared")
+            self.daemon = subprocess.Popen([str(self.binary), "daemon"], env=env,
+                                           stdout=log, stderr=subprocess.STDOUT)
 
-    def stop(self):
+        def ready():
+            if self.daemon.poll() is not None:
+                raise AssertionError((self.root / "daemon.log").read_text())
+            if not self.socket.exists():
+                return False
+            self.call("daemon.ping", {})
+            return True
+        eventually(ready, "daemon did not start")
+        panes = self.tmux("list-panes", "-a", "-F", "#{pane_id}").splitlines()
+        assert len(panes) == 2, panes
+        for pane in panes:
+            eventually(lambda: "bash-" in self.tmux("capture-pane", "-p", "-t", pane),
+                       f"shell in {pane} did not start")
+        return panes
+
+    def run_agent(self, pane, program):
+        before = {event["event_id"] for event in self.events()}
+        command = shlex.join([
+            "env", f"RADAR_CONTROL_SOCKET={self.socket}",
+            f"RADAR_CONTROL_STATE={self.state}", str(self.binary),
+            "run", "--agent", "--", *program])
+        command += "; printf 'RADAR_STATUS=%s\\n' $?"
+        self.tmux("send-keys", "-t", pane, command, "Enter")
+
+        def created():
+            for event in self.events():
+                transition = event["transition"]
+                if event["event_id"] not in before and transition["type"] == "process_created":
+                    return transition["data"]
+            return None
+        return eventually(created, f"admission in {pane} recorded no execution")
+
+    def completion(self, registration):
+        for event in self.events():
+            if (event["subject_id"] == registration
+                    and event["transition"]["type"] == "completed"):
+                return event["transition"]["data"]
+        return None
+
+    def close(self):
+        # An agent scope is outside the tmux server's cgroup. Clean up only this
+        # run's recorded scopes, even when an assertion interrupts a live program.
+        registrations = [event["transition"]["data"]["registration_id"]
+                         for event in self.events()
+                         if event["transition"]["type"] == "process_created"]
+        for registration in registrations:
+            unit = f"radar-{registration.replace('-', '')}-main.scope"
+            subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", unit],
+                           capture_output=True, timeout=10)
+            subprocess.run(["systemctl", "--user", "stop",
+                            f"radar-{registration.replace('-', '')}.slice"],
+                           capture_output=True, timeout=10)
         if self.daemon and self.daemon.poll() is None:
             self.daemon.send_signal(signal.SIGTERM)
             try:
                 self.daemon.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.daemon.kill()
-        subprocess.run(["tmux", "-L", self.server, "kill-server"],
-                       capture_output=True)
+                self.daemon.wait()
         subprocess.run(["systemctl", "--user", "stop",
-                        f"radar-tmux@{self.server}.service"], capture_output=True)
+                        f"radar-tmux@{self.server}.service"], capture_output=True, timeout=10)
         if self.keep:
             print(f"kept {self.root}", file=sys.stderr)
         else:
-            shutil.rmtree(self.root, ignore_errors=True)
-
-    # -- facts -------------------------------------------------------------
-    def subjects(self):
-        listed = call(self.socket, "lifecycle.list", {"limit": 64})
-        return {subject["subject_id"]: subject
-                for subject in listed.get("subjects", [])}
-
-    def subject(self, subject_id):
-        return call(self.socket, "lifecycle.get", {"subject_id": subject_id})["subject"]
-
-    def eventually(self, read, message):
-        deadline = time.monotonic() + WAIT
-        while time.monotonic() < deadline:
-            value = read()
-            if value is not None:
-                return value
-            time.sleep(0.05)
-        raise AssertionError(message)
-
-    def pane_pids(self):
-        listed = self.tmux("list-panes", "-a", "-F", "#{pane_id}\u001f#{pane_pid}").stdout
-        return {line.split("\u001f")[0]: int(line.split("\u001f")[1])
-                for line in listed.strip().splitlines()}
-
-    def wait_for_shell(self, pane):
-        """A shell that is ready takes keys; one that is still starting does not."""
-        def read():
-            shown = self.tmux("capture-pane", "-p", "-t", pane).stdout
-            return True if shown.strip() else None
-        self.eventually(read, f"the shell in {pane} never drew a prompt")
-
-    def run_agent(self, pane, program, label):
-        """Admit through the entrypoint an operator uses, in the pane's own shell."""
-        errors = self.root / label
-        command = (f"RADAR_CONTROL_SOCKET={self.socket} "
-                   f"RADAR_CONTROL_STATE={self.state} "
-                   f"{self.binary} run --agent -- {program} 2>{errors}")
-        self.tmux("send-keys", "-t", pane, command, "Enter")
-        return errors
-
-    def new_subject(self, before, pane):
-        """The subject this admission created, found by comparing the listing."""
-        def read():
-            for subject_id, subject in self.subjects().items():
-                if subject_id in before:
-                    continue
-                location = (subject.get("placement") or {}).get("pane")
-                if location in (None, pane):
-                    return subject_id
-            return None
-        try:
-            return self.eventually(
-                read, f"no subject was recorded for the admission in {pane}")
-        except AssertionError as error:
-            shown = self.tmux("capture-pane", "-p", "-t", pane).stdout
-            errors = self.root / "agent.err"
-            if errors.exists():
-                shown += f"\n--- stderr ---\n{errors.read_text()}"
-            raise AssertionError(f"{error}\n--- pane ---\n{shown}") from None
-
-
-def alive(pid):
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except (FileNotFoundError, ProcessLookupError):
-        return False
-    return stat.rsplit(")", 1)[1].split()[0] != "Z"
-
-
-def scenario_the_supervisor_captures_an_exit_the_shell_survives(accept, pane):
-    before = accept.subjects()
-    accept.run_agent(pane, "sh -c 'exit 7'", "agent.err")
-    subject_id = accept.new_subject(before, pane)
-    subject = accept.eventually(
-        lambda: (lambda s: s if s.get("completion") else None)(accept.subject(subject_id)),
-        "the admitted program's completion was never recorded")
-    check(subject["completion"]["code"] == 7,
-          f"the program's own exit code is recorded: {subject['completion']}")
-    check(subject.get("exited_at") is not None,
-          "the execution is verified gone rather than assumed")
-    # A spontaneous exit keeps the pane: the shell is the operator's.
-    pids = accept.pane_pids()
-    check(pane in pids, f"the pane survived its program: {pids}")
-    check(alive(pids[pane]), "the pane's own process still runs")
-    return subject_id
-
-
-def scenario_one_close_removes_the_terminal(accept, pane):
-    before = accept.subjects()
-    accept.run_agent(pane, "sleep 300", "close.err")
-    subject_id = accept.new_subject(before, pane)
-    claim = accept.subject(subject_id)
-    accept.eventually(
-        lambda: accept.subject(subject_id).get("process"),
-        "the admitted execution never recorded its process identity")
-    pid = accept.subject(subject_id)["process"]["pid"]
-    answer = call(accept.socket, "lifecycle.cancel",
-                  {"request": {"subject_id": subject_id, "claim_id": claim["claim_id"]}})
-    closed = answer["request"]["closed"]
-    check(closed["execution"]["state"] == "exited",
-          f"the close verified the exit: {closed}")
-    check(closed["resource"]["state"] == "removed",
-          f"the close removed the pane it hosted: {closed}")
-    accept.eventually(lambda: None if alive(pid) else True,
-                      "the closed program is still running")
-    accept.eventually(
-        lambda: True if pane not in accept.pane_pids() else None,
-        "the pane the close removed is still listed")
+            shutil.rmtree(self.root)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", nargs="?", default=str(ROOT / "target/debug/radar"))
     parser.add_argument("--keep", action="store_true")
-    arguments = parser.parse_args()
-    accept = Accept(arguments.binary, arguments.keep)
+    args = parser.parse_args()
+    accept = Acceptance(args.binary, args.keep)
     try:
-        accept.start()
-        panes = sorted(accept.pane_pids())
-        check(len(panes) == 2, f"the disposable server has two panes: {panes}")
-        for pane in panes:
-            accept.wait_for_shell(pane)
-        scenario_the_supervisor_captures_an_exit_the_shell_survives(accept, panes[0])
-        scenario_one_close_removes_the_terminal(accept, panes[1])
-        print("lifecycle acceptance: ok")
+        first, second = accept.start()
+        created = accept.run_agent(first, ["sh", "-c", "exit 7"])
+        registration = created["registration_id"]
+        completion = eventually(lambda: accept.completion(registration), "completion not persisted")
+        assert completion["code"] == 7, completion
+        eventually(lambda: "RADAR_STATUS=7" in accept.tmux("capture-pane", "-p", "-t", first),
+                   "program status did not reach its surviving shell")
+
+        ready = accept.root / "interrupt-ready"
+        created = accept.run_agent(first, ["sh", "-c",
+            f"trap 'exit 42' INT; : > {shlex.quote(str(ready))}; while :; do sleep 1; done"])
+        registration = created["registration_id"]
+        eventually(ready.exists, "program never installed its interrupt handler")
+        accept.tmux("send-keys", "-t", first, "C-c")
+        completion = eventually(lambda: accept.completion(registration),
+                                "interrupt completion not persisted")
+        assert completion["code"] == 42, completion
+        eventually(lambda: "RADAR_STATUS=42" in accept.tmux("capture-pane", "-p", "-t", first),
+                   "Ctrl-C did not return control to the surviving shell")
+
+        created = accept.run_agent(second, ["sleep", "300"])
+        registration = created["registration_id"]
+        placement = created["facts"]["placement"]
+        pane = placement["location"]["pane"]
+        unit = f"radar-{registration.replace('-', '')}-main.scope"
+        eventually(
+            lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
+                                   capture_output=True).returncode == 0,
+            "admitted program never entered a real scope")
+        containers = accept.call("topology.list", {})["containers"]
+        container = next(item for item in containers
+                         if (item.get("binding") or {}).get("handle") == pane)
+        result = accept.call("topology.delete", {"request": {
+            "container_id": container["container_id"],
+            "frozen": {"target": {"pane": pane},
+                       "identity": {"pane": {"pane_id": pane, "occupant": None}}}}})
+        assert result["request"]["outcome"] == "completed", result
+        eventually(lambda: second not in accept.tmux("list-panes", "-a", "-F", "#{pane_id}").splitlines(),
+                   "container close did not remove its pane")
+        eventually(lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
+                                         capture_output=True).returncode != 0,
+                   "closed execution scope is still active")
+        print("lifecycle acceptance: completion, Ctrl-C, shell return and real-scope pane close passed")
     finally:
-        accept.stop()
+        accept.close()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

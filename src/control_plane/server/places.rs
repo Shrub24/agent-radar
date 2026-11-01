@@ -157,9 +157,10 @@ pub(super) fn run_close(
 /// edge. An execution admitted in place (`radar run --agent`) has no spawn edge at
 /// all, and it still runs inside the place: a branch closed over spawn edges alone
 /// would leave it running.
-pub(super) fn executions_inside(
+fn executions_inside(
     registry: &Registry,
     target: &crate::CloseTarget,
+    instance: &crate::model::ProcessIdentity,
 ) -> Vec<crate::control_plane::lifecycle::Placed> {
     let inside = |location: &crate::control_plane::registry::RegistryLocation| match target {
         crate::CloseTarget::Pane(pane) => location.pane.as_deref() == Some(pane.as_str()),
@@ -170,22 +171,17 @@ pub(super) fn executions_inside(
     };
     let mut placed: Vec<crate::control_plane::lifecycle::Placed> = Vec::new();
     for execution in crate::control_plane::lifecycle::placements(registry) {
-        if !inside(&execution.placement.location) {
-            continue;
-        }
-        if placed
-            .iter()
-            .any(|known| known.registration_id == execution.registration_id)
+        if execution.placement.instance.as_ref() != Some(instance)
+            || !inside(&execution.placement.location)
         {
             continue;
         }
+
         placed.push(execution);
     }
     placed
 }
 
-/// The key that addresses one placed execution for termination: its subject when
-/// it has one, otherwise the registration that names the execution itself.
 /// The handle a launch would name for this target.
 fn target_handle(target: &crate::runtime::CloseTarget) -> String {
     match target {
@@ -193,13 +189,6 @@ fn target_handle(target: &crate::runtime::CloseTarget) -> String {
         | crate::runtime::CloseTarget::Tab(handle)
         | crate::runtime::CloseTarget::Pane(handle) => handle.clone(),
     }
-}
-
-pub(super) fn termination_key(placed: &crate::control_plane::lifecycle::Placed) -> String {
-    placed
-        .subject_id
-        .clone()
-        .unwrap_or_else(|| placed.registration_id.clone())
 }
 
 pub(super) fn frozen_params(
@@ -395,6 +384,9 @@ pub(super) fn run_creation(
             Code::BadParams,
             "the create target is not a valid identifier",
         )));
+    }
+    if let Some(target) = target.as_deref() {
+        super::closing::refuse_if_closing(core, target).map_err(boxed)?;
     }
     // The command this creation's slot runs, if it carries one, is parsed and
     // checked here: a recipe this backend cannot carry refuses before a pane
@@ -812,22 +804,29 @@ pub(super) fn run_container_delete(
     // row ends it: fenced, SIGTERM, one shared window for the exit, and the exit
     // recorded. The operator's confirmation named the agents it would end, so a
     // survivor does not hold the close: the outcome says whose exit was never verified.
-    let inside = executions_inside(&registry, &frozen.target);
-    // Held for as long as this close runs: a launch into this branch is refused
-    // instead of arriving in a place that is about to be removed. The place itself
-    // is held too, so a create that names it is refused even before an execution
-    // exists there.
+    // Hold empty panes too: admission into a shell is still new work in the
+    // branch. Native topology changes remain best effort.
+    let panes: Vec<_> = match &frozen.identity {
+        lifecycle::TargetIdentity::Pane(pane) => vec![pane.pane_id.clone()],
+        lifecycle::TargetIdentity::Tab { members, .. }
+        | lifecycle::TargetIdentity::Workspace { members, .. } => {
+            members.iter().map(|pane| pane.pane_id.clone()).collect()
+        }
+    };
     let closing = Arc::clone(&locked(core).closing);
-    let _held = closing.begin(
-        std::iter::once(target_handle(&frozen.target))
-            .chain(
-                inside
-                    .iter()
-                    .filter_map(|execution| execution.placement.location.pane.clone()),
-            )
-            .filter(|place| !place.is_empty()),
+    let _held = closing.begin(std::iter::once(target_handle(&frozen.target)).chain(panes));
+    let inside = executions_inside(&registry, &frozen.target, &recorded);
+    let _executions_held = closing.begin(
+        inside
+            .iter()
+            .filter_map(|execution| execution.placement.location.pane.clone()),
     );
-    let keys: Vec<String> = inside.iter().map(termination_key).collect();
+    // A logical subject may already point at a successor. Stop the exact
+    // executions discovered in this branch, never re-resolve their subjects.
+    let keys: Vec<String> = inside
+        .iter()
+        .map(|execution| execution.registration_id.clone())
+        .collect();
     let mut stopped = Vec::new();
     // Agents left alive by the window. The place still closes, and the outcome
     // says which exits were never verified.

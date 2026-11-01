@@ -211,7 +211,7 @@ preserving durable subjects and handoffs.
 | `n` / `N` | Select the next / previous row that needs attention (blocked, lost, waiting, unknown) |
 | `w` / `W` | Select the next / previous working row |
 | `d` | Show or hide the details panel |
-| `D` | Close the selected row. One gesture, one request: the daemon resolves the row you selected to an execution, a pane or a container and closes that — it never re-resolves to whatever is focused. A close stops the managed execution with a verified exit, captures the completion while the pane still exists, then removes the resource, so an agent that returns to its shell is still accounted for. Closing a branch that still holds agents asks first and names what the answer loses; answering ends every agent inside it, and any exit the daemon could not verify is reported rather than assumed | 
+| `D` | Ask to close the selected row. The daemon freezes the selected target for confirmation; it never substitutes the focused row. Container closure stops placed managed executions before removing the resource. An execution whose exit cannot be verified is reported as unverified, not assumed exited |
 | `r` | Restart the selected managed agent in its recorded session: the daemon stops it with a verified exit, then relaunches it. Offered for a bound daemon subject with a session |
 | `a` | Add an empty tab, in the workspace directory, to the selected row's workspace; it asks nothing |
 | `A` | Start a new workspace; nothing is selected, replaced or confirmed |
@@ -527,17 +527,10 @@ process ending. A row Radar records no container for still ends: its pane is clo
 directly through the runtime. Which of those applies is the daemon's answer for the
 row you selected, never a choice a view makes for it.
 
-A **managed** worker's row is stopped through its owner, so the exit is reported
-rather than only observed: `D` asks the exact parent session, through
-`herdsman-control/v1`, never the runtime. Radar does not ask an owner to close a
-pane that is not its own.
-
-Ending a place asks no owner, because a place has many and one request per owner
-would be orchestration Radar does not do. So a container ends its recorded
-launches through Radar's own cancel, above, and settles the rest as a place: the
-panes Radar holds no subject for are closed by the runtime, and their owners learn
-from the loss. The difference is deliberate — an owner request is one worker and
-its assignment; a place is a region and its contents.
+A managed agent row with a current lifecycle subject requests daemon cancellation.
+Container closure discovers managed executions from their recorded placements,
+including admitted commands that have not registered an agent or acquired a subject.
+These paths do not send owner-file requests.
 
 A container whose place is no longer served is **forgotten**: its records go and
 nothing is dispatched, because there is nothing left to close. A container whose
@@ -545,30 +538,11 @@ place is still served is refused instead of forgotten around, so no live place i
 orphaned. This is the recovery path for a fleet whose backend was replaced
 underneath it.
 
-A **managed** pane close is routed to its owner instead: `D` on a managed worker
-asks the exact parent session, through `herdsman-control/v1`, never the mux.
-`r` restarts a managed worker the same way, and only when the owner advertises it
-idle: a working, waiting or blocked worker, a lead or standalone session, a
-parentless worker and Radar's own continuity-retained history all refuse rather
-than launching anything. The request names the exact published label, run UUID
-and owner session, echoes the operation, label and run the operator saw, and
-carries the pane and session cross-checks it observed; a missing label, run or
-owner refuses. It is written atomically into the owner's directory —
-owner-created, user-owned, mode `0700`, never created by Radar — so an absent or
-untrusted directory is the transport being unavailable, not something to repair.
-Existing owner processes must reload before their control directories exist: a
-missing directory means unavailable, never unmanaged.
-
-Radar never retries a request, never treats its own timeout as a verdict, and
-never cancels one on quitting. Outcomes derive from the owner's files, and a
-request already written stays executable whether or not Radar is still running.
-Results are shown on the footer's lifecycle line, kept apart from the source
-freshness, and `!` shows the current one whole. A view keeps no history of its
-own: the daemon retains every request, readable by the id the line names. A row
-is never removed optimistically, and a
-`closed` result reports the effects the owner actually applied — a lost
-generation's close names `process_ended` and leaves its surviving shell pane, so
-Radar never infers a pane close from the outcome alone.
+The daemon retains request outcomes by request ID. A view never removes a row
+optimistically: the tree follows observations after the operation. Execution exit,
+terminal removal and the program's reported code are separate facts; none is inferred
+from another. The lifecycle status line names unverified exits and uncertain removals.
+Program completion details remain on the request record.
 
 ## Presentation
 

@@ -425,8 +425,6 @@ impl Shutdown {
     }
 }
 
-/// What a cancel did about the pane an unbound launch left behind. Reported
-/// apart from revocation and from verified process exit, and not an exit claim.
 /// How a managed program ended, as the process supervising it saw it. It is a
 /// fact about the execution, recorded when it happens: a retained pane is not
 /// durable storage for it, and its absence never blocks a lifecycle transition.
@@ -438,6 +436,7 @@ pub struct Completion {
     pub observed_at: String,
 }
 
+/// The pane-removal outcome, independent of process exit and completion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome", content = "reason")]
 pub enum PaneCleanup {
@@ -484,9 +483,8 @@ pub struct ClosedExecution {
     /// means the code was not available, never that none exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<Completion>,
-    /// Whether the graceful window ran out and the verified scope was killed.
-    /// The escalation is a fact an operator may want, and no longer a word in a
-    /// prose list.
+    /// Whether escalation was attempted after the graceful window. This is not
+    /// proof that SIGKILL succeeded; `execution` carries the verified outcome.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub escalated: bool,
 }
@@ -1442,10 +1440,9 @@ const COMPLETION_GRACE: Duration = Duration::from_millis(500);
 pub fn await_completion(registry: &Registry, key: &str) -> Option<Completion> {
     let until = std::time::Instant::now() + COMPLETION_GRACE;
     loop {
-        let reported = read(registry, key)
+        let reported = process_for_control(registry, key)
             .ok()
-            .flatten()
-            .and_then(|claim| claim.process.completion);
+            .and_then(|process| process.completion);
         if reported.is_some() || std::time::Instant::now() >= until {
             return reported;
         }
@@ -1461,15 +1458,11 @@ pub fn await_completion(registry: &Registry, key: &str) -> Option<Completion> {
 pub fn await_completions(registry: &Registry, keys: &[String]) {
     let until = std::time::Instant::now() + COMPLETION_GRACE;
     loop {
-        let outstanding: Vec<&String> = keys
-            .iter()
-            .filter(|key| {
-                read(registry, key).ok().flatten().is_some_and(|claim| {
-                    claim.process.identity.is_some() && claim.process.completion.is_none()
-                })
-            })
-            .collect();
-        if outstanding.is_empty() || std::time::Instant::now() >= until {
+        let outstanding = keys.iter().any(|key| {
+            process_for_control(registry, key)
+                .is_ok_and(|process| process.identity.is_some() && process.completion.is_none())
+        });
+        if !outstanding || std::time::Instant::now() >= until {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -3449,6 +3442,11 @@ mod tests {
         record_completion(&registry, &identity, &key, None, Some(9), 4).expect("replay");
         let completion = recorded(&scratch.registry()).expect("completion survives a reopen");
         assert_eq!((completion.code, completion.signal), (Some(7), None));
+        assert_eq!(
+            await_completion(&registry, &process.registration_id),
+            Some(completion),
+            "removal must find a report even when the execution has no subject"
+        );
     }
 
     #[test]
