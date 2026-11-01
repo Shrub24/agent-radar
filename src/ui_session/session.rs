@@ -465,7 +465,7 @@ impl Session {
                 if matches!(
                     command,
                     dto::SharedCommand::Focus
-                        | dto::SharedCommand::Delete
+                        | dto::SharedCommand::Close
                         | dto::SharedCommand::Restart
                         | dto::SharedCommand::CreateContainer
                         | dto::SharedCommand::ReloadContainer
@@ -554,7 +554,7 @@ impl Session {
             return Ok(None);
         }
         let operation = match command {
-            dto::SharedCommand::Delete => crate::app::Operation::Delete,
+            dto::SharedCommand::Close => crate::app::Operation::Close,
             dto::SharedCommand::Restart => crate::app::Operation::Restart,
             dto::SharedCommand::CreateContainer => crate::app::Operation::CreateContainer,
             dto::SharedCommand::ReloadContainer => crate::app::Operation::ReloadContainer,
@@ -1139,7 +1139,7 @@ mod tests {
             "a",
             id,
             A::RunCommand {
-                command: dto::SharedCommand::Delete,
+                command: dto::SharedCommand::Close,
                 row: Some(shown.clone()),
             },
         );
@@ -1371,7 +1371,7 @@ mod tests {
             "a",
             2,
             A::RunCommand {
-                command: dto::SharedCommand::Delete,
+                command: dto::SharedCommand::Close,
                 row: Some(pane),
             },
         );

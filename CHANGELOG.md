@@ -4,11 +4,31 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 ## Radar 0.10.0
 
+- **Breaking:** the shared command `delete` is now `close`, and the daemon decides what closing means for the row you selected: an execution is ended and its pane removed, a pane is closed, a container's whole branch is closed. No view derives a target any more, and no view re-resolves the row it selected to whatever is focused.
+- `D` is one gesture with one request. When the row's branch still holds agents it asks first and lists what the answer loses, exactly as before; the answer closes the branch once, signals every execution inside it, and reports what it could not verify instead of assuming it.
+- The status line shows what a close established rather than only that the request settled: an exit nobody verified, a pane that was left alone, a program's exit code, or a shutdown that had to be escalated. A close that went as asked adds no line.
 - **Breaking:** a close now reports what it established as typed parts on its record's `closed` field, and wire revision 14 requires a matching daemon and consumer. A read of `effects` prose to find out whether a pane was closed, or whether the process was verified gone, no longer works for `lifecycle.cancel`, `lifecycle.stop` and `topology.delete`; those operations publish `closed` instead and leave `effects` empty.
 - `closed.execution` is `exited`, or an unverified or unsignalled result with the reason. `closed.resource` says what became of the pane — `removed`, `absent`, `kept` or `unverified` — and is absent for an operation that removes nothing, so a stop no longer has to imply it kept the pane. `closed.completion` carries the program's code and signal when the process supervising it reported, and is absent when it did not: an exit verified without a code is a normal outcome, not a failure.
 - A verified exit and a pane removal are separate answers, and neither implies the other. A spontaneous exit keeps its pane on purpose; a removal may follow an exit whose code was never reported.
 - The SIGKILL step of a shutdown is one function (`lifecycle::escalate`) called by the graceful deadline, so an operator request and a configuration that shorten or disable that deadline later have a single place to act on.
 - `LocalProcfsVerifier` treats an exited-but-unreaped process as absent. It read `/proc/<pid>`, which survives until the parent reaps it, so a killed execution could be reported as still running.
+
+### Upgrading to 0.10.0
+
+Stop the daemon and the agents it manages before replacing the binary: this release
+ships a new supervisor, and an execution started by the old one keeps reporting to it.
+
+State shapes that changed are refused rather than reinterpreted — a spawn edge from
+an earlier version, an old child-close record and the pre-`messages` communication
+directory each refuse with their own message and the path that holds them. Nothing
+migrates silently and nothing falls back: the daemon stops and names what it cannot
+read. Archive the state directory (or `radar reset --hard`, which discards recorded
+history too) only once those agents are stopped and their pending work is captured;
+a plain `radar reset` is not a fix for an unreadable record, and none of this is
+needed to "repair" lifecycle state.
+
+Rollback means the previous binary with the previous archived state. A newly versioned
+store fed to an older daemon is refused, by design.
 
 ## Radar 0.9.0
 

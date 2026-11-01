@@ -115,18 +115,98 @@ Planning only. Each group lands working behaviour, its relevant tests and docs; 
 ## 4. Subject restart and TUI cutover
 
 - [ ] 4.1 Compose restart from shared termination/completion/start primitives and existing successor reservations. Verify same subject/new claim, no launch over unverified predecessor termination, and no second signalling of a replacement through an old claim. Reuse eligible dedicated panes; create replacement placement for shell-hosted admission rather than typing into a resumed shell. Update restart placement docs.
-- [ ] 4.2 Replace TUI delete/cancel/raw-close branching with one semantic Close request carrying explicit local row identity. Resolve to claim/pane/container in the daemon and retain frozen confirmation. Verify a selected agent different from focus closes that agent, a vanished explicit row refuses, and mouse/palette reach the same close behaviour. No row-owned lifecycle trait or frontend target derivation.
-- [ ] 4.3 Present root removal normally, show actionable verified survivors/removal failures and keep missing-status detail diagnostic. Verify the view remains responsive during bounded shutdown and rows reconcile through publications rather than optimistic disappearance. Update key help, README and changelog for one-press `D`.
+
+  Composition verified, and already true before this task: `restart_lead` reserves the
+  successor claim, calls the shared `subjects::stop` (the same termination a cancel
+  uses), launches only on `Exit::Exited`, and returns `refused`/`unknown` before any
+  launch when the exit is unresolved or unverified. Existing coverage holds: exactly
+  one successor, effects ordered `signalled` then `exited`, the same subject with a
+  new claim id, a same-ID replay that launches nothing, and a refusal before any
+  signal when the session context changed.
+
+  Not done: reusing an eligible dedicated pane. A restart always creates the successor
+  beside the anchor, which is right for shell-hosted admission — the resumed shell is
+  the operator's, and typing into it would be a second uncontrolled execution — but it
+  wastes the freed dedicated pane of a `radar run` lead whose own pane held the
+  program. That is an optimisation with a placement consequence (the pane's recorded
+  location must move with the successor), so it is left as its own task rather than
+  half-built here. Verify same subject/new claim, no launch over unverified predecessor termination, and no second signalling of a replacement through an old claim. Reuse eligible dedicated panes; create replacement placement for shell-hosted admission rather than typing into a resumed shell. Update restart placement docs.
+- [x] 4.2 Replace TUI delete/cancel/raw-close branching with one semantic Close request carrying explicit local row identity.
+
+  The wire verb is now `close` (`SharedCommand::Close`, formerly `delete`), and every
+  door to it — `D`, the palette, and the mouse, which dispatch the same `CommandId` —
+  sends one request with the row the view has selected. The view derives no target and
+  chooses no daemon method: `ui_session::targets` resolves the row to an execution, a
+  pane or a container, and the frozen plan is what the confirmation freezes.
+
+  Covered by tests that already existed and still hold after the rename: a destructive
+  command acts on the row its view displayed rather than on the focused row (two panes,
+  the other one absent from the request), the other view is blocked while the question
+  is open, and a row that is gone refuses instead of falling back to focus. Resolve to claim/pane/container in the daemon and retain frozen confirmation. Verify a selected agent different from focus closes that agent, a vanished explicit row refuses, and mouse/palette reach the same close behaviour. No row-owned lifecycle trait or frontend target derivation.
+- [x] 4.3 Present root removal normally, show actionable verified survivors/removal failures and keep missing-status detail diagnostic.
+
+  A close's typed report is now presented from its parts: `app::close_status::describe`
+  turns `closed` into one line, and only a part that differs from what the operator
+  asked for becomes words — an unverified exit with its reason, nothing signalled, a
+  pane deliberately left alone, a program's code or signal, and a shutdown that had to
+  be escalated. A removal that went as asked adds no line at all, which is what
+  "present root removal normally" means in practice.
+
+  Rows reconcile through publications, and the view never removes one optimistically:
+  the close is a request, the answer carries the record, and the tree follows the next
+  observation. The view stays responsive while a bounded shutdown runs because the
+  request is dispatched by the session, not by the drawing loop.
+
+  Key help, README and changelog were updated for the single `D` gesture, including the
+  paragraph that still claimed a survivor holds the deletion — it does not, and the
+  outcome names the unverified exit instead. Verify the view remains responsive during bounded shutdown and rows reconcile through publications rather than optimistic disappearance. Update key help, README and changelog for one-press `D`.
 
 ## 5. Convergence audit and upgrade integrity
 
-- [ ] 5.1 Complete the targeted divergence inventory in design.md against the final production flows: admission/claim, configured recipe, single/batch cancellation, child/subject close, expiry/revoke, restart/continue and topology reload. For each, record its authorization, shared implementation and legitimate remaining policy. Remove unused helpers and overwritten comments; list unrelated candidates with concrete evidence instead of refactoring them opportunistically. Review the delivered diff for lean Rust ownership, minimal state and existing trait seams.
-- [ ] 5.2 Add explicit record/wire version checks and the archive/reset upgrade procedure where shapes changed; no silent migration or fallback. Verify unsupported stored records refuse with their location, current records reopen, public projections expose no completion credentials/launch secrets and SDK generated contracts are current. Do not tell users to hard-reset communications merely to upgrade lifecycle state.
+- [x] 5.1 Complete the targeted divergence inventory in design.md against the final production flows: admission/claim, configured recipe, single/batch cancellation, child/subject close, expiry/revoke, restart/continue and topology reload. For each, record its authorization, shared implementation and legitimate remaining policy. Remove unused helpers and overwritten comments; list unrelated candidates with concrete evidence instead of refactoring them opportunistically. Review the delivered diff for lean Rust ownership, minimal state and existing trait seams.
+
+  The inventory is now a table in the design: each flow's authorization, the shared
+  implementation it runs on, and the policy that legitimately remains its own. Two
+  unrelated candidates are listed with their seams rather than refactored —
+  `src/control.rs` still derives `pane_closed()` from the `effects` prose that typed
+  results replaced (a contract change with its producer), and `targets::containment_of`
+  reads like target derivation though it is the daemon's row resolution.
+- [x] 5.2 Add explicit record/wire version checks and the archive/reset upgrade procedure where shapes changed; no silent migration or fallback. Verify unsupported stored records refuse with their location, current records reopen, public projections expose no completion credentials/launch secrets and SDK generated contracts are current. Do not tell users to hard-reset communications merely to upgrade lifecycle state.
+
+  The checks already refuse rather than reinterpret, and are covered: an edge, child
+  close, context or registration record of another version answers "is not served"
+  with the version it found, a partial record is "not a spawn edge", and a record whose
+  id is not its filename refuses. The upgrade procedure is now written in the changelog
+  for 0.10.0: stop the daemon and its agents, then archive the state directory if a
+  record refuses — `radar reset --hard` only when discarding history is intended, and
+  never as a way to "repair" lifecycle state. Rollback is the previous binary with the
+  previous state; a newer store fed to an older daemon is refused by design. Public
+  projections no longer carry completion keys or launch argv/env (fixed earlier in this
+  change), and the generated contracts are a gate step.
 
 ## 6. Integrated validation
 
-- [ ] 6.1 Run fmt, strict Clippy, locked Rust suites, SDK tests, schema/type/package checks, strict OpenSpec validation and rationale lint; report exact failures and any existing ignored tests. Run affected Nix evaluation and package checks only if packaging changed or for a release, not as routine Rust validation. No claiming green from filtered output or excluded failing behaviour.
+- [x] 6.1 Run fmt, strict Clippy, locked Rust suites, SDK tests, schema/type/package checks, strict OpenSpec validation and rationale lint; report exact failures and any existing ignored tests.
+
+  Verified with unfiltered exit codes: `cargo fmt --check` 0, `cargo clippy
+  --all-targets -D warnings` clean, `cargo test --locked` 0 (567 library, 177
+  control-plane, tmux and the rest), the SDK's `check:contracts` + `typecheck:contracts`
+  + 133 node tests all passing, `openspec validate --all --strict` and `ktw-lint` 0
+  errors. No test was excluded to reach that, and no Nix evaluation was run: packaging
+  changed only in the lock, which this change does not touch. Run affected Nix evaluation and package checks only if packaging changed or for a release, not as routine Rust validation. No claiming green from filtered output or excluded failing behaviour.
 - [ ] 6.2 Exercise disposable nested tmux scenarios through real entrypoints: `L`, shell-hosted `radar run --agent`, spontaneous exit, one-press `D`, restart, and workspace deletion with responsive and stubborn agents. Verify capture before pane loss, shell preservation on spontaneous exit, terminal removal on Close, bounded branch latency and no surviving verified scope after successful escalation. Record which systemd/PTY claims were actually exercised; live operator Kitty acceptance remains a separate check.
+
+  Started, not finished. `tests/lifecycle_acceptance.py` drives a disposable tmux
+  server the daemon owns, a disposable daemon and the real `radar run --agent`
+  entrypoint from a pane's own shell — the harness plumbing works, including the
+  unit-owned server the daemon insists on and the shell-ready gate. The assertions do
+  not: the subject the entrypoint creates never appears in `lifecycle.list`, and the
+  entrypoint writes nothing to stderr and returns the pane to its prompt, so this run
+  could not tell an admission that was silently refused from a listing that excludes
+  admitted (in-place) subjects. That question, and then the remaining scenarios
+  (`L`, one-press `D` through the view, restart, branch deletion with a stubborn
+  agent), are the next pass's work; the operator's own live acceptance still gates the
+  archive.
 
 ## Workflow follow-up
 

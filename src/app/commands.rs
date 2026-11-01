@@ -43,7 +43,7 @@ pub enum CommandId {
     CreateContainer,
     ReloadContainer,
     PresenceStatus,
-    Delete,
+    Close,
 }
 
 /// One command: what it is called, the chords that run it and how it is offered.
@@ -210,8 +210,8 @@ pub const COMMANDS: &[Command] = &[
         chords: &["E"],
     },
     Command {
-        id: CommandId::Delete,
-        label: "Delete the selected container",
+        id: CommandId::Close,
+        label: "Close the selected row",
         chords: &["D"],
     },
 ];

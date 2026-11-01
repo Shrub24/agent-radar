@@ -199,7 +199,7 @@ pub(crate) fn plan(
     // A row the daemon records a container for is acted on as a container; every
     // other row is the place it shows.
     if operation.is_container()
-        || (operation == Operation::Delete
+        || (operation == Operation::Close
             && !matches!(selected, Selected::Agent { .. })
             && container.is_some())
     {
@@ -300,7 +300,7 @@ fn current(state: &ObservationState) -> Result<&FleetObservation, String> {
 fn verb(operation: crate::app::Operation) -> &'static str {
     use crate::app::Operation;
     match operation {
-        Operation::Delete => "Delete ",
+        Operation::Close => "Delete ",
         Operation::Restart => "Restart ",
         Operation::CreateContainer => "Create in ",
         Operation::ReloadContainer => "Reload ",
@@ -418,7 +418,7 @@ fn container_plan(
     // control but a deletion is refused. Deleting it is the record going, and the
     // daemon accepts that only when it cannot verify the place is still served.
     if let Some(reason) = &container.unresolved {
-        if operation != Operation::Delete {
+        if operation != Operation::Close {
             return Err(format!(
                 "{described} is unresolved ({reason}): nothing to act on"
             ));
@@ -441,7 +441,7 @@ fn container_plan(
     let running = losses_under(inventory, state, &target);
     let mut losses = vec![described.clone()];
     let request = match operation {
-        Operation::Delete => {
+        Operation::Close => {
             if running.is_empty() {
                 losses.push("nothing is running in it".to_string());
             } else {
@@ -492,7 +492,7 @@ fn container_plan(
         // Only an action that can end work asks. A deletion nothing is running
         // in, and an addition, lose nothing.
         confirms: match operation {
-            Operation::Delete => !running.is_empty(),
+            Operation::Close => !running.is_empty(),
             Operation::CreateContainer => false,
             _ => true,
         },
@@ -811,7 +811,7 @@ mod tests {
             tab: None,
             losses: Vec::new(),
         };
-        let delete = plan(Operation::Delete, selected, &state, Some(&container), "r1")
+        let delete = plan(Operation::Close, selected, &state, Some(&container), "r1")
             .expect("a container deletion is freezable");
         let Effect::Domain(command) = &delete.effect else {
             panic!("a deletion is a domain request");

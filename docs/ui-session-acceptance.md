@@ -51,9 +51,9 @@ Run these in a dashboard and a compact sidebar attached to the same daemon.
 3. With a detached popup instead of the inline question (compact sidebar), press
    `D` again and answer in the popup. Expect: one close, one outcome, and the
    popup exits after the session acknowledges the result.
-4. Delete an idle pane with no agent and nothing running. Expect: no question,
+4. Close an idle pane with no agent and nothing running. Expect: no question,
    one close, and an outcome recorded in `!` with its request id.
-5. Delete a container whose agent is still alive. Expect: the question names the
+5. Close a container whose agent is still alive. Expect: the question names the
    running agent, and one confirmation sends one delete. If the agent ignores
    its stop window the place still closes, and the outcome says its exit was
    not verified. No second prompt appears.

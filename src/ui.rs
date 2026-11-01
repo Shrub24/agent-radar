@@ -6823,7 +6823,7 @@ mod tests {
         losses: &[&str],
     ) -> crate::control_plane::public_contracts::ui_session::Blocking {
         with_command(
-            crate::control_plane::public_contracts::ui_session::SharedCommand::Delete,
+            crate::control_plane::public_contracts::ui_session::SharedCommand::Close,
             prompt,
             losses,
         )
@@ -6875,7 +6875,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(screen.contains("Delete"), "{screen}");
+        assert!(screen.contains("Close"), "{screen}");
         assert!(screen.contains("wA:p3"), "{screen}");
         assert!(screen.contains("This may lose:"), "{screen}");
         assert!(screen.contains("[ Cancel ]"), "{screen}");

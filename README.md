@@ -211,7 +211,7 @@ preserving durable subjects and handoffs.
 | `n` / `N` | Select the next / previous row that needs attention (blocked, lost, waiting, unknown) |
 | `w` / `W` | Select the next / previous working row |
 | `d` | Show or hide the details panel |
-| `D` | Delete the selected row: its container when Radar records one, else end what the row is. On an agent row a managed worker is stopped through its owner, so the exit is reported; the row a tab is drawn as ends the whole tab, every other row ends its own pane. Ends a container whose place is gone, closing a place that is still served is refused unless it was confirmed | 
+| `D` | Close the selected row. One gesture, one request: the daemon resolves the row you selected to an execution, a pane or a container and closes that — it never re-resolves to whatever is focused. A close stops the managed execution with a verified exit, captures the completion while the pane still exists, then removes the resource, so an agent that returns to its shell is still accounted for. Closing a branch that still holds agents asks first and names what the answer loses; answering ends every agent inside it, and any exit the daemon could not verify is reported rather than assumed | 
 | `r` | Restart the selected managed agent in its recorded session: the daemon stops it with a verified exit, then relaunches it. Offered for a bound daemon subject with a session |
 | `a` | Add an empty tab, in the workspace directory, to the selected row's workspace; it asks nothing |
 | `A` | Start a new workspace; nothing is selected, replaced or confirmed |
@@ -506,20 +506,26 @@ When the answer is not empty the confirmation names the contents rather than the
 record that holds them — `nvim is running`, `worker-3 is working`, `pi has 2
 background task(s) running` — so the operator reads what dies, not a handle.
 
-A place holding agents ends them the way `D` on their own row ends them: each
-launch inside the container is fenced, sent SIGTERM, and the whole set is waited
-on under one window — so a workspace with three agents costs one wait, not three.
-Each verified exit is recorded before the place closes. An agent that is still
-alive when the window closes **holds the deletion**: the place is left standing
-and the refusal names the subjects, because Radar will not close a place over a
-living agent. A second `D` on the same container is the operator saying they mean
-it, and the place closes with the survivor reported as unverified.
+A place holding agents ends them the way `D` on their own row ends them: every
+execution inside the container is fenced and signalled before any is waited on, and
+the whole set shares one window — so a workspace with three agents costs one wait,
+not three. Each verified exit is recorded before the place closes, and the branch
+takes one completion window for the set so a reported code is captured while the
+pane carrying its supervisor still exists.
 
-The scope is the row's own. A workspace row deletes the workspace container and
+An agent that is still alive when the window closes does **not** hold the deletion.
+The operator named the branch and its contents, so the place closes once, and the
+outcome says whose exit it could not verify rather than claiming an exit that never
+happened. Nothing asks twice, and while the close runs the branch is held: a launch
+or restart that would land inside it is refused `busy` instead of arriving in a place
+about to be removed.
+
+The scope is the row's own. A workspace row closes the workspace container and
 everything recorded inside it; the row a tab is drawn as ends the whole tab, every
 other pane row its own pane; an agent row names a process, so `D` on it is that
 process ending. A row Radar records no container for still ends: its pane is closed
-directly through the runtime.
+directly through the runtime. Which of those applies is the daemon's answer for the
+row you selected, never a choice a view makes for it.
 
 A **managed** worker's row is stopped through its owner, so the exit is reported
 rather than only observed: `D` asks the exact parent session, through

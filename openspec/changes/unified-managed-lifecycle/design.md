@@ -141,6 +141,23 @@ Expose a small typed close result separating resource removal, verified/unverifi
 
 Known candidates to inspect and disposition: direct admission versus launch claims; configured `L` recipes versus managed release; spawn/subject child-close versus `cleanup_launch_pane`; `cancel_many` versus single cancellation; restart/continue successor handling; launch expiry/revocation; topology reload versus execution restart. Necessary convergence lands here. Recipe-only shell reload, observation/focus routing and unrelated delivery work remain separate unless they duplicate the managed behaviour being replaced. Record remaining candidates with source seams and the differing behaviour; no blanket trait/actor rewrite.
 
+Dispositions against the delivered tree:
+
+| flow | authorization | shared implementation | remaining policy |
+| --- | --- | --- | --- |
+| admission / claim (`launch.admit`, `radar run`) | caller must descend from the named pane, verified here | `launch::admit` → `subjects::capture` + `subjects::place`, the same claim and placement a tracked launch records | plants on the execution; the pane is the operator's, so nothing is removed |
+| configured `L` recipe | container create + recipe validation | `spawn_child` through the supervised launch, so the claim carries the supervisor's key | recipe argv is built in the UI session and sent as a create |
+| spawn / subject child close | child's own pane or dead-pane evidence | `bounded_close_dispatch` + `PaneCleanup::from`; completion grace before dispatch | authorization differs per caller: bound-or-revoked launch vs verified occupant |
+| single and batch cancellation | subject, resolved to its current claim | one `Shutdown` window with verified-scope escalation, `cancel` and `cancel_many` both on it | batch shares one window across the set |
+| container close (`topology.delete`) | frozen target + serving instance + confirmed contents | `executions_inside` (placement discovery) → `cancel_many` → `await_completions` → `lifecycle::close` | the operation record and container removals stay in the server |
+| restart / continue | child-of-parent rule, then session context | `subjects::stop` → launch on `Exit::Exited` only → `spawn_child` beside the anchor | successor placement beside the anchor; pane reuse deferred |
+| launch expiry / revoke | durable operation record | `subjects::revoke` + the same termination window | revocation is cancelled work, not an ended process |
+| topology reload | selected container's recorded recipe | `ReloadContainer` effect; the reload path was not converged here | recipe-only shell reload, unrelated to managed close |
+
+No helper was left unused and no overwritten comment survived in the delivered diff; `subjects_inside` (the spawn-edge scan) was deleted with its only caller, and `observe_spawn_exits`/`record_spawn_exit` went with the read-time capture this change replaces.
+
+Unrelated candidates, listed rather than refactored: `src/control.rs` still derives `pane_closed()` from the `effects` prose that typed operation results replaced, which is a contract change with its producer rather than a daemon sweep; and `src/ui_session/targets.rs` keeps its `containment_of` heuristic for choosing between a pane and a tab target, which is the daemon's row resolution (correct where it lives) but reads like a target derivation at a glance.
+
 ## Risks / Trade-offs
 
 - Supervisor changes process and terminal relationships → a real PTY/scope slice verifies stdin, foreground signals, program identity, exit status and shell return before migrating all launchers. Do not ship detached supervision or weakened identity checks to make a test pass.

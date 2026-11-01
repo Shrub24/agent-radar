@@ -186,3 +186,18 @@ Two traps, both found by building it:
 The branch also takes one completion window for the whole set before the root is
 removed: the codes belong to executions whose supervisors live in the panes being
 destroyed, and a per-member grace would make a five-agent branch pay five.
+
+## Restart is a subject operation, not a close followed by a launch
+
+A restart keeps the subject and replaces the execution: it reserves the successor's
+claim first, stops the predecessor through the same termination path a cancel uses,
+and launches only on a verified exit. An unresolved or unverified predecessor exit
+returns before any launch, so a restart can never leave two executions of one subject
+believing they own it — and because the predecessor's claim id is what was signalled,
+a replay or a later request cannot signal its replacement through the old id.
+
+The successor starts beside the predecessor's recorded pane rather than inside it.
+For a dedicated pane that is a small waste; for a shell-hosted `radar run --agent`
+execution it is the whole point, because that pane's shell belongs to the operator,
+and typing a command into a resumed shell would be a second execution nobody
+supervised.

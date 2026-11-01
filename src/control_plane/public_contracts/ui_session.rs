@@ -245,6 +245,15 @@ impl CommandOutcome {
         )
     }
 
+    /// What a close reported, when this outcome carries one: the typed parts are
+    /// the answer, so a view reads them instead of parsing prose.
+    pub fn closed(&self) -> Option<&crate::control_plane::lifecycle::ClosedExecution> {
+        match self.answer.as_deref()? {
+            CommandAnswer::Domain { result, .. } => result.request.closed.as_ref(),
+            CommandAnswer::Error { .. } => None,
+        }
+    }
+
     pub fn failure(&self) -> Option<&OutcomeError> {
         match self.answer.as_deref()? {
             CommandAnswer::Error { error, .. } => Some(error),
@@ -324,7 +333,7 @@ pub enum SharedCommand {
     NewWorkspace,
     LaunchConfigured,
     Restart,
-    Delete,
+    Close,
     CreateContainer,
     ReloadContainer,
 }

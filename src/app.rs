@@ -20,6 +20,7 @@
 //! a fact the daemon observes, and a view may follow it (see [`App::sidebar`]).
 
 mod actions;
+mod close_status;
 mod commands;
 mod details;
 mod mouse;
@@ -392,7 +393,7 @@ pub enum Operation {
     /// End the selected row: its container when Radar records one, otherwise the
     /// pane the row is. A managed worker is stopped through its owner, so the
     /// exit is reported rather than merely observed.
-    Delete,
+    Close,
     /// Restart the selected managed worker through its owner.
     Restart,
     /// Add a place inside the selected container: a tab in a workspace, or a pane
@@ -918,7 +919,14 @@ impl App {
             } else {
                 tracing::info!(request = %op.request_id, "{}", op.status);
             }
-            self.set_focus_message(Some(format!("{} · request {}", op.status, op.request_id)));
+            // A close publishes what it established, so the line says that rather
+            // than only that the request settled: an exit nobody verified and a
+            // pane left behind are the two things an operator has to act on.
+            let message = match op.closed().and_then(close_status::describe) {
+                Some(detail) => format!("{} · {detail}", op.status),
+                None => format!("{} · request {}", op.status, op.request_id),
+            };
+            self.set_focus_message(Some(message));
             // A focus with no client attached names the place: this view opens a
             // terminal for it and asks the session again once one is attached.
             if let Some(crate::control_plane::public_contracts::ui_session::OutcomeError {
@@ -1593,7 +1601,7 @@ impl App {
             CommandId::PresenceStatus => {
                 return Some(Action::PresenceStatus);
             }
-            CommandId::Delete => return self.shared_command(SharedCommand::Delete),
+            CommandId::Close => return self.shared_command(SharedCommand::Close),
         }
         None
     }
@@ -1785,7 +1793,7 @@ fn inside(area: Option<Rect>, at: (u16, u16)) -> bool {
 /// The dialog title for a shared command.
 fn title_of(command: SharedCommand) -> &'static str {
     match command {
-        SharedCommand::Delete => "Delete",
+        SharedCommand::Close => "Close",
         SharedCommand::Restart => "Restart worker",
         SharedCommand::CreateContainer => "Add a tab",
         SharedCommand::ReloadContainer => "Reload pane",
