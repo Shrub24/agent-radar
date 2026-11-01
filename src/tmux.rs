@@ -442,6 +442,18 @@ impl RuntimeProvider for TmuxRuntime {
         })
     }
 
+    fn pane_handle(&self, reference: &str) -> Option<String> {
+        if self.address(reference, Kind::Pane).is_ok() {
+            return Some(reference.to_string());
+        }
+        // The id this server hands a pane on its own command line. Whether the
+        // caller is in that pane is established by its process ancestry, not by
+        // the form of the reference.
+        let id = reference.strip_prefix('%')?;
+        let digits = id.parse::<u32>().ok()?;
+        (format!("%{digits}") == reference).then(|| self.handle(reference))
+    }
+
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence {
         // Unreadable evidence is inconclusive, never a claim about the pane.
         let Ok(pane) = self.address(pane_id, Kind::Pane) else {
@@ -741,6 +753,10 @@ impl TmuxRuntime {
             }
         };
         let address = address.map_err(Failure::refused)?;
+        // A target that no longer exists is reported unverified rather than
+        // guessed at: tmux's "can't find pane" is not proof that this call is the
+        // thing that removed it, and a caller distinguishes an absent target from
+        // a performed close when it can see the inventory.
         self.run(&[command, "-t", &address], cancel)
             .map(|_| ())
             .map_err(Failure::unknown)

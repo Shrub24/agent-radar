@@ -112,7 +112,7 @@ pub struct RegistryLocation {
 }
 
 impl RegistryLocation {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         bounded_text("location.backend", &self.backend, false)?;
         for (field, value) in [
             ("location.instance", &self.instance),

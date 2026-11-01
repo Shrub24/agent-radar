@@ -80,3 +80,27 @@ for a request known to have run nothing); filtering it out of the unfinished rea
 (the stop gate would pass, but the record would still read as pending everywhere
 else).
 
+## Escalation is one function, and the deadline is only its first caller
+
+`lifecycle::escalate` performs the single SIGKILL step of a shutdown: it kills a
+scope that was verified at signal time and reports whether the group emptied.
+`await_end` calls it when the graceful window expires. Written this way so the
+operator request that will call the same function later (a second close on the
+same claim, or a configuration that shortens or disables the deadline) cannot
+grow a second escalation path beside it.
+
+Two evidence rules came out of building it:
+
+- After an escalation, an **emptied verified scope** is the evidence that nothing
+  which ran there still runs. Requiring the process's pidfd to report as well
+  invents survivors: a zombie, or a child whose parent has not reaped it, never
+  reports, and the group is already empty.
+- A **zombie is not a live process**. `LocalProcfsVerifier` read `/proc/<pid>`,
+  which exists until the parent reaps it, so a killed execution could be reported
+  as still running. It now reads the scheduler state and treats `Z`/`X` as absent.
+  Without that, "survived SIGKILL" would mostly have meant "not yet reaped".
+
+What is *not* handled on purpose: a process in uninterruptible sleep, and a kill
+that could not be dispatched at all. Neither is a state an operator can act on —
+one ends when its I/O does, the other is an internal fault — so both are reported
+as an unverified outcome with the reason, and neither grows a retry workflow.

@@ -57,6 +57,11 @@ fn local_inspect(pid: i32) -> Result<Option<ProcessIdentity>, String> {
     let stat_path = format!("{process_path}/stat");
     let stat =
         fs::read_to_string(&stat_path).map_err(|error| format!("read {stat_path}: {error}"))?;
+    // A process that has ended is not a process to signal or to wait on, however
+    // long its parent takes to reap it.
+    if crate::procfs::Stat::state_of(&stat).is_some_and(crate::model::ProcessState::has_ended) {
+        return Ok(None);
+    }
     let (observed_pid, start_ticks) = crate::procfs::Stat::birth_identity(&stat)
         .ok_or_else(|| format!("parse {stat_path} birth identity"))?;
     if observed_pid != pid {
@@ -122,4 +127,45 @@ pub fn verify_registration(
     verifier: &dyn ProcessVerifier,
 ) -> ProcessVerification {
     verify_identity(registration.request.process.as_ref(), verifier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process that has exited and not yet been reaped is not a process to
+    /// signal: reading it as alive is how a killed execution comes to look like a
+    /// survivor.
+    #[test]
+    fn a_zombie_is_not_a_live_process() {
+        // `sh -c exit` rather than `/bin/true`: this sandbox has no `/bin/true`,
+        // and what the test needs is only a child that ends immediately.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("a child that exits at once");
+        let pid = i32::try_from(child.id()).expect("a pid");
+        // The child has exited; its parent (this test) has not reaped it yet, so
+        // it is a zombie for exactly as long as that is true.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| crate::procfs::Stat::state_of(&stat));
+            if state.is_some_and(crate::model::ProcessState::has_ended) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the child never became a zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            LocalProcfsVerifier.inspect(pid).expect("inspect"),
+            None,
+            "an exited process is absent, not alive"
+        );
+        let _ = child.wait();
+    }
 }

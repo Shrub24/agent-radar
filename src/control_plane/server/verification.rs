@@ -528,6 +528,13 @@ pub(super) fn cleanup_launch_pane(
                 .into(),
         ));
     }
+    // How the program ended is the supervisor's report, and the supervisor lives
+    // in the pane this is about to remove. Give a report that is still on its way
+    // the rest of its grace, so a code is not destroyed by the cleanup that
+    // follows it. A launch with nothing to report waits for nothing.
+    if subject.process.identity.is_some() && subject.process.completion.is_none() {
+        subjects::await_completion(registry, subject_id);
+    }
     let reader = Arc::clone(backend);
     let cancel = Arc::clone(stopping);
     let outcome = run_bounded(

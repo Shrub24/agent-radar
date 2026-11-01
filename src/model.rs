@@ -958,6 +958,15 @@ pub enum ProcessState {
 }
 
 impl ProcessState {
+    /// Whether this state is a process that has ended.
+    ///
+    /// A zombie has exited and waits only to be reaped, so nothing can be asked of
+    /// it and nothing can be signalled in it. Reading it as alive is how a killed
+    /// process comes to look like a survivor.
+    pub fn has_ended(self) -> bool {
+        matches!(self, Self::Zombie | Self::Dead)
+    }
+
     /// What the kernel's state letter stands for, or [`Self::Other`] for a
     /// letter this kernel has and Radar does not name.
     pub fn from_letter(letter: char) -> Self {

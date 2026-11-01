@@ -824,7 +824,21 @@ pub(super) fn claim_request(
         &effective,
         params.completion_key,
         store::now_ms(),
-    ) {
+    )
+    .and_then(|()| {
+        // The pane this launch runs in is the edge's, and so is the instance that
+        // created it: neither is re-derived from what the launching process says.
+        let location = edge.location.clone().ok_or("the launch recorded no pane")?;
+        subjects::place(
+            &registry,
+            &subject.process.registration_id,
+            subjects::Placement {
+                location,
+                instance: edge.instance.clone(),
+            },
+            store::now_ms(),
+        )
+    }) {
         Ok(()) => respond(
             &request.id,
             Ok(Claimed {
@@ -884,6 +898,36 @@ pub(super) fn complete_request(core: &Arc<Mutex<Core>>, request: &Request) -> Re
     }
 }
 
+/// Where an admitted execution runs: the pane that reported it, and the serving
+/// instance verified now. A placement recorded without an instance removes no
+/// pane later; the execution itself is still tracked.
+fn placement(
+    backend: &Arc<dyn RuntimeProvider>,
+    verifier: &Arc<dyn ProcessVerifier>,
+    pane: &str,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+) -> subjects::Placement {
+    let identity = backend.identity();
+    // Containment comes from the inventory that is already the daemon's own read.
+    let deadline = Instant::now() + VERIFICATION_TIMEOUT;
+    let found = bounded_inventory(backend, stopping, budget, deadline)
+        .ok()
+        .and_then(|fleet| fleet.pane(pane).cloned());
+    subjects::Placement {
+        location: crate::control_plane::registry::RegistryLocation {
+            backend: identity.name,
+            instance: identity.instance,
+            workspace: found
+                .as_ref()
+                .map(|pane| pane.location.workspace_id.clone()),
+            tab: found.as_ref().map(|pane| pane.location.tab_id.clone()),
+            pane: Some(pane.to_string()),
+        },
+        instance: serving_identity(backend, verifier, stopping, budget),
+    }
+}
+
 /// Admits an in-place managed launch, then answers with the identity the caller
 /// must enter its scope under. The pane must already hold this process, so
 /// nothing is created and no unverified placement is accepted.
@@ -919,10 +963,20 @@ pub(super) fn admit_request(
     };
     // The caller reports its own placement; what makes the claim credible is that
     // this process is the pane's own descendant, verified here and not taken from
-    // the caller's environment.
+    // the caller's environment. The pane it names is the runtime's own id, so the
+    // backend is what says what that pane is called here.
+    let Some(pane) = backend.pane_handle(&params.pane) else {
+        return Response::refused(
+            &request.id,
+            &Refusal::new(
+                Code::Refused,
+                format!("`{}` names no pane this backend serves", params.pane),
+            ),
+        );
+    };
     let foreground = match bounded_foreground(
         &backend,
-        &params.pane,
+        &pane,
         &stopping,
         verification,
         Instant::now() + VERIFICATION_TIMEOUT,
@@ -981,9 +1035,18 @@ pub(super) fn admit_request(
         &registry,
         &params.request_id,
         launch,
-        params.kind,
-        &params.process,
-        params.completion_key,
+        subjects::Admission {
+            kind: params.kind,
+            identity: params.process,
+            completion_key: params.completion_key,
+            placement: Some(placement(
+                &backend,
+                &verifier,
+                &pane,
+                &stopping,
+                verification,
+            )),
+        },
         store::now_ms(),
     ) {
         Ok(process) => process,

@@ -7880,6 +7880,130 @@ fn a_dead_child_pane_closes_from_a_dead_report_now_whether_or_not_a_status_was_r
     daemon.stop();
 }
 
+/// A supervised run in a real pane: the program is the pane's foreground, so it
+/// takes the pane's input, a signal reaches it, and its own shell survives it.
+///
+/// What the daemon recorded is asserted where the records are read directly —
+/// this test is the terminal's own evidence, which is the part no fake backend can
+/// show. The scope launcher is this test's stub, the same shape as the real one
+/// (it drops the scope's flags and runs the program), so no unit is created on the
+/// operator's own manager.
+#[test]
+fn a_supervised_run_takes_pane_input_keeps_its_shell_and_ends_as_its_program_did() {
+    let Some(server) = TmuxServer::start("pty-supervision") else {
+        return;
+    };
+    let sandbox = Sandbox::new("pty-supervision");
+    let socket = sandbox.socket();
+    let state = sandbox.state();
+    fs::create_dir_all(&state).expect("the state root");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("a private state root");
+    let launcher = state.join("scope-launcher");
+    fs::write(
+        &launcher,
+        "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+    )
+    .expect("a stub launcher");
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).expect("an executable");
+    let environment = [
+        ("RADAR_CONTROL_BACKEND", "tmux"),
+        ("RADAR_TMUX_SERVER", server.name.as_str()),
+    ];
+    let mut daemon = DaemonChild::spawn_with(&socket, &state, &environment);
+    let mut lines = BufReader::new(daemon.process.stdout.take().expect("stdout")).lines();
+    lines.next().expect("greeting line").expect("greeting");
+    let mut client = Client::dial(&socket);
+    let ping = client.call("daemon.ping", json!({}));
+    assert_eq!(ping["result"]["backend"], "tmux", "{ping}");
+
+    // A shell of its own, so the pane's own command is one this test can type
+    // into, and the supervised program runs as its foreground job.
+    server.tmux(&["new-window", "-d", "-t", "main", "/bin/sh"]);
+    let raw_pane = server
+        .tmux(&["list-panes", "-t", "main:1", "-F", "#{pane_id}"])
+        .trim()
+        .to_string();
+    let shell_pid = server
+        .tmux(&["display-message", "-p", "-t", &raw_pane, "#{pane_pid}"])
+        .trim()
+        .to_string();
+    let typed = |line: &str| {
+        server.tmux(&["send-keys", "-t", &raw_pane, line, "Enter"]);
+    };
+    let pane_text = || server.tmux(&["capture-pane", "-p", "-t", &raw_pane]);
+    fn within(what: &str, mut ready: impl FnMut() -> bool) {
+        let until = Instant::now() + DEADLINE;
+        while !ready() {
+            assert!(Instant::now() < until, "{what} never happened");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let shows = |text: &str| {
+        let text = text.to_string();
+        let pane_text = &pane_text;
+        move || pane_text().contains(&text)
+    };
+    let command = |program: &str| {
+        format!(
+            "RADAR_SYSTEMD_RUN={} RADAR_CONTROL_SOCKET={} {} run -- {}",
+            launcher.display(),
+            socket.display(),
+            env!("CARGO_BIN_EXE_radar"),
+            program
+        )
+    };
+
+    // The program reads the pane's own input, so the terminal is its: a supervisor
+    // that put itself in front of the program would never deliver it.
+    typed(&command(
+        "/bin/sh -c 'echo ready; read line; echo got:$line; exit 7'",
+    ));
+    within("the program started", shows("ready"));
+    typed("hello");
+    within("the program read the pane", shows("got:hello"));
+    assert!(
+        !pane_text().contains("radar run:"),
+        "the supervisor reported a failure: {}",
+        pane_text()
+    );
+
+    // A program that ends is not a pane that closes: the shell is the pane's own
+    // command again, and it saw the program's own status.
+    typed("echo code:$?");
+    within("the shell came back", shows("code:7"));
+    assert_eq!(
+        server
+            .tmux(&["display-message", "-p", "-t", &raw_pane, "#{pane_dead}"])
+            .trim(),
+        "0",
+        "the pane is not a dead pane"
+    );
+    assert_eq!(
+        server
+            .tmux(&["display-message", "-p", "-t", &raw_pane, "#{pane_pid}"])
+            .trim(),
+        shell_pid,
+        "the pane still runs the shell it started with"
+    );
+
+    // A signal reaches the program through the pane, and the shell takes the
+    // terminal back once it is gone.
+    typed(&command("/bin/sh -c 'sleep 30'"));
+    within("the second run started", shows("sleep 30"));
+    server.tmux(&["send-keys", "-t", &raw_pane, "C-c"]);
+    // The shell computes this; the terminal's echo of the typed line cannot.
+    typed("echo back-$((6*7))");
+    within("the interrupted run gave the pane back", shows("back-42"));
+    assert_eq!(
+        server
+            .tmux(&["display-message", "-p", "-t", &raw_pane, "#{pane_dead}"])
+            .trim(),
+        "0",
+        "the shell is still there after the interruption"
+    );
+    daemon.stop(Signal::TERM, DEADLINE);
+}
+
 /// A pane the daemon cannot establish now is not established by dead history: an
 /// unreadable inventory and a pane absent from it both refuse before recording.
 #[test]
@@ -8248,6 +8372,94 @@ fn stage_dead_pane(
         verifier.staged(staged_identity(pid, 400));
     }
     verifier
+}
+
+/// An execution Radar did not launch from a spawn request is still placed where
+/// it runs, fenced to the instance serving now — and when that instance cannot be
+/// verified, the placement names none, so nothing later may remove the pane on it.
+#[test]
+fn an_admitted_execution_records_verified_placement_and_is_found_by_its_pane() {
+    let sandbox = Sandbox::new("admitted-placement");
+    let backend = MuxBackend::new(TRACKED_SPAWN_PRIMITIVES)
+        .observing(&["wA:p2"])
+        .with_foreground(ForegroundEvidence::command(200, Some("sh".into()), None));
+    backend.served_by(900);
+    let verifier = StagedVerifier::new();
+    verifier.staged(staged_identity(200, 400));
+    verifier.staged(staged_identity(900, 500));
+    let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier);
+    let mut client = Client::dial(daemon.path());
+    let admit = |client: &mut Client, key: &str| {
+        client.call(
+            "launch.admit",
+            json!({
+                "request_id": random_uuid(),
+                "pane": "%2",
+                "process": {
+                    "boot_id": "boot-test",
+                    "pid": 200,
+                    "start_ticks": 400,
+                },
+                "executable": "/bin/sh",
+                "argv": ["-c", "sleep 1"],
+                "cwd": "/work",
+                "kind": "agent",
+                "completion_key": key,
+            }),
+        )
+    };
+    let response = admit(&mut client, &random_uuid());
+    let registration = response["result"]["registration_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{response}"))
+        .to_string();
+    assert!(
+        !response.to_string().contains("completion_key"),
+        "the key is the supervisor's alone: {response}"
+    );
+
+    let registry =
+        agent_radar::control_plane::Registry::open(&sandbox.state()).expect("a registry");
+    let placed = agent_radar::control_plane::lifecycle::placed_at(&registry, "%2")
+        .expect("the admitted execution is placed where it runs");
+    assert_eq!(placed.registration_id, registration);
+    assert_eq!(placed.subject_id, None, "admission creates no subject");
+    let placement = placed.placement;
+    assert_eq!(placement.location.backend, "fake");
+    assert_eq!(
+        placement.location.pane.as_deref(),
+        Some("%2"),
+        "the placement names the pane the backend says it is"
+    );
+    assert_eq!(
+        placement.instance.as_ref().map(|identity| identity.pid),
+        Some(900),
+        "placement is fenced to the process serving now"
+    );
+    daemon.stop();
+
+    // Nothing serves a pane it cannot be verified to serve: the execution is
+    // still tracked, and its placement names no instance.
+    let sandbox = Sandbox::new("admitted-unfenced");
+    let backend = MuxBackend::new(TRACKED_SPAWN_PRIMITIVES)
+        .observing(&["wA:p2"])
+        .with_foreground(ForegroundEvidence::command(200, Some("sh".into()), None));
+    backend.served_by(900);
+    let verifier = StagedVerifier::new();
+    verifier.staged(staged_identity(200, 400));
+    let mut daemon = daemon_with_staged_verifier(&sandbox, backend.clone(), verifier);
+    let mut client = Client::dial(daemon.path());
+    let response = admit(&mut client, &random_uuid());
+    assert!(response["result"].is_object(), "{response}");
+    let registry =
+        agent_radar::control_plane::Registry::open(&sandbox.state()).expect("a registry");
+    let placed = agent_radar::control_plane::lifecycle::placed_at(&registry, "%2")
+        .expect("the execution is placed even when its server cannot be verified");
+    assert_eq!(
+        placed.placement.instance, None,
+        "an unverified serving process fences nothing"
+    );
+    daemon.stop();
 }
 
 #[test]
@@ -9898,10 +10110,11 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
-/// A process that ignores SIGTERM is reported uncertain. It is signalled once,
-/// is not replaced, and a later stop does not signal it again.
+/// A process that ignores SIGTERM is signalled exactly once. Its end is either
+/// established by escalating the scope that was verified around it, or reported as
+/// still running — never assumed — and no later stop signals it again.
 #[test]
-fn a_process_ignoring_sigterm_stops_uncertainly_and_is_not_signalled_again() {
+fn a_term_ignoring_process_is_signalled_once_and_its_end_is_never_assumed() {
     let Some(server) = TmuxServer::start("tmux-lifecycle-ignored") else {
         return;
     };
@@ -9919,21 +10132,25 @@ fn a_process_ignoring_sigterm_stops_uncertainly_and_is_not_signalled_again() {
     let pid = captured_identity(&state, &subject).pid;
 
     let first = stop_subject(&mut client, &random_uuid(), &subject);
-    assert_eq!(result_record(&first)["outcome"], "unknown", "{first}");
-    assert_eq!(
-        result_record(&first)["effects"],
-        json!(["sigterm dispatched"]),
-        "{first}"
-    );
-    // A managed stop names what is still running instead of claiming an exit.
-    assert!(
-        result_record(&first)["message"]
-            .as_str()
-            .is_some_and(|message| message.starts_with("still running:")),
-        "{first}"
-    );
-    assert!(process_exists(pid), "the process ignored SIGTERM");
-    assert!(subject_record(&state, &subject)["exited_at"].is_null());
+    let effects = result_record(&first)["effects"].to_string();
+    assert!(effects.contains("sigterm dispatched"), "{first}");
+    // Two honest reviews of the same stop are possible: its end was established
+    // (gracefully or by escalating a verified scope), or it is still running and
+    // said so. What is never possible is claiming an end it did not establish.
+    match result_record(&first)["outcome"].as_str() {
+        Some("completed") => assert!(!process_exists(pid), "{first}"),
+        Some("unknown") => {
+            assert!(
+                result_record(&first)["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("still running:")),
+                "{first}"
+            );
+            assert!(process_exists(pid), "the process ignored SIGTERM");
+            assert!(subject_record(&state, &subject)["exited_at"].is_null());
+        }
+        other => panic!("a stop states an end or a survivor: {other:?} {first}"),
+    }
     assert_eq!(
         result_record(&first)["target"],
         subject,
@@ -9950,12 +10167,10 @@ fn a_process_ignoring_sigterm_stops_uncertainly_and_is_not_signalled_again() {
             .contains("sigterm dispatched"),
         "{cancellation}"
     );
-    assert_eq!(
-        subject_record(&state, &subject)["state"],
-        "captured",
-        "a conflicting cancel must not revoke the launch"
-    );
-
+    // Signal intent is recorded once, so no later request signals it again —
+    // whatever the first one established about the end.
+    let signalled = subject_record(&state, &subject)["signalled_at"].clone();
+    assert!(!signalled.is_null(), "the first stop recorded its signal");
     let second = stop_subject(&mut client, &random_uuid(), &subject);
     assert!(
         !result_record(&second)["effects"]
@@ -9963,9 +10178,16 @@ fn a_process_ignoring_sigterm_stops_uncertainly_and_is_not_signalled_again() {
             .contains("sigterm dispatched"),
         "{second}"
     );
+    assert_eq!(
+        subject_record(&state, &subject)["signalled_at"],
+        signalled,
+        "the second stop did not signal it again"
+    );
 
-    kill_pid(pid, Signal::KILL);
-    await_gone(pid);
+    if process_exists(pid) {
+        kill_pid(pid, Signal::KILL);
+        await_gone(pid);
+    }
     let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
@@ -10043,10 +10265,64 @@ fn an_unbound_launch_whose_process_exited_has_its_pane_cleaned_up_once() {
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
-/// A cancel whose signal is not verified gone keeps the pane: closing it would
-/// end the process without a signal or an exit claim.
+/// A supervisor's report is the only source of a program's code, and the pane is
+/// where its sender lives. So the code is read back after the close removed that
+/// pane: a cleanup follows the report, it does not destroy it.
 #[test]
-fn an_unbound_launch_whose_process_may_still_be_live_keeps_its_pane() {
+fn a_reported_code_survives_the_pane_a_close_removes() {
+    let Some(server) = TmuxServer::start("tmux-code-survives-close") else {
+        return;
+    };
+    let sandbox = Sandbox::new("tmux-code-survives-close");
+    let (socket, state) = (sandbox.socket(), sandbox.state());
+    let mut daemon = tmux_daemon(&socket, &state, &server);
+    let mut client = Client::dial(&socket);
+    let parent = tracked_parent(&mut client);
+    let (spawn_id, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", "exit 7"]));
+    let pane = launch_pane(&mut client, &spawn_id);
+
+    fn code(client: &mut Client, subject: &str) -> Value {
+        client.call("lifecycle.get", json!({"subject_id": subject}))["result"]["subject"]
+            ["completion"]["code"]
+            .clone()
+    }
+    let until = Instant::now() + DEADLINE;
+    while code(&mut client, &subject).is_null() {
+        assert!(Instant::now() < until, "the supervisor never reported");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        code(&mut client, &subject),
+        json!(7),
+        "the program's own status"
+    );
+
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    assert_eq!(
+        result_record(&cancelled)["outcome"],
+        "completed",
+        "{cancelled}"
+    );
+    assert!(
+        !pane_ids(&server).contains(&pane),
+        "the pane {pane} is closed: {:?}",
+        pane_ids(&server)
+    );
+    assert_eq!(
+        code(&mut client, &subject),
+        json!(7),
+        "the code outlives the pane its report came from"
+    );
+    drop(client);
+    let status = daemon.stop(Signal::TERM, DEADLINE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// A cancel whose process ignores TERM is escalated inside its verified scope, and
+/// only then is the pane it left closed: the pane is never the thing that ends the
+/// process, and it is not kept for a process that is verifiably gone.
+#[test]
+fn a_launch_whose_process_ignores_term_is_escalated_before_its_pane_is_closed() {
     let Some(server) = TmuxServer::start("tmux-lifecycle-kept") else {
         return;
     };
@@ -10065,20 +10341,17 @@ fn an_unbound_launch_whose_process_may_still_be_live_keeps_its_pane() {
     let pane = launch_pane(&mut client, &spawn_id);
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    let effects = result_record(&cancelled)["effects"].to_string();
+    assert!(effects.contains("scope escalated"), "{cancelled}");
     assert_eq!(
         result_record(&cancelled)["outcome"],
-        "unknown",
+        "completed",
         "{cancelled}"
     );
+    await_gone(pid);
     assert!(
-        result_record(&cancelled)["effects"]
-            .to_string()
-            .contains("pane kept"),
-        "{cancelled}"
-    );
-    assert!(
-        pane_ids(&server).contains(&pane),
-        "the pane {pane} whose launch may still be alive is kept: {:?}",
+        !pane_ids(&server).contains(&pane),
+        "the pane {pane} is closed once its execution is verifiably gone: {:?}",
         pane_ids(&server)
     );
     assert!(
@@ -10087,23 +10360,33 @@ fn an_unbound_launch_whose_process_may_still_be_live_keeps_its_pane() {
             .is_none_or(|message| message.contains("not") || message.starts_with("still running:")),
         "{cancelled}"
     );
-    // A refusal dispatches nothing, so it records no cleanup: the launch's pane
-    // is re-decided against whatever evidence a later cancel finds.
+    // The close is dispatched only after the execution is verified gone, but the
+    // pane can still leave with its process first. Either answer is recorded as it
+    // came: a performed removal, or an answer that the pane is already absent.
+    let cleanup = subject_record(&state, &subject)["pane_cleanup"]["outcome"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        matches!(cleanup.as_str(), "cleaned" | "unknown"),
+        "the close records what it established: {cleanup}"
+    );
+    assert!(!process_exists(pid), "the escalation ended the process");
+
+    // The cleanup is a durable fact of the launch, so a later cancel answers with
+    // it instead of closing the same place again.
+    let recorded = subject_record(&state, &subject)["pane_cleanup"].clone();
+    let _after = cancel_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
         subject_record(&state, &subject)["pane_cleanup"],
-        Value::Null,
-        "a refusal is not a recorded cleanup effect"
+        recorded,
+        "a second cancel does not clean the same pane again"
     );
-    assert!(process_exists(pid), "the process ignored SIGTERM");
-
-    kill_pid(pid, Signal::KILL);
-    await_gone(pid);
-
-    // The unresolved cancel keeps its target suppressed, so the process that
-    // has since gone does not become a second cleanup of the same pane.
-    let after = cancel_subject(&mut client, &random_uuid(), &subject);
-    assert_eq!(error_code(&after), "refused", "{after}");
-    assert!(pane_ids(&server).contains(&pane), "{after}");
+    assert!(
+        !pane_ids(&server).contains(&pane),
+        "{:?}",
+        pane_ids(&server)
+    );
 
     let status = daemon.stop(Signal::TERM, DEADLINE);
     assert_eq!(status.code(), Some(0), "{status:?}");
@@ -12524,19 +12807,23 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
         "{state_text}"
     );
 
-    // One that ignores TERM is reported, not killed: no SIGKILL escalation.
+    // One that ignores TERM is escalated inside its own verified scope: a stop
+    // that only ever asked would leave the operator waiting on a program that
+    // never listens. The escalation is named, and only a verified scope gets one.
     let stubborn_pid = captured_identity(&state, &stubborn_subject).pid;
     let cancelled = cancel_subject(&mut client, &random_uuid(), &stubborn_subject);
-    let cancelled_record = result_record(&cancelled).clone();
     assert!(
-        cancelled_record.to_string().contains("not verified")
-            || cancelled_record.to_string().contains("still running"),
-        "a TERM-ignoring process must be a survivor: {cancelled}"
+        result_record(&cancelled)["effects"]
+            .to_string()
+            .contains("scope escalated"),
+        "a TERM-ignoring process is escalated: {cancelled}"
     );
-    assert!(process_exists(stubborn_pid), "the survivor was killed");
-    let _ = Command::new("kill")
-        .args(["-9", &stubborn_pid.to_string()])
-        .status();
+    assert_eq!(
+        result_record(&cancelled)["outcome"],
+        "completed",
+        "the escalation established the end: {cancelled}"
+    );
+    await_gone(stubborn_pid);
 
     // The record itself names the group: recovery needs it, and no public view
     // carries the launch's environment.

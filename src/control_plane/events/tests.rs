@@ -49,13 +49,16 @@ fn a_process_can_be_recovered_without_fabricating_a_claim() {
         &registry,
         &random_uuid(),
         launch(),
-        lifecycle::ProcessKind::Agent,
-        &ProcessIdentity {
-            boot_id: "boot".into(),
-            pid: 4242,
-            start_ticks: 7,
+        lifecycle::Admission {
+            kind: lifecycle::ProcessKind::Agent,
+            identity: ProcessIdentity {
+                boot_id: "boot".into(),
+                pid: 4242,
+                start_ticks: 7,
+            },
+            completion_key: random_uuid(),
+            placement: None,
         },
-        random_uuid(),
         1000,
     )
     .unwrap();

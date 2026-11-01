@@ -101,6 +101,8 @@ pub struct ProcessFacts {
     pub pane_cleanup: Option<PaneCleanup>,
     #[serde(default)]
     pub completion: Option<Completion>,
+    #[serde(default)]
+    pub placement: Option<crate::control_plane::lifecycle::Placement>,
     pub bound_registration_id: Option<String>,
     pub signalled_at: Option<String>,
     pub exited_at: Option<String>,
@@ -134,6 +136,7 @@ impl From<&ProcessRecord> for ProcessFacts {
             ended_evidence: process.ended_evidence.clone(),
             pane_cleanup: process.pane_cleanup.clone(),
             completion: process.completion.clone(),
+            placement: process.placement.clone(),
             bound_registration_id: process.bound_registration_id.clone(),
             signalled_at: process.signalled_at.clone(),
             exited_at: process.exited_at.clone(),
@@ -152,6 +155,7 @@ impl ProcessFacts {
         process.ended_evidence = self.ended_evidence.clone();
         process.pane_cleanup = self.pane_cleanup.clone();
         process.completion = self.completion.clone();
+        process.placement = self.placement.clone();
         process.bound_registration_id = self.bound_registration_id.clone();
         process.signalled_at = self.signalled_at.clone();
         process.exited_at = self.exited_at.clone();
@@ -184,6 +188,9 @@ pub enum Transition {
     SignalRequested,
     ExitVerified,
     Observed(Observation),
+    /// Establishes where an execution runs. Recorded once per pane it occupies,
+    /// so a movement is a new fact rather than a silent rewrite of an old one.
+    Placed(crate::control_plane::lifecycle::Placement),
     /// Starts, updates or clears the bounded confirmation of a bound pane's
     /// absence. Weak evidence, so it is not itself a lifecycle outcome.
     AbsencePending(Option<PaneAbsence>),
@@ -404,6 +411,11 @@ impl Log {
             .iter()
             .find(|(_, facts)| facts.process.as_ref() == Some(process))
             .map(|(id, _)| id.as_str())
+    }
+
+    /// Every execution this daemon tracks, whether or not one subject claims it.
+    pub fn processes(&self) -> impl Iterator<Item = (&String, &ProcessFacts)> {
+        self.processes.iter()
     }
 
     pub fn ids(&self) -> impl Iterator<Item = &String> {
@@ -652,6 +664,16 @@ fn reduce(previous: Option<&Facts>, event: &Event) -> Result<Facts, String> {
                 && facts.execution.exited_at.is_none() =>
         {
             facts.execution.observation = Some(observation.clone());
+        }
+        // Placement is where an execution runs, so it is recorded while it is
+        // there and never for one that has ended.
+        Transition::Placed(placement)
+            if !matches!(facts.execution.state, State::Revoked)
+                && facts.execution.exited_at.is_none()
+                && facts.execution.ended_externally_at.is_none()
+                && facts.execution.completion.is_none() =>
+        {
+            facts.execution.placement = Some(placement.clone())
         }
         Transition::AbsencePending(absence)
             if facts.execution.exited_at.is_none()

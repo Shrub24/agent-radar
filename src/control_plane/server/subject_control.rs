@@ -800,6 +800,9 @@ pub(super) fn termination_outcome(
     if termination.signal_attempted {
         effects.push("sigterm dispatched".to_string());
     }
+    if termination.escalated {
+        effects.push("scope escalated".to_string());
+    }
     if operation == ops::Operation::Cancel {
         match cleanup {
             Some(cleanup) => effects.push(cleanup.effect()),

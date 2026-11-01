@@ -1051,6 +1051,16 @@ pub trait RuntimeProvider: Send + Sync {
     /// The whole normalized inventory, or a user-facing diagnostic.
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String>;
 
+    /// The handle this backend uses for the pane a caller names.
+    ///
+    /// A caller inside a pane knows it by the runtime's own id, while every
+    /// location Radar records is a handle. The backend is what knows the
+    /// difference; `None` means the reference names no pane this backend serves,
+    /// so nothing about it is claimed.
+    fn pane_handle(&self, reference: &str) -> Option<String> {
+        Some(reference.to_string())
+    }
+
     /// Foreground evidence for one pane, inconclusive when unreadable.
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence;
 
@@ -1202,6 +1212,10 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn inventory(&self, cancel: &AtomicBool) -> Result<FleetObservation, String> {
         (**self).inventory(cancel)
+    }
+
+    fn pane_handle(&self, reference: &str) -> Option<String> {
+        (**self).pane_handle(reference)
     }
 
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence {

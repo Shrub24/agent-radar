@@ -680,6 +680,12 @@ impl Stat {
     /// Extracts the process birth identity from a stat line. This shares the
     /// sampler's proc(5) parser so verification and sampling interpret PID reuse
     /// identically.
+    /// The scheduler state a stat line reports, for callers that must know
+    /// whether the process has ended rather than only which incarnation it is.
+    pub(crate) fn state_of(text: &str) -> Option<crate::model::ProcessState> {
+        Self::parse(text).map(|stat| stat.state)
+    }
+
     pub(crate) fn birth_identity(text: &str) -> Option<(i32, u64)> {
         let pid = text.split_once(' ')?.0.parse().ok()?;
         let start_ticks = Self::parse(text)?.start_ticks;

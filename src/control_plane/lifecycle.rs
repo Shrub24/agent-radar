@@ -8,6 +8,21 @@
 //! keeps the PID and birth identity, so the captured process is the program that
 //! runs. A correlation is spent at capture; a revoked subject never captures or binds.
 //!
+//! Three lifetimes are kept apart here, and confusing them is what makes lifecycle
+//! code wrong:
+//!
+//! - A **subject** is the logical agent: its identity, its managed metadata and
+//!   which attempt is current. It outlives the attempts that run it.
+//! - A **claim** is one attempt: the execution record, with its registration, its
+//!   captured process identity, its scope and how it ended. Termination addresses
+//!   the claim, never a re-resolved subject, so a successor is never signalled by
+//!   an operation that meant its predecessor.
+//! - A **pane** is a terminal resource that an execution runs in. Its lifetime is
+//!   neither the subject's nor the claim's: a pane can outlive the program it ran
+//!   (an interactive shell keeps it), and a claim can outlive its pane. A record's
+//!   [`Placement`] is the association, and it is only usable while the instance
+//!   that created the pane is the one serving now.
+//!
 //! Every transition of a subject runs under the registry's transition lock. That
 //! lock is the one commit fence shared with registration binding, so a cancel and
 //! a launch claim, or a cancel and a registration, have exactly one winner.
@@ -65,11 +80,13 @@ pub const NOT_AWAITING: &str = "launch is not awaiting its process";
 /// Refusal for a captured process that was not started with the requested launch.
 pub const LAUNCH_MISMATCH: &str = "launch context does not match the requested launch";
 
-const SUBJECT_VERSION: u32 = 3;
+const SUBJECT_VERSION: u32 = 4;
 const MAX_SUBJECT_BYTES: usize = 64 * 1024;
 /// How long a cancelled process gets to exit after SIGTERM before the operation
 /// reports the exit as not verified.
 const EXIT_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a verified scope is given to end after it was escalated.
+const ESCALATION_DEADLINE: Duration = Duration::from_secs(2);
 /// How long a launch waits for the daemon before it gives up without running
 /// the program.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(5);
@@ -222,6 +239,36 @@ pub struct SubjectRecord {
     pub updated_at: String,
 }
 
+/// Where one execution runs, and the backend generation that was serving when
+/// its placement was established.
+///
+/// A pane id outlives the server that answered for it, so the location alone is
+/// not authority: an operation that would remove the pane compares
+/// `instance` against the backend serving now, and a placement recorded without
+/// one removes nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Placement {
+    pub location: crate::control_plane::registry::RegistryLocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<ProcessIdentity>,
+}
+
+impl Placement {
+    /// The pane this placement names, when it names one.
+    pub fn pane(&self) -> Option<&str> {
+        self.location.pane.as_deref()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.location.validate()?;
+        if self.location.pane.is_none() {
+            return Err("placement must name a pane".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub claim_id: String,
@@ -283,6 +330,11 @@ pub struct ProcessRecord {
     /// correlation: it never leaves the recipe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_key: Option<String>,
+    /// The pane this execution runs in, recorded where it was established: at
+    /// admission, or when a tracked launch claimed its program. An execution is
+    /// found again by its placement, whether or not a spawn edge requested it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Placement>,
     /// Recorded once, by the cancel that revoked an unbound launch. A bound
     /// launch's pane belongs to its child and is closed through spawn.close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,7 +382,47 @@ pub struct Termination {
     pub revoked: bool,
     /// SIGTERM was dispatched by this cancel.
     pub signal_attempted: bool,
+    /// The execution outlived the graceful window inside a verified scope, so the
+    /// remainder of that scope was killed.
+    pub escalated: bool,
     pub exit: Exit,
+}
+
+/// One shutdown window, shared by everything ending together.
+///
+/// The graceful part is how long a signalled program has to exit on its own; the
+/// hard part is how long an escalation is then given. Nothing waits per
+/// execution, so a branch of agents costs one window, not one per agent.
+#[derive(Clone, Copy)]
+pub struct Shutdown {
+    graceful_until: std::time::Instant,
+    hard_until: std::time::Instant,
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Shutdown {
+    pub fn new() -> Self {
+        let start = std::time::Instant::now();
+        Self {
+            graceful_until: start + EXIT_DEADLINE,
+            hard_until: start + EXIT_DEADLINE + ESCALATION_DEADLINE,
+        }
+    }
+
+    fn graceful(&self) -> Duration {
+        self.graceful_until
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    fn hard(&self) -> Duration {
+        self.hard_until
+            .saturating_duration_since(std::time::Instant::now())
+    }
 }
 
 /// What a cancel did about the pane an unbound launch left behind. Reported
@@ -376,6 +468,10 @@ enum Stage {
         descriptor: std::os::fd::OwnedFd,
         signal: bool,
         scope: Option<crate::managed_scope::VerifiedScope>,
+        /// Why the recorded scope could not be verified, when it could not. The
+        /// process is still fenced by its own identity, so a TERM is still
+        /// authorised; only escalation is not.
+        scope_note: Option<String>,
     },
 }
 
@@ -435,8 +531,19 @@ fn draft_process(
         pane_cleanup: None,
         completion: None,
         completion_key: None,
+        placement: None,
         recorded_at: format_millis(now_ms),
     }
+}
+
+/// What a caller establishes when it admits an execution in place: the process
+/// itself, what kind of execution it is, what authenticates its supervisor, and
+/// where it runs.
+pub struct Admission {
+    pub kind: ProcessKind,
+    pub identity: ProcessIdentity,
+    pub completion_key: String,
+    pub placement: Option<Placement>,
 }
 
 /// A managed command needs a process registration, not an invented agent.
@@ -444,15 +551,17 @@ pub fn create_process(
     registry: &Registry,
     spawn_request_id: &str,
     launch: LaunchContext,
-    kind: ProcessKind,
-    identity: &ProcessIdentity,
-    completion_key: String,
+    admission: Admission,
     now_ms: i64,
 ) -> Result<ProcessRecord, String> {
     check_bounds(&launch)?;
+    if let Some(placement) = &admission.placement {
+        placement.validate()?;
+    }
     let mut process = draft_process(spawn_request_id, launch, random_uuid(), now_ms);
-    process.kind = kind;
-    process.completion_key = Some(completion_key);
+    process.kind = admission.kind;
+    process.completion_key = Some(admission.completion_key);
+    process.placement = admission.placement;
     process.origin = Origin::Admitted;
     process.correlation = None;
     let _transition = registry.transition();
@@ -463,10 +572,10 @@ pub fn create_process(
         &process.registration_id,
         &format_millis(now_ms),
         crate::control_plane::events::Source::Launch,
-        crate::control_plane::events::Transition::Captured(identity.clone()),
+        crate::control_plane::events::Transition::Captured(admission.identity.clone()),
     )?;
     process.state = State::Captured;
-    process.identity = Some(identity.clone());
+    process.identity = Some(admission.identity);
     Ok(process)
 }
 
@@ -857,6 +966,93 @@ fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
     write_subject_record(registry, &record)
 }
 
+/// One execution that is running where a placement puts it.
+pub struct Placed {
+    pub registration_id: String,
+    /// The logical subject this execution belongs to, when one is recorded. A
+    /// directly admitted execution has none.
+    pub subject_id: Option<String>,
+    pub placement: Placement,
+}
+
+/// Records where an execution runs, as one ordered fact of that execution.
+///
+/// Placement is what a domain operation starts from when it holds a pane rather
+/// than an execution, so it is recorded where it was established — at admission,
+/// or when a tracked launch claimed its program — and not inferred later from a
+/// process's own claims about itself.
+pub fn place(
+    registry: &Registry,
+    registration_id: &str,
+    placement: Placement,
+    now_ms: i64,
+) -> Result<(), String> {
+    placement.validate()?;
+    let _transition = registry.transition();
+    match read_process(registry, registration_id)? {
+        Some(process) if live(&process) => {}
+        Some(_) => return Err("an execution that has ended runs nowhere".into()),
+        None => return Err("no execution is recorded for this registration".into()),
+    }
+    record_process_transition(
+        registry,
+        registration_id,
+        crate::control_plane::events::Source::Launch,
+        crate::control_plane::events::Transition::Placed(placement),
+        now_ms,
+    )
+}
+
+/// Every execution whose last recorded placement is still live: the evidence a
+/// container close starts from, and the reason an agent the listing filtered out
+/// is still closed with the container it runs in.
+pub fn placements(registry: &Registry) -> Vec<Placed> {
+    let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+    let subjects: BTreeMap<String, String> = log
+        .ids()
+        .filter_map(|id| {
+            let facts = log.facts(id)?;
+            Some((
+                facts.attachment.registration_id.clone(),
+                facts.attachment.subject_id.clone()?,
+            ))
+        })
+        .collect();
+    log.processes()
+        .filter_map(|(registration_id, facts)| {
+            let placement = facts.placement.clone()?;
+            running(facts).then(|| Placed {
+                registration_id: registration_id.clone(),
+                subject_id: subjects.get(registration_id).cloned(),
+                placement,
+            })
+        })
+        .collect()
+}
+
+/// Whether this execution has not ended: a revoked launch, a verified exit, an
+/// exit established on other evidence, and a reported completion are each an end.
+fn running(facts: &crate::control_plane::events::ProcessFacts) -> bool {
+    !matches!(facts.state, State::Revoked)
+        && facts.exited_at.is_none()
+        && facts.ended_externally_at.is_none()
+        && facts.completion.is_none()
+}
+
+fn live(process: &ProcessRecord) -> bool {
+    !matches!(process.state, State::Revoked)
+        && process.exited_at.is_none()
+        && process.ended_externally_at.is_none()
+        && process.completion.is_none()
+}
+
+/// The execution running in this pane, when one is placed there and still live.
+pub fn placed_at(registry: &Registry, pane: &str) -> Option<Placed> {
+    placements(registry)
+        .into_iter()
+        .find(|placed| placed.placement.pane() == Some(pane))
+}
+
 pub(crate) fn clear_subject_attachments(registry: &Registry) -> Result<(), String> {
     let directory = registry.subjects().join("identity");
     let metadata = match fs::symlink_metadata(&directory) {
@@ -1092,7 +1288,14 @@ pub fn cancel(
     now_ms: i64,
 ) -> Result<Termination, String> {
     let revoked = revoke(registry, subject_id, now_ms)?;
-    terminate(registry, subject_id, verifier, now_ms, revoked)
+    terminate(
+        registry,
+        subject_id,
+        verifier,
+        now_ms,
+        revoked,
+        &Shutdown::new(),
+    )
 }
 
 /// Stops a tracked launch's captured process. The launch itself is left as it is:
@@ -1103,7 +1306,37 @@ pub fn stop(
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
 ) -> Result<Termination, String> {
-    terminate(registry, subject_id, verifier, now_ms, false)
+    terminate(
+        registry,
+        subject_id,
+        verifier,
+        now_ms,
+        false,
+        &Shutdown::new(),
+    )
+}
+
+/// How long a finished execution is given to report its end before the pane that
+/// holds its supervisor is removed.
+const COMPLETION_GRACE: Duration = Duration::from_millis(500);
+
+/// Waits, boundedly, for the supervisor's report of how a program ended.
+///
+/// The report is what carries the code, and the supervisor is what sends it, so a
+/// close that removes the pane first can destroy it. The wait never becomes a
+/// claim to have one: an absent report is a diagnostic, not a blocker.
+pub fn await_completion(registry: &Registry, key: &str) -> Option<Completion> {
+    let until = std::time::Instant::now() + COMPLETION_GRACE;
+    loop {
+        let reported = read(registry, key)
+            .ok()
+            .flatten()
+            .and_then(|claim| claim.process.completion);
+        if reported.is_some() || std::time::Instant::now() >= until {
+            return reported;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Records a launch's exit if its captured process is verifiably gone, and
@@ -1773,22 +2006,154 @@ fn revoke(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<bool, St
     Ok(true)
 }
 
-/// Sends SIGTERM to the captured process through its pidfd, if one is captured
-/// and not yet signalled, and waits boundedly for the exit. The registry lock is
-/// released during the wait.
+/// Sends SIGTERM to the captured process through its pidfd, or to the scope that
+/// holds it, if one was verified.
+fn send_term(
+    descriptor: &std::os::fd::OwnedFd,
+    scope: Option<&crate::managed_scope::VerifiedScope>,
+) -> Result<(), String> {
+    match scope {
+        Some(scope) => crate::managed_scope::stop(&[scope]),
+        None => process_control::terminate(descriptor).map_err(|error| error.to_string()),
+    }
+}
+
+/// What escalating one execution established.
+struct Escalated {
+    /// The scope was killed and nothing is left inside it: nothing that ran there
+    /// is running now.
+    emptied: bool,
+    /// Why the escalation itself did not happen or did not finish.
+    failure: Option<String>,
+}
+
+/// Escalates one execution that outlived its graceful window.
+///
+/// This is the only place a shutdown turns into SIGKILL, so the deadline that
+/// calls it today and the operator request that will call it later cannot drift
+/// apart. Only a scope verified at signal time is escalated: a process fenced by
+/// its own identity but held in an unreadable scope has no group to kill, and
+/// killing by name pattern would reach work Radar never claimed.
+fn escalate(scope: &crate::managed_scope::VerifiedScope, shutdown: &Shutdown) -> Escalated {
+    if let Err(error) = crate::managed_scope::kill(&[scope]) {
+        return Escalated {
+            emptied: false,
+            failure: Some(format!("scope escalation failed: {error}")),
+        };
+    }
+    // One bounded wait for the group to empty. The manager kills every member it
+    // still holds, so the cgroup is the evidence, not the pidfd of the process
+    // that started it.
+    let mut remaining = match scope.remaining() {
+        Ok(remaining) => remaining,
+        Err(error) => {
+            return Escalated {
+                emptied: false,
+                failure: Some(format!("scope membership is unresolved: {error}")),
+            };
+        }
+    };
+    while !remaining.is_empty() && !shutdown.hard().is_zero() {
+        std::thread::sleep(Duration::from_millis(20));
+        remaining = match scope.remaining() {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                return Escalated {
+                    emptied: false,
+                    failure: Some(format!("scope membership is unresolved: {error}")),
+                };
+            }
+        };
+    }
+    if remaining.is_empty() {
+        return Escalated {
+            emptied: true,
+            failure: None,
+        };
+    }
+    Escalated {
+        emptied: false,
+        failure: Some(format!("still running: {}", remaining.join(", "))),
+    }
+}
+
+/// Waits out the shared window for one signalled execution, escalates a verified
+/// scope that outlives it, and records the exit it establishes.
+///
+/// Only a scope verified at signal time is escalated, and only after the graceful
+/// part of the window ran out. A process fenced by its own identity but held in an
+/// unreadable scope is reported as still running: nothing about it is inferred.
+fn await_end(
+    registry: &Registry,
+    key: &str,
+    descriptor: &std::os::fd::OwnedFd,
+    scope: Option<&crate::managed_scope::VerifiedScope>,
+    note: Option<&str>,
+    shutdown: &Shutdown,
+    now_ms: i64,
+) -> Result<(Exit, bool), String> {
+    let exited = process_control::exited_within(descriptor, shutdown.graceful());
+    let survivors = match scope {
+        Some(scope) => scope.remaining()?,
+        None => Vec::new(),
+    };
+    if exited && survivors.is_empty() {
+        record_exit(registry, key, now_ms)?;
+        return Ok((Exit::Exited, false));
+    }
+    let Some(scope) = scope else {
+        return Ok((still_running(registry, key, note), false));
+    };
+    let escalated = escalate(scope, shutdown);
+    if escalated.emptied {
+        // An emptied, verified group is the evidence that nothing which ran there
+        // still runs — including when the pidfd of the process that started it
+        // never reported, which is what a zombie or an unreaped child looks like.
+        record_exit(registry, key, now_ms)?;
+        return Ok((Exit::Exited, true));
+    }
+    Ok((
+        Exit::Unverified(
+            escalated
+                .failure
+                .unwrap_or_else(|| "the escalation did not finish".into()),
+        ),
+        true,
+    ))
+}
+
+/// What a signalled execution that outlived the window is reported as, named by
+/// the kernel's own word for it rather than by anything the daemon stores.
+fn still_running(registry: &Registry, key: &str, note: Option<&str>) -> Exit {
+    let name = process_for_control(registry, key)
+        .ok()
+        .and_then(|process| process.identity)
+        .and_then(|identity| fs::read_to_string(format!("/proc/{}/comm", identity.pid)).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "process".to_string());
+    match note {
+        Some(note) => Exit::Unverified(format!("still running: {name} ({note})")),
+        None => Exit::Unverified(format!("still running: {name}")),
+    }
+}
+
+/// Ends one execution: TERM under the shared window, escalation of a verified
+/// scope, and the exit it establishes.
 fn terminate(
     registry: &Registry,
     subject_id: &str,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
     revoked: bool,
+    shutdown: &Shutdown,
 ) -> Result<Termination, String> {
-    let deadline = std::time::Instant::now() + EXIT_DEADLINE;
-    let (descriptor, signal, scope) = match stage(registry, subject_id, verifier, now_ms)? {
+    let (descriptor, signal, scope, note) = match stage(registry, subject_id, verifier, now_ms)? {
         Stage::Settled(exit) => {
             return Ok(Termination {
                 revoked,
                 signal_attempted: false,
+                escalated: false,
                 exit,
             });
         }
@@ -1796,45 +2161,34 @@ fn terminate(
             descriptor,
             signal,
             scope,
-        } => (descriptor, signal, scope),
+            scope_note,
+        } => (descriptor, signal, scope, scope_note),
     };
     let mut signal_attempted = false;
     if signal {
         signal_attempted = true;
-        let sent = match &scope {
-            Some(scope) => crate::managed_scope::stop(&[scope]),
-            None => process_control::terminate(&descriptor).map_err(|e| e.to_string()),
-        };
-        if let Err(error) = sent {
+        if let Err(error) = send_term(&descriptor, scope.as_ref()) {
             return Ok(Termination {
                 revoked,
                 signal_attempted,
+                escalated: false,
                 exit: Exit::Unverified(format!("SIGTERM could not be sent: {error}")),
             });
         }
     }
-    let remaining = scope.as_ref().map(|g| g.remaining()).transpose();
-    let exit = if !remaining
-        .as_ref()
-        .is_ok_and(|names| names.as_ref().is_none_or(Vec::is_empty))
-    {
-        Exit::Unverified(match remaining {
-            Ok(Some(names)) => format!("still running: {}", names.join(", ")),
-            Err(error) => error,
-            _ => unreachable!(),
-        })
-    } else if process_control::exited_within(
+    let (exit, escalated) = await_end(
+        registry,
+        subject_id,
         &descriptor,
-        deadline.saturating_duration_since(std::time::Instant::now()),
-    ) {
-        record_exit(registry, subject_id, now_ms)?;
-        Exit::Exited
-    } else {
-        Exit::Unverified("exit was not verified before the deadline".into())
-    };
+        scope.as_ref(),
+        note.as_deref(),
+        shutdown,
+        now_ms,
+    )?;
     Ok(Termination {
         revoked,
         signal_attempted,
+        escalated,
         exit,
     })
 }
@@ -1862,12 +2216,15 @@ fn stage(
         }
         Err(_) => return Ok(Stage::Settled(Exit::Unresolved)),
     };
-    let scope = match process.scope.clone() {
+    let (scope, scope_note) = match process.scope.clone() {
         Some(scope) => match scope.verify(&process.registration_id, identity, verifier) {
-            Ok(scope) => Some(scope),
-            Err(message) => return Ok(Stage::Settled(Exit::Unverified(message))),
+            Ok(scope) => (Some(scope), None),
+            // The process is fenced by its own identity, so an unreadable scope
+            // does not withhold a TERM; it withholds escalation, and it is named
+            // in the outcome so the uncertainty is not silent.
+            Err(message) => (None, Some(message)),
         },
-        None => None,
+        None => (None, None),
     };
     let _transition = registry.transition();
     let current = process_for_control(registry, subject_id)?;
@@ -1891,6 +2248,7 @@ fn stage(
         descriptor,
         signal,
         scope,
+        scope_note,
     })
 }
 
@@ -1950,7 +2308,7 @@ pub fn cancel_many(
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
 ) -> Cancelled {
-    let deadline = std::time::Instant::now() + EXIT_DEADLINE;
+    let shutdown = Shutdown::new();
     let mut report = Cancelled {
         stopped: Vec::new(),
         survivors: Vec::new(),
@@ -1967,39 +2325,50 @@ pub fn cancel_many(
                 descriptor,
                 signal,
                 scope,
-            }) => {
-                if signal && scope.is_none() && process_control::terminate(&descriptor).is_err() {
-                    report.survivors.push(id.clone());
-                } else {
-                    watching.push((id.clone(), descriptor, signal, scope));
-                }
+                scope_note,
+            }) => watching.push((id.clone(), descriptor, signal, scope, scope_note)),
+            Err(error) => {
+                tracing::warn!(%error, subject = %id, "the stop could not be staged");
+                report.survivors.push(id.clone());
             }
-            _ => report.survivors.push(id.clone()),
         }
     }
-    let groups: Vec<_> = watching
+    // Every member is signalled before any of them is waited on: one manager
+    // transaction for the scopes, one pidfd signal for each bare process.
+    let scopes: Vec<_> = watching
         .iter()
-        .filter(|(_, _, signal, _)| *signal)
-        .filter_map(|(_, _, _, scope)| scope.as_ref())
+        .filter(|(_, _, signal, _, _)| *signal)
+        .filter_map(|(_, _, _, scope, _)| scope.as_ref())
         .collect();
     // Whether each member exited is judged from evidence below, so a failed stop
     // is reported but never decides the outcome.
-    if let Err(error) = crate::managed_scope::stop(&groups) {
+    if let Err(error) = crate::managed_scope::stop(&scopes) {
         tracing::warn!(%error, "scope stop failed");
     }
-    let descriptors: Vec<_> = watching.iter().map(|(_, fd, _, _)| fd).collect();
-    let exited = process_control::exited_all_within(
-        &descriptors,
-        deadline.saturating_duration_since(std::time::Instant::now()),
-    );
-    for ((id, _, _, scope), exited) in watching.iter().zip(exited) {
-        let empty = scope
-            .as_ref()
-            .is_none_or(|g| g.remaining().is_ok_and(|names| names.is_empty()));
-        if exited && empty && record_exit(registry, id, now_ms).is_ok() {
-            report.stopped.push(id.clone());
-        } else {
-            report.survivors.push(id.clone());
+    let mut signalled = Vec::new();
+    for (id, descriptor, signal, scope, note) in watching {
+        if signal && scope.is_none() && process_control::terminate(&descriptor).is_err() {
+            report.survivors.push(id);
+            continue;
+        }
+        signalled.push((id, descriptor, scope, note));
+    }
+    for (id, descriptor, scope, note) in signalled {
+        match await_end(
+            registry,
+            &id,
+            &descriptor,
+            scope.as_ref(),
+            note.as_deref(),
+            &shutdown,
+            now_ms,
+        ) {
+            Ok((Exit::Exited, _)) => report.stopped.push(id),
+            Ok(_) => report.survivors.push(id),
+            Err(error) => {
+                tracing::warn!(%error, subject = %id, "the end could not be established");
+                report.survivors.push(id);
+            }
         }
     }
     report
@@ -2689,6 +3058,7 @@ mod tests {
             cancelled,
             Termination {
                 revoked: true,
+                escalated: false,
                 signal_attempted: false,
                 exit: Exit::Unresolved,
             }
@@ -2730,6 +3100,7 @@ mod tests {
             again,
             Termination {
                 revoked: false,
+                escalated: false,
                 signal_attempted: false,
                 exit: Exit::Unresolved,
             }
@@ -2857,9 +3228,12 @@ mod tests {
             &registry,
             &random_uuid(),
             launch(),
-            ProcessKind::Agent,
-            &identity,
-            random_uuid(),
+            Admission {
+                kind: ProcessKind::Agent,
+                identity: identity.clone(),
+                completion_key: random_uuid(),
+                placement: None,
+            },
             1,
         )
         .expect("admitted process");
@@ -2907,9 +3281,12 @@ mod tests {
             &registry,
             &random_uuid(),
             launch(),
-            ProcessKind::Agent,
-            &identity,
-            key.clone(),
+            Admission {
+                kind: ProcessKind::Agent,
+                identity: identity.clone(),
+                completion_key: key.clone(),
+                placement: None,
+            },
             1,
         )
         .expect("admitted process");
@@ -2935,6 +3312,138 @@ mod tests {
         record_completion(&registry, &identity, &key, None, Some(9), 4).expect("replay");
         let completion = recorded(&scratch.registry()).expect("completion survives a reopen");
         assert_eq!((completion.code, completion.signal), (Some(7), None));
+    }
+
+    #[test]
+    fn an_execution_is_found_by_the_pane_it_was_placed_in_until_it_ends() {
+        let scratch = Scratch::new("placement");
+        let registry = scratch.registry();
+        let identity = ProcessIdentity {
+            boot_id: "boot".into(),
+            pid: 4242,
+            start_ticks: 7,
+        };
+        let key = random_uuid();
+        let process = create_process(
+            &registry,
+            &random_uuid(),
+            launch(),
+            Admission {
+                kind: ProcessKind::Agent,
+                identity: identity.clone(),
+                completion_key: key.clone(),
+                placement: None,
+            },
+            1,
+        )
+        .expect("admitted process");
+        assert_eq!(
+            process.placement, None,
+            "an execution is placed where it runs, not where it was admitted from"
+        );
+        let placement = Placement {
+            location: crate::control_plane::registry::RegistryLocation {
+                backend: "fake".into(),
+                instance: Some("server".into()),
+                workspace: Some("wA".into()),
+                tab: Some("wA:t1".into()),
+                pane: Some("wA:p1".into()),
+            },
+            instance: Some(ProcessIdentity {
+                pid: 900,
+                ..identity.clone()
+            }),
+        };
+        place(&registry, &process.registration_id, placement.clone(), 2).expect("placed");
+        assert_eq!(
+            read_process(&scratch.registry(), &process.registration_id)
+                .expect("read")
+                .expect("process")
+                .placement,
+            Some(placement),
+            "placement survives a reopen"
+        );
+        let found = placed_at(&registry, "wA:p1").expect("the execution placed there");
+        assert_eq!(found.registration_id, process.registration_id);
+        assert_eq!(
+            found.subject_id, None,
+            "an admitted execution has no subject"
+        );
+
+        // A pane that names no execution, and an execution that has ended, are
+        // both no answer: placement is where something runs now.
+        assert!(placed_at(&registry, "wA:p2").is_none());
+        record_completion(&registry, &identity, &key, Some(0), None, 3).expect("report");
+        assert!(
+            placed_at(&registry, "wA:p1").is_none(),
+            "an execution that ended is not running in its old pane"
+        );
+    }
+
+    #[test]
+    fn a_placement_without_a_pane_or_of_an_ended_execution_is_refused() {
+        let scratch = Scratch::new("placement-shape");
+        let registry = scratch.registry();
+        let identity = ProcessIdentity {
+            boot_id: "boot".into(),
+            pid: 4242,
+            start_ticks: 7,
+        };
+        let key = random_uuid();
+        let process = create_process(
+            &registry,
+            &random_uuid(),
+            launch(),
+            Admission {
+                kind: ProcessKind::Agent,
+                identity: identity.clone(),
+                completion_key: key.clone(),
+                placement: None,
+            },
+            1,
+        )
+        .expect("admitted process");
+        let placement = |pane: Option<&str>| Placement {
+            location: crate::control_plane::registry::RegistryLocation {
+                backend: "fake".into(),
+                instance: None,
+                workspace: None,
+                tab: None,
+                pane: pane.map(str::to_owned),
+            },
+            instance: None,
+        };
+        assert!(place(&registry, &process.registration_id, placement(None), 2).is_err());
+        assert!(
+            place(
+                &registry,
+                "00000000-0000-4000-8000-000000000999",
+                placement(Some("wA:p1")),
+                2
+            )
+            .is_err(),
+            "an execution that is not recorded is not placed"
+        );
+        assert!(
+            place(
+                &registry,
+                &process.registration_id,
+                placement(Some("wA:p1")),
+                2
+            )
+            .is_ok()
+        );
+        record_completion(&registry, &identity, &key, Some(0), None, 3).expect("report");
+        assert!(
+            place(
+                &registry,
+                &process.registration_id,
+                placement(Some("wA:p1")),
+                4
+            )
+            .is_err(),
+            "an ended execution runs nowhere"
+        );
     }
 
     #[test]
@@ -3333,6 +3842,7 @@ mod tests {
             cancelled,
             Termination {
                 revoked: false,
+                escalated: false,
                 signal_attempted: true,
                 exit: Exit::Exited,
             }
@@ -3624,7 +4134,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scoped_launch_whose_unit_is_missing_is_unknown_and_not_signalled() {
+    fn a_scoped_launch_whose_unit_is_missing_is_signalled_on_its_process_not_killed() {
         let scratch = Scratch::new("scope-missing");
         let registry = scratch.registry();
         let (subject, mut child, _) = captured_child(&registry);
@@ -3651,17 +4161,26 @@ mod tests {
         .expect("scope json");
         std::fs::write(&recipe, serde_json::to_vec(&json).expect("encode")).expect("rewrite");
 
+        // The scope is the authority for killing; the process's own verified
+        // identity is the authority for a TERM. A unit that cannot be read
+        // withholds the first and names itself in the outcome.
         let cancelled = cancel(&registry, &subject, &LocalProcfsVerifier, 4).expect("cancel");
 
-        assert!(!cancelled.signal_attempted, "nothing was signalled");
         assert!(
-            matches!(cancelled.exit, Exit::Unverified(_)),
-            "a missing unit is unknown: {cancelled:?}"
+            cancelled.signal_attempted,
+            "the fenced process was signalled"
         );
+        assert!(
+            !cancelled.escalated,
+            "a scope that could not be read is never killed"
+        );
+        assert_eq!(cancelled.exit, Exit::Exited, "the fenced process ended");
         let record = read(&registry, &subject).expect("read").expect("subject");
-        assert!(record.process.exited_at.is_none(), "no exit was recorded");
-        assert!(child.0.try_wait().expect("wait").is_none(), "still alive");
-        let _ = child.0.kill();
+        assert!(record.process.exited_at.is_some(), "the exit was recorded");
+        assert!(
+            child.0.try_wait().expect("wait").is_some(),
+            "the process is gone"
+        );
     }
 
     /// Reports every PID as absent, as a process table that no longer lists it does.
@@ -3986,6 +4505,7 @@ mod tests {
             stopped,
             Termination {
                 revoked: false,
+                escalated: false,
                 signal_attempted: false,
                 exit: Exit::Unresolved,
             }
@@ -4102,6 +4622,7 @@ mod tests {
             stopped,
             Termination {
                 revoked: false,
+                escalated: false,
                 signal_attempted: false,
                 exit: Exit::Exited,
             }
@@ -4131,6 +4652,7 @@ mod tests {
             stopped,
             Termination {
                 revoked: false,
+                escalated: false,
                 signal_attempted: false,
                 exit: Exit::Unresolved,
             }

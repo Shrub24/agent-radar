@@ -180,6 +180,30 @@ pub fn stop(scopes: &[&VerifiedScope]) -> Result<(), String> {
     }
 }
 
+/// Ends whatever is left in these scopes with `SIGKILL`.
+///
+/// Called only after a graceful stop ran out of its window and only for a scope
+/// whose unit and membership were verified: a scope nothing verified holds no
+/// authority to escalate over.
+pub fn kill(scopes: &[&VerifiedScope]) -> Result<(), String> {
+    if scopes.is_empty() {
+        return Ok(());
+    }
+    let out = Command::new(crate::service::program("RADAR_SYSTEMCTL", "systemctl"))
+        .args(["--user", "kill", "--signal=KILL"])
+        .args(scopes.iter().map(|s| &s.unit))
+        .output()
+        .map_err(|e| format!("scope kill: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "scope kill: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 impl VerifiedScope {
     pub fn remaining(&self) -> Result<Vec<String>, String> {
         let root = Path::new("/sys/fs/cgroup").join(self.path.trim_start_matches('/'));
