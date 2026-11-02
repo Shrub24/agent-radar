@@ -14,7 +14,7 @@ criteria are satisfied, not merely that a helper exists or a suite passes.
 
 - [x] 2.1 Share termination through verified process/scope evidence and a shutdown window. Deadline escalation uses `lifecycle::escalate`; an unreadable scope prevents group escalation, not a fenced process TERM. Zombies are not live processes.
 - [x] 2.2 Compose termination, completion capture and generation-fenced pane removal in one domain Close (`places::close_place`). Live: `mux.close` of an admitted agent's pane ends its scope, records the signal and removes only that pane.
-- [ ] 2.3 Route cancel, parent/child close, expiry and revoked-launch cleanup through that composition, preserving authorization and replay. Child close now runs `close_place`; cancel runs the shared termination then `cleanup_launch_pane`. Not yet audited against production callers: expiry and revoked-launch cleanup.
+- [x] 2.3 Route cancel, parent/child close, expiry and revoked-launch cleanup through that composition, preserving authorization and replay. Audited against production callers: child close runs `close_place`; cancel and restart run the shared termination then `cleanup_launch_pane`; expiry and revoked-launch withdrawal (`sweeper::withdraw_unpresented`) call the same `cleanup_launch_pane`. All removals end in `places::remove_place` with the serving-generation fence; authorization stays with each caller.
 - [x] 2.4 Publish typed close outcomes across all close adapters. Cancel/stop, `topology.delete`, `mux.close` and child close all carry `closed`.
 
 ## 3. Recursive container closure
