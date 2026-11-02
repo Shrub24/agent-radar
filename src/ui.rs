@@ -139,14 +139,14 @@ pub fn render(
                     if rail {
                         rail_item(row, tick)
                     } else {
-                        row_item(row, tick, ink, focus.marks(row.id))
+                        row_item(row, tick, ink, focus.row_marks(state, row.id))
                     }
                 }
                 crate::ui_session::navigation::DrawRow::Structure {
                     row: wire,
                     connectors,
                     ..
-                } => structure_item(wire, connectors, ink, focus.marks(row.id())),
+                } => structure_item(wire, connectors, ink, focus.row_marks(state, row.id())),
             })
             .collect();
         list_state.select(app.selected_index());
@@ -774,6 +774,18 @@ impl Focus {
         self.row.as_ref() == Some(id)
     }
 
+    /// What marks a row at its end: focus, and a close that is removing it.
+    fn row_marks(&self, state: &ObservationState, id: &RowId) -> Marks {
+        let place = match id {
+            RowId::Workspace(place) | RowId::Agent(place) | RowId::Pane(place) => Some(place),
+            _ => None,
+        };
+        Marks {
+            focused: self.marks(id),
+            closing: place.is_some_and(|place| state.closing.contains(place)),
+        }
+    }
+
     /// The words the heading and the sidebar footer share, in the order a reader
     /// needs them: whether this view follows, then what the focus is.
     fn words(&self, app: &App) -> Vec<&'static str> {
@@ -1092,7 +1104,7 @@ fn structure_item(
     wire: &crate::control_plane::public_contracts::ui_session::TreeRow,
     connectors: &crate::ui_session::navigation::Connectors,
     ink: RowInk,
-    focused: bool,
+    marks: Marks,
 ) -> ListItem<'static> {
     let RowInk { width, compact, .. } = ink;
     let palette = theme::palette();
@@ -1130,9 +1142,7 @@ fn structure_item(
         palette.muted
     };
     spans.push(Span::styled(sanitize(&wire.label), Style::new().fg(ink)));
-    if focused {
-        spans.push(Span::styled(" ◆", Style::new().fg(palette.heading)));
-    }
+    push_marks(&mut spans, marks);
     ListItem::new(Line::from(fit(spans, None, width)))
 }
 
@@ -1145,7 +1155,25 @@ struct RowInk {
     compact: bool,
 }
 
-fn row_item(row: &VisibleRow<'_>, tick: usize, ink: RowInk, focused: bool) -> ListItem<'static> {
+/// What a row says about itself after its text. Marks go at the end so no row's
+/// columns move when one appears.
+#[derive(Clone, Copy)]
+struct Marks {
+    focused: bool,
+    closing: bool,
+}
+
+fn push_marks(spans: &mut Vec<Span<'static>>, marks: Marks) {
+    let palette = theme::palette();
+    if marks.closing {
+        spans.push(Span::styled(" closing", Style::new().fg(palette.retained)));
+    }
+    if marks.focused {
+        spans.push(Span::styled(" ◆", Style::new().fg(palette.heading)));
+    }
+}
+
+fn row_item(row: &VisibleRow<'_>, tick: usize, ink: RowInk, marks: Marks) -> ListItem<'static> {
     let RowInk {
         width,
         current: source_current,
@@ -1443,9 +1471,7 @@ fn row_item(row: &VisibleRow<'_>, tick: usize, ink: RowInk, focused: bool) -> Li
     }
     // The focused row is marked at its end, so no row's columns move when focus
     // does and text this panel draws for a row is unchanged by it.
-    if focused {
-        spans.push(Span::styled(" ◆", Style::new().fg(palette.heading)));
-    }
+    push_marks(&mut spans, marks);
     ListItem::new(Line::from(fit(spans, flex, width)))
 }
 
@@ -2631,6 +2657,63 @@ mod tests {
         };
         assert!(shown.marks(&RowId::Workspace("w".into())));
         assert!(!shown.marks(&RowId::Workspace("other".into())));
+    }
+
+    #[test]
+    fn a_row_inside_a_closing_branch_says_so_after_its_text_and_others_do_not() {
+        let mut state = fixture_state();
+        let app = app_for(&state);
+        let before = render_text(&state, &app, 140, 30);
+        assert!(!before.contains("closing"), "{before}");
+
+        // The daemon holds the pane its close is removing; only that row says so.
+        state.closing.insert("wA:p1".into());
+        let after = render_text(&state, &app, 140, 30);
+        let marked: Vec<_> = after
+            .lines()
+            .filter(|line| line.contains("closing"))
+            .collect();
+        assert_eq!(marked.len(), 1, "{after}");
+        // The mark only appends: the row's own text is the line it was.
+        let row_text = |line: &str| {
+            line.split("││")
+                .next()
+                .unwrap_or(line)
+                .trim_end()
+                .to_string()
+        };
+        let expected = row_text(&marked[0].replacen(" closing", "", 1));
+        assert!(
+            before.lines().any(|line| row_text(line) == expected),
+            "{before}\n{after}"
+        );
+
+        // The mark follows the daemon's release of the place.
+        state.closing.clear();
+        assert_eq!(render_text(&state, &app, 140, 30), before);
+    }
+
+    #[test]
+    fn a_focused_closing_row_carries_both_marks_in_a_fixed_order() {
+        let mut spans = Vec::new();
+        push_marks(
+            &mut spans,
+            Marks {
+                focused: true,
+                closing: true,
+            },
+        );
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, " closing ◆");
+        let mut none = Vec::new();
+        push_marks(
+            &mut none,
+            Marks {
+                focused: false,
+                closing: false,
+            },
+        );
+        assert!(none.is_empty());
     }
 
     #[test]

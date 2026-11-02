@@ -1277,6 +1277,13 @@
           "type": "array",
           "uniqueItems": true
         },
+        "closing": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "containment": {
           "additionalProperties": {
             "$ref": "#/$defs/RetainedObservation"

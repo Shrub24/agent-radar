@@ -67,6 +67,10 @@ pub struct RetainedAgent {
 pub struct ObservationState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observer: Option<crate::model::ObserverHealth>,
+    /// Places a close is removing right now: the target's handle and every pane
+    /// inside it. Memory-only, like the hold it mirrors.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub closing: BTreeSet<String>,
     inventory: Option<FleetObservation>,
     source: SourceFreshness,
     /// Freshness of the registry source alone. A registry read that fails leaves
@@ -243,6 +247,7 @@ impl ObservationState {
     ) -> Self {
         Self {
             observer: public.observer,
+            closing: public.closing,
             inventory: public.inventory,
             source: public.source.into(),
             registry: public.registry.into(),

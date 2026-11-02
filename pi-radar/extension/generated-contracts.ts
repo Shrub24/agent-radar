@@ -843,6 +843,7 @@ export interface ObservationSnapshot {
  */
 export interface ObservationProjection {
   awaiting_evidence: string[];
+  closing?: string[];
   containment: {
     [k: string]: RetainedObservation;
   };

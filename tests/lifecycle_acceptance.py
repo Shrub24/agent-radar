@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 import time
 
@@ -405,8 +406,21 @@ def main():
                                               capture_output=True).returncode == 0,
                        "stubborn execution never entered a real scope")
         started = time.monotonic()
-        accept.delete_tab(window, panes, container)
+        closer = threading.Thread(target=accept.delete_tab, args=(window, panes, container))
+        closer.start()
+        # While the stubborn agents hold the close open, the observation names the
+        # branch as closing; afterwards it names nothing.
+        seen = set()
+        while closer.is_alive():
+            observed = (accept.call("observation.get", {}).get("snapshot") or {}).get("observation") or {}
+            seen |= set(observed.get("closing", []))
+            time.sleep(0.1)
+        closer.join()
         elapsed = time.monotonic() - started
+        assert {f"tmux:{accept.server}:{pane}" for pane in panes} <= seen, f"closing never published: {seen}"
+        eventually(lambda: not ((accept.call("observation.get", {}).get("snapshot") or {})
+                                .get("observation") or {}).get("closing"),
+                   "the closing state was never released")
         for unit in units:
             assert subprocess.run(["systemctl", "--user", "is-active", unit],
                                   capture_output=True).returncode != 0, f"{unit} survived the close"

@@ -71,6 +71,8 @@ pub struct RetainedObservation {
 pub struct ObservationProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observer: Option<crate::model::ObserverHealth>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub closing: BTreeSet<String>,
     pub inventory: Option<FleetObservation>,
     pub source: ObservationFreshness,
     #[serde(default)]
@@ -230,6 +232,7 @@ impl From<&ObservationState> for ObservationProjection {
             .collect();
         Self {
             observer: state.observer.clone(),
+            closing: state.closing.clone(),
             inventory: state.inventory().cloned(),
             source: state.source_freshness().into(),
             registry: state.registry_freshness().into(),

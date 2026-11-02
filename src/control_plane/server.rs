@@ -669,6 +669,9 @@ impl Daemon {
                 hub_store,
                 &stopping,
             ));
+            let closing = Arc::clone(&locked(&core).closing);
+            let watched = Arc::clone(&hub);
+            closing.watch(Arc::new(move |places| watched.set_closing(places)));
             locked(&core).hub = Some(hub);
         }
         let ui_feeder = {

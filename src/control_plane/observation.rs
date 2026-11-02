@@ -149,6 +149,8 @@ struct Shared {
     demand: Mutex<Demand>,
     /// The backend announced a change that no completed read is known to include.
     hinted: std::sync::atomic::AtomicBool,
+    /// Places a close holds now; the sampler publishes a change as a revision.
+    closing: Mutex<std::collections::BTreeSet<String>>,
     /// Ends the backend's hint source; set whenever the sampler or hub stops.
     stop_observer: Arc<std::sync::atomic::AtomicBool>,
     /// The daemon's stop flag: the sampler stops with the daemon.
@@ -200,6 +202,7 @@ impl Hub {
             changed: Condvar::new(),
             demand: Mutex::new(Demand::default()),
             hinted: std::sync::atomic::AtomicBool::new(false),
+            closing: Mutex::new(std::collections::BTreeSet::new()),
             stop_observer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stopping: Arc::clone(stopping),
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -301,6 +304,12 @@ impl Hub {
         self.shared.changed.notify_all();
     }
 
+    /// Records the places a close holds and wakes the sampler to publish them.
+    pub(crate) fn set_closing(&self, places: Vec<String>) {
+        *locked(&self.shared.closing) = places.into_iter().collect();
+        self.shared.changed.notify_all();
+    }
+
     /// Joins the sampler thread, if this hub owns one.
     pub fn join(&mut self) {
         if let Some(worker) = self.worker.take() {
@@ -369,7 +378,10 @@ fn sample_loop(
         let health = changes.as_ref().map(|changes| changes.health());
         let health_changed = state.observer != health;
         state.observer = health;
-        if applied || health_changed {
+        let closing = locked(&shared.closing).clone();
+        let closing_changed = state.closing != closing;
+        state.closing = closing;
+        if applied || health_changed || closing_changed {
             last_pass = Some(Instant::now());
             last_generation = generation;
             let (task_value, task_state) = tasks_snapshot(&tasks, &task_error);

@@ -61,6 +61,13 @@ While Close is active, Radar SHALL reject overlapping launch, move and restart r
 - **WHEN** a new server generation reuses the target handle during Close
 - **THEN** the new resource is not removed using the old reference
 
+### Requirement: Observation publishes the places a close is removing
+The observation SHALL name the target and every pane inside it for as long as a Close holds them, and SHALL stop naming them when the Close ends, whatever its outcome. The set describes the serving process and is not durable.
+
+#### Scenario: A view sees a branch close
+- **WHEN** a branch whose agents ignore termination is being closed
+- **THEN** the observation names the branch's places until the close settles, and a view marks those rows as closing rather than showing them unchanged until they disappear
+
 ### Requirement: Close preserves durable replay and bounded escalation
 A close operation SHALL persist its identity and target before destructive effects. Identical settled replay SHALL return its recorded outcome without new effects; conflicting content SHALL refuse. Escalation within the active operation MAY follow an uncertain child attempt, but SHALL NOT become unlimited redispatch or claim an uncertain attempt never happened.
 
