@@ -6443,43 +6443,10 @@ fn stopping_the_daemon_cancels_an_in_flight_focus_into_a_durable_unknown() {
     assert!(record.completed_at.is_some());
 }
 
-/// The guard is the whole point of the daemon's close: a location its owner
-/// manages is refused, and the backend is never asked.
+/// Registration alone is not execution authority. A Close removes the confirmed
+/// place without inventing a managed exit from an unverified registration.
 #[test]
-fn a_managed_pane_close_is_refused_before_the_backend_is_asked() {
-    let sandbox = Sandbox::new("close-managed");
-    let inventory = close_inventory("wA:t1", &[("wA:p1", Some(true))]);
-    let backend = CloseBackend::new(Ok(inventory.clone()), CloseAnswer::Completed);
-    let mut daemon = sandbox.daemon_with(backend.clone());
-    let mut client = Client::dial(daemon.path());
-
-    let target = CloseTarget::Pane("wA:p1".into());
-    let response = client.call("mux.close", frozen_from(&inventory, target.clone()));
-    assert_eq!(result_record(&response)["outcome"], "refused");
-    assert_eq!(
-        result_record(&response)["category"],
-        json!(Category::BackendRefused)
-    );
-    assert_eq!(result_record(&response)["effects"], json!([]));
-    assert!(
-        result_record(&response)["message"]
-            .as_str()
-            .expect("a message")
-            .contains("managed by its owner"),
-        "{response}"
-    );
-    assert!(
-        !backend.told_to_close(&target),
-        "the backend was asked anyway"
-    );
-    daemon.stop();
-}
-
-/// A registration made after the operator's snapshot and confirmation still
-/// protects its pane and its tab: the daemon re-reads the registry before it
-/// dispatches a generic close, and the backend is never asked.
-#[test]
-fn a_registration_made_after_confirmation_blocks_pane_and_tab_close() {
+fn a_registration_without_execution_placement_never_invents_an_exit() {
     let sandbox = Sandbox::new("close-registered");
     let inventory = close_inventory("wA:t1", &[("wA:p1", None), ("wA:p2", None)]);
     let backend = CloseBackend::new(Ok(inventory.clone()), CloseAnswer::Completed);
@@ -6506,45 +6473,25 @@ fn a_registration_made_after_confirmation_blocks_pane_and_tab_close() {
 
     for (target, request) in frozen {
         let response = client.call("mux.close", request);
-        assert_eq!(result_record(&response)["outcome"], "refused", "{response}");
-        assert!(
-            !backend.told_to_close(&target),
-            "{target:?} was dispatched past its registration"
+        assert_eq!(
+            result_record(&response)["outcome"],
+            "completed",
+            "{response}"
         );
+        assert_eq!(
+            result_record(&response)["closed"]["execution"]["state"],
+            "not_applicable",
+            "{response}"
+        );
+        assert!(backend.told_to_close(&target), "{target:?} was not removed");
     }
     daemon.stop();
 }
 
-/// A registry that cannot be read refuses a generic close outright: with no
-/// answer about registrations, the pane might be an agent's, so the backend is
-/// never asked.
+/// Confirmed Close no longer routes through an owner-file protocol. A managed
+/// label does not block resource removal or count as verified execution exit.
 #[test]
-fn an_unreadable_registry_refuses_a_generic_pane_close() {
-    let sandbox = Sandbox::new("close-unreadable-registry");
-    let inventory = close_inventory("wA:t1", &[("wA:p1", None)]);
-    let backend = CloseBackend::new(Ok(inventory.clone()), CloseAnswer::Completed);
-    let mut daemon = sandbox.daemon_with(backend.clone());
-    let mut client = Client::dial(daemon.path());
-
-    // The registry directory is replaced by a file, so every registry read fails.
-    let agents = sandbox.state().join("agents");
-    fs::remove_dir_all(&agents).expect("remove the registry directory");
-    fs::write(&agents, b"").expect("replace it with a file");
-
-    let target = CloseTarget::Pane("wA:p1".into());
-    let response = client.call("mux.close", frozen_from(&inventory, target.clone()));
-    assert_eq!(result_record(&response)["outcome"], "refused", "{response}");
-    assert!(
-        !backend.told_to_close(&target),
-        "the backend was asked despite an unreadable registry"
-    );
-    daemon.stop();
-}
-
-/// One managed member is enough: a tab is refused whole rather than closed
-/// around the pane its owner is using.
-#[test]
-fn a_tab_with_one_managed_member_is_refused_whole() {
+fn a_confirmed_tab_close_needs_no_owner_file_routing() {
     let sandbox = Sandbox::new("close-mixed-tab");
     let inventory = close_inventory("wA:t1", &[("wA:p1", None), ("wA:p2", Some(true))]);
     let backend = CloseBackend::new(Ok(inventory.clone()), CloseAnswer::Completed);
@@ -6553,18 +6500,20 @@ fn a_tab_with_one_managed_member_is_refused_whole() {
 
     let target = CloseTarget::Tab("wA:t1".into());
     let response = client.call("mux.close", frozen_from(&inventory, target.clone()));
-    assert_eq!(result_record(&response)["outcome"], "refused");
+    assert_eq!(
+        result_record(&response)["outcome"],
+        "completed",
+        "{response}"
+    );
     assert_eq!(result_record(&response)["target"], "wA:t1");
-    assert!(
-        result_record(&response)["message"]
-            .as_str()
-            .expect("a message")
-            .contains("managed by its owner"),
+    assert_eq!(
+        result_record(&response)["closed"]["execution"]["state"],
+        "not_applicable",
         "{response}"
     );
     assert!(
-        !backend.told_to_close(&target),
-        "the backend was asked anyway"
+        backend.told_to_close(&target),
+        "the confirmed tab was not removed"
     );
     daemon.stop();
 }
@@ -6585,7 +6534,7 @@ fn a_replaced_occupant_is_refused_as_changed() {
     assert_eq!(result_record(&response)["outcome"], "refused");
     assert_eq!(
         result_record(&response)["message"],
-        "pane wA:p1 changed: nothing was closed"
+        "the selected place changed: nothing was closed"
     );
     assert!(
         !backend.told_to_close(&target),
@@ -6636,7 +6585,10 @@ fn an_unchanged_unmanaged_pane_closes_once() {
     let id = random_uuid();
     let first = client.call_id(&id, "mux.close", frozen.clone());
     assert_eq!(result_record(&first)["outcome"], "completed");
-    assert_eq!(result_record(&first)["effects"], json!(["close"]));
+    assert_eq!(
+        result_record(&first)["closed"]["resource"]["state"],
+        "removed"
+    );
     assert_eq!(result_record(&first)["target"], "wA:p1");
     assert!(backend.told_to_close(&target), "the backend was not asked");
 
@@ -9902,6 +9854,7 @@ fn an_uncertain_daemon_close_is_never_retried_through_direct_herdr() {
 
     let target = CloseTarget::Pane("wA:p1".into());
     let request = lifecycle::CloseRequest {
+        execution: None,
         target: target.clone(),
         identity: lifecycle::identity(&inventory, &target),
     };
@@ -11399,12 +11352,11 @@ fn a_confirmed_deletion_closes_over_a_survivor_and_names_the_unverified_exit() {
     let closed = client.call("topology.delete", request);
     let record = result_record(&closed);
     assert_eq!(record["outcome"], "completed", "{closed}");
-    assert!(
-        record["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("did not, and their exits are unverified")),
-        "the outcome names the exit it could not verify: {closed}"
+    assert_eq!(
+        record["closed"]["execution"]["state"], "unverified",
+        "{closed}"
     );
+    assert_eq!(record["closed"]["resource"]["state"], "removed", "{closed}");
     assert_eq!(
         backend.closed_targets(),
         vec![CloseTarget::Workspace("wA".to_string())],
@@ -11515,9 +11467,10 @@ fn a_deletion_never_records_an_exit_it_could_not_verify() {
         !message.contains("1 agent(s) exited"),
         "an agent that was never verified gone must not be counted as exited: {message}"
     );
-    assert!(
-        message.contains("their exits are unverified"),
-        "the unverified agent is named: {message}"
+    assert_eq!(
+        result_record(&closed)["closed"]["execution"]["state"],
+        "unverified",
+        "{closed}"
     );
     assert_eq!(
         backend.closed_targets(),
@@ -11715,12 +11668,12 @@ fn recipe_creation() -> Value {
             "focus": false,
         },
         "label": "runner",
-        "recipe": {
+        "recipe": {"plain": {
             "executable": "/bin/echo",
             "argv": ["sentinel-argv"],
             "cwd": "/tmp",
             "env": {"SENTINEL_ENV": "sentinel-value"},
-        },
+        }},
         "requester": "test",
     })
 }
@@ -11732,7 +11685,7 @@ fn a_topology_recipe_cannot_set_radar_identity_environment_variables() {
     let mut daemon = sandbox.daemon_with(backend.clone());
     let mut client = Client::dial(daemon.path());
     let mut params = recipe_creation();
-    params["recipe"]["env"]["PI_RADAR_MANAGED_PARENT_SUBJECT_ID"] =
+    params["recipe"]["plain"]["env"]["PI_RADAR_MANAGED_PARENT_SUBJECT_ID"] =
         json!("22222222-2222-4222-8222-222222222222");
 
     let refused = client.call("topology.create", params);
@@ -11801,7 +11754,7 @@ fn a_recipe_creation_holds_the_command_privately_and_runs_it_in_its_pane() {
         "topology.create",
         json!({
             "request": {"kind": "workspace", "focus": false},
-            "recipe": {"executable": "/bin/echo", "argv": [], "env": {}},
+            "recipe": {"plain": {"executable": "/bin/echo", "argv": [], "env": {}}},
             "requester": "test",
         }),
     );
@@ -11819,7 +11772,7 @@ fn a_recipe_creation_holds_the_command_privately_and_runs_it_in_its_pane() {
 
 /// A tab is made with a pane of its own, so a launch into a new window runs there:
 /// the create carries the recipe, the daemon holds it, and the command runs in the
-/// pane tmux reported for the tab. This is what `L` sends.
+/// pane tmux reported for the tab. This is a plain recipe, not a managed launch.
 #[test]
 fn a_tab_creation_runs_its_recipe_in_the_pane_the_tab_opened() {
     let sandbox = Sandbox::new("topology-recipe-tab");

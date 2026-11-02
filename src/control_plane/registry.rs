@@ -609,8 +609,9 @@ impl Registry {
         &self,
         request_id: &str,
         result: CloseResult,
+        closed: Option<crate::control_plane::lifecycle::ClosedExecution>,
     ) -> Result<ChildClose, String> {
-        child_close::record_outcome(self, request_id, result)
+        child_close::record_outcome(self, request_id, result, closed)
     }
 
     /// One recorded close request, if the daemon has one.
@@ -811,17 +812,25 @@ impl Registry {
             Ok(_) => {}
         }
         let bytes = read_record_file(&path, MAX_REGISTRATION_BYTES)?;
-        let mut registration: Registration =
+        let registration: Registration =
             decode(&bytes).map_err(|error| format!("agent {registration_id}: {error}"))?;
-        if let Some(claim) = presence::current(self, registration_id)? {
-            registration.request.location = claim.location;
-        }
         if registration.registration_id != registration_id {
             return Err(format!(
                 "agent {registration_id}: record id does not match its filename"
             ));
         }
-        Ok(Some(registration))
+        self.with_presence_location(registration).map(Some)
+    }
+
+    // Admission compares immutable requests; read projections show current placement.
+    fn with_presence_location(
+        &self,
+        mut registration: Registration,
+    ) -> Result<Registration, String> {
+        if let Some(claim) = presence::current(self, &registration.registration_id)? {
+            registration.request.location = claim.location;
+        }
+        Ok(registration)
     }
 
     /// The registrations in stable agent-id order, at most `limit` of them and
@@ -837,9 +846,7 @@ impl Registry {
     /// symlink. A malformed record fails the whole listing: a list must not
     /// forget an agent just because one file is unreadable.
     pub fn list(&self, limit: usize) -> Result<Vec<Registration>, String> {
-        let mut registrations = self.all()?;
-        registrations.truncate(limit.min(MAX_LISTED));
-        Ok(registrations)
+        self.list_after(None, limit.min(MAX_LISTED))
     }
 
     /// A cursor page of registrations in stable agent-id order.
@@ -857,11 +864,12 @@ impl Registry {
             validate_registration_id(after)?;
         }
         let records = self.all()?;
-        Ok(records
+        records
             .into_iter()
             .filter(|record| after.is_none_or(|cursor| record.registration_id.as_str() > cursor))
             .take(limit)
-            .collect())
+            .map(|record| self.with_presence_location(record))
+            .collect()
     }
 
     /// Registers a publisher incarnation, or answers with the record it already
@@ -926,7 +934,13 @@ impl Registry {
 
     /// Every registration's public record, in agent-id order, read in full.
     pub fn public_registrations(&self) -> Result<Vec<PublicRegistration>, String> {
-        Ok(self.all()?.iter().map(Registration::public).collect())
+        self.all()?
+            .into_iter()
+            .map(|record| {
+                self.with_presence_location(record)
+                    .map(|record| record.public())
+            })
+            .collect()
     }
 
     /// Every registration, in agent-id order.

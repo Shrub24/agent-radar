@@ -91,12 +91,14 @@ pub fn target_shell_recipe(
         program,
     ];
     argv.extend(command.iter().skip(1).cloned());
-    Ok(crate::control_plane::containers::Recipe {
-        executable: shell,
-        argv,
-        cwd: Some(cwd.to_string()),
-        env: Default::default(),
-    })
+    Ok(crate::control_plane::containers::Recipe::Plain(
+        crate::control_plane::lifecycle::LaunchContext {
+            executable: shell,
+            argv,
+            cwd: Some(cwd.to_string()),
+            env: Default::default(),
+        },
+    ))
 }
 
 /// One confirmed control, as the operator asked for it.
@@ -337,6 +339,7 @@ mod launch_tests {
             "/tmp/project",
         )
         .expect("a user fish shell");
+        let recipe = recipe.command();
 
         assert_eq!(recipe.executable, fish.to_string_lossy());
         assert_eq!(recipe.cwd.as_deref(), Some("/tmp/project"));

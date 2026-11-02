@@ -5,7 +5,7 @@ use crate::control_plane::lifecycle::{ClosedExecution, ExecutionEnd, ResourceEnd
 pub(super) fn describe(closed: &ClosedExecution) -> Option<String> {
     let mut parts = Vec::new();
     match &closed.execution {
-        ExecutionEnd::Exited => {}
+        ExecutionEnd::Exited | ExecutionEnd::NotApplicable => {}
         ExecutionEnd::Unverified(reason) => parts.push(format!("exit not verified: {reason}")),
         ExecutionEnd::Unsignalled(reason) => parts.push(format!("nothing was signalled: {reason}")),
     }

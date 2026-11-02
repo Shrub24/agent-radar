@@ -3554,7 +3554,10 @@ fn a_child_close_request_is_durable_and_idempotent() {
 
         // The close copies the edge's recorded pane, keeps the intent as an audit
         // label and claims no effect before one is dispatched.
-        assert_eq!(admitted.version, 1);
+        assert_eq!(
+            admitted.version,
+            agent_radar::control_plane::CHILD_CLOSE_VERSION
+        );
         assert_eq!(admitted.spawn_request_id, SPAWN_REQUEST);
         assert_eq!(admitted.source, "herdsman");
         assert_eq!(admitted.incarnation, CHILD_INCARNATION);
@@ -3653,7 +3656,7 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
             .expect("a read")
             .expect("a registration");
         let settled = registry
-            .record_child_close_outcome(CHILD_CLOSE_REQUEST, CloseResult::Completed)
+            .record_child_close_outcome(CHILD_CLOSE_REQUEST, CloseResult::Completed, None)
             .expect("a settled outcome");
         assert_eq!(settled.outcome, CloseOutcome::Completed);
         assert_eq!(settled.message, None);
@@ -3691,6 +3694,7 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
             .record_child_close_outcome(
                 CHILD_CLOSE_REQUEST,
                 CloseResult::Unknown(Some("herdr timed out\u{7} after 5s\n".to_string())),
+                None,
             )
             .expect("a settled outcome");
         assert_eq!(unconfirmed.outcome, CloseOutcome::Unknown);
@@ -3705,6 +3709,7 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
             .record_child_close_outcome(
                 OTHER_CHILD_CLOSE_REQUEST,
                 CloseResult::Refused("nothing was dispatched".to_string()),
+                None,
             )
             .expect_err("a refusal");
         assert!(error.contains("no recorded request"), "{error}");

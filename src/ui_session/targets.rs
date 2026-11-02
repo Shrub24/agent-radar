@@ -258,6 +258,9 @@ pub(crate) fn plan(
                 operation, target, losses, subject, inventory, state, request_id,
             )
         }
+        Selected::Pane { .. } if operation == Operation::Restart => {
+            Err("restart is only for a managed worker".to_string())
+        }
         Selected::Pane {
             pane_id,
             tab,
@@ -361,6 +364,7 @@ fn close_plan(
     }
     losses.extend(losses_under(inventory, state, &target));
     let request = lifecycle::CloseRequest {
+        execution: None,
         target: target.clone(),
         identity: lifecycle::identity(inventory, &target),
     };
@@ -394,7 +398,11 @@ fn subject_plan(
     };
     let action = match operation {
         crate::app::Operation::Restart => DomainAction::Restart(subject),
-        _ => DomainAction::Cancel(subject),
+        _ => DomainAction::Close(lifecycle::CloseRequest {
+            identity: lifecycle::identity(inventory, &target),
+            target,
+            execution: Some(subject),
+        }),
     };
     Ok(Plan {
         effect: Effect::Domain(Box::new(Command::new(REQUESTER, action))),
@@ -450,6 +458,7 @@ fn container_plan(
             DomainAction::Delete(DeleteRequest {
                 container_id: container.container_id.clone(),
                 frozen: Some(lifecycle::CloseRequest {
+                    execution: None,
                     target: target.clone(),
                     identity: lifecycle::identity(inventory, &target),
                 }),
@@ -571,7 +580,15 @@ pub(crate) fn launch_plan(
                     focus: Some(false),
                 },
                 label: None,
-                recipe: Some(recipe),
+                recipe: Some(crate::control_plane::containers::Recipe::Managed {
+                    command: crate::control_plane::lifecycle::LaunchContext {
+                        executable: spec.command[0].clone(),
+                        argv: spec.command[1..].to_vec(),
+                        cwd: Some(directory.clone()),
+                        env: Default::default(),
+                    },
+                    shell: recipe.command().executable.clone(),
+                }),
             },
         ))),
         request_id: request_id.to_string(),
@@ -827,6 +844,20 @@ mod tests {
             params.pointer("/request/force").is_none(),
             "consent is the confirmation the operator gave, never a request field"
         );
+    }
+
+    #[test]
+    fn restart_on_a_shell_pane_refuses_instead_of_closing_it() {
+        let mut state = ObservationState::new();
+        let fleet = crate::model::testing::fleet();
+        let pane_id = fleet.panes[0].location.pane_id.clone();
+        state.apply_success(fleet);
+        let selected = Selected::Pane {
+            pane_id,
+            tab: None,
+            losses: Vec::new(),
+        };
+        assert!(plan(crate::app::Operation::Restart, selected, &state, None, "r1").is_err());
     }
 
     fn container(kind: Kind, handle: &str) -> crate::tree::ContainerRef {

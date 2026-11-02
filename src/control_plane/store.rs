@@ -478,16 +478,15 @@ impl From<RequestRecord> for PublicRequestRecord {
     fn from(record: RequestRecord) -> Self {
         let mut params = record.params;
         if let Some(params) = params.as_mut() {
-            for field in ["request", "recipe"] {
-                if let Some(payload) = params
-                    .get_mut(field)
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    payload.remove("env");
-                    payload.remove("argv");
-                }
+            if let Some(payload) = params
+                .get_mut("request")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                payload.remove("env");
+                payload.remove("argv");
             }
             if let Some(params) = params.as_object_mut() {
+                params.remove("recipe");
                 params.remove("env");
                 params.remove("argv");
             }
@@ -1339,6 +1338,19 @@ mod tests {
             target.map(str::to_string),
             now_ms,
         )
+    }
+
+    #[test]
+    fn a_public_record_never_contains_its_private_recipe() {
+        let mut request = record("topology.create", None, 0);
+        request.params = Some(serde_json::json!({"recipe": {"managed": {
+            "command": {"executable": "/agent", "argv": ["private-argument"],
+                        "env": {"PRIVATE": "private-environment"}}, "shell": "/shell"}},
+            "label": "public-label"}));
+        let public = request.public();
+        let params = public.params.unwrap();
+        assert!(params.get("recipe").is_none(), "{params}");
+        assert_eq!(params["label"], "public-label");
     }
 
     #[test]

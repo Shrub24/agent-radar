@@ -4,8 +4,8 @@
 Run after `cargo build --locked --bin radar`:
     python3 tests/lifecycle_acceptance.py [binary] [--keep]
 
-This covers completion persistence, shell return and branch closure of an admitted
-execution. Configured L, UI D, restart and nested workspace acceptance remain separate.
+This drives real scopes and a disposable nested tmux view: completion, Ctrl-C,
+configured L, UI restart/Close, native pane movement and multi-agent branch close.
 """
 
 import argparse
@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,8 @@ class Acceptance:
         self.state = self.root / "state"
         self.socket = self.root / "control.sock"
         self.daemon = None
+        self.view_server = f"{self.server}-view"
+        self.config = self.root / "config.toml"
 
     def tmux(self, *args):
         return subprocess.run(["tmux", "-L", self.server, *args],
@@ -84,7 +87,47 @@ class Acceptance:
                   "-c", str(self.root), "bash", "--norc", "--noprofile", "-i")
         self.tmux("split-window", "-d", "-t", "accept", "-c", str(self.root),
                   "bash", "--norc", "--noprofile", "-i")
-        env = {**os.environ, "RADAR_CONTROL_BACKEND": "tmux",
+        agent = self.root / "pi"
+        agent.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f'''\
+            import json, os, runpy, sys, time, uuid
+            from pathlib import Path
+            call = runpy.run_path({str(Path(__file__).resolve())!r})["publisher"].call
+            root = Path(__file__).parent
+            session = sys.argv[sys.argv.index("--session") + 1] if "--session" in sys.argv else str(uuid.uuid4())
+            identity = {{"pid": os.getpid(), "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                        "start_ticks": int(Path("/proc/self/stat").read_text().rsplit(") ", 1)[1].split()[19])}}
+            report = {{"source": "herdsman-pi", "incarnation": str(uuid.uuid4()), "session_id": session,
+                      "claim_id": str(uuid.uuid4()), "process": identity,
+                      "registration_id": os.environ.pop("PI_RADAR_REGISTRATION_ID", None),
+                      "label": "lifecycle-acceptance-agent",
+                      "location": {{"backend": "tmux", "instance": {self.server!r},
+                                   "pane": "tmux:{self.server}:" + os.environ["TMUX_PANE"]}}}}
+            granted = call(root / "control.sock", "agent.presence", report)
+            assert granted["standing"] == "granted", granted
+            report["registration_id"] = granted["registration_id"]
+            publisher = {{"source": report["source"], "incarnation": report["incarnation"]}}
+            writer = call(root / "control.sock", "agent.acquire", {{"registration_id": report["registration_id"],
+                          "channel": "execution", "publisher": publisher}})["writer"]
+            facts = call(root / "control.sock", "agent.acquire", {{"registration_id": report["registration_id"],
+                         "channel": "facts", "publisher": publisher}})["writer"]
+            call(root / "control.sock", "agent.publish", {{"registration_id": report["registration_id"],
+                 "channel": "facts", "writer_handle": facts["handle"], "sequence": 1,
+                 "snapshot": {{"session_name": report["label"]}}}})
+            sequence = 0
+            while True:
+                sequence += 1
+                call(root / "control.sock", "agent.presence", report)
+                call(root / "control.sock", "agent.publish", {{"registration_id": report["registration_id"],
+                     "channel": "execution", "writer_handle": writer["handle"], "sequence": sequence,
+                     "snapshot": {{"activity": "working"}}}})
+                if sequence == 1:
+                    (root / f"agent-{{os.getpid()}}.json").write_text(json.dumps({{"report": report, "granted": granted}}))
+                time.sleep(1)
+            '''))
+        agent.chmod(0o700)
+        self.config.write_text(f'[server]\nbackend = "tmux"\ntmux_server = {json.dumps(self.server)}\n'
+                               f'[agents]\nlaunch_command = [{json.dumps(str(agent))}]\n')
+        env = {**os.environ, "RADAR_CONFIG": str(self.config), "RADAR_CONTROL_BACKEND": "tmux",
                "RADAR_TMUX_SERVER": self.server,
                "RADAR_CONTROL_SOCKET": str(self.socket),
                "RADAR_CONTROL_STATE": str(self.state)}
@@ -131,7 +174,66 @@ class Acceptance:
                 return event["transition"]["data"]
         return None
 
+    def view(self, *args):
+        return subprocess.run(["tmux", "-L", self.view_server, "-f", "/dev/null", *args],
+                              capture_output=True, text=True, check=True).stdout
+
+    def start_view(self):
+        self.view_pane = self.view("new-session", "-d", "-P", "-F", "#{pane_id}",
+                                  "-s", "view", "-x", "160", "-y", "45", "sh").strip()
+        self.view("set-option", "-t", self.view_pane, "remain-on-exit", "on")
+        self.view("respawn-pane", "-k", "-t", self.view_pane,
+                  "env", f"RADAR_CONFIG={self.config}", f"RADAR_CONTROL_SOCKET={self.socket}",
+                  f"RADAR_CONTROL_STATE={self.state}", f"SHELL={shutil.which('bash')}",
+                  str(self.binary), "sidebar")
+        self.view("split-window", "-d", "-h", "-t", self.view_pane, "-p", "65",
+                  "tmux", "-L", self.server, "attach", "-t", "accept")
+        def ready():
+            if self.view("display-message", "-p", "-t", self.view_pane, "#{pane_dead}").strip() == "1":
+                raise AssertionError(f"sidebar exited: {self.screen()}")
+            return "accept" in self.screen()
+        eventually(ready, "sidebar never drew its workspace")
+
+    def screen(self):
+        return self.view("capture-pane", "-p", "-t", self.view_pane)
+
+    def keys(self, *keys):
+        self.view("send-keys", "-t", self.view_pane, *keys)
+
+    def agents(self):
+        return [json.loads(path.read_text()) for path in sorted(self.root.glob("agent-*.json"))]
+
+    def working(self, pid):
+        """Wait until the daemon reports this program working, so `w` has a target."""
+        def ready():
+            agents = self.call("observation.get", {})["snapshot"]["observation"]["inventory"]["agents"]
+            return any(a["status"] == "working" and
+                       (a["registry"]["agent"]["process"]["claim"] or {}).get("pid") == pid
+                       for a in agents if a.get("registry"))
+        eventually(ready, "agent never reported working")
+        time.sleep(0.5)
+
+    def confirmed(self, key, word):
+        self.keys(key)
+        eventually(lambda: word in self.screen().lower(), f"{key} did not open its confirmation")
+        self.keys("Right", "Enter")
+
     def close(self):
+        if self.daemon is not None and self.daemon.poll() is None:
+            try:
+                observation = self.call("observation.get", {})
+            except Exception as error:
+                observation = {"diagnostic_error": str(error)}
+            (self.root / "observation.json").write_text(json.dumps(observation, indent=2))
+        panes = {}
+        for server in (self.server, self.view_server):
+            listed = subprocess.run(["tmux", "-L", server, "list-panes", "-a", "-F", "#{pane_id}"],
+                                    capture_output=True, text=True)
+            panes[server] = {pane: subprocess.run(
+                ["tmux", "-L", server, "capture-pane", "-p", "-t", pane], capture_output=True,
+                text=True).stdout for pane in listed.stdout.splitlines()}
+        (self.root / "panes.json").write_text(json.dumps(panes, indent=2))
+        subprocess.run(["tmux", "-L", self.view_server, "kill-server"], capture_output=True)
         # An agent scope is outside the tmux server's cgroup. Clean up only this
         # run's recorded scopes, even when an assertion interrupts a live program.
         registrations = [event["transition"]["data"]["registration_id"]
@@ -185,6 +287,32 @@ def main():
         assert completion["code"] == 42, completion
         eventually(lambda: "RADAR_STATUS=42" in accept.tmux("capture-pane", "-p", "-t", first),
                    "Ctrl-C did not return control to the surviving shell")
+
+        accept.start_view()
+        accept.keys("L")
+        first_agent = eventually(lambda: (accept.agents() or [None])[0],
+                                 "configured L never produced a granted managed execution")
+        eventually(lambda: "lifecycle-acceptance-agent" in accept.screen(),
+                   "configured agent never appeared in the sidebar")
+        accept.working(first_agent["report"]["process"]["pid"])
+        accept.keys("w")
+        accept.confirmed("r", "restart")
+        agents = eventually(lambda: accept.agents() if len(accept.agents()) == 2 else None,
+                            "UI restart never produced a successor")
+        successor = next(agent for agent in agents if agent != first_agent)
+        assert successor["granted"]["subject_id"] == first_agent["granted"]["subject_id"], agents
+        assert successor["report"]["claim_id"] != first_agent["report"]["claim_id"], agents
+        old_pid = first_agent["report"]["process"]["pid"]
+        eventually(lambda: not Path(f"/proc/{old_pid}").exists(), "restart left its predecessor alive")
+        accept.working(successor["report"]["process"]["pid"])
+        accept.keys("w")
+        accept.confirmed("D", "close")
+        new_pid = successor["report"]["process"]["pid"]
+        eventually(lambda: not Path(f"/proc/{new_pid}").exists(), "UI D left the execution alive")
+        pane = successor["report"]["location"]["pane"].rsplit(":", 1)[1]
+        eventually(lambda: pane not in accept.tmux("list-panes", "-a", "-F", "#{pane_id}").splitlines(),
+                   "UI D did not remove the selected agent's pane")
+        print("lifecycle acceptance: configured L, subject-preserving UI restart and UI D passed", flush=True)
 
         created = accept.run_agent(second, ["sleep", "300"])
         registration = created["registration_id"]

@@ -94,10 +94,10 @@ pub(super) fn run_subject_control(
     // belongs to its child, and a stop leaves the launch exactly as it is.
     let cleanup = match (&termination, operation, &backend) {
         (Ok(_), ops::Operation::Cancel, Some(backend)) => cleanup_launch_pane(
-            &registry,
+            core,
             backend,
-            &verifier,
             &subject_id,
+            CleanupIntent::Close,
             &stopping,
             verification,
             now,
@@ -594,6 +594,11 @@ pub(super) fn restart_lead(
         Ok(prepared) => prepared,
         Err(error) => return Settlement::backend_refused(error),
     };
+    if let Err(error) =
+        registry.attach_subject(successor, &prepared.1.claim_id, &prepared.1.registration_id)
+    {
+        return Settlement::backend_refused(error);
+    }
     let mut effects = Vec::new();
     let termination = subjects::stop(&registry, &subject.claim_id, verifier.as_ref(), now);
     if !termination
@@ -672,10 +677,10 @@ pub(super) fn restart_lead(
     let predecessor_pane = |effects: &mut Vec<String>| {
         effects.push(
             match cleanup_launch_pane(
-                &registry,
+                core,
                 &backend,
-                &verifier,
                 &subject.claim_id,
+                CleanupIntent::Retire,
                 &stopping,
                 verification,
                 store::now_ms(),

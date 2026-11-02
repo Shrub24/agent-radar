@@ -493,6 +493,8 @@ pub struct ClosedExecution {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "state", content = "reason")]
 pub enum ExecutionEnd {
+    /// The target hosted no managed execution.
+    NotApplicable,
     /// The captured process was verified gone.
     Exited,
     /// What happened to it could not be established, and this says why.
@@ -558,7 +560,7 @@ impl From<&Exit> for ExecutionEnd {
 enum Stage {
     Settled(Exit),
     Watch {
-        descriptor: std::os::fd::OwnedFd,
+        descriptor: Option<std::os::fd::OwnedFd>,
         signal: bool,
         scope: Option<crate::managed_scope::VerifiedScope>,
         /// Why the recorded scope could not be verified, when it could not. The
@@ -672,13 +674,11 @@ pub fn create_process(
     Ok(process)
 }
 
-/// Whether this registration is an agent admitted by `radar run --agent`, which binds
-/// without a spawn edge.
-pub(crate) fn admitted_agent(registry: &Registry, registration_id: &str) -> Result<bool, String> {
+/// A captured managed agent binds by its execution identity, independently of spawn provenance.
+pub(crate) fn managed_agent(registry: &Registry, registration_id: &str) -> Result<bool, String> {
     Ok(
         read_process(registry, registration_id)?.is_some_and(|process| {
-            process.origin == Origin::Admitted
-                && process.kind == ProcessKind::Agent
+            process.kind == ProcessKind::Agent
                 && matches!(process.state, State::Captured | State::Bound)
         }),
     )
@@ -756,8 +756,8 @@ pub(crate) fn record_completion(
     )
 }
 
-/// Binds an admitted agent to its presented registration, fenced on the captured identity.
-pub(crate) fn bind_admitted(
+/// Binds a managed agent to its presented registration, fenced on the captured identity.
+pub(crate) fn bind_managed(
     registry: &Registry,
     registration_id: &str,
     process: Option<&ProcessIdentity>,
@@ -2139,12 +2139,14 @@ fn revoke(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<bool, St
 /// Sends SIGTERM to the captured process through its pidfd, or to the scope that
 /// holds it, if one was verified.
 fn send_term(
-    descriptor: &std::os::fd::OwnedFd,
+    descriptor: Option<&std::os::fd::OwnedFd>,
     scope: Option<&crate::managed_scope::VerifiedScope>,
+    shutdown: &Shutdown,
 ) -> Result<(), String> {
     match scope {
-        Some(scope) => crate::managed_scope::stop(&[scope]),
-        None => process_control::terminate(descriptor).map_err(|error| error.to_string()),
+        Some(scope) => crate::managed_scope::stop_until(&[scope], shutdown.graceful_until),
+        None => process_control::terminate(descriptor.ok_or("no process descriptor is available")?)
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -2165,12 +2167,23 @@ struct Escalated {
 /// its own identity but held in an unreadable scope has no group to kill, and
 /// killing by name pattern would reach work Radar never claimed.
 fn escalate(scope: &crate::managed_scope::VerifiedScope, shutdown: &Shutdown) -> Escalated {
-    if let Err(error) = crate::managed_scope::kill(&[scope]) {
+    if let Err(error) = escalate_scopes(&[scope], shutdown) {
         return Escalated {
             emptied: false,
             failure: Some(format!("scope escalation failed: {error}")),
         };
     }
+    await_escalation(scope, shutdown)
+}
+
+fn escalate_scopes(
+    scopes: &[&crate::managed_scope::VerifiedScope],
+    shutdown: &Shutdown,
+) -> Result<(), String> {
+    crate::managed_scope::kill_until(scopes, shutdown.hard_until)
+}
+
+fn await_escalation(scope: &crate::managed_scope::VerifiedScope, shutdown: &Shutdown) -> Escalated {
     // One bounded wait for the group to empty. The manager kills every member it
     // still holds, so the cgroup is the evidence, not the pidfd of the process
     // that started it.
@@ -2216,13 +2229,14 @@ fn escalate(scope: &crate::managed_scope::VerifiedScope, shutdown: &Shutdown) ->
 fn await_end(
     registry: &Registry,
     key: &str,
-    descriptor: &std::os::fd::OwnedFd,
+    descriptor: Option<&std::os::fd::OwnedFd>,
     scope: Option<&crate::managed_scope::VerifiedScope>,
     note: Option<&str>,
     shutdown: &Shutdown,
     now_ms: i64,
 ) -> Result<(Exit, bool), String> {
-    let exited = process_control::exited_within(descriptor, shutdown.graceful());
+    let exited = descriptor
+        .is_none_or(|descriptor| process_control::exited_within(descriptor, shutdown.graceful()));
     let survivors = match scope {
         Some(scope) => scope.remaining()?,
         None => Vec::new(),
@@ -2278,26 +2292,27 @@ fn terminate(
     revoked: bool,
     shutdown: &Shutdown,
 ) -> Result<Termination, String> {
-    let (descriptor, signal, scope, note) = match stage(registry, subject_id, verifier, now_ms)? {
-        Stage::Settled(exit) => {
-            return Ok(Termination {
-                revoked,
-                signal_attempted: false,
-                escalated: false,
-                exit,
-            });
-        }
-        Stage::Watch {
-            descriptor,
-            signal,
-            scope,
-            scope_note,
-        } => (descriptor, signal, scope, scope_note),
-    };
+    let (descriptor, signal, scope, note) =
+        match stage(registry, subject_id, verifier, now_ms, shutdown)? {
+            Stage::Settled(exit) => {
+                return Ok(Termination {
+                    revoked,
+                    signal_attempted: false,
+                    escalated: false,
+                    exit,
+                });
+            }
+            Stage::Watch {
+                descriptor,
+                signal,
+                scope,
+                scope_note,
+            } => (descriptor, signal, scope, scope_note),
+        };
     let mut signal_attempted = false;
     if signal {
         signal_attempted = true;
-        if let Err(error) = send_term(&descriptor, scope.as_ref()) {
+        if let Err(error) = send_term(descriptor.as_ref(), scope.as_ref(), shutdown) {
             return Ok(Termination {
                 revoked,
                 signal_attempted,
@@ -2309,7 +2324,7 @@ fn terminate(
     let (exit, escalated) = await_end(
         registry,
         subject_id,
-        &descriptor,
+        descriptor.as_ref(),
         scope.as_ref(),
         note.as_deref(),
         shutdown,
@@ -2330,6 +2345,7 @@ fn stage(
     subject_id: &str,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
+    shutdown: &Shutdown,
 ) -> Result<Stage, String> {
     let process = process_for_control(registry, subject_id)?;
     let Some(identity) = process.identity.as_ref() else {
@@ -2340,14 +2356,21 @@ fn stage(
     }
     let acquired = process_control::acquire(identity, verifier);
     let descriptor = match acquired {
-        Ok(Acquired::Process(fd)) => fd,
-        Ok(Acquired::Absent | Acquired::Replaced) => {
-            return settle_absent(registry, &process, subject_id, now_ms).map(Stage::Settled);
-        }
+        Ok(Acquired::Process(fd)) => Some(fd),
+        Ok(Acquired::Absent | Acquired::Replaced) => None,
         Err(_) => return Ok(Stage::Settled(Exit::Unresolved)),
     };
     let (scope, scope_note) = match process.scope.clone() {
-        Some(scope) => match scope.verify(&process.registration_id, identity, verifier) {
+        Some(scope) => match if descriptor.is_some() {
+            scope.verify_until(
+                &process.registration_id,
+                identity,
+                verifier,
+                shutdown.graceful_until,
+            )
+        } else {
+            scope.verify_unit_until(&process.registration_id, shutdown.graceful_until)
+        } {
             Ok(scope) => (Some(scope), None),
             // The process is fenced by its own identity, so an unreadable scope
             // does not withhold a TERM; it withholds escalation, and it is named
@@ -2356,6 +2379,14 @@ fn stage(
         },
         None => (None, None),
     };
+    if descriptor.is_none()
+        && scope
+            .as_ref()
+            .is_none_or(|scope| scope.remaining().is_ok_and(|left| left.is_empty()))
+    {
+        record_exit(registry, subject_id, now_ms)?;
+        return Ok(Stage::Settled(Exit::Exited));
+    }
     let _transition = registry.transition();
     let current = process_for_control(registry, subject_id)?;
     if current.identity != process.identity {
@@ -2382,44 +2413,9 @@ fn stage(
     })
 }
 
-/// Settles a stop whose main process is verifiably gone.
-///
-/// The main process exiting says nothing about the rest of its scope: a backgrounded
-/// child or a daemonised command outlives it. So while the scope is readable its
-/// members are stopped and counted, and the exit is recorded only once none remain.
-/// An unreadable scope is a unit systemd has already unloaded, which holds no
-/// members, so the verified exit of the main process is then the evidence.
-fn settle_absent(
-    registry: &Registry,
-    process: &ProcessRecord,
-    subject_id: &str,
-    now_ms: i64,
-) -> Result<Exit, String> {
-    if let Some(scope) = process
-        .scope
-        .as_ref()
-        .and_then(|scope| scope.verify_unit(&process.registration_id).ok())
-    {
-        let mut left = scope.remaining()?;
-        if !left.is_empty() {
-            if let Err(error) = crate::managed_scope::stop(&[&scope]) {
-                tracing::warn!(%error, unit = %scope.unit, "scope stop failed");
-            }
-            left = scope.remaining()?;
-        }
-        if !left.is_empty() {
-            return Ok(Exit::Unverified(format!(
-                "still running: {}",
-                left.join(", ")
-            )));
-        }
-    }
-    record_exit(registry, subject_id, now_ms)?;
-    Ok(Exit::Exited)
-}
-
 /// The outcome of cancelling several executions under one window.
 pub struct Cancelled {
+    pub escalated: bool,
     /// Executions whose exit was verified and recorded.
     pub stopped: Vec<String>,
     /// Executions still alive when the window closed, by subject id. A process
@@ -2440,12 +2436,13 @@ pub fn cancel_many(
 ) -> Cancelled {
     let shutdown = Shutdown::new();
     let mut report = Cancelled {
+        escalated: false,
         stopped: Vec::new(),
         survivors: Vec::new(),
     };
     let mut watching = Vec::new();
     for id in subject_ids {
-        match stage(registry, id, verifier, now_ms) {
+        match stage(registry, id, verifier, now_ms, &shutdown) {
             Ok(Stage::Settled(Exit::Exited)) => report.stopped.push(id.clone()),
             // Only a verified exit is an exit. An unresolved or unverified verdict
             // says the daemon could not establish one, so the agent is a survivor:
@@ -2472,33 +2469,65 @@ pub fn cancel_many(
         .collect();
     // Whether each member exited is judged from evidence below, so a failed stop
     // is reported but never decides the outcome.
-    if let Err(error) = crate::managed_scope::stop(&scopes) {
+    if let Err(error) = crate::managed_scope::stop_until(&scopes, shutdown.graceful_until) {
         tracing::warn!(%error, "scope stop failed");
     }
     let mut signalled = Vec::new();
     for (id, descriptor, signal, scope, note) in watching {
-        if signal && scope.is_none() && process_control::terminate(&descriptor).is_err() {
+        if signal
+            && scope.is_none()
+            && descriptor
+                .as_ref()
+                .is_none_or(|descriptor| process_control::terminate(descriptor).is_err())
+        {
             report.survivors.push(id);
             continue;
         }
         signalled.push((id, descriptor, scope, note));
     }
+    let mut pending = Vec::new();
     for (id, descriptor, scope, note) in signalled {
-        match await_end(
-            registry,
-            &id,
-            &descriptor,
-            scope.as_ref(),
-            note.as_deref(),
-            &shutdown,
-            now_ms,
-        ) {
-            Ok((Exit::Exited, _)) => report.stopped.push(id),
-            Ok(_) => report.survivors.push(id),
+        let ended = descriptor.as_ref().is_none_or(|descriptor| {
+            process_control::exited_within(descriptor, shutdown.graceful())
+        });
+        let empty = scope.as_ref().map_or(Ok(true), |scope| {
+            scope.remaining().map(|left| left.is_empty())
+        });
+        match empty {
+            Ok(true) if ended => {
+                if record_exit(registry, &id, now_ms).is_ok() {
+                    report.stopped.push(id);
+                } else {
+                    report.survivors.push(id);
+                }
+            }
             Err(error) => {
-                tracing::warn!(%error, subject = %id, "the end could not be established");
+                tracing::warn!(%error, execution = %id, "scope membership is unresolved");
                 report.survivors.push(id);
             }
+            _ => pending.push((id, scope, note)),
+        }
+    }
+    let scopes: Vec<_> = pending
+        .iter()
+        .filter_map(|(_, scope, _)| scope.as_ref())
+        .collect();
+    report.escalated = !scopes.is_empty();
+    // Dispatch the entire escalation before waiting on any one group.
+    let dispatch = escalate_scopes(&scopes, &shutdown);
+    for (id, scope, note) in pending {
+        let Some(scope) = scope else {
+            let exit = still_running(registry, &id, note.as_deref());
+            tracing::warn!(?exit, execution = %id, "execution exit is unverified");
+            report.survivors.push(id);
+            continue;
+        };
+        let end = await_escalation(&scope, &shutdown);
+        if end.emptied && record_exit(registry, &id, now_ms).is_ok() {
+            report.stopped.push(id);
+        } else {
+            tracing::warn!(failure = ?end.failure, dispatch = ?dispatch, execution = %id, "escalation exit is unverified");
+            report.survivors.push(id);
         }
     }
     report

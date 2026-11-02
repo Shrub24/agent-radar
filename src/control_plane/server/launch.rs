@@ -141,13 +141,15 @@ pub(super) fn preflight_recipe(
             ));
         }
     };
+    let launch = shell_launch(recipe, recipe_request(recipe, pane_id.to_string()))
+        .map_err(|reason| Refusal::new(Code::BadParams, reason))?;
     preflight_command(
         core,
         pane_id,
-        &recipe.executable,
-        &recipe.argv,
-        recipe.cwd.as_deref(),
-        &recipe.env,
+        &launch.executable,
+        &launch.argv,
+        launch.cwd.as_deref(),
+        &launch.env,
     )
 }
 
@@ -420,6 +422,7 @@ pub(super) fn spawn_child(
     }
     // A backend that tracks its launches gets the subject before any effect, so
     // the launch's correlation is recorded before the launch can run it.
+    let attach = lineage.prepared.is_none();
     let tracking = if let Some(prepared) = lineage.prepared {
         Some(prepared)
     } else if backend
@@ -448,6 +451,18 @@ pub(super) fn spawn_child(
     } else {
         None
     };
+    if attach && let Some((_, ticket)) = &tracking {
+        let attached = locked(core).registry.attach_subject(
+            &request.id,
+            &ticket.claim_id,
+            &ticket.registration_id,
+        );
+        if let Err(message) = attached {
+            let settled = record.complete(Settlement::backend_refused(&message), store::now_ms());
+            let _ = write_settled(settled, core);
+            return Err(Refusal::new(Code::Internal, message));
+        }
+    }
     // The pane is a split of the parent's own pane, unfocused: a child is
     // created where its parent is, and creating one must not move the operator's
     // cursor.
@@ -551,7 +566,20 @@ pub(super) fn spawn_child(
                 env: params.env.clone(),
             };
             let launch = match &tracking {
-                Some((bootstrap, ticket)) => subjects::wrap(bootstrap, ticket, target).ok()?,
+                Some((bootstrap, ticket)) => {
+                    let placement = subjects::Placement {
+                        location: edge.location.clone()?,
+                        instance: edge.instance.clone(),
+                    };
+                    subjects::place(
+                        &locked(core).registry,
+                        &ticket.registration_id,
+                        placement,
+                        store::now_ms(),
+                    )
+                    .ok()?;
+                    subjects::wrap(bootstrap, ticket, target).ok()?
+                }
                 None => target,
             };
             Some(backend.launch(&launch, &cancel))
@@ -649,6 +677,103 @@ pub(super) fn spawn_child(
     write_settled_with(done, core, |answer| answer.with_spawn(edge.public(exit)))
 }
 
+pub(super) fn prepare_recipe(
+    core: &Arc<Mutex<Core>>,
+    request_id: &str,
+    recipe: &containers::Recipe,
+) -> Result<Option<(Bootstrap, subjects::Ticket)>, String> {
+    if !matches!(recipe, containers::Recipe::Managed { .. }) {
+        return Ok(None);
+    }
+    if !locked(core).backend.as_ref().is_some_and(|backend| {
+        backend
+            .primitives()
+            .contains(Primitives::LIFECYCLE_TRACKING)
+    }) {
+        return Err("managed recipes require lifecycle tracking".into());
+    }
+    track_launch(
+        core,
+        request_id,
+        recipe.command().clone(),
+        None,
+        None,
+        subjects::ManagedMetadata::default(),
+        store::now_ms(),
+    )
+    .map(Some)
+}
+
+pub(super) fn release_recipe(
+    core: &Arc<Mutex<Core>>,
+    backend: &Arc<dyn RuntimeProvider>,
+    recipe: &containers::Recipe,
+    placement: subjects::Placement,
+    tracking: Option<&(Bootstrap, subjects::Ticket)>,
+    cancel: &AtomicBool,
+) -> LaunchOutcome {
+    let Some(pane) = placement.location.pane.clone() else {
+        return LaunchOutcome::Refused("recipe has no pane".into());
+    };
+    let target = recipe_request(recipe, pane);
+    let target = match tracking {
+        Some((bootstrap, ticket)) => {
+            if let Err(error) = subjects::place(
+                &locked(core).registry,
+                &ticket.registration_id,
+                placement,
+                store::now_ms(),
+            ) {
+                return LaunchOutcome::Refused(error);
+            }
+            match subjects::wrap(bootstrap, ticket, target) {
+                Ok(target) => target,
+                Err(error) => return LaunchOutcome::Refused(error),
+            }
+        }
+        None => target,
+    };
+    match shell_launch(recipe, target) {
+        Ok(target) => backend.launch(&target, cancel),
+        Err(reason) => LaunchOutcome::Refused(reason),
+    }
+}
+
+fn recipe_request(recipe: &containers::Recipe, pane_id: String) -> LaunchRequest {
+    let command = recipe.command();
+    LaunchRequest {
+        pane_id,
+        executable: command.executable.clone(),
+        argv: command.argv.clone(),
+        spawn_token: None,
+        cwd: command.cwd.clone(),
+        env: command.env.clone(),
+    }
+}
+
+fn shell_launch(
+    recipe: &containers::Recipe,
+    mut target: LaunchRequest,
+) -> Result<LaunchRequest, String> {
+    if let containers::Recipe::Managed { shell, .. } = recipe {
+        let command: Vec<_> = std::iter::once(target.executable.clone())
+            .chain(target.argv.iter().cloned())
+            .collect();
+        let shell = crate::topology::target_shell_recipe(
+            &command,
+            shell,
+            None,
+            target
+                .cwd
+                .as_deref()
+                .ok_or("a managed recipe requires a directory")?,
+        )?;
+        target.executable = shell.command().executable.clone();
+        target.argv = shell.command().argv.clone();
+    }
+    Ok(target)
+}
+
 /// The launch chain a tracked launch starts: this binary, serving `socket`. `None`
 /// when either path is not text the launch argv can carry.
 pub(super) fn bootstrap_for(socket: &Path) -> Option<Bootstrap> {
@@ -678,7 +803,6 @@ pub(super) fn track_launch(
     let ticket = subjects::create_with_intent(
         &registry, request_id, launch, session, identity, managed, now,
     )?;
-    registry.attach_subject(request_id, &ticket.claim_id, &ticket.registration_id)?;
     Ok((bootstrap, ticket))
 }
 
@@ -753,18 +877,18 @@ pub(super) fn claim_request(
         Ok(_) => return not_awaiting(),
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    let edge = match registry.spawn_edge(&subject.process.spawn_request_id) {
-        Ok(Some(edge)) => edge,
-        Ok(None) => return not_awaiting(),
-        Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
-    };
-    let Some(pane) = edge
-        .location
-        .as_ref()
-        .and_then(|location| location.pane.clone())
-    else {
+    let Some(placement) = subject.process.placement.clone() else {
         return not_awaiting();
     };
+    let Some(pane) = placement.location.pane.clone() else {
+        return not_awaiting();
+    };
+    if serving_identity(&backend, &verifier, &stopping, verification).as_ref()
+        != placement.instance.as_ref()
+        || placement.instance.is_none()
+    {
+        return not_awaiting();
+    }
     if let Err(refusal) = verify_live_occupant(
         &backend,
         &verifier,
@@ -811,7 +935,8 @@ pub(super) fn claim_request(
     // The wake is installed before the launch is captured, so the program's exit
     // is noticed from the moment it can run. A launch whose wake cannot be
     // installed is never released.
-    if let Err(message) = install_exit_wake(core, &backend, &params.claim_id, &edge, &stopping) {
+    if let Err(message) = install_exit_wake(core, &backend, &params.claim_id, &placement, &stopping)
+    {
         return Response::refused(
             &request.id,
             &Refusal::new(Code::BackendUnavailable, message),
@@ -825,21 +950,7 @@ pub(super) fn claim_request(
         &effective,
         params.completion_key,
         store::now_ms(),
-    )
-    .and_then(|()| {
-        // The pane this launch runs in is the edge's, and so is the instance that
-        // created it: neither is re-derived from what the launching process says.
-        let location = edge.location.clone().ok_or("the launch recorded no pane")?;
-        subjects::place(
-            &registry,
-            &subject.process.registration_id,
-            subjects::Placement {
-                location,
-                instance: edge.instance.clone(),
-            },
-            store::now_ms(),
-        )
-    }) {
+    ) {
         Ok(()) => respond(
             &request.id,
             Ok(Claimed {
@@ -1103,14 +1214,14 @@ pub(super) fn install_exit_wake(
     core: &Arc<Mutex<Core>>,
     backend: &Arc<dyn RuntimeProvider>,
     subject_id: &str,
-    edge: &registry::SpawnEdge,
+    placement: &subjects::Placement,
     stopping: &AtomicBool,
 ) -> Result<(), String> {
     let bootstrap = locked(core)
         .bootstrap
         .clone()
         .ok_or("this daemon has no executable path a tracked launch can run through")?;
-    let instance = edge
+    let instance = placement
         .instance
         .as_ref()
         .ok_or("the launch's server generation is unrecorded, so its exit cannot be notified")?;

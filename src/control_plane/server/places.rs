@@ -69,7 +69,11 @@ pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Reply
 /// frozen-identity match, positive-unmanaged containment — and never a second
 /// implementation of it. A location its owner manages is refused here; there is
 /// no generic close route may signal it; managed close uses subject cancellation followed by spawn.close.
-pub(super) fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Reply {
+pub(super) fn execute_close(
+    request: &Request,
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+) -> Reply {
     let allowed: &[&str] = &["request", "requester"];
     if request
         .params
@@ -94,7 +98,7 @@ pub(super) fn execute_close(request: &Request, core: &Arc<Mutex<Core>>) -> Reply
         }
     };
     let requester = request.optional_string("requester")?;
-    run_close(request, close_request, requester, core)
+    run_close(request, close_request, requester, core, verification)
 }
 
 pub(super) fn run_close(
@@ -102,6 +106,7 @@ pub(super) fn run_close(
     close_request: CloseRequest,
     requester: Option<String>,
     core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
 ) -> Reply {
     let target = close_request.target.id().to_string();
     if !valid_identifier(&target) {
@@ -122,30 +127,62 @@ pub(super) fn run_close(
     };
     let record = RequestRecord::new(&request.id, method, requester, Some(target), now)
         .with_params(request.params.clone());
-    // A backend confirmation says the close was performed, not that the location
-    // is gone: nothing here re-reads the post-state, so the record says so.
-    let registrations = || locked(core).registry.public_registrations();
-    let done = match lifecycle::close_unmanaged(
-        backend.as_ref(),
-        &close_request,
+    let inventory = match bounded_inventory(
+        &backend,
         &cancel,
-        registrations,
+        verification,
+        Instant::now() + VERIFICATION_TIMEOUT,
     ) {
-        DirectClose::Completed => record.complete(
-            Settlement::new(
-                RequestOutcome::Completed,
-                None,
-                Some("the runtime confirmed the close; its removal was not re-observed"),
-                vec!["close".into()],
+        Ok(inventory) => inventory,
+        Err(()) => {
+            return write_settled(
+                record.complete(
+                    Settlement::backend_refused("fresh inventory is unavailable"),
+                    store::now_ms(),
+                ),
+                core,
+            );
+        }
+    };
+    // The backend inventory carries no registry joins, so an occupant cannot be
+    // compared here; a named execution is fenced by its recorded claim and
+    // placement below instead.
+    let mut expected = close_request.identity.clone();
+    if let (Some(_), lifecycle::TargetIdentity::Pane(pane)) =
+        (&close_request.execution, &mut expected)
+    {
+        pane.occupant = None;
+    }
+    if !lifecycle::matches(&inventory, &expected) {
+        return write_settled(
+            record.complete(
+                Settlement::backend_refused("the selected place changed: nothing was closed"),
+                store::now_ms(),
             ),
-            store::now_ms(),
-        ),
-        DirectClose::Refused(message) => {
-            record.complete(Settlement::backend_refused(&message), store::now_ms())
+            core,
+        );
+    }
+    if let Some(expected) = &close_request.execution {
+        let registry = Arc::clone(&locked(core).registry);
+        let valid = subjects::read_subject_record(&registry, &expected.subject_id)
+            .ok().flatten().is_some_and(|subject| {
+                subject.current_claim.as_deref().or(subject.last_claim.as_deref()) == Some(expected.claim_id.as_str())
+            }) && subjects::read(&registry, &expected.claim_id).ok().flatten().is_some_and(|claim| {
+                claim.subject_id == expected.subject_id && claim.process.placement.as_ref().is_some_and(|placement| {
+                    matches!(&close_request.target, crate::CloseTarget::Pane(pane) if placement.location.pane.as_deref() == Some(pane.as_str()))
+                })
+            });
+        if !valid {
+            return write_refused(
+                record,
+                "the selected execution changed: nothing was closed",
+                core,
+            );
         }
-        DirectClose::Unknown(message) => {
-            record.complete(Settlement::backend_unknown(&message), store::now_ms())
-        }
+    }
+    let done = match close_place(core, &backend, &close_request, &cancel, verification) {
+        Ok(closed) => record.complete(close_settlement(closed), store::now_ms()),
+        Err(reason) => record.complete(Settlement::backend_refused(reason), store::now_ms()),
     };
     write_settled(done, core)
 }
@@ -161,12 +198,16 @@ fn executions_inside(
     registry: &Registry,
     target: &crate::CloseTarget,
     instance: &crate::model::ProcessIdentity,
+    inventory: &FleetObservation,
 ) -> Vec<crate::control_plane::lifecycle::Placed> {
-    let inside = |location: &crate::control_plane::registry::RegistryLocation| match target {
-        crate::CloseTarget::Pane(pane) => location.pane.as_deref() == Some(pane.as_str()),
-        crate::CloseTarget::Tab(tab) => location.tab.as_deref() == Some(tab.as_str()),
-        crate::CloseTarget::Workspace(workspace) => {
-            location.workspace.as_deref() == Some(workspace.as_str())
+    let inside = |location: &crate::control_plane::registry::RegistryLocation| {
+        let Some(pane) = location.pane.as_deref().and_then(|id| inventory.pane(id)) else {
+            return false;
+        };
+        match target {
+            crate::CloseTarget::Pane(id) => pane.location.pane_id == *id,
+            crate::CloseTarget::Tab(id) => pane.location.tab_id == *id,
+            crate::CloseTarget::Workspace(id) => pane.location.workspace_id == *id,
         }
     };
     let mut placed: Vec<crate::control_plane::lifecycle::Placed> = Vec::new();
@@ -180,6 +221,142 @@ fn executions_inside(
         placed.push(execution);
     }
     placed
+}
+
+pub(super) fn close_place(
+    core: &Arc<Mutex<Core>>,
+    backend: &Arc<dyn RuntimeProvider>,
+    frozen: &CloseRequest,
+    cancel: &Arc<AtomicBool>,
+    verification: &Arc<VerificationBudget>,
+) -> Result<subjects::ClosedExecution, String> {
+    use subjects::{ClosedExecution, ExecutionEnd};
+    let (registry, verifier, closing) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            Arc::clone(&core.verifier),
+            Arc::clone(&core.closing),
+        )
+    };
+    let inventory = bounded_inventory(
+        backend,
+        cancel,
+        verification,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    )
+    .map_err(|()| "fresh inventory is unavailable".to_string())?;
+    let target = &frozen.target;
+    let instance = serving_identity(backend, &verifier, cancel, verification);
+    let panes: Vec<_> = inventory
+        .panes
+        .iter()
+        .filter(|pane| match target {
+            crate::CloseTarget::Pane(id) => pane.location.pane_id == *id,
+            crate::CloseTarget::Tab(id) => pane.location.tab_id == *id,
+            crate::CloseTarget::Workspace(id) => pane.location.workspace_id == *id,
+        })
+        .map(|pane| pane.location.pane_id.clone())
+        .collect();
+    let _held = closing.begin(std::iter::once(target_handle(target)).chain(panes));
+    let inside = instance
+        .as_ref()
+        .map(|instance| executions_inside(&registry, target, instance, &inventory))
+        .unwrap_or_default();
+    let keys: Vec<_> = inside
+        .iter()
+        .map(|placed| placed.registration_id.clone())
+        .collect();
+    let ended = subjects::cancel_many(&registry, &keys, verifier.as_ref(), store::now_ms());
+    subjects::await_completions(&registry, &keys);
+    let completion = if keys.len() == 1 {
+        subjects::read_process(&registry, &keys[0])?.and_then(|process| process.completion)
+    } else {
+        None
+    };
+    let execution = if keys.is_empty() {
+        ExecutionEnd::NotApplicable
+    } else if ended.survivors.is_empty() {
+        ExecutionEnd::Exited
+    } else {
+        ExecutionEnd::Unverified(format!(
+            "exit not verified for {}",
+            ended.survivors.join(", ")
+        ))
+    };
+    let resource = remove_place(
+        core,
+        backend,
+        frozen,
+        cancel,
+        verification,
+        instance.as_ref(),
+    );
+    Ok(ClosedExecution {
+        execution,
+        resource: Some(resource),
+        completion,
+        escalated: ended.escalated,
+    })
+}
+
+pub(super) fn remove_place(
+    core: &Arc<Mutex<Core>>,
+    backend: &Arc<dyn RuntimeProvider>,
+    frozen: &CloseRequest,
+    cancel: &Arc<AtomicBool>,
+    verification: &Arc<VerificationBudget>,
+    instance: Option<&crate::model::ProcessIdentity>,
+) -> subjects::ResourceEnd {
+    use subjects::ResourceEnd;
+    let verifier = Arc::clone(&locked(core).verifier);
+    if instance.is_some()
+        && serving_identity(backend, &verifier, cancel, verification).as_ref() != instance
+    {
+        return ResourceEnd::Kept("the serving generation changed during shutdown".into());
+    }
+    let inventory = match bounded_inventory(
+        backend,
+        cancel,
+        verification,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(inventory) => inventory,
+        Err(()) => return ResourceEnd::Kept("fresh inventory is unavailable".into()),
+    };
+    let present = match &frozen.target {
+        crate::CloseTarget::Pane(id) => inventory.pane(id).is_some(),
+        crate::CloseTarget::Tab(id) => inventory.tabs.iter().any(|tab| tab.tab_id == *id),
+        crate::CloseTarget::Workspace(id) => inventory
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.workspace_id == *id),
+    };
+    if !present {
+        return ResourceEnd::Absent;
+    }
+    match bounded_close_dispatch(
+        backend,
+        &frozen.target,
+        cancel,
+        verification,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(crate::runtime::CloseOutcome::Completed) => ResourceEnd::Removed,
+        Ok(crate::runtime::CloseOutcome::Refused(reason)) => ResourceEnd::Kept(reason),
+        Ok(crate::runtime::CloseOutcome::Unknown(reason)) => ResourceEnd::Unverified(reason),
+        Err(()) => ResourceEnd::Unverified("the removal reply was lost".into()),
+    }
+}
+
+pub(super) fn close_settlement(closed: subjects::ClosedExecution) -> Settlement {
+    use subjects::ResourceEnd;
+    match &closed.resource {
+        Some(ResourceEnd::Kept(reason)) => Settlement::backend_refused(reason),
+        Some(ResourceEnd::Unverified(reason)) => Settlement::backend_unknown(reason),
+        _ => Settlement::completed(Vec::new()),
+    }
+    .closed(closed)
 }
 
 /// The handle a launch would name for this target.
@@ -432,6 +609,19 @@ pub(super) fn run_creation(
     // whatever a later server puts at the same handle.
     let verifier = Arc::clone(&locked(core).verifier);
     let incarnation = serving_identity(&backend, &verifier, &cancel, verification);
+    let tracking = match recipe
+        .as_ref()
+        .map(|recipe| launch::prepare_recipe(core, &request.id, recipe))
+        .transpose()
+    {
+        Ok(tracking) => tracking.flatten(),
+        Err(error) => {
+            return Ok(Creation {
+                record: record.complete(Settlement::backend_refused(error), store::now_ms()),
+                container: None,
+            });
+        }
+    };
     // Creation is confirmed, not re-observed: the runtime says it made the
     // location, nothing here lists to prove it exists.
     let done = match backend.create(&create, &cancel) {
@@ -500,16 +690,16 @@ pub(super) fn run_creation(
             // outside any spawn: the child carries no spawn token, and this launch
             // is what a later reload requires to be gone before running it again.
             let launched = match (held, created.pane_id.as_deref()) {
-                (true, Some(pane_id)) => recipe.as_ref().map(|recipe| {
-                    backend.launch(
-                        &LaunchRequest {
-                            pane_id: pane_id.to_string(),
-                            executable: recipe.executable.clone(),
-                            argv: recipe.argv.clone(),
-                            spawn_token: None,
-                            cwd: recipe.cwd.clone(),
-                            env: recipe.env.clone(),
+                (true, Some(_)) => recipe.as_ref().map(|recipe| {
+                    launch::release_recipe(
+                        core,
+                        &backend,
+                        recipe,
+                        subjects::Placement {
+                            location: created_location(&created, &backend_identity),
+                            instance: incarnation.clone(),
                         },
+                        tracking.as_ref(),
                         &cancel,
                     )
                 }),
@@ -800,54 +990,16 @@ pub(super) fn run_container_delete(
         );
         return write_deleted(settled, removed, core);
     }
-    // Every agent launched inside this place ends the way a single `D` on its own
-    // row ends it: fenced, SIGTERM, one shared window for the exit, and the exit
-    // recorded. The operator's confirmation named the agents it would end, so a
-    // survivor does not hold the close: the outcome says whose exit was never verified.
-    // Hold empty panes too: admission into a shell is still new work in the
-    // branch. Native topology changes remain best effort.
-    let panes: Vec<_> = match &frozen.identity {
-        lifecycle::TargetIdentity::Pane(pane) => vec![pane.pane_id.clone()],
-        lifecycle::TargetIdentity::Tab { members, .. }
-        | lifecycle::TargetIdentity::Workspace { members, .. } => {
-            members.iter().map(|pane| pane.pane_id.clone()).collect()
-        }
+    let closed = match close_place(core, &backend, &frozen, &cancel, verification) {
+        Ok(closed) => closed,
+        Err(reason) => return write_refused(record, &reason, core),
     };
-    let closing = Arc::clone(&locked(core).closing);
-    let _held = closing.begin(std::iter::once(target_handle(&frozen.target)).chain(panes));
-    let inside = executions_inside(&registry, &frozen.target, &recorded);
-    let _executions_held = closing.begin(
-        inside
-            .iter()
-            .filter_map(|execution| execution.placement.location.pane.clone()),
-    );
-    // A logical subject may already point at a successor. Stop the exact
-    // executions discovered in this branch, never re-resolve their subjects.
-    let keys: Vec<String> = inside
-        .iter()
-        .map(|execution| execution.registration_id.clone())
-        .collect();
-    let mut stopped = Vec::new();
-    // Agents left alive by the window. The place still closes, and the outcome
-    // says which exits were never verified.
-    let mut alive: Vec<String> = Vec::new();
-    if !keys.is_empty() {
-        let verifier = Arc::clone(&locked(core).verifier);
-        let cancelled = crate::control_plane::lifecycle::cancel_many(
-            &registry,
-            &keys,
-            verifier.as_ref(),
-            store::now_ms(),
-        );
-        stopped = cancelled.stopped;
-        alive = cancelled.survivors;
-        // The place is about to be removed, and with it every pane whose supervisor
-        // still holds a reported code. One window for the whole set, so a branch
-        // does not pay a grace per agent, and a report that never comes is a
-        // diagnostic rather than a block.
-        crate::control_plane::lifecycle::await_completions(&registry, &keys);
-    }
-    let settled = match lifecycle::close_for_deletion(backend.as_ref(), &frozen, &cancel) {
+    let removal = match &closed.resource {
+        Some(subjects::ResourceEnd::Kept(reason)) => DirectClose::Refused(reason.clone()),
+        Some(subjects::ResourceEnd::Unverified(reason)) => DirectClose::Unknown(reason.clone()),
+        _ => DirectClose::Completed,
+    };
+    let settled = match removal {
         DirectClose::Completed => {
             let now = store::now_ms();
             let at = store::format_millis(now);
@@ -862,12 +1014,9 @@ pub(super) fn run_container_delete(
             // The close is the runtime's confirmation that it removed the place,
             // not a re-observation of it, and the removals are the daemon's own
             // records: neither claims anything about a process.
-            let ended = match (stopped.len(), alive.len()) {
-                (0, 0) => String::new(),
-                (count, 0) => format!(" after {count} agent(s) exited"),
-                (count, alive) => format!(
-                    " after {count} agent(s) exited; {alive} agent(s) did not, and their exits are unverified"
-                ),
+            let ended = match &closed.execution {
+                subjects::ExecutionEnd::Unverified(reason) => format!("; {reason}"),
+                _ => String::new(),
             };
             let note = if failures.is_empty() {
                 format!(
@@ -888,17 +1037,20 @@ pub(super) fn run_container_delete(
                     None,
                     Some(&note),
                     vec!["close".into(), "container.removal".into()],
-                ),
+                )
+                .closed(closed.clone()),
                 now,
             );
             return write_deleted(settled, removed, core);
         }
-        DirectClose::Refused(message) => {
-            record.complete(Settlement::backend_refused(&message), store::now_ms())
-        }
-        DirectClose::Unknown(message) => {
-            record.complete(Settlement::backend_unknown(&message), store::now_ms())
-        }
+        DirectClose::Refused(message) => record.complete(
+            Settlement::backend_refused(&message).closed(closed),
+            store::now_ms(),
+        ),
+        DirectClose::Unknown(message) => record.complete(
+            Settlement::backend_unknown(&message).closed(closed),
+            store::now_ms(),
+        ),
     };
     write_deleted(settled, Vec::new(), core)
 }
@@ -1053,17 +1205,26 @@ pub(super) fn run_container_reload(
             );
         }
     }
-    let launched = backend.launch(
-        &LaunchRequest {
-            pane_id: pane.clone(),
-            executable: recipe.executable.clone(),
-            argv: recipe.argv.clone(),
-            // A container's own launch is not a spawn child: no token, and the
-            // variable is not put in its environment.
-            spawn_token: None,
-            cwd: recipe.cwd.clone(),
-            env: recipe.env.clone(),
+    let tracking = match launch::prepare_recipe(core, &request.id, &recipe) {
+        Ok(tracking) => tracking,
+        Err(reason) => return reload_refused(record, &reason, Some(container), core),
+    };
+    let location = registry::RegistryLocation {
+        backend: binding.backend.clone(),
+        instance: backend.identity().instance,
+        workspace: None,
+        tab: None,
+        pane: Some(pane.clone()),
+    };
+    let launched = launch::release_recipe(
+        core,
+        &backend,
+        &recipe,
+        subjects::Placement {
+            location,
+            instance: binding.incarnation.clone(),
         },
+        tracking.as_ref(),
         &cancel,
     );
     let settled = match launched {

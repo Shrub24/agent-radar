@@ -161,42 +161,50 @@ pub(super) fn execute_child_close(
         Err(error) => return registry_error(request, error),
     }
 
-    // A close removes the pane the execution's supervisor reports from, so the
-    // report is given its grace first: the same rule the launch cleanup follows,
-    // because the code is destroyed by the removal that follows it, not by which
-    // path asked for the removal.
-    subjects::await_completion(&registry, &registration.registration_id);
-    let result = match bounded_close_dispatch(
-        &backend,
-        pane_id,
-        &stopping,
-        budget,
-        Instant::now() + VERIFICATION_TIMEOUT,
-    ) {
-        Ok(crate::runtime::CloseOutcome::Completed) => match already_dead {
-            Some(exit) => CloseResult::AlreadyExited(exit),
-            None => CloseResult::Completed,
+    let target = crate::CloseTarget::Pane(pane_id.to_string());
+    let frozen = CloseRequest {
+        execution: None,
+        identity: lifecycle::identity(&inventory, &target),
+        target,
+    };
+    let closed = match places::close_place(core, &backend, &frozen, &stopping, budget) {
+        Ok(closed) => closed,
+        Err(reason) => subjects::ClosedExecution {
+            execution: subjects::ExecutionEnd::Unverified(reason.clone()),
+            resource: Some(subjects::ResourceEnd::Kept(reason)),
+            completion: None,
+            escalated: false,
         },
-        Ok(crate::runtime::CloseOutcome::Refused(message)) => CloseResult::Refused(message),
-        Ok(crate::runtime::CloseOutcome::Unknown(message)) => CloseResult::Unknown(Some(message)),
-        // The dispatch may have reached the backend and its answer was lost.
-        Err(()) => CloseResult::Unknown(None),
+    };
+    let result = match &closed.resource {
+        Some(subjects::ResourceEnd::Removed | subjects::ResourceEnd::Absent) => {
+            match already_dead {
+                Some(exit) => CloseResult::AlreadyExited(exit),
+                None => CloseResult::Completed,
+            }
+        }
+        Some(subjects::ResourceEnd::Kept(reason)) => CloseResult::Refused(reason.clone()),
+        Some(subjects::ResourceEnd::Unverified(reason)) => {
+            CloseResult::Unknown(Some(reason.clone()))
+        }
+        None => CloseResult::Unknown(Some("the close returned no resource outcome".into())),
     };
     // The outcome is durable before this call answers: the effect is claimed only
     // from what the backend said, and a dispatch that said nothing leaves the
     // record unknown for every later replay to read.
-    let recorded = match registry.record_child_close_outcome(&close.request_id, result) {
-        Ok(recorded) => recorded,
-        Err(error) => {
-            return Response::refused(
-                &request.id,
-                &Refusal::new(
-                    Code::Internal,
-                    format!("the child close outcome was not recorded: {error}"),
-                ),
-            );
-        }
-    };
+    let recorded =
+        match registry.record_child_close_outcome(&close.request_id, result, Some(closed)) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                return Response::refused(
+                    &request.id,
+                    &Refusal::new(
+                        Code::Internal,
+                        format!("the child close outcome was not recorded: {error}"),
+                    ),
+                );
+            }
+        };
     close_response(request, &recorded)
 }
 
@@ -314,6 +322,7 @@ pub(super) fn close_response(request: &Request, close: &registry::ChildClose) ->
             intent: close.intent,
             pane: close.location.pane.clone(),
             exit_observation,
+            closed: close.closed.clone(),
         },
     };
     respond(

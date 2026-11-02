@@ -1,6 +1,5 @@
-//! The shared navigation model: the projected fleet tree, its folds, the filter,
-//! the pane view, the background-task toggle and the selected row. Every
-//! presentation of the dashboard reads and changes these through here.
+//! Fleet navigation: the projected tree, shared folds and filters, and each
+//! frontend's local selection.
 //!
 //! Terminal geometry, details pages and process readings are not part of it.
 //! The frontend that shows them keeps them, and resets them when the selected

@@ -28,7 +28,7 @@ pub enum Action {
     Reload(ReloadRequest),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Subject {
     pub subject_id: String,
     pub claim_id: String,

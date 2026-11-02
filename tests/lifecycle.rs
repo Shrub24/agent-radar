@@ -167,7 +167,11 @@ fn request_with(
     identity: TargetIdentity,
 ) -> Result<String, String> {
     let mut closer = Closer::new(runtime);
-    closer.start(CloseRequest { target, identity });
+    closer.start(CloseRequest {
+        execution: None,
+        target,
+        identity,
+    });
     let deadline = Instant::now() + PATIENCE;
     loop {
         if let Some(outcome) = closer.poll() {
@@ -331,6 +335,7 @@ fn a_blocked_close_does_not_delay_shutdown() {
     let frozen = identity(&runtime.observation(), &target);
     let mut closer = Closer::new(runtime);
     closer.start(CloseRequest {
+        execution: None,
         target,
         identity: frozen,
     });

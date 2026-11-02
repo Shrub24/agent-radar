@@ -41,7 +41,7 @@ use super::{MAX_TEXT_BYTES, Registry, RegistryLocation, bounded_text, read_recor
 
 /// The record shape this build writes and reads. A record naming another version
 /// fails explicitly rather than being read as this one.
-pub const CHILD_CLOSE_VERSION: u32 = 1;
+pub const CHILD_CLOSE_VERSION: u32 = 2;
 
 /// The largest close request this daemon reads or writes, so a planted file
 /// cannot be read into memory whole.
@@ -126,6 +126,8 @@ pub struct ChildClose {
     /// What the close did. `Unknown` until a dispatch answers: a recorded
     /// request claims no effect, and a lost answer leaves it here.
     pub outcome: CloseOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<crate::control_plane::lifecycle::ClosedExecution>,
     /// The exit observation of the already-dead pane this close cleaned up,
     /// copied from the claim's recorded completion so a replay answers without
     /// re-reading state that may since have moved. Only an `already_exited`
@@ -255,6 +257,7 @@ pub fn record(
         location,
         intent: request.intent,
         outcome: CloseOutcome::Unknown,
+        closed: None,
         exit: None,
         message: None,
         recorded_at: format_millis(now_ms),
@@ -280,6 +283,7 @@ pub fn record_outcome(
     registry: &Registry,
     request_id: &str,
     result: CloseResult,
+    closed: Option<crate::control_plane::lifecycle::ClosedExecution>,
 ) -> Result<ChildClose, String> {
     canonical_uuid("request_id", request_id)?;
     let _transition = registry.transition();
@@ -293,10 +297,15 @@ pub fn record_outcome(
         CloseResult::Unknown(message) => (CloseOutcome::Unknown, None, message),
     };
     let storable = storable_message(message.as_deref());
-    if stored.outcome == outcome && stored.message == storable && stored.exit == exit {
+    if stored.outcome == outcome
+        && stored.message == storable
+        && stored.exit == exit
+        && stored.closed == closed
+    {
         return Ok(stored);
     }
     let close = ChildClose {
+        closed,
         outcome,
         exit,
         message: storable,

@@ -5,7 +5,90 @@ use crate::{
     model::{ProcessIdentity, SessionUuid},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, ffi::OsStr, fs, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    ffi::OsStr,
+    fs,
+    io::{ErrorKind, Read},
+    path::Path,
+    process::{Command, Output, Stdio},
+    time::{Duration, Instant},
+};
+
+// Nonblocking pipes keep both command time and output bounded, including when
+// a manager helper leaves a descendant holding its output open.
+fn manager(command: &mut Command, deadline: Instant) -> Result<Output, String> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use std::os::unix::process::CommandExt;
+    if Instant::now() >= deadline {
+        return Err("scope command deadline expired".into());
+    }
+    let mut child = command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("systemd user manager unavailable: {error}"))?;
+    let result = (|| {
+        let mut stdout = child.stdout.take().ok_or("scope stdout is unavailable")?;
+        let mut stderr = child.stderr.take().ok_or("scope stderr is unavailable")?;
+        for fd in [
+            &stdout as &dyn std::os::fd::AsFd,
+            &stderr as &dyn std::os::fd::AsFd,
+        ] {
+            fcntl_setfl(
+                fd,
+                fcntl_getfl(fd).map_err(|e| e.to_string())? | OFlags::NONBLOCK,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        loop {
+            drain_manager(&mut stdout, &mut out)?;
+            drain_manager(&mut stderr, &mut err)?;
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                drain_manager(&mut stdout, &mut out)?;
+                drain_manager(&mut stderr, &mut err)?;
+                return Ok(Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err("scope command timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_err()
+        && let Some(group) = rustix::process::Pid::from_raw(child.id() as i32)
+    {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    let _ = child.wait();
+    result
+}
+
+fn drain_manager(pipe: &mut impl Read, output: &mut Vec<u8>) -> Result<(), String> {
+    let mut bytes = [0; 4096];
+    loop {
+        match pipe.read(&mut bytes) {
+            Ok(0) => return Ok(()),
+            Ok(count) => {
+                if output.len() + count > 64 * 1024 {
+                    return Err("scope command output is oversized".into());
+                }
+                output.extend_from_slice(&bytes[..count]);
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,19 +149,23 @@ impl Scope {
 
     /// A name alone never establishes an association with a running process.
     pub fn verify_unit(&self, id: &str) -> Result<VerifiedScope, String> {
+        self.verify_unit_until(id, Instant::now() + Duration::from_millis(500))
+    }
+
+    pub fn verify_unit_until(&self, id: &str, deadline: Instant) -> Result<VerifiedScope, String> {
         if self != &Self::for_registration(id)? {
             return Err("scope does not identify its registration".into());
         }
-        let out = Command::new(crate::service::program("RADAR_SYSTEMCTL", "systemctl"))
-            .args([
+        let out = manager(
+            Command::new(crate::service::program("RADAR_SYSTEMCTL", "systemctl")).args([
                 "--user",
                 "show",
                 &self.unit,
                 "--property=ControlGroup",
                 "--value",
-            ])
-            .output()
-            .map_err(|e| format!("systemd user manager unavailable: {e}"))?;
+            ]),
+            deadline.min(Instant::now() + Duration::from_millis(500)),
+        )?;
         if !out.status.success() {
             return Err("managed scope unavailable; restart under radar run".into());
         }
@@ -105,7 +192,22 @@ impl Scope {
         process: &ProcessIdentity,
         verifier: &dyn ProcessVerifier,
     ) -> Result<VerifiedScope, String> {
-        let verified = self.verify_unit(id)?;
+        self.verify_until(
+            id,
+            process,
+            verifier,
+            Instant::now() + Duration::from_millis(500),
+        )
+    }
+
+    pub fn verify_until(
+        &self,
+        id: &str,
+        process: &ProcessIdentity,
+        verifier: &dyn ProcessVerifier,
+        deadline: Instant,
+    ) -> Result<VerifiedScope, String> {
+        let verified = self.verify_unit_until(id, deadline)?;
         let path = &verified.path;
         if verifier.inspect(process.pid)?.as_ref() != Some(process) {
             return Err("scope member birth identity changed".into());
@@ -165,11 +267,19 @@ pub fn stop(scopes: &[&VerifiedScope]) -> Result<(), String> {
     if scopes.is_empty() {
         return Ok(());
     }
-    let out = Command::new(crate::service::program("RADAR_SYSTEMCTL", "systemctl"))
-        .args(["--user", "stop"])
-        .args(scopes.iter().map(|s| &s.unit))
-        .output()
-        .map_err(|e| format!("scope stop: {e}"))?;
+    stop_until(scopes, Instant::now() + Duration::from_millis(500))
+}
+
+pub fn stop_until(scopes: &[&VerifiedScope], deadline: Instant) -> Result<(), String> {
+    if scopes.is_empty() {
+        return Ok(());
+    }
+    let out = manager(
+        Command::new(crate::service::program("RADAR_SYSTEMCTL", "systemctl"))
+            .args(["--user", "--no-block", "stop"])
+            .args(scopes.iter().map(|s| &s.unit)),
+        deadline,
+    )?;
     if out.status.success() {
         Ok(())
     } else {
@@ -189,11 +299,19 @@ pub fn kill(scopes: &[&VerifiedScope]) -> Result<(), String> {
     if scopes.is_empty() {
         return Ok(());
     }
-    let out = Command::new(crate::service::program("RADAR_SYSTEMCTL", "systemctl"))
-        .args(["--user", "kill", "--signal=KILL"])
-        .args(scopes.iter().map(|s| &s.unit))
-        .output()
-        .map_err(|e| format!("scope kill: {e}"))?;
+    kill_until(scopes, Instant::now() + Duration::from_millis(500))
+}
+
+pub fn kill_until(scopes: &[&VerifiedScope], deadline: Instant) -> Result<(), String> {
+    if scopes.is_empty() {
+        return Ok(());
+    }
+    let out = manager(
+        Command::new(crate::service::program("RADAR_SYSTEMCTL", "systemctl"))
+            .args(["--user", "kill", "--signal=KILL"])
+            .args(scopes.iter().map(|s| &s.unit)),
+        deadline,
+    )?;
     if out.status.success() {
         Ok(())
     } else {
@@ -223,7 +341,12 @@ impl VerifiedScope {
                 }
                 pids.insert(pid);
             }
-            for entry in fs::read_dir(&path).map_err(|e| e.to_string())? {
+            let entries = match fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            for entry in entries {
                 let entry = entry.map_err(|e| e.to_string())?;
                 if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
                     pending.push(entry.path());
@@ -394,6 +517,24 @@ fn transact(systemctl: &OsStr, verb: &str, units: &[String]) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manager_commands_bound_runtime_and_output() {
+        let start = Instant::now();
+        let error = manager(
+            Command::new("sh").args(["-c", "exec sleep 30"]),
+            start + Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let error = manager(
+            Command::new("sh").args(["-c", "while :; do printf 'manager-output\\n'; done"]),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(error.contains("output is oversized"), "{error}");
+    }
 
     #[test]
     fn only_a_slice_with_nothing_left_in_it_is_stopped() {

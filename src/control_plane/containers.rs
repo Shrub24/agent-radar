@@ -575,7 +575,23 @@ impl Inventory {
 }
 
 /// The command a container's pane runs, held privately and never reported.
-pub type Recipe = crate::control_plane::lifecycle::LaunchContext;
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Recipe {
+    Plain(crate::control_plane::lifecycle::LaunchContext),
+    Managed {
+        command: crate::control_plane::lifecycle::LaunchContext,
+        shell: String,
+    },
+}
+
+impl Recipe {
+    pub fn command(&self) -> &crate::control_plane::lifecycle::LaunchContext {
+        match self {
+            Self::Plain(command) | Self::Managed { command, .. } => command,
+        }
+    }
+}
 
 /// The most one private recipe may occupy, as the private store's own bound.
 const MAX_RECIPE_BYTES: usize = 8 * 1024;
@@ -610,13 +626,13 @@ pub fn read_recipe(registry: &Registry, id: &str) -> Result<Option<Recipe>, Stri
     let path = recipe_path(registry, id);
     match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("container recipe {id}: {error}")),
+        Err(error) => return Err(format!("container recipe {}: {error}", path.display())),
         Ok(_) => {}
     }
     let bytes = crate::control_plane::registry::read_record_file(&path, MAX_RECIPE_BYTES)?;
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|error| format!("not a container recipe: {error}"))
+        .map_err(|error| format!("container recipe {}: {error}", path.display()))
 }
 
 /// A container and everything recorded inside it, in id order.

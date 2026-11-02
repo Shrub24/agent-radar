@@ -369,20 +369,20 @@ pub(super) fn serving_identity(
 
 pub(super) fn bounded_close_dispatch(
     backend: &Arc<dyn RuntimeProvider>,
-    pane_id: &str,
+    target: &crate::CloseTarget,
     stopping: &Arc<AtomicBool>,
     budget: &Arc<VerificationBudget>,
     deadline: Instant,
 ) -> Result<crate::runtime::CloseOutcome, ()> {
     let backend = Arc::clone(backend);
-    let pane_id = pane_id.to_string();
+    let target = target.clone();
     let cancel = Arc::clone(stopping);
     run_bounded(
         budget,
         stopping,
         deadline,
         "radar-child-close-dispatch",
-        move || backend.close_outcome(&crate::runtime::CloseTarget::Pane(pane_id), &cancel),
+        move || backend.close_outcome(&target, &cancel),
     )
 }
 
@@ -436,147 +436,84 @@ pub(super) fn bounded_foreground(
 /// refusal and an unanswered dispatch are each durable facts of the launch. An
 /// eligibility refusal dispatches nothing, so it records nothing and a later
 /// admitted cancel re-decides it against the evidence it finds.
+pub(super) enum CleanupIntent {
+    Close,
+    Retire,
+}
+
 pub(super) fn cleanup_launch_pane(
-    registry: &Arc<Registry>,
+    core: &Arc<Mutex<Core>>,
     backend: &Arc<dyn RuntimeProvider>,
-    verifier: &Arc<dyn ProcessVerifier>,
-    subject_id: &str,
+    key: &str,
+    intent: CleanupIntent,
     stopping: &Arc<AtomicBool>,
     budget: &Arc<VerificationBudget>,
     now_ms: i64,
 ) -> Option<subjects::PaneCleanup> {
-    use subjects::PaneCleanup;
-
-    let Ok(Some(subject)) = subjects::read(registry, subject_id) else {
-        return Some(PaneCleanup::Refused(
-            "the tracked launch is unavailable".into(),
-        ));
+    use subjects::{PaneCleanup, ResourceEnd};
+    let (registry, verifier) = {
+        let core = locked(core);
+        (Arc::clone(&core.registry), Arc::clone(&core.verifier))
     };
-    // The first outcome is the one that stands, so a second cancel reports it
-    // rather than closing anything again.
-    if let Some(recorded) = subject.process.pane_cleanup.clone() {
-        return Some(recorded);
+    let claim = subjects::read(&registry, key).ok()??;
+    if let Some(cleanup) = claim.process.pane_cleanup {
+        return Some(cleanup);
     }
-    // A bound launch's pane belongs to its registered child while that child is
-    // alive, so a cancel has nothing to say about it. Once the child is
-    // verifiably gone the pane is a dead shell this daemon made permanent by
-    // arming remain-on-exit on it, so removing it is the daemon's own cleanup.
-    // A launch that is neither bound nor revoked has no pane of its own at all.
-    if !matches!(
-        subject.process.state,
-        subjects::State::Bound | subjects::State::Revoked
-    ) {
-        return Some(PaneCleanup::Refused(
-            "the launch is not a bound or revoked one, so its pane is not this cleanup's to remove"
-                .into(),
-        ));
-    }
-    // A subject with no spawn edge never had a pane of this daemon's: an
-    // enrolled lead's pane belongs to the operator who enrolled it.
-    let Ok(Some(edge)) = registry.spawn_edge(&subject.process.spawn_request_id) else {
+    if matches!(intent, CleanupIntent::Retire) && claim.process.origin != subjects::Origin::Spawned
+    {
         return None;
-    };
-    let Some(location) = edge.location.as_ref() else {
-        return Some(PaneCleanup::Refused("the launch records no pane".into()));
-    };
-    let Some(pane) = location.pane.clone() else {
-        return Some(PaneCleanup::Refused("the launch records no pane".into()));
-    };
-    let identity = backend.identity();
-    if location.backend != identity.name || location.instance != identity.instance {
+    }
+    let placement = claim.process.placement?;
+    let pane = placement.location.pane?;
+    let instance = placement.instance?;
+    if serving_identity(backend, &verifier, stopping, budget).as_ref() != Some(&instance) {
         return Some(PaneCleanup::Refused(
-            "the recorded pane belongs to a different backend instance".into(),
+            "the execution's serving generation is no longer current".into(),
         ));
     }
-    // A pane id outlives the server that answered the create, so the pane is only
-    // this launch's while the very process that served the create still serves.
-    let Some(created_in) = edge.instance.clone() else {
-        return Some(PaneCleanup::Refused(
-            "the launch records no verified backend instance for its pane".into(),
-        ));
-    };
-    match serving_identity(backend, verifier, stopping, budget) {
-        Some(serving) if serving == created_in => {}
-        _ => {
+    subjects::await_completion(&registry, key);
+    let inventory = match bounded_inventory(
+        backend,
+        stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    ) {
+        Ok(inventory) => inventory,
+        Err(()) => {
             return Some(PaneCleanup::Refused(
-                "the backend instance serving now is not the one that created the recorded pane"
-                    .into(),
+                "fresh inventory is unavailable".into(),
             ));
         }
-    }
-    if !backend.primitives().contains(Primitives::EXIT_OBSERVATION) {
-        return Some(PaneCleanup::Refused(
-            "this backend cannot report whether the pane's command has exited".into(),
-        ));
-    }
-    let pane_dead = matches!(
-        bounded_exit_observation(backend, &pane, stopping, budget),
-        Ok(PaneExitObservation::Exited { .. })
-    );
-    // A bound child's pane can be handed to another process once that child is
-    // gone, so only the backend's own report that this very pane is dead makes
-    // it a dead shell to remove. A revoked launch never had a child, so a
-    // verified exit is enough.
-    let exited = if subject.process.state == subjects::State::Bound {
-        pane_dead
+    };
+    let target = crate::CloseTarget::Pane(pane.clone());
+    let frozen = CloseRequest {
+        execution: None,
+        identity: lifecycle::identity(&inventory, &target),
+        target,
+    };
+    let resource = if matches!(intent, CleanupIntent::Retire)
+        && inventory.pane(&pane).is_some()
+        && !matches!(
+            bounded_exit_observation(backend, &pane, stopping, budget),
+            Ok(PaneExitObservation::Exited { .. })
+        ) {
+        ResourceEnd::Kept("the dedicated pane no longer reports an exited command".into())
     } else {
-        subject.process.identity.is_none() || subject.process.exited_at.is_some() || pane_dead
+        places::remove_place(core, backend, &frozen, stopping, budget, Some(&instance))
     };
-    if !exited {
-        return Some(PaneCleanup::Refused(
-            "the launch's process is not verified gone; closing its pane would end it unclaimed"
-                .into(),
-        ));
-    }
-    // How the program ended is the supervisor's report, and the supervisor lives
-    // in the pane this is about to remove. Give a report that is still on its way
-    // the rest of its grace, so a code is not destroyed by the cleanup that
-    // follows it. A launch with nothing to report waits for nothing.
-    if subject.process.identity.is_some() && subject.process.completion.is_none() {
-        subjects::await_completion(registry, subject_id);
-    }
-    // A pane that is already gone needs no removal: the fact is the answer, and
-    // dispatching a close for it would report the backend's "can't find pane" as
-    // an uncertain cleanup of something that plainly is not there.
-    let present = match bounded_inventory(
-        backend,
-        stopping,
-        budget,
-        Instant::now() + VERIFICATION_TIMEOUT,
-    ) {
-        Ok(inventory) => inventory.pane(&pane).is_some(),
-        Err(()) => true,
+    let outcome = match resource {
+        ResourceEnd::Removed => PaneCleanup::Cleaned,
+        ResourceEnd::Absent => PaneCleanup::Absent,
+        ResourceEnd::Kept(reason) => PaneCleanup::Refused(reason),
+        ResourceEnd::Unverified(reason) => PaneCleanup::Unknown(reason),
     };
-    if !present {
-        let outcome = PaneCleanup::Absent;
-        return Some(
-            match subjects::record_pane_cleanup(registry, subject_id, outcome, now_ms) {
-                Ok(recorded) => recorded,
-                Err(error) => PaneCleanup::Unknown(format!(
-                    "the cleanup outcome could not be recorded: {error}"
-                )),
-            },
-        );
-    }
-    let outcome = match bounded_close_dispatch(
-        backend,
-        &pane,
-        stopping,
-        budget,
-        Instant::now() + VERIFICATION_TIMEOUT,
-    ) {
-        Ok(outcome) => PaneCleanup::from(outcome),
-        // The dispatch may have reached the backend and its answer was lost.
-        Err(()) => PaneCleanup::Unknown("the cleanup did not finish inside its deadline".into()),
-    };
-    match subjects::record_pane_cleanup(registry, subject_id, outcome, now_ms) {
-        Ok(recorded) => Some(recorded),
-        // An unrecorded outcome is never claimed as a cleanup: a replay must not
-        // read "cleaned" for a close nothing committed.
-        Err(error) => Some(PaneCleanup::Unknown(format!(
-            "the cleanup outcome could not be recorded: {error}"
-        ))),
-    }
+    Some(
+        subjects::record_pane_cleanup(&registry, key, outcome, now_ms).unwrap_or_else(|error| {
+            PaneCleanup::Unknown(format!(
+                "the cleanup outcome could not be recorded: {error}"
+            ))
+        }),
+    )
 }
 
 /// Reads one pane's exit state now, bounded and cancellable like every other

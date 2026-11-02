@@ -147,10 +147,10 @@ pub(super) fn withdraw_unpresented(
         };
         Ok(matches!(
             cleanup_launch_pane(
-                &registry,
+                core,
                 backend,
-                &verifier,
                 claim_id,
+                CleanupIntent::Retire,
                 &stopping,
                 verification,
                 now_ms,

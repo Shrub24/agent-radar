@@ -168,7 +168,10 @@ pub(super) fn presence_request(
         claim.subject_id = Some(subject_id);
         claim.standing = Standing::Granted;
         presence::save(&registry, &claim)?;
-        if subject.process.origin == subjects::Origin::Spawned {
+        if registry
+            .spawn_edge(&subject.process.spawn_request_id)?
+            .is_some()
+        {
             registry.record_spawn_granted(&subject.process.spawn_request_id, now)?;
         }
         Ok(claim)

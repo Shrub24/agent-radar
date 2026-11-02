@@ -159,6 +159,8 @@ fn stricter(a: Containment, b: Containment) -> Containment {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseRequest {
     pub target: CloseTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::control_plane::command::Subject>,
     /// The observed identity frozen when the operator confirmed. The worker
     /// refuses when its own fresh inventory no longer matches it, so a target
     /// replaced between confirmation and the close is never acted on.
@@ -513,42 +515,6 @@ pub fn close_unmanaged(
         return DirectClose::Refused(format!(
             "{described} is registered by its owner: direct close refused"
         ));
-    }
-    match provider.close_outcome(&request.target, cancel) {
-        CloseOutcome::Completed => DirectClose::Completed,
-        CloseOutcome::Refused(message) => DirectClose::Refused(message),
-        CloseOutcome::Unknown(message) => DirectClose::Unknown(message),
-    }
-}
-
-/// Closes one container's place for a deletion the operator confirmed.
-///
-/// The deletion has already verified the serving instance and that the recorded
-/// binding is this place, and the operator was shown what was running inside it.
-/// So this is not the generic close: it does not re-apply the containment guard,
-/// because ending the container is exactly what was asked for. A place that is
-/// already gone needs no close, which makes the deletion a success of nothing
-/// rather than a refusal.
-pub fn close_for_deletion(
-    provider: &dyn RuntimeProvider,
-    request: &CloseRequest,
-    cancel: &AtomicBool,
-) -> DirectClose {
-    let present = match provider.inventory(cancel) {
-        Ok(inventory) => Some(match &request.target {
-            CloseTarget::Pane(pane) => inventory.pane(pane).is_some(),
-            CloseTarget::Tab(id) => inventory.tabs.iter().any(|tab| tab.tab_id == *id),
-            CloseTarget::Workspace(id) => inventory
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.workspace_id == *id),
-        }),
-        // An unreadable inventory says nothing about the place; the close itself
-        // is still the last word.
-        Err(_) => None,
-    };
-    if present == Some(false) {
-        return DirectClose::Completed;
     }
     match provider.close_outcome(&request.target, cancel) {
         CloseOutcome::Completed => DirectClose::Completed,

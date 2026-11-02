@@ -323,6 +323,7 @@ impl RuntimeProvider for DaemonRuntime {
             Err(message) => return CloseOutcome::Refused(message),
         };
         let request = CloseRequest {
+            execution: None,
             target: target.clone(),
             identity: lifecycle::identity(&inventory, target),
         };

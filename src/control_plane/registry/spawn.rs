@@ -550,7 +550,7 @@ pub(super) fn launched_registration(
         .into_iter()
         .find(|edge| edge.token == token)
     else {
-        if lifecycle::admitted_agent(registry, token)? {
+        if lifecycle::managed_agent(registry, token)? {
             return Ok(Some(token.to_owned()));
         }
         return Err("no recorded spawn edge was minted with this token".into());
@@ -578,13 +578,20 @@ pub(super) fn bind_presented_token(
     let Some(token) = request.spawn_token.as_deref() else {
         return Ok(());
     };
-    if lifecycle::admitted_agent(registry, token)? {
-        return lifecycle::bind_admitted(
-            registry,
-            registration_id,
-            request.process.as_ref(),
-            now_ms,
-        );
+    if lifecycle::managed_agent(registry, token)? {
+        lifecycle::bind_managed(registry, registration_id, request.process.as_ref(), now_ms)?;
+        let process = lifecycle::read_process(registry, registration_id)?
+            .ok_or("managed execution is missing")?;
+        if let Some(edge) = edge(registry, &process.spawn_request_id)? {
+            bind_locked(
+                registry,
+                &registration_bind(&edge.token, request),
+                now_ms,
+                registration_id,
+                request.process.as_ref(),
+            )?;
+        }
+        return Ok(());
     }
     bind_locked(
         registry,
@@ -607,29 +614,13 @@ pub(super) fn heal_binding(
     request: &super::RegistrationRequest,
     now_ms: i64,
 ) -> Result<(), String> {
-    let Some(token) = request.spawn_token.as_deref() else {
+    if request.spawn_token.is_none() {
         return Ok(());
-    };
+    }
     let registration = registry
         .registration_for_incarnation(&request.source, &request.incarnation)?
         .ok_or_else(|| "registered child identity is unavailable for spawn binding".to_string())?;
-    if lifecycle::admitted_agent(registry, token)? {
-        return lifecycle::bind_admitted(
-            registry,
-            &registration.registration_id,
-            request.process.as_ref(),
-            now_ms,
-        );
-    }
-    let bind = registration_bind(token, request);
-    bind_locked(
-        registry,
-        &bind,
-        now_ms,
-        &registration.registration_id,
-        request.process.as_ref(),
-    )
-    .map(|_| ())
+    bind_presented_token(registry, request, &registration.registration_id, now_ms)
 }
 
 fn registration_bind(token: &str, request: &super::RegistrationRequest) -> SpawnBindRequest {

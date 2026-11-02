@@ -81,6 +81,8 @@ pub struct ChildClosed {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicClose {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<super::lifecycle::ClosedExecution>,
     /// `Completed` or `AlreadyExited`; a refused or unknown close is a refusal.
     pub outcome: CloseOutcome,
     pub intent: CloseIntent,

@@ -78,7 +78,7 @@ pub(super) fn execute(
 ) -> Reply {
     match operation {
         ops::Operation::Focus => execute_focus(request, core),
-        ops::Operation::Close => execute_close(request, core),
+        ops::Operation::Close => execute_close(request, core, verification),
         ops::Operation::Create => execute_create(request, core, verification),
         ops::Operation::CreateContainer => execute_container_create(request, core, verification),
         ops::Operation::DeleteContainer => execute_container_delete(request, core, verification),
@@ -381,7 +381,7 @@ pub(super) fn execute_command(
     let request = command.record_request(id);
     let requester = Some(command.requester);
     match command.action {
-        Action::Close(close) => run_close(&request, close, requester, core),
+        Action::Close(close) => run_close(&request, close, requester, core, verification),
         Action::Cancel(subject) => run_subject_control(
             &request,
             SubjectParams {

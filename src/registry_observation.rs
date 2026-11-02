@@ -210,13 +210,13 @@ pub fn project(
         lifecycle,
         containers: _,
     } = read;
-    let foreground: HashMap<&str, &ProcessIdentity> = evidence
+    let foreground: HashMap<&str, &crate::model::ProcessResources> = evidence
         .iter()
         .filter_map(|(pane_id, evidence)| match evidence {
             ForegroundEvidence::NonShell { local, .. } => local
                 .resources
                 .as_ref()
-                .map(|resources| (pane_id.as_str(), &resources.identity)),
+                .map(|resources| (pane_id.as_str(), resources)),
             _ => None,
         })
         .collect();
@@ -327,7 +327,7 @@ fn bind(
     inventory: &FleetObservation,
     backend: &BackendIdentity,
     agent: &RegistryAgent,
-    foreground: &HashMap<&str, &ProcessIdentity>,
+    foreground: &HashMap<&str, &crate::model::ProcessResources>,
 ) -> Result<String, Unjoined> {
     let reported = agent
         .registration
@@ -353,7 +353,17 @@ fn bind(
     }
     match foreground.get(pane_id) {
         None => Err(Unjoined::ForegroundUnreadable),
-        Some(identity) if *identity != claim => Err(Unjoined::IdentityMismatch),
+        Some(resources)
+            if resources.identity != *claim
+                && !resources
+                    .descendants
+                    .members
+                    .iter()
+                    .any(|member| &member.identity == claim) =>
+        {
+            Err(Unjoined::IdentityMismatch)
+        }
+
         Some(_) => Ok(pane_id.to_string()),
     }
 }
@@ -743,6 +753,53 @@ mod tests {
 
     fn at(pane_id: &str) -> Value {
         json!({"backend": "tmux", "workspace": "w1", "tab": "t1", "pane": pane_id})
+    }
+
+    #[test]
+    fn a_supervised_program_joins_through_its_sampled_birth_identity() {
+        let panes = inventory(vec![pane("p1", "t1")]);
+        let supervisor = identity(42, 900);
+        let program = identity(43, 901);
+        let mut evidence = vec![foreground("p1", supervisor.clone())];
+        let ForegroundEvidence::NonShell { local, .. } = &mut evidence[0].1 else {
+            panic!("expected non-shell evidence");
+        };
+        local
+            .resources
+            .as_mut()
+            .expect("sampled resources")
+            .descendants
+            .members
+            .push(crate::model::DescendantSample {
+                identity: program.clone(),
+                parent: supervisor,
+                name: "agent".into(),
+                state: ProcessState::from_letter('S'),
+                cpu: None,
+                rss_bytes: None,
+            });
+        for (claim, expected) in [
+            (program, Binding::Joined),
+            (
+                identity(43, 902),
+                Binding::Unjoined(Unjoined::IdentityMismatch),
+            ),
+        ] {
+            let projected = project(
+                &panes,
+                &backend(),
+                read(vec![registered("a", at("p1"), Some(claim))]),
+                &evidence,
+            );
+            assert_eq!(
+                projected[0]
+                    .registry
+                    .as_ref()
+                    .expect("registry view")
+                    .binding,
+                expected
+            );
+        }
     }
 
     #[test]
