@@ -857,7 +857,9 @@ mod tests {
             tab: None,
             losses: Vec::new(),
         };
-        assert!(plan(crate::app::Operation::Restart, selected, &state, None, "r1").is_err());
+        let refusal = plan(crate::app::Operation::Restart, selected, &state, None, "r1")
+            .expect_err("a pane is not a managed worker");
+        assert_eq!(refusal, "restart is only for a managed worker");
     }
 
     fn container(kind: Kind, handle: &str) -> crate::tree::ContainerRef {

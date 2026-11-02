@@ -101,6 +101,17 @@ pub(super) fn execute_close(
     run_close(request, close_request, requester, core, verification)
 }
 
+/// The identity this daemon can compare against its own backend inventory. That
+/// inventory carries no registry joins, so a named execution's occupant cannot be
+/// compared here; the claim and placement checks fence it instead.
+fn backend_comparable(request: &CloseRequest) -> lifecycle::TargetIdentity {
+    let mut identity = request.identity.clone();
+    if let (Some(_), lifecycle::TargetIdentity::Pane(pane)) = (&request.execution, &mut identity) {
+        pane.occupant = None;
+    }
+    identity
+}
+
 pub(super) fn run_close(
     request: &Request,
     close_request: CloseRequest,
@@ -144,16 +155,7 @@ pub(super) fn run_close(
             );
         }
     };
-    // The backend inventory carries no registry joins, so an occupant cannot be
-    // compared here; a named execution is fenced by its recorded claim and
-    // placement below instead.
-    let mut expected = close_request.identity.clone();
-    if let (Some(_), lifecycle::TargetIdentity::Pane(pane)) =
-        (&close_request.execution, &mut expected)
-    {
-        pane.occupant = None;
-    }
-    if !lifecycle::matches(&inventory, &expected) {
+    if !lifecycle::matches(&inventory, &backend_comparable(&close_request)) {
         return write_settled(
             record.complete(
                 Settlement::backend_refused("the selected place changed: nothing was closed"),
@@ -1312,4 +1314,49 @@ pub(super) fn write_deleted(
                 .collect(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::{AgentIdentity, PaneIdentity, TargetIdentity};
+
+    fn request(execution: bool) -> CloseRequest {
+        CloseRequest {
+            target: crate::CloseTarget::Pane("p".into()),
+            execution: execution.then(|| crate::control_plane::command::Subject {
+                subject_id: "s".into(),
+                claim_id: "c".into(),
+            }),
+            identity: TargetIdentity::Pane(PaneIdentity {
+                pane_id: "p".into(),
+                occupant: Some(AgentIdentity {
+                    name: None,
+                    session: None,
+                    lineage: None,
+                    managed: true,
+                    label: Some("agent".into()),
+                    run: None,
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_named_execution_is_not_compared_by_occupant_but_a_bare_pane_is() {
+        let TargetIdentity::Pane(named) = backend_comparable(&request(true)) else {
+            panic!("a pane stays a pane");
+        };
+        assert!(
+            named.occupant.is_none(),
+            "the claim fences a named execution"
+        );
+        let TargetIdentity::Pane(bare) = backend_comparable(&request(false)) else {
+            panic!("a pane stays a pane");
+        };
+        assert!(
+            bare.occupant.is_some(),
+            "drift in a bare pane stays refused"
+        );
+    }
 }

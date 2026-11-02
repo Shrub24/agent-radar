@@ -167,6 +167,42 @@ class Acceptance:
             return None
         return eventually(created, f"admission in {pane} recorded no execution")
 
+    def branch_tab(self, count):
+        """A recorded tab holding `count` POSIX shells, as (window, panes, container)."""
+        before = set(self.tmux("list-windows", "-a", "-F", "#{window_id}").split())
+        workspace = next(item for item in self.call("topology.list", {})["containers"]
+                         if item["kind"] == "workspace")
+        made = self.call("topology.create", {"request": {
+            "kind": "tab", "workspace_id": workspace["binding"]["handle"], "focus": False}})
+        assert made["request"]["outcome"] == "completed", made
+        window = eventually(
+            lambda: next(iter(set(self.tmux("list-windows", "-a", "-F", "#{window_id}").split())
+                              - before), None), "the branch tab never appeared")
+        lead = self.tmux("list-panes", "-t", window, "-F", "#{pane_id}").split()[0]
+        for _ in range(count - 1):
+            self.tmux("split-window", "-d", "-t", lead, "bash", "--norc", "--noprofile", "-i")
+        panes = self.tmux("list-panes", "-t", window, "-F", "#{pane_id}").split()
+        assert len(panes) == count, panes
+        for pane in panes:
+            # The tab starts the operator's own shell; the harness's command line is POSIX.
+            self.tmux("send-keys", "-t", pane, "exec bash --norc --noprofile -i", "Enter")
+            eventually(lambda: "bash-" in self.tmux("capture-pane", "-p", "-t", pane),
+                       f"shell in {pane} did not start")
+        tab = f"tmux:{self.server}:{window}"
+        container = next(item for item in self.call("topology.list", {})["containers"]
+                         if item["kind"] == "tab" and (item.get("binding") or {}).get("handle") == tab)
+        return window, panes, container
+
+    def delete_tab(self, window, panes, container):
+        tab = f"tmux:{self.server}:{window}"
+        members = [{"pane_id": f"tmux:{self.server}:{pane}", "occupant": None}
+                   for pane in sorted(panes)]
+        result = self.call("topology.delete", {"request": {
+            "container_id": container["container_id"],
+            "frozen": {"target": {"tab": tab},
+                       "identity": {"tab": {"tab_id": tab, "members": members}}}}})
+        assert result["request"]["outcome"] == "completed", result
+
     def completion(self, registration):
         for event in self.events():
             if (event["subject_id"] == registration
@@ -336,6 +372,78 @@ def main():
         eventually(lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
                                          capture_output=True).returncode != 0,
                    "closed execution scope is still active")
+        # A branch holding several executions ends as one: every scope, every pane.
+        window, panes, container = accept.branch_tab(2)
+        units = []
+        for pane in panes:
+            created = accept.run_agent(pane, ["sleep", "300"])
+            units.append(f"radar-{created['registration_id'].replace('-', '')}-main.scope")
+        for unit in units:
+            eventually(lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
+                                              capture_output=True).returncode == 0,
+                       "branch execution never entered a real scope")
+        accept.delete_tab(window, panes, container)
+        for unit in units:
+            eventually(lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
+                                              capture_output=True).returncode != 0,
+                       "branch close left an execution scope active")
+        eventually(lambda: window not in accept.tmux("list-windows", "-a", "-F", "#{window_id}").split(),
+                   "branch close did not remove its tab")
+        print("lifecycle acceptance: multi-agent branch close passed")
+
+        # A pane moved out of a tab by tmux is no longer inside it: closing the tab
+        # must not end the execution that now lives elsewhere.
+        window, panes, container = accept.branch_tab(2)
+        created = accept.run_agent(panes[1], ["sleep", "300"])
+        unit = f"radar-{created['registration_id'].replace('-', '')}-main.scope"
+        eventually(lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
+                                          capture_output=True).returncode == 0,
+                   "moved execution never entered a real scope")
+        accept.tmux("join-pane", "-d", "-s", panes[1], "-t", first)
+        accept.delete_tab(window, panes[:1], container)
+        eventually(lambda: window not in accept.tmux("list-windows", "-a", "-F", "#{window_id}").split(),
+                   "closing the tab did not remove it")
+        assert subprocess.run(["systemctl", "--user", "is-active", unit],
+                              capture_output=True).returncode == 0, "closing a tab ended a pane moved out of it"
+        print("lifecycle acceptance: native pane move passed")
+        # A nested workspace ends with every tab and execution inside it.
+        made = accept.call("topology.create", {"request": {
+            "kind": "workspace", "directory": str(accept.root), "focus": False}})
+        assert made["request"]["outcome"] == "completed", made
+        def workspace():
+            return next((item for item in accept.call("topology.list", {})["containers"]
+                         if item["kind"] == "workspace" and item.get("removed_at") is None
+                         and (item.get("binding") or {}).get("handle") != f"tmux:{accept.server}:$0"), None)
+        nested = eventually(workspace, "the nested workspace was never recorded")
+        handle = nested["binding"]["handle"]
+        accept.call("topology.create", {"request": {
+            "kind": "tab", "workspace_id": handle, "focus": False}})
+        short = handle.rsplit(":", 1)[1]
+        def inside():
+            rows = accept.tmux("list-panes", "-a", "-F", "#{session_id} #{pane_id}").splitlines()
+            return [pane for line in rows for sid, pane in [line.split()] if sid == short]
+        eventually(lambda: len(inside()) == 2, "the nested workspace never held two panes")
+        members = inside()
+        units = []
+        for pane in members:
+            accept.tmux("send-keys", "-t", pane, "exec bash --norc --noprofile -i", "Enter")
+            eventually(lambda: "bash-" in accept.tmux("capture-pane", "-p", "-t", pane),
+                       f"shell in {pane} did not start")
+            created = accept.run_agent(pane, ["sleep", "300"])
+            units.append(f"radar-{created['registration_id'].replace('-', '')}-main.scope")
+        result = accept.call("topology.delete", {"request": {
+            "container_id": nested["container_id"],
+            "frozen": {"target": {"workspace": handle},
+                       "identity": {"workspace": {"workspace_id": handle, "members": [
+                           {"pane_id": f"tmux:{accept.server}:{pane}", "occupant": None}
+                           for pane in sorted(members)]}}}}})
+        assert result["request"]["outcome"] == "completed", result
+        for unit in units:
+            eventually(lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
+                                              capture_output=True).returncode != 0,
+                       "workspace close left an execution scope active")
+        eventually(lambda: not inside(), "workspace close left panes behind")
+        print("lifecycle acceptance: nested workspace close passed")
         print("lifecycle acceptance: completion, Ctrl-C, shell return and real-scope pane close passed")
     finally:
         accept.close()
