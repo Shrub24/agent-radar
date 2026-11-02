@@ -644,6 +644,15 @@ pub(super) fn restart_lead(
         }
     }
     effects.push(format!("successor {successor}"));
+    let reuse = reusable_pane(
+        core,
+        &backend,
+        &subject.claim_id,
+        anchor,
+        &stopping,
+        verification,
+    );
+    let reused = reuse.is_some();
     let replacement = Request {
         id: successor.to_string(),
         method: ops::Operation::Spawn.as_str().to_string(),
@@ -667,6 +676,7 @@ pub(super) fn restart_lead(
             session: Some(session.to_string()),
             identity: Some(identity),
             prepared: Some(prepared),
+            reuse,
         },
     );
     // The predecessor's launch ended when its exit was verified above, so the pane
@@ -694,11 +704,15 @@ pub(super) fn restart_lead(
         Ok(Some(edge)) => match edge.launched {
             RequestOutcome::Completed => {
                 effects.push("launched replacement".to_string());
-                predecessor_pane(&mut effects);
+                if !reused {
+                    predecessor_pane(&mut effects);
+                }
                 Settlement::completed(effects)
             }
             RequestOutcome::Unknown => {
-                predecessor_pane(&mut effects);
+                if !reused {
+                    predecessor_pane(&mut effects);
+                }
                 Settlement {
                     effects,
                     ..Settlement::backend_unknown(

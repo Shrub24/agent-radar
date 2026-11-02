@@ -324,6 +324,7 @@ pub(super) fn continuation(
         session: Some(session.to_string()),
         identity: Some((subject_id, last.to_string())),
         prepared: None,
+        reuse: None,
     };
     Ok((
         SpawnParams {
@@ -342,6 +343,9 @@ pub(super) struct SpawnLineage {
     pub(super) session: Option<String>,
     pub(super) identity: Option<(String, String)>,
     pub(super) prepared: Option<(Bootstrap, subjects::Ticket)>,
+    /// A verified dead pane of the predecessor to launch into instead of splitting
+    /// a new one. Absent for everything but a restart that may reuse its pane.
+    pub(super) reuse: Option<CreatedLocation>,
 }
 
 /// Creates the pane a child runs in and launches it there, once its parent pane is
@@ -481,7 +485,11 @@ pub(super) fn spawn_child(
         // the operator's cursor.
         focus: Some(false),
     };
-    let created = backend.create(&create_request, &cancel);
+    let reused = lineage.reuse.is_some();
+    let created = match lineage.reuse {
+        Some(pane) => CreateOutcome::Completed(pane),
+        None => backend.create(&create_request, &cancel),
+    };
     let (created_outcome, named, mut created_message) = match &created {
         CreateOutcome::Completed(named) => (
             RequestOutcome::Completed,
@@ -499,7 +507,7 @@ pub(super) fn spawn_child(
     // The pane this launch was dispatched into is recorded as one of this
     // daemon's containers before the edge and the launch are recorded: a spawned
     // agent's slot is topology, not only a location on an edge.
-    if let Some(named) = named {
+    if let Some(named) = named.filter(|_| !reused) {
         let registry = {
             let core = locked(core);
             Arc::clone(&core.registry)
@@ -522,7 +530,14 @@ pub(super) fn spawn_child(
             created_message = Some(format!("the created container was not recorded: {error}"));
         }
     }
-    let mut effects = named.map(CreatedLocation::effects).unwrap_or_default();
+    let mut effects = match named {
+        Some(named) if reused => vec![format!(
+            "reused pane {}",
+            named.pane_id.as_deref().unwrap_or_default()
+        )],
+        Some(named) => named.effects(),
+        None => Vec::new(),
+    };
     let pane = named.and_then(|named| named.identity(CreatedKind::Pane));
     // An instance identity is recorded only for a pane: an edge with no location
     // has a generation no close could use.

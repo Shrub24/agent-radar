@@ -338,6 +338,8 @@ def main():
         successor = next(agent for agent in agents if agent != first_agent)
         assert successor["granted"]["subject_id"] == first_agent["granted"]["subject_id"], agents
         assert successor["report"]["claim_id"] != first_agent["report"]["claim_id"], agents
+        assert successor["report"]["location"]["pane"] == first_agent["report"]["location"]["pane"], \
+            "restart did not reuse the agent's dedicated pane"
         old_pid = first_agent["report"]["process"]["pid"]
         eventually(lambda: not Path(f"/proc/{old_pid}").exists(), "restart left its predecessor alive")
         accept.working(successor["report"]["process"]["pid"])

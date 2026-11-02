@@ -516,6 +516,55 @@ pub(super) fn cleanup_launch_pane(
     )
 }
 
+/// The predecessor's own pane, when a restart may launch into it again.
+///
+/// Only a pane this daemon made for a spawned launch, of the serving generation
+/// that made it, anchoring this restart, and holding an exited command. A shell
+/// the operator resumed is never eligible: a replacement is never typed into it.
+pub(super) fn reusable_pane(
+    core: &Arc<Mutex<Core>>,
+    backend: &Arc<dyn RuntimeProvider>,
+    key: &str,
+    anchor: &str,
+    stopping: &Arc<AtomicBool>,
+    budget: &Arc<VerificationBudget>,
+) -> Option<crate::runtime::CreatedLocation> {
+    let (registry, verifier) = {
+        let core = locked(core);
+        (Arc::clone(&core.registry), Arc::clone(&core.verifier))
+    };
+    let claim = subjects::read(&registry, key).ok()??;
+    if claim.process.origin != subjects::Origin::Spawned {
+        return None;
+    }
+    let placement = claim.process.placement?;
+    let pane = placement.location.pane?;
+    let instance = placement.instance?;
+    if pane != anchor
+        || serving_identity(backend, &verifier, stopping, budget).as_ref() != Some(&instance)
+    {
+        return None;
+    }
+    subjects::await_completion(&registry, key);
+    let inventory = bounded_inventory(
+        backend,
+        stopping,
+        budget,
+        Instant::now() + VERIFICATION_TIMEOUT,
+    )
+    .ok()?;
+    let location = inventory.pane(&pane)?.location.clone();
+    matches!(
+        bounded_exit_observation(backend, &pane, stopping, budget),
+        Ok(PaneExitObservation::Exited { .. })
+    )
+    .then_some(crate::runtime::CreatedLocation {
+        workspace_id: Some(location.workspace_id),
+        tab_id: Some(location.tab_id),
+        pane_id: Some(location.pane_id),
+    })
+}
+
 /// Reads one pane's exit state now, bounded and cancellable like every other
 /// read this path makes. A pane the backend does not answer for is unknown.
 pub(super) fn bounded_exit_observation(
