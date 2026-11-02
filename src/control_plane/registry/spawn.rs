@@ -688,6 +688,11 @@ fn bind_locked(
 }
 
 /// Every recorded edge, in stable request-id order.
+/// Fails naming the file of the first edge that does not decode.
+pub(super) fn verify(registry: &Registry) -> Result<(), String> {
+    edges(registry).map(drop)
+}
+
 fn edges(registry: &Registry) -> Result<Vec<SpawnEdge>, String> {
     let directory = registry.spawns();
     let entries = fs::read_dir(&directory).map_err(|error| format!("spawns: {error}"))?;
@@ -704,7 +709,10 @@ fn edges(registry: &Registry) -> Result<Vec<SpawnEdge>, String> {
             .trim_end_matches(".json")
             .to_string();
         let bytes = read_record_file(&path, MAX_SPAWN_BYTES)?;
-        edges.push(decode(&bytes, &request_id)?);
+        edges.push(
+            decode(&bytes, &request_id)
+                .map_err(|error| format!("spawn edge {}: {error}", path.display()))?,
+        );
     }
     edges.sort_by(|left, right| left.request_id.cmp(&right.request_id));
     Ok(edges)

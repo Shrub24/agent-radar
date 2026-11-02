@@ -33,7 +33,7 @@ criteria are satisfied, not merely that a helper exists or a suite passes.
 ## 5. Convergence audit and upgrade integrity
 
 - [ ] 5.1 Complete the targeted flow inventory against production callers, not shared-helper names. The design table records current policy differences; child-close termination, admitted pane cleanup, configured L, movement and container outcome convergence remain unresolved. Remove unused helpers and narrative comments without a generic trait/actor rewrite.
-- [ ] 5.2 Verify actual record/wire changes and a non-destructive cutover. Spawn edges changed to version 3; child-close versions did not change. Old spawn edges refuse on read, not necessarily at daemon startup. A tested archive/cutover procedure is still required. Preserve unrelated communications and never recommend `reset --hard` merely to upgrade lifecycle records. Check redaction, reopen/replay, unsupported versions with paths, generated contracts and packaging.
+- [ ] 5.2 Verify actual record/wire changes and a non-destructive cutover. Spawn edges changed to version 3; child-close versions did not change. Cutover run live from the installed 0.9.0 daemon to this build on one state directory: the new daemon starts over 0.9.0 state and keeps its containers. It found that an unreadable spawn edge left the daemon serving while the sweeper's launch pass failed every cycle; startup now refuses naming the file (tested). Still to check: redaction, unsupported versions in the other record paths, generated contracts and packaging. Preserve unrelated communications and never recommend `reset --hard` merely to upgrade lifecycle records.
 
 ## 6. Integrated validation
 

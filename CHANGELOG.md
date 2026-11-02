@@ -21,7 +21,7 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 Stop managed programs before replacing the daemon and CLI together. Programs started
 by the old launcher do not gain the new completion supervisor when the daemon upgrades.
 
-Stored spawn edges now use version 3; an older edge is refused when read, not migrated.
+Stored spawn edges now use version 3. The daemon reads every edge at startup and refuses to start, naming the file, when one is from another version; it does not migrate. (Before this check, such an edge left the daemon serving while the sweeper's launch pass failed on every cycle.)
 Before upgrading, preserve an offline copy of the daemon state directory. A tested
 cutover procedure for old lifecycle records is still outstanding; do not work around
 a refusal by deleting individual records. Do not reset `communications/` or use

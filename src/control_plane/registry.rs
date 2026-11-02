@@ -566,6 +566,12 @@ impl Registry {
         self.root.join(spawn::SPAWNS)
     }
 
+    /// Reads every recorded spawn edge, naming the first one this build cannot
+    /// read. A daemon starts only over edges it can serve.
+    pub fn verify_spawns(&self) -> Result<(), String> {
+        spawn::verify(self)
+    }
+
     /// The `closes` directory.
     pub fn closes(&self) -> PathBuf {
         self.root.join(child_close::CLOSES)

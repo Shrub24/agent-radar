@@ -4693,6 +4693,38 @@ fn a_physical_backend_the_daemon_cannot_serve_refuses_startup() {
     assert_ne!(unknown, shared);
 }
 
+/// A spawn edge this build cannot read refuses startup and names the file. The
+/// alternative is a daemon that serves while every pass over the topology, the
+/// sweeper's launch withdrawal included, fails on that one record.
+#[test]
+fn a_spawn_edge_from_another_version_refuses_startup_naming_the_file() {
+    let sandbox = Sandbox::new("spawn-edge-old");
+    let state = sandbox.state();
+    let spawns = state.join("spawns");
+    std::fs::create_dir_all(&spawns).expect("spawns directory");
+    for directory in [&state, &spawns] {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+    }
+    let id = "11111111-1111-4111-8111-111111111111";
+    std::fs::write(spawns.join(format!("{id}.json")), r#"{"version":2}"#).expect("old edge");
+    let mut child = DaemonChild::spawn_with(&sandbox.socket(), &state, &[]);
+    assert_eq!(child.wait(DEADLINE).code(), Some(1));
+    let mut diagnostic = String::new();
+    child
+        .process
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut diagnostic)
+        .expect("the diagnostic");
+    assert!(diagnostic.contains(id), "{diagnostic}");
+    assert!(
+        !sandbox.socket().exists(),
+        "a refused daemon bound its socket"
+    );
+}
+
 /// The daemon serves the tmux server its own unit owns. A server whose unit cannot
 /// start is a refusal at startup: nothing is served, nothing is created, and the
 /// reason names the unit.
