@@ -393,6 +393,47 @@ def main():
                    "branch close did not remove its tab")
         print("lifecycle acceptance: multi-agent branch close passed")
 
+        # Three agents that ignore TERM share one shutdown window: the branch costs
+        # one graceful wait and one escalation, not one of each per agent.
+        window, panes, container = accept.branch_tab(3)
+        units = []
+        for pane in panes:
+            created = accept.run_agent(pane, ["sh", "-c", "trap '' TERM; while :; do sleep 1; done"])
+            units.append(f"radar-{created['registration_id'].replace('-', '')}-main.scope")
+        for unit in units:
+            eventually(lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
+                                              capture_output=True).returncode == 0,
+                       "stubborn execution never entered a real scope")
+        started = time.monotonic()
+        accept.delete_tab(window, panes, container)
+        elapsed = time.monotonic() - started
+        for unit in units:
+            assert subprocess.run(["systemctl", "--user", "is-active", unit],
+                                  capture_output=True).returncode != 0, f"{unit} survived the close"
+        assert elapsed < 7, f"three stubborn agents took {elapsed:.1f}s: windows were not shared"
+        print(f"lifecycle acceptance: stubborn branch escalated together in {elapsed:.1f}s")
+
+        # Closing one admitted agent's pane ends its execution and removes only that pane.
+        window, panes, container = accept.branch_tab(2)
+        created = accept.run_agent(panes[0], ["sleep", "300"])
+        unit = f"radar-{created['registration_id'].replace('-', '')}-main.scope"
+        eventually(lambda: subprocess.run(["systemctl", "--user", "is-active", unit],
+                                          capture_output=True).returncode == 0,
+                   "admitted execution never entered a real scope")
+        target = f"tmux:{accept.server}:{panes[0]}"
+        closed = accept.call("mux.close", {"request": {
+            "target": {"pane": target},
+            "identity": {"pane": {"pane_id": target, "occupant": None}}}, "requester": "acceptance"})
+        assert closed["request"]["outcome"] == "completed", closed
+        assert closed["request"]["closed"]["execution"] == {"state": "exited"}, closed
+        assert closed["request"]["closed"]["completion"]["signal"] == 15, closed
+        assert subprocess.run(["systemctl", "--user", "is-active", unit],
+                              capture_output=True).returncode != 0, "pane close left the scope active"
+        remaining = accept.tmux("list-panes", "-a", "-F", "#{pane_id}").split()
+        assert panes[0] not in remaining and panes[1] in remaining, remaining
+        accept.delete_tab(window, panes[1:], container)
+        print("lifecycle acceptance: admitted pane close passed")
+
         # A pane moved out of a tab by tmux is no longer inside it: closing the tab
         # must not end the execution that now lives elsewhere.
         window, panes, container = accept.branch_tab(2)
