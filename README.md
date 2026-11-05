@@ -1053,17 +1053,13 @@ One Cargo package, with `radar` as its binary:
 - `src/focus.rs`: the focus worker run off the calling thread, its cancellation
   and message plumbing, and what `Enter` sends. The two transports behind it
   belong to the adapter.
-- `src/lifecycle.rs` / `src/control.rs`: the lifecycle executor. `control.rs` is
-  the `herdsman-control/v1` requester — trusted owner directories, atomic bounded
-  publication, bounded result reads, file-derived terminal states. `lifecycle.rs`
-  holds containment policy, the direct-close worker and the off-thread
-  owner-control worker that publishes a confirmed managed close or restart and
-  reads its outcome. Managed actions never touch the runtime seam; the pane close of a
-  row without a recorded container is the only lifecycle action the mux performs.
+- `src/lifecycle.rs`: containment policy and the off-thread direct-close worker.
+  Managed close and restart belong to the daemon; the pane close of a row without
+  a recorded container is the only lifecycle action the mux performs from here.
+- `src/timestamp.rs`: the contract's ISO 8601 timestamp parsed to Unix milliseconds.
 - `tests/`: sanitized fixtures, fake-executable and stub-socket transport
   checks at the adapter, collector and focus tests against an in-memory
-  runtime, lifecycle tests against fake providers and a stub owner in temporary
-  directories, bus listener and detail-join tests against a stub publisher, and
+  runtime, lifecycle tests against fake providers, bus listener and detail-join tests against a stub publisher, and
   a focused PTY check that also connects one to the running dashboard, plus
   `tests/tmux_acceptance.py`, which runs the dashboard against a disposable
   daemon on a disposable tmux server and asserts the registry-backed rows. No

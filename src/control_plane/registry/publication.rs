@@ -30,9 +30,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::timestamp_millis;
 use crate::control_plane::store::{format_millis, random_uuid};
 use crate::model::{ContextWindow, SessionUuid};
+use crate::timestamp::timestamp_millis;
 
 use super::{Registry, bounded_text, read_record_file, validate_registration_id};
 

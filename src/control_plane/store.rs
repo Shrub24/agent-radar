@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::timestamp_millis;
 use crate::runtime::CreatedIdentity;
+use crate::timestamp::timestamp_millis;
 
 /// The directory inside the state root that holds one file per request.
 const REQUESTS: &str = "requests";

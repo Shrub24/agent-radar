@@ -1810,7 +1810,7 @@ pub fn withdraw_unpresented(
         registry.record_spawn_granted(&edge.request_id, now_ms)?;
         return Ok(None);
     }
-    let overdue = crate::control::timestamp_millis(&edge.recorded_at)
+    let overdue = crate::timestamp::timestamp_millis(&edge.recorded_at)
         .is_some_and(|recorded| now_ms - recorded >= LAUNCH_DEADLINE_MS);
     let reason = match claim.process.state {
         State::Revoked if !overdue => "the launch was cancelled before it presented",

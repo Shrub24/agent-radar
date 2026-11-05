@@ -22,10 +22,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::timestamp_millis;
 use crate::control_plane::lifecycle;
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
 use crate::model::{ProcessIdentity, SessionUuid};
+use crate::timestamp::timestamp_millis;
 
 use super::publication::write_atomic;
 use super::{Freshness, Registry, RegistryLocation, bounded_text, read_record_file};

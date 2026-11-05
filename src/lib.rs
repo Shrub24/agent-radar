@@ -8,7 +8,6 @@ pub mod cli;
 pub mod collector;
 pub mod config;
 pub mod content;
-pub mod control;
 pub mod control_plane;
 pub mod focus;
 pub mod lifecycle;
@@ -29,6 +28,7 @@ pub mod tasks;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod theme;
+pub mod timestamp;
 pub mod title;
 pub mod tmux;
 pub mod topology;
@@ -40,17 +40,12 @@ pub mod workspace;
 pub use app::{Action, App, Geometry, Operation, PaneView, RowOrder};
 pub use collector::{Collector, CollectorConfig, RegistrySource};
 pub use config::{Config, Palette};
-pub use control::{
-    ControlError, ControlRequest, ControlResult, NewRequest, Outcome, OwnerControl, RequestState,
-};
 pub use control_plane::{
     Category, Code, Daemon, Derived, ErrorBody, MAX_LINE_BYTES, PROTOCOL_VERSION, RecordState,
     Refusal, Request, RequestOutcome, RequestRecord, Response, Store, decode_request,
     install_signal_handlers, socket_path, state_dir,
 };
-pub use lifecycle::{
-    CloseRequest, Closer, Containment, ManagedActions, ManagedRequest, Update, UpdateKind,
-};
+pub use lifecycle::{CloseRequest, Closer, Containment};
 pub use model::{
     AgentObservation, BinaryFreshness, BinaryIdentity, BinaryUnknown, FleetObservation,
     ForegroundEvidence, Lineage, LocalFacts, Location, Pane, RuntimeStatus, SessionIdentity,

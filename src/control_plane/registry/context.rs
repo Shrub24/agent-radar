@@ -28,9 +28,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::timestamp_millis;
 use crate::control_plane::store::format_millis;
 use crate::model::SessionUuid;
+use crate::timestamp::timestamp_millis;
 
 use super::publication::{
     AcceptedLease, DEFAULT_LEASE_MS, ExpectedWriter, Freshness, MAX_LEASE_MS, MIN_LEASE_MS,

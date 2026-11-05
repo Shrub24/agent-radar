@@ -1,8 +1,8 @@
 use super::{Registry, read_recorded, record_exit_locked, write};
-use crate::control::timestamp_millis;
 use crate::control_plane::registry::{ProcessVerifier, RegistryLocation};
 use crate::model::ProcessIdentity;
 use crate::process_control::{self, Acquired};
+use crate::timestamp::timestamp_millis;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

@@ -31,9 +31,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::timestamp_millis;
 use crate::control_plane::store::format_millis;
 use crate::model::SessionUuid;
+use crate::timestamp::timestamp_millis;
 
 use super::publication::write_atomic;
 use super::spawn::SpawnExitObservation;

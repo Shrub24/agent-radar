@@ -64,12 +64,6 @@ persistence setting remains deferred, not a reason for separate execution paths.
   ownership, subtree ordering and partial-outcome semantics in the change design.
 
 
-- Remaining typed-contract debt after close outcomes: the `herdsman-control/v1`
-  document (`src/control.rs`) still derives `pane_closed()` by scanning
-  `effects`, because that document is written by the owning controller rather than
-  by the daemon. Typing it means changing that contract with its producer, so it
-  is queued here rather than folded into the daemon sweep.
-
 ### Deferred: lead succession and spawn-edge inheritance
 
 An externally started/admitted lead should be able to inherit existing spawn-edge
