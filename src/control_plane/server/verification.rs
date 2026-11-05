@@ -516,6 +516,22 @@ pub(super) fn cleanup_launch_pane(
     )
 }
 
+/// The pane and serving generation a restart may reuse, from the record alone: a
+/// spawned launch's own placement that is the anchor. Admitted and enrolled
+/// executions live in a shell the operator owns.
+fn own_pane(
+    origin: subjects::Origin,
+    placement: Option<&subjects::Placement>,
+    anchor: &str,
+) -> Option<(String, crate::model::ProcessIdentity)> {
+    if origin != subjects::Origin::Spawned {
+        return None;
+    }
+    let placement = placement?;
+    let pane = placement.pane().filter(|pane| *pane == anchor)?;
+    Some((pane.to_owned(), placement.instance.clone()?))
+}
+
 /// The predecessor's own pane, when a restart may launch into it again.
 ///
 /// Only a pane this daemon made for a spawned launch, of the serving generation
@@ -534,15 +550,12 @@ pub(super) fn reusable_pane(
         (Arc::clone(&core.registry), Arc::clone(&core.verifier))
     };
     let claim = subjects::read(&registry, key).ok()??;
-    if claim.process.origin != subjects::Origin::Spawned {
-        return None;
-    }
-    let placement = claim.process.placement?;
-    let pane = placement.location.pane?;
-    let instance = placement.instance?;
-    if pane != anchor
-        || serving_identity(backend, &verifier, stopping, budget).as_ref() != Some(&instance)
-    {
+    let (pane, instance) = own_pane(
+        claim.process.origin,
+        claim.process.placement.as_ref(),
+        anchor,
+    )?;
+    if serving_identity(backend, &verifier, stopping, budget).as_ref() != Some(&instance) {
         return None;
     }
     subjects::await_completion(&registry, key);
@@ -630,5 +643,46 @@ pub(super) fn observed_inventory(core: &Arc<Mutex<Core>>) -> Option<FleetObserva
     match backend.inventory(&cancel) {
         Ok(inventory) if !cancel.load(Ordering::SeqCst) => Some(inventory),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ProcessIdentity;
+
+    fn placed(pane: &str, instance: bool) -> subjects::Placement {
+        subjects::Placement {
+            location: registry::RegistryLocation {
+                backend: "tmux".into(),
+                instance: None,
+                workspace: None,
+                tab: None,
+                pane: Some(pane.into()),
+            },
+            instance: instance.then(|| ProcessIdentity {
+                boot_id: "boot".into(),
+                pid: 7,
+                start_ticks: 9,
+            }),
+        }
+    }
+
+    #[test]
+    fn only_a_spawned_launchs_own_anchor_pane_is_reusable() {
+        let own = placed("%1", true);
+        assert_eq!(
+            own_pane(subjects::Origin::Spawned, Some(&own), "%1").map(|(pane, _)| pane),
+            Some("%1".into())
+        );
+        // A shell the operator owns is never typed into, however it was placed.
+        for origin in [subjects::Origin::Admitted, subjects::Origin::Enrolled] {
+            assert!(own_pane(origin, Some(&own), "%1").is_none(), "{origin:?}");
+        }
+        // Another pane, an unrecorded serving generation, or no placement at all
+        // leave nothing the daemon can show it made.
+        assert!(own_pane(subjects::Origin::Spawned, Some(&own), "%2").is_none());
+        assert!(own_pane(subjects::Origin::Spawned, Some(&placed("%1", false)), "%1").is_none());
+        assert!(own_pane(subjects::Origin::Spawned, None, "%1").is_none());
     }
 }

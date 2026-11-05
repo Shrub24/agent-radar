@@ -1,7 +1,7 @@
 //! In-flight branch holds. Durable operation records, not these holds, own recovery.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Told the held places each time the set changes, so a display can show a branch
 /// as closing rather than only gone.
@@ -10,7 +10,7 @@ type Watcher = Arc<dyn Fn(Vec<String>) + Send + Sync>;
 #[derive(Default)]
 pub(super) struct Closing {
     places: Mutex<BTreeMap<String, usize>>,
-    watcher: Mutex<Option<Watcher>>,
+    watcher: OnceLock<Watcher>,
 }
 
 impl Closing {
@@ -19,17 +19,14 @@ impl Closing {
     }
 
     pub(super) fn watch(&self, watcher: Watcher) {
-        *self.watcher.lock().unwrap_or_else(PoisonError::into_inner) = Some(watcher);
+        let _ = self.watcher.set(watcher);
     }
 
-    fn changed(&self, held: Vec<String>) {
-        let watcher = self
-            .watcher
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(watcher) = watcher {
-            watcher(held);
+    /// Called with the lock held, so snapshots reach the watcher in the order the
+    /// set changed: a stale one can never overwrite a newer.
+    fn changed(&self, held: &BTreeMap<String, usize>) {
+        if let Some(watcher) = self.watcher.get() {
+            watcher(held.keys().cloned().collect());
         }
     }
 
@@ -39,14 +36,12 @@ impl Closing {
 
     pub(super) fn begin(self: &Arc<Self>, places: impl IntoIterator<Item = String>) -> Held {
         let places: BTreeSet<_> = places.into_iter().collect();
-        let now = {
-            let mut held = self.lock();
-            for place in &places {
-                *held.entry(place.clone()).or_default() += 1;
-            }
-            held.keys().cloned().collect()
-        };
-        self.changed(now);
+        let mut held = self.lock();
+        for place in &places {
+            *held.entry(place.clone()).or_default() += 1;
+        }
+        self.changed(&held);
+        drop(held);
         Held {
             places,
             closing: Arc::clone(self),
@@ -61,18 +56,15 @@ pub(super) struct Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let now = {
-            let mut held = self.closing.lock();
-            for place in &self.places {
-                let count = held.get_mut(place).expect("a guard owns its hold");
-                *count -= 1;
-                if *count == 0 {
-                    held.remove(place);
-                }
+        let mut held = self.closing.lock();
+        for place in &self.places {
+            let count = held.get_mut(place).expect("a guard owns its hold");
+            *count -= 1;
+            if *count == 0 {
+                held.remove(place);
             }
-            held.keys().cloned().collect()
-        };
-        self.closing.changed(now);
+        }
+        self.closing.changed(&held);
     }
 }
 
@@ -112,6 +104,34 @@ mod tests {
                 vec!["%1".to_string(), "%2".to_string()],
                 Vec::<String>::new(),
             ]
+        );
+    }
+
+    #[test]
+    fn a_slow_delivery_never_lands_after_a_newer_set() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let last = Arc::new(Mutex::new(vec!["unset".to_string()]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let closing = Arc::new(Closing::default());
+        let (sink, count) = (Arc::clone(&last), Arc::clone(&calls));
+        closing.watch(Arc::new(move |places| {
+            // The third delivery lingers; the one after it must still end up last.
+            if count.fetch_add(1, Ordering::SeqCst) == 2 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            *sink.lock().unwrap() = places;
+        }));
+        let first = closing.begin(["%1".into()]);
+        let second = closing.begin(["%1".into(), "%2".into()]);
+        std::thread::scope(|scope| {
+            scope.spawn(move || drop(first));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(second);
+        });
+        assert!(
+            last.lock().unwrap().is_empty(),
+            "{:?}",
+            last.lock().unwrap()
         );
     }
 
