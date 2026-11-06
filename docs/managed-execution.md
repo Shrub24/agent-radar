@@ -1,7 +1,7 @@
 # Managed execution
 
 Radar can admit a command durably, run it inside a systemd user scope, and stop
-it gracefully. A scope is one cgroup of processes; it is never an
+it gracefully, ending it by force only when the graceful window runs out. A scope is one cgroup of processes; it is never an
 application outcome. Exit status keeps coming from the typed tmux observation,
 because systemd reports `success` for a nonzero exit and `inactive` for a
 process that never started.
@@ -101,16 +101,20 @@ paths and environment never appear in unit metadata.
 
 ## Stopping
 
-A managed stop is one `systemctl --user stop` for every scope in the set, so a
-workspace with several agents waits one window rather than one per agent.
-Managed scopes set `SendSIGKILL=no` and `TimeoutStopSec=2s`: Radar sends TERM
-and never escalates on its own.
+A managed stop signals every scope in the set before waiting on any of them, so a
+workspace with several agents waits one window rather than one per agent. The
+scopes themselves never kill on their own (`SendSIGKILL=no`,
+`TimeoutStopSec=2s`); Radar decides what happens when the window runs out.
 
-A stop whose scope still has members is reported as unresolved, with the
-surviving programs named. The unit's `failed`/`timeout` state is expected there
-and is not an outcome: a process that ignores TERM stays running and Radar says
-so rather than claiming it exited. Independently scoped tasks and subagents are
-outside a main-scope stop.
+When it does, and a scope's membership is verified at that moment, Radar kills the
+scope with `systemctl --user kill --signal=KILL` and takes an emptied scope as the
+evidence that the program ended. A scope that cannot be read, or that is still
+populated after the kill, leaves the exit **unverified**: the outcome names the
+program and the reason, and the exit is never recorded. The unit's
+`failed`/`timeout` state is expected after a stop and is not an outcome. Whether
+a stop escalated is reported in the result (`closed.escalated`), so a forced
+shutdown is visible. Independently scoped tasks and subagents are outside a
+main-scope stop.
 
 An observed agent — one started outside the managed launch path — keeps the
 signal path it always had. It is not stopped through a scope it never entered.

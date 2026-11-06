@@ -2,61 +2,48 @@
 
 # Agent Radar
 
-A full-screen fleet control plane for coding agents. Radar drives a tmux server it
-owns as its physical backend. The tree abstracts tmux workspaces and windows into
-Radar's workspace and tab hierarchy, with agent ownership kept within a window.
+A control plane for coding agents running in terminals. Radar launches agents,
+watches a whole fleet of them, and ends or restarts them safely, from a
+full-screen dashboard and a local daemon other tools can talk to.
 
-The TUI is a display and control client, not an ingest authority. The daemon
-owns lifecycle operations, managed containers, and background-task publisher
-ingest; task detail reaches the TUI through `tasks.list.v1`. Confirmed actions
-are sent to the daemon and their durable outcomes remain readable by request ID.
+- **See the fleet.** Every agent, background task and pane across your
+  workspaces in one tree: what each is doing, what it is waiting on, and how
+  fresh that knowledge is.
+- **Run agents as managed executions.** `radar run --agent -- pi`, or `L` in the
+  dashboard, starts a program in its own systemd scope under a verified identity,
+  so Radar can later stop exactly that process and nothing else.
+- **Close and restart with evidence.** `D` ends a row and `r` restarts an agent
+  in its session. Radar reports what it verified, never what it assumed: an exit
+  it could not confirm is shown as unverified, not as finished.
+- **Build on it.** The daemon owns lifecycle, launch, observation and durable
+  request records behind a versioned local protocol. The dashboard is one client
+  of it, not the authority.
 
-See [the daemon guide](docs/daemon.md) for operation and adoption status,
-[managed execution](docs/managed-execution.md) for scoped launches, and
-[ideas.md](ideas.md) for deferred functionality and options.
+Radar drives a tmux server it owns as its terminal backend, and shows tmux
+sessions and windows as workspaces and tabs. Agents are identified by their own
+process, never by a title or a label, so a row means one running thing.
 
-## Development
+## Concepts
 
-The flake uses current nixpkgs-unstable, recorded in `flake.lock`. It supplies
-Cargo, Rust, rustfmt, Clippy, rust-analyzer and Python for the terminal regression
-check. Rust 2024 and Rust 1.88 or newer are required outside the shell.
+| Term | Meaning |
+| --- | --- |
+| **Subject** | An agent's durable identity. It outlives restarts. |
+| **Execution** | One run of a subject: a process with a verified identity, in a scope of its own. |
+| **Place** | A pane, tab or workspace an execution lives in. |
+| **Managed** | Started through Radar (`radar run`, `L`, or a spawn). Radar can stop and restart a managed agent. An agent started some other way is *observed*: visible, but not controllable until it is restarted through Radar. |
 
-```sh
-direnv allow                  # with nix-direnv; once for this checkout
-# or
-nix develop
+## Install
 
-cargo run --locked            # launch radar; q quits
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked
-cargo build --locked
-python3 tests/tmux_acceptance.py target/debug/radar
-```
-
-Radar's control daemon and its tmux server run as user units
-(see [Daemon and tmux server](#daemon-and-tmux-server)), and `radar` starts them. Start with the [daemon consumer guide](docs/daemon.md)
-for the API, lifecycle and adoption path. The [mux integration contract](docs/mux.md)
-covers physical guarantees, backend responsibilities and what a backend may promise.
-See the [control-plane protocol and extension examples](docs/control-plane.md)
-and the direct [agent-registration
-contract and publisher example](docs/agent-registration.md). Version control
-uses **jj**.
-
-## Installation (Nix)
-
-The canonical flake URL for this repository is `github:Shrub24/agent-radar`.
-Package outputs are provided for `x86_64-linux` and `aarch64-linux`, with Rust
-checks enabled. The native `x86_64-linux` build has been verified; `aarch64-linux`
-has been evaluated, not built. Development shells retain their existing systems.
+Radar is a Nix flake, `github:Shrub24/agent-radar`, for `x86_64-linux` and
+`aarch64-linux` (`aarch64` is evaluated, not built). It needs a systemd user
+manager with cgroup v2 and tmux on `PATH`.
 
 ```sh
-nix run github:Shrub24/agent-radar           # run the installed binary
+nix run github:Shrub24/agent-radar           # run it
 nix build github:Shrub24/agent-radar         # ./result/bin/radar
-nix build github:Shrub24/agent-radar#radar   # the same package by name
 ```
 
-As a flake input, without a development checkout:
+As a flake input:
 
 ```nix
 inputs.radar.url = "github:Shrub24/agent-radar";
@@ -65,16 +52,13 @@ inputs.radar.inputs.nixpkgs.follows = "nixpkgs";
 environment.systemPackages = [ inputs.radar.packages.${pkgs.stdenv.hostPlatform.system}.default ];
 ```
 
-Following the consumer's nixpkgs as above builds Radar with that nixpkgs, which
-must therefore provide Rust 1.88 or newer — the floor in `Cargo.toml`, and what
-the flake's own pin satisfies. Nothing here fetches a second toolchain.
+Following your nixpkgs builds Radar with it, so it must provide Rust 1.88 or
+newer.
 
 ### Home Manager
 
-The flake exports a single Home Manager module, so a per-user install needs no
-`environment.systemPackages` entry and no development checkout. Home Manager is
-not an input of this flake: the module is evaluated with the consumer's own Home
-Manager and nixpkgs, and only the default package comes from Radar.
+The flake exports a Home Manager module that installs Radar and declares its user
+units.
 
 ```nix
 { inputs, ... }:
@@ -89,1003 +73,134 @@ Manager and nixpkgs, and only the default package comes from Radar.
       appearance.working = "pulse";
       processes.nvim = "N";
     };
+    # Programs that always run as managed agents (see below).
+    managedAgents = [ pkgs.pi ];
   };
 }
 ```
 
-`programs.radar.enable` installs the package this flake provides for the
-consumer's system; `programs.radar.package` replaces it with another one.
-`programs.radar.settings` is freeform TOML, and an explicit attrset — an empty
-one included — writes `$XDG_CONFIG_HOME/radar/config.toml`. Its `null` default
-manages no file at all, leaving Radar with the user's own configuration file or
-its built-in defaults. The module sets no `RADAR_CONFIG`, mirrors none of
-Radar's defaults, and adds no runtime directory of its own. It declares the user
-units described below.
+`programs.radar.settings` is freeform TOML written to
+`$XDG_CONFIG_HOME/radar/config.toml`. Its `null` default manages no file and
+leaves Radar with your own configuration or its built-in defaults.
+`programs.radar.package` replaces the package.
 
-### Daemon and tmux server
+### The daemon and the tmux server
 
-With `programs.radar.enable` the module declares three user units:
+The module declares three user units:
 
-- `radar-control.socket` holds the control socket at `$XDG_RUNTIME_DIR/agent-radar/control.sock`. A listening
-  socket starts the daemon on the first connection, so a stopped socket is the
-  single switch for explicit closure.
-- `radar-daemon.service` runs `radar daemon` with `KillMode=process`, so stopping the
-  daemon never stops the tmux server or its panes.
-- `radar-tmux@.service` runs one tmux server per instance name, with `KillMode=control-group` and
-  no restart. The daemon's default server is `radar`.
+- `radar-control.socket` holds the control socket at
+  `$XDG_RUNTIME_DIR/agent-radar/control.sock` and starts the daemon on the first
+  connection. A stopped socket is the single switch for explicit closure.
+- `radar-daemon.service` runs `radar daemon`. Stopping it never stops the tmux
+  server or its panes.
+- `radar-tmux@.service` runs one tmux server per instance name. The daemon's
+  default server is `radar`.
 
 ```sh
 radar                  # start the socket, connect, open the dashboard
 radar daemon stop      # stop the socket, then the daemon; the tmux server keeps running
 radar server stop      # refused while the server holds a pane or a pending operation
 radar server status
-radar --version        # the version this binary reports
-radar completions fish # a completion script for bash, zsh, fish or elvish
+radar run --agent -- pi
+radar reset            # clear transient state; durable subjects and handoffs are kept
+radar --version        # the version and wire revision
+radar completions fish # bash, zsh, fish or elvish
 ```
 
-`radar --help` and `radar <command> --help` are generated from the same
-declaration that parses the arguments, so they cannot describe a flag the binary
-does not take.
+An explicit stop holds until the next `radar` run or the next login. A refused
+stop or restart sends no signal and names what is in the way. `radar --help`
+is generated from the same declaration that parses arguments.
 
-An explicit stop holds until the next `radar` run or the next login, whichever comes
-first. A refused stop or restart sends no signal and names what is in the way.
+## Running agents under Radar
 
-The package builds `radar` from `Cargo.lock` in the Nix sandbox and runs the
-crate's own checks; building or running it needs no development shell. The
-dependency graph is compiled as its own derivation, keyed on the manifests rather
-than on the sources, so an edit under `src/` rebuilds this crate and not the
-graph. Completions generated from the built binary are installed at
-`share/bash-completion/completions`, `share/zsh/site-functions` and
-`share/fish/vendor_completions.d`, so the shells load them from the package with
-no per-shell setup. Elsewhere, `radar completions <shell>` prints the same
-script for a line that is not managed by Nix.
-
-tmux is expected on `PATH`, which is where Radar invokes it. The optional agent
-icon font (`Herdr Agent Icons Max`) draws vendor marks as logos; without it marks
-use plain Unicode. `RADAR_ICONS` overrides detection. Configuration is unchanged: `$RADAR_CONFIG`,
-else `$XDG_CONFIG_HOME/radar/config.toml`, else `~/.config/radar/config.toml`.
-
-## Managed execution
-
-`radar run [--agent] -- COMMAND [ARG...]` starts a command in the pane it was invoked from,
-inside a systemd user scope of its own. Nothing is created and no shell
-interprets the command, so a `$VAR`, a glob or a newline arrives intact. `L`
-launches through the same path, and so do restart and Herdsman spawn.
+`radar run [--agent] -- COMMAND [ARG...]` starts a command in the pane you ran it
+from, inside a systemd user scope of its own. No shell interprets the command, so
+a `$VAR`, a glob or a newline arrives intact. `L`, restart and spawned launches
+all go through this same path.
 
 ```sh
-radar run --agent -- pi            # a scoped Pi in this pane, reporting in as an agent
+radar run --agent -- pi    # a scoped Pi in this pane, reporting in as an agent
 ```
 
-The daemon admits the launch before anything executes: it refuses unless this
-process is the pane's own descendant with a verified birth identity, and it
-records the process before the command runs. The command is never executed
-directly — `systemd-run --user --scope` is what runs — so a scope that cannot be
-created runs nothing and there is no unscoped fallback.
+The daemon admits the launch before anything runs: it refuses unless the process
+is the pane's own descendant with a verified identity, and it records that
+identity first. If a scope cannot be created, nothing runs; there is no unscoped
+fallback.
 
-One scope per process lifetime, named from a registration id that is never
-reused:
+`--agent` makes the program an agent with a subject, a parent link and controls.
+Without it, `radar run -- COMMAND` is a managed command: it gets a scope and
+nothing else, never reports in as an agent, and its children inherit no identity.
 
-```text
-radar.slice
-  radar-<registration>.slice
-    radar-<registration>-main.scope
-```
+To make a program always run as a managed agent, list it in
+`programs.radar.managedAgents`. It is installed under its own name as a wrapper
+that runs `radar run --agent -- <original>`; `lib.managedAgent pkgs program` from
+the flake builds the same wrapper.
 
-A reload or `/resume` replaces the session's claim and leaves that scope alone.
+When the program exits, Radar records how it ended: its exit code, or the signal
+that stopped it, reported by the process that supervised it. That record survives
+the pane being closed. See [managed execution](docs/managed-execution.md) for the
+full contract.
 
-Stopping is graceful only. Radar stops each scope with one `systemctl --user
-stop`; managed scopes set `SendSIGKILL=no` and `TimeoutStopSec=2s`, so a process
-that ignores TERM stays running and Radar reports it as a survivor rather than
-claiming an exit. Scope state is never an outcome: `success` covers a nonzero
-exit, and exit status keeps coming from the typed tmux observation. An observed
-agent — one started outside this path — keeps the signal path it already had.
+## The dashboard
 
-A scoped row is a managed execution. An observed row keeps its subject, children
-and inbox and is marked as observed; the route to managed is a restart through
-`radar run`, not promotion in place. With Home Manager, list a program in
-`programs.radar.managedAgents` (for example your Pi package) and it is
-installed under its own name as a wrapper that runs
-`radar run --agent -- <original>`; without it, `lib.managedAgent pkgs program`
-from the flake builds the same wrapper. `radar run -- COMMAND` without `--agent`
-is a managed command: it gets a scope and nothing else, never reports in as an
-agent, and its children inherit no identity. The wrapper names the original by store path, so it never resolves back
-to itself.
-
-This needs a systemd user manager and cgroup v2. Without a manager, a launch
-refuses before the command runs. See [managed execution](docs/managed-execution.md)
-for the full contract and `radar reset` for clearing transient state while
-preserving durable subjects and handoffs.
-
-## Keys
+Run `radar`. The tree shows workspaces, tabs, panes and agents; the details panel
+beside it shows the selected row's facts.
 
 | Key | Action |
 | --- | --- |
-| `j` / `↓`, `k` / `↑` | Select the next / previous visible row. Selection is this view's own: moving it sends nothing and never moves tmux |
-| `space` or `←` / `→` | Fold or unfold the selected branch |
-| `/` | Enter a case-insensitive filter; Backspace edits |
-| `Enter` | Ask the session to focus the selected row's pane (or workspace); the daemon moves the client attached to it, and with none attached the dashboard opens a terminal for that place and asks again; while entering filter text, keeps the filter instead. The row selected here is the target, whatever another view has selected, and a row that has since gone is refused rather than replaced by the focused one |
-| `Escape` | Clear the filter and leave text entry |
-| `o` | Follow the terminal's focus: the sidebar starts on, the dashboard off. While following, a changed focus selects its row once; browsing is not undone, and following never asks tmux to move. `◆` marks the focused row in every view, apart from the selection |
-| `p` | Cycle the pane view: agents → running → all |
-| `s` | Cycle the order: source → state → name |
-| `n` / `N` | Select the next / previous row that needs attention (blocked, lost, waiting, unknown) |
-| `w` / `W` | Select the next / previous working row |
-| `d` | Show or hide the details panel |
-| `D` | Ask to close the selected row. The daemon freezes the selected target for confirmation; it never substitutes the focused row. Container closure stops placed managed executions before removing the resource. An execution whose exit cannot be verified is reported as unverified, not assumed exited |
-| `r` | Restart the selected managed agent in its recorded session: the daemon stops it with a verified exit, then relaunches it. Offered for a bound daemon subject with a session |
-| `a` | Add an empty tab, in the workspace directory, to the selected row's workspace; it asks nothing |
-| `A` | Start a new workspace; nothing is selected, replaced or confirmed |
-| `R` | Reload the selected container's recorded recipe |
-| `L` | Launch the configured managed agent in a new tab or pane |
-| `E` | Report the selected Pi session's claim standing (granted, duplicate, reserved, pending or released); sends nothing |
-| `!` | Open the full text of the last outcome and the last message |
-| `c` | Dismiss the lifecycle outcome lines |
-| `e` | Show or hide finished sessions (panes whose label is a session that has gone) |
-| `b` | Show or hide background-task children in the current view |
-| `Tab` / `Shift-Tab` | Move the keyboard between the tree and the details |
-| `q` | Quit, except while entering filter text |
-| `Ctrl-C` | Quit, including during filter entry |
+| `j` `k` / arrows | Move the selection. This view's own; it moves nothing in tmux |
+| `Enter` | Focus the selected row's pane or workspace |
+| `/` | Filter |
+| `n` / `N`, `w` / `W` | Next row needing attention / next working row |
+| `L` | Launch the configured agent in a new tab or pane |
+| `a`, `A` | New tab / new workspace |
+| `D` | Close the selected row, after a confirmation that names what it loses |
+| `r` | Restart the selected managed agent in its recorded session |
+| `o` | Follow the terminal's focus |
+| `p`, `s` | Cycle which panes are listed / the sort order |
+| `d`, `!` | Toggle the details panel / open the last outcome in full |
+| `q` | Quit |
 
-While the details hold the keyboard:
+All keys, the mouse, the detail pages, marks, colours and configuration are in the
+[dashboard reference](docs/dashboard.md). Configuration is optional: Radar reads
+`$RADAR_CONFIG`, else `$XDG_CONFIG_HOME/radar/config.toml`, and
+`radar --print-config` prints what is in use.
 
-| Key | Action |
+## Closing and restarting
+
+`D` ends a row and the daemon decides what that means for it: an agent's process
+(and its pane when Radar made the pane), a pane, a tab, or a whole workspace and
+everything recorded inside it. A confirmation lists what would be lost and starts
+on Cancel.
+
+Ending is graceful first: TERM, one shared wait, then the scope the agent ran in
+is killed if it is still running. A place with several agents costs one wait, not
+one per agent. The result says, for each agent, whether its exit was **verified**,
+and separately whether the pane was removed. A process that could not be ended is
+reported as unverified, never recorded as exited, and it does not hold the close
+open.
+
+## For tools and other agents
+
+The daemon speaks a versioned local protocol: observation, launch, close,
+restart, messages between agents, and durable request records readable by ID.
+Start with the [daemon guide](docs/daemon.md), then the
+[protocol reference](docs/control-plane.md), the
+[agent registration contract](docs/agent-registration.md) and the
+[`pi-radar`](pi-radar/README.md) extension, which lets a Pi session publish to and
+read from Radar.
+
+## More
+
+| | |
 | --- | --- |
-| `j` / `↓`, `k` / `↑` | Scroll the page one line |
-| `PgDn` / `PgUp` | Scroll the page one viewport |
-| `Home` / `End` | Scroll to the page's first / last line |
-| `←` / `→` | Cycle the pages, wrapping at either end |
-| `Space` | Move to the page's next openable block |
-| `Enter` | Open or close the block the keyboard is on |
-| `t` | With Processes focused and its process table open, enter or leave process-row navigation, where `j`/`k`, `Home`/`End` and `Enter`/`Space` move over the table's rows and fold their branches instead of the page |
-| `Escape` | Give the keyboard back to the tree |
-| `/` and the view keys | Still act on the fleet, as they do from the tree |
-
-Reading a page never moves the selection, folds nothing and sends nothing: `Enter`,
-`D` and `r` are the panel's keys there and do nothing, so a reader cannot
-focus a pane or open a lifecycle confirmation by scrolling. Filter entry and an
-open confirmation keep precedence — the confirmation's arrows swap its buttons
-rather than turning a page, and typing goes to the filter.
-
-The process table has a small mode of its own. With the Processes page focused
-and the table open, `t` enters it and the table's own label says so. There `j` /
-`↓` and `k` / `↑` select the next and previous row without wrapping, `Home` and
-`End` reach the first and last, and `Enter` or `Space` fold or open the selected
-process's branch — a leaf has none to fold. Outside the mode every key is the
-page's again: scrolling, the block cycle, page switching, `Tab` and `Escape` are
-unchanged, and so are `PgUp`/`PgDn` and the wheel. Selecting a row gives the
-compact process block above the table that process's own name, PID, state,
-interval CPU and resident set, while the root's binary comparison stays under
-its own `foreground root` heading and is never attributed to a descendant. The
-mode, the cursor and the folds belong to the selected row's own process, keyed
-by its birth identity: another row, a process replaced at the same PID, a root
-whose table is no longer offered, and closing the table all leave the page
-without them, and a process that folds out of sight or goes away returns the
-cursor to the root. Clicking a row selects that process and enters the mode;
-clicking a row's fold marker only folds that branch. None of it focuses a pane,
-changes the fleet selection or its folds, or issues a close or restart.
-
-With a mouse:
-
-| Gesture | Action |
-| --- | --- |
-| Wheel over the tree | Scroll the list |
-| Wheel over the details | Scroll the page under the pointer |
-| Left click on a page heading | Show that page and hand the details the keyboard |
-| Left click on a disclosure marker in the details | Open or close that block alone |
-| Left click in the details | Give the details the keyboard without acting on the row |
-| Left click on a row | Select it |
-| Left click on a row already selected | Focus its pane — or, for a task, its owner's pane — or workspace, as `Enter` does |
-| Left click on an agent's disclosure marker | Fold or unfold that branch, without focusing |
-| Left click on a workspace heading | Select it and fold or unfold it |
-
-Mouse capture is on, which is what makes the wheel and the clicks arrive at all.
-It costs the terminal's own text selection: with capture on, dragging selects
-nothing until your terminal's bypass key is held (usually `Shift`, `Option` in
-iTerm2). Capture is released on every exit, a failure included.
-
-Filtering matches labels and any available role or assignment text, preserving
-matching rows' ancestors. Clearing it restores previous folds. Selection follows
-surviving row identities through refreshes — and through a re-sort, which is why
-both are keyed by row identity rather than by position. The tree scrolls to the
-selected row and resizes with the terminal. The key hints stay at the bottom and
-switch to the filter's own keys while text is being entered; when one line cannot
-hold them all they wrap onto a second rather than lose a key.
-
-Ordering is per level and never changes structure: a child stays under its
-parent, and a group ranks by the most urgent row beneath it, so a workspace is
-placed by its most urgent agent. Source order is what the observation
-arrived in; state order puts what is stuck, unanswered or unreadable first, then
-a handoff in progress, then work that is moving, then parked and finished rows;
-name order is alphabetical by the label a row shows. `n` and `w` move to the next
-row of a kind, wrapping at the ends. A row hidden by a fold or excluded by the
-filter cannot be reached that way, because it is not drawn.
-
-## Detail pages
-
-The selected row's facts are split into four pages, so what a reader wants first
-is not buried under the long published text a task list brings with it:
-
-| Page | Shows |
-| --- | --- |
-| Overview | What the row is: its kind and lifecycle, its location, the live foreground PID, what it is running, and the row's activity and state. For a registered agent, each authority is a labelled line with its own publisher and freshness — physical, execution, assignment and facts — followed by the owner's role, definition, assignment text and awaited items, and the session's model, provider, thinking level and context usage |
-| Processes | The process holding the location: the command name the runtime reports for it, the package it runs from and the executable inside it, how that compares with the program `PATH` resolves now, the PID, how long it has run, the terminal mode, and what that process was measured using — scheduler state, interval CPU, resident set and the descendants observed beneath it, summed and then drawn one row each in a table of their own — with the store, the roots' own parts, the birth identity, what the state it is showing means and every reason held behind the page's `details` block |
-| Tasks | The background tasks published for the row — each task's id, phase, source, command, directory, PID, timings, output and exit — and the pane's own token ids when no publisher joins |
-| Source | Where the facts came from: source freshness, the diagnostic when the source failed or a page is retained, the identities the row carries (session name, run, request, ask), its lineage when it has one, and the diagnostics |
-
-Every fact an earlier version showed is still reachable, on one page rather than
-repeated across all four, except a foreground process's arguments: the Processes
-page names the process and its executable instead of drawing a command line that
-can carry a prompt, and the row still leads with what the pane is running. A
-page shows only the selected row's facts: a task's published PID is named with
-its source and never borrowed as a live process of the row above it.
-
-### Process identity on the Processes page
-
-The Processes page names the process itself, for an agent row and for an
-ordinary pane row whose foreground evidence is current:
-
-- `observed` is the command name the runtime reports for the process holding the
-  foreground. It is an observation of a running process, not an invocation: for a
-  bolt pane it is the exec-replaced payload's own `pi`, never the `pi-bolt` or
-  `pi-bolt-child` launcher the pane was started from and never the `pi` alias.
-- `package` names the running installation once: the package's name and version,
-  and the first characters of the store hash when the comparison has two builds
-  of that one version to tell apart. A path outside the Nix store is named whole.
-- `exe` is the file the kernel is running inside that package, relative to the
-  package root (`lib/pi-bolt/pi`) rather than the whole store path that names
-  it twice. A file outside that root is drawn where it is.
-- `binary` is how the running executable compares with the program `PATH`
-  resolves now, and it is drawn only when it has something to say: a current
-  comparison has no verdict at all, because the absence of a stale mark is the
-  verdict. Stale is marked and names the installed target as compactly as the
-  package line names the running one — `<mark> (stale) installed
-  pi-bolt-0.7.1 3f9b1c4` — in the configured stale ink; a deliberate other build
-  says `other build` and leaves both roots to the block; and a comparison that
-  could not be made gives its reason in a word or two — no counterpart, payload
-  unknown, unreadable, not the named program.
-- `▸ details` is the page's block, and holds the long halves of the same facts:
-  the store the two roots sit in, stated once, with each root's own part beside
-  it (`store /nix/store/`, then `running aaa-pi-bolt-0.7.1` and
-  `installed bbb-pi-bolt-0.7.1`), the executable's place under the running root,
-  the birth identity the reading belongs to (PID, boot id and start ticks), the
-  full sentence behind a comparison that could not be made, what the kernel
-  state this row is showing means, and what a descendant sum is. Every fact is
-  a labelled row in one column, and a fact too long for the panel continues
-  under that column rather than under its label. Space and Enter, or a click on
-  the marker, open it, and the body scrolls with the page like any other row.
-
-The process's arguments are never drawn on this page: a harness takes its prompt
-and system prompt as arguments, and nothing the runtime reports tells a prompt
-from a flag (a pane's fleet row still leads with the command it is running). A
-current identity stays readable rather than being omitted because there is
-nothing to mark, and a retained row, a stale or unavailable source, a shell and
-an inconclusive foreground draw none of these fields — and offer no block,
-because a marker that opens onto nothing is worse than no marker.
-
-### How the binary comparison resolves
-
-The comparison is by **package family** for the Pi-Bolt variants and by matching
-file name for every other program. A bolt pane's process holds
-`<package>/lib/pi-bolt/pi` while `PATH` resolves `<package>/bin/pi-bolt`, so the
-two files never share a name and only the package identifies either. For those
-variants Radar reads the family from the running executable's own Nix store
-package — the exact `pi-bolt` or `pi-bolt-child` name in its derivation root,
-never a prefix — and compares the running package root with the payload package
-root of the counterpart `PATH` resolves for that exact family. Two store roots
-that differ are `stale` even when both packages carry the same version: a rebuild
-of the same version is a different build, and no version string, build stamp or
-manifest is consulted to excuse it. A program outside the handled families keeps
-the earlier by-name comparison, and its non-store paths are unchanged.
-
-The installed counterpart is read in one of two shapes:
-
-- **Same-root entrypoint (primary).** When `PATH` resolves a family name to an
-  entrypoint inside a versioned package of that same family — the shape a Nix
-  package has, where `bin/pi-bolt` and `lib/pi-bolt/pi` share one root — that
-  package root is the payload root, and nothing is read from the entrypoint.
-  An unversioned launcher root is not a payload root merely because the
-  entrypoint sits inside it.
-- **Cross-root launcher (transitional).** While the profile still installs a
-  separate launcher script, Radar reads its declared target: a short `#!` script
-  whose only mention of `exec` is one strictly literal
-  `exec /nix/store/<root>/bin/<program> [args…]` line the script ends with, whose
-  target is a versioned package of the exact same family. Any other shape — no
-  `exec`, several, a computed, quoted or conditional target, a loop or variable
-  indirection, a non-store target, another family's package, an unrelated
-  program, an unversioned root, a target inside a package but not under `bin`, a
-  `.` or `..` component, a non-script file or a further hop — is `unknown`
-  rather than guessed at. Nothing is executed, no compiled content is read, and
-  no process's environment is read. The branch is compatibility for the
-  packaging that is shipping, depends on no fixed script text, and is removed
-  once each derivation provides its own same-root entrypoints.
-
-Radar reads its own `PATH`, never a pane's environment, so the profile in effect
-is the one that decides. The `pi` the runtime reports for a bolt payload is an
-observed name and selects no program: it is not compared through the `pi` alias
-as though the alias were the launcher. On the current multi-user profile the
-lookup is `/etc/profiles/per-user/<user>/…`, not `~/.nix-profile`, and no fixed
-profile path or version is assumed.
-
-Resources describe processes, not work. A process's CPU is the interval between
-two readings of that same process incarnation — its first reading has none — and
-its resident set counts pages shared with another process in each process that
-maps them. Beneath a sampled process Radar sums the descendants the kernel
-reports for it, from one snapshot of the process table taken per refresh and
-confirmed before any row is measured: a descendant whose birth identity or
-parent link changed in that window, and anything reached through it, is left
-out. That sum is an observed process sum, not a cgroup, workload or
-agent-ownership total, so a build a pane launched is never the pane's own CPU,
-and a total that could not cover every process it saw is shown as a lower bound
-with the reason instead of as a zero. A process Radar cannot read is not in the
-sum it would have been part of. A published task's PID is never sampled: without
-a birth identity captured at spawn, a PID that has been reused cannot authorise
-metrics. That captured identity is a publisher contract Radar does not have yet;
-until it does, a task's PID is named and the measurements beside it stay absent.
-
-On the page a process's own figures and its descendants' are drawn apart and
-never added together, and the shared-page warning sits beside the sum. Every
-value Radar could not measure says so with its reason rather than as a zero: a
-first reading has no interval to report, and a figure a row can no longer
-observe is drawn as withheld, not as the last one anyone saw.
-
-Those confirmed descendants are drawn individually too, one row each, in a table
-held behind the page's own `▸ process table` marker and closed until a reader
-opens it. The root is the table's first row: every process beneath it is indented
-under the one it was read beneath, and the siblings of one parent are ordered by
-PID, so an unchanged table draws the same tree on every refresh. Each row is one
-line of the panel — a name, a PID, an interval CPU and a resident set, aligned
-down the columns — whatever the panel's width: as it narrows the resident set is
-dropped first and then the CPU, and a name its column cannot hold is shortened,
-while the PID is never the column that goes. A `—` is a value this machine did
-not measure and never the zero a measured idle interval is, and a table that drew
-one says so beneath its rows. The name is the kernel's own short name for the
-process, sanitized like every other external text: it is not the arguments the
-process was started with, and it is never a claim about what started it. A table
-is offered only where the scan that sampled the root enumerated what is beneath
-it, so a scan that could not be read leaves the sums saying so rather than
-drawing an empty tree, and a stale or retained row draws none of it.
-
-Long published text starts collapsed behind a `▸` marker: an assignment long
-enough to bury the facts around it, each task's command and directory, and the
-table of processes observed beneath the page's own foreground process. The
-assignment keeps its opening readable while closed, a closed task block keeps
-the task's line with its id, phase, age, output and exit code, and the closed
-table keeps its one-line marker — identity, state, PID and the measures beside
-them never collapse, so only the text that would wrap over the panel is behind
-the marker. `Space` picks the page's next openable
-block, `Enter` opens or closes the one it is on, and neither focuses a pane or
-starts a lifecycle action; clicking a marker toggles that block alone. An opened
-block stays open across refreshes while its task survives, leaves with the task
-it belongs to, and closes when the selection moves to another row.
-
-The page headings name all four pages, and they move onto a second row when the
-panel is too narrow to hold them, so every page stays reachable on a stacked or
-narrow terminal. A page keeps its own scroll for the selected row; changing the
-selection brings every page back to its top, and a shorter page, a resize or a
-refresh clamps the offset to the rows actually drawn rather than leaving an empty
-tail. The unit is a drawn row, so the rows a wrapped line takes are part of the
-page like any other and scrolling reaches the last of them.
-
-`Enter` on an agent or pane row focuses that pane, on a task row focuses the
-pane its owner row names, and on a workspace row focuses that workspace. Radar
-stays open and keeps its selection. A row whose pane the
-current observation no longer reports, or any row while the displayed inventory is
-last-good rather than current, is refused: nothing is sent and the last line says
-why. A failure — tmux unreachable, the request refused, or the request past its
-timeout — is stated on that line too, which clears on the next key press or after
-a few seconds. Nothing the focus path asks tmux for changes an agent, a pane's
-contents or a layout: it selects the window or the pane and nothing else.
-
-Adding a pane or a tab, and `L`, move the client to what they created, because a
-create is dispatched unfocused and focused afterwards: `[server] focus_created`
-(default `true`) decides that, and a request may say otherwise. The focus is a
-second effect on a completed creation, so a refusal is reported without undoing
-or repeating the create; a completed focus says nothing, since moving a terminal
-changes nothing in the tree. Creating a workspace is unfocused, because tmux
-cannot create a session and switch a client to it in one command.
-
-`D` is one key for every row: it ends whatever the selected row is. A
-confirmation names the row and lists what the action may lose — the agent and its
-assignment, outstanding background work, the tab's member panes — and starts on
-**Cancel**. `Tab` or an arrow swaps the selection, `Enter` activates the selected
-button and `Escape` cancels; the mouse only ever hits the two buttons drawn.
-Nothing is sent until Confirm, and the frozen target is revalidated against the
-current observation first: a stale inventory, a disappeared target or a target
-whose identity changed cancels with a reason.
-
-Every level answers the same question, walked down from the row selected: what
-here would be lost? An agent is lossy unless it reports idle or done; a pane is
-lossy when a non-shell command is in its foreground; published background work
-still running counts too. Because the answer is collated from every pane the row
-covers, a workspace asks about the editor three panes down exactly as a pane row
-asks about itself. An idle shell, an idle agent and finished work are not losses,
-so the standard case is not a question: `D` ends the row and the outcome lands in
-the `!` panel.
-
-When the answer is not empty the confirmation names the contents rather than the
-record that holds them — `nvim is running`, `worker-3 is working`, `pi has 2
-background task(s) running` — so the operator reads what dies, not a handle.
-
-A place holding agents ends them the way `D` on their own row ends them: every
-execution inside the container is fenced and signalled before any is waited on, and
-the whole set shares one window — so a workspace with three agents costs one wait,
-not three. Each verified exit is recorded before the place closes, and the branch
-takes one completion window for the set so a reported code is captured while the
-pane carrying its supervisor still exists.
-
-An agent that is still alive when the window closes does **not** hold the deletion.
-The operator named the branch and its contents, so the place closes once, and the
-outcome says whose exit it could not verify rather than claiming an exit that never
-happened. Nothing asks twice, and while the close runs the branch is held: a launch
-or restart that would land inside it is refused `busy` instead of arriving in a place
-about to be removed.
-
-The scope is the row's own. A workspace row closes the workspace container and
-everything recorded inside it; the row a tab is drawn as ends the whole tab, every
-other pane row its own pane; an agent row names a process, so `D` on it is that
-process ending. A row Radar records no container for still ends: its pane is closed
-directly through the runtime. Which of those applies is the daemon's answer for the
-row you selected, never a choice a view makes for it.
-
-A managed agent row with a current lifecycle subject requests daemon cancellation.
-Container closure discovers managed executions from their recorded placements,
-including admitted commands that have not registered an agent or acquired a subject.
-These paths do not send owner-file requests.
-
-A container whose place is no longer served is **forgotten**: its records go and
-nothing is dispatched, because there is nothing left to close. A container whose
-place is still served is refused instead of forgotten around, so no live place is
-orphaned. This is the recovery path for a fleet whose backend was replaced
-underneath it.
-
-The daemon retains request outcomes by request ID. A view never removes a row
-optimistically: the tree follows observations after the operation. Execution exit,
-terminal removal and the program's reported code are separate facts; none is inferred
-from another. The lifecycle status line names unverified exits and uncertain removals.
-Program completion details remain on the request record.
-
-## Presentation
-
-The marks and colours are taken from the tools around Radar rather than
-invented, so a mark means the same thing here as in the sidebar next to it. The
-vendor marks, the title rules and the parked/finished/exited shapes follow the
-agent icon and title conventions Radar was built beside; the semantic states come
-from Herdsman's own status widget, which already draws them:
-
-- Every state has its own **shape**, not only a hue: `⣀`-style frames while an
-  agent works, `◷` waiting on work it depends on, `◐` blocked on its owner,
-  `◌` settling a handoff, `✓` finished, `×` lost, `?` a state the source did not
-  report, `·` parked, `⊘` a finished session. A row's **text carries the same
-  state colour as its mark**, so a glance reads the state without parsing a
-  word. A retained row is the exception: it recedes to second-rank ink and is
-  labelled `retained`.
-- Working, waiting and settling marks move by default. Every state except
-  idle, done and exited can use its own configured animation; `none` keeps
-  its fixed mark. Retained rows never animate.
-- Agents are marked with their vendor glyph and the vendor's own colour where
-  one is published; an agent with no published hue takes the row's ink rather
-  than an invented colour. Green and red stay reserved for done and for a source
-  failure.
-- A live agent whose running executable no longer matches the program `PATH`
-  resolves is marked with a warning glyph in the `stale` colour, and its details
-  name the installed target beside the running package. A current comparison has
-  no verdict at all: the absence of a stale mark is the verdict. A deliberate
-  other build — a checkout or a second installation — has no mark and says
-  `other build`, leaving both roots to the page's block. A process that has gone,
-  or a comparison that could not be made, carries no mark and gives its reason in
-  a word on the Processes page, with the whole sentence in that block.
-- The working row is set in **bold** as well as coloured: weight is the second
-  axis a coloured list needs, and spending it on the lifecycle that is *moving*
-  keeps the finished and parked rows quiet.
-- An agent row reads `name · age · model:thinking · N bg` and drops missing facts,
-  where `N bg` counts the pane's background tasks that are still unresolved.
-  Working, waiting and idle are carried by the mark and colour, not repeated in
-  words; other states keep their label. The details always name the state. The name is a
-  managed worker's runtime label or a lead's session name when Herdsman
-  publishes one, and the reported title otherwise. The age is the active
-  assignment's, so only a worker has one. Everything else — role, definition,
-  assignment text, what the pane is awaiting, background tasks, the full model
-  and provider, context, session name, and the run, request and ask identities —
-  is in the details, with the owner's projected state named there as its own
-  line when Herdsman publishes one.
-- The selected row is filled rather than inverted, so the state colour
-  underneath stays readable.
-- A workspace heading is drawn **bold** in its own `heading` role, so the
-  hierarchy reads before the words do. A terminal cell has no font size —
-  weight and ink are what a heading has to work with. Panel frames and their
-  titles take `border`, which is where a theme usually wants its chrome
-  dimmer than its content.
-- Ownership is drawn as a tree. A child that is followed by a visible sibling
-  carries `├─`, the last child `└─`, and the rows beneath a branch that
-  continues carry `│`. A workspace heading carries no connector. The prefix
-  follows the rows actually drawn — filtering or folding a branch changes it
-  rather than leaving a line behind — and takes the `subtle` ink, with its
-  width part of the row's Unicode-aware fitting. Clicking a branch's disclosure
-  marker folds that branch and sends nothing to the backend; clicking anywhere else
-  on a row selects it, and a second click focuses it.
-- Details sit **beside** the tree, not under it: the tree is a list of short rows
-  and the details are a few long lines, so a column costs the tree less than a
-  stack of rows does. A terminal narrower than 80 columns stacks them instead.
-  `d` hides the panel entirely, which gives the tree the width.
-- The content column runs the full terminal less a two-column gutter. A wider
-  terminal gives the panels width rather than margins.
-
-### Colours
-
-Radar's colours are yours to set (see [Configuration](#configuration)). Nothing
-is fixed in the code: every slot defaults to a **terminal palette name** — one of
-the ANSI slots a terminal theme actually defines — so out of the box Radar wears
-whatever theme the terminal is already using, hand-written or generated. Ratatui
-has no theme abstraction to hook into; the terminal palette is the only thing
-that follows the user.
-
-Vendor colours are the exception: a published brand colour is the brand's, so it
-is a literal `#rrggbb`, and Radar ships the ones it knows. A vendor with no
-published colour takes the palette's own slot rather than an invented hue.
-
-### Motion
-
-`[appearance]` has separate animation settings for `working`, `waiting`,
-`blocked`, `settling`, `lost` and `unknown` (also used for unrecognised states),
-plus `command` for the two marks that mean a process is running — an ordinary
-pane's foreground command, and the mark beside an agent row's running background
-work. Defaults are `pulse`, `clock`, `none`, `orbit`, `none`, `none` and
-`pulse`, respectively.
-Idle, done and exited stay still. The animations are
-single-character frame sequences — `pulse`, `orbit`, `clock`, `moon`, `arc`,
-`classic`, `braille`, `diamond` and others; `radar --print-config` lists them
-all, and `none` is a still mark. `fps` sets the rate for every one of them.
-
-Radar redraws **only while something is animating**, so a quiet fleet costs
-nothing and the rate is what a busy one costs. Frames come from
-[`tui-spinner`](https://crates.io/crates/tui-spinner)'s flux presets — Radar
-draws the marks itself (its rows carry spans, not widgets) and takes the
-vocabulary rather than the widget.
-
-### Panes
-
-`p` cycles which ordinary panes the tree lists, and the hint line names the view
-it is showing:
-
-| View | Lists |
-| --- | --- |
-| `agents` | Only live agents |
-| `running` | Live panes, including idle shells and foreground commands. The default. |
-| `all` | Every pane, including unresolved and finished rows |
-
-The default view waits for conclusive shell or process evidence; unresolved,
-exited and finished rows stay hidden unless explicitly revealed with `p` or `e`.
-A pane an agent already represents is not listed twice. Workspace rows remain
-visible in every view and under text filtering.
-
-Which task children those views list is a choice of its own rather than the pane
-filter: `agents` starts with them hidden, `running` and `all` with every
-unresolved task shown. `b` flips the current view's choice, and each view keeps
-its own answer; [Background-task detail](#background-task-detail-the-bus) has
-the phases and the rest.
-
-A pane row has two mark columns, as an agent row does: what the pane is doing
-now, and what it is. The first moves while a command runs, so a busy pane is
-visibly busy rather than only labelled. The second is the program's own mark
-where Radar has one and the terminal-mode mark where it does not, and a pane with
-nothing running leads with the pane's own mark — so an ordinary pane row is never
-a blank column under a marked agent row:
-
-```
-│    ⣿  nvim notes.md · 5h14m                  a program drawing the pane
-│    ⣿ ❯ nix build .#radar · 4m                a command that will give it back
-│    ▭ zsh                                     a pane nobody is using
-```
-
-A pane's id is not repeated here — it is a location, and the details panel is
-where locations are stated.
-
-`▣` is a program that has taken the terminal over — raw mode, no echo, which is
-what an editor, a pager or an interactive session does — and `❯` is a command
-still using the shell's line discipline, however long it runs. That is the only
-signal the kernel offers for the difference, and it is a heuristic: `ssh`, a
-pager and an editor opened by `git commit` all look full-screen, because all of
-them have taken the terminal over. The details panel spells out which it decided,
-states the duration as `running for`, and — while the evidence is current — names
-the running process's pid.
-
-#### Program marks
-
-The second column carries the program's own mark when Radar knows the program,
-which is what makes an editor, a build or a database client recognisable at a
-glance:
-
-```toml
-[processes]            # keyed by the program a foreground command runs
-"my-editor" = "✎"      # any single character; a Nerd Font glyph is usual
-htop = "none"          # take a built-in mark away
-```
-
-The built-in marks are Nerd Font codepoints, drawn only where a Nerd Font is
-installed: Radar looks for one and falls back to the terminal-mode mark, because
-a terminal without the font shows nothing rather than a mark. `RADAR_ICONS=font`
-asserts the font is there, `text` says it is not. A mark a user sets themselves
-is drawn either way, since a plain character needs no special font — and a
-program that is not listed keeps the mode mark, which is the only thing left to
-say about an unidentifiable process.
-
-The selection is Radar's own and small on purpose. The much larger list in
-[tmux-nerd-font-window-name](https://github.com/joshmedeski/tmux-nerd-font-window-name)
-is the same kind of table, and it declares no licence, so it is not vendored
-here — its entries go into `[processes]` if you want them.
-
-A pane's title is the one it was given, minus a leading provider mark. When the
-only thing the backend has for it is the directory its workspace is named after
-(`~/P/d/nix-fleet` under a `nix-fleet` header), the row shows just the pane id
-rather than repeating the header; a path somewhere else is kept.
-
-### Configuration
-
-Radar reads `$RADAR_CONFIG`, else `$XDG_CONFIG_HOME/radar/config.toml`, else
-`~/.config/radar/config.toml`. The file is optional: without one the built-in
-colours are the configuration. `radar --print-config` prints the configuration
-actually in use, which is the file to copy and edit.
-
-```toml
-# a name from the terminal's palette, an index, or a literal colour
-[colors]
-heading   = "default"     # workspace headings, drawn bold
-border    = "default"     # panel frames and their titles
-subtle    = "dark-gray"   # field names, pane ids
-muted     = "default"     # ordinary text, and the parked mark
-unknown   = "light-magenta"
-done      = "light-green"
-working   = "light-blue"  # for a vendor with no colour of its own
-waiting   = "light-cyan"  # yielded, waiting on work it depends on
-blocked   = "light-yellow" # waiting on its owner: the row to act on
-settling  = "blue"        # a handoff converging, dimmer than working
-retained  = "light-yellow"
-failed    = "light-red"
-stale     = "yellow"      # a live agent whose binary was replaced
-selection = "dark-gray"   # the fill behind the selected row
-
-[brands]                  # a vendor's own colour, literal by nature
-pi     = "#d67079"
-claude = "#d97757"
-
-[appearance]              # how a state's mark moves
-fps      = 10             # frames per second, for every animation
-working  = "pulse"
-waiting  = "clock"
-blocked  = "none"
-settling = "orbit"
-lost     = "none"
-unknown  = "none"
-```
-
-Values are `"default"` (the terminal's foreground), an ANSI name (`"red"`,
-`"light-blue"`, `"dark-gray"`), a palette index (`0`-`255`), or `"#rrggbb"` for a
-colour the theme cannot change. A vendor Radar does not know can be given a
-colour in `[brands]`; the key is the agent name the source reports. A mistyped
-key or colour is reported on startup rather than ignored — and Radar still draws,
-with the built-in colours.
-
-### Marks and the icon font
-
-An optional agent icon font (`Herdr Agent Icons Max`) carries drawn vendor
-logos in the Private Use Area. When that font is present, Radar draws those
-logos; otherwise it falls back to the ordinary-Unicode table (`π`, `§`, `✦`), so
-no row depends on a font being installed. `RADAR_ICONS=font|text|none` overrides
-the detection — `font` is what to set when the font was installed system-wide
-rather than in the user font directory (`$XDG_DATA_HOME/fonts`, else
-`~/.local/share/fonts`).
-
-### Titles and finished sessions
-
-Agents write their mark and name into the terminal title, and the backend keeps
-the last title a pane had after the session is gone. Radar strips a leading provider
-mark or name (`π Lint sweep` → `Lint sweep`, `π - Inspect Bifrost - x` →
-`Inspect Bifrost - x`) — but only at the very start, only with a separator, and
-never when it would empty the title, so `gemini rocks` keeps its words.
-
-A pane that reports no agent while its label is a finished session's title is
-shown as the session it was, greyed, with `exited` as its state:
-
-```
-│    ⊘ π Deploy and verify herdsman model scopes · exited
-```
-
-`⊘` is a state no source reports; the session's own name and vendor mark stay on
-the row, because that name is the only thing linking the pane to the work that
-was done in it. The details then say what the pane is *instead* — `pane now:` and
-its location. If the pane is in use again, it stops being history: the row leads
-with the command in its foreground, and the finished session stays in the
-details.
-
-The backend latches a session title as the pane's **label**, and it survives the
-session: on a fleet that has run many agents, most ordinary panes carry one.
-Those are historical, not running, so they stay out of the default `running` view
-— `e` lists them there anyway, and `e` again hides them.
-
-## Observation and continuity
-
-Radar observes in one of two modes, chosen once before anything is drawn, and
-neither reads agent facts from the backend's own agent records:
-
-- **Through the daemon** (the default), every agent fact comes
-  from the daemon's registry. One refresh reads the daemon's pane inventory,
-  every agent (`subject.list`, paged) and the spawn topology
-  (`spawn.list`), and joins them in one pass, so a frame comes from one moment.
-  A backend's own agent records, display metadata and native agent status are not
-  read for anything the dashboard shows. A daemon that does not declare
-  `registry.v1` and `spawn.v1` fails the refresh with that diagnostic rather
-  than showing a fleet sourced from somewhere else.
-- **No direct mode.** If the daemon is unreachable the dashboard shows a blocking
-  diagnostic and retries. It never falls back to a backend's agent state or to a
-  pane-only tree.
-
-### Where an agent row's facts come from
-
-Each authority is its own channel with its own writer, provenance and freshness,
-so one can expire, be replaced or stay silent without disturbing the others:
-
-- **execution** — what the session reports it is doing (`pi`).
-- **assignment** — what the owner reports it assigned: activity, role,
-  definition, run, the assignment text, what it awaits and the ask it waits on
-  (`herdsman`).
-- **facts** — the session's own model, provider, thinking level, context usage,
-  session name and background tasks (`pi`).
-
-A whole snapshot replaces the previous one, so an omitted field is withdrawn
-rather than remembered, and a channel nobody has published reads `unknown`,
-never `idle`. Freshness is the writer's lease: an expired snapshot reads `stale`
-beside the value it last described, and never silently turns into a current
-state. Waiting, lost and settling are **derived** by the dashboard from
-published facts and freshness, and a derived word never rewrites what a writer
-published: a row can read `waiting` while the execution line still reads `done`,
-and a finished execution never completes the owner's assignment.
-
-### Joining a registration to a pane
-
-A registration joins a pane on its backend-qualified location — `backend`,
-`instance`, workspace, tab and pane — together with the exact birth identity it
-claimed: `boot_id`, `pid` and `start_ticks`, served as `process.claim`. Radar
-samples the birth identity of the pane's own foreground process for itself, and a
-PID alone, a title, a label, an alias and a session UUID never join an agent to a
-pane.
-
-A registration that cannot be joined exactly is shown **unresolved**, with the
-location it last reported: no claim, a mismatched or unreadable process, a pane
-the inventory does not hold, or two registrations on one identity, which is
-ambiguity rather than evidence. An unresolved row owns no pane — it is not
-focused, its controls refuse, and it borrows nothing from the pane it names. A
-registered pane that vanishes from a successful inventory is unresolved, not a
-claimed process exit.
-
-### Protection is not close eligibility
-
-A registration at a pane keeps that pane, and the tab containing it, out of a
-generic unmanaged close, including where its join is unresolved or ambiguous: the
-pane may be someone's agent even where Radar cannot prove whose. Close
-eligibility is a separate and stronger fact, established by a daemon-authored
-spawn edge to that exact child; a registration, a label, a session UUID or a
-metadata flag never makes a target eligible. `D` on a registration is routed to
-the worker's owner where Radar holds a subject for it, and otherwise closes the
-pane the row shows; it never claims an owner it cannot name.
-
-### What is still read from pane metadata
-
-A backend's own agent records and the `pi_herdsman_*` pane tokens are read as
-**physical and containment evidence only**: they keep a pane that has an occupant protected
-while Radar cannot name that occupant. They are never display facts for an agent
-row — a registered row is named by its registration, its label else its agent id,
-and its values come from the channels above. Ordinary panes keep the backend's
-pane title and label, which describe the pane rather than an agent.
-
-### Refresh and continuity
-
-- A refresh runs off the UI thread with at most one in flight. It waits one
-  second between completed refreshes, each command has a five-second timeout, and
-  the registry read of one refresh has a single bounded deadline across its
-  pages. Input and quitting do not wait for a stalled read, and a refresh that
-  finishes past its deadline is never applied.
-- Failed collection preserves the last-good inventory with a **stale** diagnostic.
-  Initial failure is **unavailable**, not an empty fleet. A successful empty
-  snapshot clears the inventory; successful recovery clears the diagnostic. The
-  fleet heading carries the state (`Fleet · current`, `Fleet · STALE`,
-  `Fleet · UNAVAILABLE`), and the selected row's details write the failure out —
-  there is no status line of its own.
-- The **row's state word is the session's activity state**, derived in the
-  contract's order: a live `lost` from the owner wins, work in flight stays in
-  flight, an unknown or unreported execution stays unknown, the owner's
-  `settling` stands over an idle execution, a non-empty union of the owner's
-  awaited items (assignment `awaited`) and the ids of the session's own
-  background tasks (facts `background_tasks`) is `waiting`, and otherwise the
-  reported state stands. The running count takes no part in it, so a session
-  whose tasks have all exited with work unresolved is `waiting` with nothing
-  running, and the details keep the published running count distinguishable from
-  the unresolved set.
-- The owner's **assignment state** is a different fact and is shown as its own
-  labelled detail line (`assignment: settling (owner projection)`) rather than
-  choosing the row's word. It is what a lead's own fleet view names for that
-  worker, and it is written by a different writer at a different cadence: a
-  `settling` or `delivered` projection can be briefly stale, and the row must
-  not contradict the pane because of it. `settling`, `delivered` and `unknown`
-  projections stay reachable in the details.
-- A registration is placed at the workspace and tab its location names, or under
-  an `unplaced` root when it reports none. A registration for another backend or
-  server is never shown, and one that names no pane, or a pane the inventory
-  lacks, is shown only while a publisher holds a live lease or the daemon
-  recorded a spawn edge for it, so a dead agent's record ages out of the tree.
-  `A` creates a workspace named for a chosen project, whatever row is selected.
-  One private picker blocks shared tree input across all views: inline in the
-  dashboard or detached over a compact workspace sidebar. Candidates come from
-  `[projects] source` (default `zoxide query -l`). The picker lists git projects and `Ctrl+g`
-  reveals every directory the source prints (it opens on all when none is a git
-  project). An empty or failed source falls back to `[projects] base`
-  (default home), with a diagnostic. The invoking start directory is not prepended.
-  `L` immediately launches the configured `[agents] launch_command` argv (default `["pi"]`) as a managed agent in a new tab of the selected place's workspace — from a pane it opens its own window rather than splitting that pane — and it uses the selected pane's directory (or the workspace's) and starts the resolved command through the user's login/interactive shell, applying the target directory's direnv environment without copying the TUI's environment. Use `a` to add an empty shell for arbitrary commands. A lead started with `L` is enrolled as a lifecycle subject when it registers, so it can be stopped and restarted; `E` enrolls any other registered lead after a confirmation.
-  Enter on a row focuses it; with no tmux client attached it opens a terminal
-  attached to the server (`[tui] terminal`, else `$TERMINAL -e`) and asks again. Children are not nested under their
-  parent: the exact spawn edge is shown in the details. An ordinary pane never
-  duplicates a current or retained agent row.
-- Radar does not read Herdsman mailboxes, does not treat a backend's agent name or
-  title as a Herdsman fact, and never infers ownership from tab position or from
-  the human session name — ownership is exact session identity.
-- When an agent disappears but its pane remains, Radar keeps its last observation
-  **in memory**, visibly retained rather than current. Foreground evidence for
-  the pane distinguishes a shell from a positively identified replacement
-  command using the process's own PID and birth identity; inconclusive evidence
-  leaves the association unverified.
-- A new reported agent replaces the old association. Positive non-shell evidence
-  or a successful snapshot proving pane loss clears it. Retained facts are
-  last-observed, not current status or historical outcomes. Restarting Radar clears
-  them; it has no durable history.
-
-Polling is best effort: inventory and process reads are not atomic, short
-commands between polls can be missed, and foreground confirmation can lag by two
-refresh cycles. Continuity across backend restarts or session moves is not promised.
-
-## Background-task detail (the bus)
-
-The `pi_bg_*` pane tokens summarize background-task state but cannot carry
-the task detail, so `pi-bash-processes` publishes full snapshots. The daemon
-owns that ingest and exposes volatile detail through `tasks.list.v1`; the TUI
-never listens to publisher connections. Until the publisher migrates, the daemon
-accepts its existing line protocol on a temporary compatibility socket path
-(`$RADAR_SOCKET`, else `$XDG_RUNTIME_DIR/agent-radar/radar.sock`, else
-`/tmp/agent-radar-<uid>/radar.sock`). This entry shares transport and task state
-with the versioned control socket. Reading tasks does not acknowledge, settle
-or consume anything; `pi-bg get` remains the retrieval path. See
-[`docs/radar-bus.md`](docs/radar-bus.md) and its
-[`docs/radar-bus.fixture.json`](docs/radar-bus.fixture.json) for the protocol.
-
-A publisher task list joins an agent row only by the exact Pi session UUID
-reported by that row. The optional `pane` in a legacy publisher `hello` is not a
-join fallback. Nothing else joins task detail — not pane, cwd, title or human
-session name. A connected session with no matching agent row remains in the
-daemon snapshot but is not attached to another row.
-
-One projection decides what a row's tasks are, and the task rows, the `N bg`
-badge and the details all read that same projection, so they cannot disagree. A
-matched publisher's list is authoritative, an **empty list included** — the pane's
-own `pi_bg_tasks` ids are never unioned into it. They are the fallback for a row with no connected publisher for its exact
-session, and each of those rows is marked `tokens`, or `last-observed` when the
-agent itself is retained. A row a publisher speaks for
-shows the publisher's phase word, and when `pi_bg_running` disagrees the panel
-says so instead of choosing. Since the token counts only `running` tasks, only
-those are compared with it. A phase word Radar does not know is shown as
-published.
-
-Each unresolved task is a selectable row beneath its agent, labelled with its
-published command or, without one, its id, then the phase as published, the age
-its published start time implies, and the program's mark from the configured
-`[processes]` table where the command names one. Whether those rows are listed
-is a per-view choice: `agents` starts hidden, `running` and `all` start shown,
-and `b` toggles the current view alone — the pane view, the finished-session
-toggle, branch folds and the `N bg` badge are untouched. `running` and `all`
-list every unresolved task whatever phase it published, including `flushing`,
-`review`, a word Radar does not know and none at all: the processes view is a
-view of outstanding work, not a claim that a task's process is still alive. The
-rows read the current projection whenever they are shown, so a list that arrived
-while they were hidden is what appears. A task hidden under the selection falls
-back to its owner row, which is still there to be read from.
-
-A task's identity is its owner row, the session its facts were reported in,
-and its task id — never the command, and never the id alone, because ids are
-reused between panes and between successive sessions in one pane. The same id
-under a new session is therefore a different task, and a selection does not
-follow it: it falls back to the agent row above it. A task row is a leaf: it
-cannot be folded, and it has no disclosure control. `Enter` or a second click on
-it focuses its owner's pane through the same focus action, with the same refusal
-when that location is stale or no longer observed, because a task is read
-through the pane its owner row names and is never consumed or controlled.
-
-Selecting a task shows its own panel: its id, phase and source basis, and —
-where the publisher sent them — its command, working directory, process id,
-start, last output, output size and exit code. The owner's panel states the same
-facts on its per-task line, drawn from the same projection, so the rows, the
-parent's `N bg` count and both panels cannot disagree. A fact the publisher did
-not send draws nothing: absent is not a zero, and a `tokens` row shows only the
-id and phase its pane published. A state word this Radar does not know is shown
-as written. `command` and `cwd` are the sensitive fields: both are sanitized and
-bounded to 256 characters where they reach the screen, and are never written to
-a file, the configuration or a log. Task rows move only while their source
-reports the process alive now: a `running` word on a `last-observed` row is
-stated and stays still.
-
-Task data lives in daemon memory only while its publisher connection is active. A disconnect removes that session's entry immediately and the row falls back to its token facts, because a gone publisher is not evidence that its tasks ended. An explicit empty list is different: the publisher is connected and reports nothing unresolved, which the details state in words.
-
-Publisher ingest is a daemon service, separate from registry and inventory
-freshness. If it cannot bind its compatibility socket or is otherwise
-unavailable, `tasks.list` reports that diagnostic; the TUI keeps the rest of the
-daemon-backed fleet visible and labels task detail `· bus off`.
-
-## Layout and verification
-
-One Cargo package, with `radar` as its binary:
-
-- `src/main.rs`: terminal lifecycle and event loop.
-- `src/runtime.rs` / `src/tmux.rs`: the runtime seam and its tmux adapter.
-  Collection asks the seam for a normalized inventory and per-pane foreground
-  evidence, and focus asks it to move to a normalized workspace or pane target;
-  the adapter owns tmux's executable, server selection, format strings, wire
-  decoding and the bounded runner that kills and reaps a stalled command.
-  Managed-agent lifecycle controls go through the daemon's semantic lifecycle
-  methods; they do not use the in-process adapter or an owner-file request.
-- `src/collector.rs`: the refresh schedule the daemon's sampler drives. One
-  refresh in flight at a time on its own thread, cancellation that abandons
-  rather than waits, the assignment-age stamp taken once per refresh, and the
-  local `/proc` facts composed into the evidence the adapter returned. Sources
-  fail independently: an inventory error is a stale fleet that keeps the
-  last-good inventory, a registry error is reported as the registry and leaves
-  the fleet standing, and unreadable foreground evidence is inconclusive rather
-  than proof that a pane went away.
-- `src/control_plane/observation.rs`: the daemon's one observation sampler and
-  the immutable revisioned snapshot every reader shares. It samples only while a
-  reader or active TUI attachment has asked, and publishing appends nothing to the journal.
-- `src/ui_session/publication.rs` and `src/ui_session/client.rs`: observation,
-  tree and UI-session payloads adopted under one coherent push head. The TUI
-  collects nothing itself and has no parallel observation-fetch connection.
-- `src/content.rs`: shared bounded MessagePack encoding, XXH3-128 content,
-  immutable byte retention and segmented framing; no UI-domain dependencies.
-- `src/bus.rs` and `src/control_plane/ingest.rs`: publisher protocol decoding and daemon-owned volatile task ingestion; `src/control_plane/transport/` provides the shared bounded socket runtime.
-- `src/model.rs` / `src/observation.rs`: normalized facts and reconciliation.
-- `src/config.rs` / `src/theme.rs`: the colours, where they come from, and the
-  vocabulary they paint (state marks, vendor icons, title rules).
-- `src/tree.rs` / `src/app.rs` / `src/ui.rs` / `src/title.rs`: projection,
-  interactions, rendering and title normalisation.
-- `src/focus.rs`: the focus worker run off the calling thread, its cancellation
-  and message plumbing, and what `Enter` sends. The two transports behind it
-  belong to the adapter.
-- `src/lifecycle.rs`: the containment policy the daemon and the views share.
-  Every lifecycle action itself — close, restart, cancellation — is the daemon's.
-- `src/timestamp.rs`: the contract's ISO 8601 timestamp parsed to Unix milliseconds.
-- `tests/`: sanitized fixtures, fake-executable and stub-socket transport
-  checks at the adapter, collector and focus tests against an in-memory
-  runtime, bus listener and detail-join tests against a stub publisher, and
-  a focused PTY check that also connects one to the running dashboard, plus
-  `tests/tmux_acceptance.py`, which runs the dashboard against a disposable
-  daemon on a disposable tmux server and asserts the registry-backed rows. No
-  real tmux server is modified by these tests, and no real lifecycle request is
-  written.
-
-`Cargo.lock` and `flake.lock` record reproducible dependency versions. The approved
-scope and task list are in
-[`openspec/changes/archive/2026-10-06-initial-fleet-overview/`](openspec/changes/archive/2026-10-06-initial-fleet-overview/).
-
-Manual acceptance: run `cargo run --locked` against your tmux server. Check the
-workspace inventory, cycle the pane views, navigate/fold/filter, show and hide the
-details, and inspect location, ownership, freshness and unavailable metadata.
-Press `Enter` on an agent row, a workspace row and a retained row, and confirm
-the focus lands where the row says; then the same with tmux stopped, which
-must leave Radar usable and say why on the last line. Real
-runtime/UX acceptance is deliberately manual; automated checks use controlled
-fixtures and executables.
-
-The local control plane now wraps backend-neutral physical mux observations and
-primitives (focus, guarded unmanaged close, creation, literal input, bounded
-output reads and curated metadata reporting); tmux is the only backend. This does not add agent/session authority, a publisher registry, inferred
-resume/restart, topology, or a production tmux backend. Managed-worker close and
-restart remain requests to the worker's owner, not mux operations. The daemon's
-[protocol reference](docs/control-plane.md) documents capabilities, durable
-operation records, uncertainty and extension-porting examples.
-
-## Logs
-
-The daemon logs to stderr, which its user unit sends to the journal (`journalctl --user -u radar-daemon`). The dashboard owns the terminal, so it logs to `tui.log` beside the daemon's state directory (by default `~/.local/state/agent-radar/tui.log`, started afresh past 2 MiB). The footer shows one line cut with an ellipsis; a failure stays until `c`, and the whole text is in the log. `RADAR_LOG` takes a filter such as `debug`. Log lines carry identifiers and outcomes, never a command or an environment.
+| [Dashboard reference](docs/dashboard.md) | Keys, mouse, detail pages, marks, colours, configuration |
+| [Managed execution](docs/managed-execution.md) | Scopes, admission, stopping, completion |
+| [How Radar observes a fleet](docs/observation.md) | Where each fact comes from, stale and missing data, background tasks |
+| [Process evidence](docs/process-evidence.md) | The Processes page: identity, installed-binary comparison, measurement |
+| [Daemon guide](docs/daemon.md), [protocol](docs/control-plane.md), [mux contract](docs/mux.md) | Building against the daemon |
+| [Development](docs/development.md) | Building, testing, source layout, logs |
+| [ideas.md](ideas.md) | Deferred functionality and options |
+
+Logs: the daemon logs to the journal (`journalctl --user -u radar-daemon`); the
+dashboard logs to `~/.local/state/agent-radar/tui.log`.
