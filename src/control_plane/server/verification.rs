@@ -423,6 +423,17 @@ pub(super) fn bounded_foreground(
     )
 }
 
+/// The caller's reason for closing the pane, which decides what "gone" has to
+/// mean before it is.
+pub(super) enum CleanupIntent {
+    /// A cancel or a close ends the launch, so its pane goes once the process is
+    /// verified gone.
+    Close,
+    /// A withdrawal of a launch that never presented, which leaves only the pane
+    /// the launch built for itself.
+    Retire,
+}
+
 /// Closes the pane an unbound launch left behind, fenced to the very instance
 /// that created it, and records what happened as that launch's own durable fact.
 ///
@@ -432,15 +443,9 @@ pub(super) fn bounded_foreground(
 /// edge. Anything less leaves the pane to the operator and says why. This reports
 /// a cleanup, never a process exit.
 ///
-/// Only a cleanup that was dispatched is recorded: a confirmed close, a backend
-/// refusal and an unanswered dispatch are each durable facts of the launch. An
-/// eligibility refusal dispatches nothing, so it records nothing and a later
-/// admitted cancel re-decides it against the evidence it finds.
-pub(super) enum CleanupIntent {
-    Close,
-    Retire,
-}
-
+/// A refusal is recorded like a dispatch: it says nothing was closed and why, and
+/// the first outcome stands. A later admitted cancel re-decides eligibility
+/// against the evidence it finds only when nothing was recorded at all.
 pub(super) fn cleanup_launch_pane(
     core: &Arc<Mutex<Core>>,
     backend: &Arc<dyn RuntimeProvider>,
@@ -455,7 +460,16 @@ pub(super) fn cleanup_launch_pane(
         let core = locked(core);
         (Arc::clone(&core.registry), Arc::clone(&core.verifier))
     };
-    let claim = subjects::read(&registry, key).ok()??;
+    let claim = match subjects::read(&registry, key) {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return None,
+        // A record that cannot be read is not an absence: nothing is dispatched
+        // on evidence this daemon could not check, and the reason says so.
+        Err(error) => {
+            let refusal = format!("the launch record could not be read: {error}");
+            return Some(PaneCleanup::Refused(refusal));
+        }
+    };
     if let Some(cleanup) = claim.process.pane_cleanup {
         return Some(cleanup);
     }
@@ -471,7 +485,7 @@ pub(super) fn cleanup_launch_pane(
             "the execution's serving generation is no longer current".into(),
         ));
     }
-    subjects::await_completion(&registry, key);
+    subjects::await_completion(&registry, &claim.process.registration_id);
     let inventory = match bounded_inventory(
         backend,
         stopping,
@@ -558,7 +572,7 @@ pub(super) fn reusable_pane(
     if serving_identity(backend, &verifier, stopping, budget).as_ref() != Some(&instance) {
         return None;
     }
-    subjects::await_completion(&registry, key);
+    subjects::await_completion(&registry, &claim.process.registration_id);
     let inventory = bounded_inventory(
         backend,
         stopping,

@@ -398,11 +398,19 @@ fn subject_plan(
     };
     let action = match operation {
         crate::app::Operation::Restart => DomainAction::Restart(subject),
-        _ => DomainAction::Close(lifecycle::CloseRequest {
+        crate::app::Operation::Close => DomainAction::Close(lifecycle::CloseRequest {
             identity: lifecycle::identity(inventory, &target),
             target,
             execution: Some(subject),
         }),
+        // A row that holds a lifecycle subject is never the target of a mutation
+        // that does not act on an execution, so this is a caller bug, not a
+        // default.
+        crate::app::Operation::CreateContainer
+        | crate::app::Operation::ReloadContainer
+        | crate::app::Operation::PresenceStatus => {
+            return Err(format!("{described} cannot be {operation:?}"));
+        }
     };
     Ok(Plan {
         effect: Effect::Domain(Box::new(Command::new(REQUESTER, action))),
@@ -568,9 +576,15 @@ pub(crate) fn launch_plan(
     if spec.shell.trim().is_empty() {
         return Err("SHELL is unset; set it to fish, bash, or zsh".into());
     }
+    if spec
+        .command
+        .first()
+        .is_none_or(|program| program.trim().is_empty())
+    {
+        return Err("the configured launch command is empty".into());
+    }
     let path = spec.path.as_deref().map(std::ffi::OsStr::new);
-    let recipe =
-        crate::topology::target_shell_recipe(&spec.command, &spec.shell, path, directory.as_str())?;
+    let shell = crate::topology::launch_shell(&spec.shell, path)?;
     Ok(Plan {
         effect: Effect::Domain(Box::new(Command::new(
             REQUESTER,
@@ -587,7 +601,7 @@ pub(crate) fn launch_plan(
                         cwd: Some(directory.clone()),
                         env: Default::default(),
                     },
-                    shell: recipe.command().executable.clone(),
+                    shell,
                 }),
             },
         ))),

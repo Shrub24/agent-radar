@@ -687,12 +687,13 @@ fn bind_locked(
     Ok(edge)
 }
 
-/// Every recorded edge, in stable request-id order.
+/// Decodes every recorded edge, which is what a daemon does before it serves.
 /// Fails naming the file of the first edge that does not decode.
 pub(super) fn verify(registry: &Registry) -> Result<(), String> {
     edges(registry).map(drop)
 }
 
+/// Every recorded edge, in stable request-id order.
 fn edges(registry: &Registry) -> Result<Vec<SpawnEdge>, String> {
     let directory = registry.spawns();
     let entries = fs::read_dir(&directory).map_err(|error| format!("spawns: {error}"))?;

@@ -15,7 +15,7 @@ criteria are satisfied, not merely that a helper exists or a suite passes.
 - [x] 2.1 Share termination through verified process/scope evidence and a shutdown window. Deadline escalation uses `lifecycle::escalate`; an unreadable scope prevents group escalation, not a fenced process TERM. Zombies are not live processes.
 - [x] 2.2 Compose termination, completion capture and generation-fenced pane removal in one domain Close (`places::close_place`). Live: `mux.close` of an admitted agent's pane ends its scope, records the signal and removes only that pane.
 - [x] 2.3 Route cancel, parent/child close, expiry and revoked-launch cleanup through that composition, preserving authorization and replay. Audited against production callers: child close runs `close_place`; cancel and restart run the shared termination then `cleanup_launch_pane`; expiry and revoked-launch withdrawal (`sweeper::withdraw_unpresented`) call the same `cleanup_launch_pane`. All removals end in `places::remove_place` with the serving-generation fence; authorization stays with each caller.
-- [x] 2.4 Publish typed close outcomes across all close adapters. Cancel/stop, `topology.delete`, `mux.close` and child close all carry `closed`.
+- [x] 2.4 Publish typed close outcomes across all close adapters. Cancel/stop, `topology.delete`, `mux.close` and child close all carry `closed`, and it reports one entry per execution the close addressed (`executions`, wire 16) rather than one verdict for the whole target.
 
 ## 3. Recursive container closure
 
@@ -44,3 +44,19 @@ criteria are satisfied, not merely that a helper exists or a suite passes.
 
 - Sync predecessor UI and managed lifecycle/topology specs in dependency order before archive; strict validation is not proof that the archive baseline is ready.
 - Archive only after implementation, consumer coordination and live acceptance. Interrupted-operation recovery, lead inheritance, pane gathering, all-shell scopes and configurable/manual escalation remain deferred.
+
+## 7. Review follow-ups (2026-11-06)
+
+Raised by a full review pass over this change and fixed before release.
+
+- [x] 7.1 Withdraw a reservation that records no spawn edge, keyed on the claim: the sweeper pages `unclaimed`, and a refused create or launch abandons its reservation in the same request. A configured `L` or container reload that never presented left a pending claim that no path resolved.
+- [x] 7.2 Delete the guarded direct-close policy (`Closer`, `close_unmanaged`, `guard`, `registrations_in`, `registered_within`, `DirectClose`). It had no production caller and contradicted the daemon-owned close.
+- [x] 7.3 Report every execution a close addressed, per execution, with its own end and completion. A place closing over survivors said which ones, not just that some were unverified.
+- [x] 7.4 Name the two execution lookups for what they take (`process_of_claim`, `process_of_registration`), and make `record_exit`, `await_completions` and `still_running` take the record they act on instead of a key that could be either.
+- [x] 7.5 Stop losing a cleanup reason: a launch record that cannot be read refuses with that reason instead of reporting "the launch records no pane of this daemon's".
+- [x] 7.6 Hold the closing place before its inventory is read, so an admission cannot land in a branch already being torn down.
+- [x] 7.7 Name the still-running program from its launch record, not from `/proc/<pid>/comm`, which reports whatever holds that pid now.
+- [x] 7.8 Remove `managed_scope::kill` (no deadline, no callers), fix doc comments attached to the wrong items, and make a row operation's match exhaustive instead of defaulting to Close.
+- [ ] 7.9 Typed identity for claim/subject/registration ids. Attempted and reverted: it is a staged change of its own (domain types, then interfaces, then wire DTOs), not a review fix. See `context/lifecycle.md`, "Identity stays a string at the wire".
+- [ ] 7.10 Pane reuse records a create that never happened: the edge's creation outcome says `Completed` for a pane the restart reused. Needs a provenance value on the reuse path.
+- [ ] 7.11 `a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart` is flaky on its real-time windows. The fix is an injectable `Shutdown` duration, not a wider window: widening it would hide the timing property the test exists to check.

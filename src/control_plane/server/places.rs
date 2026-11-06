@@ -232,7 +232,7 @@ pub(super) fn close_place(
     cancel: &Arc<AtomicBool>,
     verification: &Arc<VerificationBudget>,
 ) -> Result<subjects::ClosedExecution, String> {
-    use subjects::{ClosedExecution, ExecutionEnd};
+    use subjects::ClosedExecution;
     let (registry, verifier, closing) = {
         let core = locked(core);
         (
@@ -241,6 +241,10 @@ pub(super) fn close_place(
             Arc::clone(&core.closing),
         )
     };
+    let target = &frozen.target;
+    // The place is held before it is read: an admission between this read and the
+    // close would otherwise be accepted into a branch already being torn down.
+    let mut held = vec![closing.begin(std::iter::once(target_handle(target)))];
     let inventory = bounded_inventory(
         backend,
         cancel,
@@ -248,7 +252,6 @@ pub(super) fn close_place(
         Instant::now() + VERIFICATION_TIMEOUT,
     )
     .map_err(|()| "fresh inventory is unavailable".to_string())?;
-    let target = &frozen.target;
     let instance = serving_identity(backend, &verifier, cancel, verification);
     let panes: Vec<_> = inventory
         .panes
@@ -260,32 +263,24 @@ pub(super) fn close_place(
         })
         .map(|pane| pane.location.pane_id.clone())
         .collect();
-    let _held = closing.begin(std::iter::once(target_handle(target)).chain(panes));
+    held.push(closing.begin(panes));
     let inside = instance
         .as_ref()
         .map(|instance| executions_inside(&registry, target, instance, &inventory))
         .unwrap_or_default();
-    let keys: Vec<_> = inside
+    let targets: Vec<subjects::ExecutionRef> = inside
         .iter()
-        .map(|placed| placed.registration_id.clone())
+        .map(|placed| subjects::ExecutionRef {
+            registration_id: placed.registration_id.clone(),
+            subject_id: placed.subject_id.clone(),
+        })
         .collect();
-    let ended = subjects::cancel_many(&registry, &keys, verifier.as_ref(), store::now_ms());
+    let ended = subjects::cancel_many(&registry, &targets, verifier.as_ref(), store::now_ms());
+    let keys: Vec<_> = targets
+        .iter()
+        .map(|target| target.registration_id.clone())
+        .collect();
     subjects::await_completions(&registry, &keys);
-    let completion = if keys.len() == 1 {
-        subjects::read_process(&registry, &keys[0])?.and_then(|process| process.completion)
-    } else {
-        None
-    };
-    let execution = if keys.is_empty() {
-        ExecutionEnd::NotApplicable
-    } else if ended.survivors.is_empty() {
-        ExecutionEnd::Exited
-    } else {
-        ExecutionEnd::Unverified(format!(
-            "exit not verified for {}",
-            ended.survivors.join(", ")
-        ))
-    };
     let resource = remove_place(
         core,
         backend,
@@ -295,9 +290,8 @@ pub(super) fn close_place(
         instance.as_ref(),
     );
     Ok(ClosedExecution {
-        execution,
+        executions: ended.ended,
         resource: Some(resource),
-        completion,
         escalated: ended.escalated,
     })
 }
@@ -1018,12 +1012,10 @@ pub(super) fn run_container_delete(
         Err(reason) => return write_refused(record, &reason, core),
     };
     let settled = match &closed.resource {
-        Some(subjects::ResourceEnd::Kept(reason)) => {
-            record.complete(
-                Settlement::backend_refused(reason).closed(closed),
-                store::now_ms(),
-            )
-        }
+        Some(subjects::ResourceEnd::Kept(reason)) => record.complete(
+            Settlement::backend_refused(reason).closed(closed),
+            store::now_ms(),
+        ),
         Some(subjects::ResourceEnd::Unverified(reason)) => record.complete(
             Settlement::backend_unknown(reason).closed(closed),
             store::now_ms(),
@@ -1041,14 +1033,11 @@ pub(super) fn run_container_delete(
             }
             // The close is the runtime's confirmation that it removed the place,
             // not a re-observation of it, and the removals are the daemon's own
-            // records: neither claims anything about a process.
-            let ended = match &closed.execution {
-                subjects::ExecutionEnd::Unverified(reason) => format!("; {reason}"),
-                _ => String::new(),
-            };
+            // records: neither claims anything about a process. What became of
+            // each execution is the close report's own answer.
             let note = if failures.is_empty() {
                 format!(
-                    "{} was closed by the runtime{ended}; {} container record(s) marked removed",
+                    "{} was closed by the runtime; {} container record(s) marked removed",
                     frozen.target.description(),
                     removed.len()
                 )

@@ -465,36 +465,60 @@ impl From<crate::runtime::CloseOutcome> for PaneCleanup {
 
 /// What one close established, in parts that answer different questions.
 ///
-/// Whether the execution ended, what became of the pane that hosted it, and — when
-/// a supervisor reported it — how the program ended. A reader takes the part it
-/// needs; nothing here has to be recovered from prose, and no part is inferred
-/// from another. In particular a removal that completed says nothing about the
-/// program's code, and a verified exit says nothing about the pane, which for a
-/// spontaneous exit is deliberately retained.
+/// Which executions ended and how, what became of the pane or place that hosted
+/// them, and — when a supervisor reported it — how each program ended. A reader
+/// takes the part it needs; nothing here has to be recovered from prose, and no
+/// part is inferred from another. In particular a removal that completed says
+/// nothing about a program's code, and a verified exit says nothing about the
+/// pane, which for a spontaneous exit is deliberately retained.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClosedExecution {
-    pub execution: ExecutionEnd,
+    /// One entry per execution this close found and addressed, in the order it
+    /// addressed them. Empty when the target hosted none: a close of a place is
+    /// never reported as one execution's outcome.
+    pub executions: Vec<EndedExecution>,
     /// Absent when the operation removes nothing: a stop ends the process and
     /// leaves the pane where it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<ResourceEnd>,
-    /// How the program ended, when the process supervising it reported. Absent
-    /// means the code was not available, never that none exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion: Option<Completion>,
     /// Whether escalation was attempted after the graceful window. This is not
-    /// proof that SIGKILL succeeded; `execution` carries the verified outcome.
+    /// proof that SIGKILL succeeded; each execution carries its own outcome.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub escalated: bool,
+}
+
+/// One execution this close addressed, and what became of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EndedExecution {
+    /// The logical agent this execution ran as, when one is recorded. A directly
+    /// admitted command has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    /// The process incarnation, which every recorded execution has.
+    pub registration_id: String,
+    pub end: ExecutionEnd,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<Completion>,
+}
+
+impl EndedExecution {
+    /// How a reader names this execution: its agent when it has one, otherwise
+    /// the process it ran as.
+    pub fn name(&self) -> &str {
+        self.subject_id
+            .as_deref()
+            .unwrap_or(&self.registration_id)
+            .get(..8)
+            .unwrap_or_default()
+    }
 }
 
 /// Whether the execution this close addressed is known to have ended.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "state", content = "reason")]
 pub enum ExecutionEnd {
-    /// The target hosted no managed execution.
-    NotApplicable,
     /// The captured process was verified gone.
     Exited,
     /// What happened to it could not be established, and this says why.
@@ -1430,17 +1454,11 @@ const COMPLETION_GRACE: Duration = Duration::from_millis(500);
 /// The report is what carries the code, and the supervisor is what sends it, so a
 /// close that removes the pane first can destroy it. The wait never becomes a
 /// claim to have one: an absent report is a diagnostic, not a blocker.
-pub fn await_completion(registry: &Registry, key: &str) -> Option<Completion> {
-    let until = std::time::Instant::now() + COMPLETION_GRACE;
-    loop {
-        let reported = process_for_control(registry, key)
-            .ok()
-            .and_then(|process| process.completion);
-        if reported.is_some() || std::time::Instant::now() >= until {
-            return reported;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+pub fn await_completion(registry: &Registry, registration: &str) -> Option<Completion> {
+    await_completions(registry, std::slice::from_ref(&registration.to_string()));
+    process_of_registration(registry, registration)
+        .ok()
+        .and_then(|process| process.completion)
 }
 
 /// Waits, boundedly, for the supervisor's report of every execution in one place.
@@ -1448,11 +1466,11 @@ pub fn await_completion(registry: &Registry, key: &str) -> Option<Completion> {
 /// One window for the whole set, not one per member: a branch of five agents must
 /// not pay five graces before its root is removed, and the reports are all on their
 /// way at the same time. Reads the records only: nothing here dispatches.
-pub fn await_completions(registry: &Registry, keys: &[String]) {
+pub fn await_completions(registry: &Registry, registrations: &[String]) {
     let until = std::time::Instant::now() + COMPLETION_GRACE;
     loop {
-        let outstanding = keys.iter().any(|key| {
-            process_for_control(registry, key)
+        let outstanding = registrations.iter().any(|registration| {
+            process_of_registration(registry, registration)
                 .is_ok_and(|process| process.identity.is_some() && process.completion.is_none())
         });
         if !outstanding || std::time::Instant::now() >= until {
@@ -1617,7 +1635,7 @@ pub fn release_if_gone(
     use crate::control_plane::registry::process::{ProcessVerification, verify_identity};
     match verify_identity(holder.process.identity.as_ref(), verifier) {
         ProcessVerification::Absent | ProcessVerification::Mismatched => {
-            record_exit(registry, &holder.claim_id, now_ms)?;
+            record_exit(registry, &holder.process, now_ms)?;
             Ok(true)
         }
         ProcessVerification::Verified | ProcessVerification::Unavailable => Ok(false),
@@ -1799,8 +1817,9 @@ fn stop_and_release(
     // no process to stop.
     let stopped = match cancel(registry, &claim.claim_id, verifier, now_ms)?.exit {
         Exit::Exited => true,
-        Exit::Unresolved => read(registry, &claim.claim_id)?
-            .is_some_and(|claim| claim.process.identity.is_none()),
+        Exit::Unresolved => {
+            read(registry, &claim.claim_id)?.is_some_and(|claim| claim.process.identity.is_none())
+        }
         Exit::Unverified(_) => false,
     };
     if !stopped || !cleanup(&claim.claim_id)? {
@@ -1875,7 +1894,11 @@ pub fn withdraw_unclaimed(
 /// The claims a withdrawal pass considers: every reservation whose deadline
 /// passed and which nothing attached. Paged like the exit sweep, so a fleet larger
 /// than one page is covered over successive passes.
-pub fn unclaimed(registry: &Registry, after: Option<&str>, now_ms: i64) -> (Vec<String>, Option<String>) {
+pub fn unclaimed(
+    registry: &Registry,
+    after: Option<&str>,
+    now_ms: i64,
+) -> (Vec<String>, Option<String>) {
     let ids: Vec<String> = {
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
         log.ids()
@@ -1883,12 +1906,8 @@ pub fn unclaimed(registry: &Registry, after: Option<&str>, now_ms: i64) -> (Vec<
                 log.facts(id).is_some_and(|facts| {
                     withdrawal(facts.execution.state, &facts.execution.recorded_at, now_ms)
                         .is_some()
-                        && !released(
-                            registry,
-                            facts.attachment.subject_id.as_deref(),
-                            id,
-                        )
-                        .unwrap_or(false)
+                        && !released(registry, facts.attachment.subject_id.as_deref(), id)
+                            .unwrap_or(false)
                 })
             })
             .cloned()
@@ -1920,8 +1939,14 @@ pub fn withdraw_unpresented(
     if edge.withdrawn.is_some() {
         return Ok(None);
     }
-    let Some(reason) =
-        withdraw_locked(registry, &claim_id, Some(&edge.recorded_at), verifier, now_ms, &mut cleanup)?
+    let Some(reason) = withdraw_locked(
+        registry,
+        &claim_id,
+        Some(&edge.recorded_at),
+        verifier,
+        now_ms,
+        &mut cleanup,
+    )?
     else {
         return Ok(None);
     };
@@ -2316,7 +2341,7 @@ fn await_escalation(scope: &crate::managed_scope::VerifiedScope, shutdown: &Shut
 /// unreadable scope is reported as still running: nothing about it is inferred.
 fn await_end(
     registry: &Registry,
-    key: &str,
+    process: &ProcessRecord,
     descriptor: Option<&std::os::fd::OwnedFd>,
     scope: Option<&crate::managed_scope::VerifiedScope>,
     note: Option<&str>,
@@ -2330,18 +2355,18 @@ fn await_end(
         None => Vec::new(),
     };
     if exited && survivors.is_empty() {
-        record_exit(registry, key, now_ms)?;
+        record_exit(registry, process, now_ms)?;
         return Ok((Exit::Exited, false));
     }
     let Some(scope) = scope else {
-        return Ok((still_running(registry, key, note), false));
+        return Ok((still_running(Some(process), note), false));
     };
     let escalated = escalate(scope, shutdown);
     if escalated.emptied {
         // An emptied, verified group is the evidence that nothing which ran there
         // still runs — including when the pidfd of the process that started it
         // never reported, which is what a zombie or an unreaped child looks like.
-        record_exit(registry, key, now_ms)?;
+        record_exit(registry, process, now_ms)?;
         return Ok((Exit::Exited, true));
     }
     Ok((
@@ -2356,12 +2381,19 @@ fn await_end(
 
 /// What a signalled execution that outlived the window is reported as, named by
 /// the kernel's own word for it rather than by anything the daemon stores.
-fn still_running(registry: &Registry, key: &str, note: Option<&str>) -> Exit {
-    let name = process_for_control(registry, key)
-        .ok()
-        .and_then(|process| process.identity)
-        .and_then(|identity| fs::read_to_string(format!("/proc/{}/comm", identity.pid)).ok())
-        .map(|name| name.trim().to_string())
+fn still_running(process: Option<&ProcessRecord>, note: Option<&str>) -> Exit {
+    // The name comes from the launch's own record, not from `/proc`: this text
+    // names what the daemon could not end, and reading a pid's current command
+    // would report whatever holds that pid now.
+    let name = process
+        .map(|process| {
+            Path::new(&process.launch.executable)
+                .file_name()
+                .map_or_else(
+                    || process.launch.executable.clone(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+        })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "process".to_string());
     match note {
@@ -2374,14 +2406,14 @@ fn still_running(registry: &Registry, key: &str, note: Option<&str>) -> Exit {
 /// scope, and the exit it establishes.
 fn terminate(
     registry: &Registry,
-    subject_id: &str,
+    execution: &str,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
     revoked: bool,
     shutdown: &Shutdown,
 ) -> Result<Termination, String> {
     let (descriptor, signal, scope, note) =
-        match stage(registry, subject_id, verifier, now_ms, shutdown)? {
+        match stage(registry, execution, verifier, now_ms, shutdown)? {
             Stage::Settled(exit) => {
                 return Ok(Termination {
                     revoked,
@@ -2397,6 +2429,9 @@ fn terminate(
                 scope_note,
             } => (descriptor, signal, scope, scope_note),
         };
+    // The record the exit is written against, read once the signal intent is
+    // known: `stage` already established that the identity has not moved.
+    let process = process_by(registry, execution)?;
     let mut signal_attempted = false;
     if signal {
         signal_attempted = true;
@@ -2411,7 +2446,7 @@ fn terminate(
     }
     let (exit, escalated) = await_end(
         registry,
-        subject_id,
+        &process,
         descriptor.as_ref(),
         scope.as_ref(),
         note.as_deref(),
@@ -2430,12 +2465,12 @@ fn terminate(
 /// Settles without waiting when there is no captured process to signal.
 fn stage(
     registry: &Registry,
-    subject_id: &str,
+    execution: &str,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
     shutdown: &Shutdown,
 ) -> Result<Stage, String> {
-    let process = process_for_control(registry, subject_id)?;
+    let process = process_by(registry, execution)?;
     let Some(identity) = process.identity.as_ref() else {
         return Ok(Stage::Settled(Exit::Unresolved));
     };
@@ -2472,11 +2507,11 @@ fn stage(
             .as_ref()
             .is_none_or(|scope| scope.remaining().is_ok_and(|left| left.is_empty()))
     {
-        record_exit(registry, subject_id, now_ms)?;
+        record_exit(registry, &process, now_ms)?;
         return Ok(Stage::Settled(Exit::Exited));
     }
     let _transition = registry.transition();
-    let current = process_for_control(registry, subject_id)?;
+    let current = process_by(registry, execution)?;
     if current.identity != process.identity {
         return Ok(Stage::Settled(Exit::Unresolved));
     }
@@ -2503,12 +2538,28 @@ fn stage(
 
 /// The outcome of cancelling several executions under one window.
 pub struct Cancelled {
+    /// One entry per execution the batch addressed, in the order it addressed
+    /// them, each with its own outcome.
+    pub ended: Vec<EndedExecution>,
     pub escalated: bool,
-    /// Executions whose exit was verified and recorded.
-    pub stopped: Vec<String>,
-    /// Executions still alive when the window closed, by subject id. A process
-    /// that could not be signalled is one of these: it is not known to be gone.
-    pub survivors: Vec<String>,
+}
+
+impl Cancelled {
+    /// Every execution whose exit is not verified, which is every execution this
+    /// close may not claim ended. A process that could not be signalled is one of
+    /// these: it is not known to be gone.
+    pub fn survivors(&self) -> impl Iterator<Item = &EndedExecution> {
+        self.ended
+            .iter()
+            .filter(|ended| !matches!(ended.end, ExecutionEnd::Exited))
+    }
+}
+
+/// One execution a batch addresses: the process incarnation to stop, and the agent
+/// it runs as when one is recorded.
+pub struct ExecutionRef {
+    pub registration_id: String,
+    pub subject_id: Option<String>,
 }
 
 /// Cancels every named execution together: each is fenced, signalled once, and
@@ -2518,33 +2569,34 @@ pub struct Cancelled {
 /// several agents bounded: the operator waits one window, not a series of them.
 pub fn cancel_many(
     registry: &Registry,
-    subject_ids: &[String],
+    targets: &[ExecutionRef],
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
 ) -> Cancelled {
     let shutdown = Shutdown::new();
-    let mut report = Cancelled {
-        escalated: false,
-        stopped: Vec::new(),
-        survivors: Vec::new(),
-    };
+    let mut ended: Vec<EndedExecution> = Vec::new();
     let mut watching = Vec::new();
-    for id in subject_ids {
-        match stage(registry, id, verifier, now_ms, &shutdown) {
-            Ok(Stage::Settled(Exit::Exited)) => report.stopped.push(id.clone()),
+    for target in targets {
+        match stage(
+            registry,
+            &target.registration_id,
+            verifier,
+            now_ms,
+            &shutdown,
+        ) {
+            Ok(Stage::Settled(exit)) => ended.push(ended_execution(registry, target, exit)),
             // Only a verified exit is an exit. An unresolved or unverified verdict
             // says the daemon could not establish one, so the agent is a survivor:
             // recording an exit here would authorise closing the place over it.
-            Ok(Stage::Settled(_)) => report.survivors.push(id.clone()),
             Ok(Stage::Watch {
                 descriptor,
                 signal,
                 scope,
                 scope_note,
-            }) => watching.push((id.clone(), descriptor, signal, scope, scope_note)),
+            }) => watching.push((target, descriptor, signal, scope, scope_note)),
             Err(error) => {
-                tracing::warn!(%error, subject = %id, "the stop could not be staged");
-                report.survivors.push(id.clone());
+                tracing::warn!(%error, execution = %target.registration_id, "the stop could not be staged");
+                ended.push(unverified_execution(registry, target, error));
             }
         }
     }
@@ -2561,71 +2613,131 @@ pub fn cancel_many(
         tracing::warn!(%error, "scope stop failed");
     }
     let mut signalled = Vec::new();
-    for (id, descriptor, signal, scope, note) in watching {
+    for (target, descriptor, signal, scope, note) in watching {
         if signal
             && scope.is_none()
             && descriptor
                 .as_ref()
                 .is_none_or(|descriptor| process_control::terminate(descriptor).is_err())
         {
-            report.survivors.push(id);
+            ended.push(unverified_execution(registry, target, UNRESPONSIVE.into()));
             continue;
         }
-        signalled.push((id, descriptor, scope, note));
+        signalled.push((target, descriptor, scope, note));
     }
     let mut pending = Vec::new();
-    for (id, descriptor, scope, note) in signalled {
-        let ended = descriptor.as_ref().is_none_or(|descriptor| {
+    for (target, descriptor, scope, note) in signalled {
+        let gone = descriptor.as_ref().is_none_or(|descriptor| {
             process_control::exited_within(descriptor, shutdown.graceful())
         });
         let empty = scope.as_ref().map_or(Ok(true), |scope| {
             scope.remaining().map(|left| left.is_empty())
         });
         match empty {
-            Ok(true) if ended => {
-                if record_exit(registry, &id, now_ms).is_ok() {
-                    report.stopped.push(id);
-                } else {
-                    report.survivors.push(id);
-                }
-            }
+            Ok(true) if gone => match record_exit_of_registration(registry, target, now_ms) {
+                Ok(()) => ended.push(ended_execution(registry, target, Exit::Exited)),
+                Err(error) => ended.push(unverified_execution(registry, target, error)),
+            },
             Err(error) => {
-                tracing::warn!(%error, execution = %id, "scope membership is unresolved");
-                report.survivors.push(id);
+                tracing::warn!(%error, execution = %target.registration_id, "scope membership is unresolved");
+                ended.push(unverified_execution(registry, target, error));
             }
-            _ => pending.push((id, scope, note)),
+            _ => pending.push((target, scope, note)),
         }
     }
     let scopes: Vec<_> = pending
         .iter()
         .filter_map(|(_, scope, _)| scope.as_ref())
         .collect();
-    report.escalated = !scopes.is_empty();
+    let escalated = !scopes.is_empty();
     // Dispatch the entire escalation before waiting on any one group.
     let dispatch = escalate_scopes(&scopes, &shutdown);
-    for (id, scope, note) in pending {
+    for (target, scope, note) in pending {
         let Some(scope) = scope else {
-            let exit = still_running(registry, &id, note.as_deref());
-            tracing::warn!(?exit, execution = %id, "execution exit is unverified");
-            report.survivors.push(id);
+            let exit = still_running(
+                process_of_registration(registry, &target.registration_id)
+                    .ok()
+                    .as_ref(),
+                note.as_deref(),
+            );
+            tracing::warn!(?exit, execution = %target.registration_id, "execution exit is unverified");
+            ended.push(ended_execution(registry, target, exit));
             continue;
         };
         let end = await_escalation(&scope, &shutdown);
-        if end.emptied && record_exit(registry, &id, now_ms).is_ok() {
-            report.stopped.push(id);
+        if end.emptied && record_exit_of_registration(registry, target, now_ms).is_ok() {
+            ended.push(ended_execution(registry, target, Exit::Exited));
         } else {
-            tracing::warn!(failure = ?end.failure, dispatch = ?dispatch, execution = %id, "escalation exit is unverified");
-            report.survivors.push(id);
+            tracing::warn!(failure = ?end.failure, dispatch = ?dispatch, execution = %target.registration_id, "escalation exit is unverified");
+            ended.push(ended_execution(
+                registry,
+                target,
+                Exit::Unverified(UNRESPONSIVE.into()),
+            ));
         }
     }
-    report
+    Cancelled { ended, escalated }
 }
 
-fn process_for_control(registry: &Registry, key: &str) -> Result<ProcessRecord, String> {
-    if let Some(process) = read_process(registry, key)? {
+/// What a shutdown reports when a process outlived the window and cannot be
+/// asked anything further.
+const UNRESPONSIVE: &str = "the process outlived the shutdown window";
+
+/// The execution a batch addressed, with what the records say about it.
+fn ended_execution(registry: &Registry, target: &ExecutionRef, exit: Exit) -> EndedExecution {
+    EndedExecution {
+        subject_id: target.subject_id.clone(),
+        registration_id: target.registration_id.clone(),
+        end: ExecutionEnd::from(&exit),
+        completion: read_process(registry, &target.registration_id)
+            .ok()
+            .flatten()
+            .and_then(|process| process.completion),
+    }
+}
+
+/// A verdict this batch could not establish, and why.
+fn unverified_execution(
+    registry: &Registry,
+    target: &ExecutionRef,
+    reason: String,
+) -> EndedExecution {
+    ended_execution(registry, target, Exit::Unverified(reason))
+}
+
+/// The execution one key addresses, whichever key the caller holds.
+///
+/// A close may know only the claim it resolved, or only the registration a
+/// placement named; both are durable keys of the same execution, and the two
+/// named readers below exist for the callers that hold exactly one of them.
+fn process_by(registry: &Registry, execution: &str) -> Result<ProcessRecord, String> {
+    if let Some(process) = read_process(registry, execution)? {
         return Ok(process);
     }
-    Ok(read_recorded(registry, key)?.process)
+    process_of_claim(registry, execution)
+}
+
+/// Records the exit of the execution a batch addressed.
+fn record_exit_of_registration(
+    registry: &Registry,
+    target: &ExecutionRef,
+    now_ms: i64,
+) -> Result<(), String> {
+    let process = process_of_registration(registry, &target.registration_id)?;
+    record_exit(registry, &process, now_ms)
+}
+
+/// The execution a claim addresses, through the attempt it belongs to.
+fn process_of_claim(registry: &Registry, claim: &str) -> Result<ProcessRecord, String> {
+    Ok(read_recorded(registry, claim)?.process)
+}
+
+/// The execution one process incarnation is, without needing its attempt.
+fn process_of_registration(
+    registry: &Registry,
+    registration: &str,
+) -> Result<ProcessRecord, String> {
+    read_process(registry, registration)?.ok_or_else(|| "the execution is not recorded".into())
 }
 
 fn record_process_transition(
@@ -2642,10 +2754,17 @@ fn record_process_transition(
         .append(registration_id, &format_millis(now_ms), source, transition)
 }
 
-fn record_exit(registry: &Registry, key: &str, now_ms: i64) -> Result<(), String> {
+fn record_exit(registry: &Registry, process: &ProcessRecord, now_ms: i64) -> Result<(), String> {
     let _transition = registry.transition();
-    let process = process_for_control(registry, key)?;
-    if process.exited_at.is_none() {
+    // Another observer may have recorded the exit since this record was read, and
+    // a second `ExitVerified` is an invalid transition rather than a no-op.
+    let recorded = if process.exited_at.is_some() {
+        true
+    } else {
+        read_process(registry, &process.registration_id)?
+            .is_some_and(|current| current.exited_at.is_some())
+    };
+    if !recorded {
         record_process_transition(
             registry,
             &process.registration_id,
@@ -4774,6 +4893,24 @@ mod tests {
         assert_eq!(subject.process.state, State::Pending);
     }
 
+    /// The executions a batch addresses, as a place's placements name them: the
+    /// process incarnation, not the attempt it belongs to.
+    fn targets(registry: &Registry, claims: &[String]) -> Vec<ExecutionRef> {
+        claims
+            .iter()
+            .map(|claim| {
+                let process = read(registry, claim)
+                    .expect("read")
+                    .expect("subject")
+                    .process;
+                ExecutionRef {
+                    registration_id: process.registration_id,
+                    subject_id: None,
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn cancelling_several_executions_signals_them_together_and_records_each_exit() {
         let scratch = Scratch::new("cancel-many");
@@ -4786,10 +4923,23 @@ mod tests {
             children.push(child);
         }
 
-        let cancelled = cancel_many(&registry, &subjects, &LocalProcfsVerifier, 3);
+        let cancelled = cancel_many(
+            &registry,
+            &targets(&registry, &subjects),
+            &LocalProcfsVerifier,
+            3,
+        );
 
-        assert_eq!(cancelled.survivors, Vec::<String>::new());
-        assert_eq!(cancelled.stopped.len(), 2, "both executions exited");
+        assert_eq!(cancelled.survivors().count(), 0);
+        assert_eq!(
+            cancelled
+                .ended
+                .iter()
+                .filter(|ended| ended.end == ExecutionEnd::Exited)
+                .count(),
+            2,
+            "both executions exited"
+        );
         for subject_id in &subjects {
             let subject = read(&registry, subject_id).expect("read").expect("subject");
             assert!(subject.process.exited_at.is_some(), "an exit was recorded");
@@ -4832,13 +4982,19 @@ mod tests {
 
         let cancelled = cancel_many(
             &registry,
-            std::slice::from_ref(&ticket.claim_id),
+            &targets(&registry, std::slice::from_ref(&ticket.claim_id)),
             &LocalProcfsVerifier,
             3,
         );
 
-        assert_eq!(cancelled.survivors, vec![ticket.claim_id.clone()]);
-        assert!(cancelled.stopped.is_empty());
+        assert_eq!(
+            cancelled
+                .survivors()
+                .map(|ended| ended.registration_id.clone())
+                .collect::<Vec<_>>(),
+            vec![ticket.registration_id.clone()]
+        );
+        assert!(cancelled.ended[0].end != ExecutionEnd::Exited);
         let subject = read(&registry, &ticket.claim_id)
             .expect("read")
             .expect("subject");

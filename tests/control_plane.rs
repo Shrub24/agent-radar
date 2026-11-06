@@ -5175,6 +5175,10 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .expect("tracked launch subject")
         .to_string();
     let subject = subject_record(&state, &subject_id);
+    let agent_subject = subject["subject_id"]
+        .as_str()
+        .expect("the agent the execution runs as")
+        .to_string();
     let pid = subject["process"]["pid"].as_i64().expect("captured pid") as i32;
 
     let cancel_id = random_uuid();
@@ -5204,9 +5208,18 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .as_ref()
         .expect("a close reports what it established");
     assert_eq!(
-        closed.execution,
-        ClosedAsExecutionEnd::Exited,
+        closed
+            .executions
+            .iter()
+            .map(|ended| &ended.end)
+            .collect::<Vec<_>>(),
+        vec![&ClosedAsExecutionEnd::Exited],
         "{cancelled:?}"
+    );
+    assert_eq!(
+        closed.executions[0].subject_id.as_deref(),
+        Some(agent_subject.as_str()),
+        "the close names the agent it ended"
     );
     assert_eq!(
         closed.resource,
@@ -5394,7 +5407,7 @@ fn a_cancel_after_binding_stops_the_bound_process() {
     );
     let closed = &result_record(&cancelled)["closed"];
     assert_eq!(
-        closed["execution"],
+        closed["executions"][0]["end"],
         json!({"state": "exited"}),
         "{cancelled}"
     );
@@ -5455,7 +5468,7 @@ fn a_registration_after_cancel_is_refused_and_the_launch_stays_revoked() {
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
     let closed = &result_record(&cancelled)["closed"];
     assert_eq!(
-        closed["execution"],
+        closed["executions"][0]["end"],
         json!({"state": "exited"}),
         "{cancelled}"
     );
@@ -5647,7 +5660,7 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
     );
     let closed = &result_record(&cancelled)["closed"];
     assert_eq!(
-        closed["execution"]["state"],
+        closed["executions"][0]["end"]["state"],
         json!("unsignalled"),
         "{cancelled}"
     );
@@ -5678,7 +5691,7 @@ fn a_launch_that_exits_at_once_is_observable_without_a_registration() {
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
-        result_record(&cancelled)["closed"]["execution"],
+        result_record(&cancelled)["closed"]["executions"][0]["end"],
         json!({"state": "exited"}),
         "{cancelled}"
     );
@@ -6586,9 +6599,9 @@ fn a_registration_without_execution_placement_never_invents_an_exit() {
             "{response}"
         );
         assert_eq!(
-            result_record(&response)["closed"]["execution"]["state"],
-            "not_applicable",
-            "{response}"
+            result_record(&response)["closed"]["executions"],
+            json!([]),
+            "a place that hosted no execution reports none: {response}"
         );
         assert!(backend.told_to_close(&target), "{target:?} was not removed");
     }
@@ -6614,9 +6627,9 @@ fn a_confirmed_tab_close_needs_no_owner_file_routing() {
     );
     assert_eq!(result_record(&response)["target"], "wA:t1");
     assert_eq!(
-        result_record(&response)["closed"]["execution"]["state"],
-        "not_applicable",
-        "{response}"
+        result_record(&response)["closed"]["executions"],
+        json!([]),
+        "a place that hosted no execution reports none: {response}"
     );
     assert!(
         backend.told_to_close(&target),
@@ -9321,23 +9334,8 @@ impl ClientBackend {
         })
     }
 
-    /// The same backend answering a close with this outcome.
-    fn closing(self: &Arc<Self>, close: CloseAnswer) -> Arc<Self> {
-        Arc::new(Self {
-            primitives: self.primitives,
-            inventory: self.inventory.clone(),
-            evidence: self.evidence.clone(),
-            close,
-            closed: Mutex::new(Vec::new()),
-        })
-    }
-
     fn told_to_close(&self, target: &CloseTarget) -> bool {
         self.closed.lock().expect("the close list").contains(target)
-    }
-
-    fn closes_seen(&self) -> usize {
-        self.closed.lock().expect("the close list").len()
     }
 }
 
@@ -10133,7 +10131,11 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
     let stopped = stop_subject(&mut client, &request_id, &subject);
     assert_eq!(result_record(&stopped)["outcome"], "completed", "{stopped}");
     let closed = &result_record(&stopped)["closed"];
-    assert_eq!(closed["execution"], json!({"state": "exited"}), "{stopped}");
+    assert_eq!(
+        closed["executions"][0]["end"],
+        json!({"state": "exited"}),
+        "{stopped}"
+    );
     assert!(
         closed.get("resource").is_none(),
         "a stop removes no pane: {stopped}"
@@ -10150,7 +10152,7 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
 
     let fresh = stop_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
-        result_record(&fresh)["closed"]["execution"],
+        result_record(&fresh)["closed"]["executions"][0]["end"],
         json!({"state": "exited"}),
         "{fresh}"
     );
@@ -11427,7 +11429,7 @@ fn a_confirmed_deletion_closes_over_a_survivor_and_names_the_unverified_exit() {
     let record = result_record(&closed);
     assert_eq!(record["outcome"], "completed", "{closed}");
     assert_eq!(
-        record["closed"]["execution"]["state"], "unverified",
+        record["closed"]["executions"][0]["end"]["state"], "unverified",
         "{closed}"
     );
     assert_eq!(record["closed"]["resource"]["state"], "removed", "{closed}");
@@ -11490,6 +11492,11 @@ fn a_launch_into_a_branch_being_closed_is_refused_until_it_is_gone() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    assert_eq!(
+        refusal["error"]["code"],
+        json!("busy"),
+        "a held branch is a busy refusal, not a bad request: {refusal}"
+    );
     assert!(
         refusal["error"]["message"]
             .as_str()
@@ -11542,7 +11549,7 @@ fn a_deletion_never_records_an_exit_it_could_not_verify() {
         "an agent that was never verified gone must not be counted as exited: {message}"
     );
     assert_eq!(
-        result_record(&closed)["closed"]["execution"]["state"],
+        result_record(&closed)["closed"]["executions"][0]["end"]["state"],
         "unverified",
         "{closed}"
     );

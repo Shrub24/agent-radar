@@ -46,6 +46,23 @@ pub fn resolve_executable(name: &str, path: Option<&std::ffi::OsStr>) -> Result<
     Err(format!("{name} is not an executable on PATH"))
 }
 
+/// The login shell a configured launch runs through, resolved and checked to be
+/// one this daemon knows how to drive.
+pub fn launch_shell(shell: &str, path: Option<&std::ffi::OsStr>) -> Result<String, String> {
+    let shell = resolve_executable(shell, path)
+        .map_err(|_| "SHELL is not an executable; set it to fish, bash, or zsh".to_string())?;
+    let name = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !matches!(name, "fish" | "bash" | "zsh") {
+        return Err(format!(
+            "SHELL `{name}` is unsupported for managed launches; use fish, bash, or zsh"
+        ));
+    }
+    Ok(shell)
+}
+
 /// Build a private launch recipe that starts in `cwd` through the user's login
 /// shell, then lets direnv evaluate that directory before execing the configured
 /// argv. The command remains positional data, never shell-interpolated text.
@@ -64,8 +81,7 @@ pub fn target_shell_recipe(
         return Err("the selected launch directory is not absolute".into());
     }
     let program = program.clone();
-    let shell = resolve_executable(shell, path)
-        .map_err(|_| "SHELL is not an executable; set it to fish, bash, or zsh".to_string())?;
+    let shell = launch_shell(shell, path)?;
     let shell_name = Path::new(&shell)
         .file_name()
         .and_then(|name| name.to_str())

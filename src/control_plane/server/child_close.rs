@@ -170,9 +170,8 @@ pub(super) fn execute_child_close(
     let closed = match places::close_place(core, &backend, &frozen, &stopping, budget) {
         Ok(closed) => closed,
         Err(reason) => subjects::ClosedExecution {
-            execution: subjects::ExecutionEnd::Unverified(reason.clone()),
+            executions: Vec::new(),
             resource: Some(subjects::ResourceEnd::Kept(reason)),
-            completion: None,
             escalated: false,
         },
     };

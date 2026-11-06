@@ -107,16 +107,25 @@ pub(super) fn run_subject_control(
     // The supervisor's report is read back here rather than at the pane, so a
     // close that removed the pane still reports how the program ended. It is
     // absent when nothing reported: never an error, and never a block.
-    let completion = subjects::read(&registry, &subject_id)
-        .ok()
-        .flatten()
-        .and_then(|claim| claim.process.completion);
+    let claim = subjects::read(&registry, &subject_id).ok().flatten();
+    let completion = claim
+        .as_ref()
+        .and_then(|claim| claim.process.completion.clone());
     let settlement = match termination {
         Ok(termination) => {
             if let (subjects::Exit::Exited, Some(backend)) = (&termination.exit, &backend) {
                 retire_wake(backend, &subject_id, &stopping);
             }
-            termination_outcome(&termination, operation, cleanup.as_ref(), completion)
+            // The subject's own attempt is what the close addressed: a read that
+            // went astray after the stop leaves the report unexecutioned rather
+            // than inventing an identity.
+            termination_outcome(
+                &termination,
+                claim.as_ref(),
+                operation,
+                cleanup.as_ref(),
+                completion,
+            )
         }
         Err(error) => Settlement::new(RequestOutcome::Unknown, None, Some(&error), Vec::new()),
     };
@@ -824,12 +833,22 @@ pub(super) fn cancel_target(
 /// because only a cancel acts on one.
 pub(super) fn termination_outcome(
     termination: &subjects::Termination,
+    claim: Option<&subjects::Claim>,
     operation: ops::Operation,
     cleanup: Option<&subjects::PaneCleanup>,
     completion: Option<subjects::Completion>,
 ) -> Settlement {
     let closed = subjects::ClosedExecution {
-        execution: (&termination.exit).into(),
+        executions: claim
+            .map(|claim| {
+                vec![subjects::EndedExecution {
+                    subject_id: Some(claim.subject_id.clone()),
+                    registration_id: claim.process.registration_id.clone(),
+                    end: (&termination.exit).into(),
+                    completion: completion.clone(),
+                }]
+            })
+            .unwrap_or_default(),
         // A cancel always answers for the pane, including when the launch has
         // none of this daemon's: "nothing was removed" and "this operation never
         // removes" are different answers.
@@ -843,7 +862,6 @@ pub(super) fn termination_outcome(
                 subjects::ResourceEnd::from,
             )
         }),
-        completion,
         escalated: termination.escalated,
     };
     match &termination.exit {

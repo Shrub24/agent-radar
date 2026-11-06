@@ -82,7 +82,8 @@ pub(super) fn spawn_sweeper(
                 let serving = serving.0.as_ref().and_then(|backend| {
                     serving_identity(backend, &serving.1, &serving.2, &verification)
                 });
-                if let Err(error) = withdraw_unclaimed_launches(&core, &verification, &mut claim_cursor, now)
+                if let Err(error) =
+                    withdraw_unclaimed_launches(&core, &verification, &mut claim_cursor, now)
                 {
                     tracing::error!(%error, "unclaimed launch withdrawal failed");
                 }
@@ -184,7 +185,13 @@ fn withdraw_unclaimed_launches(
                 now_ms,
             ))
         };
-        subjects::withdraw_unclaimed(&registry, &claim_id, verifier.as_ref(), now_ms, &mut cleanup)?;
+        subjects::withdraw_unclaimed(
+            &registry,
+            &claim_id,
+            verifier.as_ref(),
+            now_ms,
+            &mut cleanup,
+        )?;
     }
     Ok(())
 }

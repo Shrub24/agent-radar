@@ -295,13 +295,6 @@ pub fn stop_until(scopes: &[&VerifiedScope], deadline: Instant) -> Result<(), St
 /// Called only after a graceful stop ran out of its window and only for a scope
 /// whose unit and membership were verified: a scope nothing verified holds no
 /// authority to escalate over.
-pub fn kill(scopes: &[&VerifiedScope]) -> Result<(), String> {
-    if scopes.is_empty() {
-        return Ok(());
-    }
-    kill_until(scopes, Instant::now() + Duration::from_millis(500))
-}
-
 pub fn kill_until(scopes: &[&VerifiedScope], deadline: Instant) -> Result<(), String> {
     if scopes.is_empty() {
         return Ok(());

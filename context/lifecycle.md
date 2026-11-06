@@ -196,8 +196,61 @@ returns before any launch, so a restart can never leave two executions of one su
 believing they own it — and because the predecessor's claim id is what was signalled,
 a replay or a later request cannot signal its replacement through the old id.
 
-The successor starts beside the predecessor's recorded pane rather than inside it.
-For a dedicated pane that is a small waste; for a shell-hosted `radar run --agent`
-execution it is the whole point, because that pane's shell belongs to the operator,
-and typing a command into a resumed shell would be a second execution nobody
-supervised.
+The successor reuses the predecessor's pane when that pane is the launch's own — a
+spawned launch's recorded placement, of the serving generation that made it, with a
+command that has exited. Anything else starts beside it. A shell-hosted
+`radar run --agent` execution is never reused: that pane's shell belongs to the
+operator, and typing a command into a resumed shell would be a second execution
+nobody supervised.
+
+## A close reports every execution it addressed, not one verdict for the place
+
+**Id:** 3b71c9d2-5a84-4e16-9f0c-71d2b8a45e63
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** full review pass over the managed-lifecycle change, then the operator's ruling that ids and outcomes be typed, 2026-11-06
+**Verification:** corroborated — `a_survivor_of_a_branch_close_is_named`, `a_place_that_hosted_nothing_reports_no_execution`, and the live-shape assertions in `a_confirmed_deletion_closes_over_a_survivor_and_names_the_unverified_exit` and `a_deletion_never_records_an_exit_it_could_not_verify`, which now read `closed.executions[0].end`
+**Revisit when:** a consumer needs a single verdict for a place, which would mean a derived summary field rather than the report going back to one entry
+
+`closed.executions` carries one entry per execution the close addressed: its registration, the subject it runs as when one is recorded, its own `end` and its own `completion`. An empty list means the target hosted none.
+
+**Reason:** a branch holding five agents reported one `execution` for all five. The survivors' names went only to the log, so an operator told "exit not verified" could not tell which agent it was — the one fact a close exists to establish was the one it lost.
+
+**Rejected alternative:** keep one verdict and list survivors in its reason text. That is what the code did, and it is prose an operator has to parse for an identity.
+
+**Consequence:** `ExecutionEnd::NotApplicable` is gone. "No execution here" is an empty list, a different answer from "one execution, nothing to report", which the old variant conflated. Wire revision 16.
+
+## Withdrawal is keyed on the claim, not the spawn edge
+
+**Id:** c4d8a1f6-2b3e-4709-8d55-9e6a0c17b842
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** review pass over the managed-lifecycle change, 2026-11-06
+**Verification:** corroborated — `a_reservation_with_no_spawn_edge_is_withdrawn_when_it_never_presents` (a recipe reservation with no edge is found by `unclaimed`, withdrawn once, its pane retired, its subject released) and the pre-existing edge-keyed test, which still passes
+**Revisit when:** a launch exists that records neither an edge nor a claim, which nothing does today
+
+`unclaimed` pages reservation claims on the sweeper's own cursor, and `withdraw_unclaimed` withdraws one; the edge path keeps its own bookkeeping and measures the deadline from the edge's `recorded_at`, because a revoke rewrites the claim's. A refused create or launch abandons its reservation in the request that made it.
+
+**Reason:** a recipe launch (a configured `L`, a container reload) records no spawn edge, and every withdrawal path was reached from an edge. A create or launch the runtime refused, or a shell that died before presenting, left a pending claim for ever, and the tree draws one as a subject row nothing resolves.
+
+**Rejected alternative:** record a spawn edge for recipe launches so the existing pass covers them. That gives a recipe launch provenance it does not have — nothing asked for it as a child — to satisfy a scan.
+
+**Consequence:** the third convergence miss of the same shape, after discovery and cleanup. Anything keyed on spawn edges misses admitted and recipe executions.
+
+## Identity stays a string at the wire; typing it is a change of its own
+
+**Id:** e07f2b19-6c48-4a3d-b1f7-58c9d0e6a4b7
+**Type:** workaround
+**Status:** open
+**Evidence:** confirmed
+**Source:** review pass, and the operator's ruling that ids should be appropriately typed, 2026-11-06
+**Verification:** corroborated — newtypes were added, threaded through the lifecycle domain, and reverted after the compiler showed 220 sites across the registry, the events log and the public DTOs
+**Revisit when:** someone plans the typed-identity change, which should be its own change rather than a review fix
+
+Claim, subject and registration ids are canonical UUIDs and are not interchangeable, but all three are `String` in the records and the protocol. `process_for_control` accepts either a claim id or a registration id; `cancel` and `terminate` take a parameter named `subject_id` and are passed claim ids; `cancel_many` takes registration ids.
+
+**Reason it is not done:** `#[serde(transparent)]` keeps the JSON identical and `#[schemars(with = "String")]` keeps the generated schemas identical, so the wire is not the obstacle. The obstacle is that every id at every interface converts once, and the boundary has to be chosen deliberately: domain types first, then the interfaces, then the wire DTOs, each gated. Attempting all three at once produced a 220-error tree that was reverted rather than left half-migrated.
+
+**Consequence:** the class of bug stays reachable — branch close terminated by subject id and resolved nothing, and that was found only by reading the code. Until the change lands, the two lookups are at least named for what they take.
