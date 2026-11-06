@@ -1408,6 +1408,16 @@ impl ProcessVerifier for MatchingVerifier {
     }
 }
 
+/// The live execution placed in `pane`, read from the registry's recorded placements.
+fn placed_in(
+    registry: &agent_radar::control_plane::Registry,
+    pane: &str,
+) -> Option<agent_radar::control_plane::lifecycle::Placed> {
+    agent_radar::control_plane::lifecycle::placements(registry)
+        .into_iter()
+        .find(|placed| placed.placement.pane() == Some(pane))
+}
+
 /// The birth identity a test stages for one pid.
 fn staged_identity(pid: i32, start_ticks: u64) -> ProcessIdentity {
     ProcessIdentity {
@@ -8429,8 +8439,8 @@ fn an_admitted_execution_records_verified_placement_and_is_found_by_its_pane() {
         "the key is the supervisor's alone: {response}"
     );
 
-    let placed = agent_radar::control_plane::lifecycle::placed_at(&registry, "%2")
-        .expect("the admitted execution is placed where it runs");
+    let placed =
+        placed_in(&registry, "%2").expect("the admitted execution is placed where it runs");
     assert_eq!(placed.registration_id, registration);
     assert_eq!(placed.subject_id, None, "admission creates no subject");
     let placement = placed.placement;
@@ -8462,7 +8472,7 @@ fn an_admitted_execution_records_verified_placement_and_is_found_by_its_pane() {
     assert!(response["result"].is_object(), "{response}");
     let registry =
         agent_radar::control_plane::Registry::open(&sandbox.state()).expect("a registry");
-    let placed = agent_radar::control_plane::lifecycle::placed_at(&registry, "%2")
+    let placed = placed_in(&registry, "%2")
         .expect("the execution is placed even when its server cannot be verified");
     assert_eq!(
         placed.placement.instance, None,

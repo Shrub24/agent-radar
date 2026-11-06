@@ -1158,13 +1158,6 @@ fn live(process: &ProcessRecord) -> bool {
         && process.completion.is_none()
 }
 
-/// The execution running in this pane, when one is placed there and still live.
-pub fn placed_at(registry: &Registry, pane: &str) -> Option<Placed> {
-    placements(registry)
-        .into_iter()
-        .find(|placed| placed.placement.pane() == Some(pane))
-}
-
 pub(crate) fn clear_subject_attachments(registry: &Registry) -> Result<(), String> {
     let directory = registry.subjects().join("identity");
     let metadata = match fs::symlink_metadata(&directory) {
@@ -3476,6 +3469,12 @@ mod tests {
             Some(completion),
             "removal must find a report even when the execution has no subject"
         );
+    }
+
+    fn placed_at(registry: &Registry, pane: &str) -> Option<Placed> {
+        placements(registry)
+            .into_iter()
+            .find(|placed| placed.placement.pane() == Some(pane))
     }
 
     #[test]

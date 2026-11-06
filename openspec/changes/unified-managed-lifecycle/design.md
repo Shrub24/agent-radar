@@ -154,7 +154,7 @@ Dispositions against the delivered tree:
 | launch expiry / revoke | durable operation record | `subjects::revoke` + the same termination window | revocation is cancelled work, not an ended process |
 | topology reload | selected container's recorded recipe | `ReloadContainer` effect; the reload path was not converged here | recipe-only shell reload, unrelated to managed close |
 
-`subjects_inside` (the spawn-edge scan), `observe_spawn_exits` and `record_spawn_exit` were removed. `placed_at` currently has only test callers; it is not evidence that production row-to-execution resolution is implemented.
+`subjects_inside` (the spawn-edge scan), `observe_spawn_exits` and `record_spawn_exit` were removed.
 
 Unrelated candidate, listed rather than refactored: `src/ui_session/targets.rs` keeps its `containment_of` heuristic for choosing between a pane and a tab target, which is the daemon's row resolution (correct where it lives) but reads like a target derivation at a glance.
 
