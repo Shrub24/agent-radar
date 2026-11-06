@@ -48,6 +48,11 @@ written by the new daemon.
 - A request that expired before it was claimed is settled as refused `not_executed` by the next reconciliation. It used to stay unfinished forever, block `radar server stop`, and be refused by `radar lifecycle abandon`. The stop refusal now names `radar lifecycle reconcile` and `abandon`.
 - `radar workspace` on a server with no session no longer creates a `main` session. The agent area waits for the first workspace and the sidebar opens the workspace picker. Without `--session` it attaches to tmux's most recent session, not the first listed.
 
+## pi-radar 0.14.0
+
+- Requires a Radar daemon at wire revision 13 or later (`RADAR_MINIMUM_REVISION` was 12), so the client reads the UI session and observation shapes the current daemon serves. Upgrade the daemon first; a pi-radar newer than the daemon refuses it rather than guessing.
+- The observation schema carries the daemon's `closing` places, so a branch being closed is visible to a consumer instead of looking unchanged and then vanishing. The field is optional, so a daemon that does not publish it is still read.
+
 ## pi-radar 0.13.3
 
 - `createRadarAttention` takes `onDiagnostic(problem | undefined)`: a mailbox that cannot drain — an unreadable message, a consumer that declines or throws, a failed receipt, a message no consumer handles — is reported when the answer changes and cleared on recovery. Before, every failure was swallowed and a stuck mailbox was invisible to the host.
