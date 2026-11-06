@@ -45,6 +45,9 @@ pub(super) fn spawn_sweeper(
             let mut pane_cursor: Option<String> = None;
             // The same for the process-exit pass, which is bounded per pass too.
             let mut sweep_cursor: Option<String> = None;
+            // And for reservations that never presented: a recipe launch has no
+            // spawn edge, so nothing else would ever withdraw one.
+            let mut claim_cursor: Option<String> = None;
             // And for container observation, so a record set larger than one page
             // is reached over successive passes.
             let mut reconcile_after: Option<String> = None;
@@ -79,6 +82,10 @@ pub(super) fn spawn_sweeper(
                 let serving = serving.0.as_ref().and_then(|backend| {
                     serving_identity(backend, &serving.1, &serving.2, &verification)
                 });
+                if let Err(error) = withdraw_unclaimed_launches(&core, &verification, &mut claim_cursor, now)
+                {
+                    tracing::error!(%error, "unclaimed launch withdrawal failed");
+                }
                 if let Err(error) = observe_launch_panes(
                     &registry,
                     observation.as_ref(),
@@ -122,6 +129,66 @@ pub(super) fn spawn_sweeper(
         .ok()
 }
 
+/// Leaves the pane a launch built for itself, once that launch is gone.
+pub(super) fn retire_pane(
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+    backend: &Arc<dyn RuntimeProvider>,
+    claim_id: &str,
+    stopping: &Arc<AtomicBool>,
+    now_ms: i64,
+) -> bool {
+    matches!(
+        cleanup_launch_pane(
+            core,
+            backend,
+            claim_id,
+            CleanupIntent::Retire,
+            stopping,
+            verification,
+            now_ms,
+        ),
+        Some(subjects::PaneCleanup::Cleaned)
+    )
+}
+
+/// Withdraws reservations that never presented, without needing a spawn edge.
+fn withdraw_unclaimed_launches(
+    core: &Arc<Mutex<Core>>,
+    verification: &Arc<VerificationBudget>,
+    cursor: &mut Option<String>,
+    now_ms: i64,
+) -> Result<(), String> {
+    let (registry, verifier, backend, stopping) = {
+        let core = locked(core);
+        (
+            Arc::clone(&core.registry),
+            Arc::clone(&core.verifier),
+            core.backend.clone(),
+            Arc::clone(&core.stopping),
+        )
+    };
+    let (page, next) = subjects::unclaimed(&registry, cursor.as_deref(), now_ms);
+    *cursor = next;
+    for claim_id in page {
+        let mut cleanup = |claim_id: &str| -> Result<bool, String> {
+            let Some(backend) = &backend else {
+                return Err("this daemon has no backend to close a pane with".into());
+            };
+            Ok(retire_pane(
+                core,
+                verification,
+                backend,
+                claim_id,
+                &stopping,
+                now_ms,
+            ))
+        };
+        subjects::withdraw_unclaimed(&registry, &claim_id, verifier.as_ref(), now_ms, &mut cleanup)?;
+    }
+    Ok(())
+}
+
 /// Withdraws a launch that never presented, then closes the pane it left behind.
 pub(super) fn withdraw_unpresented(
     core: &Arc<Mutex<Core>>,
@@ -145,17 +212,13 @@ pub(super) fn withdraw_unpresented(
         let Some(backend) = &backend else {
             return Ok(false);
         };
-        Ok(matches!(
-            cleanup_launch_pane(
-                core,
-                backend,
-                claim_id,
-                CleanupIntent::Retire,
-                &stopping,
-                verification,
-                now_ms,
-            ),
-            Some(subjects::PaneCleanup::Cleaned)
+        Ok(retire_pane(
+            core,
+            verification,
+            backend,
+            claim_id,
+            &stopping,
+            now_ms,
         ))
     };
     if let Err(error) =

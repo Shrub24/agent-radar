@@ -3547,6 +3547,71 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
     );
 }
 
+/// A recipe launch reserves a claim without a spawn edge, so nothing in the
+/// edge-keyed pass would ever withdraw one: a reservation whose create or launch
+/// was refused would draw a subject row nothing resolves.
+#[test]
+fn a_reservation_with_no_spawn_edge_is_withdrawn_when_it_never_presents() {
+    use agent_radar::control_plane::lifecycle::{self, LaunchContext, ManagedMetadata};
+    use agent_radar::control_plane::registry::{LocalProcfsVerifier, Registry};
+
+    let sandbox = Sandbox::new("claim-withdrawn");
+    let registry = Registry::open(&sandbox.state()).expect("a registry");
+    let request_id = "0a000009-0000-4000-8000-000000000009";
+    let ticket = lifecycle::create_with_intent(
+        &registry,
+        request_id,
+        LaunchContext {
+            executable: "/bin/true".into(),
+            argv: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+        },
+        None,
+        None,
+        ManagedMetadata::default(),
+        1_000,
+    )
+    .expect("a reservation");
+    assert!(
+        registry.spawn_edge(request_id).expect("read").is_none(),
+        "a recipe launch records no edge"
+    );
+
+    let (early, _) = lifecycle::unclaimed(&registry, None, 1_000 + 29_999);
+    assert!(early.is_empty(), "a reservation inside its deadline waits");
+    let (due, _) = lifecycle::unclaimed(&registry, None, 1_000 + 30_000);
+    assert_eq!(due, vec![ticket.claim_id.clone()]);
+
+    let mut retired: Vec<String> = Vec::new();
+    let reason = lifecycle::withdraw_unclaimed(
+        &registry,
+        &ticket.claim_id,
+        &LocalProcfsVerifier,
+        1_000 + 30_000,
+        |claim_id| {
+            retired.push(claim_id.to_string());
+            Ok(true)
+        },
+    )
+    .expect("a due pass");
+    assert_eq!(reason, Some("the launch did not present within 30 seconds"));
+    assert_eq!(
+        retired,
+        vec![ticket.claim_id.clone()],
+        "the pane the reservation left is retired"
+    );
+    let record = lifecycle::read_subject_record(&registry, &ticket.subject_id)
+        .expect("read")
+        .expect("subject");
+    assert_eq!(record.current_claim, None, "the subject is free again");
+    let (after, _) = lifecycle::unclaimed(&registry, None, 1_000 + 60_000);
+    assert!(
+        after.is_empty(),
+        "a withdrawn reservation is not withdrawn again: {after:?}"
+    );
+}
+
 /// The incarnation of a child process that registers with the token its launch
 /// carried.
 const CHILD_INCARNATION: &str = "9d8c7b6a-5f4e-4d3c-9b2a-1809f7e6d5c4";
@@ -9879,39 +9944,6 @@ fn a_stalled_daemon_is_abandoned_when_the_caller_cancels() {
         "a cancelled request waited {:?}",
         started.elapsed()
     );
-}
-
-/// An uncertain daemon close is never re-run through the direct adapter: Radar's
-/// own close path hands the operation over once, keeps its unknown answer, and
-/// leaves the fallback adapter unused.
-#[test]
-fn an_uncertain_daemon_close_is_never_retried_through_direct_herdr() {
-    let sandbox = Sandbox::new("client-no-retry");
-    let inventory = close_inventory("wA:t1", &[("wA:p1", None)]);
-    let backend = ClientBackend::new(CLIENT_PRIMITIVES)
-        .observing(inventory.clone())
-        .closing(CloseAnswer::Unknown("the reply was lost".into()));
-    let mut daemon = sandbox.daemon_with(backend.clone());
-    let selection = connect_at(daemon.path()).expect("a usable daemon");
-
-    let target = CloseTarget::Pane("wA:p1".into());
-    let request = lifecycle::CloseRequest {
-        execution: None,
-        target: target.clone(),
-        identity: lifecycle::identity(&inventory, &target),
-    };
-    let cancel = AtomicBool::new(false);
-    let outcome =
-        lifecycle::close_unmanaged(selection.provider.as_ref(), &request, &cancel, || {
-            Ok(Vec::new())
-        });
-    assert!(
-        matches!(outcome, lifecycle::DirectClose::Unknown(_)),
-        "{outcome:?}"
-    );
-    assert!(backend.told_to_close(&target));
-    assert_eq!(backend.closes_seen(), 1, "the close was asked for twice");
-    daemon.stop();
 }
 
 /// A backend that only says what it is, so the handshake's own words can be read

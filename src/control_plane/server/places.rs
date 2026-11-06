@@ -714,6 +714,10 @@ pub(super) fn run_creation(
                     (RequestOutcome::Completed, None)
                 }
                 Some(LaunchOutcome::Refused(message)) => {
+                    // A refused launch runs no program, so its reservation is
+                    // abandoned here rather than left for a program that will
+                    // never arrive.
+                    abandon_reservation(core, tracking.as_ref());
                     notes.push(format!("the recipe was not launched: {message}"));
                     (RequestOutcome::Refused, Some(Category::BackendRefused))
                 }
@@ -771,10 +775,27 @@ pub(super) fn run_creation(
             record.complete(Settlement::backend_unknown(&message), store::now_ms())
         }
     };
+    // Nothing will present for a create the runtime refused or did not confirm.
+    abandon_reservation(core, tracking.as_ref());
     Ok(Creation {
         record: done,
         container: None,
     })
+}
+
+/// Abandons a reservation that will never present, so no subject row waits on it.
+/// A launch the runtime accepted is left alone: its program claims it asynchronously.
+fn abandon_reservation(
+    core: &Arc<Mutex<Core>>,
+    tracking: Option<&(subjects::Bootstrap, subjects::Ticket)>,
+) {
+    let Some((_, ticket)) = tracking else {
+        return;
+    };
+    let registry = Arc::clone(&locked(core).registry);
+    if let Err(error) = subjects::revoke(&registry, &ticket.claim_id, store::now_ms()) {
+        tracing::warn!(%error, claim = %ticket.claim_id, "the abandoned reservation was not revoked");
+    }
 }
 
 /// Deletes one container Radar records: the hierarchy's own verb for removing a
@@ -996,13 +1017,18 @@ pub(super) fn run_container_delete(
         Ok(closed) => closed,
         Err(reason) => return write_refused(record, &reason, core),
     };
-    let removal = match &closed.resource {
-        Some(subjects::ResourceEnd::Kept(reason)) => DirectClose::Refused(reason.clone()),
-        Some(subjects::ResourceEnd::Unverified(reason)) => DirectClose::Unknown(reason.clone()),
-        _ => DirectClose::Completed,
-    };
-    let settled = match removal {
-        DirectClose::Completed => {
+    let settled = match &closed.resource {
+        Some(subjects::ResourceEnd::Kept(reason)) => {
+            record.complete(
+                Settlement::backend_refused(reason).closed(closed),
+                store::now_ms(),
+            )
+        }
+        Some(subjects::ResourceEnd::Unverified(reason)) => record.complete(
+            Settlement::backend_unknown(reason).closed(closed),
+            store::now_ms(),
+        ),
+        _ => {
             let now = store::now_ms();
             let at = store::format_millis(now);
             let mut removed: Vec<containers::Container> = Vec::new();
@@ -1045,14 +1071,6 @@ pub(super) fn run_container_delete(
             );
             return write_deleted(settled, removed, core);
         }
-        DirectClose::Refused(message) => record.complete(
-            Settlement::backend_refused(&message).closed(closed),
-            store::now_ms(),
-        ),
-        DirectClose::Unknown(message) => record.complete(
-            Settlement::backend_unknown(&message).closed(closed),
-            store::now_ms(),
-        ),
     };
     write_deleted(settled, Vec::new(), core)
 }
@@ -1242,6 +1260,7 @@ pub(super) fn run_container_reload(
             store::now_ms(),
         ),
         LaunchOutcome::Refused(message) => {
+            abandon_reservation(core, tracking.as_ref());
             record.complete(Settlement::backend_refused(&message), store::now_ms())
         }
         LaunchOutcome::Unknown(message) => {

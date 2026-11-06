@@ -49,7 +49,7 @@ use crate::control_plane::store::{
 use crate::control_plane::transport::{
     Dispatch, EventReady, IngestDispatch, ListenerSource, StreamOpen, Transport,
 };
-use crate::lifecycle::{self, CloseRequest, DirectClose};
+use crate::lifecycle::{self, CloseRequest};
 use crate::model::SessionUuid;
 use crate::model::{FleetObservation, ProcessIdentity};
 use crate::process_control::{self, Acquired};

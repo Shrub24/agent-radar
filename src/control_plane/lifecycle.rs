@@ -1766,31 +1766,69 @@ pub fn cancel_reservation(
 /// a restart of the daemon does not move.
 const LAUNCH_DEADLINE_MS: i64 = 30_000;
 
-/// Withdraws a launch whose process never presented: revokes its claim, stops
-/// what was captured and marks its edge, so a reader sees an outcome instead of an
-/// absence. A launch someone already revoked is finished the same way. The edge is
-/// marked only once the process is verifiably gone, so the next pass retries a
-/// stop that did not settle. Returns the claim when the edge was marked, for the
-/// caller to close the pane the launch left.
-pub fn withdraw_unpresented(
+/// Why a launch is withdrawn, when it is: it never presented and either its
+/// deadline passed or it was cancelled first.
+///
+/// `recorded_at` is the launch's own reservation time. A revoke rewrites the
+/// claim's stamp, so a caller that holds an older one measures the deadline from
+/// that instead of from a stamp its own withdrawal moved.
+fn withdrawal(state: State, recorded_at: &str, now_ms: i64) -> Option<&'static str> {
+    let overdue = crate::timestamp::timestamp_millis(recorded_at)
+        .is_some_and(|recorded| now_ms - recorded >= LAUNCH_DEADLINE_MS);
+    match state {
+        State::Revoked if !overdue => Some("the launch was cancelled before it presented"),
+        State::Revoked | State::Pending | State::Captured if overdue => {
+            Some("the launch did not present within 30 seconds")
+        }
+        _ => None,
+    }
+}
+
+/// Revokes a claim, stops what it captured, closes the pane it left and releases
+/// it. Answers whether the launch is finished, which is what lets a caller record
+/// the withdrawal: a stop that did not settle is retried by the next pass.
+fn stop_and_release(
     registry: &Registry,
-    edge: &crate::control_plane::registry::SpawnEdge,
+    claim: &Claim,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
-    mut cleanup: impl FnMut(&str) -> Result<bool, String>,
-) -> Result<Option<String>, String> {
-    // Presence takes this same lock through grant. A stale sweep page must never
-    // revoke a launch that granted while the page was being read.
-    let _presence = registry.presence.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(edge) = registry.spawn_edge(&edge.request_id)? else {
-        return Ok(None);
+    cleanup: &mut impl FnMut(&str) -> Result<bool, String>,
+) -> Result<bool, String> {
+    revoke(registry, &claim.claim_id, now_ms)?;
+    // A revoked launch captures nothing afterwards, so one with no identity has
+    // no process to stop.
+    let stopped = match cancel(registry, &claim.claim_id, verifier, now_ms)?.exit {
+        Exit::Exited => true,
+        Exit::Unresolved => read(registry, &claim.claim_id)?
+            .is_some_and(|claim| claim.process.identity.is_none()),
+        Exit::Unverified(_) => false,
     };
-    let Some(claim_id) = edge.claim_id.as_deref() else {
-        return Ok(None);
+    if !stopped || !cleanup(&claim.claim_id)? {
+        return Ok(false);
+    }
+    release_attachment(registry, &claim.claim_id, Some(claim.subject_id.as_str()))?;
+    Ok(true)
+}
+
+/// Whether this claim is already withdrawn: only a withdrawal releases a revoked
+/// claim from its subject while leaving the claim itself recorded.
+fn released(registry: &Registry, subject_id: Option<&str>, claim_id: &str) -> Result<bool, String> {
+    let Some(subject_id) = subject_id else {
+        return Ok(false);
     };
-    if edge.granted_at.is_some() || edge.withdrawn.is_some() {
-        return Ok(None);
-    };
+    Ok(read_subject_record(registry, subject_id)?
+        .is_some_and(|record| record.current_claim.as_deref() != Some(claim_id)))
+}
+
+/// One claim, under the presence lock both withdrawal paths hold.
+fn withdraw_locked(
+    registry: &Registry,
+    claim_id: &str,
+    deadline_from: Option<&str>,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+    cleanup: &mut impl FnMut(&str) -> Result<bool, String>,
+) -> Result<Option<&'static str>, String> {
     let Some(claim) = read(registry, claim_id)? else {
         return Ok(None);
     };
@@ -1800,41 +1838,95 @@ pub fn withdraw_unpresented(
     )?
     .is_some()
     {
-        registry.record_spawn_granted(&edge.request_id, now_ms)?;
         return Ok(None);
     }
-    let overdue = crate::timestamp::timestamp_millis(&edge.recorded_at)
-        .is_some_and(|recorded| now_ms - recorded >= LAUNCH_DEADLINE_MS);
-    let reason = match claim.process.state {
-        State::Revoked if !overdue => "the launch was cancelled before it presented",
-        State::Revoked | State::Pending | State::Captured | State::Bound if overdue => {
-            "the launch did not present within 30 seconds"
-        }
-        _ => return Ok(None),
+    let basis = deadline_from.unwrap_or(&claim.process.recorded_at);
+    let Some(reason) = withdrawal(claim.process.state, basis, now_ms) else {
+        return Ok(None);
     };
-    {
-        let _transition = registry.transition();
-        let mut claim = read_recorded(registry, claim_id)?;
-        claim.process.state = State::Revoked;
-        claim.process.correlation = None;
-        claim.process.recorded_at = format_millis(now_ms);
-        write(registry, &claim)?;
-    }
-    // A revoked launch captures nothing afterwards, so one with no identity has
-    // no process to stop.
-    let stopped = match cancel(registry, claim_id, verifier, now_ms)?.exit {
-        Exit::Exited => true,
-        Exit::Unresolved => {
-            read(registry, claim_id)?.is_some_and(|claim| claim.process.identity.is_none())
-        }
-        Exit::Unverified(_) => false,
-    };
-    if !stopped || !cleanup(claim_id)? {
+    if released(registry, Some(&claim.subject_id), claim_id)? {
         return Ok(None);
     }
-    release_attachment(registry, claim_id, Some(claim.subject_id.as_str()))?;
+    if !stop_and_release(registry, &claim, verifier, now_ms, cleanup)? {
+        return Ok(None);
+    }
+    Ok(Some(reason))
+}
+
+/// Withdraws a launch that never presented, whether or not a spawn edge asked for
+/// it: a recipe launch has no edge, and a claim left pending is a subject row that
+/// never resolves.
+///
+/// Answers the reason it was withdrawn, so a caller holding an edge can record it.
+///
+/// Presence takes this same lock through grant, so a stale pass never revokes a
+/// launch that granted while its page was being read.
+pub fn withdraw_unclaimed(
+    registry: &Registry,
+    claim_id: &str,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+    mut cleanup: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<Option<&'static str>, String> {
+    let _presence = registry.presence.lock().unwrap_or_else(|e| e.into_inner());
+    withdraw_locked(registry, claim_id, None, verifier, now_ms, &mut cleanup)
+}
+
+/// The claims a withdrawal pass considers: every reservation whose deadline
+/// passed and which nothing attached. Paged like the exit sweep, so a fleet larger
+/// than one page is covered over successive passes.
+pub fn unclaimed(registry: &Registry, after: Option<&str>, now_ms: i64) -> (Vec<String>, Option<String>) {
+    let ids: Vec<String> = {
+        let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
+        log.ids()
+            .filter(|id| {
+                log.facts(id).is_some_and(|facts| {
+                    withdrawal(facts.execution.state, &facts.execution.recorded_at, now_ms)
+                        .is_some()
+                        && !released(
+                            registry,
+                            facts.attachment.subject_id.as_deref(),
+                            id,
+                        )
+                        .unwrap_or(false)
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    crate::control_plane::store::page_after(&ids, after, SWEEP_LIMIT)
+}
+
+/// Withdraws a launch whose process never presented and marks its edge, so a
+/// reader sees an outcome instead of an absence. The edge is marked only once the
+/// process is verifiably gone, so the next pass retries a stop that did not
+/// settle. Returns the claim when the edge was marked, for the caller to close the
+/// pane the launch left.
+pub fn withdraw_unpresented(
+    registry: &Registry,
+    edge: &crate::control_plane::registry::SpawnEdge,
+    verifier: &dyn ProcessVerifier,
+    now_ms: i64,
+    mut cleanup: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<Option<String>, String> {
+    // A page read before a grant must not mark an edge that has since granted.
+    let _presence = registry.presence.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(edge) = registry.spawn_edge(&edge.request_id)? else {
+        return Ok(None);
+    };
+    let (Some(claim_id), true) = (edge.claim_id.clone(), edge.granted_at.is_none()) else {
+        return Ok(None);
+    };
+    if edge.withdrawn.is_some() {
+        return Ok(None);
+    }
+    let Some(reason) =
+        withdraw_locked(registry, &claim_id, Some(&edge.recorded_at), verifier, now_ms, &mut cleanup)?
+    else {
+        return Ok(None);
+    };
     registry.record_spawn_withdrawn(&edge.request_id, reason, now_ms)?;
-    Ok(Some(claim_id.to_string()))
+    Ok(Some(claim_id))
 }
 
 /// Pi's value-taking flags that a restart keeps, from `pi --help`. Any other flag
@@ -2115,10 +2207,13 @@ pub fn sweep(
     Ok((exited, next))
 }
 
-/// Revokes a launch that is still unbound, and says whether it did.
-fn revoke(registry: &Registry, subject_id: &str, now_ms: i64) -> Result<bool, String> {
+/// Revokes a claim that never bound. Answers whether one was still open.
+///
+/// A reservation whose launch was refused will never present, and a claim left
+/// pending draws a lifecycle row that nothing resolves.
+pub(crate) fn revoke(registry: &Registry, claim_id: &str, now_ms: i64) -> Result<bool, String> {
     let _transition = registry.transition();
-    let mut subject = read_recorded(registry, subject_id)?;
+    let mut subject = read_recorded(registry, claim_id)?;
     if !matches!(subject.process.state, State::Pending | State::Captured) {
         return Ok(false);
     }

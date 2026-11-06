@@ -45,7 +45,7 @@ pub use control_plane::{
     Refusal, Request, RequestOutcome, RequestRecord, Response, Store, decode_request,
     install_signal_handlers, socket_path, state_dir,
 };
-pub use lifecycle::{CloseRequest, Closer, Containment};
+pub use lifecycle::{CloseRequest, Containment};
 pub use model::{
     AgentObservation, BinaryFreshness, BinaryIdentity, BinaryUnknown, FleetObservation,
     ForegroundEvidence, Lineage, LocalFacts, Location, Pane, RuntimeStatus, SessionIdentity,
