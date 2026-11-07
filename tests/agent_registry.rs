@@ -2373,7 +2373,7 @@ const CHILD_INCARNATION: &str = "9d8c7b6a-5f4e-4d3c-9b2a-1809f7e6d5c4";
 fn spawn_request(request_id: &str, parent: &str) -> SpawnRequest {
     SpawnRequest {
         request_id: request_id.into(),
-        parent: parent.into(),
+        parent: RegistrationId::parse(parent).expect("a registration id"),
         parent_session_id: SESSION.into(),
         parent_subject_id: None,
     }
@@ -2445,7 +2445,7 @@ fn a_recorded_spawn_edge_survives_reopening_with_its_private_token() {
         recorded = registry
             .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
             .expect("a recorded edge");
-        assert_eq!(recorded.parent, parent);
+        assert_eq!(recorded.parent.as_str(), parent);
         assert_eq!(recorded.parent_session_id, SESSION);
     }
 
@@ -2638,7 +2638,8 @@ fn duplicate_session_attaches_remain_distinct_and_edges_keep_session_on_second_a
         .expect("edge read")
         .expect("edge");
     assert_eq!(
-        stored.parent, parent,
+        stored.parent.as_str(),
+        parent,
         "edge retains the exact supplied process"
     );
     assert_eq!(stored.parent_session_id, SESSION);
@@ -2766,7 +2767,7 @@ fn a_spawn_token_never_reaches_a_public_read() {
     // A pending edge reads as a parent with no child and no token.
     let pending = edge.public(PublicSpawnExitObservation::Unknown);
     assert_eq!(pending.request_id, SPAWN_REQUEST);
-    assert_eq!(pending.parent, parent);
+    assert_eq!(pending.parent.as_str(), parent);
     assert!(pending.bound.is_none());
     let json = serde_json::to_string(&pending).expect("an encoding");
     assert!(
@@ -2882,13 +2883,6 @@ fn a_spawn_request_naming_an_unknown_parent_is_refused_before_any_write() {
         "nothing may be written for a refused request"
     );
 
-    // A parent that is not a canonical UUID cannot name a record either.
-    let error = registry
-        .record_spawn(&spawn_request(SPAWN_REQUEST, "wA:p1"), 2_000)
-        .expect_err("a refusal");
-    assert!(error.contains("must be a canonical UUID"), "{error}");
-    assert!(spawn_files(&registry).is_empty());
-
     // A registered parent without context is refused before writing.
     let parent = registry
         .register(&request(INCARNATION), 1_000)
@@ -2951,7 +2945,7 @@ fn a_registration_with_its_spawn_token_binds_the_pending_edge_once() {
         Some(named.registration_id.as_str()),
         Some(registered.registration_id.as_str())
     );
-    assert_eq!(bound.parent, parent);
+    assert_eq!(bound.parent.as_str(), parent);
     assert_eq!(bound.token, edge.token, "binding spends, never re-mints");
 
     // The token is spent: a second registration presenting it is refused, and
@@ -3255,7 +3249,7 @@ fn a_spawn_edge_records_what_each_effect_did_in_order() {
             .expect("the created effect");
         assert_eq!(created.created, RequestOutcome::Completed);
         assert_eq!(created.location.as_ref(), Some(&location));
-        assert_eq!(created.parent, parent);
+        assert_eq!(created.parent.as_str(), parent);
         assert_eq!(created.token, intent.token, "the token is minted once");
         assert_eq!(created.launched, RequestOutcome::Unknown);
 
@@ -3704,7 +3698,7 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
     {
         let registry = Registry::open_at(&root, 1_000).expect("a registry");
         let edge = managed_edge(&registry, 1_000);
-        let parent = RegistrationId::parse(&edge.parent).expect("a registration id");
+        let parent = edge.parent.clone();
         let request = close_request(
             CHILD_CLOSE_REQUEST,
             SPAWN_REQUEST,

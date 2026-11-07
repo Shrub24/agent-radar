@@ -244,7 +244,7 @@ pub(super) fn validate_producer_recipients(
         .ok_or(messages::Error::NotFound)?
         .managed
         .parent_subject_id;
-    if !messages::is_parent_recipient(parent.as_deref(), recipient) {
+    if !messages::is_parent_recipient(parent.as_ref().map(SubjectId::as_str), recipient) {
         return Err(messages::Error::WrongRecipient);
     }
     // A recipient that is not a subject id names no subject.

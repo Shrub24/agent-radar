@@ -417,12 +417,7 @@ pub(super) fn run_restart(
             ));
         }
         (None, Some(parent)) => {
-            let owned = match subject
-                .managed
-                .parent_subject_id
-                .as_deref()
-                .and_then(SubjectId::parse)
-            {
+            let owned = match subject.managed.parent_subject_id.clone() {
                 Some(parent_subject) => matches!(
                     subjects::current_attachment(&registry, &parent_subject),
                     Ok(Some(claim)) if claim.process.bound_registration_id.as_ref().map(RegistrationId::as_str) == Some(parent.as_str())
@@ -574,7 +569,7 @@ pub(super) fn restart_lead(
         Err(message) => return Settlement::backend_refused(message),
     };
     let params = SpawnParams {
-        parent: agent.to_string(),
+        parent: agent.clone(),
         parent_session_id: session.to_string(),
         executable: resume.executable,
         argv: resume.argv,
@@ -801,13 +796,9 @@ pub(super) fn cancel_target(
                 .spawn_edge(request_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "spawn is not recorded"))?;
-            let claim_id = edge
-                .claim_id
-                .as_deref()
-                .and_then(ClaimId::parse)
-                .ok_or_else(|| {
-                    Refusal::new(Code::Refused, "spawn is not a lifecycle-tracked launch")
-                })?;
+            let claim_id = edge.claim_id.ok_or_else(|| {
+                Refusal::new(Code::Refused, "spawn is not a lifecycle-tracked launch")
+            })?;
             let launched = subjects::read_claim(registry, &claim_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;

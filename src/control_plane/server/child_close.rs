@@ -242,13 +242,13 @@ pub(super) fn subject_child_close(
             intent: params.intent,
         },
         Ok(None) => {
-            let Some(parent) = record.managed.parent_subject_id.as_deref() else {
+            let Some(parent) = record.managed.parent_subject_id.as_ref() else {
                 return Response::refused(
                     &request.id,
                     &Refusal::new(Code::Refused, "subject has no recorded parent"),
                 );
             };
-            match current_edge(&registry, parent, &params.subject_id) {
+            match current_edge(&registry, parent, &record.subject_id) {
                 Ok(Some(edge)) => {
                     let bound = edge.bound.expect("a current edge is bound");
                     registry::ChildCloseRequest {
@@ -279,8 +279,8 @@ pub(super) fn subject_child_close(
 /// The newest bound, unwithdrawn launch of one child subject.
 fn current_edge(
     registry: &Registry,
-    parent_subject: &str,
-    subject: &str,
+    parent_subject: &SubjectId,
+    subject: &SubjectId,
 ) -> Result<Option<registry::SpawnEdge>, String> {
     let mut newest: Option<registry::SpawnEdge> = None;
     let mut after: Option<String> = None;
@@ -291,7 +291,7 @@ fn current_edge(
             let Some(bound) = edge.bound.as_ref() else {
                 continue;
             };
-            if bound.subject_id.as_deref() != Some(subject) || edge.withdrawn.is_some() {
+            if bound.subject_id.as_ref() != Some(subject) || edge.withdrawn.is_some() {
                 continue;
             }
             let later = newest.as_ref().is_none_or(|current| {

@@ -409,10 +409,7 @@ pub(super) fn registry_request(
             let inventory = observed_inventory(core);
             let evidence =
                 crate::control_plane::registry_read::location_evidence(inventory.as_ref(), &stored);
-            let exit = subjects::spawn_exit(
-                &locked(core).registry,
-                stored.claim_id.as_deref().and_then(ClaimId::parse).as_ref(),
-            );
+            let exit = subjects::spawn_exit(&locked(core).registry, stored.claim_id.as_ref());
             respond(
                 &request.id,
                 Ok(answers::Spawn {
@@ -826,7 +823,7 @@ pub(super) fn registry_request(
                 };
                 let page = match parent.as_ref() {
                     Some(subject) => core.registry.spawn_edges_for_subject_after(
-                        subject.as_str(),
+                        subject,
                         params.after.as_deref(),
                         limit + 1,
                     ),
@@ -851,10 +848,7 @@ pub(super) fn registry_request(
                         inventory.as_ref(),
                         edge,
                     ),
-                    subjects::spawn_exit(
-                        &registry,
-                        edge.claim_id.as_deref().and_then(ClaimId::parse).as_ref(),
-                    ),
+                    subjects::spawn_exit(&registry, edge.claim_id.as_ref()),
                 );
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
                 if used + size > MAX_LIST_RESPONSE_BYTES {

@@ -1108,13 +1108,7 @@ fn spawn_answer(request: &Request, reply: Reply, core: &Arc<Mutex<Core>>) -> Rep
     let registry = Arc::clone(&locked(core).registry);
     Ok(match registry.spawn_edge(&request.id) {
         Ok(Some(edge)) => {
-            let exit = subjects::spawn_exit(
-                &registry,
-                edge.claim_id
-                    .as_deref()
-                    .and_then(crate::identity::ClaimId::parse)
-                    .as_ref(),
-            );
+            let exit = subjects::spawn_exit(&registry, edge.claim_id.as_ref());
             answer.with_spawn(edge.public(exit))
         }
         _ => answer,

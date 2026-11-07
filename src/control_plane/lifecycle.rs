@@ -184,7 +184,7 @@ pub struct ManagedMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_subject_id: Option<String>,
+    pub parent_subject_id: Option<SubjectId>,
 }
 
 impl ManagedMetadata {
@@ -204,13 +204,6 @@ impl ManagedMetadata {
                     "managed {name} must be non-empty, control-free, and at most 256 bytes"
                 ));
             }
-        }
-        if self
-            .parent_subject_id
-            .as_deref()
-            .is_some_and(|id| SessionUuid::parse(id).is_none())
-        {
-            return Err("managed parent_subject_id must be a canonical UUID".into());
         }
         Ok(())
     }
@@ -354,7 +347,7 @@ pub struct Ticket {
     pub subject_id: SubjectId,
     /// The exact Radar launch operation that created this execution.
     pub launch_id: String,
-    pub parent_subject_id: Option<String>,
+    pub parent_subject_id: Option<SubjectId>,
     pub correlation: String,
 }
 
@@ -1991,10 +1984,7 @@ pub fn withdraw_unpresented(
     let Some(edge) = registry.spawn_edge(&edge.request_id)? else {
         return Ok(None);
     };
-    let (Some(claim_id), true) = (
-        edge.claim_id.as_deref().and_then(ClaimId::parse),
-        edge.granted_at.is_none(),
-    ) else {
+    let (Some(claim_id), true) = (edge.claim_id.clone(), edge.granted_at.is_none()) else {
         return Ok(None);
     };
     if edge.withdrawn.is_some() {
@@ -2868,7 +2858,7 @@ pub fn wrap(
     if let Some(parent_subject_id) = &ticket.parent_subject_id {
         env.insert(
             MANAGED_PARENT_SUBJECT_ENV.to_string(),
-            parent_subject_id.clone(),
+            parent_subject_id.to_string(),
         );
     }
     // A launch that could not enter its scope would run nothing, so it is refused
@@ -3546,7 +3536,7 @@ mod tests {
             run: Some("run-17".into()),
             label: Some("reviewer".into()),
             role: Some("worker".into()),
-            parent_subject_id: Some("01a10c77-8a6b-7035-8a0e-b1fa607bb507".into()),
+            parent_subject_id: SubjectId::parse("01a10c77-8a6b-7035-8a0e-b1fa607bb507"),
         };
         let first = create_with_intent(&registry, SPAWN, launch(), None, None, metadata.clone(), 1)
             .expect("accepted launch intent");
@@ -3966,7 +3956,7 @@ mod tests {
                 version: SUBJECT_VERSION,
                 subject_id: subject_id.clone(),
                 managed: ManagedMetadata {
-                    parent_subject_id: Some(parent_id.into()),
+                    parent_subject_id: SubjectId::parse(parent_id),
                     ..ManagedMetadata::default()
                 },
                 session: Some(session.clone()),
@@ -4000,7 +3990,14 @@ mod tests {
             .expect("read claim")
             .expect("new claim");
         assert_eq!(claim.subject_id, subject_id);
-        assert_eq!(claim.managed.parent_subject_id.as_deref(), Some(parent_id));
+        assert_eq!(
+            claim
+                .managed
+                .parent_subject_id
+                .as_ref()
+                .map(SubjectId::as_str),
+            Some(parent_id)
+        );
     }
 
     #[test]

@@ -450,12 +450,12 @@ fn spawn_binding(agent: &RegistryAgent, topology: &[PublicSpawnTopology]) -> Opt
             edge.edge
                 .bound
                 .as_ref()
-                .is_some_and(|bound| bound.registration_id == id)
+                .is_some_and(|bound| bound.registration_id.as_str() == id)
         })
         .map(|edge| SpawnBinding {
-            parent: edge.edge.parent.clone(),
+            parent: edge.edge.parent.to_string(),
             request_id: edge.edge.request_id.clone(),
-            claim_id: edge.edge.claim_id.clone(),
+            claim_id: edge.edge.claim_id.as_ref().map(ToString::to_string),
             child_source: edge.edge.bound.as_ref().map(|bound| bound.source.clone()),
             child_incarnation: edge
                 .edge
@@ -675,12 +675,16 @@ mod tests {
         BackendIdentity::named("tmux")
     }
 
+    const CHILD: &str = "0c000000-0000-4000-8000-0000000c41d0";
+    const LEAD: &str = "01ead000-0000-4000-8000-00000001ead0";
+    const CLAIM: &str = "0c1a0000-0000-4000-8000-00000000c1a1";
+
     /// The daemon's spawn edge for a child already bound to `registration_id`.
     fn spawn_edge(registration_id: &str) -> PublicSpawnTopology {
         serde_json::from_value(json!({
             "version": 1,
             "request_id": "r1",
-            "parent": "parent-1",
+            "parent": "0e000000-0000-4000-8000-0000000a7e00",
             "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
             "exit_observation": {"state": "unknown"},
             "created": "completed",
@@ -768,11 +772,8 @@ mod tests {
         );
         // The daemon's own spawn edge keeps a launch visible while it resolves.
         assert_eq!(
-            ids(
-                vec![registered("child", gone, None)],
-                vec![spawn_edge("child")]
-            ),
-            ["child"]
+            ids(vec![registered(CHILD, gone, None)], vec![spawn_edge(CHILD)]),
+            [CHILD]
         );
         // A pane that is here keeps its registration however stale: the pane stays
         // protected.
@@ -880,10 +881,10 @@ mod tests {
     #[test]
     fn a_registration_on_an_absent_pane_keeps_its_last_location_unjoined() {
         let panes = inventory(vec![pane("p1", "t1")]);
-        let agent = registered("a", at("p9"), Some(identity(7, 5)));
+        let agent = registered(CHILD, at("p9"), Some(identity(7, 5)));
         let read = RegistryRead {
             agents: vec![agent],
-            topology: vec![spawn_edge("a")],
+            topology: vec![spawn_edge(CHILD)],
             ..RegistryRead::default()
         };
         let projected = project(&panes, &backend(), read, &[]);
@@ -950,16 +951,16 @@ mod tests {
     #[test]
     fn a_registration_carries_the_spawn_edge_that_binds_its_identity() {
         let panes = inventory(vec![pane("p1", "t1")]);
-        let agent = registered("child", at("p1"), None);
+        let agent = registered(CHILD, at("p1"), None);
         let edge: PublicSpawnTopology = serde_json::from_value(json!({
             "version": 1,
             "request_id": "r1",
-            "parent": "parent-1",
+            "parent": "0e000000-0000-4000-8000-0000000a7e00",
             "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
             "exit_observation": {"state": "unknown"},
             "created": "completed",
             "launched": "completed",
-            "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "registration_id": "child", "bound_at": "2026-01-01T00:00:00.000Z"},
+            "bound": {"source": "test", "incarnation": "11111111-1111-4111-8111-111111111111", "registration_id": "0c000000-0000-4000-8000-0000000c41d0", "bound_at": "2026-01-01T00:00:00.000Z"},
             "recorded_at": "2026-01-01T00:00:00.000Z",
             "state": "bound"
         }))
@@ -974,7 +975,7 @@ mod tests {
         assert_eq!(
             view.spawn,
             Some(SpawnBinding {
-                parent: "parent-1".into(),
+                parent: "0e000000-0000-4000-8000-0000000a7e00".into(),
                 request_id: "r1".into(),
                 claim_id: None,
                 child_source: Some("test".into()),
@@ -988,13 +989,13 @@ mod tests {
     fn lifecycle_subject_joins_only_on_agent_and_process_birth_identity() {
         let claim = identity(10, 1);
         let panes = inventory(vec![pane("p1", "t1")]);
-        let agent = registered("lead", at("p1"), Some(claim.clone()));
+        let agent = registered(LEAD, at("p1"), Some(claim.clone()));
         let subject = LifecycleSubject {
             subject_id: "logical-subject-1".into(),
-            claim_id: Some("subject-1".into()),
+            claim_id: Some(CLAIM.into()),
 
             spawn_request_id: Some("subject-1".into()),
-            bound_registration_id: Some("lead".into()),
+            bound_registration_id: Some(LEAD.into()),
             process: Some(claim.clone()),
             state: crate::control_plane::lifecycle::State::Bound,
             managed: crate::control_plane::lifecycle::ManagedMetadata::default(),
@@ -1005,13 +1006,13 @@ mod tests {
         let edge: PublicSpawnTopology = serde_json::from_value(json!({
             "version": 1,
             "request_id": "spawn-1",
-            "parent": "parent-1",
+            "parent": "0e000000-0000-4000-8000-0000000a7e00",
             "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
             "exit_observation": {"state": "unknown"},
-            "claim_id": "subject-1",
+            "claim_id": "0c1a0000-0000-4000-8000-00000000c1a1",
             "created": "completed",
             "launched": "completed",
-            "bound": {"source":"lead", "incarnation":"11111111-1111-4111-8111-111111111111", "registration_id":"lead", "bound_at":"2026-01-01T00:00:00.000Z"},
+            "bound": {"source":"lead", "incarnation":"11111111-1111-4111-8111-111111111111", "registration_id":"01ead000-0000-4000-8000-00000001ead0", "bound_at":"2026-01-01T00:00:00.000Z"},
             "recorded_at": "2026-01-01T00:00:00.000Z",
             "state": "bound"
         })).expect("spawn edge");
@@ -1061,7 +1062,7 @@ mod tests {
             assert!(projected[0].registry.managed.is_none());
         }
 
-        let unjoined = registered("lead", at("p9"), Some(claim.clone()));
+        let unjoined = registered(LEAD, at("p9"), Some(claim.clone()));
         let read = RegistryRead {
             agents: vec![unjoined],
             topology: vec![edge],

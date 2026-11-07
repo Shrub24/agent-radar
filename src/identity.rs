@@ -42,21 +42,25 @@ fn canonical(value: &str) -> Option<String> {
 macro_rules! identity {
     ($name:ident, $what:literal) => {
         #[doc = concat!("A ", $what, ", as a validated canonical UUID.")]
-        #[derive(
-            Clone,
-            Debug,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Hash,
-            Serialize,
-            Deserialize,
-            schemars::JsonSchema,
-        )]
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
-        #[schemars(with = "String")]
         pub struct $name(String);
+
+        /// Published as the bare string it serializes to, inline, so the
+        /// generated schemas are what they were before the type existed.
+        impl schemars::JsonSchema for $name {
+            fn inline_schema() -> bool {
+                true
+            }
+
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                String::schema_name()
+            }
+
+            fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                String::json_schema(generator)
+            }
+        }
 
         impl $name {
             /// Parses a canonical UUID, normalizing hex digits to lowercase.

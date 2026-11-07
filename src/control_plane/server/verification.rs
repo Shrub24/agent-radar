@@ -302,10 +302,9 @@ pub(super) fn dead_pane_evidence(
         }
     }
     match bounded_exit_observation(backend, pane_id, stopping, budget) {
-        Ok(PaneExitObservation::Exited { .. }) => DeadPane::Cleanup(recorded_exit(
-            registry,
-            edge.claim_id.as_deref().and_then(ClaimId::parse).as_ref(),
-        )),
+        Ok(PaneExitObservation::Exited { .. }) => {
+            DeadPane::Cleanup(recorded_exit(registry, edge.claim_id.as_ref()))
+        }
         // A pane reported running, undetermined, or unreadable is not a pane whose
         // command has exited: the live refusal stands.
         Ok(PaneExitObservation::Running | PaneExitObservation::Unknown) | Err(()) => {

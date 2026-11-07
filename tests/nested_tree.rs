@@ -2095,26 +2095,42 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
 /// parent this view does not hold is said to be absent, not guessed at.
 #[test]
 fn a_child_names_its_exact_parent_and_an_absent_parent_is_said_so() {
+    const LEAD: &str = "00000000-0000-4000-8000-0000000001ea";
+    const OTHER: &str = "00000000-0000-4000-8000-0000000007e0";
+    const CHILD: &str = "00000000-0000-4000-8000-00000000c41d";
+    const ORPHAN: &str = "00000000-0000-4000-8000-0000000000f0";
+    const GONE: &str = "00000000-0000-4000-8000-0000000009e0";
     let state = registry_state(
         wa_inventory(&["wA:p1", "wA:p2", "wA:p3", "wA:p4"]),
         vec![
-            registration("lead", at("wA:p1"), false, Vec::new()),
-            registration("other", at("wA:p2"), false, Vec::new()),
-            registration("child", at("wA:p3"), false, Vec::new()),
-            registration("orphan", at("wA:p4"), false, Vec::new()),
+            registration(LEAD, at("wA:p1"), false, Vec::new()),
+            registration(OTHER, at("wA:p2"), false, Vec::new()),
+            registration(CHILD, at("wA:p3"), false, Vec::new()),
+            registration(ORPHAN, at("wA:p4"), false, Vec::new()),
         ],
-        vec![bound_edge("other", "child"), bound_edge("gone", "orphan")],
+        vec![bound_edge(OTHER, CHILD), bound_edge(GONE, ORPHAN)],
     );
-    let child = details(&state, &RowId::Registered("child".into()));
+    // The pane wraps a line this long, so its text is read unwrapped.
+    let unwrapped = |rendered: String| -> String {
+        rendered
+            .lines()
+            .filter_map(|line| line.split_once("││").map(|(_, pane)| pane))
+            .map(|pane| pane.trim_end_matches('│').trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let child = unwrapped(details(&state, &RowId::Registered(CHILD.into())));
     assert!(
-        child.contains("spawn: child of other label (other) (bound)"),
+        child.contains(&format!("spawn: child of {OTHER} label ({OTHER}) (bound)")),
         "{child}"
     );
-    assert!(!child.contains("child of lead"), "{child}");
+    assert!(!child.contains(&format!("child of {LEAD}")), "{child}");
 
-    let orphan = details(&state, &RowId::Registered("orphan".into()));
+    let orphan = unwrapped(details(&state, &RowId::Registered(ORPHAN.into())));
     assert!(
-        orphan.contains("spawn: child of gone (not in this view) (bound)"),
+        orphan.contains(&format!(
+            "spawn: child of {GONE} (not in this view) (bound)"
+        )),
         "{orphan}"
     );
 }

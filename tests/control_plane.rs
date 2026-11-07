@@ -3366,11 +3366,12 @@ fn registry_parent_at(
 #[test]
 fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() {
     use agent_radar::control_plane::registry::{Registry, SpawnRequest};
+    use agent_radar::identity::SubjectId;
 
     let sandbox = Sandbox::new("spawn-subject-filter");
     let registry = Registry::open(&sandbox.state()).expect("a registry");
-    let mine = "3f8c1d20-1111-4a2b-8c4d-000000000001";
-    let other = "3f8c1d20-2222-4a2b-8c4d-000000000002";
+    let mine = &SubjectId::parse("3f8c1d20-1111-4a2b-8c4d-000000000001").expect("an id");
+    let other = &SubjectId::parse("3f8c1d20-2222-4a2b-8c4d-000000000002").expect("an id");
     let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let parent = registry_parent(&registry, session);
     let mut ids = Vec::new();
@@ -3382,9 +3383,9 @@ fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() 
     ] {
         let request = SpawnRequest {
             request_id: request_id.into(),
-            parent: parent.registration_id.to_string(),
+            parent: parent.registration_id.clone(),
             parent_session_id: session.into(),
-            parent_subject_id: subject.map(str::to_string),
+            parent_subject_id: subject.cloned(),
         };
         registry.record_spawn(&request, 1).expect("an edge");
         ids.push(request_id);
@@ -3425,7 +3426,7 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
         .record_spawn(
             &SpawnRequest {
                 request_id: request_id.into(),
-                parent: parent.registration_id.to_string(),
+                parent: parent.registration_id.clone(),
                 parent_session_id: session.into(),
                 parent_subject_id: None,
             },
@@ -7474,9 +7475,9 @@ fn the_wire_shapes_of_spawn_are_validated_before_dispatch() {
             "cannot contain terminal control characters",
         ),
         (
-            "a parent that is not a runtime subject id",
+            "a parent that is not a registration id",
             spawn_params("parent", "/usr/bin/pi", &[]),
-            "`parent` must be a canonical UUID",
+            "`request` is not a valid spawn request",
         ),
         (
             "a field this request does not have",
@@ -11290,7 +11291,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
         .record_spawn(
             &SpawnRequest {
                 request_id: request_id.clone(),
-                parent: parent.registration_id.to_string(),
+                parent: parent.registration_id.clone(),
                 parent_session_id: session.into(),
                 parent_subject_id: None,
             },

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control_plane::lifecycle;
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
-use crate::identity::{ClaimId, RegistrationId};
+use crate::identity::{ClaimId, RegistrationId, SubjectId};
 use crate::model::{ProcessIdentity, SessionUuid};
 use crate::timestamp::timestamp_millis;
 
@@ -50,22 +50,18 @@ pub struct SpawnRequest {
     /// a retry repeats.
     pub request_id: String,
     /// Exact agent registration used as the live process parent.
-    pub parent: String,
+    pub parent: RegistrationId,
     /// Parent subject, verified against this registration's fresh context.
     pub parent_session_id: String,
     /// The parent subject, when the request was made on behalf of one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_subject_id: Option<String>,
+    pub parent_subject_id: Option<SubjectId>,
 }
 
 impl SpawnRequest {
     pub fn validate(&self) -> Result<(), String> {
         canonical_uuid("request_id", &self.request_id)?;
-        canonical_uuid("parent", &self.parent)?;
         canonical_uuid("parent_session_id", &self.parent_session_id)?;
-        if let Some(id) = self.parent_subject_id.as_deref() {
-            canonical_uuid("parent_subject_id", id)?;
-        }
         Ok(())
     }
 }
@@ -85,11 +81,11 @@ pub struct BoundChild {
     pub source: String,
     pub incarnation: String,
     /// Exact registry identity returned to the registering child.
-    pub registration_id: String,
+    pub registration_id: RegistrationId,
     /// The durable agent the bound child attaches as. Absent for an edge without
     /// a tracked launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<String>,
+    pub subject_id: Option<SubjectId>,
     /// When the edge bound to this incarnation.
     pub bound_at: String,
 }
@@ -114,16 +110,16 @@ pub struct SpawnExitObservation {
 pub struct SpawnEdge {
     pub version: u32,
     pub request_id: String,
-    pub parent: String,
+    pub parent: RegistrationId,
     /// Logical session parent.
     pub parent_session_id: String,
     /// The subject that requested this launch, when it had one. Durable
     /// parentage: a session moves on `/resume`, so it is not the parent key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_subject_id: Option<String>,
+    pub parent_subject_id: Option<SubjectId>,
     /// Exact tracked attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_id: Option<String>,
+    pub claim_id: Option<ClaimId>,
     /// Binding credential: the claim id for tracked launches, private otherwise.
     pub token: String,
     /// Where the child was created, once a create answered.
@@ -227,12 +223,12 @@ pub enum PublicSpawnExitObservation {
 pub struct PublicSpawnEdge {
     pub version: u32,
     pub request_id: String,
-    pub parent: String,
+    pub parent: RegistrationId,
     pub parent_session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_subject_id: Option<String>,
+    pub parent_subject_id: Option<SubjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_id: Option<String>,
+    pub claim_id: Option<ClaimId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<RegistryLocation>,
     pub created: RequestOutcome,
@@ -330,12 +326,11 @@ pub fn record(
             request.request_id
         ));
     }
-    let parent = RegistrationId::required(&request.parent, "parent")?;
     registry
-        .get(&parent)?
+        .get(&request.parent)?
         .ok_or_else(|| format!("parent {} is not a registered agent", request.parent))?;
     let context = registry
-        .context(&parent, now_ms)?
+        .context(&request.parent, now_ms)?
         .ok_or_else(|| format!("parent {} has no published session context", request.parent))?;
     if context.context.freshness != Freshness::Fresh
         || context.context.session.as_deref() != Some(&request.parent_session_id)
@@ -365,7 +360,7 @@ pub fn record(
     write_edge(registry, &edge)?;
     registry.append_event(
         "spawn.requested",
-        Some(&edge.parent),
+        Some(edge.parent.as_str()),
         None,
         Some(&edge.request_id),
     );
@@ -377,12 +372,10 @@ pub fn record(
 pub fn attach_subject(
     registry: &Registry,
     request_id: &str,
-    claim_id: &str,
-    registration_id: &str,
+    claim_id: &ClaimId,
+    registration_id: &RegistrationId,
 ) -> Result<SpawnEdge, String> {
     canonical_uuid("request_id", request_id)?;
-    canonical_uuid("claim_id", claim_id)?;
-    canonical_uuid("registration_id", registration_id)?;
     let _transition = registry.transition();
     let stored = stored_edge(registry, request_id)?;
     if stored.claim_id.is_some() {
@@ -391,7 +384,7 @@ pub fn attach_subject(
         ));
     }
     let edge = SpawnEdge {
-        claim_id: Some(claim_id.to_string()),
+        claim_id: Some(claim_id.clone()),
         token: registration_id.to_string(),
         ..stored
     };
@@ -524,20 +517,17 @@ pub fn list_after(
     registry: &Registry,
     after: Option<&str>,
     limit: usize,
-    parent_subject: Option<&str>,
+    parent_subject: Option<&SubjectId>,
 ) -> Result<Vec<SpawnEdge>, String> {
     if let Some(after) = after {
         canonical_uuid("after", after)?;
-    }
-    if let Some(subject) = parent_subject {
-        canonical_uuid("parent_subject_id", subject)?;
     }
     let mut edges = edges(registry)?;
     edges.retain(|edge| after.is_none_or(|cursor| edge.request_id.as_str() > cursor));
     // The filter applies before the page is cut, so a caller that pages its own
     // launches never walks the whole topology to find them.
     if let Some(subject) = parent_subject {
-        edges.retain(|edge| edge.parent_subject_id.as_deref() == Some(subject));
+        edges.retain(|edge| edge.parent_subject_id.as_ref() == Some(subject));
     }
     edges.truncate(limit);
     Ok(edges)
@@ -559,11 +549,9 @@ pub(super) fn launched_registration(
         return Err("no recorded spawn edge was minted with this token".into());
     };
     match edge.claim_id {
-        Some(claim_id) => {
-            lifecycle::read_claim(registry, &ClaimId::required(&claim_id, "claim_id")?)?
-                .map(|launch| Some(launch.process.registration_id))
-                .ok_or_else(|| "launch reservation is missing".into())
-        }
+        Some(claim_id) => lifecycle::read_claim(registry, &claim_id)?
+            .map(|launch| Some(launch.process.registration_id))
+            .ok_or_else(|| "launch reservation is missing".into()),
         None => Ok(None),
     }
 }
@@ -663,14 +651,12 @@ fn bind_locked(
     // could not be written leaves the subject bound, which a same-content retry heals.
     let mut subject = None;
     if let Some(claim_id) = &stored.claim_id {
-        let claim_id = ClaimId::required(claim_id, "claim_id")?;
-        lifecycle::fence_registration(registry, &claim_id, process, Some(registration_id), now_ms)?;
-        subject =
-            lifecycle::read_claim(registry, &claim_id)?.map(|launch| launch.subject_id.to_string());
+        lifecycle::fence_registration(registry, claim_id, process, Some(registration_id), now_ms)?;
+        subject = lifecycle::read_claim(registry, claim_id)?.map(|launch| launch.subject_id);
     }
     if let Some(bound) = &stored.bound {
         if bound.source == request.source && bound.incarnation == request.incarnation {
-            if bound.registration_id != registration_id.as_str() {
+            if &bound.registration_id != registration_id {
                 return Err("spawn binding names a different registry identity".into());
             }
             return Ok(stored);
@@ -681,7 +667,7 @@ fn bind_locked(
         bound: Some(BoundChild {
             source: request.source.clone(),
             incarnation: request.incarnation.clone(),
-            registration_id: registration_id.to_string(),
+            registration_id: registration_id.clone(),
             subject_id: subject,
             bound_at: format_millis(now_ms),
         }),
@@ -762,9 +748,6 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
     if edge.request_id != request_id {
         return Err("spawn edge id does not match its filename".into());
     }
-    if SessionUuid::parse(&edge.parent).is_none() {
-        return Err("spawn edge names a malformed parent".into());
-    }
     if SessionUuid::parse(&edge.token).is_none() {
         return Err("spawn edge names a malformed token".into());
     }
@@ -779,7 +762,6 @@ fn decode(bytes: &[u8], request_id: &str) -> Result<SpawnEdge, String> {
         if timestamp_millis(&bound.bound_at).is_none() {
             return Err("spawn edge bound_at is not a timestamp".into());
         }
-        canonical_uuid("bound.registration_id", &bound.registration_id)?;
     }
     if timestamp_millis(&edge.recorded_at).is_none() {
         return Err("spawn edge recorded_at is not a timestamp".into());

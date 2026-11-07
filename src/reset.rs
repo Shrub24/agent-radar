@@ -421,7 +421,7 @@ mod tests {
             version: 1,
             subject_id: crate::identity::SubjectId::parse(id).expect("a subject id"),
             managed: ManagedMetadata {
-                parent_subject_id: Some(PARENT_SUBJECT_ID.into()),
+                parent_subject_id: crate::identity::SubjectId::parse(PARENT_SUBJECT_ID),
                 ..ManagedMetadata::default()
             },
             session: Some("session".into()),
@@ -498,7 +498,11 @@ mod tests {
         let record: SubjectRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(record.subject_id.as_str(), SUBJECT_ID);
         assert_eq!(
-            record.managed.parent_subject_id.as_deref(),
+            record
+                .managed
+                .parent_subject_id
+                .as_ref()
+                .map(|id| id.as_str()),
             Some(PARENT_SUBJECT_ID)
         );
         assert_eq!(fs::read(handoff).unwrap(), b"durable communication");

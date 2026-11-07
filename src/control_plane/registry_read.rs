@@ -199,13 +199,7 @@ fn topology(
         topology.extend(page.iter().map(|edge| {
             edge.topology(
                 location_evidence(inventory, edge),
-                crate::control_plane::lifecycle::spawn_exit(
-                    registry,
-                    edge.claim_id
-                        .as_deref()
-                        .and_then(crate::identity::ClaimId::parse)
-                        .as_ref(),
-                ),
+                crate::control_plane::lifecycle::spawn_exit(registry, edge.claim_id.as_ref()),
             )
         }));
         if page.len() < PAGE {

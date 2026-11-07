@@ -17,7 +17,7 @@ pub(super) fn child_record(
     let record = subjects::read_subject_record(registry, &subject_id)
         .map_err(|error| Refusal::new(Code::Internal, error))?
         .ok_or_else(|| Refusal::new(Code::NotFound, "subject is not recorded"))?;
-    if record.managed.parent_subject_id.as_deref() != Some(parent.subject_id.as_str()) {
+    if record.managed.parent_subject_id.as_ref() != Some(&parent.subject_id) {
         return Err(Refusal::new(
             Code::Refused,
             "subject is not this caller's child",
@@ -297,9 +297,10 @@ pub(super) fn subject_read_request(
         let complete = page.len() < MAX_REGISTRY_PAGE;
         for record in page {
             after = Some(record.subject_id.to_string());
-            if parent.as_ref().is_some_and(|parent| {
-                record.managed.parent_subject_id.as_deref() != Some(parent.as_str())
-            }) {
+            if parent
+                .as_ref()
+                .is_some_and(|parent| record.managed.parent_subject_id.as_ref() != Some(parent))
+            {
                 continue;
             }
             let entry = match project(record) {

@@ -30,7 +30,7 @@ pub struct ManagedLaunchMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_subject_id: Option<String>,
+    pub parent_subject_id: Option<crate::identity::SubjectId>,
 }
 
 /// The managed Pi execution that produced or received a message. `subject_id` is

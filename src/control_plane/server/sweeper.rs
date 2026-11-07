@@ -306,7 +306,7 @@ pub(super) fn observe_launch_panes(
         if edge.bound.is_none() || edge.withdrawn.is_some() {
             continue;
         }
-        let Some(claim_id) = edge.claim_id.as_deref().and_then(ClaimId::parse) else {
+        let Some(claim_id) = edge.claim_id.clone() else {
             continue;
         };
         let Some(location) = edge.location.as_ref() else {

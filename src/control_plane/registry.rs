@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
-use crate::identity::{ClaimId, RegistrationId};
+use crate::identity::{ClaimId, RegistrationId, SubjectId};
 use crate::model::{ProcessIdentity, SessionUuid};
 
 /// Missing registry authority is distinct from a rejected write.
@@ -640,20 +640,20 @@ impl Registry {
         spawn::edge(self, request_id)
     }
 
-    /// One page of spawn edges in stable request-id order, at most `limit` of
-    /// them, starting after `after`. Each token is included: what a client may
-    /// read is [`SpawnEdge::topology`].
     /// [`Self::spawn_edges_after`] restricted to the edges one parent subject
-    /// subject launched, so a caller reads its own children, not the topology.
+    /// launched, so a caller reads its own children, not the topology.
     pub fn spawn_edges_for_subject_after(
         &self,
-        parent_subject: &str,
+        parent_subject: &SubjectId,
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SpawnEdge>, String> {
         spawn::list_after(self, after, limit, Some(parent_subject))
     }
 
+    /// One page of spawn edges in stable request-id order, at most `limit` of
+    /// them, starting after `after`. Each token is included: what a client may
+    /// read is [`SpawnEdge::topology`].
     pub fn spawn_edges_after(
         &self,
         after: Option<&str>,
@@ -703,12 +703,7 @@ impl Registry {
         claim_id: &ClaimId,
         registration_id: &RegistrationId,
     ) -> Result<SpawnEdge, String> {
-        spawn::attach_subject(
-            self,
-            request_id,
-            claim_id.as_str(),
-            registration_id.as_str(),
-        )
+        spawn::attach_subject(self, request_id, claim_id, registration_id)
     }
 
     /// The opaque serving epoch of this registry instance.

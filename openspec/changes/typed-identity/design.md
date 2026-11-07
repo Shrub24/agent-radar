@@ -4,9 +4,11 @@
 
 `src/identity.rs` defines `SubjectId`, `ClaimId` and `RegistrationId`. Each wraps a
 canonical lowercase UUID and offers `parse(&str) -> Option<Self>`, `random()`,
-`as_str()` and `Display`. Serialization is `#[serde(transparent)]` with
-`#[schemars(with = "String")]`, so JSON and the generated schemas are unchanged and
-the SDK needs no regeneration.
+`as_str()` and `Display`. Serialization goes through the bare string, and the
+`JsonSchema` impl is `String`'s, inlined: `#[schemars(with = "String")]` on the
+type still emits a named definition that every field references, which changes
+the published schemas. JSON and the generated schemas are unchanged and the SDK
+needs no regeneration.
 
 Deserializing validates. An id in a stored record that is not a canonical UUID
 fails to decode, which startup verification already turns into a named refusal.

@@ -6,7 +6,7 @@ use crate::control_plane::answer::{Admitted, Claimed};
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SpawnParams {
-    pub(super) parent: String,
+    pub(super) parent: RegistrationId,
     pub(super) parent_session_id: String,
     pub(super) executable: String,
     #[serde(default)]
@@ -19,7 +19,7 @@ pub(super) struct SpawnParams {
     pub(super) managed: subjects::ManagedMetadata,
     /// Start this child agent again instead of a new one.
     #[serde(default)]
-    pub(super) continue_subject_id: Option<String>,
+    pub(super) continue_subject_id: Option<SubjectId>,
 }
 
 /// Asks the selected backend whether it can carry this launch, before any record
@@ -220,9 +220,8 @@ pub(super) fn execute_spawn(
     // lands wherever the multiplexer happens to have focus, and a parent with no
     // recorded pane is refused rather than guessed from a title or a label.
     let parent_pane = {
-        let parent_id = id_param(&params.parent, "parent", RegistrationId::required)?;
         let core = locked(core);
-        let parent = match core.registry.get(&parent_id) {
+        let parent = match core.registry.get(&params.parent) {
             Ok(Some(parent)) => parent,
             Ok(None) => {
                 return Err(Refusal::new(
@@ -234,7 +233,7 @@ pub(super) fn execute_spawn(
                 return Err(Refusal::new(Code::Internal, error));
             }
         };
-        let context = match core.registry.context(&parent_id, store::now_ms()) {
+        let context = match core.registry.context(&params.parent, store::now_ms()) {
             Ok(Some(context)) => context,
             Ok(None) => {
                 return Err(Refusal::new(
@@ -295,10 +294,9 @@ pub(super) fn continuation(
     core: &Arc<Mutex<Core>>,
     params: SpawnParams,
 ) -> Result<(SpawnParams, SpawnLineage), Refusal> {
-    let Some(subject_id) = params.continue_subject_id.as_deref() else {
+    let Some(subject_id) = params.continue_subject_id.clone() else {
         return Ok((params, SpawnLineage::default()));
     };
-    let subject_id = id_param(subject_id, "continue_subject_id", SubjectId::required)?;
     let refuse = |message: &str| Refusal::new(Code::Refused, message.to_string());
     let registry = Arc::clone(&locked(core).registry);
     let internal = |error: String| Refusal::new(Code::Internal, error);
@@ -368,19 +366,13 @@ pub(super) fn spawn_child(
         return spawn_answer(request, response, core);
     }
     if lineage.prepared.is_none()
-        && let Some(parent_subject_id) = params.managed.parent_subject_id.as_deref()
+        && let Some(parent_subject_id) = &params.managed.parent_subject_id
     {
-        let parent_subject_id =
-            id_param(parent_subject_id, "parent_subject_id", SubjectId::required)?;
         let registry = Arc::clone(&locked(core).registry);
-        match subjects::current_attachment(&registry, &parent_subject_id) {
+        match subjects::current_attachment(&registry, parent_subject_id) {
             Ok(Some(parent_subject))
-                if parent_subject
-                    .process
-                    .bound_registration_id
-                    .as_ref()
-                    .map(RegistrationId::as_str)
-                    == Some(params.parent.as_str()) => {}
+                if parent_subject.process.bound_registration_id.as_ref()
+                    == Some(&params.parent) => {}
             Ok(Some(_)) => {
                 return Err(Refusal::new(
                     Code::BadParams,
@@ -695,10 +687,7 @@ pub(super) fn spawn_child(
         Settlement::new(outcome, category, message, effects),
         store::now_ms(),
     );
-    let exit = subjects::spawn_exit(
-        &locked(core).registry,
-        edge.claim_id.as_deref().and_then(ClaimId::parse).as_ref(),
-    );
+    let exit = subjects::spawn_exit(&locked(core).registry, edge.claim_id.as_ref());
     write_settled_with(done, core, |answer| answer.with_spawn(edge.public(exit)))
 }
 
