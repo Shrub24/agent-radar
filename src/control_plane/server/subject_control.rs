@@ -183,8 +183,13 @@ pub(super) fn execute_enroll(
             Arc::clone(&core.stopping),
         )
     };
+    let registration_id = id_param(
+        &params.registration_id,
+        "registration_id",
+        RegistrationId::required,
+    )?;
     let now = store::now_ms();
-    let registration = match registry.get(&params.registration_id) {
+    let registration = match registry.get(&registration_id) {
         Ok(Some(registration)) => registration,
         Ok(None) => {
             return Err(Refusal::new(
@@ -211,7 +216,7 @@ pub(super) fn execute_enroll(
             "registration claims no process to enroll".to_string(),
         ));
     };
-    match registry.context(&params.registration_id, now) {
+    match registry.context(&registration_id, now) {
         Ok(Some(context))
             if context.context.freshness == registry::Freshness::Fresh
                 && context.context.session.as_deref() == Some(params.session.as_str()) => {}
@@ -434,12 +439,7 @@ pub(super) fn run_restart(
         _ => {}
     }
     // A restart retains the lead's existing pane.
-    let anchor = match subject
-        .process
-        .bound_registration_id
-        .as_ref()
-        .map(RegistrationId::as_str)
-    {
+    let anchor = match subject.process.bound_registration_id.as_ref() {
         Some(agent) => match registry.get(agent) {
             Ok(Some(registration)) => registration
                 .request
@@ -537,11 +537,7 @@ pub(super) fn restart_lead(
         return Settlement::backend_refused("the Pi session has no current granted presence claim");
     }
     let (Some(agent), Some(session)) = (
-        subject
-            .process
-            .bound_registration_id
-            .as_ref()
-            .map(RegistrationId::as_str),
+        subject.process.bound_registration_id.as_ref(),
         subject.session.as_deref(),
     ) else {
         return Settlement::backend_refused(
@@ -620,11 +616,9 @@ pub(super) fn restart_lead(
         Ok(prepared) => prepared,
         Err(error) => return Settlement::backend_refused(error),
     };
-    if let Err(error) = registry.attach_subject(
-        successor,
-        prepared.1.claim_id.as_str(),
-        prepared.1.registration_id.as_str(),
-    ) {
+    if let Err(error) =
+        registry.attach_subject(successor, &prepared.1.claim_id, &prepared.1.registration_id)
+    {
         return Settlement::backend_refused(error);
     }
     let mut effects = Vec::new();
@@ -775,7 +769,7 @@ pub(super) fn current_presence_grant(
     ) else {
         return Ok(true);
     };
-    let Some(registration) = registry.get(registration_id.as_str())? else {
+    let Some(registration) = registry.get(registration_id)? else {
         return Ok(false);
     };
     if registration.request.source != "herdsman-pi" {

@@ -61,7 +61,7 @@ pub fn registration(
         )
     };
     if let Some(id) = &report.registration_id {
-        if let Some(existing) = registry.get(id)? {
+        if let Some(existing) = registry.get(&RegistrationId::required(id, "registration_id")?)? {
             if existing.request.process.as_ref() != Some(&report.process)
                 || existing.request.source != report.source
                 || existing.request.incarnation != report.incarnation
@@ -81,14 +81,16 @@ pub fn registration(
         }) {
             return Err("a managed command is not an agent and cannot be attached".into());
         }
-        if super::spawn::launched_registration(registry, Some(id))?.as_deref() != Some(id) {
+        if super::spawn::launched_registration(registry, Some(id))?
+            .is_none_or(|admitted| admitted.as_str() != id)
+        {
             return Err("registration was not admitted by a managed launch".into());
         }
         // Binding a pre-minted registration uses the same captured-birth fence
         // as registration admission. An unknown ID refuses; never adopt instead.
         return register();
     }
-    let mut after = None;
+    let mut after: Option<String> = None;
     loop {
         let page = registry.list_after(after.as_deref(), 256)?;
         if let Some(existing) = page.iter().find(|r| {
@@ -102,7 +104,7 @@ pub fn registration(
         if page.len() < 256 {
             break;
         }
-        after = page.last().map(|r| r.registration_id.clone());
+        after = page.last().map(|r| r.registration_id.to_string());
     }
     register()
 }

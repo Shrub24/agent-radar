@@ -8,7 +8,7 @@
 ## 2. Registry and events
 
 - [x] 2.1 Type `ProcessFacts`, attachments, placements and their map keys. Gate green.
-- [ ] 2.2 Type the registry's own registration record (`Registration.registration_id`) and the registration-keyed registry reads (`get`, `context`, `published_facts`), deleting the `RegistrationId::required` conversions stage 2.1 left at their callers. Gate green.
+- [x] 2.2 Type the registry's own registration record (`Registration.registration_id`) and the registration-keyed registry reads (`get`, `context`, `published_facts`), deleting the `RegistrationId::required` conversions stage 2.1 left at their callers. Gate green.
 
 ## 3. Server and wire
 

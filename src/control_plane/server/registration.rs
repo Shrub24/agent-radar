@@ -22,8 +22,10 @@ pub(super) fn presence_request(
         if request.method == "agent.release" {
             let release: presence::Release =
                 serde_json::from_value(request.params.clone()).map_err(|e| e.to_string())?;
+            let registration_id =
+                RegistrationId::required(&release.registration_id, "registration_id")?;
             let registration = registry
-                .get(&release.registration_id)?
+                .get(&registration_id)?
                 .ok_or("registration is not recorded")?;
             if registration.request.process.as_ref() != Some(&release.process)
                 || !matches!(verifier.inspect(release.process.pid), Ok(Some(p)) if p == release.process)
@@ -32,7 +34,7 @@ pub(super) fn presence_request(
             }
             return presence::release(
                 &registry,
-                &RegistrationId::required(&release.registration_id, "registration_id")?,
+                &registration_id,
                 &ClaimId::required(&release.claim_id, "claim_id")?,
             );
         }
@@ -51,8 +53,7 @@ pub(super) fn presence_request(
             Ok(_) => return Err("process birth identity is absent or mismatched".into()),
         }
         let registration = presence::registration(&registry, &report, now)?;
-        let registration_id =
-            RegistrationId::required(&registration.registration_id, "registration_id")?;
+        let registration_id = registration.registration_id.clone();
         let claim_id = ClaimId::required(&report.claim_id, "claim_id")?;
         let mut claim = presence::begin(
             &registry,
@@ -112,7 +113,7 @@ pub(super) fn presence_request(
         )?;
         registry::context::report_presence(
             &registry,
-            &registration.registration_id,
+            registration.registration_id.as_str(),
             registry::PublisherIdentity {
                 source: registration.request.source.clone(),
                 incarnation: registration.request.incarnation.clone(),
@@ -138,7 +139,7 @@ pub(super) fn presence_request(
                     &registry,
                     &verifier,
                     &EnrollParams {
-                        registration_id: registration.registration_id.clone(),
+                        registration_id: registration.registration_id.to_string(),
                         session: report.session_id,
                     },
                     &report.process,
@@ -266,6 +267,14 @@ pub(super) fn registry_request(
                 Ok(value) => value,
                 Err(refusal) => return Response::refused(&request.id, &refusal),
             };
+            let registration_id = match id_param(
+                &publish.registration_id,
+                "registration_id",
+                RegistrationId::required,
+            ) {
+                Ok(registration_id) => registration_id,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
+            };
             let core = locked(core);
             let now_ms = store::now_ms();
             match core.registry.publish_context(&publish, now_ms) {
@@ -274,16 +283,12 @@ pub(super) fn registry_request(
                     // on its bound subject, so that subject can be attached. A failure
                     // leaves the subject unattached, which is reported, not retried here.
                     if let Some(session) = publish.context.session.as_deref()
-                        && let Err(error) =
-                            RegistrationId::required(&publish.registration_id, "registration_id")
-                                .and_then(|registration_id| {
-                                    subjects::record_launch_session(
-                                        &core.registry,
-                                        &registration_id,
-                                        session,
-                                        now_ms,
-                                    )
-                                })
+                        && let Err(error) = subjects::record_launch_session(
+                            &core.registry,
+                            &registration_id,
+                            session,
+                            now_ms,
+                        )
                     {
                         tracing::warn!(%error, "could not record a launched session");
                     }
@@ -293,11 +298,7 @@ pub(super) fn registry_request(
                             writer: result.record.writer.clone(),
                             context: result.record.public(now_ms, core.registry.serving_epoch()),
                             warning: result.warning,
-                            management: management_view(
-                                &core.registry,
-                                &publish.registration_id,
-                                now_ms,
-                            ),
+                            management: management_view(&core.registry, &registration_id, now_ms),
                         }),
                     )
                 }
@@ -344,7 +345,15 @@ pub(super) fn registry_request(
                     Arc::clone(&core.stopping),
                 )
             };
-            let registration = match registry.get(&params.registration_id) {
+            let registration_id = match id_param(
+                &params.registration_id,
+                "registration_id",
+                RegistrationId::required,
+            ) {
+                Ok(registration_id) => registration_id,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
+            };
+            let registration = match registry.get(&registration_id) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     return Response::refused(

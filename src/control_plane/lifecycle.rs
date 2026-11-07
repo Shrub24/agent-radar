@@ -1591,7 +1591,7 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
             ));
     }
     Ok(registry
-        .context(agent.as_str(), now_ms)?
+        .context(agent, now_ms)?
         .and_then(|context| context.context.session)
         .as_deref()
         == Some(session))
@@ -3685,7 +3685,7 @@ mod tests {
         let registration = registry
             .register(&presenting(identity.clone()), 2)
             .expect("presence binds the admitted registration");
-        assert_eq!(registration.registration_id, admitted.as_str());
+        assert_eq!(registration.registration_id, admitted);
 
         let other = ProcessIdentity {
             pid: 4243,

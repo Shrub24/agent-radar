@@ -312,7 +312,9 @@ pub fn publish(
     request.validate()?;
     let _transition = registry.transition();
     // The context is a fact about an agent record, so the subject must exist.
-    registry.get(&request.registration_id)?.ok_or_else(|| {
+    let registration_id =
+        crate::identity::RegistrationId::required(&request.registration_id, "registration_id")?;
+    registry.get(&registration_id)?.ok_or_else(|| {
         super::Error::NotFound(format!(
             "agent {} is not registered",
             request.registration_id

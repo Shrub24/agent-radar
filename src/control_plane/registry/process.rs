@@ -110,7 +110,7 @@ impl Registry {
     /// runs independently of all registry transitions.
     pub fn verify_process(
         &self,
-        registration_id: &str,
+        registration_id: &crate::identity::RegistrationId,
         verifier: &dyn ProcessVerifier,
     ) -> Result<ProcessVerification, String> {
         let registration = self

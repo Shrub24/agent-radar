@@ -330,11 +330,12 @@ pub fn record(
             request.request_id
         ));
     }
+    let parent = RegistrationId::required(&request.parent, "parent")?;
     registry
-        .get(&request.parent)?
+        .get(&parent)?
         .ok_or_else(|| format!("parent {} is not a registered agent", request.parent))?;
     let context = registry
-        .context(&request.parent, now_ms)?
+        .context(&parent, now_ms)?
         .ok_or_else(|| format!("parent {} has no published session context", request.parent))?;
     if context.context.freshness != Freshness::Fresh
         || context.context.session.as_deref() != Some(&request.parent_session_id)
@@ -545,24 +546,22 @@ pub fn list_after(
 pub(super) fn launched_registration(
     registry: &Registry,
     token: Option<&str>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<RegistrationId>, String> {
     let Some(token) = token else { return Ok(None) };
     let Some(edge) = edges(registry)?
         .into_iter()
         .find(|edge| edge.token == token)
     else {
-        if lifecycle::managed_agent(
-            registry,
-            &RegistrationId::required(token, "registration_id")?,
-        )? {
-            return Ok(Some(token.to_owned()));
+        let admitted = RegistrationId::required(token, "registration_id")?;
+        if lifecycle::managed_agent(registry, &admitted)? {
+            return Ok(Some(admitted));
         }
         return Err("no recorded spawn edge was minted with this token".into());
     };
     match edge.claim_id {
         Some(claim_id) => {
             lifecycle::read_claim(registry, &ClaimId::required(&claim_id, "claim_id")?)?
-                .map(|launch| Some(launch.process.registration_id.to_string()))
+                .map(|launch| Some(launch.process.registration_id))
                 .ok_or_else(|| "launch reservation is missing".into())
         }
         None => Ok(None),
@@ -578,7 +577,7 @@ pub(super) fn launched_registration(
 pub(super) fn bind_presented_token(
     registry: &Registry,
     request: &super::RegistrationRequest,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     now_ms: i64,
 ) -> Result<(), String> {
     let Some(token) = request.spawn_token.as_deref() else {
@@ -588,10 +587,9 @@ pub(super) fn bind_presented_token(
         registry,
         &RegistrationId::required(token, "registration_id")?,
     )? {
-        let typed = RegistrationId::required(registration_id, "registration_id")?;
-        lifecycle::bind_managed(registry, &typed, request.process.as_ref(), now_ms)?;
-        let process =
-            lifecycle::read_process(registry, &typed)?.ok_or("managed execution is missing")?;
+        lifecycle::bind_managed(registry, registration_id, request.process.as_ref(), now_ms)?;
+        let process = lifecycle::read_process(registry, registration_id)?
+            .ok_or("managed execution is missing")?;
         if let Some(edge) = edge(registry, &process.spawn_request_id)? {
             bind_locked(
                 registry,
@@ -646,7 +644,7 @@ fn bind_locked(
     registry: &Registry,
     request: &SpawnBindRequest,
     now_ms: i64,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     process: Option<&ProcessIdentity>,
 ) -> Result<SpawnEdge, String> {
     let mut matches = edges(registry)?
@@ -666,14 +664,13 @@ fn bind_locked(
     let mut subject = None;
     if let Some(claim_id) = &stored.claim_id {
         let claim_id = ClaimId::required(claim_id, "claim_id")?;
-        let typed = RegistrationId::required(registration_id, "registration_id")?;
-        lifecycle::fence_registration(registry, &claim_id, process, Some(&typed), now_ms)?;
+        lifecycle::fence_registration(registry, &claim_id, process, Some(registration_id), now_ms)?;
         subject =
             lifecycle::read_claim(registry, &claim_id)?.map(|launch| launch.subject_id.to_string());
     }
     if let Some(bound) = &stored.bound {
         if bound.source == request.source && bound.incarnation == request.incarnation {
-            if bound.registration_id != registration_id {
+            if bound.registration_id != registration_id.as_str() {
                 return Err("spawn binding names a different registry identity".into());
             }
             return Ok(stored);
@@ -684,7 +681,7 @@ fn bind_locked(
         bound: Some(BoundChild {
             source: request.source.clone(),
             incarnation: request.incarnation.clone(),
-            registration_id: registration_id.to_owned(),
+            registration_id: registration_id.to_string(),
             subject_id: subject,
             bound_at: format_millis(now_ms),
         }),
@@ -693,7 +690,7 @@ fn bind_locked(
     write_edge(registry, &edge)?;
     registry.append_event(
         "spawn.bound",
-        Some(registration_id),
+        Some(registration_id.as_str()),
         None,
         Some(&edge.request_id),
     );

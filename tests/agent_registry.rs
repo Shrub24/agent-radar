@@ -30,6 +30,7 @@ use agent_radar::control_plane::registry::{
     RegistryLocation, Report, Snapshot, SpawnEdge, SpawnRequest, SpawnState, WriterBinding,
 };
 use agent_radar::control_plane::{RequestOutcome, random_uuid};
+use agent_radar::identity::RegistrationId;
 use agent_radar::model::{ProcessIdentity, SessionUuid};
 use serde_json::{Value, json};
 
@@ -402,21 +403,6 @@ fn a_registration_of_another_version_is_refused() {
 }
 
 #[test]
-fn an_id_that_is_not_canonical_cannot_name_a_file() {
-    let root = temp_root("id");
-    let registry = Registry::open(&root).expect("a registry");
-    for id in [
-        "not-a-uuid",
-        "../escape",
-        "8a1f5c30-6f4b-4c58-9c7b-2d0e1a9f4b2",
-    ] {
-        let error = registry.get(id).expect_err("a refusal");
-        assert!(error.contains("canonical UUID"), "{id}: {error}");
-    }
-    drop_root(&root);
-}
-
-#[test]
 fn a_registration_listing_is_in_stable_id_order_and_bounded() {
     let root = temp_root("listing");
     let registry = Registry::open(&root).expect("a registry");
@@ -444,7 +430,7 @@ fn a_registration_listing_is_in_stable_id_order_and_bounded() {
     let mut expected = ids.clone();
     expected.sort();
 
-    let listed: Vec<String> = registry
+    let listed: Vec<RegistrationId> = registry
         .list(usize::MAX)
         .expect("a list")
         .into_iter()
@@ -453,7 +439,7 @@ fn a_registration_listing_is_in_stable_id_order_and_bounded() {
     assert_eq!(listed, expected, "stable agent-id order");
     assert_eq!(listed.len(), MAX_LISTED.min(ids.len()));
 
-    let first_two: Vec<String> = registry
+    let first_two: Vec<RegistrationId> = registry
         .list(2)
         .expect("a list")
         .into_iter()
@@ -472,7 +458,7 @@ fn concurrent_identical_registrations_admit_one_record() {
     let (start_tx, start_rx) = mpsc::sync_channel::<()>(CALLERS);
     let start_rx = Arc::new(Mutex::new(start_rx));
 
-    let admitted: Vec<String> = thread::scope(|scope| {
+    let admitted: Vec<RegistrationId> = thread::scope(|scope| {
         let handles: Vec<_> = (0..CALLERS)
             .map(|_| {
                 let registry = Arc::clone(&registry);
@@ -736,7 +722,7 @@ fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
 
     let execution_writer = acquire(
         &registry,
-        &child.registration_id,
+        child.registration_id.as_str(),
         Channel::Execution,
         publisher(&child.request.source, &child.request.incarnation),
         1_000,
@@ -760,7 +746,7 @@ fn execution_and_assignment_keep_channel_and_writer_provenance_distinct() {
     let execution = registry
         .publish(
             &channel_request(
-                &child.registration_id,
+                child.registration_id.as_str(),
                 Channel::Execution,
                 &execution_writer.handle,
                 1,
@@ -816,7 +802,7 @@ fn a_channel_is_one_atomic_record() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let writer = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, &agent.request.incarnation),
         1_000,
@@ -825,7 +811,7 @@ fn a_channel_is_one_atomic_record() {
     registry
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &writer.handle,
                 1,
@@ -854,14 +840,14 @@ fn sequence_replay_conflicts_and_daemon_clock_expiry_are_distinct() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let writer = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, &agent.request.incarnation),
         1_000,
     )
     .unwrap();
     let first_request = channel_request(
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         &writer.handle,
         1,
@@ -889,7 +875,7 @@ fn sequence_replay_conflicts_and_daemon_clock_expiry_are_distinct() {
     assert_eq!(
         published(
             &registry,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             10_999
         )
@@ -901,7 +887,7 @@ fn sequence_replay_conflicts_and_daemon_clock_expiry_are_distinct() {
     assert_eq!(
         published(
             &registry,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             11_000
         )
@@ -920,7 +906,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let old = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, &agent.request.incarnation),
         1_000,
@@ -929,7 +915,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
     let first = registry
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &old.handle,
                 1,
@@ -944,7 +930,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
     assert!(
         replace(
             &registry,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             successor.clone(),
             &old,
@@ -956,7 +942,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
 
     registry
         .retire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             &old.handle,
             1_002,
@@ -968,7 +954,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
     assert!(
         replace(
             &registry,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             successor.clone(),
             &wrong,
@@ -979,7 +965,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
     );
     let replacement = replace(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         successor.clone(),
         &old,
@@ -991,7 +977,12 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
 
     // The previous report keeps its own authorship and reads stale; it is never
     // relabelled as the successor's.
-    let prior = published(&registry, &agent.registration_id, Channel::Execution, 1_004);
+    let prior = published(
+        &registry,
+        agent.registration_id.as_str(),
+        Channel::Execution,
+        1_004,
+    );
     assert_eq!(prior.writer.handle, replacement.handle);
     assert_eq!(prior.writer.sequence, 0);
     let snapshot = prior.snapshot.expect("old facts preserved");
@@ -1006,7 +997,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
         registry
             .publish(
                 &channel_request(
-                    &agent.registration_id,
+                    agent.registration_id.as_str(),
                     Channel::Execution,
                     &old.handle,
                     2,
@@ -1021,7 +1012,7 @@ fn replacement_preserves_old_snapshot_authorship_and_fences_the_old_handle() {
     let updated = registry
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &replacement.handle,
                 1,
@@ -1043,7 +1034,7 @@ fn acquisition_replay_is_generation_safe() {
     let me = publisher(&agent.request.source, &agent.request.incarnation);
     let first = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         me.clone(),
         1_000,
@@ -1052,7 +1043,7 @@ fn acquisition_replay_is_generation_safe() {
     // Identical acquisition retry returns the same binding, not a new one.
     let retry = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         me.clone(),
         1_000,
@@ -1065,7 +1056,7 @@ fn acquisition_replay_is_generation_safe() {
     assert!(
         acquire(
             &registry,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             other.clone(),
             1_000
@@ -1076,7 +1067,7 @@ fn acquisition_replay_is_generation_safe() {
 
     registry
         .retire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             &first.handle,
             1_000,
@@ -1084,7 +1075,7 @@ fn acquisition_replay_is_generation_safe() {
         .unwrap();
     let second = replace(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         other.clone(),
         &first,
@@ -1097,7 +1088,7 @@ fn acquisition_replay_is_generation_safe() {
     assert!(
         replace(
             &registry,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             other.clone(),
             &first,
@@ -1108,7 +1099,7 @@ fn acquisition_replay_is_generation_safe() {
     );
     assert_eq!(
         registry
-            .channel(&agent.registration_id, Channel::Execution)
+            .channel(agent.registration_id.as_str(), Channel::Execution)
             .unwrap()
             .unwrap()
             .writer,
@@ -1125,7 +1116,7 @@ fn an_unreported_channel_exposes_no_invented_snapshot_and_survives_reopening() {
         let agent = registry_agent(&registry, INCARNATION, None);
         let writer = acquire(
             &registry,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             publisher(&agent.request.source, &agent.request.incarnation),
             1_000,
@@ -1133,7 +1124,12 @@ fn an_unreported_channel_exposes_no_invented_snapshot_and_survives_reopening() {
         .unwrap();
 
         // Acquired but not yet reported: no fabricated activity, no freshness.
-        let view = published(&registry, &agent.registration_id, Channel::Execution, 1_000);
+        let view = published(
+            &registry,
+            agent.registration_id.as_str(),
+            Channel::Execution,
+            1_000,
+        );
         assert!(view.snapshot.is_none());
         assert_eq!(view.writer.sequence, 0);
         assert_eq!(view.writer.handle, writer.handle);
@@ -1143,14 +1139,14 @@ fn an_unreported_channel_exposes_no_invented_snapshot_and_survives_reopening() {
     let reopened = Registry::open_at(&root, 1_000).expect("a registry");
     let agent = reopened.list(MAX_LISTED).unwrap().remove(0);
     let restored = reopened
-        .channel(&agent.registration_id, Channel::Execution)
+        .channel(agent.registration_id.as_str(), Channel::Execution)
         .unwrap()
         .expect("the channel");
     assert!(restored.snapshot.is_none());
     assert_eq!(restored.writer.sequence, 0);
     assert_eq!(
         reopened
-            .published(&agent.registration_id, Channel::Execution, 1_000)
+            .published(agent.registration_id.as_str(), Channel::Execution, 1_000)
             .unwrap()
             .unwrap()
             .snapshot,
@@ -1166,7 +1162,7 @@ fn an_unreported_successor_does_not_inherit_the_retired_lease() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let first = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, &agent.request.incarnation),
         1_000,
@@ -1175,7 +1171,7 @@ fn an_unreported_successor_does_not_inherit_the_retired_lease() {
     registry
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &first.handle,
                 1,
@@ -1186,7 +1182,7 @@ fn an_unreported_successor_does_not_inherit_the_retired_lease() {
         .unwrap();
     registry
         .retire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             &first.handle,
             1_000,
@@ -1197,7 +1193,7 @@ fn an_unreported_successor_does_not_inherit_the_retired_lease() {
     // not reported. That inherited lease must not make it look fresh.
     let second = replace(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, OTHER_INCARNATION),
         &first,
@@ -1205,17 +1201,22 @@ fn an_unreported_successor_does_not_inherit_the_retired_lease() {
     )
     .unwrap();
     assert_eq!(
-        published(&registry, &agent.registration_id, Channel::Execution, 1_001)
-            .snapshot
-            .unwrap()
-            .freshness,
+        published(
+            &registry,
+            agent.registration_id.as_str(),
+            Channel::Execution,
+            1_001
+        )
+        .snapshot
+        .unwrap()
+        .freshness,
         Freshness::Stale
     );
 
     // An unreported successor can itself be replaced, still by naming it exactly.
     let third = replace(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, OWNER_INCARNATION),
         &second,
@@ -1317,7 +1318,7 @@ fn process_verification_does_not_hold_registry_lock_and_freshness_is_independent
     let agent = registry.register(&wanted, 1_000).unwrap();
     let writer = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, &agent.request.incarnation),
         1_000,
@@ -1326,7 +1327,7 @@ fn process_verification_does_not_hold_registry_lock_and_freshness_is_independent
     registry
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &writer.handle,
                 1,
@@ -1337,7 +1338,7 @@ fn process_verification_does_not_hold_registry_lock_and_freshness_is_independent
         .unwrap();
     let snapshot = published(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         12_000,
     )
@@ -1382,7 +1383,7 @@ fn process_verification_does_not_hold_registry_lock_and_freshness_is_independent
     let updated = registry
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &writer.handle,
                 2,
@@ -1399,7 +1400,7 @@ fn process_verification_does_not_hold_registry_lock_and_freshness_is_independent
     assert_eq!(
         published(
             &registry,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             12_002
         )
@@ -1437,7 +1438,7 @@ fn a_failed_channel_write_leaves_the_record_and_retry_succeeds() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let writer = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, &agent.request.incarnation),
         1_000,
@@ -1446,7 +1447,7 @@ fn a_failed_channel_write_leaves_the_record_and_retry_succeeds() {
     registry
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &writer.handle,
                 1,
@@ -1456,7 +1457,7 @@ fn a_failed_channel_write_leaves_the_record_and_retry_succeeds() {
         )
         .unwrap();
     let retry_request = channel_request(
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         &writer.handle,
         2,
@@ -1479,7 +1480,7 @@ fn restart_epoch_stales_restored_facts_even_when_clock_repeats_or_goes_back() {
     let agent = registry_agent(&first, INCARNATION, None);
     let writer = acquire(
         &first,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher(&agent.request.source, &agent.request.incarnation),
         5_000,
@@ -1488,7 +1489,7 @@ fn restart_epoch_stales_restored_facts_even_when_clock_repeats_or_goes_back() {
     let old = first
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &writer.handle,
                 1,
@@ -1502,7 +1503,7 @@ fn restart_epoch_stales_restored_facts_even_when_clock_repeats_or_goes_back() {
     assert_ne!(first.serving_epoch(), restarted.serving_epoch());
     let restored = published(
         &restarted,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         4_000,
     );
@@ -1517,7 +1518,7 @@ fn restart_epoch_stales_restored_facts_even_when_clock_repeats_or_goes_back() {
     let refreshed = restarted
         .publish(
             &channel_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 Channel::Execution,
                 &writer.handle,
                 2,
@@ -1530,7 +1531,7 @@ fn restart_epoch_stales_restored_facts_even_when_clock_repeats_or_goes_back() {
     assert_eq!(
         published(
             &restarted,
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Execution,
             4_001
         )
@@ -1543,10 +1544,15 @@ fn restart_epoch_stales_restored_facts_even_when_clock_repeats_or_goes_back() {
     // Replaying the old content against the restored epoch does not freshen it.
     let replay = Registry::open_at(&root, 4_000).expect("a second restore");
     assert_eq!(
-        published(&replay, &agent.registration_id, Channel::Execution, 4_001)
-            .snapshot
-            .unwrap()
-            .freshness,
+        published(
+            &replay,
+            agent.registration_id.as_str(),
+            Channel::Execution,
+            4_001
+        )
+        .snapshot
+        .unwrap()
+        .freshness,
         Freshness::Stale
     );
     drop_root(&root);
@@ -1602,7 +1608,10 @@ fn context_path(registry: &Registry, registration_id: &str) -> PathBuf {
 
 fn context_of(registry: &Registry, registration_id: &str, now_ms: i64) -> PublicContext {
     registry
-        .context(registration_id, now_ms)
+        .context(
+            &RegistrationId::parse(registration_id).expect("a registration id"),
+            now_ms,
+        )
         .expect("a read")
         .expect("a context")
 }
@@ -1620,14 +1629,20 @@ fn a_context_switch_republishes_without_changing_identity_or_generation() {
 
     let first = registry
         .publish_context(
-            &context_request(&agent.registration_id, me.clone(), None, 1, Some(SESSION)),
+            &context_request(
+                agent.registration_id.as_str(),
+                me.clone(),
+                None,
+                1,
+                Some(SESSION),
+            ),
             1_000,
         )
         .expect("a first publish");
     assert!(first.warning.is_none());
     assert_eq!(first.record.writer.generation, 1);
     let handle = first.record.writer.handle.clone();
-    let path = context_path(&registry, &agent.registration_id);
+    let path = context_path(&registry, agent.registration_id.as_str());
     assert_eq!(
         fs::metadata(&path).expect("a record").permissions().mode() & 0o777,
         0o600,
@@ -1639,7 +1654,7 @@ fn a_context_switch_republishes_without_changing_identity_or_generation() {
     let switched = registry
         .publish_context(
             &context_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 me,
                 Some(&handle),
                 2,
@@ -1656,8 +1671,8 @@ fn a_context_switch_republishes_without_changing_identity_or_generation() {
         Some(NEXT_SESSION)
     );
 
-    let read = context_of(&registry, &agent.registration_id, 1_002);
-    assert_eq!(read.registration_id, agent.registration_id);
+    let read = context_of(&registry, agent.registration_id.as_str(), 1_002);
+    assert_eq!(read.registration_id, agent.registration_id.as_str());
     assert_eq!(read.writer.generation, 1);
     assert_eq!(read.writer.sequence, 2);
     assert_eq!(read.context.generation, 1);
@@ -1676,13 +1691,13 @@ fn a_context_switch_republishes_without_changing_identity_or_generation() {
 
     // The lease is bounded on the daemon's clock and nothing else.
     assert_eq!(
-        context_of(&registry, &agent.registration_id, 11_000)
+        context_of(&registry, agent.registration_id.as_str(), 11_000)
             .context
             .freshness,
         Freshness::Fresh
     );
     assert_eq!(
-        context_of(&registry, &agent.registration_id, 11_001)
+        context_of(&registry, agent.registration_id.as_str(), 11_001)
             .context
             .freshness,
         Freshness::Stale
@@ -1705,7 +1720,7 @@ fn an_identical_context_replay_warns_and_refreshes_no_lease() {
     let registry = Registry::open_at(&root, 1_000).expect("a registry");
     let agent = registry_agent(&registry, INCARNATION, None);
     let me = publisher(&agent.request.source, &agent.request.incarnation);
-    let request = context_request(&agent.registration_id, me, None, 1, Some(SESSION));
+    let request = context_request(agent.registration_id.as_str(), me, None, 1, Some(SESSION));
     let first = registry
         .publish_context(&request, 1_000)
         .expect("a first publish");
@@ -1725,13 +1740,13 @@ fn an_identical_context_replay_warns_and_refreshes_no_lease() {
 
     // The lease still ends where the first report put it.
     assert_eq!(
-        context_of(&registry, &agent.registration_id, 10_999)
+        context_of(&registry, agent.registration_id.as_str(), 10_999)
             .context
             .freshness,
         Freshness::Fresh
     );
     assert_eq!(
-        context_of(&registry, &agent.registration_id, 11_000)
+        context_of(&registry, agent.registration_id.as_str(), 11_000)
             .context
             .freshness,
         Freshness::Stale
@@ -1747,7 +1762,13 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
     let me = publisher(&agent.request.source, &agent.request.incarnation);
     let first = registry
         .publish_context(
-            &context_request(&agent.registration_id, me.clone(), None, 1, Some(SESSION)),
+            &context_request(
+                agent.registration_id.as_str(),
+                me.clone(),
+                None,
+                1,
+                Some(SESSION),
+            ),
             1_000,
         )
         .expect("a first publish");
@@ -1755,7 +1776,7 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
     registry
         .publish_context(
             &context_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 me.clone(),
                 Some(&handle),
                 2,
@@ -1770,7 +1791,7 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
     let conflicting = registry
         .publish_context(
             &context_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 me.clone(),
                 Some(&handle),
                 2,
@@ -1786,7 +1807,7 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
     let lease_conflict = ContextRequest {
         lease_ms: Some(20_000),
         ..context_request(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             me.clone(),
             Some(&handle),
             2,
@@ -1804,7 +1825,13 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
     // An older sequence is refused even when its session matches the incumbent's.
     let older = registry
         .publish_context(
-            &context_request(&agent.registration_id, me, Some(&handle), 1, Some(SESSION)),
+            &context_request(
+                agent.registration_id.as_str(),
+                me,
+                Some(&handle),
+                1,
+                Some(SESSION),
+            ),
             1_004,
         )
         .expect_err("a refusal");
@@ -1813,7 +1840,7 @@ fn context_sequence_conflicts_and_older_reports_are_refused() {
         "{older}"
     );
 
-    let read = context_of(&registry, &agent.registration_id, 1_005);
+    let read = context_of(&registry, agent.registration_id.as_str(), 1_005);
     assert_eq!(read.context.sequence, 2);
     assert_eq!(read.context.session.as_deref(), Some(NEXT_SESSION));
     assert_eq!(read.context.expires_at, format_millis(11_001));
@@ -1828,12 +1855,18 @@ fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
     let me = publisher(&agent.request.source, &agent.request.incarnation);
     let first = registry
         .publish_context(
-            &context_request(&agent.registration_id, me.clone(), None, 1, Some(SESSION)),
+            &context_request(
+                agent.registration_id.as_str(),
+                me.clone(),
+                None,
+                1,
+                Some(SESSION),
+            ),
             1_000,
         )
         .expect("a first publish");
     let handle = first.record.writer.handle.clone();
-    let path = context_path(&registry, &agent.registration_id);
+    let path = context_path(&registry, agent.registration_id.as_str());
     let before = fs::read(&path).expect("the stored record");
     let other = publisher(&agent.request.source, OTHER_INCARNATION);
     let incumbent = format!("the incumbent is generation 1 handle {handle}");
@@ -1842,7 +1875,7 @@ fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
     let stale = registry
         .publish_context(
             &context_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 other.clone(),
                 Some(&random_uuid()),
                 2,
@@ -1861,7 +1894,7 @@ fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
     let unreported = registry
         .publish_context(
             &context_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 other.clone(),
                 None,
                 2,
@@ -1880,7 +1913,7 @@ fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
     let takeover = registry
         .publish_context(
             &context_replacement(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 other.clone(),
                 &first.record.writer,
                 2,
@@ -1905,7 +1938,7 @@ fn a_non_incumbent_context_writer_is_refused_and_leaves_the_record_alone() {
     let next = registry
         .publish_context(
             &context_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 me,
                 Some(&handle),
                 2,
@@ -1927,7 +1960,13 @@ fn context_replacement_after_retirement_advances_the_generation() {
     let me = publisher(&agent.request.source, &agent.request.incarnation);
     let first = registry
         .publish_context(
-            &context_request(&agent.registration_id, me.clone(), None, 1, Some(SESSION)),
+            &context_request(
+                agent.registration_id.as_str(),
+                me.clone(),
+                None,
+                1,
+                Some(SESSION),
+            ),
             1_000,
         )
         .expect("a first publish");
@@ -1935,7 +1974,7 @@ fn context_replacement_after_retirement_advances_the_generation() {
     let successor = publisher(&agent.request.source, OTHER_INCARNATION);
 
     registry
-        .retire_context(&agent.registration_id, &old.handle, 1_500)
+        .retire_context(agent.registration_id.as_str(), &old.handle, 1_500)
         .expect("a retirement");
 
     // A replacement must name the exact incumbent it observed.
@@ -1946,7 +1985,7 @@ fn context_replacement_after_retirement_advances_the_generation() {
     let mismatch = registry
         .publish_context(
             &context_replacement(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 successor.clone(),
                 &wrong,
                 1,
@@ -1969,7 +2008,7 @@ fn context_replacement_after_retirement_advances_the_generation() {
     let replacement = registry
         .publish_context(
             &context_replacement(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 successor.clone(),
                 &old,
                 1,
@@ -1992,7 +2031,7 @@ fn context_replacement_after_retirement_advances_the_generation() {
     let fenced = registry
         .publish_context(
             &context_request(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 me,
                 Some(&old.handle),
                 2,
@@ -2009,7 +2048,13 @@ fn context_replacement_after_retirement_advances_the_generation() {
     );
     let delayed = registry
         .publish_context(
-            &context_replacement(&agent.registration_id, successor, &old, 2, Some(SESSION)),
+            &context_replacement(
+                agent.registration_id.as_str(),
+                successor,
+                &old,
+                2,
+                Some(SESSION),
+            ),
             1_700,
         )
         .expect_err("a refusal");
@@ -2018,7 +2063,7 @@ fn context_replacement_after_retirement_advances_the_generation() {
         "{delayed}"
     );
 
-    let read = context_of(&registry, &agent.registration_id, 1_700);
+    let read = context_of(&registry, agent.registration_id.as_str(), 1_700);
     assert_eq!(read.writer.generation, 2);
     assert_eq!(read.context.session.as_deref(), Some(NEXT_SESSION));
     let records: Vec<_> = fs::read_dir(registry.publications())
@@ -2038,7 +2083,7 @@ fn context_replacement_after_lease_expiry_advances_the_generation() {
     let me = publisher(&agent.request.source, &agent.request.incarnation);
     let first = registry
         .publish_context(
-            &context_request(&agent.registration_id, me, None, 1, Some(SESSION)),
+            &context_request(agent.registration_id.as_str(), me, None, 1, Some(SESSION)),
             1_000,
         )
         .expect("a first publish");
@@ -2048,7 +2093,7 @@ fn context_replacement_after_lease_expiry_advances_the_generation() {
     let fresh = registry
         .publish_context(
             &context_replacement(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 successor.clone(),
                 &first.record.writer,
                 1,
@@ -2066,7 +2111,7 @@ fn context_replacement_after_lease_expiry_advances_the_generation() {
 
     // At expiry the reader sees stale facts and the record may be succeeded.
     assert_eq!(
-        context_of(&registry, &agent.registration_id, 11_000)
+        context_of(&registry, agent.registration_id.as_str(), 11_000)
             .context
             .freshness,
         Freshness::Stale
@@ -2074,7 +2119,7 @@ fn context_replacement_after_lease_expiry_advances_the_generation() {
     let replacement = registry
         .publish_context(
             &context_replacement(
-                &agent.registration_id,
+                agent.registration_id.as_str(),
                 successor,
                 &first.record.writer,
                 1,
@@ -2084,7 +2129,7 @@ fn context_replacement_after_lease_expiry_advances_the_generation() {
         )
         .expect("a replacement");
     assert_eq!(replacement.record.writer.generation, 2);
-    let read = context_of(&registry, &agent.registration_id, 11_000);
+    let read = context_of(&registry, agent.registration_id.as_str(), 11_000);
     assert_eq!(read.writer.generation, 2);
     assert_eq!(read.context.freshness, Freshness::Fresh);
     drop_root(&root);
@@ -2098,11 +2143,11 @@ fn a_malformed_context_record_fails_explicitly() {
     let me = publisher(&agent.request.source, &agent.request.incarnation);
     registry
         .publish_context(
-            &context_request(&agent.registration_id, me, None, 1, Some(SESSION)),
+            &context_request(agent.registration_id.as_str(), me, None, 1, Some(SESSION)),
             1_000,
         )
         .expect("a first publish");
-    let path = context_path(&registry, &agent.registration_id);
+    let path = context_path(&registry, agent.registration_id.as_str());
     let valid = fs::read(&path).expect("a read");
     let planted = |value: &serde_json::Value| {
         fs::write(&path, serde_json::to_vec(value).expect("an encoding")).expect("a write")
@@ -2186,13 +2231,13 @@ fn an_absent_context_and_an_explicit_null_stay_distinguishable() {
     let me = publisher(&agent.request.source, &agent.request.incarnation);
     let first = registry
         .publish_context(
-            &context_request(&agent.registration_id, me.clone(), None, 1, None),
+            &context_request(agent.registration_id.as_str(), me.clone(), None, 1, None),
             1_000,
         )
         .expect("an explicit null");
     assert_eq!(first.record.context.session, None);
 
-    let cleared = context_of(&registry, &agent.registration_id, 1_000);
+    let cleared = context_of(&registry, agent.registration_id.as_str(), 1_000);
     assert_eq!(cleared.context.session, None, "no current session");
     let json = serde_json::to_string(&cleared).expect("an encoding");
     assert!(json.contains("\"session\":null"), "{json}");
@@ -2205,13 +2250,23 @@ fn an_absent_context_and_an_explicit_null_stay_distinguishable() {
     let handle = first.record.writer.handle.clone();
     let switched = registry
         .publish_context(
-            &context_request(&agent.registration_id, me, Some(&handle), 2, Some(SESSION)),
+            &context_request(
+                agent.registration_id.as_str(),
+                me,
+                Some(&handle),
+                2,
+                Some(SESSION),
+            ),
             1_001,
         )
         .expect("a switch");
     assert_eq!(switched.record.context.session.as_deref(), Some(SESSION));
-    let json = serde_json::to_string(&context_of(&registry, &agent.registration_id, 1_001))
-        .expect("an encoding");
+    let json = serde_json::to_string(&context_of(
+        &registry,
+        agent.registration_id.as_str(),
+        1_001,
+    ))
+    .expect("an encoding");
     assert!(json.contains(SESSION), "{json}");
     assert!(!json.contains(&handle), "{json}");
 
@@ -2236,7 +2291,7 @@ fn an_absent_context_and_an_explicit_null_stay_distinguishable() {
     );
     let nothing = registry.publish_context(
         &context_replacement(
-            &silent.registration_id,
+            silent.registration_id.as_str(),
             publisher("herdsman", INCARNATION),
             &first.record.writer,
             1,
@@ -2265,7 +2320,7 @@ fn a_restored_context_reads_stale_until_republished() {
         registration_id = agent.registration_id.clone();
         let first = registry
             .publish_context(
-                &context_request(&registration_id, me.clone(), None, 1, Some(SESSION)),
+                &context_request(registration_id.as_str(), me.clone(), None, 1, Some(SESSION)),
                 5_000,
             )
             .expect("a first publish");
@@ -2273,7 +2328,7 @@ fn a_restored_context_reads_stale_until_republished() {
     }
 
     let restarted = Registry::open_at(&root, 5_000).expect("a reopen at the same clock");
-    let restored = context_of(&restarted, &registration_id, 4_000);
+    let restored = context_of(&restarted, registration_id.as_str(), 4_000);
     assert!(restored.context.restored);
     assert_eq!(restored.context.freshness, Freshness::Stale);
     assert_eq!(restored.context.session.as_deref(), Some(SESSION));
@@ -2288,14 +2343,20 @@ fn a_restored_context_reads_stale_until_republished() {
     // without a replacement and without a new generation.
     let refreshed = restarted
         .publish_context(
-            &context_request(&registration_id, me, Some(&handle), 2, Some(NEXT_SESSION)),
+            &context_request(
+                registration_id.as_str(),
+                me,
+                Some(&handle),
+                2,
+                Some(NEXT_SESSION),
+            ),
             4_000,
         )
         .expect("a reconnect");
     assert_eq!(refreshed.record.writer.generation, 1);
     assert_eq!(refreshed.record.writer.handle, handle);
     assert_eq!(
-        context_of(&restarted, &registration_id, 4_001)
+        context_of(&restarted, registration_id.as_str(), 4_001)
             .context
             .freshness,
         Freshness::Fresh
@@ -2347,11 +2408,17 @@ fn spawn_parent(registry: &Registry, incarnation: &str, now_ms: i64) -> String {
     let identity = publisher(&parent.request.source, &parent.request.incarnation);
     registry
         .publish_context(
-            &context_request(&parent.registration_id, identity, None, 1, Some(SESSION)),
+            &context_request(
+                parent.registration_id.as_str(),
+                identity,
+                None,
+                1,
+                Some(SESSION),
+            ),
             now_ms,
         )
         .expect("a fresh parent session context");
-    parent.registration_id
+    parent.registration_id.to_string()
 }
 
 fn spawn_path(registry: &Registry, request_id: &str) -> PathBuf {
@@ -2507,7 +2574,7 @@ fn spawn_admission_requires_fresh_non_null_matching_context_on_the_exact_parent(
         registry
             .publish_context(
                 &context_request(
-                    &parent.registration_id,
+                    parent.registration_id.as_str(),
                     publisher(&parent.request.source, &parent.request.incarnation),
                     None,
                     1,
@@ -2518,7 +2585,10 @@ fn spawn_admission_requires_fresh_non_null_matching_context_on_the_exact_parent(
             .expect("publish context");
         let now = if stale { 12_001 } else { 1_001 };
         let error = registry
-            .record_spawn(&spawn_request(SPAWN_REQUEST, &parent.registration_id), now)
+            .record_spawn(
+                &spawn_request(SPAWN_REQUEST, parent.registration_id.as_str()),
+                now,
+            )
             .expect_err("refuse invalid context");
         assert!(error.contains("fresh matching session context"), "{error}");
         assert!(
@@ -2540,11 +2610,11 @@ fn duplicate_session_attaches_remain_distinct_and_edges_keep_session_on_second_a
     let second_attach = registry
         .register(&request(OTHER_INCARNATION), 2_001)
         .expect("second registration");
-    assert_ne!(parent, second_attach.registration_id);
+    assert_ne!(parent, second_attach.registration_id.as_str());
     registry
         .publish_context(
             &context_request(
-                &second_attach.registration_id,
+                second_attach.registration_id.as_str(),
                 publisher(
                     &second_attach.request.source,
                     &second_attach.request.incarnation,
@@ -2825,14 +2895,14 @@ fn a_spawn_request_naming_an_unknown_parent_is_refused_before_any_write() {
         .expect("parent")
         .registration_id;
     let error = registry
-        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .record_spawn(&spawn_request(SPAWN_REQUEST, parent.as_str()), 2_000)
         .expect_err("missing session context");
     assert!(error.contains("session context"));
     assert!(spawn_files(&registry).is_empty());
     registry
         .publish_context(
             &context_request(
-                &parent,
+                parent.as_str(),
                 publisher("herdsman", INCARNATION),
                 None,
                 1,
@@ -2842,7 +2912,7 @@ fn a_spawn_request_naming_an_unknown_parent_is_refused_before_any_write() {
         )
         .expect("fresh matching context");
     registry
-        .record_spawn(&spawn_request(SPAWN_REQUEST, &parent), 2_000)
+        .record_spawn(&spawn_request(SPAWN_REQUEST, parent.as_str()), 2_000)
         .expect("a recorded edge");
     assert_eq!(
         spawn_files(&registry),
@@ -2980,7 +3050,7 @@ fn a_registration_reaching_a_spent_edge_it_already_bound_is_answered_not_refused
     // Registering again with the same request finds the record and its own
     // binding: answered, not refused, and the edge names no other child.
     let again = registry.register(&child, 3_000).expect("a retry");
-    assert_eq!(again.registration_id, registration_id);
+    assert_eq!(again.registration_id.as_str(), registration_id);
     let restored = registry
         .spawn_edge(SPAWN_REQUEST)
         .expect("a read")
@@ -3016,7 +3086,7 @@ fn a_registration_retry_refuses_when_stored_bound_registration_id_conflicts() {
         .expect_err("conflicting exact ID");
     assert!(error.contains("different registry identity"), "{error}");
     assert_ne!(
-        registered.registration_id,
+        registered.registration_id.as_str(),
         stored["bound"]["registration_id"].as_str().unwrap()
     );
     drop_root(&root);
@@ -3634,7 +3704,7 @@ fn a_child_close_settles_once_and_a_replay_reads_the_outcome() {
     {
         let registry = Registry::open_at(&root, 1_000).expect("a registry");
         let edge = managed_edge(&registry, 1_000);
-        let parent = edge.parent.clone();
+        let parent = RegistrationId::parse(&edge.parent).expect("a registration id");
         let request = close_request(
             CHILD_CLOSE_REQUEST,
             SPAWN_REQUEST,
@@ -3975,7 +4045,7 @@ fn facts_publish_without_an_owner_and_never_touch_execution() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let writer = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Facts,
         publisher("pi", OTHER_INCARNATION),
         1_000,
@@ -3984,7 +4054,7 @@ fn facts_publish_without_an_owner_and_never_touch_execution() {
     publish_wire(
         &registry,
         facts_wire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             &writer.handle,
             1,
             json!({
@@ -3999,7 +4069,7 @@ fn facts_publish_without_an_owner_and_never_touch_execution() {
     .expect("an ordinary session's facts report");
 
     let facts = registry
-        .published(&agent.registration_id, Channel::Facts, 1_002)
+        .published(agent.registration_id.as_str(), Channel::Facts, 1_002)
         .expect("a read")
         .expect("a facts channel");
     let snapshot = facts.snapshot.expect("an accepted facts snapshot");
@@ -4016,7 +4086,7 @@ fn facts_publish_without_an_owner_and_never_touch_execution() {
     assert_eq!(fields.background_tasks[0].id, "task-1");
     assert!(
         registry
-            .published(&agent.registration_id, Channel::Execution, 1_002)
+            .published(agent.registration_id.as_str(), Channel::Execution, 1_002)
             .expect("a read")
             .is_none(),
         "facts never create or alter execution"
@@ -4031,7 +4101,7 @@ fn facts_schema_is_strict_and_a_refused_report_keeps_the_prior_snapshot() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let writer = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Facts,
         publisher("pi", OTHER_INCARNATION),
         1_000,
@@ -4040,7 +4110,7 @@ fn facts_schema_is_strict_and_a_refused_report_keeps_the_prior_snapshot() {
     publish_wire(
         &registry,
         facts_wire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             &writer.handle,
             1,
             json!({"model": "m1"}),
@@ -4076,7 +4146,12 @@ fn facts_schema_is_strict_and_a_refused_report_keeps_the_prior_snapshot() {
         assert!(
             publish_wire(
                 &registry,
-                facts_wire(&agent.registration_id, &writer.handle, 2, snapshot.clone()),
+                facts_wire(
+                    agent.registration_id.as_str(),
+                    &writer.handle,
+                    2,
+                    snapshot.clone()
+                ),
                 1_002,
             )
             .is_err(),
@@ -4085,7 +4160,7 @@ fn facts_schema_is_strict_and_a_refused_report_keeps_the_prior_snapshot() {
     }
 
     let prior = registry
-        .published(&agent.registration_id, Channel::Facts, 1_003)
+        .published(agent.registration_id.as_str(), Channel::Facts, 1_003)
         .expect("a read")
         .expect("a facts channel")
         .snapshot
@@ -4098,7 +4173,7 @@ fn facts_schema_is_strict_and_a_refused_report_keeps_the_prior_snapshot() {
     publish_wire(
         &registry,
         facts_wire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             &writer.handle,
             2,
             json!({"model": "m3"}),
@@ -4116,7 +4191,7 @@ fn owner_assignment_fields_extend_only_the_assignment_channel() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let execution = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Execution,
         publisher("child", OTHER_INCARNATION),
         1_000,
@@ -4166,7 +4241,7 @@ fn owner_assignment_fields_extend_only_the_assignment_channel() {
     assert_eq!(fields.ask.as_deref(), Some("approve the merge?"));
 
     let execution_view = registry
-        .published(&agent.registration_id, Channel::Execution, 1_003)
+        .published(agent.registration_id.as_str(), Channel::Execution, 1_003)
         .expect("a read")
         .expect("an execution channel")
         .snapshot
@@ -4185,7 +4260,7 @@ fn owner_assignment_fields_extend_only_the_assignment_channel() {
         "assignment-only fields are refused on execution"
     );
     let still_working = registry
-        .published(&agent.registration_id, Channel::Execution, 1_005)
+        .published(agent.registration_id.as_str(), Channel::Execution, 1_005)
         .expect("a read")
         .expect("an execution channel")
         .snapshot
@@ -4223,7 +4298,7 @@ fn restored_facts_are_stale_and_a_successor_withdraws_what_it_omits() {
     let agent = registry_agent(&registry, INCARNATION, None);
     let writer = acquire(
         &registry,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Facts,
         publisher("pi", OTHER_INCARNATION),
         1_000,
@@ -4232,7 +4307,7 @@ fn restored_facts_are_stale_and_a_successor_withdraws_what_it_omits() {
     publish_wire(
         &registry,
         facts_wire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             &writer.handle,
             1,
             json!({"model": "m1", "session_name": "s1"}),
@@ -4244,7 +4319,7 @@ fn restored_facts_are_stale_and_a_successor_withdraws_what_it_omits() {
 
     let restarted = Registry::open_at(&root, 2_000).expect("a restarted registry");
     let restored = restarted
-        .published(&agent.registration_id, Channel::Facts, 2_000)
+        .published(agent.registration_id.as_str(), Channel::Facts, 2_000)
         .expect("a read")
         .expect("a facts channel")
         .snapshot
@@ -4258,7 +4333,7 @@ fn restored_facts_are_stale_and_a_successor_withdraws_what_it_omits() {
 
     restarted
         .retire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             Channel::Facts,
             &writer.handle,
             2_000,
@@ -4266,7 +4341,7 @@ fn restored_facts_are_stale_and_a_successor_withdraws_what_it_omits() {
         .expect("retire the incumbent");
     let successor = replace(
         &restarted,
-        &agent.registration_id,
+        agent.registration_id.as_str(),
         Channel::Facts,
         publisher("pi", SUCCESSOR),
         &writer,
@@ -4276,7 +4351,7 @@ fn restored_facts_are_stale_and_a_successor_withdraws_what_it_omits() {
     publish_wire(
         &restarted,
         facts_wire(
-            &agent.registration_id,
+            agent.registration_id.as_str(),
             &successor.handle,
             1,
             json!({"session_name": "s2"}),
@@ -4285,7 +4360,7 @@ fn restored_facts_are_stale_and_a_successor_withdraws_what_it_omits() {
     )
     .expect("the successor's facts");
     let current = restarted
-        .published(&agent.registration_id, Channel::Facts, 2_003)
+        .published(agent.registration_id.as_str(), Channel::Facts, 2_003)
         .expect("a read")
         .expect("a facts channel")
         .snapshot

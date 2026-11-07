@@ -3342,7 +3342,7 @@ fn registry_parent_at(
     registry
         .publish_context(
             &agent_radar::control_plane::registry::ContextRequest {
-                registration_id: parent.registration_id.clone(),
+                registration_id: parent.registration_id.to_string(),
                 publisher: agent_radar::control_plane::registry::PublisherIdentity {
                     source: parent.request.source.clone(),
                     incarnation: parent.request.incarnation.clone(),
@@ -3382,7 +3382,7 @@ fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() 
     ] {
         let request = SpawnRequest {
             request_id: request_id.into(),
-            parent: parent.registration_id.clone(),
+            parent: parent.registration_id.to_string(),
             parent_session_id: session.into(),
             parent_subject_id: subject.map(str::to_string),
         };
@@ -3425,7 +3425,7 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
         .record_spawn(
             &SpawnRequest {
                 request_id: request_id.into(),
-                parent: parent.registration_id.clone(),
+                parent: parent.registration_id.to_string(),
                 parent_session_id: session.into(),
                 parent_subject_id: None,
             },
@@ -3449,11 +3449,7 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
     )
     .expect("a reservation");
     registry
-        .attach_subject(
-            request_id,
-            ticket.claim_id.as_str(),
-            ticket.registration_id.as_str(),
-        )
+        .attach_subject(request_id, &ticket.claim_id, &ticket.registration_id)
         .expect("attached");
     let edge = registry
         .spawn_edge(request_id)
@@ -11294,7 +11290,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
         .record_spawn(
             &SpawnRequest {
                 request_id: request_id.clone(),
-                parent: parent.registration_id.clone(),
+                parent: parent.registration_id.to_string(),
                 parent_session_id: session.into(),
                 parent_subject_id: None,
             },
@@ -11317,11 +11313,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
     )
     .expect("a reservation");
     registry
-        .attach_subject(
-            &request_id,
-            ticket.claim_id.as_str(),
-            ticket.registration_id.as_str(),
-        )
+        .attach_subject(&request_id, &ticket.claim_id, &ticket.registration_id)
         .expect("attached");
     if !keep_scope {
         // Nothing here is a unit: drop the descriptor the unit tests drop.

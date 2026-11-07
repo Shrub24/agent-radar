@@ -56,13 +56,8 @@ pub(crate) fn agent_entry(
         registry.published_facts(&registration.registration_id, Channel::Assignment, now_ms)?;
     let facts = registry.published_facts(&registration.registration_id, Channel::Facts, now_ms)?;
     let context = registry.context(&registration.registration_id, now_ms)?;
-    let attachment = crate::control_plane::registry::presence::current(
-        registry,
-        &crate::identity::RegistrationId::required(
-            &registration.registration_id,
-            "registration_id",
-        )?,
-    )?;
+    let attachment =
+        crate::control_plane::registry::presence::current(registry, &registration.registration_id)?;
     // The attachment's location is the one presence verified against the live
     // pane; the registration's own is whatever it supplied when it registered.
     // Without this an agent that only ever reported through presence names no
@@ -74,12 +69,10 @@ pub(crate) fn agent_entry(
     Ok(AgentEntry {
         registration: public,
         claim_standing: attachment.map(|claim| claim.standing),
-        scoped: match crate::identity::RegistrationId::required(
+        scoped: match crate::control_plane::lifecycle::read_process(
+            registry,
             &registration.registration_id,
-            "registration_id",
-        )
-        .and_then(|id| crate::control_plane::lifecycle::read_process(registry, &id))
-        {
+        ) {
             Ok(Some(process)) => Some(process.scope.is_some()),
             Ok(None) => Some(false),
             Err(_) => None,
@@ -176,7 +169,7 @@ fn agents(registry: &Registry, now_ms: i64) -> Result<Vec<RegistryAgent>, String
         let page = registry.list_after(after.as_deref(), PAGE)?;
         let last = page
             .last()
-            .map(|registration| registration.registration_id.clone());
+            .map(|registration| registration.registration_id.to_string());
         for registration in &page {
             let entry = agent_entry(
                 registry,

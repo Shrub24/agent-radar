@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
-use crate::identity::RegistrationId;
+use crate::identity::{ClaimId, RegistrationId};
 use crate::model::{ProcessIdentity, SessionUuid};
 
 /// Missing registry authority is distinct from a rejected write.
@@ -330,7 +330,7 @@ impl RegistrationRequest {
 pub struct Registration {
     pub version: u32,
     /// The daemon-issued process-registration UUID and durable key.
-    pub registration_id: String,
+    pub registration_id: RegistrationId,
     pub registered_at: String,
     pub request: RegistrationRequest,
 }
@@ -342,7 +342,7 @@ impl Registration {
     pub fn public(&self) -> PublicRegistration {
         PublicRegistration {
             version: self.version,
-            registration_id: self.registration_id.clone(),
+            registration_id: self.registration_id.to_string(),
             registered_at: self.registered_at.clone(),
             source: self.request.source.clone(),
             incarnation: self.request.incarnation.clone(),
@@ -700,10 +700,15 @@ impl Registry {
     pub fn attach_subject(
         &self,
         request_id: &str,
-        claim_id: &str,
-        registration_id: &str,
+        claim_id: &ClaimId,
+        registration_id: &RegistrationId,
     ) -> Result<SpawnEdge, String> {
-        spawn::attach_subject(self, request_id, claim_id, registration_id)
+        spawn::attach_subject(
+            self,
+            request_id,
+            claim_id.as_str(),
+            registration_id.as_str(),
+        )
     }
 
     /// The opaque serving epoch of this registry instance.
@@ -752,11 +757,11 @@ impl Registry {
     /// fencing handle.
     pub fn published_facts(
         &self,
-        registration_id: &str,
+        registration_id: &RegistrationId,
         channel: Channel,
         now_ms: i64,
     ) -> Result<Option<PublicChannelFacts>, String> {
-        publication::published_facts(self, registration_id, channel, now_ms)
+        publication::published_facts(self, registration_id.as_str(), channel, now_ms)
     }
 
     /// Replace one channel's complete snapshot under its writer handle.
@@ -799,10 +804,10 @@ impl Registry {
     /// when this agent has never published one.
     pub fn context(
         &self,
-        registration_id: &str,
+        registration_id: &RegistrationId,
         now_ms: i64,
     ) -> Result<Option<PublicContext>, String> {
-        context::published(self, registration_id, now_ms)
+        context::published(self, registration_id.as_str(), now_ms)
     }
 
     pub(crate) fn transition(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -812,9 +817,8 @@ impl Registry {
     }
 
     /// Reads one registration.
-    pub fn get(&self, registration_id: &str) -> Result<Option<Registration>, String> {
-        validate_registration_id(registration_id)?;
-        let path = self.path(registration_id);
+    pub fn get(&self, registration_id: &RegistrationId) -> Result<Option<Registration>, String> {
+        let path = self.path(registration_id.as_str());
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("agent record {}: {error}", path.display())),
@@ -823,7 +827,7 @@ impl Registry {
         let bytes = read_record_file(&path, MAX_REGISTRATION_BYTES)?;
         let registration: Registration =
             decode(&bytes).map_err(|error| format!("agent {registration_id}: {error}"))?;
-        if registration.registration_id != registration_id {
+        if &registration.registration_id != registration_id {
             return Err(format!(
                 "agent {registration_id}: record id does not match its filename"
             ));
@@ -836,9 +840,7 @@ impl Registry {
         &self,
         mut registration: Registration,
     ) -> Result<Registration, String> {
-        let registration_id =
-            RegistrationId::required(&registration.registration_id, "registration_id")?;
-        if let Some(claim) = presence::current(self, &registration_id)? {
+        if let Some(claim) = presence::current(self, &registration.registration_id)? {
             registration.request.location = claim.location;
         }
         Ok(registration)
@@ -923,7 +925,7 @@ impl Registry {
         let registration = Registration {
             version: REGISTRATION_VERSION,
             registration_id: spawn::launched_registration(self, request.spawn_token.as_deref())?
-                .unwrap_or_else(random_uuid),
+                .unwrap_or_else(RegistrationId::random),
             registered_at: format_millis(now_ms),
             request: request.clone(),
         };
@@ -931,12 +933,12 @@ impl Registry {
         if let Err(error) =
             spawn::bind_presented_token(self, request, &registration.registration_id, now_ms)
         {
-            let _ = fs::remove_file(self.path(&registration.registration_id));
+            let _ = fs::remove_file(self.path(registration.registration_id.as_str()));
             return Err(error);
         }
         self.append_event(
             "agent.registered",
-            Some(&registration.registration_id),
+            Some(registration.registration_id.as_str()),
             None,
             None,
         );
@@ -967,7 +969,7 @@ impl Registry {
             let bytes = read_record_file(&path, MAX_REGISTRATION_BYTES)?;
             let registration =
                 decode(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
-            if registration.registration_id
+            if registration.registration_id.as_str()
                 != entry
                     .file_name()
                     .to_string_lossy()
@@ -998,14 +1000,13 @@ impl Registry {
     /// Writes a new registration exactly once. An agent id is minted here, so a
     /// second write of the same id is a broken invariant rather than a retry.
     fn create(&self, registration: &Registration) -> Result<(), String> {
-        validate_registration_id(&registration.registration_id)?;
         let bytes = serialize(registration)?;
         let temporary = self.directory.join(format!(
             ".{}.tmp-{}",
             registration.registration_id,
             random_uuid()
         ));
-        let final_path = self.path(&registration.registration_id);
+        let final_path = self.path(registration.registration_id.as_str());
         let result = (|| -> std::io::Result<()> {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -1444,7 +1445,7 @@ mod tests {
     fn a_registration_of_another_version_is_not_read_as_this_one() {
         let registration = Registration {
             version: 2,
-            registration_id: random_uuid(),
+            registration_id: RegistrationId::random(),
             registered_at: format_millis(1_000),
             request: request(),
         };

@@ -220,8 +220,9 @@ pub(super) fn execute_spawn(
     // lands wherever the multiplexer happens to have focus, and a parent with no
     // recorded pane is refused rather than guessed from a title or a label.
     let parent_pane = {
+        let parent_id = id_param(&params.parent, "parent", RegistrationId::required)?;
         let core = locked(core);
-        let parent = match core.registry.get(&params.parent) {
+        let parent = match core.registry.get(&parent_id) {
             Ok(Some(parent)) => parent,
             Ok(None) => {
                 return Err(Refusal::new(
@@ -233,7 +234,7 @@ pub(super) fn execute_spawn(
                 return Err(Refusal::new(Code::Internal, error));
             }
         };
-        let context = match core.registry.context(&params.parent, store::now_ms()) {
+        let context = match core.registry.context(&parent_id, store::now_ms()) {
             Ok(Some(context)) => context,
             Ok(None) => {
                 return Err(Refusal::new(
@@ -464,8 +465,8 @@ pub(super) fn spawn_child(
     if attach && let Some((_, ticket)) = &tracking {
         let attached = locked(core).registry.attach_subject(
             &request.id,
-            ticket.claim_id.as_str(),
-            ticket.registration_id.as_str(),
+            &ticket.claim_id,
+            &ticket.registration_id,
         );
         if let Err(message) = attached {
             let settled = record.complete(Settlement::backend_refused(&message), store::now_ms());

@@ -61,7 +61,7 @@ pub(crate) fn read(
             }
         };
     if current {
-        let registration = registry.get(process.registration_id.as_str())?;
+        let registration = registry.get(&process.registration_id)?;
         if result.state == AttachmentState::Live {
             result.location = standing.and_then(|decision| decision.location).or_else(|| {
                 registration
@@ -71,7 +71,7 @@ pub(crate) fn read(
         }
         let channel = |kind| -> Result<Option<ChannelFacts>, String> {
             Ok(registry
-                .published_facts(process.registration_id.as_str(), kind, now_ms)?
+                .published_facts(&process.registration_id, kind, now_ms)?
                 .map(|facts| ChannelFacts {
                     writer: facts.writer,
                     snapshot: facts.snapshot,

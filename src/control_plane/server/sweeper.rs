@@ -244,7 +244,7 @@ pub(super) const MAX_PANE_OBSERVATIONS: usize = 64;
 /// already succeeded.
 pub(super) fn management_view(
     registry: &registry::Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     now_ms: i64,
 ) -> answers::Management {
     let session = match registry.context(registration_id, now_ms) {
@@ -254,10 +254,7 @@ pub(super) fn management_view(
     let Some(session) = session else {
         return answers::Management::Unmanaged;
     };
-    let Some(registration_id) = RegistrationId::parse(registration_id) else {
-        return answers::Management::Unmanaged;
-    };
-    match subjects::attachment(registry, &registration_id, &session, now_ms) {
+    match subjects::attachment(registry, registration_id, &session, now_ms) {
         Ok(subjects::Attachment::Own(subject)) => answers::Management::Managed {
             subject_id: subject.subject_id.to_string(),
         },

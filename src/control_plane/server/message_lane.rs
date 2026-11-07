@@ -189,13 +189,10 @@ pub(super) fn message_identity(
     registry: &Registry,
     registration_id: &str,
 ) -> Result<AgentIdentity, messages::Error> {
-    if !valid_identifier(registration_id) {
-        return Err(messages::Error::Invalid(
-            "registration_id is invalid".into(),
-        ));
-    }
+    let registration_id = RegistrationId::required(registration_id, "registration_id")
+        .map_err(messages::Error::Invalid)?;
     let context = registry
-        .context(registration_id, unix_millis())
+        .context(&registration_id, unix_millis())
         .map_err(messages::Error::Internal)?
         .ok_or(messages::Error::NotFound)?;
     if context.context.freshness != crate::control_plane::registry::publication::Freshness::Fresh {
@@ -207,8 +204,6 @@ pub(super) fn message_identity(
         .context
         .session
         .ok_or_else(|| messages::Error::Invalid("sender has no current Pi session".into()))?;
-    let registration_id = RegistrationId::required(registration_id, "registration_id")
-        .map_err(messages::Error::Invalid)?;
     let attachment = registry::presence::attachment(registry, &registration_id)
         .map_err(messages::Error::Internal)?
         .ok_or_else(|| {

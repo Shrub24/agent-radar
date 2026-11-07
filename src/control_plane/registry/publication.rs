@@ -835,7 +835,10 @@ pub fn acquire_writer(
         .ok_or("assignment subject is not recorded")?;
     } else {
         registry
-            .get(&request.target_id)?
+            .get(&crate::identity::RegistrationId::required(
+                &request.target_id,
+                "target_id",
+            )?)?
             .ok_or_else(|| super::Error::NotFound("process is not registered".into()))?;
     }
     let existing = read_record(registry, &request.target_id, request.channel)?;
@@ -1275,7 +1278,7 @@ mod tests {
         let writer = registry
             .acquire_writer(
                 &AcquireRequest {
-                    target_id: agent.registration_id.clone(),
+                    target_id: agent.registration_id.to_string(),
                     channel: Channel::Execution,
                     publisher,
                     replace: None,
@@ -1284,7 +1287,7 @@ mod tests {
             )
             .expect("acquire");
         let make_request = |sequence| PublishRequest {
-            target_id: agent.registration_id.clone(),
+            target_id: agent.registration_id.to_string(),
             channel: Channel::Execution,
             update: PublicationUpdate {
                 writer_handle: writer.handle.clone(),
@@ -1302,10 +1305,14 @@ mod tests {
         registry
             .publish(&make_request(1), 1_000)
             .expect("first publish");
-        let path = record_path(&registry, &agent.registration_id, Channel::Execution);
+        let path = record_path(
+            &registry,
+            agent.registration_id.as_str(),
+            Channel::Execution,
+        );
         let before = fs::read(&path).expect("old record bytes");
         let old_record = registry
-            .channel(&agent.registration_id, Channel::Execution)
+            .channel(agent.registration_id.as_str(), Channel::Execution)
             .expect("read")
             .expect("record");
         let failed = ChannelRecord {
@@ -1333,7 +1340,7 @@ mod tests {
         assert_eq!(fs::read(&path).expect("old record still present"), before);
         assert_eq!(
             registry
-                .channel(&agent.registration_id, Channel::Execution)
+                .channel(agent.registration_id.as_str(), Channel::Execution)
                 .unwrap()
                 .unwrap()
                 .writer
@@ -1347,7 +1354,7 @@ mod tests {
         drop(registry);
         let reopened = Registry::open_at(&root, 2_000).expect("reopen");
         let restored = reopened
-            .channel(&agent.registration_id, Channel::Execution)
+            .channel(agent.registration_id.as_str(), Channel::Execution)
             .unwrap()
             .unwrap();
         assert_eq!(restored.writer.sequence, 2);
