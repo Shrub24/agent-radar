@@ -199,6 +199,7 @@ read from Radar.
 | [How Radar observes a fleet](docs/observation.md) | Where each fact comes from, stale and missing data, background tasks |
 | [Process evidence](docs/process-evidence.md) | The Processes page: identity, installed-binary comparison, measurement |
 | [Daemon guide](docs/daemon.md), [protocol](docs/control-plane.md), [mux contract](docs/mux.md) | Building against the daemon |
+| [Operator acceptance](docs/operator-acceptance.md) | Live checks to run at a real terminal |
 | [Development](docs/development.md) | Building, testing, source layout, logs |
 | [ideas.md](ideas.md) | Deferred functionality and options |
 

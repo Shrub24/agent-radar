@@ -64,11 +64,9 @@ pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Reply
 
 /// Validates, records and dispatches one guarded close.
 ///
-/// The caller's frozen identity travels as one [`CloseRequest`], so the daemon
-/// applies exactly the policy Radar's direct close applies — fresh inventory,
-/// frozen-identity match, positive-unmanaged containment — and never a second
-/// implementation of it. A location its owner manages is refused here; there is
-/// no generic close route may signal it; managed close uses subject cancellation followed by spawn.close.
+/// The caller's frozen identity travels as one [`CloseRequest`]: the daemon
+/// re-reads the inventory, refuses a place that changed since it was frozen, and
+/// ends every execution placed inside it before removing the place.
 pub(super) fn execute_close(
     request: &Request,
     core: &Arc<Mutex<Core>>,

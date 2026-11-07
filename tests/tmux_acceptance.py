@@ -10,13 +10,13 @@ What this run establishes, end to end and on a real backend:
 - `herdr` is a fail-fast sentinel on PATH that records every invocation. The run
   asserts the dashboard made no Herdr call and drew no fallback diagnostic, so
   nothing read Herdr agent state.
-- Registered agents publish execution, owner assignment and self facts
-  independently. Two registrations join their own panes by the exact procfs
+- With no daemon the dashboard draws only the blocking diagnostic, and it
+  recovers by itself once a daemon answers.
+- Registered agents publish execution and self facts independently. Two registrations join their own panes by the exact procfs
   birth identity of the pane's own process; one reports a pane the inventory
   does not hold and publishes nothing; one lets its facts lease expire.
-- The three authorities keep their own values and freshness on the screen, and a
-  session's finished execution never completes the owner's assignment.
-- Close is refused for a registration, joined or not, with no confirmation.
+- Each channel keeps its own value and freshness on the screen, and a session's
+  finished execution never completes an assignment.
 - Every resource is removed on success and on failure: the dashboard, the
   daemon, the tmux server with its panes, and the sockets under one temporary
   directory. The run fails if anything survives.
@@ -267,22 +267,6 @@ class Fleet:
             "lease_ms": MAX_LEASE_MS})["channel"]
         check(channel["snapshot"]["freshness"] == "fresh", str(channel))
 
-    def publish_assignment(self, registration_id):
-        writer = call(self.socket, "agent.acquire", {
-            "registration_id": registration_id, "channel": "assignment",
-            "publisher": {"source": "herdsman", "incarnation": str(uuid.uuid4()),
-                          "reporting_owner": OWNER}})["writer"]
-        channel = call(self.socket, "agent.publish", {
-            "registration_id": registration_id, "channel": "assignment", "writer_handle": writer["handle"],
-            "sequence": 1, "lease_ms": MAX_LEASE_MS,
-            "snapshot": {"activity": "working", "role": "worker",
-                         "definition": "acceptance-worker", "run": "run-1",
-                         "assignment": "keep the acceptance honest",
-                         "awaited": ["bg-1"], "actions": ["nix build .#radar"],
-                         "waiting_reason": "reading the panel",
-                         "last_outcome": {"result": "partial", "detail": "pending"}}})["channel"]
-        check(channel["snapshot"]["freshness"] == "fresh", str(channel))
-
     def publish_facts(self, registration_id, lease_ms, snapshot):
         return publisher.publish_facts(
             self.socket, registration_id, {"source": "pi", "incarnation": str(uuid.uuid4())},
@@ -488,7 +472,17 @@ def accept(binary, dump=False):
     failure = None
     try:
         fleet.start_tmux()
+        # With no daemon the dashboard draws only the blocking diagnostic, and it
+        # recovers on its own once one answers: there is no fleet to fall back to.
+        fleet.start_dashboard()
+        fleet.expect(b"Radar cannot reach its control daemon.")
+        check(b"Fleet" not in fleet.seen, "a fleet was drawn without a daemon")
         fleet.start_daemon()
+        fleet.expect(b"Fleet")
+        fleet.quit_dashboard()
+        os.close(fleet.master)
+        os.close(fleet.slave)
+        fleet.seen.clear()
 
         ping = call(fleet.socket, "daemon.ping", {})
         check(ping.get("backend") == "tmux", f"daemon backend: {ping.get('backend')}")
@@ -512,7 +506,6 @@ def accept(binary, dump=False):
 
         worker = fleet.register("accept worker", location(joined), birth_identity(joined_pid))
         fleet.publish_execution(worker, "done")
-        fleet.publish_assignment(worker)
         fleet.publish_facts(worker, MAX_LEASE_MS, {
             "model": "accept-model", "provider": "accept-provider", "thinking": "high",
             "context_window": {"tokens": 122000, "window": 200000}, "session_name": "accept-session",
@@ -541,6 +534,10 @@ def accept(binary, dump=False):
 
         fleet.start_dashboard()
         fleet.expect(b"current")
+        # No tmux client is attached, so the heading says there is no focus to show.
+        fleet.expect(b"no operator")
+        # A registration that joins no pane is history, listed once `e` shows it.
+        fleet.keys(b"e")
 
         names = ("accept worker", "accept stale", "accept orphan", unnamed)
         captures = fleet.read_rows(names + ("accept ghost",))
@@ -560,20 +557,13 @@ def accept(binary, dump=False):
         # The three authorities, each with its own value, publisher and freshness.
         check("physical: joined" in worker_panel, worker_panel)
         check("execution: done · from pi" in worker_panel, worker_panel)
-        check("assignment: working · from herdsman for accept-owner" in worker_panel,
-              worker_panel)
         check("facts: fresh · from pi" in worker_panel, worker_panel)
         # Open awaited items and background tasks make the row waiting, which is
         # derived, and the execution line keeps saying what the session reported.
         check("state: waiting" in worker_panel, worker_panel)
         # A session's finished execution never completes the owner's assignment.
         check("assignment: done" not in worker_panel, worker_panel)
-        # The owner's facts and the session's, side by side.
-        check("role: worker" in worker_panel, worker_panel)
-        check("definition: acceptance-worker" in worker_panel, worker_panel)
-        check("waiting reason: reading the panel" in worker_panel, worker_panel)
-        check("last outcome: partial — pending" in worker_panel, worker_panel)
-        check("awaiting: bg-1, 2 background tasks" in worker_panel, worker_panel)
+        check("awaiting: 2 background tasks" in worker_panel, worker_panel)
         check("model: accept-model" in worker_panel, worker_panel)
         check("provider: accept-provider" in worker_panel, worker_panel)
         check("context usage: 61%" in worker_panel, worker_panel)
@@ -590,17 +580,6 @@ def accept(binary, dump=False):
         check("physical: unresolved" in orphan_panel, orphan_panel)
         check("execution: unknown — nothing reported" in orphan_panel, orphan_panel)
         check("facts: not reported" in orphan_panel, orphan_panel)
-
-        # A registered worker without a daemon lifecycle subject cannot be
-        # controlled from its pane row; an unresolved registration is not joined
-        # to a pane at all. Neither falls back to owner files or generic close.
-        for name, refusal in (("accept worker", b"no daemon lifecycle subject"),
-                              ("accept orphan", b"not joined to a pane")):
-            fleet.select(name)
-            pressed = fleet.keys(b"x", 0.4)
-            check(refusal in pressed, f"{name}: close was not refused as expected: "
-                                      f"{frame_text(pressed)!r}")
-            check(b"[ Confirm ]" not in pressed, f"{name}: a close confirmation was offered")
 
         # Quitting the way an operator does, then stopping the daemon, so the
         # sockets are removed by their owners rather than by this harness.
@@ -622,12 +601,13 @@ def accept(binary, dump=False):
             check(not leftovers, f"leftovers: {leftovers}")
         elif leftovers:
             print(f"leftovers after failure: {leftovers}", file=sys.stderr)
-    print("PASS: two registrations joined a real disposable tmux server through a "
-          "disposable daemon; their execution, owner assignment and self facts kept their "
-          "own values and freshness; a registration with no label was named by its agent "
-          "id; an unjoinable one stayed unresolved and silent; a finished execution did "
-          "not complete the assignment; close was refused for both; Herdr was never "
-          "called; the server, its panes, the daemon and the sockets are gone")
+    print("PASS: the dashboard waited on a blocking diagnostic and recovered when the "
+          "daemon answered; two registrations joined a real disposable tmux server through "
+          "a disposable daemon; their execution and self facts kept their own values and "
+          "freshness; a registration with no label was named by its agent id; an "
+          "unjoinable one stayed unresolved and silent; a finished execution did not "
+          "complete an assignment; Herdr was never called; the server, its panes, the "
+          "daemon and the sockets are gone")
 
 
 def main():

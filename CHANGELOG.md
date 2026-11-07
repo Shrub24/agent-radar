@@ -2,6 +2,12 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Radar 0.10.1
+
+- The daemon refuses to start over a process recipe or subject identity it cannot read, naming the file, as it already did for a spawn edge. A 0.9.0 recipe used to start a daemon whose `subject.list` and fleet listing then failed on every read. The 0.10.0 upgrade notes now give the cutover, checked against a copy of real 0.9.0 state.
+- Closing a place that holds an agent Radar does not manage is refused as "holds an agent Radar does not manage" instead of naming an owner.
+- `radar` no longer starts or consults the `radar-control.socket` unit when `RADAR_CONTROL_SOCKET` names another socket: that daemon is not the unit's.
+
 ## Radar 0.10.0
 
 - **Breaking:** the shared command `delete` is now `close`, and the daemon decides what closing means for the row you selected: an execution is ended and its pane removed, a pane is closed, a container's whole branch is closed. No view derives a target any more, and no view re-resolves the row it selected to whatever is focused.
@@ -23,20 +29,29 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 ### Upgrading to 0.10.0
 
-Stop managed programs before replacing the daemon and CLI together. Programs started
-by the old launcher do not gain the new completion supervisor when the daemon upgrades.
+Process recipes are now version 4 and spawn edges version 3. The daemon reads every
+spawn edge, subject identity and process recipe at startup and refuses to start,
+naming the file, when one is from another version; it does not migrate. (Before
+this check, such a record left the daemon serving while every read that reached
+it failed: the fleet listing, `subject.list` and the sweeper's launch pass.)
 
-Stored spawn edges now use version 3. The daemon reads every edge at startup and refuses to start, naming the file, when one is from another version; it does not migrate. (Before this check, such an edge left the daemon serving while the sweeper's launch pass failed on every cycle.)
-Before upgrading, preserve an offline copy of the daemon state directory. A tested
-cutover procedure for old lifecycle records is still outstanding; do not work around
-a refusal by deleting individual records. Do not reset `communications/` or use
-`radar reset --hard` merely to upgrade lifecycle records: that discards unrelated
-mailbox state and history.
+State written by 0.9.0 holds version-3 process recipes, so a 0.10.0 daemon refuses
+it. The cutover, checked against a copy of a real 0.9.0 state directory:
 
-Child-close record versions did not change in this release. The broader record-version
-and downgrade checks remain part of the unfinished lifecycle upgrade audit. To roll
-back, use the previous binary with the preserved pre-upgrade state, not the state
-written by the new daemon.
+```sh
+# with the 0.9.0 binary still installed: end managed agents, keep a copy
+cp -a ~/.local/state/agent-radar ~/agent-radar-0.9.0-state
+# install 0.10.0, then
+radar reset          # default reset: keeps subject IDs, sessions and inboxes
+radar
+```
+
+The default reset purges claims, process records, spawn edges, requests and the
+event journal, keeps `lifecycle/identity/` and `communications/`, and restarts
+Radar's tmux server, so panes in it are lost. Afterwards the daemon starts over the
+old subjects and serves them detached. Do not use `radar reset --hard` to upgrade:
+it discards inboxes and history. To roll back, use the 0.9.0 binary with the copy,
+not the state the new daemon wrote.
 
 ## Radar 0.9.0
 

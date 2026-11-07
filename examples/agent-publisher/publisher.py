@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Minimal reconnecting publisher for the Radar direct agent registry.
 
-The main loop publishes only an owner assignment projection. `publish_facts`
-shows the self-authored facts channel a session publishes with no owner.
-Execution facts are a separate channel with a separate writer identity and
-lifecycle.
+The main loop registers one process and keeps its self-authored facts channel
+fresh, publishing its current session when that changes. Execution facts are a
+separate channel with a separate writer identity and lifecycle. Assignments are
+subject-addressed and written by the recorded parent through
+`subject.assignment.*`, so a registration cannot publish one.
 """
 
 from __future__ import annotations
@@ -109,24 +110,10 @@ def publish_context(path: Path, registration_id: str, publisher: dict,
     return result["writer"], result["context"]
 
 
-def owner_snapshot(activity: str, waiting_reason: str | None = None,
-                   last_outcome: dict | None = None, actions: list[str] | None = None) -> dict:
-    """Map Herdsman's existing owner projection without importing its tokens."""
-    result = {"activity": activity}
-    if waiting_reason is not None:
-        result["waiting_reason"] = waiting_reason
-    if last_outcome is not None:
-        result["last_outcome"] = last_outcome
-    if actions:
-        result["actions"] = actions
-    return result
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("socket", type=Path, help="trusted Radar daemon socket")
-    parser.add_argument("--owner", default="example-owner")
-    parser.add_argument("--label", default="Herdsman owner projection")
+    parser.add_argument("--label", default="example publisher")
     parser.add_argument("--session", help="current session UUID; omit to publish an explicit null")
     parser.add_argument("--once", action="store_true", help="publish one snapshot")
     parser.add_argument("--interval", type=float, default=10.0,
@@ -135,32 +122,31 @@ def main() -> int:
     if args.interval <= 0:
         parser.error("--interval must be positive")
 
+    trusted_socket(args.socket)
     incarnation = str(uuid.uuid4())
-    registration = {"source": "herdsman-owner-example", "incarnation": incarnation,
-                    "owner": args.owner, "label": args.label}
-    publisher = {"source": "herdsman-owner-example", "incarnation": incarnation,
-                 "reporting_owner": args.owner}
+    publisher = {"source": "example-publisher", "incarnation": incarnation}
+    registration_id = None
     sequence = 0
     context_writer = None
     context_sequence = 0
     published_session = object()
-    snapshot = owner_snapshot("waiting", "awaiting-child", actions=["assign", "cancel"])
     while True:
-        attempted_sequence = sequence + 1
         try:
-            registered, channel = publish_assignment(
-                args.socket, registration, publisher, snapshot, attempted_sequence,
-                lease_ms=DEFAULT_LEASE_MS)
-            sequence = attempted_sequence
-            current_session = args.session
-            if current_session != published_session:
+            if registration_id is None:
+                registration_id = call(args.socket, "agent.register", {
+                    "source": "example-publisher", "incarnation": incarnation,
+                    "label": args.label})["registration"]["registration_id"]
+            channel = publish_facts(args.socket, registration_id, publisher,
+                                    {"session_name": args.label}, sequence + 1,
+                                    lease_ms=DEFAULT_LEASE_MS)
+            sequence += 1
+            if args.session != published_session:
                 context_writer, context = publish_context(
-                    args.socket, registered["registration_id"], publisher, context_writer,
-                    context_sequence + 1, current_session, lease_ms=DEFAULT_LEASE_MS)
+                    args.socket, registration_id, publisher, context_writer,
+                    context_sequence + 1, args.session, lease_ms=DEFAULT_LEASE_MS)
                 context_sequence += 1
-                published_session = current_session
-            print(json.dumps({"registration_id": registered["registration_id"],
-                              "generation": channel["writer"]["generation"],
+                published_session = args.session
+            print(json.dumps({"registration_id": registration_id,
                               "sequence": sequence,
                               "freshness": channel.get("snapshot", {}).get("freshness"),
                               "context_session": context.get("context", {}).get("session")}),

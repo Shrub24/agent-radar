@@ -426,7 +426,7 @@ and results must be specified and verified separately.
 
 ## Examples and compatibility
 
-- [Reconnecting owner publisher](../examples/agent-publisher/publisher.py)
+- [Reconnecting publisher](../examples/agent-publisher/publisher.py)
 - [Reconnecting events consumer](../examples/agent-publisher/events_consumer.py)
 - [Registry and spawn exchanges](agent-registration.fixture.jsonl)
 - [Mux exchanges](control-plane.fixture.jsonl)

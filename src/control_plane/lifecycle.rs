@@ -964,6 +964,40 @@ pub fn read_process(
         .transpose()
 }
 
+/// Decodes every subject identity and process recipe this build serves, naming
+/// the file of the first one it cannot read.
+pub(crate) fn verify(registry: &Registry) -> Result<(), String> {
+    let mut after: Option<String> = None;
+    loop {
+        let page = subject_ids_after(registry, after.as_deref(), 100)?;
+        let Some(last) = page.last().cloned() else {
+            break;
+        };
+        for id in &page {
+            read_subject_record(registry, id).map_err(|error| {
+                format!("{}: {error}", subject_record_path(registry, id).display())
+            })?;
+        }
+        after = Some(last);
+    }
+    let processes: Vec<(String, crate::control_plane::events::ProcessFacts)> = registry
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .processes()
+        .map(|(id, facts)| (id.clone(), facts.clone()))
+        .collect();
+    for (registration_id, facts) in processes {
+        load_process(registry, &registration_id, &facts).map_err(|error| {
+            format!(
+                "{}: {error}",
+                recipe_path(registry, &registration_id).display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn load_process(
     registry: &Registry,
     registration_id: &str,
@@ -1257,6 +1291,21 @@ pub fn subject_records_after(
     after: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SubjectRecord>, String> {
+    subject_ids_after(registry, after, limit)?
+        .into_iter()
+        .map(|id| {
+            read_subject_record(registry, &id)?
+                .ok_or_else(|| "subject disappeared during listing".into())
+        })
+        .collect()
+}
+
+/// Subject ids with a recorded identity, ordered, after `after`.
+fn subject_ids_after(
+    registry: &Registry,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>, String> {
     let directory = registry.subjects().join("identity");
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -1278,13 +1327,7 @@ pub fn subject_records_after(
             ids.insert(id.to_owned());
         }
     }
-    ids.into_iter()
-        .take(limit)
-        .map(|id| {
-            read_subject_record(registry, &id)?
-                .ok_or_else(|| "subject disappeared during listing".into())
-        })
-        .collect()
+    Ok(ids.into_iter().take(limit).collect())
 }
 
 /// Lists one current attachment per subject, ordered by subject id.
@@ -3631,6 +3674,38 @@ mod tests {
             registry.register(&presenting(other), 3).is_err(),
             "a different process cannot bind the admitted registration"
         );
+    }
+
+    #[test]
+    fn a_process_recipe_of_another_version_fails_verification_naming_its_file() {
+        let scratch = Scratch::new("verify");
+        let registry = scratch.registry();
+        let process = create_process(
+            &registry,
+            &random_uuid(),
+            launch(),
+            Admission {
+                kind: ProcessKind::Agent,
+                identity: ProcessIdentity {
+                    boot_id: "boot".into(),
+                    pid: 4242,
+                    start_ticks: 7,
+                },
+                completion_key: random_uuid(),
+                placement: None,
+            },
+            1,
+        )
+        .expect("admitted process");
+        verify(&registry).expect("a record this build wrote verifies");
+
+        let path = recipe_path(&registry, &process.registration_id);
+        let mut recipe: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("recipe")).expect("json");
+        recipe["version"] = (SUBJECT_VERSION - 1).into();
+        fs::write(&path, serde_json::to_vec(&recipe).expect("json")).expect("old recipe");
+        let refusal = verify(&registry).expect_err("an old recipe refuses");
+        assert!(refusal.contains(&process.registration_id), "{refusal}");
     }
 
     #[test]

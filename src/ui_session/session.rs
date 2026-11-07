@@ -1301,6 +1301,78 @@ mod tests {
     }
 
     #[test]
+    fn a_focus_change_during_a_confirmation_does_not_retarget_it() {
+        let panes: Vec<String> = focused_on(&a_pane_id(&seeded()))
+            .current()
+            .rows
+            .iter()
+            .filter_map(|row| match &row.id {
+                dto::UiRowId::Pane { pane_id } => Some(pane_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let (first, second) = (panes[0].clone(), panes[1].clone());
+        let mut session = focused_on(&first);
+        let Out::Applied {
+            interaction_id: Some(interaction),
+            ..
+        } = session.act(
+            "a",
+            2,
+            A::RunCommand {
+                command: dto::SharedCommand::Close,
+                row: None,
+            },
+        )
+        else {
+            panic!("a close with no row resolves the focus and asks first");
+        };
+
+        // The operator's terminal moves to another pane while the question is open.
+        let mut fleet = crate::model::testing::fleet();
+        let moved = fleet.pane(&second).expect("the second pane").clone();
+        fleet.focus = crate::model::Focus::Focused {
+            location: moved.location,
+            zoomed: false,
+        };
+        let mut state = ObservationState::new();
+        state.apply_success(fleet);
+        session.observe(&state, None);
+        assert!(
+            matches!(&session.current().state.focus,
+                dto::FocusDto::Focused { row: Some(dto::UiRowId::Agent { pane_id } | dto::UiRowId::Pane { pane_id }) }
+                    if *pane_id == second),
+            "the focus really moved: {:?}",
+            session.current().state.focus
+        );
+
+        session.act(
+            "a",
+            3,
+            A::ClaimPresentation {
+                interaction_id: interaction.clone(),
+            },
+        );
+        session.act(
+            "a",
+            4,
+            A::ResolveInteraction {
+                interaction_id: interaction,
+                result: dto::InteractionResult::Confirm { accepted: true },
+            },
+        );
+        let jobs = session.take_completions();
+        let plan = jobs[0].plan.as_ref().expect("a frozen effect");
+        let crate::ui_session::targets::Effect::Domain(command) = &plan.effect else {
+            panic!("a close is a domain request");
+        };
+        let frozen = serde_json::to_string(&command.record_request(&plan.request_id).params)
+            .expect("params serialize");
+        assert!(frozen.contains(first.as_str()), "{frozen}");
+        assert!(!frozen.contains(second.as_str()), "{frozen}");
+    }
+
+    #[test]
     fn a_stale_read_keeps_the_place_it_last_saw_but_never_acts_on_it() {
         let pane = a_pane_id(&seeded());
         let mut session = focused_on(&pane);

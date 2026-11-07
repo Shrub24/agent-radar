@@ -1,6 +1,6 @@
 # UI session architecture
 
-These are confirmed design decisions for the planned shared-session architecture, not claims that it is already implemented. Protocol and migration detail live in the [core design](../openspec/changes/shared-ui-session/design.md) and [UX design](../openspec/changes/tui-interaction-ux/design.md).
+These are the design decisions behind the shared UI session. Protocol and migration detail live in the [core design](../openspec/changes/archive/2026-11-07-shared-ui-session/design.md) and [UX design](../openspec/changes/tui-interaction-ux/design.md).
 
 ## Canonical interaction authority, not synchronized Apps
 

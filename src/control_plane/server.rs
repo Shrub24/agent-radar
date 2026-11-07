@@ -541,10 +541,11 @@ impl Daemon {
         let ready_store = store.clone();
         let event_ready: Arc<EventReady> =
             Arc::new(move |line| event_read_ready(&ready_store, line));
-        // An edge this build cannot read would fail every pass over the topology, the
-        // sweeper's included, while the daemon kept serving: refuse to start instead.
+        // A record this build cannot read would fail every read that reaches it, the
+        // sweeper's and the fleet listing's included, while the daemon kept serving:
+        // refuse to start instead.
         let registry = match Registry::open(state).and_then(|registry| {
-            registry.verify_spawns()?;
+            registry.verify_records()?;
             Ok(registry)
         }) {
             Ok(registry) => registry,

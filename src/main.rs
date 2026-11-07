@@ -412,13 +412,23 @@ fn load_config() -> Config {
 /// starts without the daemon. `None` means the operator quit while waiting.
 ///
 /// Starting the socket is what brings a stopped daemon back: an explicit stop lasts
-/// only until the next `radar` run, which starts it again here.
+/// only until the next `radar` run, which starts it again here. A socket named by
+/// `RADAR_CONTROL_SOCKET` is not the unit's, so its daemon is neither started nor
+/// explained through the units.
 fn await_daemon(
     terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<Option<control_plane::Selected>> {
-    let mut reason = match agent_radar::service::start_control_socket() {
-        Ok(()) => "connecting to the control daemon".to_string(),
-        Err(problem) => problem,
+    let unit_owned = std::env::var_os("RADAR_CONTROL_SOCKET").is_none_or(|path| path.is_empty());
+    let mut reason = if !unit_owned {
+        format!(
+            "connecting to the control daemon at {}",
+            control_plane::socket_path().display()
+        )
+    } else {
+        match agent_radar::service::start_control_socket() {
+            Ok(()) => "connecting to the control daemon".to_string(),
+            Err(problem) => problem,
+        }
     };
     let mut next_attempt = Instant::now();
     loop {
@@ -426,7 +436,10 @@ fn await_daemon(
             next_attempt = Instant::now() + Duration::from_secs(2);
             match control_plane::connect() {
                 Ok(selected) => return Ok(Some(selected)),
-                Err(problem) => reason = agent_radar::service::explain_unreachable(&problem),
+                Err(problem) if unit_owned => {
+                    reason = agent_radar::service::explain_unreachable(&problem);
+                }
+                Err(problem) => reason = problem,
             }
         }
         terminal.draw(|frame| draw_daemon_diagnostic(frame, &reason))?;
@@ -442,7 +455,6 @@ fn await_daemon(
     }
 }
 
-/// The screen drawn while the daemon cannot be reached: the reason, and what to do.
 /// The diagnostic one source of a snapshot carries, if it has one.
 ///
 /// A source that is stale or unavailable names why, and the footer shows that
@@ -461,6 +473,7 @@ fn source_diagnostic(snapshot: &Observation, name: &str) -> Option<String> {
         })
 }
 
+/// The screen drawn while the daemon cannot be reached: the reason, and what to do.
 fn draw_daemon_diagnostic(frame: &mut ratatui::Frame, reason: &str) {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Text};

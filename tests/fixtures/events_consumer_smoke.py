@@ -87,7 +87,7 @@ def main():
                 assert observed is not None, f"consumer printed no event; stderr: {run.stderr.read()}"
                 assert observed["event"]["kind"] == "agent.registered", observed
                 assert observed["event"]["registration_id"] == registered, observed
-                assert observed["agent"]["registration"]["registration_id"] == registered, observed
+                assert observed["process"]["registration"]["registration_id"] == registered, observed
             finally:
                 if run.poll() is None:
                     run.kill()

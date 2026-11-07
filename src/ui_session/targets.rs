@@ -652,7 +652,7 @@ pub(crate) fn containment_refusal(
     match containment {
         Containment::Unmanaged => None,
         Containment::Managed => Some(format!(
-            "{described} is managed by its owner: direct close is not available"
+            "{described} holds an agent Radar does not manage: not closing"
         )),
         Containment::Uncertain => Some(format!(
             "{described} cannot be verified as unmanaged: not closing"

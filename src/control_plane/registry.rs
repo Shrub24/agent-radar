@@ -566,10 +566,12 @@ impl Registry {
         self.root.join(spawn::SPAWNS)
     }
 
-    /// Reads every recorded spawn edge, naming the first one this build cannot
-    /// read. A daemon starts only over edges it can serve.
-    pub fn verify_spawns(&self) -> Result<(), String> {
-        spawn::verify(self)
+    /// Reads every spawn edge, subject identity and process recipe, naming the
+    /// first one this build cannot read. A daemon starts only over records it can
+    /// serve.
+    pub fn verify_records(&self) -> Result<(), String> {
+        spawn::verify(self)?;
+        crate::control_plane::lifecycle::verify(self)
     }
 
     /// The `closes` directory.

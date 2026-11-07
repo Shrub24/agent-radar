@@ -41,9 +41,8 @@ def fixture_pairs():
     pairs = list(zip(rows[::2], rows[1::2]))
     expected = ["agent.register", "events.read", "events.read", "events.read",
                 "agent.acquire", "agent.publish", "agent.acquire", "agent.publish",
-                "agent.acquire", "agent.publish", "agent.publish", "agent.context",
-                "agent.context", "agent.context", "agent.context",
-                "agent.context", "agent.retire", "spawn.create", "agent.register", "spawn.get",
+                "agent.context", "agent.context", "agent.context", "agent.context",
+                "agent.context", "spawn.create", "agent.register", "spawn.get",
                 "spawn.list", "spawn.create", "spawn.close", "spawn.close"]
     actual = []
     for request, response in pairs:
@@ -262,9 +261,10 @@ def main():
         }
         identity = {"source": "herdsman-owner-example", "incarnation": incarnation,
                     "reporting_owner": "owner-smoke"}
-        snapshot = publisher.owner_snapshot(
-            "owner-waiting-new-state", "custom-waiting-reason",
-            {"result": "custom-unclassified-outcome"}, ["custom-action"])
+        snapshot = {"activity": "owner-waiting-new-state",
+                    "waiting_reason": "custom-waiting-reason",
+                    "last_outcome": {"result": "custom-unclassified-outcome"},
+                    "actions": ["custom-action"]}
         server = tmux_server.name("publisher")
         if not tmux_server.start(server):
             print("skipped: a disposable tmux server needs tmux and a user manager")

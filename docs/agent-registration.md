@@ -7,10 +7,10 @@ For the overall surface, lifecycle and adoption path, start with the
 normative wire reference for direct agent
 registry producers. The records it documents carry their own `version`, which is
 independent of the control-plane protocol version: registrations, close records
-and context records are `1`, and a spawn edge is `2` — see [the version table](control-plane.md#versions). The canonical
+and context records are `1`, and a spawn edge is `3` — see [the version table](control-plane.md#versions). The canonical
 request/response exchanges are in
 [`agent-registration.fixture.jsonl`](agent-registration.fixture.jsonl); the
-stdlib-only reconnecting owner publisher is
+stdlib-only reconnecting publisher is
 [`examples/agent-publisher/publisher.py`](../examples/agent-publisher/publisher.py),
 exercised against a disposable daemon by
 [`tests/agent_publisher.py`](../tests/agent_publisher.py). The fixture uses
@@ -631,7 +631,7 @@ not overload immutable `agent.presence` with succession. Automatic replacement
 policy, process-death inference from a stale lease, launch/stop/resume,
 task-completion certification and physical mux controls remain out of scope.
 
-## Reconnecting owner-publisher example
+## Reconnecting publisher example
 
 Run the example against an already-running daemon with a socket path that passes
 the daemon's trust check:
@@ -640,8 +640,10 @@ the daemon's trust check:
 python3 examples/agent-publisher/publisher.py /run/user/1000/agent-radar/control.sock --once
 ```
 
-The script is dependency-free Python 3.10+ and demonstrates owner assignment
-projection plus current-session context publication when its session changes. A production publisher stores its process registration and current session claim
+The script is dependency-free Python 3.10+ and demonstrates a self-authored facts
+heartbeat plus current-session context publication when its session changes.
+Assignments are not published by a registration: the recorded parent writes them
+to a child subject through `subject.assignment.*`. A production publisher stores its process registration and current session claim
 outside the process, reuses the same `claim_id` after reconnect, reports the
 current location, and calls `agent.acquire` without `replace` to recover the same
 current writer. The example process generates an
