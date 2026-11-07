@@ -43,7 +43,7 @@ pub(super) fn execute_focus(request: &Request, core: &Arc<Mutex<Core>>) -> Reply
     };
     let record = RequestRecord::new(&request.id, method, requester, Some(target), now)
         .with_params(request.params.clone());
-    let outcome = backend.focus_outcome(&runtime_target, &cancel);
+    let outcome = backend.focus(&runtime_target, &cancel);
     let done = match outcome {
         FocusOutcome::Completed => {
             record.complete(Settlement::completed(vec!["focus".into()]), store::now_ms())
@@ -727,25 +727,23 @@ pub(super) fn run_creation(
             // or repeats it.
             if focus && matches!(outcome, RequestOutcome::Completed) {
                 match created.pane_id.as_deref() {
-                    Some(pane) => {
-                        match backend.focus_outcome(&Target::Pane(pane.to_string()), &cancel) {
-                            FocusOutcome::Completed => {}
-                            FocusOutcome::NoClient => {
-                                notes.push(format!(
-                                    "the created pane was not focused: {}",
-                                    crate::runtime::NO_CLIENT
-                                ));
-                            }
-                            FocusOutcome::Refused(message) => {
-                                notes.push(format!("the created pane was not focused: {message}"));
-                            }
-                            FocusOutcome::Unknown(message) => {
-                                notes.push(format!(
-                                    "the focus of the created pane is unknown: {message}"
-                                ));
-                            }
+                    Some(pane) => match backend.focus(&Target::Pane(pane.to_string()), &cancel) {
+                        FocusOutcome::Completed => {}
+                        FocusOutcome::NoClient => {
+                            notes.push(format!(
+                                "the created pane was not focused: {}",
+                                crate::runtime::NO_CLIENT
+                            ));
                         }
-                    }
+                        FocusOutcome::Refused(message) => {
+                            notes.push(format!("the created pane was not focused: {message}"));
+                        }
+                        FocusOutcome::Unknown(message) => {
+                            notes.push(format!(
+                                "the focus of the created pane is unknown: {message}"
+                            ));
+                        }
+                    },
                     None => notes.push("the creation named no pane to focus".to_string()),
                 }
             }
@@ -1337,11 +1335,8 @@ mod tests {
             identity: TargetIdentity::Pane(PaneIdentity {
                 pane_id: "p".into(),
                 occupant: Some(AgentIdentity {
-                    name: None,
+                    registration_id: "r".into(),
                     session: None,
-                    lineage: None,
-                    managed: true,
-                    label: Some("agent".into()),
                     run: None,
                 }),
             }),

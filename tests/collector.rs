@@ -19,11 +19,13 @@ use agent_radar::model::{
     Location, Pane, ProcessResources, ProcessState, RuntimeStatus, SessionIdentity, Total,
 };
 use agent_radar::procfs::{Procs, Sampler};
-use agent_radar::registry_observation::{self, Binding, RegistryAgent, RegistryRead, Unjoined};
+use agent_radar::registry_observation::{
+    self, Binding, RegistryAgent, RegistryRead, RegistryView, Unjoined,
+};
 use agent_radar::runtime::BackendIdentity;
 use agent_radar::{
-    CloseTarget, Collector, CollectorConfig, ObservationState, RegistrySource, RetentionBasis,
-    RuntimeProvider, SourceFreshness, Target,
+    CloseOutcome, CloseTarget, Collector, CollectorConfig, FocusOutcome, ObservationState,
+    RegistrySource, RetentionBasis, RuntimeProvider, SourceFreshness, Target,
 };
 use serde_json::json;
 
@@ -120,11 +122,11 @@ impl RuntimeProvider for FakeRuntime {
         self.evidence.lock().expect("evidence").clone()
     }
 
-    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
+    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
         unreachable!("the collector never focuses")
     }
 
-    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
+    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
         unreachable!("the collector never closes anything")
     }
 }
@@ -266,19 +268,21 @@ fn location(pane_id: &str) -> Location {
 fn agent(pane_id: &str, assigned_started_unix_ms: Option<u64>) -> AgentObservation {
     AgentObservation {
         location: location(pane_id),
-        name: Some("pi".into()),
-        label: Some("owner task".into()),
         status: Some(RuntimeStatus::Idle),
         session: Some(SessionIdentity::Reported {
             source: Some("herdr:pi".into()),
             value: "/home/dev/sessions/2026-09-01T10-00-00.jsonl".into(),
         }),
-        lineage: None,
         facts: HerdsmanFacts {
             assigned_started_unix_ms,
             ..HerdsmanFacts::default()
         },
-        registry: None,
+        registry: RegistryView {
+            agent: registered_assignment(&format!("test-{pane_id}"), assigned_started_unix_ms),
+            binding: Binding::Unjoined(Unjoined::NoLocation),
+            spawn: None,
+            managed: None,
+        },
     }
 }
 
@@ -339,7 +343,6 @@ fn registered_assignment(
 fn inventory(pane_ids: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
     FleetObservation {
         focus: Default::default(),
-        metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
         workspaces: vec![],
@@ -465,12 +468,7 @@ fn assignment_age_is_measured_from_the_published_start() {
         inventory
             .agents
             .iter()
-            .find(|agent| {
-                agent
-                    .registry
-                    .as_ref()
-                    .is_some_and(|view| view.agent.registration.registration_id == registration_id)
-            })
+            .find(|agent| agent.registry.agent.registration.registration_id == registration_id)
             .expect("registered agent")
             .facts
             .assigned_for
@@ -489,72 +487,6 @@ fn assignment_age_is_measured_from_the_published_start() {
 
     // No published start: no age.
     assert_eq!(aged_for("unassigned"), None);
-}
-
-#[test]
-fn registry_facts_replace_conflicting_backend_records_and_direct_records_stay_evidence() {
-    let runtime = Arc::new(FakeRuntime::default());
-    // The backend's own record says one thing about the pane...
-    let legacy = agent("wA:p1", None);
-    runtime.set_inventory(inventory(&["wA:p1"], vec![legacy]));
-    // ...and the registry, which is the only fact source, says another.
-    runtime.set_registrations(vec![registered_assignment("reg", None)]);
-    let mut state = ObservationState::new();
-    let mut collector = collector_for(&runtime);
-    assert!(refresh_until(&mut collector, &mut state, |state| state
-        .source_freshness()
-        == &SourceFreshness::Current));
-    let inventory = state.inventory().expect("inventory");
-
-    assert_eq!(inventory.agents.len(), 1, "{:?}", inventory.agents);
-    let presented = &inventory.agents[0];
-    assert_eq!(presented.label, None, "the backend label leaked through");
-    assert_eq!(presented.facts.role.as_deref(), Some("worker"));
-    // The backend's record survives as containment evidence, never as a fact.
-    assert_eq!(inventory.metadata_agents.len(), 1);
-
-    // With no registry at all, the backend's record presents nothing.
-    runtime.registered.lock().expect("registered").take();
-    let mut direct = ObservationState::new();
-    let mut collector = collector_for(&runtime);
-    assert!(refresh_until(&mut collector, &mut direct, |state| state
-        .source_freshness()
-        == &SourceFreshness::Current));
-    let inventory = direct.inventory().expect("inventory");
-    assert!(inventory.agents.is_empty(), "{:?}", inventory.agents);
-    assert_eq!(inventory.metadata_agents.len(), 1);
-}
-
-#[test]
-fn a_vanished_backend_record_is_containment_evidence_never_a_row() {
-    let runtime = Arc::new(FakeRuntime::default());
-    let mut managed = agent("wA:p1", None);
-    managed.facts.managed_metadata = true;
-    runtime.set_inventory(inventory(&["wA:p1"], vec![managed]));
-    let mut state = ObservationState::new();
-    let mut collector = collector_for(&runtime);
-    assert!(refresh_until(&mut collector, &mut state, |state| state
-        .source_freshness()
-        == &SourceFreshness::Current));
-    assert!(state.inventory().expect("inventory").agents.is_empty());
-
-    // The record vanishes while the pane survives.
-    runtime.set_inventory(inventory(&["wA:p1"], vec![]));
-    assert!(refresh_until(&mut collector, &mut state, |state| state
-        .source_freshness()
-        == &SourceFreshness::Current
-        && state
-            .inventory()
-            .is_some_and(|i| i.metadata_agents.is_empty())));
-
-    assert!(state.retained().is_empty(), "metadata became a display row");
-    assert!(
-        state
-            .retained_containment()
-            .get("wA:p1")
-            .is_some_and(|entry| entry.observation.facts.managed_metadata),
-        "the managed pane lost its protection"
-    );
 }
 
 #[test]
@@ -786,11 +718,7 @@ fn a_registration_joins_its_pane_only_on_the_exact_live_identity() {
         .inventory()
         .and_then(|inventory| inventory.agent_on_pane("wA:p1"))
         .expect("registered agent on its pane");
-    assert_eq!(joined.facts.label.as_deref(), Some("worker-a"));
-    assert_eq!(
-        joined.registry.as_ref().map(|view| view.binding),
-        Some(Binding::Joined)
-    );
+    assert_eq!(joined.registry.binding, Binding::Joined);
 
     // A later incarnation on the same pid is not this registration: the start
     // time differs, so the pane stays protected but unjoined.
@@ -804,7 +732,7 @@ fn a_registration_joins_its_pane_only_on_the_exact_live_identity() {
         state
             .inventory()
             .and_then(|inventory| inventory.agent_on_pane("wA:p1"))
-            .and_then(|agent| agent.registry.as_ref().map(|view| view.binding))
+            .map(|agent| agent.registry.binding)
             == Some(Binding::Unjoined(Unjoined::IdentityMismatch))
     };
     assert!(refresh_until(&mut collector, &mut state, reused));
@@ -963,7 +891,8 @@ fn a_live_pane_carries_a_root_sample_and_neither_stale_nor_retained_panes_do() {
         Sampler::reading(procs.clone()),
     );
     let mut state = ObservationState::new();
-    runtime.set_inventory(inventory(&["wA:p1"], vec![agent("wA:p1", None)]));
+    runtime.set_inventory(inventory(&["wA:p1"], vec![]));
+    runtime.set_registrations(vec![registered_at("test-wA:p1", "wA:p1", None)]);
     runtime.set_evidence(ForegroundEvidence::command(
         4242,
         Some("pi".into()),
@@ -1016,13 +945,13 @@ fn a_live_pane_carries_a_root_sample_and_neither_stale_nor_retained_panes_do() {
         SourceFreshness::Stale { .. }
     ));
 
-    // A retained association is a pane whose agent record stopped being
-    // reported. This record is Herdr metadata, so it is kept for containment
-    // only. Its pane reports a shell, and a shell is not a process to sample.
+    // A retained association is a pane whose registration stopped being read.
+    // Its pane reports a shell, and a shell is not a process to sample.
+    runtime.registered.lock().expect("registered").take();
     runtime.set_inventory(inventory(&["wA:p1"], vec![]));
     runtime.set_evidence(ForegroundEvidence::Shell);
     assert!(refresh_until(&mut collector, &mut state, |state| {
-        state.retained_containment().contains_key("wA:p1")
+        state.retained().contains_key("wA:p1")
             && matches!(state.foreground("wA:p1"), Some(ForegroundEvidence::Shell))
     }));
     assert_eq!(sample(&state), None);
@@ -1044,7 +973,8 @@ fn a_build_beneath_a_pane_reaches_the_row_as_a_measured_sum() {
         Sampler::reading(procs.clone()),
     );
     let mut state = ObservationState::new();
-    runtime.set_inventory(inventory(&["wA:p1"], vec![agent("wA:p1", None)]));
+    runtime.set_inventory(inventory(&["wA:p1"], vec![]));
+    runtime.set_registrations(vec![registered_at("test-wA:p1", "wA:p1", None)]);
     runtime.set_evidence(ForegroundEvidence::command(
         4242,
         Some("pi".into()),

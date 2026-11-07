@@ -194,6 +194,42 @@ pub struct RegistryView {
     pub managed: Option<ManagedSubject>,
 }
 
+/// A registration as a test row needs it.
+///
+/// Integration tests build the same view from the fixture document they already
+/// keep; this is for the crate's own modules, which need a row and not a whole
+/// registry read.
+#[cfg(test)]
+impl RegistryView {
+    /// A joined registration on `pane_id`, with no spawn edge and no managed
+    /// subject.
+    pub fn test_joined(registration_id: &str, pane_id: &str) -> Self {
+        let agent = serde_json::from_value(serde_json::json!({
+            "registration": {
+                "version": 1,
+                "registration_id": registration_id,
+                "registered_at": "2026-01-01T00:00:00.000Z",
+                "source": "pi",
+                "incarnation": registration_id,
+                "location": {"backend": "test", "workspace": "wA", "tab": "wA:t1", "pane": pane_id},
+                "process_claimed": false,
+                "launch": {"available": false}
+            },
+            "process": {"claimed": false, "claim": null, "verification": "unavailable"},
+            "execution": null,
+            "assignment": null,
+            "facts": null
+        }))
+        .expect("test registration decodes");
+        Self {
+            agent,
+            binding: Binding::Joined,
+            spawn: None,
+            managed: None,
+        }
+    }
+}
+
 /// Projects a registry read onto `inventory`'s panes as agent observations.
 ///
 /// `evidence` is the foreground answer for each pane this refresh sampled. The
@@ -270,18 +306,15 @@ pub fn project(
             let session = agent.current_session_uuid().map(SessionIdentity::Uuid);
             Some(AgentObservation {
                 location,
-                name: None,
-                label: None,
                 status: execution_status(&agent),
                 session,
-                lineage: None,
                 facts: facts_of(&agent),
-                registry: Some(RegistryView {
+                registry: RegistryView {
                     agent,
                     binding,
                     spawn,
                     managed,
-                }),
+                },
             })
         })
         .collect()
@@ -493,7 +526,6 @@ fn execution_status(agent: &RegistryAgent) -> Option<RuntimeStatus> {
 /// one clock reading per refresh by the collector.
 fn facts_of(agent: &RegistryAgent) -> HerdsmanFacts {
     let mut facts = HerdsmanFacts {
-        label: agent.registration.label.clone(),
         ..HerdsmanFacts::default()
     };
     if let Some(Report::Assignment(assignment)) = fresh(&agent.assignment, Channel::Assignment) {
@@ -578,7 +610,6 @@ mod tests {
     fn inventory(panes: Vec<Pane>) -> FleetObservation {
         FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: Vec::new(),
@@ -722,7 +753,7 @@ mod tests {
             };
             project(&panes, &backend(), read, &[])
                 .into_iter()
-                .filter_map(|agent| Some(agent.registry?.agent.registration.registration_id))
+                .map(|agent| agent.registry.agent.registration.registration_id.clone())
                 .collect()
         };
         // Radar reaches only what is inside its own server: a pane it does not
@@ -791,14 +822,7 @@ mod tests {
                 read(vec![registered("a", at("p1"), Some(claim))]),
                 &evidence,
             );
-            assert_eq!(
-                projected[0]
-                    .registry
-                    .as_ref()
-                    .expect("registry view")
-                    .binding,
-                expected
-            );
+            assert_eq!(projected[0].registry.binding, expected);
         }
     }
 
@@ -844,7 +868,7 @@ mod tests {
         ];
         for (name, agent, evidence, expected) in cases {
             let projected = project(&panes, &backend(), read(vec![agent]), &evidence);
-            let view = projected[0].registry.as_ref().expect("registry view");
+            let view = &projected[0].registry;
             assert_eq!(view.binding, expected, "case: {name}");
             assert_eq!(
                 projected[0].location.pane_id, "p1",
@@ -863,7 +887,7 @@ mod tests {
             ..RegistryRead::default()
         };
         let projected = project(&panes, &backend(), read, &[]);
-        let view = projected[0].registry.as_ref().expect("registry view");
+        let view = &projected[0].registry;
         assert_eq!(view.binding, Binding::Unjoined(Unjoined::PaneAbsent));
         assert_eq!(projected[0].location.pane_id, "p9");
         assert_eq!(projected[0].location.tab_id, "t1");
@@ -878,8 +902,8 @@ mod tests {
         let agent = registered("a", reported, Some(identity(7, 5)));
         let projected = project(&panes, &backend(), read(vec![agent]), &[]);
         assert_eq!(
-            projected[0].registry.as_ref().map(|view| &view.binding),
-            Some(&Binding::Unjoined(Unjoined::LocationMismatch))
+            projected[0].registry.binding,
+            Binding::Unjoined(Unjoined::LocationMismatch)
         );
         assert_eq!(projected[0].location.tab_id, "t9");
     }
@@ -907,17 +931,14 @@ mod tests {
             read(vec![named(Some("srv-a"))]),
             &fg(),
         );
-        assert_eq!(
-            joined[0].registry.as_ref().map(|v| &v.binding),
-            Some(&Binding::Joined)
-        );
+        assert_eq!(joined[0].registry.binding, Binding::Joined);
 
         // A registration that names no server never joins a named backend, and its
         // pane stays protected, so the row stays.
         let projected = project(&panes, &on(Some("srv-a")), read(vec![named(None)]), &fg());
         assert_eq!(
-            projected[0].registry.as_ref().map(|v| &v.binding),
-            Some(&Binding::Unjoined(Unjoined::LocationMismatch))
+            projected[0].registry.binding,
+            Binding::Unjoined(Unjoined::LocationMismatch)
         );
 
         // A registration naming a server the backend does not report is another
@@ -949,7 +970,7 @@ mod tests {
             ..RegistryRead::default()
         };
         let projected = project(&panes, &backend(), read, &[]);
-        let view = projected[0].registry.as_ref().expect("registry view");
+        let view = &projected[0].registry;
         assert_eq!(
             view.spawn,
             Some(SpawnBinding {
@@ -1004,16 +1025,16 @@ mod tests {
         assert_eq!(
             projected[0]
                 .registry
+                .managed
                 .as_ref()
-                .and_then(|view| view.managed.as_ref())
                 .map(|managed| managed.subject_id.as_str()),
             Some("logical-subject-1")
         );
         assert_eq!(
             projected[0]
                 .registry
+                .managed
                 .as_ref()
-                .and_then(|view| view.managed.as_ref())
                 .and_then(|managed| managed.child_close.as_ref()),
             Some(&ChildCloseTarget {
                 spawn_request_id: "spawn-1".into(),
@@ -1037,12 +1058,7 @@ mod tests {
                 ..RegistryRead::default()
             };
             let projected = project(&panes, &backend(), read, &[foreground("p1", claim.clone())]);
-            assert!(
-                projected[0]
-                    .registry
-                    .as_ref()
-                    .is_some_and(|view| view.managed.is_none())
-            );
+            assert!(projected[0].registry.managed.is_none());
         }
 
         let unjoined = registered("lead", at("p9"), Some(claim.clone()));
@@ -1053,12 +1069,7 @@ mod tests {
             ..RegistryRead::default()
         };
         let projected = project(&panes, &backend(), read, &[foreground("p1", claim)]);
-        assert!(
-            projected[0]
-                .registry
-                .as_ref()
-                .is_some_and(|view| view.managed.is_none())
-        );
+        assert!(projected[0].registry.managed.is_none());
     }
 
     #[test]
@@ -1074,7 +1085,7 @@ mod tests {
         assert!(
             projected
                 .iter()
-                .all(|agent| agent.registry.as_ref().unwrap().binding == Binding::Joined)
+                .all(|agent| agent.registry.binding == Binding::Joined)
         );
         assert_eq!(projected[0].location.pane_id, "p1");
         assert_eq!(projected[1].location.pane_id, "p2");
@@ -1096,7 +1107,7 @@ mod tests {
         );
         for agent in &projected {
             assert_eq!(
-                agent.registry.as_ref().unwrap().binding,
+                agent.registry.binding,
                 Binding::Unjoined(Unjoined::Ambiguous)
             );
             assert_eq!(agent.location.pane_id, "p1", "the pane stays protected");

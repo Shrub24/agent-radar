@@ -301,7 +301,7 @@ pub struct RequestRecord {
 }
 
 /// The public record has no transition or persistence API. Its params are a
-/// compatibility projection, never the private retry contents.
+/// public projection, never the private retry contents.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PublicRequestRecord {
     pub id: String,

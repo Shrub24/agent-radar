@@ -142,12 +142,7 @@ impl RuntimeProvider for FakeBackend {
             ForegroundEvidence::Inconclusive
         }
     }
-    fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
-        self.focus_outcome(target, cancel)
-            .diagnostic()
-            .map_or(Ok(()), |message| Err(message.to_string()))
-    }
-    fn focus_outcome(&self, target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
+    fn focus(&self, target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
         self.focused
             .lock()
             .expect("focus list")
@@ -158,8 +153,9 @@ impl RuntimeProvider for FakeBackend {
             FocusAnswer::Unknown(message) => FocusOutcome::Unknown(message.clone()),
         }
     }
-    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
-        unreachable!()
+
+    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
+        unreachable!("the fake backend closes nothing")
     }
 }
 
@@ -269,7 +265,6 @@ impl RuntimeProvider for GatedBackend {
     fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
         Ok(FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: Vec::new(),
@@ -281,10 +276,7 @@ impl RuntimeProvider for GatedBackend {
     fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
         ForegroundEvidence::Inconclusive
     }
-    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
-        unreachable!("the gated backend is asked through focus_outcome")
-    }
-    fn focus_outcome(&self, _target: &Target, cancel: &AtomicBool) -> FocusOutcome {
+    fn focus(&self, _target: &Target, cancel: &AtomicBool) -> FocusOutcome {
         if self.released {
             self.gate.hold();
         } else {
@@ -297,13 +289,43 @@ impl RuntimeProvider for GatedBackend {
         }
         self.answer.clone()
     }
-    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
-        unreachable!()
+
+    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
+        unreachable!("the gated backend closes nothing")
     }
 }
 
 /// One workspace and one tab, with the listed panes and the agents the close
 /// policy reads. `Some(managed)` is a Pi pane publishing (or not publishing)
+/// A joined registration on `pane_id`, as the close policy reads it.
+fn registered_on(pane_id: &str) -> agent_radar::registry_observation::RegistryView {
+    use agent_radar::registry_observation::{Binding, RegistryView};
+    let registration_id = format!("test-{pane_id}");
+    let agent = serde_json::from_value(json!({
+        "registration": {
+            "version": 1,
+            "registration_id": registration_id,
+            "registered_at": "2026-01-01T00:00:00.000Z",
+            "source": "pi",
+            "incarnation": "11111111-1111-4111-8111-111111111111",
+            "location": {"backend":"tmux","workspace":"wA","tab":"wA:t1","pane":pane_id},
+            "process_claimed": false,
+            "launch": {"available": false}
+        },
+        "process": {"claimed": false, "claim": null, "verification": "unavailable"},
+        "execution": null,
+        "assignment": null,
+        "facts": null
+    }))
+    .expect("registration fixture decodes");
+    RegistryView {
+        agent,
+        binding: Binding::Joined,
+        spawn: None,
+        managed: None,
+    }
+}
+
 /// owner metadata; `None` is a bare pane with no agent on it.
 fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObservation {
     let location = |pane_id: &str| Location {
@@ -313,7 +335,6 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
     };
     FleetObservation {
         focus: Default::default(),
-        metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {
@@ -340,18 +361,14 @@ fn close_inventory(tab_id: &str, occupants: &[(&str, Option<bool>)]) -> FleetObs
         agents: occupants
             .iter()
             .filter_map(|(pane_id, occupant)| {
-                occupant.map(|managed| AgentObservation {
+                occupant.map(|_registered| AgentObservation {
                     location: location(pane_id),
-                    name: Some("pi".into()),
-                    label: None,
                     status: None,
                     session: None,
-                    lineage: None,
                     facts: HerdsmanFacts {
-                        managed_metadata: managed,
                         ..Default::default()
                     },
-                    registry: None,
+                    registry: registered_on(pane_id),
                 })
             })
             .collect(),
@@ -428,15 +445,7 @@ impl RuntimeProvider for CloseBackend {
     fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
         ForegroundEvidence::Inconclusive
     }
-    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
-        unreachable!("the close backend is never asked to focus")
-    }
-    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
-        self.close_outcome(target, cancel)
-            .diagnostic()
-            .map_or(Ok(()), |message| Err(message.to_string()))
-    }
-    fn close_outcome(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
         self.closed
             .lock()
             .expect("the close list")
@@ -452,6 +461,10 @@ impl RuntimeProvider for CloseBackend {
             CloseAnswer::Refused(message) => CloseOutcome::Refused(message.clone()),
             CloseAnswer::Unknown(message) => CloseOutcome::Unknown(message.clone()),
         }
+    }
+
+    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
+        unreachable!("the close backend focuses nothing")
     }
 }
 
@@ -781,7 +794,6 @@ impl MuxBackend {
             launch: self.launch.clone(),
             inventory: FleetObservation {
                 focus: Default::default(),
-                metadata_agents: Vec::new(),
                 containers: Vec::new(),
                 lifecycle_subjects: Vec::new(),
                 workspaces: Vec::new(),
@@ -909,19 +921,14 @@ impl RuntimeProvider for MuxBackend {
     fn foreground_evidence(&self, _pane_id: &str, _cancel: &AtomicBool) -> ForegroundEvidence {
         self.foreground.clone()
     }
-    fn focus(&self, target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
+    fn focus(&self, target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
         self.focused_targets
             .lock()
             .expect("the focus list")
             .push(target.clone());
-        Ok(())
+        FocusOutcome::Completed
     }
-    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
-        self.close_outcome(target, cancel)
-            .diagnostic()
-            .map_or(Ok(()), |message| Err(message.to_string()))
-    }
-    fn close_outcome(&self, target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
+    fn close(&self, target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
         self.closed
             .lock()
             .expect("the close list")
@@ -1283,7 +1290,6 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
     };
     let inventory = FleetObservation {
         focus: Default::default(),
-        metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {
@@ -1306,17 +1312,14 @@ fn populated_graph() -> (FleetObservation, ForegroundEvidence) {
         }],
         agents: vec![AgentObservation {
             location,
-            name: Some("pi".into()),
-            label: Some("worker".into()),
             status: Some(RuntimeStatus::Other("dormant".into())),
             session: None,
-            lineage: None,
             facts: HerdsmanFacts {
                 state: Some(SemanticState::Other("grepping".into())),
                 awaited: vec!["agent:peer".into()],
                 ..HerdsmanFacts::default()
             },
-            registry: None,
+            registry: registered_on("wA:p1"),
         }],
     };
     let evidence = ForegroundEvidence::NonShell {
@@ -3347,7 +3350,6 @@ fn registry_parent_at(
                 observed_at: None,
                 context: agent_radar::control_plane::registry::ContextValue {
                     session: Some(session.into()),
-                    launch_identity: None,
                 },
             },
             now + 1,
@@ -4140,7 +4142,7 @@ fn a_request_id_is_at_most_once_across_methods() {
     // stored request does not describe this one.
     let mut changed_contents = frozen_pane("pane:3");
     changed_contents["request"]["identity"]["pane"]["occupant"] =
-        json!({"name": "pi", "managed": false});
+        json!({"registration_id": "another-registration", "session": null, "run": null});
     let reordered = client.call_id(&id, "mux.close", changed_contents);
     assert_eq!(error_code(&reordered), "refused");
     daemon.stop();
@@ -9134,7 +9136,6 @@ fn a_populated_normalized_graph_round_trips_including_unknown_states() {
 fn empty_inventory() -> FleetObservation {
     FleetObservation {
         focus: Default::default(),
-        metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
         workspaces: Vec::new(),
@@ -9357,20 +9358,10 @@ impl RuntimeProvider for ClientBackend {
             ForegroundEvidence::Inconclusive
         }
     }
-    fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
-        self.focus_outcome(target, cancel)
-            .diagnostic()
-            .map_or(Ok(()), |message| Err(message.to_string()))
-    }
-    fn focus_outcome(&self, _target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
+    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
         FocusOutcome::Completed
     }
-    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
-        self.close_outcome(target, cancel)
-            .diagnostic()
-            .map_or(Ok(()), |message| Err(message.to_string()))
-    }
-    fn close_outcome(&self, target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
+    fn close(&self, target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
         self.closed
             .lock()
             .expect("the close list")
@@ -9480,14 +9471,11 @@ fn the_daemon_client_serves_every_method_over_a_real_socket() {
     );
 
     assert_eq!(
-        client.focus_outcome(&Target::Pane("wA:p1".into()), &cancel),
+        client.focus(&Target::Pane("wA:p1".into()), &cancel),
         FocusOutcome::Completed
     );
     let pane = CloseTarget::Pane("wA:p1".into());
-    assert_eq!(
-        client.close_outcome(&pane, &cancel),
-        CloseOutcome::Completed
-    );
+    assert_eq!(client.close(&pane, &cancel), CloseOutcome::Completed);
     assert!(backend.told_to_close(&pane));
     assert_eq!(
         client.create(
@@ -9708,14 +9696,18 @@ fn planted_daemon(root: &Path, name: &str, marker: PathBuf) -> PathBuf {
     })
 }
 
-/// A daemon older than this build, which an install it outlived leaves behind, is
-/// refused with one line that says how to replace it. A daemon that answers no
-/// revision at all is older still.
+/// A daemon of any revision but this build\'s — an older one an install outlived,
+/// a newer one, or one that answers no revision — is refused with one line that
+/// says how to replace it.
 #[test]
-fn an_older_daemon_is_refused_and_told_to_restart() {
+fn a_daemon_of_another_revision_is_refused_and_told_to_restart() {
     let sandbox = Sandbox::new("client-incompatible");
-    for answer_revision in [None, Some(0_u64)] {
-        let name = format!("older-{}.sock", answer_revision.unwrap_or(99));
+    let current = u64::from(agent_radar::control_plane::ops::PROTOCOL_REVISION);
+    for answer_revision in [None, Some(current - 1), Some(current + 1)] {
+        let name = format!(
+            "other-{}.sock",
+            answer_revision.map_or(0, |revision| revision + 1)
+        );
         let path = scripted_socket(&sandbox.root, &name, move |request| {
             let mut ping = scripted_ping(request);
             match answer_revision {
@@ -9728,10 +9720,7 @@ fn an_older_daemon_is_refused_and_told_to_restart() {
         });
         let diagnostic = connect_at(&path).err().expect("a refusal");
         assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
-        assert!(
-            diagnostic.contains("is older than this build"),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.contains("is not this build's"), "{diagnostic}");
         assert!(
             diagnostic.contains("systemctl --user restart radar-daemon"),
             "{diagnostic}"
@@ -9792,7 +9781,7 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
         },
     );
     let client = DaemonRuntime::handshake(&internal).expect("a scripted daemon");
-    let outcome = client.focus_outcome(&Target::Pane("wA:p1".into()), &cancel);
+    let outcome = client.focus(&Target::Pane("wA:p1".into()), &cancel);
     assert!(matches!(outcome, FocusOutcome::Unknown(_)), "{outcome:?}");
 
     // `outcome_unknown` is the daemon's word for a dispatched request whose
@@ -9818,7 +9807,7 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
             },
         );
     let client = DaemonRuntime::handshake(&uncertain).expect("a scripted daemon");
-    let outcome = client.close_outcome(&CloseTarget::Pane("wA:p1".into()), &cancel);
+    let outcome = client.close(&CloseTarget::Pane("wA:p1".into()), &cancel);
     assert!(matches!(outcome, CloseOutcome::Unknown(_)), "{outcome:?}");
 
     // A connection that ends without an answer may have carried the request.
@@ -9831,7 +9820,7 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
         },
     );
     let client = DaemonRuntime::handshake(&silent).expect("a scripted daemon");
-    let outcome = client.focus_outcome(&Target::Pane("wA:p1".into()), &cancel);
+    let outcome = client.focus(&Target::Pane("wA:p1".into()), &cancel);
     assert!(matches!(outcome, FocusOutcome::Unknown(_)), "{outcome:?}");
 
     // An accepted request whose record is not settled may still be executed, so
@@ -9849,7 +9838,7 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
             },
         );
     let client = DaemonRuntime::handshake(&unresolved).expect("a scripted daemon");
-    let outcome = client.focus_outcome(&Target::Pane("wA:p1".into()), &cancel);
+    let outcome = client.focus(&Target::Pane("wA:p1".into()), &cancel);
     assert!(matches!(outcome, FocusOutcome::Unknown(_)), "{outcome:?}");
 
     // A refusal the daemon states before dispatch stays a refusal.
@@ -9865,7 +9854,7 @@ fn the_clients_error_mapping_keeps_dispatch_certainty() {
         },
     );
     let client = DaemonRuntime::handshake(&refusing).expect("a scripted daemon");
-    let outcome = client.focus_outcome(&Target::Pane("wA:p1".into()), &cancel);
+    let outcome = client.focus(&Target::Pane("wA:p1".into()), &cancel);
     assert!(matches!(outcome, FocusOutcome::Refused(_)), "{outcome:?}");
 }
 
@@ -9934,7 +9923,7 @@ fn a_stalled_daemon_is_abandoned_when_the_caller_cancels() {
             thread::sleep(Duration::from_millis(50));
             setter.store(true, Ordering::SeqCst);
         });
-        client.focus_outcome(&Target::Pane("wA:p1".into()), &cancel)
+        client.focus(&Target::Pane("wA:p1".into()), &cancel)
     });
     assert!(matches!(outcome, FocusOutcome::Unknown(_)), "{outcome:?}");
     assert!(
@@ -9965,12 +9954,12 @@ impl RuntimeProvider for IdentifiedBackend {
         ForegroundEvidence::Inconclusive
     }
 
-    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
-        Ok(())
+    fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
+        FocusOutcome::Completed
     }
 
-    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
-        Ok(())
+    fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
+        CloseOutcome::Completed
     }
 }
 
@@ -11028,7 +11017,6 @@ fn the_snapshot_carries_the_containers_the_daemon_records() {
 fn workspace_inventory(workspace_id: &str) -> FleetObservation {
     FleetObservation {
         focus: Default::default(),
-        metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {

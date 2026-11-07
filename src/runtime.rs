@@ -52,17 +52,6 @@ pub enum FocusOutcome {
     Unknown(String),
 }
 
-impl FocusOutcome {
-    /// Existing direct-runtime surfaces display a concise human diagnostic.
-    pub fn diagnostic(&self) -> Option<&str> {
-        match self {
-            Self::Completed => None,
-            Self::NoClient => Some(NO_CLIENT),
-            Self::Refused(message) | Self::Unknown(message) => Some(message),
-        }
-    }
-}
-
 /// Where `Enter` wants a runtime's focus moved: an existing normalized
 /// location the view already produces.
 #[derive(
@@ -126,16 +115,6 @@ pub enum CloseOutcome {
     Refused(String),
     /// Dispatch or completion may have happened, but no trustworthy answer arrived.
     Unknown(String),
-}
-
-impl CloseOutcome {
-    /// The existing direct-close surfaces display a one-line diagnostic.
-    pub fn diagnostic(&self) -> Option<&str> {
-        match self {
-            Self::Completed => None,
-            Self::Refused(message) | Self::Unknown(message) => Some(message),
-        }
-    }
 }
 
 /// Which way a pane split puts the new pane relative to the one it splits.
@@ -1064,40 +1043,21 @@ pub trait RuntimeProvider: Send + Sync {
     /// Foreground evidence for one pane, inconclusive when unreadable.
     fn foreground_evidence(&self, pane_id: &str, cancel: &AtomicBool) -> ForegroundEvidence;
 
-    /// Moves the runtime's focus to `target`.
+    /// Moves the runtime's focus to `target`, with its dispatch certainty.
     ///
-    /// `Err` carries the one-line refusal or failure a user reads. Like every
-    /// operation here, a cancelled request must abandon an outstanding
-    /// command or exchange, return without waiting out its deadline, and leave
-    /// no child process behind.
-    fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String>;
+    /// Like every operation here, a cancelled request must abandon an
+    /// outstanding command or exchange, return without waiting out its deadline,
+    /// and leave no child process behind.
+    fn focus(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome;
 
-    /// Focus with dispatch certainty for durable callers. Legacy adapters may
-    /// only return a diagnostic, so conservatively treat their errors as unknown.
-    fn focus_outcome(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
-        match self.focus(target, cancel) {
-            Ok(()) => FocusOutcome::Completed,
-            Err(message) => FocusOutcome::Unknown(message),
-        }
-    }
-
-    /// Closes `target` through the runtime, for a location Radar has positive
-    /// evidence is unmanaged. An adapter that cannot close returns an explicit
-    /// refusal; nothing here may kill a process directly.
+    /// Closes `target` through the runtime, with its dispatch certainty. An
+    /// adapter that cannot close answers an explicit refusal; nothing here may
+    /// kill a process directly.
     ///
     /// Same cancellation duty as [`Self::focus`]. A close already handed to the
     /// runtime is not retracted by cancelling: cancellation only abandons a
     /// request still waiting.
-    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String>;
-
-    /// Close with dispatch certainty for durable callers. Legacy adapters may
-    /// only return a diagnostic, so conservatively treat their errors as unknown.
-    fn close_outcome(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
-        match self.close(target, cancel) {
-            Ok(()) => CloseOutcome::Completed,
-            Err(message) => CloseOutcome::Unknown(message),
-        }
-    }
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome;
 
     /// Creates one location, returning what the runtime reports it created.
     ///
@@ -1222,20 +1182,12 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
         (**self).foreground_evidence(pane_id, cancel)
     }
 
-    fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
+    fn focus(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
         (**self).focus(target, cancel)
     }
 
-    fn focus_outcome(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
-        (**self).focus_outcome(target, cancel)
-    }
-
-    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
         (**self).close(target, cancel)
-    }
-
-    fn close_outcome(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
-        (**self).close_outcome(target, cancel)
     }
 
     fn create(&self, request: &CreateRequest, cancel: &AtomicBool) -> CreateOutcome {

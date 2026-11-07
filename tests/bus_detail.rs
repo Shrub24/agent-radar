@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_radar::app::DetailPage;
 use agent_radar::model::{
-    AgentObservation, FleetObservation, HerdsmanFacts, Lineage, Location, Pane, RuntimeStatus,
+    AgentObservation, FleetObservation, HerdsmanFacts, Location, Pane, RuntimeStatus,
     SessionIdentity, SessionUuid, Tab, Workspace,
 };
 use agent_radar::registry_observation::{self, RegistryAgent, RegistryView};
@@ -20,7 +20,7 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::widgets::ListState;
 
-/// The session UUID the fixture pane publishes as its lineage.
+/// The session UUID the fixture pane publishes.
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 /// A second session UUID some tests connect with instead.
 const OTHER_SESSION: &str = "22222222-2222-4222-8222-222222222222";
@@ -33,7 +33,10 @@ fn location(pane_id: &str) -> Location {
     }
 }
 
-/// A one-workspace fleet with one agent row per entry: its pane id, the lineage
+/// A session UUID for a test row that publishes none.
+const NO_SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1a2b3c4d5e";
+
+/// A one-workspace fleet with one agent row per entry: its pane id, the session
 /// UUID it publishes (`None` for a row that publishes none), and the background
 /// tasks its pane tokens carry. The token list is what says what is unresolved
 /// — the running count beside it is not a task set — so the count publishes
@@ -96,7 +99,6 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
     let mut state = ObservationState::new();
     state.apply_success(FleetObservation {
         focus: Default::default(),
-        metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {
@@ -124,16 +126,10 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
             .iter()
             .map(|(pane_id, session, background_running)| AgentObservation {
                 location: location(pane_id),
-                name: Some("pi".into()),
-                label: Some(format!("worker {pane_id}")),
                 status: Some(RuntimeStatus::Working),
                 session: session
                     .and_then(SessionUuid::parse)
                     .map(SessionIdentity::Uuid),
-                lineage: session.map(|uuid| Lineage {
-                    session: SessionUuid::parse(uuid).expect("test UUID"),
-                    parent: None,
-                }),
                 facts: HerdsmanFacts {
                     background_running: *background_running,
                     background_tasks: (0..background_running.unwrap_or(0))
@@ -141,7 +137,7 @@ fn fleet(agents: &[(&str, Option<&str>, Option<u32>)]) -> ObservationState {
                         .collect(),
                     ..HerdsmanFacts::default()
                 },
-                registry: session.map(|uuid| task_session_view(pane_id, uuid)),
+                registry: task_session_view(pane_id, session.unwrap_or(NO_SESSION)),
             })
             .collect(),
     });

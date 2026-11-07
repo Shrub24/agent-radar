@@ -2266,7 +2266,6 @@ mod tests {
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: vec![],
@@ -2288,7 +2287,6 @@ mod tests {
     fn filter_matches_reported_role_and_assignment_when_available() {
         let observation = FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
@@ -2319,20 +2317,20 @@ mod tests {
                     tab_id: "wX:t1".into(),
                     pane_id: "wX:p1".into(),
                 },
-                name: Some("pi".into()),
-                label: Some("unrelated label".into()),
                 status: Some(RuntimeStatus::Idle),
                 session: Some(SessionIdentity::Reported {
                     source: None,
                     value: "session-1".into(),
                 }),
-                lineage: None,
                 facts: crate::model::HerdsmanFacts {
                     role: Some("reviewer".into()),
                     assignment: Some("audit the parser".into()),
                     ..Default::default()
                 },
-                registry: None,
+                registry: crate::registry_observation::RegistryView::test_joined(
+                    "test-wX:p1",
+                    "wX:p1",
+                ),
             }],
         };
         let mut state = ObservationState::new();
@@ -2421,8 +2419,7 @@ mod tests {
 
     fn managed_facts() -> crate::model::HerdsmanFacts {
         crate::model::HerdsmanFacts {
-            managed_metadata: true,
-            label: Some("implementer-1".into()),
+            definition: Some("implementer-1".into()),
             run: Some(MANAGED_RUN.into()),
             state: Some(crate::model::SemanticState::Idle),
             ..Default::default()
@@ -2451,15 +2448,11 @@ mod tests {
             tab_id: "wM:t1".into(),
             pane_id: "wM:p1".into(),
         };
-        let session = crate::model::SessionUuid::parse(MANAGED_OWNER).expect("a UUID");
-        let lineage = Some(crate::model::Lineage {
-            session,
-            parent: owner.map(|owner| crate::model::SessionUuid::parse(owner).expect("a UUID")),
-        });
+        // A parent link is a spawn edge naming the parent's registration now.
+        let parent = owner.map(|owner| format!("reg-{owner}"));
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
@@ -2482,13 +2475,10 @@ mod tests {
             }],
             agents: vec![AgentObservation {
                 location,
-                name: Some("pi".into()),
-                label: None,
                 status: Some(status),
                 session: None,
-                lineage,
                 facts,
-                registry: Some(crate::registry_observation::RegistryView {
+                registry: crate::registry_observation::RegistryView {
                     agent: serde_json::from_value(serde_json::json!({
                         "registration": {
                             "version": 1,
@@ -2506,7 +2496,14 @@ mod tests {
                         "facts": null
                     })).expect("registry agent"),
                     binding: crate::registry_observation::Binding::Joined,
-                    spawn: None,
+                    spawn: parent.map(|parent| crate::registry_observation::SpawnBinding {
+                        parent,
+                        request_id: "r-managed".into(),
+                        claim_id: None,
+                        child_source: None,
+                        child_incarnation: None,
+                        state: crate::control_plane::registry::SpawnState::Bound,
+                    }),
                     managed: Some(crate::registry_observation::ManagedSubject {
                         subject_id: "subject-managed".into(),
                     claim_id: "claim-managed".into(),
@@ -2517,8 +2514,7 @@ mod tests {
                         session: Some(MANAGED_OWNER.into()),
                         ended,
                     }),
-                }),
-            }],
+                }}],
         });
         state
     }
@@ -2720,11 +2716,7 @@ mod tests {
     fn an_agent_that_joins_no_pane_is_history_too() {
         let mut state = managed_state(managed_facts(), RuntimeStatus::Working, Some(MANAGED_OWNER));
         let mut observation = state.inventory().expect("current inventory").clone();
-        observation.agents[0]
-            .registry
-            .as_mut()
-            .expect("registry view")
-            .binding = crate::registry_observation::Binding::Unjoined(
+        observation.agents[0].registry.binding = crate::registry_observation::Binding::Unjoined(
             crate::registry_observation::Unjoined::PaneAbsent,
         );
         state.apply_success(observation);

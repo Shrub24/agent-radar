@@ -633,12 +633,10 @@ pub(crate) fn containment_of(
     target: &CloseTarget,
 ) -> Containment {
     match target {
-        CloseTarget::Pane(pane_id) => {
-            lifecycle::pane(inventory, state.retained_containment(), pane_id)
-        }
-        CloseTarget::Tab(tab_id) => lifecycle::tab(inventory, state.retained_containment(), tab_id),
+        CloseTarget::Pane(pane_id) => lifecycle::pane(inventory, state.retained(), pane_id),
+        CloseTarget::Tab(tab_id) => lifecycle::tab(inventory, state.retained(), tab_id),
         CloseTarget::Workspace(workspace_id) => {
-            lifecycle::workspace(inventory, state.retained_containment(), workspace_id)
+            lifecycle::workspace(inventory, state.retained(), workspace_id)
         }
     }
 }
@@ -708,9 +706,11 @@ pub(crate) fn losses_under(
         {
             if agent_busy(agent) {
                 let name = agent
+                    .registry
+                    .agent
+                    .registration
                     .label
                     .as_deref()
-                    .or(agent.name.as_deref())
                     .unwrap_or("an agent");
                 let state = agent
                     .status
@@ -761,9 +761,11 @@ fn task_losses(inventory: &FleetObservation, target: &CloseTarget) -> Vec<String
         .filter_map(|agent| {
             let running = agent.facts.background_running.filter(|count| *count > 0)?;
             let name = agent
+                .registry
+                .agent
+                .registration
                 .label
                 .as_deref()
-                .or(agent.name.as_deref())
                 .unwrap_or("an agent");
             Some(format!("{name} has {running} background task(s) running"))
         })

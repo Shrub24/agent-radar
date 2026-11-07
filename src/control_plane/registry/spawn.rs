@@ -86,7 +86,7 @@ pub struct BoundChild {
     /// Exact registry identity returned to the registering child.
     pub registration_id: String,
     /// The durable agent the bound child attaches as. Absent for an edge without
-    /// a tracked launch and in records written before it was recorded.
+    /// a tracked launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
     /// When the edge bound to this incarnation.

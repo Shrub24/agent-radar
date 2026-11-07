@@ -503,10 +503,7 @@ impl FleetTree {
                 // Only a joined agent owns its pane. An unresolved one claims
                 // nothing, so the pane it reported still shows its own row and
                 // two unresolved registrations on one pane both show.
-                let joined = agent
-                    .registry
-                    .as_ref()
-                    .is_none_or(|view| view.binding == Binding::Joined);
+                let joined = agent.registry.binding == Binding::Joined;
                 if joined && !claimed.insert(pane_id) {
                     continue; // duplicate agent record for an already-rowed pane
                 }
@@ -520,7 +517,6 @@ impl FleetTree {
                         node: agent_node(agent, None, pane, foreground, &places),
                         parent: parent_claim(agent),
                         registration_id: claimed_registration_id(agent),
-                        session: claimed_session(agent),
                     },
                     agent.location.tab_id.clone(),
                 ));
@@ -548,7 +544,6 @@ impl FleetTree {
                         ),
                         parent: parent_claim(agent),
                         registration_id: claimed_registration_id(agent),
-                        session: claimed_session(agent),
                     },
                     agent.location.tab_id.clone(),
                 ));
@@ -645,7 +640,7 @@ impl FleetTree {
         let represented: HashSet<&str> = inventory
             .agents
             .iter()
-            .filter_map(|agent| agent.registry.as_ref()?.managed.as_ref())
+            .filter_map(|agent| agent.registry.managed.as_ref())
             .map(|subject| subject.subject_id.as_str())
             .collect();
         for subject in &inventory.lifecycle_subjects {
@@ -736,12 +731,10 @@ fn agent_node(
     places: &Places<'_>,
 ) -> TreeNode {
     let location = &agent.location;
-    let registry = agent.registry.clone();
-    let id = match &registry {
-        Some(view) if view.binding != Binding::Joined => {
-            RowId::Registered(view.agent.registration.registration_id.clone())
-        }
-        _ => RowId::Agent(location.pane_id.clone()),
+    let registry = &agent.registry;
+    let id = match registry.binding {
+        Binding::Joined => RowId::Agent(location.pane_id.clone()),
+        _ => RowId::Registered(registry.agent.registration.registration_id.clone()),
     };
     // The name a row shows is what Herdsman publishes for this agent — a
     // managed worker's runtime label, a lead's session name — and only then
@@ -752,21 +745,20 @@ fn agent_node(
         _ => location.pane_id.clone(),
     };
     let raw = agent
-        .facts
-        .display_name()
-        .map(str::to_string)
-        .or_else(|| agent.label.clone())
-        .or_else(|| agent.name.clone())
+        .registry
+        .agent
+        .registration
+        .label
+        .clone()
         .or_else(|| pane.and_then(|pane| pane.display_name().map(str::to_string)))
         .unwrap_or(fallback);
     let title_provider = crate::title::session_provider(&raw);
-    let name = match (agent.name.as_deref(), title_provider) {
-        (None, Some(provider)) => Some(provider.to_string()),
-        (Some(name), Some("pi-bolt")) if name.eq_ignore_ascii_case("pi") => {
-            Some("pi-bolt".to_string())
-        }
-        _ => agent.name.clone(),
-    };
+    // The mark a row draws names the program it was registered under, so the
+    // registration's source stands in for the name a backend used to report.
+    let name = title_provider.map(str::to_string).or_else(|| {
+        let source = &agent.registry.agent.registration.source;
+        crate::theme::logo(Some(source)).map(|_| source.clone())
+    });
     let displayed = crate::title::display(&raw, name.as_deref());
     let title = crate::title::strip_workspace_suffix(
         &displayed,
@@ -800,15 +792,15 @@ fn agent_node(
                 retained,
                 session: agent.session.clone(),
                 session_uuid: registry
-                    .as_ref()
-                    .and_then(|view| view.agent.current_session_uuid())
+                    .agent
+                    .current_session_uuid()
                     .map(|session| session.as_str().to_string()),
                 facts: agent.facts.clone(),
                 // Filled by `FleetTree::attach_tasks`: the observation cannot
                 // say what a publisher is connected with.
                 tasks: TaskProjection::default(),
                 foreground,
-                registry,
+                registry: Some(registry.clone()),
             })),
         },
         children: Vec::new(),
@@ -1020,113 +1012,62 @@ fn mark_tab_root(node: &mut TreeNode) {
     }
 }
 
-/// One agent row as nesting needs it: the node itself, what it claims as its
-/// parent, and the identities a child can name it by.
-///
-/// The identities are the registration id Radar's spawn edges are written in and
-/// the session UUID a legacy lineage names. Both are carried because either may be
-/// what another row claims, and a row that is not the one claimed must not be
-/// linked by accident.
+/// One agent row as nesting needs it: the node itself, the parent its spawn edge
+/// names, and the registration id a child names it by. A row that is not the one
+/// claimed must not be linked by accident.
 struct Nestable {
     node: TreeNode,
-    parent: Option<ParentClaim>,
-    registration_id: Option<String>,
-    session: Option<String>,
+    parent: Option<String>,
+    registration_id: String,
 }
 
 /// What a row claims as its parent.
 ///
 /// A managed child's parent is the daemon's own spawn edge: Radar recorded which
 /// registration launched it, and that edge is the durable relationship. A
-/// registration that publishes a session lineage instead is the older path, used
-/// only when no edge exists — a worker whose parent is a Herdsman worker that
-/// never reported one has no edge and still nests by the session it names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ParentClaim {
-    /// The registration this row's spawn edge names as its parent.
-    Edge(String),
-    /// The session UUID this row reports as its parent.
-    Session(String),
-}
-
-/// What a registration claims as its parent, preferring Radar's own edge.
-fn parent_claim(agent: &AgentObservation) -> Option<ParentClaim> {
-    if let Some(parent) = agent
+/// registration with no edge nests nowhere.
+fn parent_claim(agent: &AgentObservation) -> Option<String> {
+    agent
         .registry
+        .spawn
         .as_ref()
-        .and_then(|view| view.spawn.as_ref())
         .map(|spawn| spawn.parent.clone())
-    {
-        return Some(ParentClaim::Edge(parent));
-    }
-    agent
-        .lineage
-        .as_ref()
-        .and_then(|lineage| lineage.parent.as_ref())
-        .map(|parent| ParentClaim::Session(parent.as_str().to_string()))
 }
 
-/// The registration id a row is addressed by, when it has one.
-fn claimed_registration_id(agent: &AgentObservation) -> Option<String> {
-    agent
-        .registry
-        .as_ref()
-        .map(|view| view.agent.registration.registration_id.clone())
-}
-
-/// The session UUID a row is addressed by, when it publishes a lineage.
-///
-/// A lineage carries both halves of the join: the session this row *is* and the
-/// parent session it names. A row that publishes no lineage cannot be the owner
-/// another row is looking for, because a session-named parent is only ever named
-/// by a lineage.
-fn claimed_session(agent: &AgentObservation) -> Option<String> {
-    agent
-        .lineage
-        .as_ref()
-        .map(|lineage| lineage.session.as_str().to_string())
+/// The registration id a row is addressed by.
+fn claimed_registration_id(agent: &AgentObservation) -> String {
+    agent.registry.agent.registration.registration_id.clone()
 }
 
 /// Nests agent rows under unambiguous owners within the same group and returns the
 /// rest as roots, in original row order.
 ///
-/// A link is used only when exactly one agent in the group is the parent this row
-/// claims — by registration id where a spawn edge names one, otherwise by session
-/// UUID — and the link is not self-referential; cycles are then broken by dropping
-/// every edge inside the cycle (all members stay visible as roots, per the spec
-/// fallback).
+/// A link is used only when exactly one agent in the group is the parent this row's
+/// spawn edge names, and the link is not self-referential; cycles are then broken
+/// by dropping every edge inside the cycle (all members stay visible as roots, per
+/// the spec fallback).
 fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
     let count = agents.len();
     if count == 0 {
         return Vec::new();
     }
 
-    // Registration ids and session UUIDs identify agents uniquely; the maps are
-    // keyed by their canonical text so no ordering/hashing derive is needed on
-    // the id types.
+    // Registration ids identify agents uniquely; the map is keyed by their
+    // canonical text so no ordering/hashing derive is needed on the id type.
     let mut by_registration_id: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut by_session: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, nestable) in agents.iter().enumerate() {
-        if let Some(registration_id) = nestable.registration_id.as_deref() {
-            by_registration_id
-                .entry(registration_id)
-                .or_default()
-                .push(index);
-        }
-        if let Some(session) = nestable.session.as_deref() {
-            by_session.entry(session).or_default().push(index);
-        }
+        by_registration_id
+            .entry(nestable.registration_id.as_str())
+            .or_default()
+            .push(index);
     }
 
     let mut parent: Vec<Option<usize>> = vec![None; count];
     for (index, nestable) in agents.iter().enumerate() {
-        let owners = match nestable.parent.as_ref() {
-            Some(ParentClaim::Edge(registration_id)) => {
-                by_registration_id.get(registration_id.as_str())
-            }
-            Some(ParentClaim::Session(session)) => by_session.get(session.as_str()),
-            None => None,
-        };
+        let owners = nestable
+            .parent
+            .as_deref()
+            .and_then(|registration_id| by_registration_id.get(registration_id));
         if let Some(owners) = owners
             && owners.len() == 1
             && owners[0] != index
@@ -1276,17 +1217,7 @@ mod tests {
     use crate::control_plane::containers::{
         Binding as ContainerBinding, Provenance, PublicContainer,
     };
-    use crate::model::{
-        FleetObservation, Lineage, Location, RuntimeStatus, SessionIdentity, SessionUuid, Tab,
-        Workspace,
-    };
-
-    /// A canonical UUID derived from a small integer, so tests never embed
-    /// UUID-shaped literals (which secret scanners mangle on write).
-    fn u(n: u32) -> SessionUuid {
-        SessionUuid::parse(&format!("{n:08x}-{n:04x}-4{n:03x}-8{n:03x}-{n:012x}"))
-            .expect("synthetic canonical UUID")
-    }
+    use crate::model::{FleetObservation, Location, RuntimeStatus, Tab, Workspace};
 
     fn fixture_state() -> ObservationState {
         let mut state = ObservationState::new();
@@ -1335,7 +1266,6 @@ mod tests {
             tabs: Vec::new(),
             panes: Vec::new(),
             agents: Vec::new(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
         };
@@ -1425,7 +1355,6 @@ mod tests {
                 current_path: None,
             }],
             agents: Vec::new(),
-            metadata_agents: Vec::new(),
             containers: vec![
                 workspace_container("c1", "wA", "work", None),
                 pane_container("c2", "wA:p1", None),
@@ -1560,13 +1489,10 @@ mod tests {
                 tab_id: tab_id.into(),
                 pane_id: pane_id.into(),
             },
-            name: None,
-            label: None,
             status: Some(RuntimeStatus::Idle),
             session: None,
-            lineage: None,
             facts: HerdsmanFacts::default(),
-            registry: Some(registry),
+            registry,
         }
     }
 
@@ -1590,7 +1516,6 @@ mod tests {
             }],
             panes: vec![pane("wA:p1", "wA:t1"), pane("wA:p2", "wA:t1")],
             agents,
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
         });
@@ -1600,8 +1525,7 @@ mod tests {
     #[test]
     fn a_bolt_title_selects_the_pi_bolt_row_identity() {
         let mut agent = registered_agent("lead", "wA:p1", "wA:t1", None);
-        agent.name = Some("pi".into());
-        agent.label = Some("Bolt - Inspect Bifrost".into());
+        agent.registry.agent.registration.label = Some("Bolt - Inspect Bifrost".into());
 
         let tree = FleetTree::build(&two_agent_window(vec![agent]));
         let row = node(&tree, &RowId::Agent("wA:p1".into()));
@@ -1743,7 +1667,8 @@ mod tests {
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
                 agent.location.tab_id = "wA:t1".into();
-                agent.lineage = None;
+                // Neither row claims the other: no edge, no nesting.
+                agent.registry.spawn = None;
             }
         }
         let mut state = ObservationState::new();
@@ -1780,32 +1705,49 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_ownership_links_fall_back_to_flat_rows() {
-        // One workspace, four unsafe links plus one valid link for contrast.
-        let session = |id: u32, parent: Option<u32>| Lineage {
-            session: u(id),
-            parent: parent.map(u),
-        };
-        let agent = |pane: &str, lineage: Option<Lineage>| AgentObservation {
-            location: Location {
-                workspace_id: "wX".into(),
-                tab_id: "wX:t1".into(),
-                pane_id: pane.into(),
-            },
-            name: Some("pi".into()),
-            label: Some(format!("agent {pane}")),
-            status: Some(RuntimeStatus::Idle),
-            session: Some(SessionIdentity::Reported {
-                source: None,
-                value: format!("session-{pane}"),
-            }),
-            lineage,
-            facts: crate::model::HerdsmanFacts::default(),
-            registry: None,
+    fn an_unsafe_spawn_edge_falls_back_to_a_flat_row() {
+        // One workspace, four unsafe edges plus one valid one for contrast.
+        let agent = |pane: &str, parent: Option<&str>| {
+            // p3 and p4 both answer to "dup", which p2's edge names: two
+            // possible parents, so that edge is left flat.
+            AgentObservation {
+                location: Location {
+                    workspace_id: "wX".into(),
+                    tab_id: "wX:t1".into(),
+                    pane_id: pane.into(),
+                },
+                status: Some(RuntimeStatus::Idle),
+                session: None,
+                facts: crate::model::HerdsmanFacts::default(),
+                registry: crate::registry_observation::RegistryView {
+                    agent: registered_agent(
+                        if matches!(pane, "wX:p3" | "wX:p4") {
+                            "dup".to_string()
+                        } else {
+                            format!("reg-{pane}")
+                        }
+                        .as_str(),
+                        pane,
+                        "wX:t1",
+                        None,
+                    )
+                    .registry
+                    .agent,
+                    binding: crate::registry_observation::Binding::Joined,
+                    spawn: parent.map(|parent| crate::registry_observation::SpawnBinding {
+                        parent: parent.to_string(),
+                        request_id: format!("req-{pane}"),
+                        claim_id: None,
+                        child_source: None,
+                        child_incarnation: None,
+                        state: crate::control_plane::registry::SpawnState::Bound,
+                    }),
+                    managed: None,
+                },
+            }
         };
         let observation = FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
@@ -1834,18 +1776,17 @@ mod tests {
                 })
                 .collect(),
             agents: vec![
-                // p1: parent UUID that no agent claims (absent owner).
-                agent("wX:p1", Some(session(11, Some(90)))),
-                // p2: parent claimed by two agents (ambiguous owner).
-                agent("wX:p2", Some(session(12, Some(33)))),
-                // p3 + p4: duplicate owner claimants for 33.
-                agent("wX:p3", Some(session(33, None))),
-                agent("wX:p4", Some(session(33, None))),
+                // p1: a parent no row claims (absent owner).
+                agent("wX:p1", Some("reg-90")),
+                // p2 names a registration two rows both answer to.
+                agent("wX:p2", Some("dup")),
+                agent("wX:p3", None),
+                agent("wX:p4", None),
                 // p5 <-> p6: ownership cycle.
-                agent("wX:p5", Some(session(55, Some(66)))),
-                agent("wX:p6", Some(session(66, Some(55)))),
-                // p7: valid link onto p1's session — must still nest.
-                agent("wX:p7", Some(session(77, Some(11)))),
+                agent("wX:p5", Some("reg-wX:p6")),
+                agent("wX:p6", Some("reg-wX:p5")),
+                // p7: an unambiguous link onto p1, which no other row claims.
+                agent("wX:p7", Some("reg-wX:p1")),
             ],
         };
         let mut state = ObservationState::new();
@@ -1875,20 +1816,10 @@ mod tests {
 
     #[test]
     fn owner_in_another_workspace_is_not_nested() {
-        let worker_lineage = Lineage {
-            session: u(2),
-            parent: Some(u(99)),
-        };
         let mut state = fixture_state();
         // Move the worker's ownership link to a session owned in workspace wB
         // (the reviewer's), which must not nest across workspaces.
         let mut observation = crate::model::testing::fleet();
-        let worker = observation
-            .agents
-            .iter_mut()
-            .find(|agent| agent.location.pane_id == "wA:p2")
-            .expect("worker");
-        worker.lineage = Some(worker_lineage);
         // The reviewer in wB carries session 9999… as identity, not lineage;
         // give it lineage so an owner physically exists — in another workspace.
         let reviewer = observation
@@ -1896,10 +1827,7 @@ mod tests {
             .iter_mut()
             .find(|agent| agent.location.pane_id == "wB:p1")
             .expect("reviewer");
-        reviewer.lineage = Some(Lineage {
-            session: u(99),
-            parent: None,
-        });
+        reviewer.registry.agent.registration.registration_id = "reviewer-session".into();
         state.apply_success(observation);
         let tree = FleetTree::build(&state);
 

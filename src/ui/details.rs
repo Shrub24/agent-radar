@@ -733,14 +733,15 @@ pub(super) fn overview_lines(
             container_fields(agent.container.as_ref(), page);
             match &agent.registry {
                 Some(view) => registry_lines(state, agent, view, page),
+                // Only a retained row arrives without a registration: the
+                // inventory's agents always carry one, and a row kept from an
+                // earlier observation keeps whatever it had then.
                 None => {
                     let status = agent
                         .status
                         .as_ref()
                         .map(|status| sanitize(&status.to_string()))
                         .unwrap_or_else(unavailable);
-                    // The row draws the state derived from the pane; how the owner
-                    // projects it, and the identities it published, are Source facts.
                     page.push(field(
                         "state",
                         format!("{} (derived from the pane)", sanitize(agent.state.word())),
@@ -973,7 +974,7 @@ pub(super) fn spawn_text(state: &ObservationState, spawn: &SpawnBinding) -> Stri
         .inventory()
         .into_iter()
         .flat_map(|inventory| inventory.agents.iter())
-        .filter_map(|agent| agent.registry.as_ref())
+        .map(|agent| &agent.registry)
         .find(|view| view.agent.registration.registration_id == spawn.parent);
     let parent = match parent.and_then(|view| view.agent.registration.label.as_deref()) {
         Some(label) => format!("{} ({})", sanitize(label), sanitize(&spawn.parent)),
@@ -1285,20 +1286,6 @@ pub(super) fn source_lines(state: &ObservationState, row: &VisibleRow<'_>) -> Ve
             session_text(agent.session.as_ref()).unwrap_or_else(unavailable),
         ));
         lines.extend(owner_identity_lines(&agent.facts));
-        // The lineage the tree placed this row by. A retained row keeps its
-        // observation, so its link stays readable after the agent goes away.
-        let observation = state
-            .inventory()
-            .and_then(|inventory| inventory.agent_on_pane(&agent.pane_id))
-            .or_else(|| {
-                state
-                    .retained()
-                    .get(agent.pane_id.as_str())
-                    .map(|retained| &retained.observation)
-            });
-        if let Some(observation) = observation {
-            lines.extend(lineage_lines(state, observation));
-        }
     }
     lines
 }
@@ -2092,81 +2079,6 @@ pub(super) fn owner_identity_lines(facts: &HerdsmanFacts) -> Vec<Line<'static>> 
         lines.push(field("ask", sanitize(ask)));
     }
     lines
-}
-
-/// This row's lineage, for Source: the session the owner published for it and the
-/// parent it named, with what became of that link.
-///
-/// A worker that lands at a workspace root can be there because two panes
-/// publish one session UUID, which makes its parent an ambiguity rather than an
-/// owner. The tree does not fabricate a nesting, so the reason is said here
-/// rather than left for a reader to infer from where the row landed.
-pub(super) fn lineage_lines(
-    state: &ObservationState,
-    agent: &AgentObservation,
-) -> Vec<Line<'static>> {
-    let Some(lineage) = agent.lineage.as_ref() else {
-        return Vec::new();
-    };
-    let mut lines = vec![field("session uuid", sanitize(lineage.session.as_str()))];
-    if let Some(parent) = lineage.parent.as_ref() {
-        lines.push(field("parent", parent_link(state, agent, parent)));
-    }
-    lines
-}
-
-/// What became of a parent link: the row it is nested under, or the reason the
-/// tree left it where it is. The rule is the tree's own — one claimant in the
-/// workspace, and never the row itself.
-pub(super) fn parent_link(
-    state: &ObservationState,
-    agent: &AgentObservation,
-    parent: &SessionUuid,
-) -> String {
-    let uuid = sanitize(parent.as_str());
-    let owners: Vec<&AgentObservation> = state
-        .inventory()
-        .map(|inventory| {
-            inventory
-                .agents
-                .iter()
-                .filter(|other| {
-                    other.location.workspace_id == agent.location.workspace_id
-                        && other
-                            .lineage
-                            .as_ref()
-                            .is_some_and(|lineage| &lineage.session == parent)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    match owners.as_slice() {
-        [] => format!("{uuid} — no row publishes this session, so this row is not nested"),
-        [owner] if owner.location.pane_id == agent.location.pane_id => {
-            format!("{uuid} — this row's own session, so it is not nested")
-        }
-        [owner] => format!("{uuid} — nested under {}", owner_name(owner)),
-        owners => format!(
-            "{uuid} — {} rows publish this session, so this row is not nested",
-            owners.len()
-        ),
-    }
-}
-
-/// The name an owner is linked by: the label or name it published, and the pane
-/// that carries it.
-pub(super) fn owner_name(agent: &AgentObservation) -> String {
-    let name = agent
-        .facts
-        .label
-        .as_deref()
-        .or(agent.label.as_deref())
-        .or(agent.facts.name.as_deref())
-        .filter(|name| !name.is_empty());
-    match name {
-        Some(name) => format!("{} · {}", agent.location.pane_id, sanitize(name)),
-        None => agent.location.pane_id.clone(),
-    }
 }
 
 pub(super) fn unavailable() -> String {

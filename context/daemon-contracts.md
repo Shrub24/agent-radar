@@ -46,3 +46,23 @@ A lifecycle claim requires its actual `subject_id`; reads and public projections
 **Reason:** subject and execution-attempt identity have different meanings. Treating one as the other hides invalid data, while preserving obsolete category forms adds a second supported model the maintainer does not want.
 
 **Rejected alternative:** optional subject identity with a claim-ID fallback, plus an `Other(String)` category adapter for historical records. Rejected as legacy support, not a requirement of the current model. Unknown external error codes still establish uncertainty rather than safe non-execution; that is a transport safety rule, not legacy decoding.
+
+## An agent row is a registration; a backend's agent record is not an agent
+
+**Id:** f21f5aab-09e1-45df-b4fe-415baf53349b
+**Type:** decision
+**Status:** active
+**Evidence:** confirmed
+**Source:** maintainer instruction to remove the Herdr-era observation fields outright, 2026-11-01
+**Verification:** corroborated — the Rust suites and the pi-radar contract, typecheck and tests pass with wire revision 17; the fields had no writer, so nothing observable changed but their absence.
+**Revisit when:** a backend is again a source of agent identity in its own right, or a second producer of agent rows exists
+
+`AgentObservation` carries `location`, `status`, `session`, `owner` facts and a required `registry: RegistryView`, and nothing else. The observation has no `metadata_agents`, and no `containment` map. An agent row is a registration the daemon read: its name is the registration's label, else the title's session provider, else the source it was registered under, and containment is "a pane holding an agent row is not closable by a generic unmanaged close". Nesting is the daemon's spawn edge alone.
+
+**Reason:** the fields described a second producer of agent facts that had already stopped existing when the Herdr backend was removed. The registry projection became the only writer and filled them empty, so containment's name-based branch, the session-lineage nesting path and the "no registry view" branch were all unreachable — dead vocabulary a reader would have to reason about, and a shape that let a backend record become an agent without anyone deciding it should.
+
+**Rejected alternative:** keep the fields and their branches as containment evidence for a pane whose agent Radar cannot name. Nothing produced such a pane: the backend's records arrive in the same observation the registry projection owns, so a pane with an occupant is either a registration or an ordinary pane. Keeping the branch meant keeping a rule that could never fire.
+
+**Rejected alternative:** make the removal a separate change on its own branch. It was attempted once, reached about 120 fixture errors across `src/` test modules and four integration suites, and was reverted rather than left half-migrated; the fixtures that built an `AgentObservation` by hand now build a `RegistryView`, and the fixtures that nested by session lineage nested by spawn edge. The work is one mechanical change with a large test-shaped tail, which is why it waited for a pass that would carry the tail with it.
+
+**Consequence:** removing fields from the observation changes the document a consumer decodes, so the wire revision moved to 17 rather than staying at 16. An exact-revision client refuses a daemon it cannot decode anyway, and letting the shape change under one revision number would have made that refusal happen at decode time instead.

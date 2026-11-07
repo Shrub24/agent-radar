@@ -48,7 +48,7 @@ pub(super) fn execute(
             );
         };
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        match backend.focus_outcome(&target, &cancel) {
+        match backend.focus(&target, &cancel) {
             crate::runtime::FocusOutcome::Completed => {
                 return dto::CommandOutcome::new(&job.request_id, dto::CommandStatus::Completed);
             }

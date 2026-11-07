@@ -400,23 +400,10 @@ impl ContextWindow {
 pub struct HerdsmanFacts {
     /// The role the agent runs as: a lead role, or a worker's agent definition.
     pub role: Option<String>,
-    /// A lead's published session name.
-    pub name: Option<String>,
     /// The agent definition a pane reports as its display agent.
     pub definition: Option<String>,
-    /// A managed worker's runtime label: the name its owner and its siblings
-    /// use for it, and the only faithful source for a worker's name. The backend's
-    /// own agent name truncates it and its title welds it to the task.
-    pub label: Option<String>,
     /// A managed worker's run identity.
     pub run: Option<String>,
-    /// Whether this pane's tokens carried any `pi_herdsman_*` key.
-    ///
-    /// Presence, not readability: the owner's metadata is what makes a Pi pane
-    /// managed, so a key whose value this build cannot read still counts. The
-    /// decoder sets this at the adapter boundary, where the raw token map is,
-    /// because the named fields below discard keys this version does not know.
-    pub managed_metadata: bool,
     /// The active assignment's request identity.
     pub request: Option<String>,
     /// A lead's pending owner question.
@@ -475,10 +462,6 @@ impl HerdsmanFacts {
 
     /// The name to label this agent with: a worker's runtime label, a lead's
     /// published name, or nothing when the source published neither.
-    pub fn display_name(&self) -> Option<&str> {
-        self.label.as_deref().or(self.name.as_deref())
-    }
-
     /// Whether anything is outstanding: a child agent, an owner answer, or a
     /// background task this pane started.
     ///
@@ -562,24 +545,16 @@ impl HerdsmanFacts {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentObservation {
     pub location: Location,
-    /// Reported agent name (for example `"pi"`), if any.
-    pub name: Option<String>,
-    /// Reported display label (the stripped terminal title), if any.
-    pub label: Option<String>,
     /// Runtime lifecycle as reported; never a semantic control state.
     pub status: Option<RuntimeStatus>,
     /// Reported session identity; `None` when the source reports none.
     pub session: Option<SessionIdentity>,
-    /// Explicit ownership lineage; `None` unless valid UUID tokens were supplied.
-    pub lineage: Option<Lineage>,
     /// What Herdsman publishes about this agent. Empty unless the source
     /// published metadata; never inferred from runtime facts.
     pub facts: HerdsmanFacts,
-    /// The daemon's registration for this agent, with how it binds to a pane.
-    /// `None` for an agent the registry does not know, and for every agent when
-    /// no registry is read. A registration that names a pane protects that pane
-    /// even when unjoined.
-    pub registry: Option<RegistryView>,
+    /// The daemon's registration for this agent, with how it binds to a pane. A
+    /// registration that names a pane protects that pane even when unjoined.
+    pub registry: RegistryView,
 }
 
 impl AgentObservation {
@@ -686,14 +661,9 @@ pub struct FleetObservation {
     pub workspaces: Vec<Workspace>,
     pub tabs: Vec<Tab>,
     pub panes: Vec<Pane>,
-    /// The agents this observation presents as facts. The collector sets these
-    /// from the registry; a backend's own metadata records never land here.
+    /// The agents this observation presents as facts, projected from the
+    /// registry read.
     pub agents: Vec<AgentObservation>,
-    /// Agent records a backend reads from pane metadata. They are physical
-    /// evidence that protects a pane from unmanaged control, and are never
-    /// presented as agent facts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub metadata_agents: Vec<AgentObservation>,
     /// The containers this daemon records, read beside the registry facts. A
     /// backend's inventory never carries them, and an empty list means no
     /// container was read — not that none exists.
@@ -715,17 +685,9 @@ impl FleetObservation {
         self.panes.iter().find(|p| p.location.pane_id == pane_id)
     }
 
-    /// The agent currently reported on this pane, if any.
-    ///
-    /// The `agents` inventory is authoritative for agent facts; pane records
-    /// may mirror agent fields but are never consulted here.
+    /// The agent registered on this pane, if any.
     pub fn agent_on_pane(&self, pane_id: &str) -> Option<&AgentObservation> {
         self.agents.iter().find(|a| a.location.pane_id == pane_id)
-    }
-
-    /// Every agent record this observation holds, presented or metadata.
-    pub fn all_agents(&self) -> impl Iterator<Item = &AgentObservation> {
-        self.agents.iter().chain(&self.metadata_agents)
     }
 }
 
@@ -1154,13 +1116,10 @@ mod tests {
                 tab_id: "wA:t1".into(),
                 pane_id: "wA:p1".into(),
             },
-            name: Some("pi".into()),
-            label: None,
             status,
             session: None,
-            lineage: None,
             facts,
-            registry: None,
+            registry: crate::registry_observation::RegistryView::test_joined("test-wA:p1", "wA:p1"),
         }
     }
 

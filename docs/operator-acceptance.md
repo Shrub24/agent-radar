@@ -28,7 +28,7 @@ From `radar-reset`.
 From `managed-scoped-launch`, `managed-topology` and `unified-managed-lifecycle`.
 
 - [ ] A Pi installed through `programs.radar.managedAgents` runs as a managed agent, and a Pi you start by hand keeps its identity, children, inbox and controls.
-- [ ] Create, close, reload and focus a container (`A`, `a`, `D`, `R`, `Enter`) with Herdr unavailable.
+- [ ] Create, close, reload and focus a container (`A`, `a`, `D`, `R`, `Enter`).
 - [ ] While a branch shuts down its rows show `closing`, and they disappear afterwards.
 - [ ] `D` on an agent row, a tab and a workspace ends what the row names.
 - [ ] Restarting an `L` agent keeps its pane; restarting a `radar run --agent` agent you started from your own shell gives it a pane beside yours.

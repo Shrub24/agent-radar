@@ -61,8 +61,7 @@ The first message on a connection identifies the Pi session:
 ```
 
 `session` is the exact Pi session UUID; tasks are keyed by it, not by pane or
-process. `pane` is an optional legacy hint and is never used as a task identity
-or join fallback. Version 1 advertises no operations, so `ops` is `[]`.
+process. `pane` is carried and never used as a task identity or join fallback. Version 1 advertises no operations, so `ops` is `[]`.
 
 ### `tasks`
 

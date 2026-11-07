@@ -456,8 +456,7 @@ export interface PresenceReleaseProcessIdentity {
   [k: string]: unknown;
 }
 /**
- * `daemon.ping` result. Contract names remain strings so older clients can
- * preserve and ignore names introduced by newer daemon builds.
+ * `daemon.ping` result.
  */
 export interface DaemonPingSerialize {
   backend: string;
@@ -627,9 +626,52 @@ export interface ObservationGetParamsDeserialize {
 export type ObservationGetResponseSerialize =
   ObservationSnapshotResult | ObservationNotModifiedResult | ObservationExpiredResult | ObservationTooLargeResult;
 /**
- * Why a retained association is reported as not current.
+ * Evidence about a pane's foreground, decoded inside the connector.
+ *
+ * The reconciler treats only [`ForegroundEvidence::NonShell`] as positive
+ * supersession evidence; absence or ambiguity retains the last observation.
  */
-export type RetainedBasis = "shell_foreground" | "unverified";
+export type ForegroundEvidence =
+  | {
+      kind: "shell";
+    }
+  | {
+      /**
+       * The leader's command line as the operating system reports it.
+       */
+      command: string | null;
+      kind: "non_shell";
+      local: LocalFacts;
+      name: string | null;
+      pid: number;
+    }
+  | {
+      kind: "inconclusive";
+    };
+/**
+ * How a foreground process's running executable compares with the installed
+ * program it would run.
+ */
+export type BinaryFreshness = "current" | "stale" | "unknown";
+/**
+ * Why a running executable could not be compared, when it could not.
+ *
+ * Each variant is something a reader can act on differently: a program that is
+ * not installed, an installed entrypoint whose payload cannot be identified,
+ * an executable that cannot be read, or a running file that is not the program
+ * in question. The words a row uses are the row's, not this type's.
+ */
+export type BinaryUnknown = "no_counterpart" | "unsupported_launcher" | "unreadable" | "not_compared";
+/**
+ * Interval CPU use of one process, as a percentage of one CPU.
+ *
+ * Held in hundredths of a percent, as an integer: the value is a ratio of two
+ * kernel counter readings, and an exact integer is what a row can show and a
+ * test can assert. `12.5%` of one CPU is `1_250`. It measures the process
+ * rather than the machine, so a process that used two CPUs for a whole
+ * interval is `20_000`, not `100%`.
+ */
+export type CpuPercent = number;
 /**
  * Herdsman's projection of an agent's state, as an owner publishes it.
  *
@@ -643,13 +685,6 @@ export type SemanticState =
   | {
       other: string;
     };
-/**
- * A validated canonical UUID (lowercase `8-4-4-4-12` hex).
- *
- * Only explicitly supplied UUID metadata is ever turned into this type —
- * session file paths are never scanned for embedded UUIDs.
- */
-export type SessionUuid = string;
 /**
  * Independent publisher channels.
  */
@@ -710,6 +745,13 @@ export type SessionIdentity =
       };
     };
 /**
+ * A validated canonical UUID (lowercase `8-4-4-4-12` hex).
+ *
+ * Only explicitly supplied UUID metadata is ever turned into this type —
+ * session file paths are never scanned for embedded UUIDs.
+ */
+export type SessionUuid = string;
+/**
  * Runtime lifecycle exactly as the source reports it.
  *
  * This is not a semantic control state: `Idle` says nothing about
@@ -722,53 +764,6 @@ export type RuntimeStatus =
   | {
       other: string;
     };
-/**
- * Evidence about a pane's foreground, decoded inside the connector.
- *
- * The reconciler treats only [`ForegroundEvidence::NonShell`] as positive
- * supersession evidence; absence or ambiguity retains the last observation.
- */
-export type ForegroundEvidence =
-  | {
-      kind: "shell";
-    }
-  | {
-      /**
-       * The leader's command line as the operating system reports it.
-       */
-      command: string | null;
-      kind: "non_shell";
-      local: LocalFacts;
-      name: string | null;
-      pid: number;
-    }
-  | {
-      kind: "inconclusive";
-    };
-/**
- * How a foreground process's running executable compares with the installed
- * program it would run.
- */
-export type BinaryFreshness = "current" | "stale" | "unknown";
-/**
- * Why a running executable could not be compared, when it could not.
- *
- * Each variant is something a reader can act on differently: a program that is
- * not installed, an installed entrypoint whose payload cannot be identified,
- * an executable that cannot be read, or a running file that is not the program
- * in question. The words a row uses are the row's, not this type's.
- */
-export type BinaryUnknown = "no_counterpart" | "unsupported_launcher" | "unreadable" | "not_compared";
-/**
- * Interval CPU use of one process, as a percentage of one CPU.
- *
- * Held in hundredths of a percent, as an integer: the value is a ratio of two
- * kernel counter readings, and an exact integer is what a row can show and a
- * test can assert. `12.5%` of one CPU is `1_250`. It measures the process
- * rather than the machine, so a process that used two CPUs for a whole
- * interval is `20_000`, not `100%`.
- */
-export type CpuPercent = number;
 /**
  * What a container is in the hierarchy.
  */
@@ -804,6 +799,10 @@ export type Focus =
        */
       zoomed: boolean;
     };
+/**
+ * Why a retained association is reported as not current.
+ */
+export type RetainedBasis = "shell_foreground" | "unverified";
 /**
  * Source freshness included in an observation response.
  */
@@ -844,9 +843,6 @@ export interface ObservationSnapshot {
 export interface ObservationProjection {
   awaiting_evidence: string[];
   closing?: string[];
-  containment: {
-    [k: string]: RetainedObservation;
-  };
   foreground: {
     [k: string]: ForegroundEvidence;
   };
@@ -873,37 +869,338 @@ export interface ObservationProjection {
   source: ObservationFreshness;
 }
 /**
- * Retained agent facts carried across an idle-shell gap.
+ * What this machine knows about that process. Filled by the collector
+ * from the operating system, never by the runtime's own report.
  */
-export interface RetainedObservation {
-  basis: RetainedBasis;
-  observation: AgentObservation;
+export interface LocalFacts {
+  binary: BinaryIdentity;
+  /**
+   * What the process is using, from the sample taken for it. `None` when no
+   * sample was taken: this machine has no reader for that process, the
+   * process could not be read, or the platform cannot sample at all. A
+   * reading from an earlier refresh is never carried here.
+   */
+  resources: ProcessResources | null;
+  /**
+   * How long the process has been alive, measured from its own start time
+   * rather than from when Radar first saw it.
+   */
+  running_for: number | null;
+  /**
+   * What it has done to the terminal.
+   */
+  terminal: "full_screen" | "line" | "unknown";
+}
+/**
+ * How the foreground program's executable compares with the installed
+ * program of its own name or package family.
+ */
+export interface BinaryIdentity {
+  /**
+   * The running executable's own path, when it could be read.
+   */
+  executable: string | null;
+  freshness: BinaryFreshness;
+  /**
+   * The installation the installed counterpart's payload belongs to. `None`
+   * when no counterpart was found or its payload could not be identified.
+   */
+  installed: string | null;
+  /**
+   * The installation the running executable belongs to. `None` when its
+   * executable could not be read.
+   */
+  running: string | null;
+  /**
+   * Why nothing was compared, when nothing was.
+   */
+  unknown: BinaryUnknown | null;
+}
+/**
+ * What one process is using, as the collector sampled it.
+ *
+ * These are the resources of that process and of nothing larger: a build
+ * running beneath a pane is a descendant and is summed separately in
+ * [`Self::descendants`], and nothing here says who owns the process, what work
+ * it serves, or whether it is progressing. Every field comes from one read of
+ * the process, so a sample never mixes two incarnations; RSS is that process's
+ * resident set, in which pages shared with another process are counted here as
+ * well.
+ */
+export interface ProcessResources {
+  /**
+   * Interval CPU since the previous sample of this same identity. `None`
+   * until such a sample exists, and whenever the interval cannot be
+   * measured.
+   */
+  cpu: CpuPercent | null;
+  descendants: DescendantResources;
+  identity: ProcessIdentity2;
+  /**
+   * Resident set size in bytes. `None` when this machine cannot convert the
+   * kernel's page count.
+   */
+  rss_bytes: number | null;
+  /**
+   * The kernel's scheduler state when the sample was taken.
+   */
+  state:
+    | {
+        kind: "running";
+      }
+    | {
+        kind: "sleeping";
+      }
+    | {
+        kind: "disk_sleep";
+      }
+    | {
+        kind: "stopped";
+      }
+    | {
+        kind: "tracing_stop";
+      }
+    | {
+        kind: "zombie";
+      }
+    | {
+        kind: "dead";
+      }
+    | {
+        kind: "idle";
+      }
+    | {
+        kind: "other";
+        value: string;
+      };
+}
+/**
+ * What the processes beneath this one are using, as the refresh's scan
+ * observed them. Never merged with the fields above: a build's work is not
+ * its launcher's.
+ */
+export interface DescendantResources {
+  /**
+   * Their interval CPU. Every one of them needs its own matching pair of
+   * readings, so a descendant seen for the first time contributes nothing
+   * and leaves this partial.
+   */
+  cpu:
+    | {
+        kind: "complete";
+        value: CpuPercent;
+      }
+    | {
+        kind: "partial";
+        /**
+         * @minItems 2
+         * @maxItems 2
+         */
+        value: [unknown, unknown];
+      }
+    | {
+        kind: "unknown";
+        value: string;
+      };
+  /**
+   * Those processes: one sample each, and exactly the ones `observed` counts
+   * and the totals cover. Empty when none could be enumerated, and the
+   * totals below say why.
+   */
+  members: DescendantSample[];
+  /**
+   * How many processes the scan observed beneath the root. `None` when none
+   * could be enumerated at all.
+   */
+  observed: number | null;
+  /**
+   * The resident set of those of them whose size could be read.
+   */
+  rss_bytes:
+    | {
+        kind: "complete";
+        value: number;
+      }
+    | {
+        kind: "partial";
+        /**
+         * @minItems 2
+         * @maxItems 2
+         */
+        value: [unknown, unknown];
+      }
+    | {
+        kind: "unknown";
+        value: string;
+      };
+}
+/**
+ * One process beneath a root, as one refresh's scan confirmed it.
+ *
+ * These are the members the totals of [`DescendantResources`] are made of, from
+ * the same snapshot, the same reads and the same confirmation — never a second
+ * walk and never a second reading of `/proc`. The parent is the identity of the
+ * process this one was read beneath: what a table can order and fold by is the
+ * incarnation, since a pid alone names a different process once the kernel
+ * reuses it. The name is the kernel's own short name for the process, which is
+ * neither the arguments it was started with nor a claim about what started it.
+ */
+export interface DescendantSample {
+  /**
+   * Interval CPU since the previous sample of this same identity. `None` when
+   * no interval can be measured; a measured idle interval is `Some(0)`.
+   */
+  cpu: CpuPercent | null;
+  identity: ProcessIdentity;
+  /**
+   * The kernel's name for the process (`comm` in `/proc/<pid>/stat`), which
+   * is not argv and says nothing about who started it.
+   */
+  name: string;
+  parent: ProcessIdentity1;
+  /**
+   * Resident set size in bytes. `None` when this machine cannot convert the
+   * kernel's page count.
+   */
+  rss_bytes: number | null;
+  /**
+   * The scheduler state the kernel reported for it.
+   */
+  state:
+    | {
+        kind: "running";
+      }
+    | {
+        kind: "sleeping";
+      }
+    | {
+        kind: "disk_sleep";
+      }
+    | {
+        kind: "stopped";
+      }
+    | {
+        kind: "tracing_stop";
+      }
+    | {
+        kind: "zombie";
+      }
+    | {
+        kind: "dead";
+      }
+    | {
+        kind: "idle";
+      }
+    | {
+        kind: "other";
+        value: string;
+      };
+}
+/**
+ * Which process incarnation a sample belongs to.
+ *
+ * The kernel reuses process ids, so a pid does not name a process: one
+ * incarnation is the boot it started in, its pid, and when it started. Those
+ * are what make two readings comparable — counters may only be subtracted
+ * from an earlier reading of the same identity, and a difference taken across
+ * two of them measures neither process.
+ */
+export interface ProcessIdentity {
+  /**
+   * The boot this process started in, as the kernel reports it.
+   */
+  boot_id: string;
+  /**
+   * The process id, unique within one boot and one incarnation of it.
+   */
+  pid: number;
+  /**
+   * Start time since boot, in clock ticks (`starttime` in
+   * `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
+   */
+  start_ticks: number;
+}
+/**
+ * Which process incarnation a sample belongs to.
+ *
+ * The kernel reuses process ids, so a pid does not name a process: one
+ * incarnation is the boot it started in, its pid, and when it started. Those
+ * are what make two readings comparable — counters may only be subtracted
+ * from an earlier reading of the same identity, and a difference taken across
+ * two of them measures neither process.
+ */
+export interface ProcessIdentity1 {
+  /**
+   * The boot this process started in, as the kernel reports it.
+   */
+  boot_id: string;
+  /**
+   * The process id, unique within one boot and one incarnation of it.
+   */
+  pid: number;
+  /**
+   * Start time since boot, in clock ticks (`starttime` in
+   * `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
+   */
+  start_ticks: number;
+}
+/**
+ * Which process incarnation a sample belongs to.
+ *
+ * The kernel reuses process ids, so a pid does not name a process: one
+ * incarnation is the boot it started in, its pid, and when it started. Those
+ * are what make two readings comparable — counters may only be subtracted
+ * from an earlier reading of the same identity, and a difference taken across
+ * two of them measures neither process.
+ */
+export interface ProcessIdentity2 {
+  /**
+   * The boot this process started in, as the kernel reports it.
+   */
+  boot_id: string;
+  /**
+   * The process id, unique within one boot and one incarnation of it.
+   */
+  pid: number;
+  /**
+   * Start time since boot, in clock ticks (`starttime` in
+   * `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
+   */
+  start_ticks: number;
+}
+/**
+ * One successful inventory: workspaces, tabs, panes, reported agents and
+ * daemon lifecycle subjects not represented by a joined agent row.
+ */
+export interface FleetObservation {
+  /**
+   * The agents this observation presents as facts, projected from the
+   * registry read.
+   */
+  agents: AgentObservation[];
+  /**
+   * The containers this daemon records, read beside the registry facts. A
+   * backend's inventory never carries them, and an empty list means no
+   * container was read — not that none exists.
+   */
+  containers?: PublicContainer[];
+  focus?: Focus;
+  /**
+   * Public lifecycle records from the same daemon read as agent facts. The
+   * tree suppresses subjects already represented by a joined agent row.
+   */
+  lifecycle_subjects?: LifecycleObservation[];
+  panes: Pane[];
+  tabs: Tab[];
+  workspaces: Workspace[];
 }
 /**
  * A normalized observation of one agent, keyed in the inventory by its pane.
  */
 export interface AgentObservation {
   facts: HerdsmanFacts;
-  /**
-   * Reported display label (the stripped terminal title), if any.
-   */
-  label: string | null;
-  /**
-   * Explicit ownership lineage; `None` unless valid UUID tokens were supplied.
-   */
-  lineage: Lineage | null;
   location: Location;
-  /**
-   * Reported agent name (for example `"pi"`), if any.
-   */
-  name: string | null;
-  /**
-   * The daemon's registration for this agent, with how it binds to a pane.
-   * `None` for an agent the registry does not know, and for every agent when
-   * no registry is read. A registration that names a pane protects that pane
-   * even when unjoined.
-   */
-  registry: RegistryView | null;
+  registry: RegistryView;
   /**
    * Reported session identity; `None` when the source reports none.
    */
@@ -974,32 +1271,13 @@ export interface HerdsmanFacts {
    */
   definition: string | null;
   /**
-   * A managed worker's runtime label: the name its owner and its siblings
-   * use for it, and the only faithful source for a worker's name. The backend's
-   * own agent name truncates it and its title welds it to the task.
-   */
-  label: string | null;
-  /**
    * The owner's last outcome for the assignment, as it published it.
    */
   last_outcome: string | null;
   /**
-   * Whether this pane's tokens carried any `pi_herdsman_*` key.
-   *
-   * Presence, not readability: the owner's metadata is what makes a Pi pane
-   * managed, so a key whose value this build cannot read still counts. The
-   * decoder sets this at the adapter boundary, where the raw token map is,
-   * because the named fields below discard keys this version does not know.
-   */
-  managed_metadata: boolean;
-  /**
    * The session's model identity as published, provider prefix included.
    */
   model: string | null;
-  /**
-   * A lead's published session name.
-   */
-  name: string | null;
   provider: string | null;
   /**
    * The active assignment's request identity.
@@ -1038,17 +1316,6 @@ export interface ContextWindow {
   window: number;
 }
 /**
- * Explicit ownership lineage from `pi_herdsman_session` /
- * `pi_herdsman_parent_session` UUID metadata.
- *
- * Used only for ownership joins (worker → owner). Lineage is never used as
- * session identity, and absent or malformed tokens yield no lineage at all.
- */
-export interface Lineage {
-  parent: SessionUuid | null;
-  session: SessionUuid;
-}
-/**
  * Backend-scoped runtime location: workspace, tab and pane identifiers.
  *
  * Pane identity is a runtime location detail; it is never an agent identity.
@@ -1059,7 +1326,8 @@ export interface Location {
   workspace_id: string;
 }
 /**
- * A registered agent with its binding, carried on the agent it projects to.
+ * The daemon's registration for this agent, with how it binds to a pane. A
+ * registration that names a pane protects that pane even when unjoined.
  */
 export interface RegistryView {
   agent: RegistryAgent;
@@ -1236,7 +1504,7 @@ export interface PublicSession {
  * to join, because a join needs the claim to match the live foreground.
  */
 export interface ProcessEvidence {
-  claim: ProcessIdentity | null;
+  claim: ProcessIdentity3 | null;
 }
 /**
  * Which process incarnation a sample belongs to.
@@ -1247,7 +1515,7 @@ export interface ProcessEvidence {
  * from an earlier reading of the same identity, and a difference taken across
  * two of them measures neither process.
  */
-export interface ProcessIdentity {
+export interface ProcessIdentity3 {
   /**
    * The boot this process started in, as the kernel reports it.
    */
@@ -1320,7 +1588,7 @@ export interface ManagedSubject {
    */
   ended: boolean;
   metadata: ManagedMetadata;
-  process: ProcessIdentity;
+  process: ProcessIdentity3;
   session: string | null;
   state: State;
   subject_id: string;
@@ -1359,338 +1627,6 @@ export interface SpawnBinding {
   state: SpawnState;
 }
 /**
- * What this machine knows about that process. Filled by the collector
- * from the operating system, never by the runtime's own report.
- */
-export interface LocalFacts {
-  binary: BinaryIdentity;
-  /**
-   * What the process is using, from the sample taken for it. `None` when no
-   * sample was taken: this machine has no reader for that process, the
-   * process could not be read, or the platform cannot sample at all. A
-   * reading from an earlier refresh is never carried here.
-   */
-  resources: ProcessResources | null;
-  /**
-   * How long the process has been alive, measured from its own start time
-   * rather than from when Radar first saw it.
-   */
-  running_for: number | null;
-  /**
-   * What it has done to the terminal.
-   */
-  terminal: "full_screen" | "line" | "unknown";
-}
-/**
- * How the foreground program's executable compares with the installed
- * program of its own name or package family.
- */
-export interface BinaryIdentity {
-  /**
-   * The running executable's own path, when it could be read.
-   */
-  executable: string | null;
-  freshness: BinaryFreshness;
-  /**
-   * The installation the installed counterpart's payload belongs to. `None`
-   * when no counterpart was found or its payload could not be identified.
-   */
-  installed: string | null;
-  /**
-   * The installation the running executable belongs to. `None` when its
-   * executable could not be read.
-   */
-  running: string | null;
-  /**
-   * Why nothing was compared, when nothing was.
-   */
-  unknown: BinaryUnknown | null;
-}
-/**
- * What one process is using, as the collector sampled it.
- *
- * These are the resources of that process and of nothing larger: a build
- * running beneath a pane is a descendant and is summed separately in
- * [`Self::descendants`], and nothing here says who owns the process, what work
- * it serves, or whether it is progressing. Every field comes from one read of
- * the process, so a sample never mixes two incarnations; RSS is that process's
- * resident set, in which pages shared with another process are counted here as
- * well.
- */
-export interface ProcessResources {
-  /**
-   * Interval CPU since the previous sample of this same identity. `None`
-   * until such a sample exists, and whenever the interval cannot be
-   * measured.
-   */
-  cpu: CpuPercent | null;
-  descendants: DescendantResources;
-  identity: ProcessIdentity3;
-  /**
-   * Resident set size in bytes. `None` when this machine cannot convert the
-   * kernel's page count.
-   */
-  rss_bytes: number | null;
-  /**
-   * The kernel's scheduler state when the sample was taken.
-   */
-  state:
-    | {
-        kind: "running";
-      }
-    | {
-        kind: "sleeping";
-      }
-    | {
-        kind: "disk_sleep";
-      }
-    | {
-        kind: "stopped";
-      }
-    | {
-        kind: "tracing_stop";
-      }
-    | {
-        kind: "zombie";
-      }
-    | {
-        kind: "dead";
-      }
-    | {
-        kind: "idle";
-      }
-    | {
-        kind: "other";
-        value: string;
-      };
-}
-/**
- * What the processes beneath this one are using, as the refresh's scan
- * observed them. Never merged with the fields above: a build's work is not
- * its launcher's.
- */
-export interface DescendantResources {
-  /**
-   * Their interval CPU. Every one of them needs its own matching pair of
-   * readings, so a descendant seen for the first time contributes nothing
-   * and leaves this partial.
-   */
-  cpu:
-    | {
-        kind: "complete";
-        value: CpuPercent;
-      }
-    | {
-        kind: "partial";
-        /**
-         * @minItems 2
-         * @maxItems 2
-         */
-        value: [unknown, unknown];
-      }
-    | {
-        kind: "unknown";
-        value: string;
-      };
-  /**
-   * Those processes: one sample each, and exactly the ones `observed` counts
-   * and the totals cover. Empty when none could be enumerated, and the
-   * totals below say why.
-   */
-  members: DescendantSample[];
-  /**
-   * How many processes the scan observed beneath the root. `None` when none
-   * could be enumerated at all.
-   */
-  observed: number | null;
-  /**
-   * The resident set of those of them whose size could be read.
-   */
-  rss_bytes:
-    | {
-        kind: "complete";
-        value: number;
-      }
-    | {
-        kind: "partial";
-        /**
-         * @minItems 2
-         * @maxItems 2
-         */
-        value: [unknown, unknown];
-      }
-    | {
-        kind: "unknown";
-        value: string;
-      };
-}
-/**
- * One process beneath a root, as one refresh's scan confirmed it.
- *
- * These are the members the totals of [`DescendantResources`] are made of, from
- * the same snapshot, the same reads and the same confirmation — never a second
- * walk and never a second reading of `/proc`. The parent is the identity of the
- * process this one was read beneath: what a table can order and fold by is the
- * incarnation, since a pid alone names a different process once the kernel
- * reuses it. The name is the kernel's own short name for the process, which is
- * neither the arguments it was started with nor a claim about what started it.
- */
-export interface DescendantSample {
-  /**
-   * Interval CPU since the previous sample of this same identity. `None` when
-   * no interval can be measured; a measured idle interval is `Some(0)`.
-   */
-  cpu: CpuPercent | null;
-  identity: ProcessIdentity1;
-  /**
-   * The kernel's name for the process (`comm` in `/proc/<pid>/stat`), which
-   * is not argv and says nothing about who started it.
-   */
-  name: string;
-  parent: ProcessIdentity2;
-  /**
-   * Resident set size in bytes. `None` when this machine cannot convert the
-   * kernel's page count.
-   */
-  rss_bytes: number | null;
-  /**
-   * The scheduler state the kernel reported for it.
-   */
-  state:
-    | {
-        kind: "running";
-      }
-    | {
-        kind: "sleeping";
-      }
-    | {
-        kind: "disk_sleep";
-      }
-    | {
-        kind: "stopped";
-      }
-    | {
-        kind: "tracing_stop";
-      }
-    | {
-        kind: "zombie";
-      }
-    | {
-        kind: "dead";
-      }
-    | {
-        kind: "idle";
-      }
-    | {
-        kind: "other";
-        value: string;
-      };
-}
-/**
- * Which process incarnation a sample belongs to.
- *
- * The kernel reuses process ids, so a pid does not name a process: one
- * incarnation is the boot it started in, its pid, and when it started. Those
- * are what make two readings comparable — counters may only be subtracted
- * from an earlier reading of the same identity, and a difference taken across
- * two of them measures neither process.
- */
-export interface ProcessIdentity1 {
-  /**
-   * The boot this process started in, as the kernel reports it.
-   */
-  boot_id: string;
-  /**
-   * The process id, unique within one boot and one incarnation of it.
-   */
-  pid: number;
-  /**
-   * Start time since boot, in clock ticks (`starttime` in
-   * `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
-   */
-  start_ticks: number;
-}
-/**
- * Which process incarnation a sample belongs to.
- *
- * The kernel reuses process ids, so a pid does not name a process: one
- * incarnation is the boot it started in, its pid, and when it started. Those
- * are what make two readings comparable — counters may only be subtracted
- * from an earlier reading of the same identity, and a difference taken across
- * two of them measures neither process.
- */
-export interface ProcessIdentity2 {
-  /**
-   * The boot this process started in, as the kernel reports it.
-   */
-  boot_id: string;
-  /**
-   * The process id, unique within one boot and one incarnation of it.
-   */
-  pid: number;
-  /**
-   * Start time since boot, in clock ticks (`starttime` in
-   * `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
-   */
-  start_ticks: number;
-}
-/**
- * Which process incarnation a sample belongs to.
- *
- * The kernel reuses process ids, so a pid does not name a process: one
- * incarnation is the boot it started in, its pid, and when it started. Those
- * are what make two readings comparable — counters may only be subtracted
- * from an earlier reading of the same identity, and a difference taken across
- * two of them measures neither process.
- */
-export interface ProcessIdentity3 {
-  /**
-   * The boot this process started in, as the kernel reports it.
-   */
-  boot_id: string;
-  /**
-   * The process id, unique within one boot and one incarnation of it.
-   */
-  pid: number;
-  /**
-   * Start time since boot, in clock ticks (`starttime` in
-   * `/proc/<pid>/stat`): the kernel's stamp for this incarnation.
-   */
-  start_ticks: number;
-}
-/**
- * One successful inventory: workspaces, tabs, panes, reported agents and
- * daemon lifecycle subjects not represented by a joined agent row.
- */
-export interface FleetObservation {
-  /**
-   * The agents this observation presents as facts. The collector sets these
-   * from the registry; a backend's own metadata records never land here.
-   */
-  agents: AgentObservation[];
-  /**
-   * The containers this daemon records, read beside the registry facts. A
-   * backend's inventory never carries them, and an empty list means no
-   * container was read — not that none exists.
-   */
-  containers?: PublicContainer[];
-  focus?: Focus;
-  /**
-   * Public lifecycle records from the same daemon read as agent facts. The
-   * tree suppresses subjects already represented by a joined agent row.
-   */
-  lifecycle_subjects?: LifecycleObservation[];
-  /**
-   * Agent records a backend reads from pane metadata. They are physical
-   * evidence that protects a pane from unmanaged control, and are never
-   * presented as agent facts.
-   */
-  metadata_agents?: AgentObservation[];
-  panes: Pane[];
-  tabs: Tab[];
-  workspaces: Workspace[];
-}
-/**
  * One container as a consumer reads it.
  */
 export interface PublicContainer {
@@ -1725,7 +1661,7 @@ export interface Binding2 {
    * established. A handle alone cannot be told apart from a later server
    * reusing it, so a binding that names no incarnation is never verified.
    */
-  incarnation: ProcessIdentity | null;
+  incarnation: ProcessIdentity3 | null;
 }
 /**
  * Public lifecycle identity carried into the display projection.
@@ -1738,7 +1674,7 @@ export interface LifecycleObservation {
    * still running from one that is history.
    */
   ended: boolean;
-  process: ProcessIdentity | null;
+  process: ProcessIdentity3 | null;
   session: string | null;
   state: State;
   subject_id: string;
@@ -1793,6 +1729,13 @@ export interface ObserverHealth {
    * Why the last attempt ended, one bounded line. `None` while attached.
    */
   loss_reason: string | null;
+}
+/**
+ * Retained agent facts carried across an idle-shell gap.
+ */
+export interface RetainedObservation {
+  basis: RetainedBasis;
+  observation: AgentObservation;
 }
 /**
  * One source's freshness in a snapshot revision.
@@ -1912,7 +1855,7 @@ export interface SpawnListPageSerializeBoundChild {
   source: string;
   /**
    * The durable agent the bound child attaches as. Absent for an edge without
-   * a tracked launch and in records written before it was recorded.
+   * a tracked launch.
    */
   subject_id?: string | null;
 }

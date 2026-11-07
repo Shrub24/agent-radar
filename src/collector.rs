@@ -376,9 +376,8 @@ impl Drop for Collector {
 ///
 /// Registered agents are read after the inventory and joined after the evidence,
 /// so a registration's pane is sampled in this refresh whether or not an agent
-/// was ever seen on it. The backend's own agent records are kept as containment
-/// evidence only. A refresh that was cancelled, by its deadline or by shutdown,
-/// is a failure, never a partial success.
+/// was ever seen on it. A refresh that was cancelled, by its deadline or by
+/// shutdown, is a failure, never a partial success.
 fn collect(
     provider: &dyn RuntimeProvider,
     registry_source: &RegistrySource,
@@ -478,13 +477,11 @@ fn collect(
                 .collect()
         })
         .unwrap_or_default();
-    // Presented agents come from the registry alone. Where there is no registry,
-    // none are presented; the backend's own records stay as containment evidence.
-    let metadata_agents = std::mem::take(&mut observation.agents);
+    // Agents come from the registry alone: with no registry read, none are
+    // presented.
     observation.agents = registry.map_or_else(Vec::new, |read| {
         registry_observation::project(&observation, &provider.identity(), read, &evidence)
     });
-    observation.metadata_agents = metadata_agents;
     observation.containers = containers;
     observation.lifecycle_subjects = lifecycle_subjects;
     stamp_assignment_ages(&mut observation);
@@ -559,6 +556,8 @@ mod tests {
 
     /// A backend that answers an empty inventory and nothing else: the refresh
     /// has no panes to sample, so only its own clock decides the outcome.
+    use crate::{CloseOutcome, FocusOutcome};
+
     struct EmptyInventory;
 
     impl RuntimeProvider for EmptyInventory {
@@ -569,7 +568,6 @@ mod tests {
         fn inventory(&self, _cancel: &AtomicBool) -> Result<FleetObservation, String> {
             Ok(FleetObservation {
                 focus: Default::default(),
-                metadata_agents: Vec::new(),
                 containers: Vec::new(),
                 lifecycle_subjects: Vec::new(),
                 workspaces: Vec::new(),
@@ -583,12 +581,12 @@ mod tests {
             ForegroundEvidence::Inconclusive
         }
 
-        fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> Result<(), String> {
-            Err("not used".into())
+        fn focus(&self, _target: &Target, _cancel: &AtomicBool) -> FocusOutcome {
+            FocusOutcome::Refused("not used".into())
         }
 
-        fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> Result<(), String> {
-            Err("not used".into())
+        fn close(&self, _target: &CloseTarget, _cancel: &AtomicBool) -> CloseOutcome {
+            CloseOutcome::Refused("not used".into())
         }
     }
 

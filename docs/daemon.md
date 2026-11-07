@@ -199,7 +199,7 @@ units start and stop it; see [Stopping and refusals](#stopping-and-refusals).
 
 Clients connect directly using Unix-domain UTF-8 JSON Lines, protocol version
 `2`, with a canonical UUID request ID and one matching response per request.
-Send `daemon.ping` first. The answer includes protocol `2`, a wire `revision`, and the contracts this daemon serves. External consumers pin only what they use: `registry.v1` for a registry publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader, `observation.get.v1` for a display or any reader of the shared observation snapshot, `tasks.list.v1` for background-task snapshots, `communication.messages.v1` for the durable addressed message lane, and `spawn.v1`/`spawn.close.v1` for managed children. Unknown contract names are tolerated. The bundled Radar client requires its minimum revision and shows a blocking diagnostic with the daemon restart command if a daemon outlived an install. `mux.*` primitives are internal and are not sent in the handshake.
+Send `daemon.ping` first. The answer includes protocol `2`, a wire `revision`, and the contracts this daemon serves. External consumers pin only what they use: `registry.v1` for a registry publisher (plus `registry.facts.v1` before publishing the `facts` channel or assignment extension), `events.v1` for a journal reader, `observation.get.v1` for a display or any reader of the shared observation snapshot, `tasks.list.v1` for background-task snapshots, `communication.messages.v1` for the durable addressed message lane, and `spawn.v1`/`spawn.close.v1` for managed children. Unknown contract names are tolerated. The bundled Radar client and pi-radar require this build's exact revision and show a blocking diagnostic with the daemon restart command when a daemon outlived an install or precedes one. `mux.*` primitives are internal and are not sent in the handshake.
 
 Default control socket resolution: `RADAR_CONTROL_SOCKET`, then `$XDG_RUNTIME_DIR/agent-radar/control.sock`, then `/tmp/agent-radar-<uid>/control.sock`. The daemon temporarily also binds the legacy publisher socket path described in [the publisher bridge](radar-bus.md); it is an ingest-only compatibility entry into the same transport and task state. See the [protocol reference](control-plane.md#start-and-select) for state-path resolution, the `[server]` table, and physical-backend selection.
 
@@ -424,7 +424,7 @@ Resume and restart are the `lifecycle.*` operations above, not generic recovery;
 adoption of foreign panes is not provided, and recovery of children, pending asks
 and results must be specified and verified separately.
 
-## Examples and compatibility
+## Examples
 
 - [Reconnecting publisher](../examples/agent-publisher/publisher.py)
 - [Reconnecting events consumer](../examples/agent-publisher/events_consumer.py)
@@ -452,7 +452,7 @@ user-fleet integration in the test suite.
 
 Consumers should negotiate contracts, tolerate unfamiliar contract names, and
 switch on error codes rather than human-readable messages. Bundled Radar clients
-also require the wire revision. Keep wire compatibility explicit as the API grows.
+also require the exact wire revision: a daemon of any other revision is refused, never served around.
 Transport guarantees, identity fencing, privacy and uncertain-effect handling
 are requirements of the current contract;
 state vocabulary, placement policy, richer topology and recovery responsibilities

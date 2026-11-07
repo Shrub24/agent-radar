@@ -41,12 +41,10 @@ import type {
  */
 export const RADAR_PROTOCOL_VERSION = 2;
 /**
- * Revision 5 names attempts by claim_id and requires exact-claim controls.
- * Revision 7 starts every managed launch through `radar run --launch` and lets a
- * parent continue or restart its own child by subject.
- * Earlier daemons expose different identity fields; require a coordinated update.
+ * The one wire revision this port speaks. A daemon of any other revision outlived
+ * an install or precedes one, and is told to restart rather than served around.
  */
-export const RADAR_MINIMUM_REVISION = 13;
+export const RADAR_WIRE_REVISION = 17;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";
@@ -555,7 +553,7 @@ function managementAt(value: unknown): RadarManagement | undefined {
 		const subjectId = stringAt(field, "subject_id");
 		return subjectId === undefined ? undefined : { state, subject_id: subjectId };
 	}
-	if (state === "duplicate" || state === "pending" || state === "unmanaged") return { state };
+	if (state === "duplicate" || state === "unmanaged") return { state };
 	return undefined;
 }
 
@@ -1098,7 +1096,7 @@ export type RadarClient = {
 		lease_ms?: number;
 		observed_at?: string;
 		context: RadarContextValue;
-	}): Promise<RadarResult<{ writer: RadarWriterBinding; warning?: string; management?: RadarManagement }>>;
+	}): Promise<RadarResult<{ writer: RadarWriterBinding; warning?: string; management: RadarManagement }>>;
 	retire(request: {
 		registration_id?: string;
 		subject_id?: string;
@@ -1632,15 +1630,13 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				}, not ${RADAR_PROTOCOL_VERSION}`,
 			};
 		const revision = numberAt(answer.value, "revision");
-		if (
-			revision === undefined ||
-			!Number.isSafeInteger(revision) ||
-			revision < RADAR_MINIMUM_REVISION
-		)
+		if (revision !== RADAR_WIRE_REVISION)
 			return {
 				ok: false,
 				code: "unsupported",
-				message: `the daemon at ${currentPath()} does not support wire revision ${RADAR_MINIMUM_REVISION}; run systemctl --user restart radar-daemon`,
+				message: `the daemon at ${currentPath()} is not this build's (wire revision ${
+					revision === undefined ? "unstated" : revision
+				}, needs ${RADAR_WIRE_REVISION}); run systemctl --user restart radar-daemon`,
 			};
 		const backend = stringAt(answer.value, "backend");
 		const instance = recordAt(answer.value, "instance");
@@ -1890,12 +1886,14 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					return protocol("context reply carries no writer binding");
 				const warning = stringAt(answer.value, "warning");
 				const management = managementAt(answer.value);
+				if (management === undefined)
+					return protocol("context reply names no standing");
 				return {
 					ok: true,
 					value: {
 						writer,
 						...(warning !== undefined ? { warning } : {}),
-						...(management !== undefined ? { management } : {}),
+						management,
 					},
 				};
 			});

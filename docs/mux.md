@@ -178,11 +178,10 @@ only when the edge recorded that exit and the tmux server serving now is the one
 that served the create. An edge whose creating instance cannot be named is
 unfenced, and its dead panes are refused rather than inferred.
 
-Record reads accept the raw separator byte observed on tmux 3.7c and the literal
-`\037` separator observed on Debian tmux 3.5a. Only field boundaries are decoded;
-the final display field stays as tmux sent it, including literal backslashes.
-This avoids general escape decoding, which would alter display text. These checks
-establish record-format compatibility, not full lifecycle acceptance on 3.5a.
+Record reads accept the raw separator byte and the literal `\037` a backend that
+quotes it emits. Only field boundaries are decoded; the final display field stays
+as tmux sent it, including literal backslashes. This avoids general escape
+decoding, which would alter display text.
 
 The registry-backed dashboard and tmux acceptance are shipped. A consumer's own
 migration and real Pi acceptance remain its work; dashboard acceptance does not

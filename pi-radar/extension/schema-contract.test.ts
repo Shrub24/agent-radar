@@ -207,7 +207,6 @@ test("observation.get schemas cover unchanged, expired, oversized, and snapshot 
 					source: "pending",
 					registry: "pending",
 					retained: {},
-					containment: {},
 					awaiting_evidence: [],
 					foreground: {},
 				},

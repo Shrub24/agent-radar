@@ -64,19 +64,19 @@ A registration at a pane keeps that pane, and the tab containing it, out of a
 generic unmanaged close, including where its join is unresolved or ambiguous: the
 pane may be someone's agent even where Radar cannot prove whose. Close
 eligibility is a separate and stronger fact, established by a daemon-authored
-spawn edge to that exact child; a registration, a label, a session UUID or a
-metadata flag never makes a target eligible. `D` on a registration is routed to
+spawn edge to that exact child; a registration, a label or a session UUID never
+makes a target eligible. `D` on a registration is routed to
 the worker's owner where Radar holds a subject for it, and otherwise closes the
 pane the row shows; it never claims an owner it cannot name.
 
-### What is still read from pane metadata
+### An agent row is a registration
 
-A backend's own agent records and the `pi_herdsman_*` pane tokens are read as
-**physical and containment evidence only**: they keep a pane that has an occupant protected
-while Radar cannot name that occupant. They are never display facts for an agent
-row — a registered row is named by its registration, its label else its agent id,
-and its values come from the channels above. Ordinary panes keep the backend's
-pane title and label, which describe the pane rather than an agent.
+The inventory's agents are the daemon's registrations and nothing else: the
+backend's own agent records, pane titles and `pi_herdsman_*` tokens never become
+agent facts, and a row is named by its registration's label, else by the agent id
+it was registered under. A pane with no registration is an ordinary pane row and
+keeps the backend's pane title and label, which describe the pane rather than an
+agent.
 
 ### Refresh and continuity
 
@@ -157,7 +157,7 @@ or consume anything; `pi-bg get` remains the retrieval path. See
 [`radar-bus.fixture.json`](radar-bus.fixture.json) for the protocol.
 
 A publisher task list joins an agent row only by the exact Pi session UUID
-reported by that row. The optional `pane` in a legacy publisher `hello` is not a
+reported by that row. The optional `pane` in a publisher `hello` is not a
 join fallback. Nothing else joins task detail — not pane, cwd, title or human
 session name. A connected session with no matching agent row remains in the
 daemon snapshot but is not attached to another row.

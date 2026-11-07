@@ -146,10 +146,10 @@ fn drive(fake: &Fake) {
     let workspace = fake.handle("$0");
     let _ = runtime.inventory(&cancel);
     let _ = runtime.foreground_evidence(&pane, &cancel);
-    let _ = runtime.focus_outcome(&Target::Pane(pane.clone()), &cancel);
-    let _ = runtime.focus_outcome(&Target::Workspace(workspace.clone()), &cancel);
-    let _ = runtime.close_outcome(&CloseTarget::Pane(pane.clone()), &cancel);
-    let _ = runtime.close_outcome(&CloseTarget::Tab(fake.handle("@0")), &cancel);
+    let _ = runtime.focus(&Target::Pane(pane.clone()), &cancel);
+    let _ = runtime.focus(&Target::Workspace(workspace.clone()), &cancel);
+    let _ = runtime.close(&CloseTarget::Pane(pane.clone()), &cancel);
+    let _ = runtime.close(&CloseTarget::Tab(fake.handle("@0")), &cancel);
     let _ = runtime.create(
         &CreateRequest::Workspace {
             focus: Some(false),
@@ -290,21 +290,21 @@ fn a_handle_of_another_backend_or_server_runs_nothing() {
 
     assert!(
         matches!(
-            runtime.focus_outcome(&Target::Pane(foreign_pane.clone()), &cancel),
+            runtime.focus(&Target::Pane(foreign_pane.clone()), &cancel),
             FocusOutcome::Refused(_)
         ),
         "another backend's pane handle was not refused"
     );
     assert!(
         matches!(
-            runtime.focus_outcome(&Target::Workspace(foreign_workspace), &cancel),
+            runtime.focus(&Target::Workspace(foreign_workspace), &cancel),
             FocusOutcome::Refused(_)
         ),
         "another server's session handle was not refused"
     );
     assert!(
         matches!(
-            runtime.close_outcome(&CloseTarget::Pane(foreign_pane), &cancel),
+            runtime.close(&CloseTarget::Pane(foreign_pane), &cancel),
             CloseOutcome::Refused(_)
         ),
         "another backend's close target was not refused"
@@ -353,12 +353,12 @@ fn a_command_that_failed_after_dispatch_is_unknown_never_refused() {
     let cancel = cancel();
     let pane = fake.handle("%0");
 
-    let focus = runtime.focus_outcome(&Target::Pane(pane.clone()), &cancel);
+    let focus = runtime.focus(&Target::Pane(pane.clone()), &cancel);
     assert!(
         matches!(focus, FocusOutcome::Unknown(_)),
         "a dispatched focus failure was not unknown: {focus:?}"
     );
-    let close = runtime.close_outcome(&CloseTarget::Pane(pane.clone()), &cancel);
+    let close = runtime.close(&CloseTarget::Pane(pane.clone()), &cancel);
     assert!(
         matches!(close, CloseOutcome::Unknown(_)),
         "a dispatched close failure was not unknown: {close:?}"
@@ -963,7 +963,7 @@ fn the_observer_wakes_on_native_changes_is_no_operator_and_ends_with_its_stop_fl
     assert_eq!(
         probe
             .runtime
-            .focus_outcome(&Target::Pane(probe.runtime_handle(&pane)), &cancel()),
+            .focus(&Target::Pane(probe.runtime_handle(&pane)), &cancel()),
         FocusOutcome::NoClient,
         "the observer is not an operator client"
     );
@@ -1056,7 +1056,7 @@ fn focus_moves_the_window_and_makes_the_pane_active() {
     let before = probe.tmux(&["list-panes", "-a", "-F", "#{pane_id} #{pane_active}"]);
     let alone = probe
         .runtime
-        .focus_outcome(&Target::Pane(pane_handle.clone()), &cancel());
+        .focus(&Target::Pane(pane_handle.clone()), &cancel());
     assert_eq!(alone, FocusOutcome::NoClient);
     assert_eq!(
         before,
@@ -1065,9 +1065,7 @@ fn focus_moves_the_window_and_makes_the_pane_active() {
     );
 
     let _client = probe.attach_client();
-    let outcome = probe
-        .runtime
-        .focus_outcome(&Target::Pane(pane_handle), &cancel());
+    let outcome = probe.runtime.focus(&Target::Pane(pane_handle), &cancel());
     assert_eq!(outcome, FocusOutcome::Completed, "{outcome:?}");
     let active = probe.tmux(&[
         "list-panes",
@@ -1110,7 +1108,7 @@ fn focus_moves_the_window_and_makes_the_pane_active() {
     );
     let outcome = probe
         .runtime
-        .focus_outcome(&Target::Pane(probe.runtime_handle(&other)), &cancel());
+        .focus(&Target::Pane(probe.runtime_handle(&other)), &cancel());
     assert_eq!(outcome, FocusOutcome::Completed, "{outcome:?}");
     assert_eq!(
         probe
@@ -1676,7 +1674,7 @@ fn close_ends_the_pane_and_then_the_window() {
 
     let closed = probe
         .runtime
-        .close_outcome(&CloseTarget::Pane(pane_handle.clone()), &cancel);
+        .close(&CloseTarget::Pane(pane_handle.clone()), &cancel);
     assert_eq!(closed, CloseOutcome::Completed, "{closed:?}");
     let after = probe.runtime.inventory(&cancel).expect("an inventory");
     assert!(
@@ -1689,7 +1687,7 @@ fn close_ends_the_pane_and_then_the_window() {
 
     let closed = probe
         .runtime
-        .close_outcome(&CloseTarget::Tab(window.clone()), &cancel);
+        .close(&CloseTarget::Tab(window.clone()), &cancel);
     assert_eq!(closed, CloseOutcome::Completed, "{closed:?}");
     assert!(
         eventually(DEADLINE, || {
@@ -1731,7 +1729,7 @@ fn a_killed_server_leaves_every_effect_unknown() {
     );
     let focus = probe
         .runtime
-        .focus_outcome(&Target::Pane(pane_handle.clone()), &cancel);
+        .focus(&Target::Pane(pane_handle.clone()), &cancel);
     assert!(
         matches!(focus, FocusOutcome::Unknown(_)),
         "a focus on a server that is gone was not unknown: {focus:?}"
@@ -1762,9 +1760,7 @@ fn a_killed_server_leaves_every_effect_unknown() {
         matches!(output, OutputOutcome::Unknown(_)),
         "a read from a server that is gone was not unknown: {output:?}"
     );
-    let closed = probe
-        .runtime
-        .close_outcome(&CloseTarget::Tab(window), &cancel);
+    let closed = probe.runtime.close(&CloseTarget::Tab(window), &cancel);
     assert!(
         matches!(closed, CloseOutcome::Unknown(_)),
         "a close on a server that is gone was not unknown: {closed:?}"
@@ -1813,7 +1809,7 @@ fn adapter_work_leaves_tmuxs_default_server_alone() {
     let _ = probe.runtime.foreground_evidence(&pane_handle, &cancel);
     let _ = probe
         .runtime
-        .focus_outcome(&Target::Pane(pane_handle.clone()), &cancel);
+        .focus(&Target::Pane(pane_handle.clone()), &cancel);
     let _ = probe.runtime.create(
         &CreateRequest::Tab {
             workspace_id: probe.runtime_handle("$0"),

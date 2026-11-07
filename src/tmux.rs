@@ -416,7 +416,6 @@ impl RuntimeProvider for TmuxRuntime {
         if sessions.trim().is_empty() {
             return Ok(FleetObservation {
                 focus: Focus::NoOperator,
-                metadata_agents: Vec::new(),
                 containers: Vec::new(),
                 lifecycle_subjects: Vec::new(),
                 workspaces: Vec::new(),
@@ -430,7 +429,6 @@ impl RuntimeProvider for TmuxRuntime {
         let clients = self.run_whole(&["list-clients", "-F", CLIENT_FORMAT], cancel)?;
         Ok(FleetObservation {
             focus: self.decode_focus(&clients)?,
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: self.decode_sessions(&sessions)?,
@@ -475,13 +473,7 @@ impl RuntimeProvider for TmuxRuntime {
         decode_foreground(&read.text)
     }
 
-    fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
-        self.focus_outcome(target, cancel)
-            .diagnostic()
-            .map_or(Ok(()), |message| Err(message.to_string()))
-    }
-
-    fn focus_outcome(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
+    fn focus(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
         let focused = match target {
             Target::Pane(pane_id) => self.focus_pane(pane_id, cancel),
             Target::Workspace(workspace_id) => self.focus_workspace(workspace_id, cancel),
@@ -489,13 +481,7 @@ impl RuntimeProvider for TmuxRuntime {
         focused.map_or_else(Failure::into_focus, |()| FocusOutcome::Completed)
     }
 
-    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
-        self.close_outcome(target, cancel)
-            .diagnostic()
-            .map_or(Ok(()), |message| Err(message.to_string()))
-    }
-
-    fn close_outcome(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
         self.close_target(target, cancel)
             .map_or_else(Failure::into_close, |()| CloseOutcome::Completed)
     }

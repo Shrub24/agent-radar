@@ -52,7 +52,7 @@ pub use model::{
     SessionUuid, Tab, TerminalMode, Workspace,
 };
 pub use observation::{ObservationState, RetainedAgent, RetentionBasis, SourceFreshness};
-pub use runtime::{CloseTarget, FocusOutcome, RuntimeProvider, Target};
+pub use runtime::{CloseOutcome, CloseTarget, FocusOutcome, RuntimeProvider, Target};
 pub use tmux::{TmuxConfig, TmuxRuntime};
 pub use tree::{
     AgentRow, FleetTree, PaneRow, RowId, RowKind, TaskId, TaskProjection, TaskRow, TaskSource,

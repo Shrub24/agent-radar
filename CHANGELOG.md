@@ -2,8 +2,19 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
+## Radar 0.10.2
+
+- **Breaking:** an agent row is a registration and nothing else. `AgentObservation` no longer carries `name`, `label` or `lineage`, and `HerdsmanFacts` no longer carries `name`, `label` or `managed_metadata`; the observation no longer carries `metadata_agents` and its `containment` map is gone. A backend's own agent records and `pi_herdsman_*` pane tokens no longer exist as a second kind of agent: the registry is the only producer of an agent row.
+- **Breaking:** `AgentObservation.registry` is required rather than optional, so a row either names its registration or is a pane row. Containment collapses to "an agent row is a registered agent", and nesting goes through the daemon's spawn edges alone.
+- The row's name comes from the registration's label, else the title's session provider, else the source the registration was published under, which is also what selects its vendor mark. An unreported execution or assignment is now stated as `unknown — nothing reported` rather than omitted.
+- The observation's shape changed, so the wire revision moves to 17: a daemon or dashboard of revision 16 is refused by name rather than served a document it cannot decode.
+
 ## Radar 0.10.1
 
+- One wire revision, no tolerance: the dashboard refuses a daemon of any revision but its own, and pi-radar requires exactly wire 16, so a daemon that outlived an install and one that precedes it are both told to restart instead of served around.
+- Removed record and protocol tolerance for earlier builds: `launch_identity` on context records and requests, and the note that a bound child's subject may be missing from an older edge.
+- `RuntimeProvider` reports its dispatch certainty directly through `focus` and `close`; the `focus_outcome`/`close_outcome` pair and its "legacy adapters" default are gone.
+- A message store holding a file this build does not write is refused by name, rather than described as a retired mailbox to drain.
 - The daemon refuses to start over a process recipe or subject identity it cannot read, naming the file, as it already did for a spawn edge. A 0.9.0 recipe used to start a daemon whose `subject.list` and fleet listing then failed on every read. The 0.10.0 upgrade notes now give the cutover, checked against a copy of real 0.9.0 state.
 - Closing a place that holds an agent Radar does not manage is refused as "holds an agent Radar does not manage" instead of naming an owner.
 - `radar` no longer starts or consults the `radar-control.socket` unit when `RADAR_CONTROL_SOCKET` names another socket: that daemon is not the unit's.

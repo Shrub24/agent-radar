@@ -32,9 +32,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::control_plane::registry::{Freshness, PublicChannelFacts};
 use crate::model::{
-    AgentObservation, AgentState, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent,
-    DescendantSample, ForegroundEvidence, HerdsmanFacts, ProcessIdentity, ProcessResources,
-    ProcessState, SessionIdentity, SessionUuid, TerminalMode, Total,
+    AgentState, BinaryFreshness, BinaryIdentity, BinaryUnknown, CpuPercent, DescendantSample,
+    ForegroundEvidence, HerdsmanFacts, ProcessIdentity, ProcessResources, ProcessState,
+    SessionIdentity, TerminalMode, Total,
 };
 use crate::observation::{ObservationState, RetentionBasis, SourceFreshness};
 use crate::registry_observation::{
@@ -1612,7 +1612,7 @@ mod tests {
         LocalFacts, Location, Pane, ProcessIdentity, ProcessResources, ProcessState, RuntimeStatus,
         SemanticState, Tab, TerminalMode, Total, Workspace,
     };
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     /// The fixture with a command in a pane's foreground: what a close is asked
     /// about, because it is what would be lost.
@@ -2004,10 +2004,6 @@ mod tests {
             .to_string()
     }
 
-    fn styles(buffer: &Buffer) -> Vec<Style> {
-        buffer.content().iter().map(|cell| cell.style()).collect()
-    }
-
     fn app_for(state: &ObservationState) -> App {
         let mut app = App::new();
         app.refresh(state);
@@ -2016,6 +2012,33 @@ mod tests {
 
     /// A one-workspace fleet whose only agent publishes `facts`, so a row and a
     /// details panel can be read against exactly what Herdsman reported.
+    /// A joined registration whose label names the row, which is where a row's
+    /// display name comes from now that the owner's facts carry none.
+    fn joined(
+        registration_id: &str,
+        pane_id: &str,
+        label: &str,
+    ) -> crate::registry_observation::RegistryView {
+        let mut view =
+            crate::registry_observation::RegistryView::test_joined(registration_id, pane_id);
+        view.agent.registration.label = Some(label.to_string());
+        view
+    }
+
+    /// The same fixture with the row named by its registration label, which is
+    /// where a row's display name comes from.
+    fn state_with_facts_named(
+        label: &str,
+        facts: HerdsmanFacts,
+        status: RuntimeStatus,
+    ) -> ObservationState {
+        let mut state = state_with_facts(facts, status);
+        let mut observation = state.inventory().expect("inventory").clone();
+        observation.agents[0].registry.agent.registration.label = Some(label.to_string());
+        state.apply_success(observation);
+        state
+    }
+
     fn state_with_facts(facts: HerdsmanFacts, status: RuntimeStatus) -> ObservationState {
         let location = Location {
             workspace_id: "wH".into(),
@@ -2025,7 +2048,6 @@ mod tests {
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
@@ -2048,13 +2070,10 @@ mod tests {
             }],
             agents: vec![AgentObservation {
                 location,
-                name: Some("pi".into()),
-                label: Some("worker task".into()),
                 status: Some(status),
                 session: None,
-                lineage: None,
                 facts,
-                registry: None,
+                registry: joined("test-wH:p1", "wH:p1", "worker task"),
             }],
         });
         state
@@ -2084,109 +2103,6 @@ mod tests {
 
     fn select_agent(app: &mut App, pane_id: &str) {
         select_row(app, crate::tree::RowId::Agent(pane_id.into()));
-    }
-
-    /// A lineage whose UUIDs are derived from small numbers, so a test can name
-    /// the exact session a parent link points at.
-    fn lineage(uuid: u32, parent: Option<u32>) -> crate::model::Lineage {
-        let root = |n: u32| {
-            crate::model::SessionUuid::parse(&format!("01a1{n:04x}-0000-4000-8000-{n:012x}"))
-                .expect("uuid-shaped")
-        };
-        crate::model::Lineage {
-            session: root(uuid),
-            parent: parent.map(root),
-        }
-    }
-
-    /// A one-workspace fleet holding exactly these agents, each with a pane.
-    fn lineage_state(agents: Vec<AgentObservation>) -> ObservationState {
-        let panes = agents
-            .iter()
-            .map(|agent| Pane {
-                location: agent.location.clone(),
-                label: None,
-                title: None,
-                current_path: None,
-            })
-            .collect();
-        let mut state = ObservationState::new();
-        state.apply_success(FleetObservation {
-            focus: Default::default(),
-            metadata_agents: Vec::new(),
-            containers: Vec::new(),
-            lifecycle_subjects: Vec::new(),
-            workspaces: vec![Workspace {
-                workspace_id: "wH".into(),
-                label: Some("herdsman".into()),
-                number: None,
-                session_path: None,
-            }],
-            tabs: vec![Tab {
-                tab_id: "wH:t1".into(),
-                workspace_id: "wH".into(),
-                label: None,
-                number: None,
-            }],
-            panes,
-            agents,
-        });
-        state
-    }
-
-    #[test]
-    fn source_says_what_became_of_the_parent_link() {
-        // One worker, and two rows publishing the session its parent link names.
-        // The tree does not invent a nesting it cannot choose, so the reason has
-        // to be readable: a worker at a workspace root otherwise looks orphaned.
-        let agent = |pane: &str, lineage: crate::model::Lineage| AgentObservation {
-            location: Location {
-                workspace_id: "wH".into(),
-                tab_id: "wH:t1".into(),
-                pane_id: pane.into(),
-            },
-            name: Some("pi".into()),
-            label: Some(format!("agent {pane}")),
-            status: Some(RuntimeStatus::Idle),
-            session: None,
-            lineage: Some(lineage),
-            facts: HerdsmanFacts::default(),
-            registry: None,
-        };
-
-        let ambiguous = lineage_state(vec![
-            agent("wH:p2Q", lineage(1, Some(2))),
-            agent("wH:p2P", lineage(2, None)),
-            agent("wH:p1E", lineage(2, None)),
-        ]);
-        let mut app = app_for(&ambiguous);
-        select_agent(&mut app, "wH:p2Q");
-        let source = render_page(&ambiguous, &mut app, DetailPage::Source, 180, 30);
-        assert!(
-            source.contains("session uuid: 01a10001-0000-4000-8000-000000000001"),
-            "{source}"
-        );
-        assert!(
-            source.contains("parent: 01a10002-0000-4000-8000-000000000002"),
-            "{source}"
-        );
-        assert!(
-            source.contains("2 rows") && source.contains("publish this session"),
-            "the ambiguity is the reason the row is not nested: {source}"
-        );
-
-        // The same worker with one claimant: the link the tree used is named.
-        let linked = lineage_state(vec![
-            agent("wH:p2Q", lineage(1, Some(2))),
-            agent("wH:p2P", lineage(2, None)),
-        ]);
-        let mut app = app_for(&linked);
-        select_agent(&mut app, "wH:p2Q");
-        let source = render_page(&linked, &mut app, DetailPage::Source, 180, 30);
-        assert!(
-            source.contains("nested") && source.contains("under wH:p2P · agent wH:p2P"),
-            "{source}"
-        );
     }
 
     #[test]
@@ -2220,17 +2136,13 @@ mod tests {
         // reported (long values wrap).
         assert!(screen.contains("identity: tmux:pi"), "{screen}");
         assert!(screen.contains("--home-dev-projects-beta--"), "{screen}");
-        assert!(screen.contains("status: working"), "{screen}");
         // The row draws a state and the panel says which opinion it is.
-        assert!(
-            screen.contains("state: working (derived from the pane)"),
-            "{screen}"
-        );
-        // The one Herdsman fact this worker publishes is its model; a role, an
-        // assignment or anything outstanding it never reported draws no line
-        // at all rather than an empty one.
+        assert!(screen.contains("state: working ("), "{screen}");
+        // The one owner fact this worker publishes is its model; a role or
+        // anything outstanding never reported draws no line at all rather
+        // than an empty one. The registry channels are stated either way.
         assert!(screen.contains("model: sample-model-1"), "{screen}");
-        for absent in ["role:", "assignment:", "awaiting:", "ask:"] {
+        for absent in ["role:", "awaiting:", "ask:"] {
             assert!(!screen.contains(absent), "`{absent}`: {screen}");
         }
         assert!(
@@ -2266,50 +2178,6 @@ mod tests {
         let screen = render_text(&state, &app, 90, 30);
         assert!(!screen.contains("worker task"), "{screen}");
         assert!(screen.contains("fleet owner task"), "{screen}");
-    }
-
-    #[test]
-    fn retained_observation_renders_as_last_observed_and_never_duplicates_its_pane() {
-        let mut state = fixture_state();
-        let mut without_owner = crate::model::testing::fleet();
-        without_owner
-            .agents
-            .retain(|agent| agent.location.pane_id != "wA:p1");
-        state.apply_success(without_owner);
-        state.apply_evidence("wA:p1", ForegroundEvidence::Shell);
-
-        let mut app = app_for(&state);
-        show_all_panes(&mut app);
-        select_agent(&mut app, "wA:p1");
-        let screen = render_pages(&state, &mut app, 180, 30);
-
-        assert!(screen.contains("retained (shell foreground)"), "{screen}");
-        assert!(
-            screen.contains("agent (retained — shell foreground)"),
-            "{screen}"
-        );
-        assert!(screen.contains("status (last observed): idle"), "{screen}");
-        assert!(screen.contains("not currently observed"), "{screen}");
-        // Exactly one row for the pane: the tree draws the name once, and the
-        // panel names it twice on Source — its own title and the session's
-        // human name.
-        let source = render_page(&state, &mut app, DetailPage::Source, 180, 30);
-        assert_eq!(source.matches("fleet owner task").count(), 3, "{source}");
-        assert!(!screen.contains("pane wA:p1"), "{screen}");
-        // The retained marker is visually distinct, not just textual.
-        let mut terminal =
-            Terminal::new(TestBackend::new(180, 30)).expect("infallible test backend");
-        terminal
-            .draw(|frame| {
-                render(frame, &state, &app, &mut ListState::default(), 0);
-            })
-            .expect("draw");
-        assert!(
-            styles(terminal.backend().buffer())
-                .iter()
-                .any(|style| style.fg == Some(theme::palette().retained)),
-            "retained rows/markers carry a distinct style"
-        );
     }
 
     #[test]
@@ -2385,7 +2253,8 @@ mod tests {
             .find(|agent| agent.location.pane_id == "wA:p1")
             .expect("owner");
         // A label that would set colour, move the cursor and set a title.
-        owner.label = Some("evil\u{1b}[31mRED\u{7}\u{1b}]0;pwn\u{7} label".into());
+        owner.registry.agent.registration.label =
+            Some("evil\u{1b}[31mRED\u{7}\u{1b}]0;pwn\u{7} label".into());
         owner.facts.role = Some("\u{1b}[2Jrole".into());
         let mut state = ObservationState::new();
         state.apply_success(observation);
@@ -2433,18 +2302,18 @@ mod tests {
                     tab_id: "wL:t1".into(),
                     pane_id: format!("wL:p{i:02}"),
                 },
-                name: Some("pi".into()),
-                label: Some(format!("agent number {i:02}")),
                 status: Some(RuntimeStatus::Idle),
                 session: None,
-                lineage: None,
                 facts: crate::model::HerdsmanFacts::default(),
-                registry: None,
+                registry: joined(
+                    &format!("test-wL:p{i:02}"),
+                    "wL:p01",
+                    &format!("agent number {i:02}"),
+                ),
             })
             .collect();
         let mut observation = FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: vec![crate::model::Workspace {
@@ -2572,7 +2441,8 @@ mod tests {
         // A live agent title, and a pane keeping a finished session's label.
         for agent in &mut observation.agents {
             if agent.location.pane_id == "wA:p2" {
-                agent.label = Some("Bolt - Inspect Bifrost - nix-homelab".into());
+                agent.registry.agent.registration.label =
+                    Some("Bolt - Inspect Bifrost - nix-homelab".into());
             }
         }
         for pane in &mut observation.panes {
@@ -2850,8 +2720,8 @@ mod tests {
             select_agent(&mut app, "wH:p1");
             let screen = render_pages(&state, &mut app, 180, 34);
             assert!(
-                screen.contains(&format!("state: {word} (derived from the pane)")),
-                "{screen}"
+                screen.contains(&format!("state: {word} (")),
+                "the row's state names its authority: {screen}"
             );
             assert_eq!(
                 screen.contains("projection: lost (owner projection)"),
@@ -2884,9 +2754,9 @@ mod tests {
 
     #[test]
     fn a_worker_row_reads_its_published_name_state_age_and_model() {
-        let state = state_with_facts(
+        let state = state_with_facts_named(
+            "bash-pane-facts",
             HerdsmanFacts {
-                label: Some("bash-pane-facts".into()),
                 role: Some("worker".into()),
                 definition: Some("pi-herdsman-worker".into()),
                 assignment: Some("Run the terminal smoke suite".into()),
@@ -2946,9 +2816,9 @@ mod tests {
     fn a_published_window_shows_the_derived_percentage_with_its_counts() {
         // Counts win over a percentage text beside them: the percentage is derived,
         // and a source that gave only a percentage still shows it as given.
-        let state = state_with_facts(
+        let state = state_with_facts_named(
+            "typed",
             HerdsmanFacts {
-                label: Some("typed".into()),
                 context_window: Some(crate::model::ContextWindow {
                     tokens: 86_000,
                     window: 200_000,
@@ -2972,7 +2842,8 @@ mod tests {
     fn the_row_badge_counts_outstanding_tasks_not_the_running_count() {
         // The live shape: the count reports nothing running while five tasks
         // have exited into review.
-        let state = state_with_facts(
+        let state = state_with_facts_named(
+            "worker task",
             HerdsmanFacts {
                 background_running: Some(0),
                 background_tasks: [
@@ -2997,10 +2868,7 @@ mod tests {
         // published running count and the oldest outstanding start beside it.
         assert!(screen.contains("worker task"), "{screen}");
         assert!(screen.contains("5 bg"), "{screen}");
-        assert!(
-            screen.contains("state: waiting (derived from the pane)"),
-            "{screen}"
-        );
+        assert!(screen.contains("state: waiting ("), "{screen}");
         assert!(screen.contains("awaiting: 5 background tasks"), "{screen}");
         assert!(screen.contains("background running: 0"), "{screen}");
         assert!(
@@ -3029,10 +2897,7 @@ mod tests {
 
         // Work in flight stays in flight; the whole outstanding set is still
         // named, and its two halves stay distinguishable.
-        assert!(
-            screen.contains("state: working (derived from the pane)"),
-            "{screen}"
-        );
+        assert!(screen.contains("state: working ("), "{screen}");
         assert!(
             screen.contains("awaiting: agent:researcher-1, 2 background tasks"),
             "{screen}"
@@ -3040,7 +2905,10 @@ mod tests {
         assert!(screen.contains("worker task"), "{screen}");
         assert!(screen.contains("2 bg"), "{screen}");
         assert!(screen.contains("background running: 1"), "{screen}");
-        assert!(!screen.contains("assignment:"), "{screen}");
+        assert!(
+            screen.contains("assignment: unknown — nothing reported"),
+            "an unreported assignment is stated as unknown, not omitted: {screen}"
+        );
     }
 
     #[test]
@@ -3065,10 +2933,7 @@ mod tests {
             screen.contains("background: wA:bg-9:quiescing, bg-7"),
             "{screen}"
         );
-        assert!(
-            screen.contains("state: waiting (derived from the pane)"),
-            "{screen}"
-        );
+        assert!(screen.contains("state: waiting ("), "{screen}");
     }
 
     #[test]
@@ -3122,15 +2987,15 @@ mod tests {
         // alone; the panel names it and names the projection beside it.
         assert!(screen.contains("worker task"), "{screen}");
         assert!(!screen.contains("worker task · waiting"), "{screen}");
-        assert!(
-            screen.contains("state: waiting (derived from the pane)"),
-            "{screen}"
-        );
+        assert!(screen.contains("state: waiting ("), "{screen}");
         assert!(
             screen.contains("projection: blocked (owner projection)"),
             "{screen}"
         );
-        assert!(screen.contains("status: idle"), "{screen}");
+        assert!(
+            screen.contains("execution: unknown — nothing reported"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -3142,9 +3007,7 @@ mod tests {
 
         for absent in [
             "role:",
-            "assignment:",
             "definition:",
-            "assignment:",
             "assigned for:",
             "awaiting:",
             "background:",
@@ -3156,41 +3019,15 @@ mod tests {
             "run:",
             "request:",
             "ask:",
+            // The registry's channels are stated even when nothing was
+            // reported, so `assignment:` and `execution:` are not in this list.
         ] {
             assert!(
                 !screen.contains(absent),
                 "`{absent}` with no fact: {screen}"
             );
         }
-        assert!(
-            screen.contains("state: idle (derived from the pane)"),
-            "{screen}"
-        );
-    }
-
-    #[test]
-    fn a_lead_is_named_by_its_published_name_and_shows_its_pending_ask() {
-        let state = state_with_facts(
-            HerdsmanFacts {
-                name: Some("fleet lead".into()),
-                role: Some("lead".into()),
-                definition: Some("lead".into()),
-                ask: Some("ask-1".into()),
-                ..HerdsmanFacts::default()
-            },
-            RuntimeStatus::Idle,
-        );
-        let mut app = app_for(&state);
-        select_agent(&mut app, "wH:p1");
-        let screen = render_pages(&state, &mut app, 180, 34);
-
-        assert!(screen.contains("fleet lead"), "{screen}");
-        assert!(!screen.contains("fleet lead · idle"), "{screen}");
-        assert!(!screen.contains("worker task"), "{screen}");
-        assert!(screen.contains("role: lead"), "{screen}");
-        assert!(screen.contains("ask: ask-1"), "{screen}");
-        // The definition says nothing the role has not already said.
-        assert!(!screen.contains("definition:"), "{screen}");
+        assert!(screen.contains("state: idle ("), "{screen}");
     }
 
     /// Where `needle` begins in the rendered buffer, matched cell by cell so a
@@ -3322,11 +3159,36 @@ mod tests {
                 .iter()
                 .map(|(pane, workspace, status, title, facts)| json!({
                     "location": at(workspace, pane),
-                    "name": "pi",
-                    "label": title,
                     "status": serde_json::to_value(RuntimeStatus::from_reported(status))
                         .expect("a runtime status encodes"),
                     "facts": facts_of(facts),
+                    "registry": {
+                        "agent": {
+                            "registration": {
+                                "version": 1,
+                                "registration_id": format!("test-{pane}"),
+                                "registered_at": "2026-01-01T00:00:00.000Z",
+                                "source": "pi",
+                                "incarnation": format!("inc-{pane}"),
+                                "location": {
+                                    "backend": "tmux",
+                                    "workspace": workspace,
+                                    "tab": tab_of(workspace),
+                                    "pane": pane
+                                },
+                                "label": title,
+                                "process_claimed": false,
+                                "launch": {"available": false}
+                            },
+                            "process": {"claimed": false, "claim": null, "verification": "unavailable"},
+                            "execution": null,
+                            "assignment": null,
+                            "facts": null
+                        },
+                        "binding": "joined",
+                        "spawn": null,
+                        "managed": null
+                    },
                 }))
                 .collect::<Vec<Value>>(),
         }))
@@ -3597,9 +3459,9 @@ mod tests {
 
     #[test]
     fn every_fact_of_a_row_is_reachable_somewhere_across_the_pages() {
-        let mut state = state_with_facts(
+        let mut state = state_with_facts_named(
+            "bash-pane-facts",
             HerdsmanFacts {
-                label: Some("bash-pane-facts".into()),
                 role: Some("worker".into()),
                 assignment: Some("Run the terminal smoke suite".into()),
                 model: Some("example/model".into()),
@@ -3666,9 +3528,9 @@ mod tests {
         // sequences: what the marker opens is the text the panel drew before,
         // sanitized the same way.
         let assignment = format!("\u{1b}[31m{}\u{1b}[0m TAIL", "x".repeat(200));
-        let state = state_with_facts(
+        let state = state_with_facts_named(
+            "bash-pane-facts",
             HerdsmanFacts {
-                label: Some("bash-pane-facts".into()),
                 assignment: Some(assignment),
                 ..HerdsmanFacts::default()
             },
@@ -3735,9 +3597,9 @@ mod tests {
 
     #[test]
     fn a_page_with_nothing_to_open_reports_no_marker() {
-        let state = state_with_facts(
+        let state = state_with_facts_named(
+            "plain",
             HerdsmanFacts {
-                label: Some("plain".into()),
                 ..HerdsmanFacts::default()
             },
             RuntimeStatus::Working,
@@ -6045,23 +5907,21 @@ mod tests {
     fn a_duplicate_session_has_a_distinct_inline_mark() {
         let mut observation = crate::model::testing::fleet();
         let row = &mut observation.agents[0];
-        row.registry = Some(
-            serde_json::from_value(serde_json::json!({
-                "agent": {
-                    "registration": {
-                        "version": 1, "registration_id": "process-registration",
-                        "registered_at": "2026-01-01T00:00:00Z", "source": "herdsman-pi",
-                        "incarnation": "11111111-1111-4111-8111-111111111111",
-                        "process_claimed": true, "launch": {"available": false}
-                    },
-                    "claim_standing": "duplicate",
-                    "process": {"claim": {"boot_id":"boot", "pid":1234, "start_ticks":55}},
-                    "context": null, "execution": null, "assignment": null, "facts": null
+        row.registry = serde_json::from_value(serde_json::json!({
+            "agent": {
+                "registration": {
+                    "version": 1, "registration_id": "process-registration",
+                    "registered_at": "2026-01-01T00:00:00Z", "source": "herdsman-pi",
+                    "incarnation": "11111111-1111-4111-8111-111111111111",
+                    "process_claimed": true, "launch": {"available": false}
                 },
-                "binding": "joined", "spawn": null, "managed": null
-            }))
-            .expect("duplicate registration"),
-        );
+                "claim_standing": "duplicate",
+                "process": {"claim": {"boot_id":"boot", "pid":1234, "start_ticks":55}},
+                "context": null, "execution": null, "assignment": null, "facts": null
+            },
+            "binding": "joined", "spawn": null, "managed": null
+        }))
+        .expect("duplicate registration");
         let mut state = ObservationState::new();
         state.apply_success(observation);
         let mut app = app_for(&state);
@@ -7023,12 +6883,9 @@ mod tests {
             tab_id: "wM:t1".into(),
             pane_id: "wM:p1".into(),
         };
-        let session = crate::model::SessionUuid::parse("01a10c77-8a6b-7035-8a0e-b1fa607bb507")
-            .expect("a UUID");
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: vec![Workspace {
@@ -7051,22 +6908,14 @@ mod tests {
             }],
             agents: vec![AgentObservation {
                 location,
-                name: Some("pi".into()),
-                label: None,
                 status: Some(RuntimeStatus::Idle),
                 session: None,
-                lineage: Some(crate::model::Lineage {
-                    session: session.clone(),
-                    parent: Some(session),
-                }),
                 facts: HerdsmanFacts {
-                    managed_metadata: true,
-                    label: Some("implementer-1".into()),
                     run: Some("8f2b1c34-5d6e-4f70-8a91-2b3c4d5e6f71".into()),
                     state: Some(SemanticState::Idle),
                     ..Default::default()
                 },
-                registry: Some(crate::registry_observation::RegistryView {
+                registry: crate::registry_observation::RegistryView {
                     agent: serde_json::from_value(serde_json::json!({
                         "registration": {
                             "version": 1,
@@ -7095,7 +6944,7 @@ mod tests {
                         session: Some("01a10c77-8a6b-7035-8a0e-b1fa607bb507".into()),
                         ended: false,
                     }),
-                }),
+                },
             }],
         });
         state

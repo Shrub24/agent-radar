@@ -7,16 +7,20 @@
 //! [`App::apply_task_event`] — so the join, the child rows, the parent badge and
 //! the detail summary are exercised together rather than asserted apart.
 
+use std::collections::HashMap;
+
 use agent_radar::Target;
 use agent_radar::app::DetailPage;
 use agent_radar::config::Config;
 use agent_radar::control_plane::registry::PublicSpawnTopology;
 use agent_radar::focus;
 use agent_radar::model::{
-    AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Lineage, Location, Pane,
+    AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Location, Pane,
     RuntimeStatus, SessionIdentity, SessionUuid, Tab, Workspace,
 };
-use agent_radar::registry_observation::{self, RegistryAgent, RegistryRead, RegistryView};
+use agent_radar::registry_observation::{
+    self, RegistryAgent, RegistryRead, RegistryView, SpawnBinding,
+};
 use agent_radar::runtime::BackendIdentity;
 use agent_radar::tasks::{Task, TaskEvent, TaskState};
 use agent_radar::tree::{RowKind, TaskId, TaskProjection, TaskRow, TaskSource, TreeNode};
@@ -49,6 +53,8 @@ fn session(digit: char) -> &'static str {
 struct Agent<'a> {
     pane_id: &'a str,
     session: Option<&'a str>,
+    /// The session the parent row publishes, which the fixture turns into the
+    /// spawn edge that now carries parentage.
     parent: Option<&'a str>,
     /// The pane's unresolved task entries, as its own tokens publish them.
     tokens: &'a [&'a str],
@@ -87,13 +93,19 @@ impl<'a> Agent<'a> {
     }
 }
 
-/// A one-workspace observation: every agent in one tab, with the lineage it
-/// publishes and the task entries its pane tokens carry, and the panes the
-/// inventory reports beside them.
+/// A one-workspace observation: every agent in one tab, with the registration
+/// and spawn edge it carries and the task entries its pane tokens hold, and the
+/// panes the inventory reports beside them.
 fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
+    // Parentage is a spawn edge naming the parent's registration, and the
+    // fixture states it as the session the parent publishes.
+    let by_session: HashMap<&str, &str> = agents
+        .iter()
+        .filter_map(|agent| Some((agent.session?, agent.pane_id)))
+        .collect();
+    let pane_of = |session: &str| by_session.get(session).copied();
     FleetObservation {
         focus: Default::default(),
-        metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {
@@ -121,17 +133,11 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
             .iter()
             .map(|agent| AgentObservation {
                 location: location(agent.pane_id),
-                name: Some("pi".into()),
-                label: Some(format!("worker {}", agent.pane_id)),
                 status: Some(RuntimeStatus::Working),
                 session: agent
                     .session
                     .and_then(SessionUuid::parse)
                     .map(SessionIdentity::Uuid),
-                lineage: agent.session.map(|uuid| Lineage {
-                    session: SessionUuid::parse(uuid).expect("test UUID"),
-                    parent: agent.parent.and_then(SessionUuid::parse),
-                }),
                 facts: HerdsmanFacts {
                     background_running: agent.running,
                     background_tasks: agent
@@ -141,8 +147,9 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                         .collect(),
                     ..HerdsmanFacts::default()
                 },
-                registry: agent.session.map(|session| {
+                registry: {
                     let registration_id = format!("test-{}", agent.pane_id);
+                    let session = agent.session;
                     let mut registered = registration(
                         &registration_id,
                         json!({
@@ -179,13 +186,21 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                         }))
                         .expect("fresh registry context fixture"),
                     );
+                    registered.registration.label = Some(format!("worker {}", agent.pane_id));
                     RegistryView {
                         agent: registered,
                         binding: registry_observation::Binding::Joined,
-                        spawn: None,
+                        spawn: agent.parent.and_then(pane_of).map(|parent| SpawnBinding {
+                            parent: format!("test-{parent}"),
+                            request_id: format!("r-{}", agent.pane_id),
+                            claim_id: None,
+                            child_source: None,
+                            child_incarnation: None,
+                            state: agent_radar::control_plane::registry::SpawnState::Bound,
+                        }),
                         managed: None,
                     }
-                }),
+                },
             })
             .collect(),
     }
@@ -830,60 +845,6 @@ fn retained_token_facts_are_labelled_and_never_animate() {
     );
     assert!(tasks(&app, "wH:p1")[0].is_running());
     assert!(app.animates(), "a live running task animates");
-}
-
-/// Herdr metadata for `pane_id`: a Pi-owned record, managed by its owner, that
-/// the backend reports as containment evidence only.
-fn owner_metadata(pane_id: &str) -> AgentObservation {
-    AgentObservation {
-        location: location(pane_id),
-        name: Some("pi".into()),
-        label: Some("owner task".into()),
-        status: Some(RuntimeStatus::Working),
-        session: None,
-        lineage: None,
-        facts: HerdsmanFacts {
-            managed_metadata: true,
-            ..HerdsmanFacts::default()
-        },
-        registry: None,
-    }
-}
-
-/// A fleet whose only agent record is Herdr metadata, not a presented agent.
-fn metadata_only(metadata: Vec<AgentObservation>, panes: &[&str]) -> FleetObservation {
-    let mut observation = observation(&[], panes);
-    observation.metadata_agents = metadata;
-    observation
-}
-
-/// Metadata that appears and then vanishes while its pane survives must never
-/// become an agent row, retained or current. The pane it was recorded against
-/// still refuses a direct close: Radar cannot verify the occupant and has no owner
-/// to route the stop to, so the refusal names that rather than guessing.
-#[test]
-fn vanished_metadata_shows_no_row_and_its_pane_refuses_a_direct_close() {
-    let mut state = ObservationState::new();
-    state.apply_success(metadata_only(vec![owner_metadata("wH:p1")], &["wH:p1"]));
-    assert!(agent_node(&agents_view(&state).tree().roots, "wH:p1").is_none());
-
-    state.apply_success(metadata_only(Vec::new(), &["wH:p1"]));
-    assert!(
-        state.retained().is_empty(),
-        "metadata reached display continuity"
-    );
-    assert!(state.retained_containment().contains_key("wH:p1"));
-
-    let mut app = app_with_history(&state);
-    assert!(agent_node(&app.tree().roots, "wH:p1").is_none());
-    // Every pane shows, so the pane row is the close target.
-    while app.pane_view() != PaneView::All {
-        app.cycle_panes();
-    }
-    select(&mut app, &RowId::Pane("wH:p1".into()));
-    // A retained association still governs the target: the row is shown, so the
-    // place is present, and its eligibility is the shared target model's call.
-    assert!(app.selected_row().is_some());
 }
 
 /// Installs the configuration the presentation tests draw with, once per test
@@ -1875,7 +1836,6 @@ fn node_of<'a>(nodes: &'a [TreeNode], id: &RowId) -> Option<&'a TreeNode> {
 fn wa_inventory(pane_ids: &[&str]) -> FleetObservation {
     FleetObservation {
         focus: Default::default(),
-        metadata_agents: Vec::new(),
         containers: Vec::new(),
         lifecycle_subjects: Vec::new(),
         workspaces: vec![Workspace {

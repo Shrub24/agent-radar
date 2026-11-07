@@ -21,7 +21,7 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "`daemon.ping` result. Contract names remain strings so older clients can\npreserve and ignore names introduced by newer daemon builds.",
+  "description": "`daemon.ping` result.",
   "properties": {
     "backend": {
       "type": "string"

@@ -109,8 +109,6 @@
         "tab_id": "wA:t1",
         "pane_id": "wA:p1"
       },
-      "name": "pi",
-      "label": "fleet owner task",
       "status": "idle",
       "session": {
         "kind": "reported",
@@ -119,17 +117,10 @@
           "value": "/home/dev/.pi/agent/sessions/--home-dev-projects-alpha--/2026-09-01T10-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl"
         }
       },
-      "lineage": {
-        "session": "11111111-1111-4111-8111-111111111111",
-        "parent": null
-      },
       "facts": {
         "role": null,
-        "name": null,
         "definition": null,
-        "label": null,
         "run": null,
-        "managed_metadata": true,
         "request": null,
         "ask": null,
         "waiting_reason": null,
@@ -149,7 +140,38 @@
         "background_tasks": [],
         "background_started": null
       },
-      "registry": null
+      "registry": {
+        "agent": {
+          "registration": {
+            "version": 1,
+            "registration_id": "reg-wA:p1",
+            "registered_at": "2026-09-01T10:00:00.000Z",
+            "source": "pi",
+            "incarnation": "11111111-1111-4111-8111-222907922757",
+            "location": {
+              "backend": "tmux",
+              "workspace": "wA",
+              "tab": "wA:t1",
+              "pane": "wA:p1"
+            },
+            "process_claimed": false,
+            "launch": {
+              "available": false
+            }
+          },
+          "process": {
+            "claimed": false,
+            "claim": null,
+            "verification": "unavailable"
+          },
+          "execution": null,
+          "assignment": null,
+          "facts": null
+        },
+        "binding": "joined",
+        "spawn": null,
+        "managed": null
+      }
     },
     {
       "location": {
@@ -157,8 +179,6 @@
         "tab_id": "wA:t2",
         "pane_id": "wA:p2"
       },
-      "name": "pi",
-      "label": "worker task",
       "status": "working",
       "session": {
         "kind": "reported",
@@ -167,17 +187,10 @@
           "value": "/home/dev/.pi/agent/sessions/--home-dev-projects-beta--/2026-09-02T11-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl"
         }
       },
-      "lineage": {
-        "session": "22222222-2222-4222-8222-222222222222",
-        "parent": "11111111-1111-4111-8111-111111111111"
-      },
       "facts": {
         "role": null,
-        "name": null,
         "definition": null,
-        "label": null,
         "run": null,
-        "managed_metadata": true,
         "request": null,
         "ask": null,
         "waiting_reason": null,
@@ -197,7 +210,45 @@
         "background_tasks": [],
         "background_started": null
       },
-      "registry": null
+      "registry": {
+        "agent": {
+          "registration": {
+            "version": 1,
+            "registration_id": "reg-wA:p2",
+            "registered_at": "2026-09-01T10:00:00.000Z",
+            "source": "pi",
+            "incarnation": "11111111-1111-4111-8111-870264870037",
+            "location": {
+              "backend": "tmux",
+              "workspace": "wA",
+              "tab": "wA:t2",
+              "pane": "wA:p2"
+            },
+            "process_claimed": false,
+            "launch": {
+              "available": false
+            }
+          },
+          "process": {
+            "claimed": false,
+            "claim": null,
+            "verification": "unavailable"
+          },
+          "execution": null,
+          "assignment": null,
+          "facts": null
+        },
+        "binding": "joined",
+        "spawn": {
+          "parent": "reg-wA:p1",
+          "request_id": "req-wA:p2",
+          "subject_id": null,
+          "child_source": null,
+          "child_incarnation": null,
+          "state": "bound"
+        },
+        "managed": null
+      }
     },
     {
       "location": {
@@ -205,18 +256,12 @@
         "tab_id": "wA:t3",
         "pane_id": "wA:p5"
       },
-      "name": "radar-monitor",
-      "label": "monitor row",
       "status": "done",
       "session": null,
-      "lineage": null,
       "facts": {
         "role": null,
-        "name": null,
         "definition": null,
-        "label": null,
         "run": null,
-        "managed_metadata": false,
         "request": null,
         "ask": null,
         "waiting_reason": null,
@@ -236,7 +281,38 @@
         "background_tasks": [],
         "background_started": null
       },
-      "registry": null
+      "registry": {
+        "agent": {
+          "registration": {
+            "version": 1,
+            "registration_id": "reg-wA:p5",
+            "registered_at": "2026-09-01T10:00:00.000Z",
+            "source": "pi",
+            "incarnation": "11111111-1111-4111-8111-910034120575",
+            "location": {
+              "backend": "tmux",
+              "workspace": "wA",
+              "tab": "wA:t3",
+              "pane": "wA:p5"
+            },
+            "process_claimed": false,
+            "launch": {
+              "available": false
+            }
+          },
+          "process": {
+            "claimed": false,
+            "claim": null,
+            "verification": "unavailable"
+          },
+          "execution": null,
+          "assignment": null,
+          "facts": null
+        },
+        "binding": "joined",
+        "spawn": null,
+        "managed": null
+      }
     },
     {
       "location": {
@@ -244,21 +320,15 @@
         "tab_id": "wB:t1",
         "pane_id": "wB:p1"
       },
-      "name": "pi",
-      "label": "review task",
       "status": "idle",
       "session": {
         "kind": "uuid",
         "value": "55555555-5555-4555-8555-555555555555"
       },
-      "lineage": null,
       "facts": {
         "role": null,
-        "name": null,
         "definition": null,
-        "label": null,
         "run": null,
-        "managed_metadata": true,
         "request": null,
         "ask": null,
         "waiting_reason": null,
@@ -278,7 +348,38 @@
         "background_tasks": [],
         "background_started": null
       },
-      "registry": null
+      "registry": {
+        "agent": {
+          "registration": {
+            "version": 1,
+            "registration_id": "reg-wB:p1",
+            "registered_at": "2026-09-01T10:00:00.000Z",
+            "source": "pi",
+            "incarnation": "11111111-1111-4111-8111-954403598411",
+            "location": {
+              "backend": "tmux",
+              "workspace": "wB",
+              "tab": "wB:t1",
+              "pane": "wB:p1"
+            },
+            "process_claimed": false,
+            "launch": {
+              "available": false
+            }
+          },
+          "process": {
+            "claimed": false,
+            "claim": null,
+            "verification": "unavailable"
+          },
+          "execution": null,
+          "assignment": null,
+          "facts": null
+        },
+        "binding": "joined",
+        "spawn": null,
+        "managed": null
+      }
     }
   ]
 }

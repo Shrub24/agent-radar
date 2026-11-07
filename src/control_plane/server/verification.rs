@@ -382,7 +382,7 @@ pub(super) fn bounded_close_dispatch(
         stopping,
         deadline,
         "radar-child-close-dispatch",
-        move || backend.close_outcome(&target, &cancel),
+        move || backend.close(&target, &cancel),
     )
 }
 

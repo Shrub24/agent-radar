@@ -78,7 +78,6 @@ pub struct ObservationProjection {
     #[serde(default)]
     pub registry: ObservationFreshness,
     pub retained: BTreeMap<String, RetainedObservation>,
-    pub containment: BTreeMap<String, RetainedObservation>,
     pub awaiting_evidence: BTreeSet<String>,
     pub foreground: BTreeMap<String, ForegroundEvidence>,
 }
@@ -238,11 +237,6 @@ impl From<&ObservationState> for ObservationProjection {
             registry: state.registry_freshness().into(),
             retained: state
                 .retained()
-                .iter()
-                .map(|(pane, retained)| (pane.clone(), retained.into()))
-                .collect(),
-            containment: state
-                .retained_containment()
                 .iter()
                 .map(|(pane, retained)| (pane.clone(), retained.into()))
                 .collect(),

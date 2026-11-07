@@ -7,44 +7,12 @@
           "$ref": "#/$defs/HerdsmanFacts",
           "description": "What Herdsman publishes about this agent. Empty unless the source\npublished metadata; never inferred from runtime facts."
         },
-        "label": {
-          "description": "Reported display label (the stripped terminal title), if any.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "lineage": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Lineage"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Explicit ownership lineage; `None` unless valid UUID tokens were supplied."
-        },
         "location": {
           "$ref": "#/$defs/Location"
         },
-        "name": {
-          "description": "Reported agent name (for example `\"pi\"`), if any.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "registry": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RegistryView"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The daemon's registration for this agent, with how it binds to a pane.\n`None` for an agent the registry does not know, and for every agent when\nno registry is read. A registration that names a pane protects that pane\neven when unjoined."
+          "$ref": "#/$defs/RegistryView",
+          "description": "The daemon's registration for this agent, with how it binds to a pane. A\nregistration that names a pane protects that pane even when unjoined."
         },
         "session": {
           "anyOf": [
@@ -71,7 +39,8 @@
       },
       "required": [
         "location",
-        "facts"
+        "facts",
+        "registry"
       ],
       "type": "object"
     },
@@ -530,7 +499,7 @@
       "description": "One successful inventory: workspaces, tabs, panes, reported agents and\ndaemon lifecycle subjects not represented by a joined agent row.",
       "properties": {
         "agents": {
-          "description": "The agents this observation presents as facts. The collector sets these\nfrom the registry; a backend's own metadata records never land here.",
+          "description": "The agents this observation presents as facts, projected from the\nregistry read.",
           "items": {
             "$ref": "#/$defs/AgentObservation"
           },
@@ -550,13 +519,6 @@
           "description": "Public lifecycle records from the same daemon read as agent facts. The\ntree suppresses subjects already represented by a joined agent row.",
           "items": {
             "$ref": "#/$defs/LifecycleObservation"
-          },
-          "type": "array"
-        },
-        "metadata_agents": {
-          "description": "Agent records a backend reads from pane metadata. They are physical\nevidence that protects a pane from unmanaged control, and are never\npresented as agent facts.",
-          "items": {
-            "$ref": "#/$defs/AgentObservation"
           },
           "type": "array"
         },
@@ -830,13 +792,6 @@
             "null"
           ]
         },
-        "label": {
-          "description": "A managed worker's runtime label: the name its owner and its siblings\nuse for it, and the only faithful source for a worker's name. The backend's\nown agent name truncates it and its title welds it to the task.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "last_outcome": {
           "description": "The owner's last outcome for the assignment, as it published it.",
           "type": [
@@ -844,19 +799,8 @@
             "null"
           ]
         },
-        "managed_metadata": {
-          "description": "Whether this pane's tokens carried any `pi_herdsman_*` key.\n\nPresence, not readability: the owner's metadata is what makes a Pi pane\nmanaged, so a key whose value this build cannot read still counts. The\ndecoder sets this at the adapter boundary, where the raw token map is,\nbecause the named fields below discard keys this version does not know.",
-          "type": "boolean"
-        },
         "model": {
           "description": "The session's model identity as published, provider prefix included.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "name": {
-          "description": "A lead's published session name.",
           "type": [
             "string",
             "null"
@@ -922,7 +866,6 @@
         }
       },
       "required": [
-        "managed_metadata",
         "awaited",
         "background_tasks"
       ],
@@ -977,28 +920,6 @@
       "required": [
         "subject_id",
         "state"
-      ],
-      "type": "object"
-    },
-    "Lineage": {
-      "description": "Explicit ownership lineage from `pi_herdsman_session` /\n`pi_herdsman_parent_session` UUID metadata.\n\nUsed only for ownership joins (worker → owner). Lineage is never used as\nsession identity, and absent or malformed tokens yield no lineage at all.",
-      "properties": {
-        "parent": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SessionUuid"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "session": {
-          "$ref": "#/$defs/SessionUuid"
-        }
-      },
-      "required": [
-        "session"
       ],
       "type": "object"
     },
@@ -1237,12 +1158,6 @@
           "type": "array",
           "uniqueItems": true
         },
-        "containment": {
-          "additionalProperties": {
-            "$ref": "#/$defs/RetainedObservation"
-          },
-          "type": "object"
-        },
         "foreground": {
           "additionalProperties": {
             "$ref": "#/$defs/ForegroundEvidence"
@@ -1286,7 +1201,6 @@
       "required": [
         "source",
         "retained",
-        "containment",
         "awaiting_evidence",
         "foreground"
       ],
@@ -1985,10 +1899,6 @@
         },
         "incarnation": {
           "type": "string"
-        },
-        "launch_identity": {
-          "description": "Read from records and requests that predate session-bound management, and\nnever written or served: the execution a session belongs to is its\nattached subject, not a marker a process presents.",
-          "writeOnly": true
         },
         "lease_ms": {
           "format": "int64",

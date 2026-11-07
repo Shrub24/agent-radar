@@ -146,13 +146,13 @@ impl DaemonRuntime {
                 PROTOCOL_VERSION
             ));
         }
-        // The daemon and this build ship together; only a daemon that outlived an
-        // install is older, and it is told apart by one number, not a name list.
-        if revision.is_none_or(|revision| revision < u64::from(ops::PROTOCOL_REVISION)) {
+        // The daemon and this build ship together, so they speak one revision; a
+        // daemon of any other revision outlived an install or preceded one.
+        if revision != Some(u64::from(ops::PROTOCOL_REVISION)) {
             let revision =
                 revision.map_or_else(|| "no revision".to_string(), |r| format!("revision {r}"));
             return Err(format!(
-                "the control daemon at {} is older than this build ({revision}, needs {}); \
+                "the control daemon at {} is not this build's ({revision}, needs {}); \
                  restart it with `systemctl --user restart radar-daemon`",
                 socket.display(),
                 ops::PROTOCOL_REVISION
@@ -283,15 +283,7 @@ impl RuntimeProvider for DaemonRuntime {
             .map_or(ForegroundEvidence::Inconclusive, |read| read.evidence)
     }
 
-    fn focus(&self, target: &Target, cancel: &AtomicBool) -> Result<(), String> {
-        match self.focus_outcome(target, cancel) {
-            FocusOutcome::Completed => Ok(()),
-            FocusOutcome::NoClient => Err(crate::runtime::NO_CLIENT.into()),
-            FocusOutcome::Refused(message) | FocusOutcome::Unknown(message) => Err(message),
-        }
-    }
-
-    fn focus_outcome(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
+    fn focus(&self, target: &Target, cancel: &AtomicBool) -> FocusOutcome {
         let (id, kind) = match target {
             Target::Pane(id) => (id, "pane"),
             Target::Workspace(id) => (id, "workspace"),
@@ -306,14 +298,7 @@ impl RuntimeProvider for DaemonRuntime {
         }
     }
 
-    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> Result<(), String> {
-        match self.close_outcome(target, cancel) {
-            CloseOutcome::Completed => Ok(()),
-            CloseOutcome::Refused(message) | CloseOutcome::Unknown(message) => Err(message),
-        }
-    }
-
-    fn close_outcome(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
+    fn close(&self, target: &CloseTarget, cancel: &AtomicBool) -> CloseOutcome {
         // The daemon closes only against a frozen identity, and this is where the
         // request gets one: this client's own fresh observation. The daemon then
         // re-observes and applies its containment checks, so a target replaced in

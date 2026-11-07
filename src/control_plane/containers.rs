@@ -987,7 +987,6 @@ mod tests {
                 current_path: None,
             }],
             agents: Vec::new(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
         };

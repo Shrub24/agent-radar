@@ -78,14 +78,11 @@ pub struct ObservationState {
     /// failure: the fleet was not what was unreadable.
     #[serde(default)]
     registry: SourceFreshness,
-    /// Display continuity: retained presented agents keyed by connector-scoped
-    /// pane id. Invariant maintained by the transitions: every retained pane
-    /// exists in the inventory and has no presented agent reported on it.
+    /// Continuity: retained agents keyed by connector-scoped pane id, for
+    /// display and for close containment. Invariant maintained by the
+    /// transitions: every retained pane exists in the inventory and has no agent
+    /// reported on it.
     retained: BTreeMap<String, RetainedAgent>,
-    /// Close containment: the same retention over every agent record, presented
-    /// or pane metadata. Never displayed, so a vanished metadata record keeps
-    /// its pane protected without becoming a row.
-    containment: BTreeMap<String, RetainedAgent>,
     /// Retained panes that have not yet been evidence-queried this cycle;
     /// rebuilt on every successful inventory, drained by [`Self::apply_evidence`].
     awaiting_evidence: BTreeSet<String>,
@@ -113,8 +110,6 @@ impl ObservationState {
     ///   again, or whose session is reported on any current pane is cleared;
     /// - source freshness becomes [`SourceFreshness::Current`].
     ///
-    /// Display continuity reads presented agents only. Containment reads every
-    /// record, so pane metadata that vanishes still protects its pane.
     pub fn apply_success(&mut self, observation: FleetObservation) {
         let previous = self.inventory.take();
 
@@ -124,19 +119,8 @@ impl ObservationState {
             observation.agents.iter(),
             &observation,
         );
-        self.containment = reconcile(
-            std::mem::take(&mut self.containment),
-            previous.iter().flat_map(|p| p.all_agents()),
-            observation.all_agents(),
-            &observation,
-        );
 
-        self.awaiting_evidence = self
-            .retained
-            .keys()
-            .chain(self.containment.keys())
-            .cloned()
-            .collect();
+        self.awaiting_evidence = self.retained.keys().cloned().collect();
         // Evidence belongs to the inventory that was just replaced: a pane that
         // is gone takes its process with it, and the refresh re-queries what is
         // left.
@@ -207,20 +191,15 @@ impl ObservationState {
         match evidence {
             ForegroundEvidence::NonShell { .. } => {
                 self.retained.remove(pane_id);
-                self.containment.remove(pane_id);
             }
             ForegroundEvidence::Shell => {
-                for map in [&mut self.retained, &mut self.containment] {
-                    if let Some(entry) = map.get_mut(pane_id) {
-                        entry.basis = RetentionBasis::ShellForeground;
-                    }
+                if let Some(entry) = self.retained.get_mut(pane_id) {
+                    entry.basis = RetentionBasis::ShellForeground;
                 }
             }
             ForegroundEvidence::Inconclusive => {
-                for map in [&mut self.retained, &mut self.containment] {
-                    if let Some(entry) = map.get_mut(pane_id) {
-                        entry.basis = RetentionBasis::Unverified;
-                    }
+                if let Some(entry) = self.retained.get_mut(pane_id) {
+                    entry.basis = RetentionBasis::Unverified;
                 }
             }
         }
@@ -256,26 +235,15 @@ impl ObservationState {
                 .into_iter()
                 .map(|(pane, retained)| (pane, retained.into()))
                 .collect(),
-            containment: public
-                .containment
-                .into_iter()
-                .map(|(pane, retained)| (pane, retained.into()))
-                .collect(),
             awaiting_evidence: public.awaiting_evidence,
             foreground: public.foreground,
         }
     }
 
-    /// Retained presented agents keyed by pane id, for display (empty when
-    /// nothing is retained). Pane metadata never appears here.
+    /// Retained agents keyed by pane id, for display and for close containment
+    /// (empty when nothing is retained).
     pub fn retained(&self) -> &BTreeMap<String, RetainedAgent> {
         &self.retained
-    }
-
-    /// Retained associations for close containment, keyed by pane id. Read by
-    /// the close guard only; a display must use [`Self::retained`].
-    pub fn retained_containment(&self) -> &BTreeMap<String, RetainedAgent> {
-        &self.containment
     }
 
     /// The pane ids the current inventory reports, which is what a whole-fleet
@@ -321,7 +289,8 @@ impl ObservationState {
         if let Some(inventory) = &self.inventory {
             candidates.extend(
                 inventory
-                    .all_agents()
+                    .agents
+                    .iter()
                     .map(|agent| agent.location.pane_id.clone()),
             );
         }
@@ -389,11 +358,7 @@ fn reconcile<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Lineage, Location, RuntimeStatus, SessionIdentity, SessionUuid};
-
-    fn uuid(value: &str) -> SessionUuid {
-        SessionUuid::parse(value).expect("test UUID")
-    }
+    use crate::model::{Location, RuntimeStatus};
 
     fn reported(value: &str) -> SessionIdentity {
         SessionIdentity::Reported {
@@ -413,23 +378,16 @@ mod tests {
                 tab_id: "wA:t1".into(),
                 pane_id: pane_id.into(),
             },
-            name: Some("pi".into()),
-            label: Some("fleet owner task".into()),
             status: Some(status),
             session,
-            lineage: Some(Lineage {
-                session: uuid("11111111-1111-4111-8111-111111111111"),
-                parent: None,
-            }),
             facts: crate::model::HerdsmanFacts::default(),
-            registry: None,
+            registry: crate::registry_observation::RegistryView::test_joined("test-wA:p1", "wA:p1"),
         }
     }
 
     fn observation(pane_ids: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
         FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: vec![],

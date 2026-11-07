@@ -1573,7 +1573,6 @@ fn context_request(
         observed_at: None,
         context: ContextValue {
             session: session.map(str::to_string),
-            launch_identity: None,
         },
     }
 }

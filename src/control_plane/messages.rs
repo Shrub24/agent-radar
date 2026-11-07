@@ -116,7 +116,7 @@ impl MessageStore {
             writes: Mutex::new(()),
             index: RwLock::new(BTreeMap::new()),
         };
-        store.reject_legacy_records()?;
+        store.refuse_unknown_records()?;
         store
             .load()
             .map_err(|error| format!("message store {}: {error:?}", store.root.display()))?;
@@ -441,10 +441,12 @@ impl MessageStore {
         self.index.write().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn reject_legacy_records(&self) -> Result<(), String> {
+    /// Refuses a store holding a file this build does not write, rather than
+    /// serving around it.
+    fn refuse_unknown_records(&self) -> Result<(), String> {
         let entries = fs::read_dir(&self.root)
             .map_err(|error| format!("message store {}: {error}", self.root.display()))?;
-        let mut legacy = Vec::new();
+        let mut unknown = Vec::new();
         for entry in entries {
             let entry =
                 entry.map_err(|error| format!("message store {}: {error}", self.root.display()))?;
@@ -454,18 +456,18 @@ impl MessageStore {
                 continue;
             }
             if parse_message_file(name).is_none() && parse_receipt_file(name).is_none() {
-                legacy.push(name.to_owned());
+                unknown.push(name.to_owned());
             }
         }
-        if legacy.is_empty() {
+        if unknown.is_empty() {
             return Ok(());
         }
-        legacy.sort();
+        unknown.sort();
         Err(format!(
-            "message store {} holds {} record(s) from the retired handoff mailbox, starting with `{}`: drain them with the previous daemon or remove the directory before starting this daemon",
+            "message store {} holds {} file(s) this build does not write, starting with `{}`",
             self.root.display(),
-            legacy.len(),
-            legacy[0]
+            unknown.len(),
+            unknown[0]
         ))
     }
 
@@ -768,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn a_retired_mailbox_is_refused_rather_than_migrated() {
+    fn a_store_holding_a_file_this_build_does_not_write_is_refused() {
         let state = std::env::temp_dir().join(format!(
             "radar-messages-{}",
             crate::control_plane::store::random_uuid()
@@ -777,10 +779,10 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(format!("{M1}.json")), b"{}").unwrap();
         let error = match MessageStore::open(&state) {
-            Ok(_) => panic!("legacy records were accepted"),
+            Ok(_) => panic!("an unknown file was accepted"),
             Err(error) => error,
         };
-        assert!(error.contains("retired handoff mailbox"), "{error}");
+        assert!(error.contains(&format!("{M1}.json")), "{error}");
     }
 
     #[test]

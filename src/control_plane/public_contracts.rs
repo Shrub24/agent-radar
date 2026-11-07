@@ -118,8 +118,7 @@ pub struct Attention {
     pub pending: u64,
 }
 
-/// `daemon.ping` result. Contract names remain strings so older clients can
-/// preserve and ignore names introduced by newer daemon builds.
+/// `daemon.ping` result.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PingResult {
     pub protocol: u32,

@@ -26,33 +26,33 @@ Radar SHALL keep reported session identity, runtime location, lifecycle and opti
 - **WHEN** the backend reports an idle agent without semantic control metadata
 - **THEN** Radar exposes runtime idle without claiming assignment delivery, availability for new work or safe lifecycle actions
 
-#### Scenario: Explicit lineage
-- **WHEN** records contain unambiguous explicit session and parent-session UUIDs
-- **THEN** Radar exposes that ownership link without equating a pane ID or session file path with either UUID
+#### Scenario: An owner link
+- **WHEN** the registry holds a spawn edge naming the parent execution's registration
+- **THEN** Radar nests the child under that row and equates no pane ID or session file path with a parent link
 
-#### Scenario: No lineage metadata
-- **WHEN** an agent record contains no explicit ownership identity
+#### Scenario: No owner link
+- **WHEN** no spawn edge names an unambiguous parent for an agent
 - **THEN** ownership remains unavailable rather than inferred from the agent's tab or workspace
 
 ### Requirement: Herdsman pane-metadata facts are kept distinct from runtime facts
 
-Radar SHALL read the Herdsman facts reported as pane metadata — the agent's role, a managed worker's runtime label, the owner's projected state, the active assignment with its display text and start time, the run, request and pending-ask identities, and a lead's published name — and SHALL keep them distinct from runtime facts.
+Radar SHALL read the owner-published facts a registration carries — the agent's role and definition, a managed worker's runtime label, the owner's projected state, the active assignment with its display text and start time, the run, request and pending-ask identities, and a lead's published name — and SHALL keep them distinct from runtime facts. A backend's own agent records SHALL NOT become agent facts.
 
 #### Scenario: An owner-projected state
 - **WHEN** the metadata carries `pi_herdsman_state` and the backend reports its own lifecycle status for the same agent
 - **THEN** Radar presents the state derived from the pane as the agent's state and the owner's projection as its assignment state, exposing both
 
 #### Scenario: A worker's runtime label
-- **WHEN** the metadata carries `pi_herdsman_label`
-- **THEN** Radar exposes it as the worker's name and does not read the backend's own truncated agent name or its task-bearing title as a name
+- **WHEN** a registration carries a label
+- **THEN** Radar exposes it as the row's name and does not read the backend's own truncated agent name or its task-bearing title as a name
 
 #### Scenario: Assignment facts
 - **WHEN** a worker's metadata carries an active assignment with its display text and a start time
 - **THEN** Radar exposes the assignment and an age measured from that start time, and exposes no age for an agent that has no start time
 
-#### Scenario: Lineage from pane metadata
-- **WHEN** a record carries exact session and parent-session identities
-- **THEN** ownership is taken from those identities, and the human session name is never used as an identity
+#### Scenario: Ownership from a spawn edge
+- **WHEN** the registry holds a spawn edge naming a parent execution's registration
+- **THEN** ownership is taken from that edge, and neither the human session name nor the pane's title is used as an identity
 
 ### Requirement: Awaited and background facts are one set published twice
 
@@ -76,7 +76,7 @@ Radar SHALL read what the pane is awaiting, the background tasks it reports, and
 
 ### Requirement: Unrecognised and absent metadata values
 
-A value this version does not recognise SHALL be preserved rather than dropped or coerced. A value absent from the metadata SHALL stay unavailable: the backend's own agent name and title SHALL NOT be read as Herdsman facts.
+A value this version does not recognise SHALL be preserved rather than dropped or coerced. A value absent from the registration SHALL stay unavailable: a backend's own agent record and a pane's title SHALL NOT be read as owner facts.
 
 #### Scenario: An unrecognised state value
 - **WHEN** the metadata publishes a state value this version does not know

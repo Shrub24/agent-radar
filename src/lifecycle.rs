@@ -10,10 +10,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AgentObservation, FleetObservation, Lineage, SessionIdentity};
+use crate::model::{AgentObservation, FleetObservation, SessionIdentity};
 use crate::observation::RetainedAgent;
 use crate::runtime::CloseTarget;
-use crate::theme;
 
 /// Whether a location is known to be outside Pi Herdsman's ownership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +52,8 @@ pub fn pane(
     // Every record on the pane counts, presented or metadata, and the strictest
     // answer wins. No record at all is positive unmanaged evidence.
     inventory
-        .all_agents()
+        .agents
+        .iter()
         .filter(|agent| agent.location.pane_id == pane_id)
         .map(agent_containment)
         .fold(Containment::Unmanaged, stricter)
@@ -101,30 +101,11 @@ pub fn target(inventory: &FleetObservation, target: &CloseTarget) -> Containment
     }
 }
 
-/// The containment of the agent recorded on a pane.
-fn agent_containment(agent: &AgentObservation) -> Containment {
-    // Any owner metadata makes the pane managed, whether or not this build can
-    // read the key: presence is the signal, absence is unknown.
-    if is_protected(agent) {
-        return Containment::Managed;
-    }
-    match agent.name.as_deref() {
-        // Pi without owner metadata is unverified, never unmanaged.
-        Some(name) if name.eq_ignore_ascii_case("pi") => Containment::Uncertain,
-        // A vendor Radar ships a mark for is a kind Pi Herdsman never manages.
-        Some(name) if theme::shipped_agent(name) => Containment::Unmanaged,
-        // A kind Radar cannot place is never guessed unmanaged.
-        _ => Containment::Uncertain,
-    }
-}
-
-/// Whether the pane's agent is protected from unmanaged control: owner metadata
-/// was published, or the daemon's registry knows an agent on this location.
-///
-/// A registration counts even unjoined, so a pane never becomes an unmanaged
-/// close target because its evidence is missing or ambiguous.
-fn is_protected(agent: &AgentObservation) -> bool {
-    agent.facts.managed_metadata || agent.registry.is_some()
+/// The containment of the registration on a pane: a registration protects the
+/// place it occupies even when it has not joined a pane, so a pane naming one is
+/// never an unmanaged close target.
+fn agent_containment(_agent: &AgentObservation) -> Containment {
+    Containment::Managed
 }
 
 /// The stricter of two answers: managed beats uncertain beats unmanaged.
@@ -150,16 +131,13 @@ pub struct CloseRequest {
 
 /// What was observed on a pane, normalized for identity comparison.
 ///
-/// Only identity-bearing fields: the agent kind, its session, its ownership
-/// lineage and its owner-published label and run. Display titles are
-/// deliberately absent, so a cosmetic retitle is not a new occupant.
+/// Only identity-bearing fields: the registration and its owner-published run.
+/// Display titles are deliberately absent, so a cosmetic retitle is not a new
+/// occupant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentIdentity {
-    pub name: Option<String>,
+    pub registration_id: String,
     pub session: Option<SessionIdentity>,
-    pub lineage: Option<Lineage>,
-    pub managed: bool,
-    pub label: Option<String>,
     pub run: Option<String>,
 }
 
@@ -244,7 +222,8 @@ fn pane_identity(inventory: &FleetObservation, pane_id: &str) -> PaneIdentity {
     PaneIdentity {
         pane_id: pane_id.to_string(),
         occupant: inventory
-            .all_agents()
+            .agents
+            .iter()
             .find(|agent| agent.location.pane_id == pane_id)
             .map(registration_identity),
     }
@@ -252,11 +231,8 @@ fn pane_identity(inventory: &FleetObservation, pane_id: &str) -> PaneIdentity {
 
 fn registration_identity(agent: &AgentObservation) -> AgentIdentity {
     AgentIdentity {
-        name: agent.name.clone(),
+        registration_id: agent.registry.agent.registration.registration_id.clone(),
         session: agent.session.clone(),
-        lineage: agent.lineage.clone(),
-        managed: is_protected(agent),
-        label: agent.facts.label.clone(),
         run: agent.facts.run.clone(),
     }
 }
@@ -285,26 +261,22 @@ mod tests {
         }
     }
 
-    fn agent(pane_id: &str, name: Option<&str>, managed: bool) -> AgentObservation {
+    fn agent(pane_id: &str) -> AgentObservation {
         AgentObservation {
             location: location(pane_id),
-            name: name.map(str::to_string),
-            label: None,
             status: None,
             session: None,
-            lineage: None,
-            facts: HerdsmanFacts {
-                managed_metadata: managed,
-                ..HerdsmanFacts::default()
-            },
-            registry: None,
+            facts: HerdsmanFacts::default(),
+            registry: crate::registry_observation::RegistryView::test_joined(
+                &format!("test-{pane_id}"),
+                pane_id,
+            ),
         }
     }
 
     fn inventory(panes: &[&str], agents: Vec<AgentObservation>) -> FleetObservation {
         FleetObservation {
             focus: Default::default(),
-            metadata_agents: Vec::new(),
             containers: Vec::new(),
             lifecycle_subjects: Vec::new(),
             workspaces: Vec::new(),
@@ -342,52 +314,21 @@ mod tests {
     }
 
     #[test]
-    fn a_non_pi_known_agent_is_unmanaged() {
-        let inventory = inventory(&["wA:p1"], vec![agent("wA:p1", Some("claude"), false)]);
-        assert_eq!(pane(&inventory, &none(), "wA:p1"), Containment::Unmanaged);
-    }
-
-    #[test]
-    fn a_pi_pane_without_metadata_is_uncertain() {
-        let inventory = inventory(&["wA:p1"], vec![agent("wA:p1", Some("pi"), false)]);
-        assert_eq!(pane(&inventory, &none(), "wA:p1"), Containment::Uncertain);
-    }
-
-    #[test]
-    fn pi_metadata_marks_a_pane_managed() {
-        let inventory = inventory(&["wA:p1"], vec![agent("wA:p1", Some("pi"), true)]);
+    fn a_registered_agent_on_a_pane_is_managed() {
+        let inventory = inventory(&["wA:p1"], vec![agent("wA:p1")]);
         assert_eq!(pane(&inventory, &none(), "wA:p1"), Containment::Managed);
-    }
-
-    #[test]
-    fn an_unrecognized_agent_kind_is_never_unmanaged() {
-        let inventory = inventory(&["wA:p1"], vec![agent("wA:p1", Some("mystery"), false)]);
-        assert_eq!(pane(&inventory, &none(), "wA:p1"), Containment::Uncertain);
-    }
-
-    #[test]
-    fn an_agent_without_a_kind_is_uncertain() {
-        let inventory = inventory(&["wA:p1"], vec![agent("wA:p1", None, false)]);
-        assert_eq!(pane(&inventory, &none(), "wA:p1"), Containment::Uncertain);
     }
 
     #[test]
     fn a_retained_managed_association_forbids_a_direct_close() {
         let inventory = inventory(&["wA:p1"], Vec::new());
-        let retained = retained(agent("wA:p1", Some("pi"), true));
+        let retained = retained(agent("wA:p1"));
         assert_eq!(pane(&inventory, &retained, "wA:p1"), Containment::Managed);
     }
 
     #[test]
-    fn a_retained_uncertain_association_forbids_a_direct_close() {
-        let inventory = inventory(&["wA:p1"], Vec::new());
-        let retained = retained(agent("wA:p1", Some("pi"), false));
-        assert_eq!(pane(&inventory, &retained, "wA:p1"), Containment::Uncertain);
-    }
-
-    #[test]
     fn a_mixed_tab_is_refused_whole() {
-        let inventory = inventory(&["wA:p1", "wA:p2"], vec![agent("wA:p1", Some("pi"), true)]);
+        let inventory = inventory(&["wA:p1", "wA:p2"], vec![agent("wA:p1")]);
         assert_eq!(tab(&inventory, &none(), "wA:t1"), Containment::Managed);
     }
 
@@ -405,7 +346,7 @@ mod tests {
     }
 
     /// A pane whose only evidence is a registration that did not join: no
-    /// pane metadata, no lineage, no label.
+    /// backend agent record and nothing on the pane itself.
     fn registered_only_inventory() -> FleetObservation {
         let mut observation = inventory(&["wA:p1"], Vec::new());
         let agent: crate::registry_observation::RegistryAgent = serde_json::from_value(json!({

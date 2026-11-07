@@ -11,7 +11,7 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { RADAR_MAX_LINE_BYTES, RADAR_MINIMUM_REVISION, createRadarClient, type RadarClient, type RadarClientOptions, type RadarSocket, untrustedControlSocket, watchRadarEvents } from "./radar-client.ts";
+import { RADAR_MAX_LINE_BYTES, RADAR_WIRE_REVISION, createRadarClient, type RadarClient, type RadarClientOptions, type RadarSocket, untrustedControlSocket, watchRadarEvents } from "./radar-client.ts";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
 const UUID_B = "22222222-2222-4222-8222-222222222222";
@@ -86,12 +86,9 @@ const reply = (request: any, result: unknown): string => {
 		instance: null,
 		tasks: { available: false, error: null },
 		...fields,
-		// Most tests exercise ordinary current daemons; old-revision cases use
-		// rawReply so the handshake gate remains explicitly covered.
-		revision:
-			typeof fields.revision === "number" && fields.revision < RADAR_MINIMUM_REVISION
-				? RADAR_MINIMUM_REVISION
-				: fields.revision,
+		// A fake daemon is this build's unless the test builds a raw reply to make
+		// the handshake gate the thing under test.
+		revision: RADAR_WIRE_REVISION,
 	});
 };
 
@@ -756,7 +753,7 @@ test("spawn carries validated Radar-owned launch metadata in the durable request
 		if (request.method === "daemon.ping")
 			return reply(request, {
 				protocol: 2,
-				revision: RADAR_MINIMUM_REVISION,
+				revision: RADAR_WIRE_REVISION,
 				contracts: ["registry.v1", "spawn.v1"],
 			});
 		assert.equal(request.method, "spawn.create");
@@ -912,7 +909,7 @@ test("an untrusted control socket is refused without dialling", async () => {
 	}
 });
 
-test("daemon.ping requires protocol 2, the minimum revision, and registry.v1", async () => {
+test("daemon.ping requires protocol 2, this build's wire revision, and registry.v1", async () => {
 	const answers = [
 		(request: any) =>
 			reply(request, { protocol: 1, revision: 1, contracts: ["registry.v1"] }),
@@ -926,14 +923,14 @@ test("daemon.ping requires protocol 2, the minimum revision, and registry.v1", a
 			rawReply(request, {
 				protocol: 2,
 				backend: "sqlite",
-				revision: RADAR_MINIMUM_REVISION - 1,
+				revision: RADAR_WIRE_REVISION - 1,
 				contracts: ["registry.v1", "future.contract.v9"],
 			}),
 		(request: any) =>
 			reply(request, {
 				protocol: 2,
 				backend: "sqlite",
-				revision: 1,
+				revision: RADAR_WIRE_REVISION + 1,
 				contracts: ["registry.v1", "future.contract.v9"],
 			}),
 	];
@@ -947,18 +944,17 @@ test("daemon.ping requires protocol 2, the minimum revision, and registry.v1", a
 		const oldRevision = await client.ping();
 		assert.equal(oldRevision.ok, false);
 		assert.match(oldRevision.ok ? "" : oldRevision.message, /restart radar-daemon/);
-		// Revision 3 served managed lifecycle but no Pi presence, so a session on it
-		// would be accepted and then never gain a subject.
-		const presenceless = await client.ping();
-		assert.equal(presenceless.ok, false);
-		assert.match(presenceless.ok ? "" : presenceless.message, /revision 13/);
+		// A newer daemon is outlived by this install just as an older one is.
+		const newer = await client.ping();
+		assert.equal(newer.ok, false);
+		assert.match(newer.ok ? "" : newer.message, /restart radar-daemon/);
 		const capable = await client.ping();
 		assert.deepEqual(capable, {
 			ok: true,
 			value: {
 				protocol: 2,
 				backend: "sqlite",
-				revision: RADAR_MINIMUM_REVISION,
+				revision: RADAR_WIRE_REVISION,
 				instance: null,
 				contracts: ["registry.v1", "future.contract.v9"],
 				tasks: { available: false, error: null },
@@ -973,7 +969,7 @@ test("a mailbox page returns stable IDs and rejects malformed IDs", async () => 
 	let malformed = false;
 	const fixture = makeFixture((request) => {
 		if (request.method === "daemon.ping")
-			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["communication.messages.v1"] });
+			return reply(request, { protocol: 2, revision: RADAR_WIRE_REVISION, contracts: ["communication.messages.v1"] });
 		return reply(request, { message_ids: [malformed ? "not-a-uuid" : UUID_A], next: null });
 	});
 	try {
@@ -998,7 +994,7 @@ test("message content and receipts decode the claim identity without execution o
 	const receipt = { version: 1, message_id: UUID_A, recipient: identity, received_at_unix_ms: 2 };
 	const fixture = makeFixture((request) => {
 		if (request.method === "daemon.ping")
-			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["communication.messages.v1"] });
+			return reply(request, { protocol: 2, revision: RADAR_WIRE_REVISION, contracts: ["communication.messages.v1"] });
 		return reply(request, request.method === "communication.get" ? { message, receipt } : { receipt, created: true });
 	});
 	try {
@@ -1013,7 +1009,7 @@ test("message content and receipts decode the claim identity without execution o
 
 test("message contract absence disables only message calls", async () => {
 	const fixture = makeFixture((request) =>
-		reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["registry.v1"] }),
+		reply(request, { protocol: 2, revision: RADAR_WIRE_REVISION, contracts: ["registry.v1"] }),
 	);
 	try {
 		await listen(fixture);
@@ -1506,7 +1502,7 @@ test("the context answer reports Radar's standing on the session when it names o
 				? { state: "managed", subject_id: subjectId }
 				: session === DUPLICATE_SESSION
 					? { state: "duplicate" }
-					: undefined;
+					: { state: "unmanaged" };
 		return reply(request, {
 			writer: {
 				handle: FIXTURE_WRITER,
@@ -1531,16 +1527,15 @@ test("the context answer reports Radar's standing on the session when it names o
 				context: { session },
 			});
 		const managed = await publish(1, UUID_B);
-		assert.equal(managed.ok && managed.value.management?.state, "managed");
+		assert.equal(managed.ok && managed.value.management.state, "managed");
 		assert.deepEqual(managed.ok && managed.value.management, {
 			state: "managed",
 			subject_id: subjectId,
 		});
 		const duplicate = await publish(2, DUPLICATE_SESSION);
 		assert.deepEqual(duplicate.ok && duplicate.value.management, { state: "duplicate" });
-		// An answer that names no standing (an older daemon) stays undecided.
-		const older = await publish(3, "d2b3c4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e");
-		assert.equal(older.ok && "management" in older.value, false);
+		const unmanaged = await publish(3, "d2b3c4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e");
+		assert.deepEqual(unmanaged.ok && unmanaged.value.management, { state: "unmanaged" });
 	} finally {
 		cleanup(fixture);
 	}
@@ -1560,6 +1555,7 @@ test("the context channel carries only the session and keeps the returned bindin
 					},
 					context: { version: 1, registration_id: UUID_A },
 					warning: null,
+					management: { state: "unmanaged" },
 				}),
 	);
 	try {
@@ -1582,6 +1578,7 @@ test("the context channel carries only the session and keeps the returned bindin
 					generation: 1,
 					sequence: 1,
 				},
+				management: { state: "unmanaged" },
 			},
 		});
 		// A first publish omits both credentials the daemon would issue, and the
@@ -1731,6 +1728,7 @@ test("the canonical daemon contract fixture round-trips through this client", as
 					generation: 1,
 					sequence: 2,
 				},
+				management: { state: "unmanaged" },
 			},
 		});
 		// The identical replay is answered, never refused, and renews no lease.
@@ -1745,6 +1743,7 @@ test("the canonical daemon contract fixture round-trips through this client", as
 					sequence: 2,
 				},
 				warning: "<replay-warning>",
+				management: { state: "unmanaged" },
 			},
 		});
 		// An explicit null is an accepted fact, not a missing one.
@@ -1765,6 +1764,7 @@ test("the canonical daemon contract fixture round-trips through this client", as
 					generation: 2,
 					sequence: 1,
 				},
+				management: { state: "unmanaged" },
 			},
 		});
 
@@ -1811,7 +1811,11 @@ test("the control socket path follows the environment", async () => {
 	}
 });
 
-const EVENTS_CONTRACTS = { protocol: 2, revision: 1, contracts: ["registry.v1", "events.v1"] };
+const EVENTS_CONTRACTS = {
+	protocol: 2,
+	revision: RADAR_WIRE_REVISION,
+	contracts: ["registry.v1", "events.v1"],
+};
 
 /** Wait until `done` holds or the deadline passes, then return what it saw. */
 async function until(done: () => boolean, ms = 2_000): Promise<void> {
@@ -2111,7 +2115,7 @@ test("spawn.list uses process registration, paginates, and surfaces claim refusa
 	let granted = true;
 	const fixture = makeFixture((request) => {
 		if (request.method === "daemon.ping")
-			return reply(request, { protocol: 2, revision: RADAR_MINIMUM_REVISION, contracts: ["registry.v1"] });
+			return reply(request, { protocol: 2, revision: RADAR_WIRE_REVISION, contracts: ["registry.v1"] });
 		if (request.method === "agent.register")
 			return reply(request, { registration: { registration_id: UUID_A } });
 		if (!granted) return refuse(request, "refused", "registration has no granted subject");

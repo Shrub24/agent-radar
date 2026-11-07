@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createRadarAttention } from "./radar-attention.ts";
-import { createRadarClient } from "./radar-client.ts";
+import { RADAR_WIRE_REVISION, createRadarClient } from "./radar-client.ts";
 
 const REGISTRATION = "11111111-1111-4111-8111-111111111111";
 const OPEN_TIMEOUT_MS = 300;
@@ -39,7 +39,7 @@ function daemon(behaviour: Behaviour) {
 			const request = JSON.parse(buffered.slice(0, end));
 			if (request.method === "daemon.ping") {
 				socket.end(`${JSON.stringify({ id: request.id, result: {
-					protocol: 2, backend: "tmux", instance: null, revision: 13,
+					protocol: 2, backend: "tmux", instance: null, revision: RADAR_WIRE_REVISION,
 					contracts: ["communication.messages.v1"], tasks: { available: false, error: null },
 				} })}\n`);
 				return;
