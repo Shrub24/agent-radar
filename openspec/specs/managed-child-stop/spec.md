@@ -6,32 +6,34 @@ Define safe, durable pane closure for managed children created by the daemon, wi
 ## Requirements
 
 ### Requirement: Close targets an exact daemon-created child pane
-
-A close request SHALL identify the daemon's spawn edge and its bound child `(source, incarnation)`; it SHALL NOT carry a caller-chosen pane id. The daemon SHALL refuse before dispatch if the edge is absent, unbound, already closed, or names a different child, and SHALL refuse if the edge's recorded location carries no pane. Children named by labels, titles, session UUIDs or pane position are never eligible.
-
-#### Scenario: Unbound edge
-- **WHEN** a caller requests close for an edge with no bound child
-- **THEN** the request is refused and no backend effect occurs
+A spawn-close request SHALL identify the spawn relationship and bound child, never a caller-chosen pane. The daemon SHALL authorize that relationship, resolve the exact eligible execution and its current verified placement, and invoke common managed close. Historical create location SHALL NOT override verified current placement or authorize a replacement execution.
 
 #### Scenario: Caller names a pane
-- **WHEN** a request supplies a pane id independently of the recorded edge
-- **THEN** it is rejected as malformed and nothing is dispatched
+- **WHEN** a caller supplies a pane independently of its authorized child relationship
+- **THEN** the malformed request is refused without effects
+
+#### Scenario: Moved child
+- **WHEN** a bound child's pane has a verified new tab location
+- **THEN** close targets its current execution and pane without rewriting historical spawn provenance
+
+#### Scenario: Unbound edge
+- **WHEN** a caller targets an edge with no eligible bound child
+- **THEN** it is refused without signalling or removing a guessed pane
 
 ### Requirement: Close requires fresh occupant verification
-
-Immediately before dispatch the daemon SHALL verify that the recorded pane still exists within its recorded containment and that the pane's current foreground process carries the birth identity held for the bound child's registration. It SHALL refuse, with no close effect and no accepted record, when that evidence is missing, inconclusive or different, and SHALL NOT accept pane presence or session lineage as occupant proof.
+Before destructive effects, close SHALL validate the exact claim, pane association and backend generation. A replacement execution or unrelated current occupant SHALL NOT be terminated using an old child identity. A live eligible execution SHALL use common managed termination before pane removal; an already-ended eligible execution SHALL require no live foreground process or recorded exit code.
 
 #### Scenario: A different process occupies the pane
-- **WHEN** the foreground process birth identity differs from the bound child's registered identity
-- **THEN** close refuses without dispatching and leaves that occupant untouched
+- **WHEN** an old close target now refers to a different execution occupying the pane
+- **THEN** close refuses rather than terminating the replacement
 
 #### Scenario: Occupant evidence unavailable
-- **WHEN** foreground evidence is inconclusive or the registration holds no process claim
-- **THEN** close refuses without dispatching and records no accepted close
+- **WHEN** neither live-claim association nor an eligible ended-execution association can be established for the pane
+- **THEN** this narrow child-close request refuses without signalling a guessed process or removing an unrelated pane
 
 #### Scenario: Verified child
-- **WHEN** the recorded pane holds the exact bound child's birth identity within its recorded containment
-- **THEN** close may be dispatched for that pane
+- **WHEN** the bound execution and its placement remain eligible
+- **THEN** common graceful termination and bounded escalation precede pane removal
 
 ### Requirement: Close is durable and idempotent
 
@@ -46,16 +48,19 @@ The daemon SHALL persist the operation identity and target before dispatch. Repl
 - **THEN** the durable result remains unknown and no retry occurs
 
 ### Requirement: Pane closure does not assert process termination
-
-The operation SHALL report only the mux pane-close outcome. It SHALL NOT claim that the foreground process or process group exited, and SHALL NOT synthesize an execution-status or assignment-state transition. Missing pane evidence after an unknown result remains unresolved, not confirmed closure.
+Managed close SHALL report execution termination and pane removal separately. Verified process or scope evidence MAY establish execution exit; confirmed pane removal alone SHALL NOT do so. The operation SHALL NOT synthesize assignment completion or agent-advertised work outcomes.
 
 #### Scenario: Confirmed pane close
-- **WHEN** the backend confirms it closed the target pane
-- **THEN** the result records pane closure and makes no claim about process exit or assignment completion
+- **WHEN** the managed close verifies execution termination and removes its pane
+- **THEN** both outcomes are reported without changing assignment facts
 
 #### Scenario: Pane disappears without a confirmation
-- **WHEN** the pane is absent after a possibly dispatched close but no valid backend confirmation exists
-- **THEN** the outcome remains unknown or unresolved and is not reported as a confirmed close
+- **WHEN** pane removal may have occurred but no confirmation or fresh same-generation absence is available
+- **THEN** the removal result remains unknown and process exit is not inferred
+
+#### Scenario: Pane removed with unverified process exit
+- **WHEN** pane removal is confirmed but execution termination remains unverified
+- **THEN** the result reports removal without claiming every process exited
 
 ### Requirement: Close intent does not change assignment state
 
@@ -82,47 +87,50 @@ A close SHALL preserve the original spawn edge and child binding. The edge SHALL
 - **THEN** topology reads unresolved and no process-exit claim is made
 
 ### Requirement: Close is restricted to daemon-managed children
-
-The daemon SHALL close only a pane named by its own spawn edge with a bound child. It SHALL not adopt or control foreign panes, leads, standalone agents, or children spawned outside the daemon, and SHALL not resume or restart the child. Managed close SHALL not be advertised as a capability while any eligible target necessarily refuses.
+The spawn-close entrypoint SHALL remain restricted to the caller's authorized bound spawn relationship. Directly admitted agents SHALL instead be eligible through the common subject/operator close entrypoints without a fabricated edge. All entrypoints SHALL share execution termination and pane-removal semantics after authorization.
 
 #### Scenario: Foreign child
-- **WHEN** a caller targets a registered child with no daemon-authored spawn edge
-- **THEN** the operation is refused without backend effects
+- **WHEN** a caller targets a child outside its authorized spawn relationship
+- **THEN** the request is refused without effects
 
 #### Scenario: Not yet implemented
-- **WHEN** the verification path is not implemented or not advertised
-- **THEN** `child.close` refuses explicitly and no capability is claimed
+- **WHEN** the common managed-close implementation is unavailable
+- **THEN** the capability is not advertised as working and the operation refuses explicitly
+
+#### Scenario: Admitted agent through operator close
+- **WHEN** the operator closes an eligible directly admitted agent
+- **THEN** the same managed-close behaviour runs without requiring a spawn edge
 
 ### Requirement: Dead-pane cleanup is fenced to the creating instance
-A pane id is not an identity: a backend that addresses a server may hand the same pane ids to panes this daemon never created. `spawn.close` SHALL refuse, before the request is admitted and before anything is dispatched, when the spawn edge records no verified creating instance, when that instance cannot be verified now, or when the process serving now is not the one that served the create. No generation SHALL be inferred from a pane id, a server name or history.
+Pane removal SHALL be fenced to the verified backend generation associated with the execution's placement. A created pane SHALL retain its creating-generation evidence; direct admission SHALL establish placement through verified admission. A missing or changed generation SHALL NOT be inferred from a pane handle or authorize removal of a reused handle.
 
 #### Scenario: Another server generation
-- **WHEN** the server that served the create is gone and another now answers to the same name with the same pane ids
-- **THEN** close refuses before admission and dispatches nothing, and the pane that now carries the id is untouched
-
-#### Scenario: No verified instance
-- **WHEN** the edge records no verified creating instance for its pane
-- **THEN** close refuses before admission and dispatches nothing
+- **WHEN** a new backend generation exposes the recorded physical handle
+- **THEN** the new pane is not removed using the old execution's placement
 
 #### Scenario: The serving process changed
-- **WHEN** the process serving now is not the one the edge recorded for its pane
-- **THEN** close refuses before admission and dispatches nothing
+- **WHEN** the current serving process differs from the placement's verified generation
+- **THEN** the old pane reference authorizes no removal
+
+#### Scenario: No verified instance
+- **WHEN** the serving generation cannot be verified for the selected pane
+- **THEN** removal is not dispatched against that unverified pane
 
 ### Requirement: Closing an exited child is a defined result
-When the recorded pane exists within its recorded containment, is fenced to the instance that created it, and the bound child's spawn edge holds a recorded exit observation for that exact pane, `spawn.close` SHALL close the retained pane, persist the outcome durably and return `already_exited` carrying that observation. It SHALL require no live foreground occupant. Replay of the same request SHALL return the stored result without dispatching again.
+An already-ended eligible child SHALL remain closable through the common workflow without a recorded numeric exit status. Fresh evidence SHALL establish that its pane has not been reassigned to another execution. The result SHALL distinguish an already-ended execution, optional recorded status and confirmed pane removal; same-ID replay SHALL not dispatch again.
 
 #### Scenario: Exited child, retained pane
-- **WHEN** a tmux child has exited, its pane is dead and its edge records the exit
-- **THEN** close returns `already_exited` with the exit observation and the pane is closed once
-
-#### Scenario: Pane respawned after the exit
-- **WHEN** the pane is no longer reported dead
-- **THEN** the live-occupant verification applies and a non-matching occupant refuses
+- **WHEN** an eligible child's execution ended and its pane remains safely attributable
+- **THEN** common close removes it and returns the recorded optional completion facts
 
 #### Scenario: No recorded exit
-- **WHEN** the pane is dead but the edge holds no exit observation for it
-- **THEN** close refuses with no record and no dispatch
+- **WHEN** the child's exit is verified but no code was captured and its retained pane is eligible
+- **THEN** close removes the pane without refusing for the missing code
 
 #### Scenario: Pane absent
-- **WHEN** the recorded pane is not in a successful inventory
-- **THEN** close refuses as unresolved and claims neither closure nor exit
+- **WHEN** the selected pane is freshly confirmed absent under its verified generation
+- **THEN** the result reports resource absence without asserting unverified execution exit
+
+#### Scenario: Pane respawned after the exit
+- **WHEN** the retained pane was reused by a different execution
+- **THEN** the old child's close does not terminate that execution

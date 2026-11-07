@@ -42,7 +42,7 @@ The daemon SHALL record the bound child's subject id on the spawn edge's `bound`
 - **THEN** `bound` carries that registration's granted subject id
 
 ### Requirement: A consumer lists its own children
-pi-radar SHALL list the calling process's children, derived from its own granted subject, each with its subject id, Pi session id, state (live, released or gone), pane and label, and a caller without a granted subject SHALL get no children.
+pi-radar SHALL list the calling process's children through Radar's subject-derived child read, each with its subject id, Pi session id, attachment state, current location when known and label. The default SHALL include retained children; live-only selection SHALL be explicit. A caller without a granted subject SHALL be refused.
 
 #### Scenario: Selecting a child by session
 - **WHEN** a consumer has a Pi session id for one of its children
@@ -53,7 +53,7 @@ pi-radar SHALL list the calling process's children, derived from its own granted
 - **THEN** the listing is refused
 
 ### Requirement: Child control is addressed by subject id
-pi-radar SHALL address assign, retire, inspect and observe of a launched child by its subject id, resolving the child's current registration from the daemon's spawn edges on each operation and caching nothing across a restart.
+pi-radar SHALL address assign, retire, inspect and observe of a child by subject id through daemon subject operations. It SHALL NOT receive, resolve or cache child registration or claim ids, choose a current process from spawn history, or require caller-supplied session identity to validate the target. Its own registration and claim SHALL remain self-publication authority.
 
 #### Scenario: A restarted child keeps its key
 - **WHEN** a child's process is replaced and the same subject attaches under a new registration
@@ -61,19 +61,48 @@ pi-radar SHALL address assign, retire, inspect and observe of a launched child b
 
 #### Scenario: A resumed subject has several edges
 - **WHEN** a subject has more than one bound edge
-- **THEN** the edge with the newest `bound_at` decides the current registration
+- **THEN** Radar resolves the current attachment from subject authority and pi-radar does not rank edges
 
 #### Scenario: A child with no subject on its edge
-- **WHEN** the edge records no subject
-- **THEN** the operation reports the child as not addressable and does not fall back to a registration
+- **WHEN** an unbound launch cannot yet name a granted child
+- **THEN** the SDK reports launch state without substituting a process identifier as the child key
 
 ### Requirement: An assignment follows the agent across a restart
-pi-radar SHALL keep the last assignment it published for a child, keyed by subject, and when the child's registration changes SHALL retire the writer on the old registration and publish that assignment on the new one.
+pi-radar SHALL publish child assignments by subject to Radar, which SHALL own assignment retention and delivery across process replacement. SDK reads SHALL have no assignment publication side effects and SHALL NOT keep process-specific child writers or replay assignments when a process changes.
 
 #### Scenario: A child restarts with a retained assignment
-- **WHEN** a child with a published assignment attaches under a new registration
-- **THEN** the new registration carries the same assignment and the old channel is retired
+- **WHEN** a child with a still-valid published assignment attaches under a new registration
+- **THEN** Radar delivers that assignment to the granted attachment without an SDK read or replay
 
 #### Scenario: A duplicate holder
 - **WHEN** another process opens the same session and is refused the subject
 - **THEN** it receives no assignment
+
+### Requirement: One mailbox consumer owns message incorporation
+pi-radar SHALL reconcile pending messages on startup and from heartbeat or push attention through one serialized drain. The typed consumer SHALL confirm durable capture before receipt. Unsupported bodies and consumer failures SHALL remain pending; receipt SHALL NOT itself prompt the model or settle domain work.
+
+#### Scenario: Concurrent triggers
+- **WHEN** startup, heartbeat and push overlap
+- **THEN** one drain incorporates messages and records a bounded rerun rather than starting overlapping consumers
+
+#### Scenario: Retry without attention change
+- **WHEN** capture fails and the mailbox revision does not change
+- **THEN** the pending message remains eligible for bounded retry
+
+### Requirement: Only continuous Herdsman idle releases the optional push tier
+An opted-in consumer SHALL close its subscription after 30 seconds continuously in Herdsman's literal idle status. Waiting or other non-idle statuses SHALL NOT count as idle. Activity resumption SHALL cancel the hold and establish current recipient attention; shutdown and identity replacement SHALL release old work.
+
+#### Scenario: Waiting for children
+- **WHEN** the agent remains waiting for a child for longer than 30 seconds
+- **THEN** its optional subscription is not closed as idle
+
+#### Scenario: Idle then resumed
+- **WHEN** an agent passes the idle hold and later becomes active
+- **THEN** it holds no socket during idle and obtains a new baseline on resubscription
+
+### Requirement: Heartbeat fallback preserves delivery
+Idle or disconnected consumers SHALL continue discovering pending messages through successful heartbeat replies. Subscription refusal or failure SHALL use bounded backoff, not disable delivery. Revisions SHALL be opaque strings in both codecs; daemon restart SHALL establish a new baseline, not compare unrelated revisions.
+
+#### Scenario: Message arrives without a subscription
+- **WHEN** a recipient has no push connection and receives a message
+- **THEN** its next successful heartbeat exposes pending work and invokes the same mailbox drain

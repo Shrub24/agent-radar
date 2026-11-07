@@ -6,15 +6,19 @@ Every daemon-created agent launch starts through `radar run --launch`, continues
 ## Requirements
 
 ### Requirement: Every managed launch runs through radar run
-A launch the daemon creates SHALL start its pane with `radar run --launch`, which claims the recorded launch with its correlation secret and birth identity and receives the program from the daemon's record. No managed launch SHALL run through another chain.
+Daemon-created and directly admitted managed launches SHALL enter one supervised `radar run` execution chain after their placement and admission checks. Daemon-created launches SHALL claim their recorded reservation; direct admission SHALL verify the caller's existing placement. Both SHALL run the actual program inside its execution scope and expose the same lifecycle capabilities.
 
 #### Scenario: A spawned child claims its launch
-- **WHEN** a pane created for a spawn runs `radar run --launch` with the launch's correlation
-- **THEN** the daemon answers with the registration and program, and the program runs inside the registration's scope
+- **WHEN** a spawned child presents its valid launch credential and identity
+- **THEN** the common supervised chain runs its recorded program and binds the actual managed execution
+
+#### Scenario: Directly admitted agent
+- **WHEN** `radar run --agent` verifies admission in an existing shell pane
+- **THEN** it enters the same supervised chain without creating a pane or fabricating a spawn parent
 
 #### Scenario: A process without the correlation
-- **WHEN** `radar run --launch` presents a correlation or birth identity that does not match the recorded launch
-- **THEN** it is refused and runs nothing
+- **WHEN** a daemon-created launch cannot establish its recorded admission authority
+- **THEN** no managed program is released
 
 ### Requirement: A relaunch resumes the agent's own session
 A relaunch SHALL start the program with the given args, session selectors removed and `--session` with the agent's recorded session appended, and SHALL refuse a bare argument in args.
@@ -47,22 +51,34 @@ A relaunch SHALL start the program with the given args, session selectors remove
 - **THEN** the request is refused and nothing is created
 
 ### Requirement: A parent can restart its own child
-`lifecycle.restart` SHALL accept a request from the subject's recorded parent addressed by subject alone, with the program and args the parent sends; the daemon SHALL resolve the current process itself, stop it through its scope, await its exit and relaunch. An operator restart SHALL stay fenced by the claim it names.
+`lifecycle.restart` SHALL authorize a recorded parent against its child subject, resolve and freeze the current claim, and use the common termination and start behaviour. Operator restart SHALL remain fenced by its expected claim. The successor SHALL retain subject identity, use a fresh claim and resume the recorded session; an existing successor reservation SHALL refuse another restart.
 
 #### Scenario: Restart under a new definition
-- **WHEN** a parent restarts its live child with a new program
-- **THEN** the current process is stopped and the child relaunches in its own pane and session with the new program
+- **WHEN** an authorized parent restarts a live child with an eligible program
+- **THEN** the predecessor is terminated through the common workflow and a fresh claim resumes that child's session
 
 #### Scenario: Two restarts in a row
-- **WHEN** an operator restart and a parent restart of the same child arrive one after the other
-- **THEN** the second replaces the first's successor, and a restart arriving while a successor is reserved is refused
+- **WHEN** a restart arrives while a successor is reserved
+- **THEN** it is refused without terminating a different execution; a later authorized restart resolves the current successor rather than the original claim
 
 ### Requirement: A relaunch keeps the agent's pane when it exists
-A relaunch SHALL place the process in the agent's own pane when that pane still exists, and otherwise split beside the parent.
+Restart SHALL reuse verified dedicated placement when safe. It SHALL NOT inject a replacement into an operator's resumed interactive shell; that case SHALL create replacement placement alongside the recorded location. If placement is gone, an eligible recorded-parent fallback MAY be used; otherwise relaunch SHALL refuse rather than guess from current focus.
+
+#### Scenario: Dedicated dead pane remains
+- **WHEN** restart has verified reusable dedicated placement
+- **THEN** the replacement starts there through the common supervised launch chain
+
+#### Scenario: Agent was admitted from a shell
+- **WHEN** an agent admitted from an interactive shell is restarted
+- **THEN** replacement placement is created beside its verified location and the original shell is not commandeered
 
 #### Scenario: The child's pane was closed
-- **WHEN** a child is continued after its pane was closed
-- **THEN** it starts in a new pane beside its parent
+- **WHEN** the old pane is absent but a verified recorded-parent fallback exists
+- **THEN** the successor starts beside that parent through common managed supervision
+
+#### Scenario: Placement cannot be resolved
+- **WHEN** neither safe placement nor an eligible recorded-parent fallback exists
+- **THEN** relaunch refuses without using whichever pane currently has focus
 
 ### Requirement: Assignment facts belong to the launch
 Owner, run, label and role SHALL be recorded per launch, and the subject's parent SHALL NOT change on a relaunch.

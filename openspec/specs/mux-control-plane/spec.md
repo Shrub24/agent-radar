@@ -70,29 +70,31 @@ Operation records SHALL distinguish pending, completed, refused and unknown. Bac
 
 ### Requirement: Close preserves current identity and containment safeguards
 
-Close SHALL require a frozen expected target identity and fresh observation.
-Direct mux close SHALL retain the positive-unmanaged containment checks and
-SHALL NOT close managed or uncertain panes. A distinct managed-child close MAY
-close a daemon-spawned pane only when its durable edge names a bound child and
-fresh evidence verifies that location, containment and occupant. It SHALL
-report the pane outcome only. Owner-routed managed close/restart is unchanged,
-with no fallback between the routes.
+Close SHALL require a frozen expected target identity and fresh observation. A close target SHALL name a pane, a tab or a workspace; a workspace target covers what is inside it, and a place whose frozen membership changed before dispatch is not closed. Close SHALL end every execution placed inside the target before removing it, and a view SHALL refuse to close a place holding an agent Radar does not manage.
 
 #### Scenario: Replacement occupant
 - **WHEN** a different session or run occupies the requested pane at execution
 - **THEN** close refuses and leaves that occupant untouched
 
 #### Scenario: Mixed tab
-- **WHEN** any tab member is managed or uncertain
-- **THEN** the whole direct close refuses without partially closing members
+- **WHEN** a tab member holds an agent Radar does not manage or cannot classify
+- **THEN** the view refuses the close without partially closing members
+
+#### Scenario: Mixed workspace
+- **WHEN** a pane in the workspace holds an agent Radar does not manage or cannot classify
+- **THEN** the view refuses the close without partially closing it
+
+#### Scenario: Workspace membership changed
+- **WHEN** a workspace's membership differs from the frozen identity at execution
+- **THEN** close refuses and closes nothing in it
 
 #### Scenario: Unmanaged safeguards unchanged
-- **WHEN** a direct close targets a managed, uncertain or mixed-container target
-- **THEN** it refuses before dispatch
+- **WHEN** a close would cover an agent Radar does not manage or cannot classify
+- **THEN** it is refused before dispatch
 
 #### Scenario: Verified daemon-managed child
-- **WHEN** managed close targets a bound child whose recorded pane and containment still match current observation
-- **THEN** it may request pane closure and records that effect separately, without claiming the process exited
+- **WHEN** a close targets a pane whose recorded execution still holds its claim and placement
+- **THEN** the execution is ended first, the pane is removed, and the exit and the removal are reported as separate facts
 
 ### Requirement: Reporting is a backend bridge
 The control plane SHALL wrap source-provided state, session and display metadata without claiming a new registry or lifecycle authority. Caller source, sequence, TTL and reported values SHALL be preserved where the backend supports them; unsupported reporting SHALL refuse. No report SHALL imply recovered assignments, children or pending work.
@@ -102,15 +104,15 @@ The control plane SHALL wrap source-provided state, session and display metadata
 - **THEN** the adapter forwards the report without deriving additional agent facts
 
 ### Requirement: Radar chooses transport without effectful fallback retries
-Radar SHALL support the daemon client and the existing direct adapter. Startup failure to handshake may select the direct adapter with a diagnostic. Once an operation may have been accepted by the daemon, Radar SHALL not retry it directly. Managed lifecycle eligibility and confirmation SHALL remain unchanged. Radar SHALL not auto-start the daemon.
+Radar SHALL use the daemon as its only runtime source and SHALL NOT read Herdr directly. A daemon that cannot be reached or handshaken SHALL be shown as a blocking diagnostic and SHALL NOT switch to another source. Once an operation may have been accepted by the daemon, Radar SHALL not retry it directly. Managed lifecycle eligibility and confirmation SHALL remain unchanged. Radar SHALL start the daemon's socket unit when launched, as `daemon-service` specifies.
 
 #### Scenario: Daemon absent at startup
-- **WHEN** a configured daemon cannot handshake
-- **THEN** Radar reports its direct fallback choice and continues observation
+- **WHEN** the daemon cannot be reached or handshaken after Radar starts
+- **THEN** Radar draws a blocking diagnostic with no agent rows and retries on its refresh cycle
 
 #### Scenario: Daemon disconnects during close
 - **WHEN** the close response is lost after submission
-- **THEN** Radar does not call the backend directly to repeat close
+- **THEN** Radar does not call Herdr directly to repeat close
 
 ### Requirement: Wrapper scope does not claim session recovery
 This change SHALL not derive resume commands, restart leads, register agent topology or claim recovery from a new PID or a shared session UUID. Creation and input SHALL be named mux primitives, not a promise to restore agent assignments or results. Later lifecycle policy SHALL be added independently of the mux backend.
@@ -231,7 +233,7 @@ Environment values and spawn tokens SHALL be kept only in bounded private launch
 - **THEN** the daemon reports a bounded diagnostic without launch environment values or the token
 
 ### Requirement: Daemon physical backend is explicitly selected
-The daemon SHALL use exactly one physical backend per process, chosen by explicit configuration. The tmux backend SHALL target a named tmux server and never the default one. An unknown backend or unreachable server SHALL fail startup or refuse operations, with no fallback to another backend.
+The daemon SHALL use exactly one physical backend per process, chosen by configuration or environment, with `tmux` as the default and the named server `radar`. `herdr` SHALL be served only when explicitly selected. A tmux backend SHALL target a named tmux server and never the default one. An unknown backend or unreachable server SHALL fail startup or refuse operations, with no fallback to another backend.
 
 #### Scenario: Unknown backend
 - **WHEN** the daemon is configured with an unknown backend name
@@ -240,6 +242,10 @@ The daemon SHALL use exactly one physical backend per process, chosen by explici
 #### Scenario: Named tmux server
 - **WHEN** the tmux backend is selected with a server name
 - **THEN** every effect targets that server and none targets the default tmux server
+
+#### Scenario: Default backend
+- **WHEN** no backend is configured or set in the environment
+- **THEN** the daemon serves the tmux backend on the server `radar`
 
 ### Requirement: tmux adapter declares only implemented capabilities
 The tmux adapter SHALL advertise observation, focus, create, input, output, close and launch only as implemented, using stable tmux ids qualified by backend and server as location handles. Operations it cannot express SHALL be refused by absent capability before dispatch.

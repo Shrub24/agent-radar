@@ -7,61 +7,57 @@ The durable path by which a managed worker hands its result to the parent Radar 
 ## Requirements
 
 ### Requirement: Idempotent immutable handoff publication
-The daemon SHALL persist bounded handoff content under a stable UUID. Repeating the same publication ID with the same immutable sender, recipient, correlation, summary and payload SHALL return the existing record; reusing the ID with different immutable content SHALL be refused.
+The daemon SHALL publish handoffs as the typed handoff body in the shared agent-message lane, not a separate handoff mailbox. Repeating a message ID with identical sender, recipients, correlation, summary and content SHALL return the accepted message; conflicting immutable content SHALL be refused.
 
 #### Scenario: Retry after a lost publication response
-- **WHEN** a sender retries publication with the same ID and identical immutable content after losing the response
-- **THEN** the daemon returns the already-published handoff without creating a duplicate
-- **AND** a retry with different immutable content under that ID is refused
+- **WHEN** a worker retries a handoff with the same ID and body after losing the reply
+- **THEN** the common message lane returns the existing publication without a duplicate
 
 ### Requirement: Recipient inbox and identity continuity
-A managed recipient SHALL recover pending handoffs by inbox scan without relying on a notification. The first contract SHALL address only stable Radar subject IDs, and a verified successor SHALL access that same subject inbox. Unmanaged/session addressing is out of scope; stale or unresolved managed identity SHALL be refused.
+Handoff publication SHALL retain its current parent-only policy: a verified managed worker may target only its resolved daemon-recorded parent subject. Delivery SHALL use the common subject mailbox, including verified successor recovery. Root, unrelated, unmanaged or unresolved targets SHALL be refused.
+
+#### Scenario: Worker addresses another subject
+- **WHEN** a worker tries to send a handoff to someone other than its recorded parent
+- **THEN** publication is refused despite the common envelope supporting recipient sets
 
 #### Scenario: Recover a pending handoff after restart
-- **WHEN** a recipient reconnects after a daemon restart
-- **THEN** its inbox query returns every unacknowledged handoff addressed to its stable subject
-- **AND** recovery does not depend on replaying a pointer event
+- **WHEN** the parent reconnects after a daemon restart
+- **THEN** the common inbox returns every pending handoff without needing a notification replay
 
 #### Scenario: Verified successor reads the subject inbox
-- **WHEN** a registration is attached to the managed subject of its current Pi session, with a verified process and a resolved identity
-- **THEN** the daemon allows that execution to recover the same subject inbox
-- **AND** a detached registration, a session it no longer publishes, or an unresolved identity is refused
+- **WHEN** a verified successor takes over the parent subject
+- **THEN** the same pending handoff is available through the message inbox
+- **AND** a stale or unresolved execution is refused
 
 #### Scenario: Managed sender targets its recorded parent only
-- **WHEN** a managed sender publishes a handoff to its recorded `parent_subject_id`
-- **THEN** the daemon accepts the target if the parent subject is resolved
-- **AND** a root sender or any different target is refused
+- **WHEN** a verified worker publishes to its resolved daemon-recorded parent
+- **THEN** publication is accepted, while root senders and different targets are refused
 
 ### Requirement: Separate durable receipt and retained retrieval
-The daemon SHALL store the recipient receipt separately from immutable content. A receipt SHALL mean only that the recipient-side consumer durably recorded the payload. A recipient SHALL be able to retrieve the full content after acknowledgement, and repeated acknowledgement SHALL return the existing receipt without replacing it.
+Handoff receipts SHALL use the common per-recipient message receipt and retained content retrieval. Receipt SHALL attest only to durable recipient capture, remain idempotent, and SHALL NOT replace immutable handoff content.
 
 #### Scenario: Acknowledge after durable local capture
-- **WHEN** the recipient has durably recorded the payload locally and acknowledges it
-- **THEN** the daemon records an idempotent receipt separately from immutable content
-- **AND** the recipient can still retrieve the full payload afterward
+- **WHEN** the parent durably records the handoff then acknowledges its delivery
+- **THEN** the message receipt persists and content remains retrievable during retention
 
 ### Requirement: Bounded storage and recoverable notification
-The daemon SHALL enforce per-payload and aggregate storage bounds without silently evicting pending handoffs. Pointer events SHALL reference durable communication records without embedding their payload; inbox scans SHALL remain the recovery source when a notification is missed. Acknowledged content MAY expire under the documented retention policy.
+Handoffs SHALL share the message lane's storage bounds, pending recovery and attention notifications. There SHALL NOT be a parallel handoff store or reliance on a raw-event pointer. Missing or coalescing attention SHALL NOT lose a pending handoff.
 
 #### Scenario: Capacity is exhausted
-- **WHEN** a publication would exceed the configured payload, pending-recipient, record-count, or byte bound
-- **THEN** the daemon returns a definite non-accepted capacity response
-- **AND** it does not silently evict a pending handoff
+- **WHEN** publication would exceed a message-lane storage or pending-recipient bound
+- **THEN** it is definitely not accepted and no pending handoff is evicted
 
 #### Scenario: Publication event is missed
-- **WHEN** a recipient misses or coalesces a pointer event
-- **THEN** a later inbox scan still returns the durable pending handoff
-- **AND** the event contains no payload body
+- **WHEN** no handoff attention update reaches the parent, including after a missed historical pointer event
+- **THEN** a later common inbox read still returns its pending delivery without a raw-event dependency
 
 ### Requirement: Handoff transport remains separate from lifecycle settlement
-Radar SHALL own handoff publication, durable payload, recipient accounting and receipt state. Herdsman SHALL retain authority over assignment validity, worker eligibility and lifecycle disposition. Neither publication nor receipt SHALL authorize worker closure or settle the Herdsman completion obligation.
+Radar SHALL own the common message delivery record and receipts. Herdsman SHALL retain assignment validity, worker eligibility and lifecycle disposition. Neither publication nor receipt SHALL authorize worker closure or settle the completion obligation.
 
 #### Scenario: Handoff is published but not consumed
-- **WHEN** a worker's completion handoff is published and the parent has not durably recorded it
-- **THEN** the handoff remains pending and recoverable
-- **AND** publication alone does not authorize the worker's closure
+- **WHEN** a worker publishes and its parent has not durably captured the result
+- **THEN** delivery remains pending and publication does not authorise worker closure
 
 #### Scenario: Handoff is received but not settled
-- **WHEN** the parent records the handoff and acknowledges receipt
-- **THEN** Herdsman may continue its separate wrapup and lifecycle policy
-- **AND** the receipt is not treated as settlement success
+- **WHEN** the parent has durably captured and acknowledged a handoff
+- **THEN** Herdsman's separate settlement and worker-closure decisions remain outstanding

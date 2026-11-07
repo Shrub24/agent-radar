@@ -56,23 +56,34 @@ A revision or epoch the daemon does not hold SHALL return a typed `snapshot_expi
 - **THEN** the answer is `not_modified` at revision zero, not a snapshot the read itself caused
 
 ### Requirement: Sampling is demand-driven
-The daemon SHALL sample a data class only while a reader has recently asked for it, SHALL sample nothing while no reader has, and SHALL keep at most one sample in flight, coalescing requests that arrive during it. The fleet, registry and task classes SHALL be collected for any read; the process class SHALL be collected only while a reader asks for it. An unknown class name SHALL be refused rather than ignored. The contract SHALL NOT promise a sampling interval.
+The daemon SHALL sample a data class only while a reader has recently asked for it or an active TUI attachment holds demand for it, SHALL sample nothing while no demand exists, and SHALL keep at most one sample in flight, coalescing requests that arrive during it. An unknown class name SHALL be refused rather than ignored. The contract SHALL NOT promise a sampling interval.
 
 #### Scenario: Process table requested
-- **WHEN** one reader asks for the process table and another does not
-- **THEN** the daemon samples processes and both readers see that revision, and the second reader's view is unchanged in its other sources
+- **WHEN** one reader or TUI attachment asks for the process table and another does not
+- **THEN** the daemon samples processes and both see that revision, and the second reader's view is unchanged in its other sources
 
 #### Scenario: No readers
-- **WHEN** no reader has asked for a snapshot within the demand window
+- **WHEN** no reader has asked within the demand window and no TUI attachment holds demand
 - **THEN** the daemon does not sample, and the first read afterwards reports revision zero rather than a sample
 
 #### Scenario: A class this daemon does not collect
-- **WHEN** a read asks for a class name the daemon does not collect
+- **WHEN** a read or TUI demand update asks for a class name the daemon does not collect
 - **THEN** it is refused `bad_params` naming the class, rather than left waiting for data that can never arrive
 
 #### Scenario: Requests during a sample
 - **WHEN** several wake requests arrive while a sample is running
 - **THEN** one further sample follows and no two samples run at once
+
+#### Scenario: TUI disconnect releases demand
+- **WHEN** the last TUI attachment requesting processes disconnects
+- **THEN** its demand ends without cancelling process demand still held by another reader
+
+### Requirement: Demand is released with its holder
+The fleet, registry and task classes SHALL be collected for any reader or active TUI demand; the process class SHALL be collected only while requested. TUI attachment loss SHALL release its demand.
+
+#### Scenario: Demand is released with its holder
+- **WHEN** the last TUI attachment holding demand for a class goes away
+- **THEN** the class is no longer sampled unless a reader asks for it again
 
 ### Requirement: Failed collection preserves the last-good snapshot
 When a source fails the daemon SHALL keep that source's last-good observation, mark that source stale and report its failure, SHALL NOT treat failure as proof that panes or agents disappeared, and SHALL bound each sample with a deadline that cancels its runtime calls. A failed registry read SHALL be reported as the registry source and SHALL leave the fleet observation and the presented agents standing. A sample SHALL NOT delay lifecycle requests.
@@ -93,11 +104,15 @@ A snapshot SHALL contain no selection, fold state, filter, focus target or windo
 - **THEN** the snapshot carries no launch value and no environment overlay
 
 ### Requirement: Observation is not a durable event
-Publishing a revision SHALL NOT append to the durable event log, and the daemon SHALL NOT expose a revision through `events.read`. A reader that needs a change wake SHALL use the revision wait.
+Publishing a revision SHALL NOT append to the durable event log, and the daemon SHALL NOT expose a revision through `events.read`. Existing observation-read consumers SHALL retain the revision-wait API. TUI consumers SHALL receive the same daemon-owned facts and source freshness through coherent hash-addressed publications, without a second sampler or frontend collection.
 
 #### Scenario: Frequent samples
 - **WHEN** samples publish every second for an hour
 - **THEN** the durable event log grows only by committed facts
+
+#### Scenario: TUI publication subscriber
+- **WHEN** an active TUI receives a newer observation with its head
+- **THEN** that observation originates from the existing sampler and does not require a parallel observation long-read connection
 
 ### Requirement: Diagnostics are structured and carry identifiers only
 Daemon and display diagnostics SHALL be structured events with request, sampler-pass and operation identifiers, SHALL go to the daemon's stderr or the display's log file and never to the terminal the display draws on, and SHALL NOT contain launch values, tokens or request bodies. The observation read SHALL log identifiers only and no snapshot payload.

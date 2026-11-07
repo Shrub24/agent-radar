@@ -6,24 +6,23 @@ Let an operator close panes or restart managed workers through the authority tha
 ## Requirements
 
 ### Requirement: Lifecycle actions require separate confirmation
-Radar SHALL open confirmation for x (selected pane/agent close), X (its tab close) and r (managed-worker restart). Opening confirmation SHALL send nothing. It SHALL name the target and possible losses, default to Cancel, and require activation of Confirm. Task/workspace rows SHALL not redirect destructive actions to their parents.
+Radar SHALL offer one semantic Close command on `D` and restart on `r`. Destructive confirmation SHALL name the selected resource and known running work, default to Cancel and send nothing until accepted. Keyboard, mouse and palette SHALL reach the same daemon-owned target resolution; unsupported rows SHALL NOT redirect to parents.
 
 #### Scenario: Close confirmation
-- **WHEN** x is pressed on an eligible row
-- **THEN** a confirmation names the pane and any process, assignment or outstanding work that may be lost, without sending a request
-
-#### Scenario: Cancel or accidental Enter
-- **WHEN** Escape is pressed or the initially selected Cancel is activated
-- **THEN** no lifecycle action is submitted
+- **WHEN** the operator confirms `D` on an eligible agent
+- **THEN** one operation terminates its managed execution and removes its pane without a second `D`
 
 #### Scenario: Mouse confirmation
-- **WHEN** the operator clicks Confirm in the drawn dialog
-- **THEN** the same checks as keyboard confirmation apply
-- **AND** tree second-click focus never serves as lifecycle confirmation
+- **WHEN** the operator accepts the drawn close confirmation with the mouse
+- **THEN** it uses the same target and checks as keyboard acceptance, never a focus second-click
 
 #### Scenario: Filter entry
-- **WHEN** a lifecycle key is typed while editing the filter
-- **THEN** it is filter text and opens no confirmation
+- **WHEN** a close key is typed while editing a filter
+- **THEN** it changes filter text rather than dispatching close
+
+#### Scenario: Cancel or accidental Enter
+- **WHEN** the operator cancels a close dialog
+- **THEN** no termination or removal is submitted
 
 ### Requirement: Confirmation is tied to observed identity
 Radar SHALL refuse lifecycle submission from stale inventory or absent targets. Confirmation SHALL freeze operation and target identities and SHALL be revalidated before submission. A changed identity or containment SHALL cancel the action with a reason, not redirect it to the current selection.
@@ -37,87 +36,72 @@ Radar SHALL refuse lifecycle submission from stale inventory or absent targets. 
 - **THEN** no action is submitted
 
 ### Requirement: Direct runtime close requires positive unmanaged evidence
-Radar SHALL route unmanaged pane/tab close through its runtime provider only with current positive unmanaged evidence. Pi panes without ownership metadata are uncertain. Managed and continuity-retained managed associations SHALL never use direct runtime close. Unsupported providers SHALL refuse explicitly.
+Close SHALL terminate known managed executions through the common lifecycle implementation before terminal removal. Ordinary unmanaged workloads SHALL use best-effort terminal teardown. Uncertain agent identity SHALL NOT authorize signalling a guessed process; a confirmed eligible enclosing-container close MAY still remove its verified resource with unresolved execution outcomes retained.
 
 #### Scenario: Ordinary unmanaged pane
-- **WHEN** current evidence reports no agent and no retained or uncertain managed association
-- **THEN** confirmed close can reach the runtime provider
+- **WHEN** the operator confirms Close on an ordinary shell
+- **THEN** its pane is removed without inventing a managed execution
 
 #### Scenario: Unverified Pi pane
-- **WHEN** a Pi pane publishes no ownership metadata
-- **THEN** direct close is refused, not treated as unmanaged
+- **WHEN** a narrow agent Close cannot establish its exact execution association
+- **THEN** it refuses to signal a guessed process; separately confirmed enclosing-container closure retains its broader removal intent
 
 #### Scenario: Retained managed association
-- **WHEN** a managed association is locally retained while its pane still exists
-- **THEN** direct runtime close remains forbidden
+- **WHEN** a known managed association remains on an eligible retained pane
+- **THEN** the common close resolves its execution state rather than using an independent mux-only bypass
+
+#### Scenario: Incomplete managed discovery
+- **WHEN** a confirmed container close cannot identify every hosted agent
+- **THEN** it may remove the verified root without signalling guessed identities or claiming unverified process exits
 
 ### Requirement: Container close is all or nothing at admission
-Radar SHALL refuse an entire tab close when any observed member is managed or uncertain. It SHALL perform no partial pane closure and SHALL recheck containment before direct tab close.
+A confirmed container Close SHALL recursively handle its hosted managed executions and remove its panes through the common close implementation. Managed children SHALL NOT alone cause refusal. Graceful shutdown SHALL share a deadline and incomplete child handling SHALL NOT alone block bounded enclosing-resource removal; verified identity changes SHALL still fence destruction.
 
 #### Scenario: Mixed tab
-- **WHEN** a tab contains an ordinary pane and a managed or unverified Pi pane
-- **THEN** tab close is refused and neither pane is closed
+- **WHEN** a tab contains an ordinary shell and a managed agent
+- **THEN** Close requests managed termination and removes the selected tab without requiring separate operator actions for each child
 
 ### Requirement: Managed operations are owner-routed
-Radar SHALL send confirmed managed close/restart only to the exact parent-session owner using herdsman-control/v1, with exact label/run identity, available cross-checks and matching confirmation. Missing identity or owner SHALL refuse. Restart SHALL be limited to idle retained managed workers; leads, standalone sessions and busy targets SHALL not be restarted.
+Radar SHALL route managed Close and restart to the daemon's common lifecycle implementation using exact subject/claim and placement identities. A spawn-parent relationship SHALL authorize parent requests, not select a separate termination implementation. Assignment and message-consumption authority SHALL remain with their existing owners.
 
 #### Scenario: Idle managed worker restart
-- **WHEN** an eligible idle managed worker is confirmed
-- **THEN** the request echoes its operation, label and run UUID and asks its exact owner to restart it
+- **WHEN** an eligible managed worker is restarted
+- **THEN** the daemon replaces its execution through the common lifecycle implementation
 
 #### Scenario: Busy or parentless target
-- **WHEN** restart targets a working/waiting/blocked worker or a lead/standalone session
-- **THEN** Radar refuses without a mux launch fallback
+- **WHEN** a managed agent has no spawn parent or is busy but has eligible verified execution and resume context
+- **THEN** those facts alone do not force an owner-file route or a second lifecycle implementation; normal restart admission and confirmation apply
 
 #### Scenario: Close abandoned assignment
-- **WHEN** a managed close is confirmed for active work
-- **THEN** Radar warns that the assignment may be abandoned and the owner decides eligibility
+- **WHEN** Close will interrupt active work
+- **THEN** confirmation names that loss and closure does not settle the assignment
 
-### Requirement: Owner file transport preserves trust and identity
-Requests SHALL use trusted owner-created user-owned 0700 non-symlink directories, unique UUID filenames, atomic 0600 publication, an 8 KiB limit and absolute expiry. Radar SHALL not create owner directories or overwrite requests. Results SHALL be bounded and validated against request id, version and operation; unknown fields SHALL be tolerated.
-
-#### Scenario: Untrusted or missing directory
-- **WHEN** an owner directory is absent, symlinked, foreign-owned or has loose permissions
-- **THEN** Radar refuses and writes nothing
-
-#### Scenario: Mismatched result
-- **WHEN** a result names a different request or operation
-- **THEN** Radar reports invalid evidence and does not claim completion
-
-### Requirement: Outcomes come from files, never local timeout
-Radar SHALL derive result, started, not_executed and pending in that precedence. Claimed requests SHALL never be retried; local timeout and shutdown SHALL not imply cancellation. Pending or unknown actions SHALL block duplicate submission for that target until authoritative resolution.
-
-#### Scenario: Claim without result
-- **WHEN** a claim exists but no result exists
-- **THEN** Radar reports started with unknown outcome even after expiry and does not retry
-- **AND** a later valid result can refine the display
-
-#### Scenario: Expired unclaimed request
-- **WHEN** neither result nor claim exists and absolute expiry passed
-- **THEN** Radar reports not_executed
-
-#### Scenario: Owner refusal
-- **WHEN** a valid refused result exists
-- **THEN** Radar shows the owner's category and message without removing or changing the row optimistically
-
-#### Scenario: Quit after submitting
-- **WHEN** Radar quits with a published request
-- **THEN** quitting remains responsive and Radar does not delete or cancel the request
+#### Scenario: Different entrypoints
+- **WHEN** an authorized parent and the operator each request equivalent managed closure through their respective interfaces
+- **THEN** both reach the same managed termination and pane-removal semantics after authorization
 
 ### Requirement: Lifecycle results do not replace observation
-Lifecycle work SHALL not block input, collection or quitting. Outcomes SHALL be shown separately from source diagnostics, with no optimistic row removal, whether read from owner files or control-plane records. Managed controls SHALL remain unavailable until owner implementation acceptance is confirmed and SHALL refuse when their transport is unavailable. An uncertain control-plane outcome SHALL not trigger direct retry.
+Lifecycle work SHALL NOT block input or collection. Confirmed resource removal SHALL be presented normally and rows SHALL reconcile from observation. Confirmed survivors or failed removal SHALL be actionable; unavailable exit code alone SHALL remain diagnostic. Uncertain outcomes SHALL remain readable without being presented as proof that no effect occurred.
 
 #### Scenario: Owner control unavailable
-- **WHEN** the owner implementation is unconfirmed or no trusted transport exists
-- **THEN** managed actions explain their unavailability while observation and focus continue
+- **WHEN** retired owner-file transport is absent but daemon lifecycle authority is available
+- **THEN** managed close uses the daemon and does not require that retired transport
 
 #### Scenario: Applied operation
-- **WHEN** a valid closed or restarted result arrives
-- **THEN** Radar reports it and reconciles rows through subsequent inventory rather than fabricating runtime state
+- **WHEN** Close or restart returns a valid outcome
+- **THEN** the TUI reconciles rows through subsequent observation, without fabricating topology
 
 #### Scenario: Control-plane outcome unknown
-- **WHEN** a control-plane response is lost after possible dispatch
-- **THEN** Radar reports uncertainty, issues no direct retry and fabricates no row removal
+- **WHEN** a request reply is lost after possible dispatch
+- **THEN** the view reconciles the existing operation rather than submitting a fresh destructive request
+
+#### Scenario: Missing code only
+- **WHEN** a close verifies the requested removal but cannot capture an exit code
+- **THEN** the TUI does not leave the branch pending or require another confirmation solely for that missing code
+
+#### Scenario: Confirmed surviving agent
+- **WHEN** a managed execution is verified to survive after its terminal was removed
+- **THEN** the outcome exposes that actionable failure without changing it into a verified exit
 
 ### Requirement: A new workspace starts in a chosen project directory
 Radar SHALL, on `A`, offer a fuzzy picker of project directories and create a workspace in the chosen one, named for the folder of the git root containing it, or for the directory's own folder when it is in no repository. Cancelling the picker SHALL create nothing. Radar SHALL NOT follow a later change of directory in the workspace.
@@ -131,11 +115,30 @@ Radar SHALL, on `A`, offer a fuzzy picker of project directories and create a wo
 - **THEN** no workspace is created and the dashboard is drawn again
 
 ### Requirement: Project candidates come from a configured source
-Radar SHALL offer the directory it was started in first, then the directories printed by `[tui] project_source` (default `zoxide query -l`) that are absolute, existing and accepted by `[tui] project_filter` (default: containing `.git`), each once. Radar SHALL NOT run anything the source prints. A source that is missing, fails or exceeds its time limit SHALL leave only the start directory and say so in one line.
+Radar SHALL offer the directories printed by `[tui] project_source` (default `zoxide query -l`) that are absolute, existing and accepted by `[tui] project_filter` (default: containing `.git`), each once, in the order the source printed them. The candidate list SHALL NOT depend on the working directory of the process that requested it. Radar SHALL NOT run anything the source prints.
 
 #### Scenario: No source is installed
 - **WHEN** the project source program is missing
-- **THEN** the picker offers only the start directory and a one-line message names the failure
+- **THEN** the picker offers only the base directory and a one-line message names the failure
+
+#### Scenario: Requested from different directories
+- **WHEN** the picker is opened from two frontends whose working directories differ
+- **THEN** both are offered the same candidates in the same order
+
+#### Scenario: Source accepted nothing
+- **WHEN** the source succeeds but every directory it prints is rejected by the filter
+- **THEN** the picker offers the base directory and says that no listed project was accepted
+
+#### Scenario: Base directory unusable
+- **WHEN** the configured base directory is absent or not an existing directory
+- **THEN** the picker offers no candidate and says so rather than substituting another directory
+
+### Requirement: No accepted project directory
+When the source yields no accepted directory, including when it is missing, fails or exceeds its time limit, Radar SHALL offer one configured base directory, defaulting to the user's home directory, and SHALL say why in one line.
+
+#### Scenario: No accepted project directory
+- **WHEN** the project source is missing, fails, times out or yields no accepted directory
+- **THEN** Radar offers the configured base directory, defaulting to the home directory, and says why in one line
 
 ### Requirement: A workspace directory is checked by the runtime
 The runtime SHALL refuse a workspace creation whose directory is relative or is not an existing directory before creating anything, and SHALL start a created tmux session in the directory it was given. A runtime that cannot start a workspace in a directory SHALL refuse it.
@@ -145,15 +148,19 @@ The runtime SHALL refuse a workspace creation whose directory is relative or is 
 - **THEN** it is refused and no session is created
 
 ### Requirement: L launches the configured managed-agent command
-Radar SHALL expose `[tui].launch_command` as an argv vector defaulting to `["pi"]`. Pressing `L` on a recorded workspace or pane SHALL immediately create a tab in that place's workspace running that command as a private recipe, without a command prompt or confirmation. A launch from a pane SHALL open its own tab rather than splitting the pane.
+`L` SHALL create dedicated placement in the selected eligible workspace and run `[agents].launch_command` through common managed admission and supervision. It SHALL NOT leave the program as an untracked container recipe. Existing target-shell startup, directory and direnv behaviour SHALL remain; adding a launch SHALL require no destructive confirmation.
 
 #### Scenario: Launch the default agent
-- **WHEN** the user presses `L` on a recorded workspace or pane without a launch-command override
-- **THEN** Radar starts `pi` in a new tab of that place's workspace
+- **WHEN** the operator presses `L` on an eligible workspace with the default launch command
+- **THEN** a new tab starts the default agent with verified placement, scope, claim and completion reporting
 
 #### Scenario: Launch from a pane
-- **WHEN** the user presses `L` on a pane
-- **THEN** the agent gets a window of its own in that pane's workspace, and the pane it was launched from is left as it was
+- **WHEN** the operator presses `L` on an eligible pane
+- **THEN** its new tab receives managed supervision and target-shell context while the source pane is left untouched
+
+#### Scenario: Scope fails during a TUI launch
+- **WHEN** the scope cannot be established for an `L` launch
+- **THEN** the command does not run, its reserved claim is withdrawn, and Radar reports the refusal rather than starting it unscoped
 
 ### Requirement: L uses the selected place's shell context
 A launch SHALL use the pane's current directory, or the workspace's recorded directory when the selected place is the workspace itself. It SHALL start through the user's login/interactive shell and apply direnv in that target directory. It SHALL NOT copy the TUI environment wholesale or persist environment values in public records, reads, or events.
@@ -206,3 +213,36 @@ Radar SHALL answer `E` on a selected Pi session with a one-line message naming i
 #### Scenario: Not a Pi session
 - **WHEN** `E` is pressed on a pane that is not a Pi session
 - **THEN** a one-line message says only a Pi session can be managed and nothing else happens
+
+### Requirement: Externally started agents are observed, not promoted
+Radar SHALL show an agent started outside its managed launch path as observed: its facts, session identity, children and inbox identity remain visible and durable. Radar SHALL NOT offer it execution controls that require a managed launch, and SHALL NOT imply its resource grouping, startup admission or exit result are tracked.
+
+#### Scenario: Observed agent selected
+- **WHEN** the operator selects an agent Radar did not launch
+- **THEN** Radar shows its facts and relationships and states that it is not a managed execution
+
+#### Scenario: Transition through restart
+- **WHEN** the operator chooses to place an observed agent under Radar's management
+- **THEN** Radar confirms a restart, verifies the previous process has exited, and starts its replacement through the managed launch path
+
+### Requirement: Lifecycle controls name the claim they were issued against
+Every lifecycle control that affects a process SHALL name the claim that was current when the operation was requested. Radar SHALL refuse the control when that claim is no longer the subject's current claim, and SHALL NOT retarget a response or a signal onto a successor attempt.
+
+#### Scenario: Stale control after a restart
+- **WHEN** an operation naming an earlier claim reaches the daemon after the subject's successor became current
+- **THEN** it is refused as stale and no signal targets the successor
+
+#### Scenario: Replayed control
+- **WHEN** a control is replayed under its own request id for the claim it named
+- **THEN** the recorded response is returned and no second effect occurs
+
+### Requirement: Restart pre-mints its successor before stopping
+A managed restart SHALL pre-mint the successor claim and record it as the subject's current claim before it signals the previous process, so the subject is never without a current attempt between the stop and the replacement starting. A restart SHALL refuse before signalling when it cannot pre-mint.
+
+#### Scenario: Continuity during restart
+- **WHEN** a managed restart is dispatched
+- **THEN** the successor claim exists before the previous process is signalled, and a competing launch cannot claim that subject in the gap
+
+#### Scenario: Successor cannot be admitted
+- **WHEN** the successor claim cannot be made durable
+- **THEN** no signal is sent and the previous process is left as it was

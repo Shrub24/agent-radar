@@ -54,7 +54,7 @@ A retained row is not a refusal: continuity keeps a row only while its pane is s
 
 ### Requirement: A failed focus is stated and harmless
 
-Radar SHALL NOT block input or quitting while a focus request is outstanding, and SHALL state a failure in one line that does not replace the source diagnostic.
+Radar SHALL NOT block input or quitting while a focus request is outstanding, and SHALL state a failure in one line that does not replace the source diagnostic. A focus SHALL NOT hold its target against a later mutation however it ended. A tmux focus with no client attached to the server SHALL be refused before anything changes, with a refusal that names that case.
 
 #### Scenario: The backend does not answer
 - **WHEN** a focus request exceeds the command timeout
@@ -63,3 +63,52 @@ Radar SHALL NOT block input or quitting while a focus request is outstanding, an
 #### Scenario: Filter entry
 - **WHEN** the filter is being edited and the user presses `Enter`
 - **THEN** the filter is kept as before and no focus request is sent
+
+#### Scenario: No client is attached
+- **WHEN** a focus is requested on a tmux server with no client attached
+- **THEN** it is refused with the no-client refusal and the server is unchanged
+
+#### Scenario: A focus that ended unknown
+- **WHEN** a focus of a workspace ended unknown
+- **THEN** creating a tab in that workspace is not refused because of it
+
+### Requirement: TUI selection and terminal focus are separate
+A TUI focus invocation SHALL explicitly identify its locally selected row. Browsing and inspecting details SHALL NOT execute focus. Available observed terminal focus SHALL be indicated independently of selection. A focus request SHALL NOT publish its intended destination as observed success before confirming state through a read.
+
+#### Scenario: Inspect elsewhere
+- **WHEN** the user selects B while tmux displays A
+- **THEN** details describe B, the focus marker identifies A, and tmux remains at A
+
+#### Scenario: Enter requests focus
+- **WHEN** Enter invokes focus on selected B outside filter editing or confirmation
+- **THEN** the command names B and the existing focus execution and no-client recovery rules apply
+
+#### Scenario: Focus fails
+- **WHEN** the backend refuses focus on B
+- **THEN** observed focus is not changed to B and the failure is reported
+
+### Requirement: Implicit targets need evidence the read still vouches for
+A command that supplies no row SHALL resolve focus only from a current observation. Stale or unavailable evidence SHALL refuse and report that no current focus was available, rather than act on a place that may have moved.
+
+#### Scenario: Focus the read cannot vouch for
+- **WHEN** a row-dependent command supplies no row while the last observation is stale
+- **THEN** nothing is dispatched and the refusal names the missing current focus
+
+### Requirement: Missing row means observed focus for row-dependent commands
+A row-dependent command with an explicit row SHALL validate and freeze that identity. With no row supplied it SHALL resolve and freeze the currently observed focused place. Invalid explicit rows SHALL NOT fall back to focus. No selected row in a TUI SHALL be reported locally rather than accidentally invoking omitted-row semantics. Commands without row targets SHALL remain targetless.
+
+#### Scenario: Selected row differs from focus
+- **WHEN** a TUI invokes a row-dependent command with selected B while focus is A
+- **THEN** the actor validates B, not A
+
+#### Scenario: Intentional implicit invocation
+- **WHEN** a caller omits a row for a row-dependent command and current focus is available
+- **THEN** the actor resolves that focused place through command eligibility and freezes its target
+
+#### Scenario: No eligible focus
+- **WHEN** a row-dependent command omits a row but focus is unavailable, stale, ambiguous or has no eligible target
+- **THEN** the actor refuses without guessing a row
+
+#### Scenario: No local selection
+- **WHEN** a TUI has no selected row and the user invokes a row-dependent action
+- **THEN** it reports no selection instead of silently acting on focus

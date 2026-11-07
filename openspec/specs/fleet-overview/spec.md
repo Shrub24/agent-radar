@@ -108,28 +108,46 @@ Radar SHALL allow agent branches to be folded by Space, existing arrow navigatio
 
 ### Requirement: Workspace-grouped fleet tree
 
-Radar SHALL provide a standalone full-screen tree grouped by workspace. Each window of a workspace SHALL be drawn as a tab whose identity is its root agent: the one agent in it with no owner in the same window. Other agents and ordinary panes of that window nest beneath it. An owner link across windows SHALL NOT nest. A window with no root agent, or with more than one, keeps flat placement beneath its workspace. Unresolvable or cyclic ownership leaves agents visible without unsafe nesting.
+Radar SHALL provide a standalone full-screen tree grouped by workspace. It SHALL nest agents using unambiguous explicit ownership within a workspace, without requiring a shared tab. Unresolvable or cyclic ownership SHALL leave agents visible without unsafe nesting. Radar SHALL show only what is inside the server it serves: a registration of another backend or server, and a registration whose reported pane is not in the inventory and for which the daemon holds no spawn edge, SHALL NOT be shown.
 
 #### Scenario: Owner and worker in different tabs
-- **WHEN** an owner and worker share a workspace but occupy different windows
-- **THEN** the worker is not nested under the owner and is grouped by its own window, so the tree never fabricates a cross-window parent
-
-#### Scenario: Window with one root agent
-- **WHEN** a window holds a root agent and other agents or panes
-- **THEN** the root agent's row is the tab and the others appear beneath it, with the window name shown as its tab label
-
-#### Scenario: Window with several root agents
-- **WHEN** a window holds more than one agent with no owner in that window
-- **THEN** the window has no single identity, and its agents and panes remain flat beneath the workspace
+- **WHEN** an owner and worker share a workspace and have an explicit ownership link but occupy different tabs
+- **THEN** the worker appears beneath the owner and its tab remains available as location detail
 
 #### Scenario: Ownership cannot be resolved
 - **WHEN** ownership is missing, ambiguous, cyclic or references an owner outside the workspace
-- **THEN** affected agents remain visible in their window without fabricated nesting
+- **THEN** affected agents remain visible in their physical workspace without fabricated nesting
 
 #### Scenario: Provider prefix in a reported title
 - **WHEN** a reported title begins with a provider mark or name followed by a separator
 - **THEN** the row shows the title with that prefix removed, because the row already carries the provider's mark
 - **AND** a title that would be emptied by the removal is shown unchanged
+
+#### Scenario: Window with one root agent
+- **WHEN** a tab holds a root agent and other agents or panes
+- **THEN** the root agent's row is the tab and the others appear beneath it, with the tab name shown as its tab label
+
+#### Scenario: Window with several root agents
+- **WHEN** a tab holds more than one agent with no owner in that tab
+- **THEN** the tab has no single identity, and its agents and panes remain flat beneath its workspace
+
+#### Scenario: A session of another server
+- **WHEN** a session registered a pane of a different tmux server
+- **THEN** it is not shown
+
+#### Scenario: A registration naming no pane here
+- **WHEN** a registration names no pane, or one the inventory lacks, and no spawn edge exists for it
+- **THEN** it is not shown and no unplaced group appears
+
+#### Scenario: A container's binding is unresolved
+
+- **WHEN** a container's backend binding cannot be verified, or its handle now exists under a different serving instance
+- **THEN** the row stays visible, marks its location as unresolved and offers no destructive action for it
+
+#### Scenario: An unmanaged container
+
+- **WHEN** a workspace, tab or pane exists that Radar did not create
+- **THEN** it is shown as observed with its own identity and location, and no reload is offered for it
 
 ### Requirement: Pane views over ordinary panes
 
@@ -323,28 +341,34 @@ Radar SHALL read separate animation settings for working, waiting, blocked, sett
 - **THEN** those marks keep their fixed shape and the row is drawn without animation
 
 ### Requirement: Keyboard selection and folding
-
-Radar SHALL support keyboard selection and expanding/collapsing tree branches using Vim-style keys and arrow-key navigation. Refreshes SHALL preserve selection and fold state for surviving row identities where possible. If a selected row disappears, selection SHALL remain on a valid visible row or become empty when none remain.
+Radar SHALL support local keyboard selection and shared expanding/collapsing of branches using Vim-style keys and arrows. Refreshes SHALL preserve each view's selected identity where visible. A hidden or removed selection SHALL reconcile locally to a valid visible row, or become empty. Viewport and details state SHALL remain local. Browsing SHALL NOT request terminal focus.
 
 #### Scenario: Navigate and fold
-- **WHEN** the user navigates to an owner and collapses its branch
-- **THEN** its descendants are hidden and selection remains valid
+- **WHEN** one view selects an owner and collapses its branch
+- **THEN** the shared listing reflects the fold and each frontend independently reconciles its own selection
 
 #### Scenario: Stable refresh
-- **WHEN** a refresh updates facts without removing the selected row
-- **THEN** selection remains on that row and existing fold state is preserved
+- **WHEN** facts refresh without removing the selected identity from the listing
+- **THEN** the view keeps that selection unless its enabled follow policy adopts changed focus
+
+#### Scenario: Independent viewport
+- **WHEN** one frontend scrolls, selects another row or changes dimensions
+- **THEN** another frontend's selection and viewport are unchanged
 
 ### Requirement: Text filtering
-
-Radar SHALL support a case-insensitive text filter over displayed labels and available role/assignment text. Matching rows SHALL remain visible with the ancestors needed to understand their placement. Clearing the filter SHALL restore the unfiltered tree and prior fold state.
+Radar SHALL support a shared live case-insensitive fuzzy filter over displayed labels and available role/assignment text, edited by at most one attachment. Matching descendants SHALL retain the ancestry needed to understand placement and tree ordering. Clearing the filter SHALL restore the otherwise eligible listing and prior folds. Each frontend SHALL reconcile its own selection against the resulting canonical rows.
 
 #### Scenario: Match a nested assignment
-- **WHEN** the filter matches a worker's reported assignment but not its owner's label
-- **THEN** the worker and its owner/workspace ancestry remain visible
+- **WHEN** the filter matches a worker assignment but not its owner's label
+- **THEN** the worker and necessary ancestry remain visible in tree order
 
 #### Scenario: Clear filter
-- **WHEN** the user clears the filter
-- **THEN** all otherwise eligible rows return with the pre-filter fold state
+- **WHEN** the editor clears the filter
+- **THEN** otherwise eligible rows return with prior folds preserved
+
+#### Scenario: Live shared query
+- **WHEN** the editor changes the query without committing
+- **THEN** all frontends receive the same filter and canonical rows but not a shared browsing selection
 
 ### Requirement: Safe terminal lifecycle
 
@@ -378,11 +402,11 @@ Radar SHALL initially hide task children in agents view and show them in running
 
 ### Requirement: Background-task rows can be toggled
 
-Outside filter entry, b SHALL toggle task-row visibility for the current view without changing the pane view or finished-session toggle. Each view's choice SHALL be retained for the current Radar run. The footer SHALL name the effective action. A hidden selected task SHALL fall back to its surviving visible parent.
+Outside filter entry, b SHALL toggle task-row visibility for the current shared pane view without changing that view or the finished-session toggle. Each view's choice SHALL be retained for the daemon-hosted UI session. The footer SHALL name the effective action. A hidden selected task SHALL fall back to its surviving visible parent.
 
 #### Scenario: Toggle task rows
 - **WHEN** b is pressed outside filter entry
-- **THEN** task children switch between visible and hidden in the current view, and the footer changes between showing and hiding background-task rows
+- **THEN** task children switch between visible and hidden in the current shared view, and each frontend's footer changes between showing and hiding background-task rows
 
 #### Scenario: Mode choices survive cycling
 - **WHEN** task rows are hidden with b in running view, and the user cycles through all and agents views back to running
@@ -403,8 +427,9 @@ Outside filter entry, b SHALL toggle task-row visibility for the current view wi
 - **THEN** it is filter text rather than a visibility command
 
 #### Scenario: A new Radar run
-- **WHEN** Radar restarts
-- **THEN** view visibility returns to its built-in defaults rather than persisting the last choices to disk
+- **WHEN** a frontend restarts and attaches to the existing UI session
+- **THEN** it receives that session's choices instead of resetting them
+- **AND** a daemon restart starts a new volatile UI session with built-in defaults rather than restoring choices from disk
 
 ### Requirement: Rows and details keep three authorities separate
 The dashboard SHALL present physical lifecycle, execution status and assignment facts as separate, labelled values and SHALL NOT collapse them into one status. Each SHALL carry its own freshness, and a stale value SHALL be marked stale.
