@@ -55,8 +55,15 @@ committed before the next starts.
   in the gate catches it.
 - Staging leaves temporary `parse` calls at module edges. Stage 3 deletes them, and
   the change is not done while any remain.
-- A fresh `spawn.create` reserves a placeholder subject whose id equals its launch
-  claim id, so for that one record the same string is both kinds. The types keep
-  the two roles apart, but this record defeats the "not found" scenario until the
-  placeholder gets an id of its own. Stage 1 decides whether to mint a separate id
-  there; it must not be papered over with a conversion.
+- A fresh `spawn.create` reserves a subject whose id equalled its launch claim id,
+  and enrollment (`lifecycle.rs`, an absent logical subject) did the same, so for
+  those records one string was written into both roles. Decided: a subject identity
+  invented at either site is minted (`SubjectId::random()`), never borrowed from the
+  claim. Records already holding one string in both fields still decode — both are
+  canonical UUIDs — and read as "this claim belongs to this subject" rather than as
+  a conversion.
+- The claim read (`lifecycle::read`) was keyed on a parameter it called
+  `subject_id` and stored as the claim id, and built the subject from the same
+  string. Decided: it is `read_claim(&ClaimId)`, and the subject comes from the
+  attachment, refusing when the attachment names none or names an unreadable one.
+  No lookup resolves one identity kind through another.
