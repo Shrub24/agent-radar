@@ -120,12 +120,12 @@ pub enum Standing {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Decision {
-    pub registration_id: String,
-    pub claim_id: String,
+    pub registration_id: RegistrationId,
+    pub claim_id: ClaimId,
     pub session_id: Option<String>,
     pub standing: Standing,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub subject_id: Option<String>,
+    pub subject_id: Option<SubjectId>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub location: Option<RegistryLocation>,
 }
@@ -144,10 +144,10 @@ pub struct Answer {
 impl From<&Decision> for Answer {
     fn from(claim: &Decision) -> Self {
         Self {
-            registration_id: claim.registration_id.clone(),
-            claim_id: claim.claim_id.clone(),
+            registration_id: claim.registration_id.to_string(),
+            claim_id: claim.claim_id.to_string(),
             standing: claim.standing.clone(),
-            subject_id: claim.subject_id.clone(),
+            subject_id: claim.subject_id.as_ref().map(ToString::to_string),
         }
     }
 }
@@ -175,15 +175,15 @@ fn write(registry: &Registry, name: &str, claim: &Decision) -> Result<(), String
 /// re-reads the claims, and copied inward as a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
-    pub subject_id: String,
-    pub claim_id: String,
+    pub subject_id: SubjectId,
+    pub claim_id: ClaimId,
 }
 
 /// The attachment a registration currently holds, if any. A pending, duplicate
 /// or released claim is not authority.
 pub fn attachment(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
 ) -> Result<Option<Attachment>, String> {
     let Some(claim) = current(registry, registration_id)? else {
         return Ok(None);
@@ -192,13 +192,8 @@ pub fn attachment(
         return Ok(None);
     };
     if claim.standing != Standing::Granted
-        || crate::control_plane::lifecycle::read_subject_record(
-            registry,
-            &SubjectId::required(&subject_id, "subject_id")?,
-        )?
-        .is_none_or(|record| {
-            record.current_claim.as_ref().map(ClaimId::as_str) != Some(claim.claim_id.as_str())
-        })
+        || crate::control_plane::lifecycle::read_subject_record(registry, &subject_id)?
+            .is_none_or(|record| record.current_claim.as_ref() != Some(&claim.claim_id))
     {
         return Ok(None);
     }
@@ -208,13 +203,14 @@ pub fn attachment(
     }))
 }
 
-pub fn decision(registry: &Registry, claim_id: &str) -> Result<Option<Decision>, String> {
-    validate_registration_id(claim_id)?;
+pub fn decision(registry: &Registry, claim_id: &ClaimId) -> Result<Option<Decision>, String> {
     read(registry, &format!("{claim_id}.json"))
 }
 
-pub fn current(registry: &Registry, registration_id: &str) -> Result<Option<Decision>, String> {
-    validate_registration_id(registration_id)?;
+pub fn current(
+    registry: &Registry,
+    registration_id: &RegistrationId,
+) -> Result<Option<Decision>, String> {
     match read(registry, &format!("current-{registration_id}.json"))? {
         Some(pointer) => read(registry, &format!("{}.json", pointer.claim_id)),
         None => Ok(None),
@@ -224,23 +220,21 @@ pub fn current(registry: &Registry, registration_id: &str) -> Result<Option<Deci
 /// Caller serializes presence decisions, including verification and binding.
 pub fn begin(
     registry: &Registry,
-    registration_id: &str,
-    claim_id: &str,
+    registration_id: &RegistrationId,
+    claim_id: &ClaimId,
     session_id: &str,
     location: Option<RegistryLocation>,
 ) -> Result<Decision, String> {
-    for id in [registration_id, claim_id, session_id] {
-        validate_registration_id(id)?;
-    }
+    validate_registration_id(session_id)?;
     let name = format!("{claim_id}.json");
     if let Some(mut claim) = read(registry, &name)? {
-        if claim.registration_id != registration_id
+        if &claim.registration_id != registration_id
             || claim.session_id.as_deref() != Some(session_id)
         {
             return Err("claim ID already identifies a different process or session".into());
         }
         if current(registry, registration_id)?
-            .is_some_and(|c| c.claim_id != claim_id && c.standing != Standing::Released)
+            .is_some_and(|c| &c.claim_id != claim_id && c.standing != Standing::Released)
         {
             claim.standing = Standing::Released;
             claim.subject_id = None;
@@ -258,13 +252,8 @@ pub fn begin(
     {
         crate::control_plane::lifecycle::release_attachment(
             registry,
-            &ClaimId::required(&previous.claim_id, "claim_id")?,
-            previous
-                .subject_id
-                .as_deref()
-                .map(|id| SubjectId::required(id, "subject_id"))
-                .transpose()?
-                .as_ref(),
+            &previous.claim_id,
+            previous.subject_id.as_ref(),
         )?;
         previous.standing = Standing::Released;
         previous.subject_id = None;
@@ -276,8 +265,8 @@ pub fn begin(
         )?;
     }
     let claim = Decision {
-        registration_id: registration_id.into(),
-        claim_id: claim_id.into(),
+        registration_id: registration_id.clone(),
+        claim_id: claim_id.clone(),
         session_id: Some(session_id.into()),
         standing: Standing::Pending,
         subject_id: None,
@@ -291,17 +280,17 @@ pub fn begin(
 /// does not grant any reader authority; only a verified presence report can.
 pub fn reserve(
     registry: &Registry,
-    registration_id: &str,
-    claim_id: &str,
-    subject_id: &str,
+    registration_id: &RegistrationId,
+    claim_id: &ClaimId,
+    subject_id: &SubjectId,
     session_id: Option<String>,
 ) -> Result<(), String> {
     save(
         registry,
         &Decision {
-            registration_id: registration_id.into(),
-            claim_id: claim_id.into(),
-            subject_id: Some(subject_id.into()),
+            registration_id: registration_id.clone(),
+            claim_id: claim_id.clone(),
+            subject_id: Some(subject_id.clone()),
             session_id,
             standing: Standing::Reserved,
             location: None,
@@ -321,29 +310,22 @@ pub fn save(registry: &Registry, claim: &Decision) -> Result<(), String> {
 
 pub fn release(
     registry: &Registry,
-    registration_id: &str,
-    claim_id: &str,
+    registration_id: &RegistrationId,
+    claim_id: &ClaimId,
 ) -> Result<Decision, String> {
-    validate_registration_id(registration_id)?;
-    validate_registration_id(claim_id)?;
     let mut claim = read(registry, &format!("{claim_id}.json"))?.ok_or("claim is not recorded")?;
-    if claim.registration_id != registration_id {
+    if &claim.registration_id != registration_id {
         return Err("claim belongs to another registration".into());
     }
     crate::control_plane::lifecycle::release_attachment(
         registry,
-        &ClaimId::required(claim_id, "claim_id")?,
-        claim
-            .subject_id
-            .as_deref()
-            .map(|id| SubjectId::required(id, "subject_id"))
-            .transpose()?
-            .as_ref(),
+        claim_id,
+        claim.subject_id.as_ref(),
     )?;
     claim.standing = Standing::Released;
     claim.subject_id = None;
     write(registry, &format!("{claim_id}.json"), &claim)?;
-    if current(registry, registration_id)?.is_some_and(|c| c.claim_id == claim_id) {
+    if current(registry, registration_id)?.is_some_and(|c| &c.claim_id == claim_id) {
         write(registry, &format!("current-{registration_id}.json"), &claim)?;
     }
     Ok(claim)

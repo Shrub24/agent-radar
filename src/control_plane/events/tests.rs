@@ -77,12 +77,9 @@ fn a_process_can_be_recovered_without_fabricating_a_claim() {
         "process identity and private recipe survive replay without a claim"
     );
     assert!(
-        crate::control_plane::registry::presence::attachment(
-            &restored,
-            process.registration_id.as_str(),
-        )
-        .unwrap()
-        .is_none()
+        crate::control_plane::registry::presence::attachment(&restored, &process.registration_id,)
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -94,7 +91,7 @@ fn attachment_views_share_process_evidence_across_replay() {
     {
         let mut log = registry.events.lock().unwrap();
         log.append(
-            ticket.claim_id.as_str(),
+            Stream::Claim(&ticket.claim_id),
             "2026-01-01T00:00:00.000Z",
             Source::Bootstrap,
             Transition::Captured(ProcessIdentity {
@@ -104,24 +101,24 @@ fn attachment_views_share_process_evidence_across_replay() {
             }),
         )
         .unwrap();
-        let before_signal = log.facts(ticket.claim_id.as_str()).unwrap();
-        let next_claim = random_uuid();
+        let before_signal = log.facts(&ticket.claim_id).unwrap();
+        let next_claim = ClaimId::random();
         log.append(
-            &next_claim,
+            Stream::Claim(&next_claim),
             "2026-01-01T00:00:01.000Z",
             Source::Registration,
             Transition::Enrolled(before_signal.clone()),
         )
         .unwrap();
         log.append(
-            &next_claim,
+            Stream::Claim(&next_claim),
             "2026-01-01T00:00:02.000Z",
             Source::ProcessControl,
             Transition::SignalRequested,
         )
         .unwrap();
         assert!(
-            log.facts(ticket.claim_id.as_str())
+            log.facts(&ticket.claim_id)
                 .unwrap()
                 .execution
                 .signalled_at
@@ -129,7 +126,7 @@ fn attachment_views_share_process_evidence_across_replay() {
         );
         assert!(
             log.append(
-                &random_uuid(),
+                Stream::Claim(&ClaimId::random()),
                 "2026-01-01T00:00:03.000Z",
                 Source::Registration,
                 Transition::Enrolled(before_signal)

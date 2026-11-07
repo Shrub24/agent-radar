@@ -9,7 +9,8 @@ pub(super) fn child_record(
     registration_id: &str,
     subject_id: &str,
 ) -> Result<subjects::SubjectRecord, Refusal> {
-    let parent = registry::presence::attachment(registry, registration_id)
+    let registration_id = id_param(registration_id, "registration_id", RegistrationId::required)?;
+    let parent = registry::presence::attachment(registry, &registration_id)
         .map_err(|error| Refusal::new(Code::Internal, error))?
         .ok_or_else(|| Refusal::new(Code::Refused, "caller has no granted subject"))?;
     let subject_id = id_param(subject_id, "subject_id", SubjectId::required)?;
@@ -236,7 +237,15 @@ pub(super) fn subject_read_request(
             Ok(params) => params,
             Err(refusal) => return Response::refused(&request.id, &refusal),
         };
-        let attachment = match registry::presence::attachment(&registry, &params.registration_id) {
+        let registration_id = match id_param(
+            &params.registration_id,
+            "registration_id",
+            RegistrationId::required,
+        ) {
+            Ok(registration_id) => registration_id,
+            Err(refusal) => return Response::refused(&request.id, &refusal),
+        };
+        let attachment = match registry::presence::attachment(&registry, &registration_id) {
             Ok(Some(attachment)) => attachment,
             Ok(None) => {
                 return Response::refused(
@@ -288,10 +297,9 @@ pub(super) fn subject_read_request(
         let complete = page.len() < MAX_REGISTRY_PAGE;
         for record in page {
             after = Some(record.subject_id.to_string());
-            if parent
-                .as_deref()
-                .is_some_and(|parent| record.managed.parent_subject_id.as_deref() != Some(parent))
-            {
+            if parent.as_ref().is_some_and(|parent| {
+                record.managed.parent_subject_id.as_deref() != Some(parent.as_str())
+            }) {
                 continue;
             }
             let entry = match project(record) {

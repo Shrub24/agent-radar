@@ -319,7 +319,7 @@ pub struct ProcessRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_evidence: Option<EndedEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bound_registration_id: Option<String>,
+    pub bound_registration_id: Option<RegistrationId>,
     /// Recorded before a SIGTERM is sent, so a signal is never sent twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signalled_at: Option<String>,
@@ -689,7 +689,7 @@ pub fn create_process(
     ensure_process(registry, &mut log, &process)?;
     // Captured here so the first presence fences its bind on the verified identity.
     log.append(
-        process.registration_id.as_str(),
+        crate::control_plane::events::Stream::Process(&process.registration_id),
         &format_millis(now_ms),
         crate::control_plane::events::Source::Launch,
         crate::control_plane::events::Transition::Captured(admission.identity.clone()),
@@ -762,7 +762,7 @@ pub(crate) fn record_completion(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .registration_of(process)
-        .and_then(RegistrationId::parse)
+        .cloned()
         .ok_or("no launch holds this process")?;
     let record = read_process(registry, &registration_id)?.ok_or("launch is not recorded")?;
     if record.completion_key.as_deref() != Some(key) {
@@ -802,15 +802,11 @@ pub(crate) fn bind_managed(
             registration_id,
             crate::control_plane::events::Source::Registration,
             crate::control_plane::events::Transition::Bound {
-                registration_id: registration_id.to_string(),
+                registration_id: registration_id.clone(),
             },
             now_ms,
         ),
-        State::Bound
-            if record.bound_registration_id.as_deref() == Some(registration_id.as_str()) =>
-        {
-            Ok(())
-        }
+        State::Bound if record.bound_registration_id.as_ref() == Some(registration_id) => Ok(()),
         _ => Err("launch is already bound to another registration".into()),
     }
 }
@@ -898,9 +894,9 @@ pub fn create_with_intent(
     write(registry, &subject)?;
     crate::control_plane::registry::presence::reserve(
         registry,
-        subject.process.registration_id.as_str(),
-        subject.claim_id.as_str(),
-        subject.subject_id.as_str(),
+        &subject.process.registration_id,
+        &subject.claim_id,
+        &subject.subject_id,
         subject.session.clone(),
     )?;
     let mut record =
@@ -928,20 +924,21 @@ pub fn read_claim(registry: &Registry, claim_id: &ClaimId) -> Result<Option<Clai
         .events
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .facts(claim_id.as_str())
+        .facts(claim_id)
     else {
         return Ok(None);
     };
-    let registration_id = RegistrationId::parse(&facts.attachment.registration_id)
-        .ok_or("the attachment names an unreadable registration")?;
-    let execution = load_process(registry, &registration_id, &facts.execution)?;
+    let execution = load_process(
+        registry,
+        &facts.attachment.registration_id,
+        &facts.execution,
+    )?;
     let subject = Claim {
         claim_id: claim_id.clone(),
         subject_id: facts
             .attachment
             .subject_id
-            .as_deref()
-            .and_then(SubjectId::parse)
+            .clone()
             .ok_or("execution has no readable subject identity")?,
         managed: facts.attachment.managed.clone(),
         session: facts.attachment.session.clone(),
@@ -959,7 +956,7 @@ pub fn read_process(
         .events
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .process(registration_id.as_str())
+        .process(registration_id)
         .cloned();
     facts
         .map(|facts| load_process(registry, registration_id, &facts))
@@ -985,7 +982,7 @@ pub(crate) fn verify(registry: &Registry) -> Result<(), String> {
         }
         after = Some(last.to_string());
     }
-    let processes: Vec<(String, crate::control_plane::events::ProcessFacts)> = registry
+    let processes: Vec<(RegistrationId, crate::control_plane::events::ProcessFacts)> = registry
         .events
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -993,9 +990,7 @@ pub(crate) fn verify(registry: &Registry) -> Result<(), String> {
         .map(|(id, facts)| (id.clone(), facts.clone()))
         .collect();
     for (registration_id, facts) in processes {
-        let path = recipe_path(registry, &registration_id);
-        let registration_id = RegistrationId::parse(&registration_id)
-            .ok_or_else(|| format!("{}: not named by a registration id", path.display()))?;
+        let path = recipe_path(registry, registration_id.as_str());
         load_process(registry, &registration_id, &facts)
             .map_err(|error| format!("{}: {error}", path.display()))?;
     }
@@ -1168,13 +1163,10 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
     // itself. Whichever carries the placement is the same execution, so they are
     // read together and keyed by registration.
     let mut placements: BTreeMap<RegistrationId, Placed> = BTreeMap::new();
-    let mut record = |registration_id: &str,
+    let mut record = |registration_id: &RegistrationId,
                       facts: &crate::control_plane::events::ProcessFacts,
-                      subject_id: Option<&str>| {
-        let (Some(placement), Some(registration_id)) = (
-            facts.placement.clone(),
-            RegistrationId::parse(registration_id),
-        ) else {
+                      subject_id: Option<&SubjectId>| {
+        let Some(placement) = facts.placement.clone() else {
             return;
         };
         if ended(facts) {
@@ -1185,12 +1177,12 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
         let known = placements
             .entry(registration_id.clone())
             .or_insert_with(|| Placed {
-                registration_id,
+                registration_id: registration_id.clone(),
                 subject_id: None,
                 placement,
             });
         if known.subject_id.is_none() {
-            known.subject_id = subject_id.and_then(SubjectId::parse);
+            known.subject_id = subject_id.cloned();
         }
     };
     for (registration_id, facts) in log.processes() {
@@ -1201,7 +1193,7 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
             record(
                 &facts.attachment.registration_id,
                 &facts.execution,
-                facts.attachment.subject_id.as_deref(),
+                facts.attachment.subject_id.as_ref(),
             );
         }
     }
@@ -1440,7 +1432,7 @@ pub(crate) fn fence_registration(
     }
     match (subject.process.state, registration_id) {
         (State::Bound, Some(agent))
-            if subject.process.bound_registration_id.as_deref() == Some(agent.as_str())
+            if subject.process.bound_registration_id.as_ref() == Some(agent)
                 && subject.process.identity.as_ref() == process =>
         {
             Ok(())
@@ -1450,7 +1442,7 @@ pub(crate) fn fence_registration(
             if process.is_some() && subject.process.identity.as_ref() == process =>
         {
             subject.process.state = State::Bound;
-            subject.process.bound_registration_id = Some(agent.to_string());
+            subject.process.bound_registration_id = Some(agent.clone());
             subject.process.recorded_at = format_millis(now_ms);
             write(registry, &subject)
         }
@@ -1576,7 +1568,7 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
         return Ok(true);
     }
     let (Some(agent), Some(session)) = (
-        subject.process.bound_registration_id.as_deref(),
+        subject.process.bound_registration_id.as_ref(),
         subject.session.as_deref(),
     ) else {
         return Ok(false);
@@ -1584,16 +1576,14 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
     if subject.process.state != State::Bound || subject.process.exited_at.is_some() {
         return Ok(false);
     }
-    if crate::control_plane::registry::presence::decision(registry, subject.claim_id.as_str())?
-        .is_some_and(|claim| {
-            claim.standing == crate::control_plane::registry::presence::Standing::Reserved
-        })
-    {
+    if crate::control_plane::registry::presence::decision(registry, &subject.claim_id)?.is_some_and(
+        |claim| claim.standing == crate::control_plane::registry::presence::Standing::Reserved,
+    ) {
         return Ok(true);
     }
     if let Some(claim) = crate::control_plane::registry::presence::current(registry, agent)? {
         return Ok(claim.session_id.as_deref() == Some(session)
-            && claim.claim_id == subject.claim_id.as_str()
+            && claim.claim_id == subject.claim_id
             && matches!(
                 claim.standing,
                 crate::control_plane::registry::presence::Standing::Granted
@@ -1601,7 +1591,7 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
             ));
     }
     Ok(registry
-        .context(agent, now_ms)?
+        .context(agent.as_str(), now_ms)?
         .and_then(|context| context.context.session)
         .as_deref()
         == Some(session))
@@ -1622,7 +1612,7 @@ pub fn record_launch_session(
     loop {
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
         if let Some(found) = page.iter().find(|subject| {
-            subject.process.bound_registration_id.as_deref() == Some(registration_id.as_str())
+            subject.process.bound_registration_id.as_ref() == Some(registration_id)
                 && subject.process.state == State::Bound
                 && subject.process.exited_at.is_none()
                 && subject.process.ended_externally_at.is_none()
@@ -1723,7 +1713,7 @@ pub fn attachment(
     }
     let process = &holder.process;
     Ok(
-        if process.bound_registration_id.as_deref() == Some(registration_id.as_str())
+        if process.bound_registration_id.as_ref() == Some(registration_id)
             || &process.registration_id == registration_id
         {
             Attachment::Own(Box::new(holder))
@@ -1799,7 +1789,7 @@ pub fn enroll_subject(
     subject.process.state = State::Bound;
     subject.process.correlation = None;
     subject.process.identity = Some(process.clone());
-    subject.process.bound_registration_id = Some(registration_id.to_string());
+    subject.process.bound_registration_id = Some(registration_id.clone());
     subject.process.recorded_at = format_millis(now_ms);
     write(registry, &subject)?;
     let mut record =
@@ -1917,7 +1907,7 @@ fn withdraw_locked(
     };
     if crate::control_plane::registry::presence::attachment(
         registry,
-        claim.process.registration_id.as_str(),
+        &claim.process.registration_id,
     )?
     .is_some()
     {
@@ -1966,22 +1956,15 @@ pub fn unclaimed(
     let ids: Vec<String> = {
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
         log.ids()
-            .filter(|id| {
-                let Some(claim) = ClaimId::parse(id) else {
-                    return false;
-                };
-                log.facts(id).is_some_and(|facts| {
-                    let subject = facts
-                        .attachment
-                        .subject_id
-                        .as_deref()
-                        .and_then(SubjectId::parse);
+            .filter(|claim| {
+                log.facts(claim).is_some_and(|facts| {
                     withdrawal(facts.execution.state, &facts.execution.recorded_at, now_ms)
                         .is_some()
-                        && !released(registry, subject.as_ref(), &claim).unwrap_or(false)
+                        && !released(registry, facts.attachment.subject_id.as_ref(), claim)
+                            .unwrap_or(false)
                 })
             })
-            .cloned()
+            .map(ToString::to_string)
             .collect()
     };
     let (page, next) = crate::control_plane::store::page_after(&ids, after, SWEEP_LIMIT);
@@ -2193,7 +2176,11 @@ pub fn public_view(subject: &Claim) -> PublicClaim {
         ended_evidence: subject.process.ended_evidence.clone(),
         pane_cleanup: subject.process.pane_cleanup.clone(),
         completion: subject.process.completion.clone(),
-        bound_registration_id: subject.process.bound_registration_id.clone(),
+        bound_registration_id: subject
+            .process
+            .bound_registration_id
+            .as_ref()
+            .map(ToString::to_string),
         signalled_at: subject.process.signalled_at.clone(),
         exited_at: subject.process.exited_at.clone(),
         recorded_at: subject.process.recorded_at.clone(),
@@ -2250,7 +2237,7 @@ pub fn list_after(
             .unwrap_or_else(|e| e.into_inner())
             .ids()
             .filter(|id| after.is_none_or(|after| id.as_str() > after))
-            .cloned(),
+            .map(ToString::to_string),
     );
     ids.sort();
     ids.dedup();
@@ -2290,7 +2277,7 @@ pub fn sweep(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .ids()
-        .cloned()
+        .map(ToString::to_string)
         .collect();
     for entry in fs::read_dir(registry.subjects()).map_err(|e| format!("launch subjects: {e}"))? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -2823,7 +2810,7 @@ fn record_process_transition(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .append(
-            registration_id.as_str(),
+            crate::control_plane::events::Stream::Process(registration_id),
             &format_millis(now_ms),
             source,
             transition,
@@ -3237,7 +3224,7 @@ fn ensure_process(
     log: &mut crate::control_plane::events::Log,
     process: &ProcessRecord,
 ) -> Result<(), String> {
-    if log.process(process.registration_id.as_str()).is_some() {
+    if log.process(&process.registration_id).is_some() {
         return Ok(());
     }
     let directory = registry.subjects().join("private");
@@ -3249,7 +3236,7 @@ fn ensure_process(
         write_atomic(&directory, &recipe, &bytes, MAX_SUBJECT_BYTES)?;
     }
     log.append(
-        process.registration_id.as_str(),
+        crate::control_plane::events::Stream::Process(&process.registration_id),
         &process.recorded_at,
         if process.origin != Origin::Enrolled {
             crate::control_plane::events::Source::Launch
@@ -3257,17 +3244,17 @@ fn ensure_process(
             crate::control_plane::events::Source::Registration
         },
         crate::control_plane::events::Transition::ProcessCreated {
-            registration_id: process.registration_id.to_string(),
+            registration_id: process.registration_id.clone(),
             facts: crate::control_plane::events::ProcessFacts::from(process),
         },
     )
 }
 
 fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
-    use crate::control_plane::events::{Facts, Source, Transition};
+    use crate::control_plane::events::{Facts, Source, Stream, Transition};
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
     ensure_process(registry, &mut log, &subject.process)?;
-    let previous = match log.facts(subject.claim_id.as_str()) {
+    let previous = match log.facts(&subject.claim_id) {
         Some(facts) => facts,
         None => {
             let facts = Facts::from_subject(subject);
@@ -3277,7 +3264,7 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
                 Origin::Admitted => return Err("an admitted process has no subject".into()),
             };
             return log.append(
-                subject.claim_id.as_str(),
+                Stream::Claim(&subject.claim_id),
                 &subject.process.recorded_at,
                 source,
                 transition,
@@ -3381,7 +3368,7 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
         return Err("unsupported lifecycle transition".into());
     };
     log.append_checked(
-        subject.claim_id.as_str(),
+        &subject.claim_id,
         &subject.process.recorded_at,
         source,
         transition,
@@ -4071,12 +4058,10 @@ mod tests {
         assert_ne!(claim.registration_id.as_str(), claim.claim_id.as_str());
         // A subject invented for a reservation is its own identity, not its claim.
         assert_ne!(claim.subject_id.as_str(), claim.claim_id.as_str());
-        let reserved = crate::control_plane::registry::presence::current(
-            &reopened,
-            claim.registration_id.as_str(),
-        )
-        .expect("reservation read")
-        .expect("reservation");
+        let reserved =
+            crate::control_plane::registry::presence::current(&reopened, &claim.registration_id)
+                .expect("reservation read")
+                .expect("reservation");
         assert_eq!(
             reserved.standing,
             crate::control_plane::registry::presence::Standing::Reserved
@@ -4084,7 +4069,7 @@ mod tests {
         assert!(
             crate::control_plane::registry::presence::attachment(
                 &reopened,
-                claim.registration_id.as_str(),
+                &claim.registration_id,
             )
             .expect("authority read")
             .is_none(),
@@ -4266,8 +4251,8 @@ mod tests {
         );
         crate::control_plane::registry::presence::begin(
             &reopened,
-            ticket.registration_id.as_str(),
-            &random_uuid(),
+            &ticket.registration_id,
+            &ClaimId::random(),
             &session,
             None,
         )

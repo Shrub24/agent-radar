@@ -275,7 +275,7 @@ pub(super) fn record_enrollment(
 ) -> Result<ClaimId, String> {
     let enrollment_id = ClaimId::required(enrollment_id, "enrollment_id")?;
     let registration_id = RegistrationId::required(&params.registration_id, "registration_id")?;
-    let presence = registry::presence::current(registry, &params.registration_id)?
+    let presence = registry::presence::current(registry, &registration_id)?
         .ok_or("lifecycle enrollment requires a current presence claim")?;
     if presence.session_id.as_deref() != Some(params.session.as_str())
         || !matches!(
@@ -420,7 +420,7 @@ pub(super) fn run_restart(
             {
                 Some(parent_subject) => matches!(
                     subjects::current_attachment(&registry, &parent_subject),
-                    Ok(Some(claim)) if claim.process.bound_registration_id.as_deref() == Some(parent.as_str())
+                    Ok(Some(claim)) if claim.process.bound_registration_id.as_ref().map(RegistrationId::as_str) == Some(parent.as_str())
                 ),
                 None => false,
             };
@@ -434,7 +434,12 @@ pub(super) fn run_restart(
         _ => {}
     }
     // A restart retains the lead's existing pane.
-    let anchor = match subject.process.bound_registration_id.as_deref() {
+    let anchor = match subject
+        .process
+        .bound_registration_id
+        .as_ref()
+        .map(RegistrationId::as_str)
+    {
         Some(agent) => match registry.get(agent) {
             Ok(Some(registration)) => registration
                 .request
@@ -532,7 +537,11 @@ pub(super) fn restart_lead(
         return Settlement::backend_refused("the Pi session has no current granted presence claim");
     }
     let (Some(agent), Some(session)) = (
-        subject.process.bound_registration_id.as_deref(),
+        subject
+            .process
+            .bound_registration_id
+            .as_ref()
+            .map(RegistrationId::as_str),
         subject.session.as_deref(),
     ) else {
         return Settlement::backend_refused(
@@ -761,12 +770,12 @@ pub(super) fn current_presence_grant(
     subject: &subjects::Claim,
 ) -> Result<bool, String> {
     let (Some(registration_id), Some(session)) = (
-        subject.process.bound_registration_id.as_deref(),
+        subject.process.bound_registration_id.as_ref(),
         subject.session.as_deref(),
     ) else {
         return Ok(true);
     };
-    let Some(registration) = registry.get(registration_id)? else {
+    let Some(registration) = registry.get(registration_id.as_str())? else {
         return Ok(false);
     };
     if registration.request.source != "herdsman-pi" {
@@ -775,11 +784,10 @@ pub(super) fn current_presence_grant(
     let Some(claim) = registry::presence::current(registry, registration_id)? else {
         return Ok(false);
     };
-    let expected_subject = subject.subject_id.as_str();
     Ok(claim.standing == registry::presence::Standing::Granted
-        && claim.claim_id == subject.claim_id.as_str()
+        && claim.claim_id == subject.claim_id
         && claim.session_id.as_deref() == Some(session)
-        && claim.subject_id.as_deref() == Some(expected_subject))
+        && claim.subject_id.as_ref() == Some(&subject.subject_id))
 }
 
 pub(super) fn cancel_target(

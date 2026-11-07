@@ -30,7 +30,11 @@ pub(super) fn presence_request(
             {
                 return Err("release does not identify the registered live process".into());
             }
-            return presence::release(&registry, &release.registration_id, &release.claim_id);
+            return presence::release(
+                &registry,
+                &RegistrationId::required(&release.registration_id, "registration_id")?,
+                &ClaimId::required(&release.claim_id, "claim_id")?,
+            );
         }
         let report: presence::Report =
             serde_json::from_value(request.params.clone()).map_err(|e| e.to_string())?;
@@ -49,10 +53,11 @@ pub(super) fn presence_request(
         let registration = presence::registration(&registry, &report, now)?;
         let registration_id =
             RegistrationId::required(&registration.registration_id, "registration_id")?;
+        let claim_id = ClaimId::required(&report.claim_id, "claim_id")?;
         let mut claim = presence::begin(
             &registry,
-            &registration.registration_id,
-            &report.claim_id,
+            &registration_id,
+            &claim_id,
             &report.session_id,
             None,
         )?;
@@ -100,8 +105,8 @@ pub(super) fn presence_request(
         }
         claim = presence::begin(
             &registry,
-            &registration.registration_id,
-            &report.claim_id,
+            &registration_id,
+            &claim_id,
             &report.session_id,
             report.location.clone(),
         )?;
@@ -151,7 +156,7 @@ pub(super) fn presence_request(
         {
             return Err("reported subject does not match Radar's stored claim".into());
         }
-        claim.subject_id = Some(subject_id.to_string());
+        claim.subject_id = Some(subject_id);
         claim.standing = Standing::Granted;
         presence::save(&registry, &claim)?;
         if registry
@@ -783,9 +788,17 @@ pub(super) fn registry_request(
                 let core = locked(core);
                 let parent = match params.registration_id.as_deref() {
                     Some(registration_id) => {
+                        let registration_id = match id_param(
+                            registration_id,
+                            "registration_id",
+                            RegistrationId::required,
+                        ) {
+                            Ok(registration_id) => registration_id,
+                            Err(refusal) => return Response::refused(&request.id, &refusal),
+                        };
                         match crate::control_plane::registry::presence::attachment(
                             &core.registry,
-                            registration_id,
+                            &registration_id,
                         ) {
                             Ok(Some(attachment)) => Some(attachment.subject_id),
                             Ok(None) => {
@@ -802,9 +815,9 @@ pub(super) fn registry_request(
                     }
                     None => None,
                 };
-                let page = match parent.as_deref() {
+                let page = match parent.as_ref() {
                     Some(subject) => core.registry.spawn_edges_for_subject_after(
-                        subject,
+                        subject.as_str(),
                         params.after.as_deref(),
                         limit + 1,
                     ),

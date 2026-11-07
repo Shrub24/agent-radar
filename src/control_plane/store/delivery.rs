@@ -88,13 +88,21 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::ContainerObserved(_) => "container.observed",
         Transition::ContainerRemoved => "container.removed",
     };
-    let facts = event.subject_id.as_deref().and_then(|id| log.facts(id));
+    let facts = event
+        .subject_id
+        .as_deref()
+        .and_then(crate::identity::ClaimId::parse)
+        .and_then(|claim| log.facts(&claim));
     let registration_id = match &event.transition {
         Transition::ProcessCreated {
             registration_id, ..
         }
-        | Transition::Bound { registration_id } => Some(registration_id.clone()),
-        Transition::Enrolled(facts) => facts.execution.bound_registration_id.clone(),
+        | Transition::Bound { registration_id } => Some(registration_id.to_string()),
+        Transition::Enrolled(facts) => facts
+            .execution
+            .bound_registration_id
+            .as_ref()
+            .map(ToString::to_string),
         _ => None,
     };
     let lifecycle_execution = event.operation_id.is_none() && facts.is_some();
@@ -103,7 +111,13 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
     } else {
         facts
             .as_ref()
-            .and_then(|facts| facts.attachment.subject_id.clone())
+            .and_then(|facts| {
+                facts
+                    .attachment
+                    .subject_id
+                    .as_ref()
+                    .map(ToString::to_string)
+            })
             .or_else(|| event.subject_id.clone())
     };
     Some(Event {

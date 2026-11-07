@@ -43,7 +43,7 @@ pub(crate) fn read(
     let current = record.current_claim.as_ref() == Some(&claim.claim_id);
     let process = &claim.process;
     result.scoped = Some(process.scope.is_some());
-    let standing = presence::decision(registry, claim.claim_id.as_str())?;
+    let standing = presence::decision(registry, &claim.claim_id)?;
     result.state =
         if !current || process.exited_at.is_some() || process.ended_externally_at.is_some() {
             AttachmentState::Detached

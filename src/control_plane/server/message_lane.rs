@@ -207,21 +207,21 @@ pub(super) fn message_identity(
         .context
         .session
         .ok_or_else(|| messages::Error::Invalid("sender has no current Pi session".into()))?;
-    let attachment = registry::presence::attachment(registry, registration_id)
+    let registration_id = RegistrationId::required(registration_id, "registration_id")
+        .map_err(messages::Error::Invalid)?;
+    let attachment = registry::presence::attachment(registry, &registration_id)
         .map_err(messages::Error::Internal)?
         .ok_or_else(|| {
             messages::Error::Invalid("message operations require a current granted claim".into())
         })?;
-    let claim_id =
-        ClaimId::required(&attachment.claim_id, "claim_id").map_err(messages::Error::Internal)?;
-    let subject = subjects::read_claim(registry, &claim_id)
+    let subject = subjects::read_claim(registry, &attachment.claim_id)
         .map_err(messages::Error::Internal)?
         .filter(|claim| claim.session.as_deref() == Some(session_id.as_str()))
         .ok_or_else(|| {
             messages::Error::Invalid("the granted claim does not match the current session".into())
         })?;
     Ok(AgentIdentity {
-        registration_id: registration_id.to_owned(),
+        registration_id: registration_id.to_string(),
         session_id,
         subject_id: subject.subject_id.to_string(),
         claim_id: subject.claim_id.to_string(),

@@ -374,7 +374,11 @@ pub(super) fn spawn_child(
         let registry = Arc::clone(&locked(core).registry);
         match subjects::current_attachment(&registry, &parent_subject_id) {
             Ok(Some(parent_subject))
-                if parent_subject.process.bound_registration_id.as_deref()
+                if parent_subject
+                    .process
+                    .bound_registration_id
+                    .as_ref()
+                    .map(RegistrationId::as_str)
                     == Some(params.parent.as_str()) => {}
             Ok(Some(_)) => {
                 return Err(Refusal::new(

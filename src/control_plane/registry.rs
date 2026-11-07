@@ -40,6 +40,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
+use crate::identity::RegistrationId;
 use crate::model::{ProcessIdentity, SessionUuid};
 
 /// Missing registry authority is distinct from a rejected write.
@@ -835,7 +836,9 @@ impl Registry {
         &self,
         mut registration: Registration,
     ) -> Result<Registration, String> {
-        if let Some(claim) = presence::current(self, &registration.registration_id)? {
+        let registration_id =
+            RegistrationId::required(&registration.registration_id, "registration_id")?;
+        if let Some(claim) = presence::current(self, &registration_id)? {
             registration.request.location = claim.location;
         }
         Ok(registration)

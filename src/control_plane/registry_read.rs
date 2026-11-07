@@ -56,8 +56,13 @@ pub(crate) fn agent_entry(
         registry.published_facts(&registration.registration_id, Channel::Assignment, now_ms)?;
     let facts = registry.published_facts(&registration.registration_id, Channel::Facts, now_ms)?;
     let context = registry.context(&registration.registration_id, now_ms)?;
-    let attachment =
-        crate::control_plane::registry::presence::current(registry, &registration.registration_id)?;
+    let attachment = crate::control_plane::registry::presence::current(
+        registry,
+        &crate::identity::RegistrationId::required(
+            &registration.registration_id,
+            "registration_id",
+        )?,
+    )?;
     // The attachment's location is the one presence verified against the live
     // pane; the registration's own is whatever it supplied when it registered.
     // Without this an agent that only ever reported through presence names no

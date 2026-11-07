@@ -407,7 +407,7 @@ pub fn record_created(
         recorded_at: at.to_owned(),
     };
     log.append(
-        &container.id,
+        crate::control_plane::events::Stream::Container(&container.id),
         at,
         Source::TopologyControl,
         Transition::ContainerCreated(container.clone()),
@@ -481,7 +481,7 @@ pub fn adopt(
             recorded_at: at.to_owned(),
         };
         log.append(
-            &container.id,
+            crate::control_plane::events::Stream::Container(&container.id),
             at,
             Source::TopologyObservation,
             Transition::ContainerCreated(container.clone()),
@@ -910,7 +910,7 @@ mod tests {
         let created = container(Some(binding("wA:p1", 42)));
         let id = created.id.clone();
         log.append(
-            &id,
+            crate::control_plane::events::Stream::Container(&id),
             "1000",
             Source::TopologyControl,
             Transition::ContainerCreated(created),
@@ -926,7 +926,7 @@ mod tests {
             "a handle under another incarnation is not this container"
         );
         log.append(
-            &id,
+            crate::control_plane::events::Stream::Container(&id),
             "2000",
             Source::TopologyControl,
             Transition::ContainerRemoved,

@@ -19,6 +19,7 @@ use crate::control_plane::registry::publication::write_atomic;
 use crate::control_plane::registry::{prepare_directory, read_record_file};
 use crate::control_plane::store::RequestRecord;
 use crate::control_plane::store::random_uuid;
+use crate::identity::{ClaimId, RegistrationId, SubjectId};
 use crate::model::{ProcessIdentity, SessionUuid};
 
 pub(crate) mod operations;
@@ -71,11 +72,11 @@ pub struct Facts {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttachmentFacts {
-    pub registration_id: String,
+    pub registration_id: RegistrationId,
     pub session: Option<String>,
     /// The durable agent this attachment is one process of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<String>,
+    pub subject_id: Option<SubjectId>,
     #[serde(default)]
     pub managed: crate::control_plane::lifecycle::ManagedMetadata,
 }
@@ -103,7 +104,7 @@ pub struct ProcessFacts {
     pub completion: Option<Completion>,
     #[serde(default)]
     pub placement: Option<crate::control_plane::lifecycle::Placement>,
-    pub bound_registration_id: Option<String>,
+    pub bound_registration_id: Option<RegistrationId>,
     pub signalled_at: Option<String>,
     pub exited_at: Option<String>,
     pub recorded_at: String,
@@ -113,8 +114,8 @@ impl Facts {
     pub fn from_subject(subject: &Claim) -> Self {
         Self {
             attachment: AttachmentFacts {
-                registration_id: subject.process.registration_id.to_string(),
-                subject_id: Some(subject.subject_id.to_string()),
+                registration_id: subject.process.registration_id.clone(),
+                subject_id: Some(subject.subject_id.clone()),
                 managed: subject.managed.clone(),
                 session: subject.session.clone(),
             },
@@ -175,14 +176,14 @@ impl ProcessFacts {
 )]
 pub enum Transition {
     ProcessCreated {
-        registration_id: String,
+        registration_id: RegistrationId,
         facts: ProcessFacts,
     },
     Created(Facts),
     Enrolled(Facts),
     Captured(ProcessIdentity),
     Bound {
-        registration_id: String,
+        registration_id: RegistrationId,
     },
     Revoked,
     SignalRequested,
@@ -258,6 +259,26 @@ pub struct Event {
     pub transition: Transition,
 }
 
+/// The record an event extends. Its id is the event's key on disk.
+#[derive(Clone, Copy, Debug)]
+pub enum Stream<'a> {
+    /// An attachment of a subject to one process.
+    Claim(&'a ClaimId),
+    /// A process registration, recorded whether or not a claim holds it.
+    Process(&'a RegistrationId),
+    Container(&'a str),
+}
+
+impl Stream<'_> {
+    fn key(&self) -> &str {
+        match self {
+            Self::Claim(id) => id.as_str(),
+            Self::Process(id) => id.as_str(),
+            Self::Container(id) => id,
+        }
+    }
+}
+
 /// One daemon-scoped FIFO, protected by the owning registry. Immutable files
 /// reuse the registry's fsync/rename discipline; public pointer retention cannot
 /// discard this authority.
@@ -265,8 +286,8 @@ pub struct Event {
 pub struct Log {
     directory: PathBuf,
     next_seq: u64,
-    facts: BTreeMap<String, AttachmentFacts>,
-    processes: BTreeMap<String, ProcessFacts>,
+    facts: BTreeMap<ClaimId, AttachmentFacts>,
+    processes: BTreeMap<RegistrationId, ProcessFacts>,
     operations: BTreeMap<String, RequestRecord>,
     containers: BTreeMap<String, Container>,
     last_subject_event: BTreeMap<String, String>,
@@ -389,7 +410,7 @@ impl Log {
         Ok(events)
     }
 
-    pub fn facts(&self, claim_id: &str) -> Option<Facts> {
+    pub fn facts(&self, claim_id: &ClaimId) -> Option<Facts> {
         let attachment = self.facts.get(claim_id)?;
         let execution = self
             .processes
@@ -400,30 +421,30 @@ impl Log {
             execution: execution.clone(),
         })
     }
-    pub fn process(&self, registration_id: &str) -> Option<&ProcessFacts> {
+    pub fn process(&self, registration_id: &RegistrationId) -> Option<&ProcessFacts> {
         self.processes.get(registration_id)
     }
 
     /// The registration whose captured process is this one. Identities carry the
     /// boot and start time, so a recycled pid never matches an earlier launch.
-    pub fn registration_of(&self, process: &ProcessIdentity) -> Option<&str> {
+    pub fn registration_of(&self, process: &ProcessIdentity) -> Option<&RegistrationId> {
         self.processes
             .iter()
             .find(|(_, facts)| facts.process.as_ref() == Some(process))
-            .map(|(id, _)| id.as_str())
+            .map(|(id, _)| id)
     }
 
     /// Every execution this daemon tracks, whether or not one subject claims it.
-    pub fn processes(&self) -> impl Iterator<Item = (&String, &ProcessFacts)> {
+    pub fn processes(&self) -> impl Iterator<Item = (&RegistrationId, &ProcessFacts)> {
         self.processes.iter()
     }
 
-    pub fn ids(&self) -> impl Iterator<Item = &String> {
+    pub fn ids(&self) -> impl Iterator<Item = &ClaimId> {
         self.facts.keys()
     }
 
     /// Materialized attachment views over the one process owner per registration.
-    pub fn all_facts(&self) -> Vec<(String, Facts)> {
+    pub fn all_facts(&self) -> Vec<(ClaimId, Facts)> {
         self.facts
             .keys()
             .map(|id| (id.clone(), self.facts(id).expect("recorded attachment")))
@@ -438,27 +459,18 @@ impl Log {
 
     pub fn append_checked(
         &mut self,
-        subject_id: &str,
+        claim_id: &ClaimId,
         at: &str,
         source: Source,
         transition: Transition,
         expected: &Facts,
     ) -> Result<(), String> {
-        let event = Event {
-            version: VERSION,
-            seq: self.next_seq,
-            event_id: random_uuid(),
-            subject_id: Some(subject_id.to_owned()),
-            operation_id: None,
-            causation_id: self.last_subject_event.get(subject_id).cloned(),
-            at: at.to_owned(),
-            source: source.clone(),
-            transition: transition.clone(),
-        };
-        if &self.reduce_event(&event)? != expected {
+        let stream = Stream::Claim(claim_id);
+        let event = self.event(stream, at, source.clone(), transition.clone());
+        if &self.reduce_event(stream, &event)? != expected {
             return Err("lifecycle transition changes unrelated facts".into());
         }
-        self.append(subject_id, at, source, transition)
+        self.append(stream, at, source, transition)
     }
 
     /// Appends a container transition only if it leaves that container's record
@@ -471,17 +483,8 @@ impl Log {
         transition: Transition,
         expected: &Container,
     ) -> Result<(), String> {
-        let event = Event {
-            version: VERSION,
-            seq: self.next_seq,
-            event_id: random_uuid(),
-            subject_id: Some(container_id.to_owned()),
-            operation_id: None,
-            causation_id: self.last_subject_event.get(container_id).cloned(),
-            at: at.to_owned(),
-            source: source.clone(),
-            transition: transition.clone(),
-        };
+        let stream = Stream::Container(container_id);
+        let event = self.event(stream, at, source.clone(), transition.clone());
         // `recorded_at` is the append's own bookkeeping, so the check is about
         // the facts a caller read rather than about when it read them.
         let mut expected = expected.clone();
@@ -489,12 +492,12 @@ impl Log {
         if reduce_container(self.containers.get(container_id), &event)? != expected {
             return Err("container transition changes unrelated facts".into());
         }
-        self.append(container_id, at, source, transition)
+        self.append(stream, at, source, transition)
     }
 
     pub fn append(
         &mut self,
-        subject_id: &str,
+        stream: Stream<'_>,
         at: &str,
         source: Source,
         transition: Transition,
@@ -502,33 +505,46 @@ impl Log {
         if self.failed {
             return Err("event storage requires recovery".into());
         }
-        let event = Event {
+        let event = self.event(stream, at, source, transition);
+        match (stream, &event.transition) {
+            (
+                Stream::Process(id),
+                Transition::ProcessCreated {
+                    registration_id, ..
+                },
+            ) => self.validate_process_creation(id, registration_id)?,
+            (Stream::Container(id), _) => {
+                reduce_container(self.containers.get(id), &event)?;
+            }
+            _ => {
+                self.reduce_event(stream, &event)?;
+            }
+        }
+        self.persist(&event)?;
+        self.apply(stream, &event)
+    }
+
+    fn event(&self, stream: Stream<'_>, at: &str, source: Source, transition: Transition) -> Event {
+        let key = stream.key();
+        Event {
             version: VERSION,
             seq: self.next_seq,
             event_id: random_uuid(),
-            subject_id: Some(subject_id.to_owned()),
+            subject_id: Some(key.to_owned()),
             operation_id: None,
-            causation_id: self.last_subject_event.get(subject_id).cloned(),
+            causation_id: self.last_subject_event.get(key).cloned(),
             at: at.to_owned(),
             source,
             transition,
-        };
-        if let Transition::ProcessCreated {
-            registration_id, ..
-        } = &event.transition
-        {
-            self.validate_process_creation(subject_id, registration_id)?;
-        } else if event.transition.is_container() {
-            reduce_container(self.containers.get(subject_id), &event)?;
-        } else {
-            self.reduce_event(&event)?;
         }
-        self.persist(&event)?;
-        self.replay(&event)
     }
 
-    fn validate_process_creation(&self, key: &str, registration_id: &str) -> Result<(), String> {
-        if key != registration_id || SessionUuid::parse(registration_id).is_none() {
+    fn validate_process_creation(
+        &self,
+        key: &RegistrationId,
+        registration_id: &RegistrationId,
+    ) -> Result<(), String> {
+        if key != registration_id {
             return Err("process event does not identify its registration".into());
         }
         if self.processes.contains_key(registration_id) {
@@ -537,22 +553,20 @@ impl Log {
         Ok(())
     }
 
-    fn reduce_event(&self, event: &Event) -> Result<Facts, String> {
-        let id = event
-            .subject_id
-            .as_deref()
-            .ok_or("event has no record identity")?;
-        let previous = self.facts(id).or_else(|| {
-            self.processes.get(id).map(|execution| Facts {
+    fn reduce_event(&self, stream: Stream<'_>, event: &Event) -> Result<Facts, String> {
+        let previous = match stream {
+            Stream::Claim(id) => self.facts(id),
+            Stream::Process(id) => self.processes.get(id).map(|execution| Facts {
                 attachment: AttachmentFacts {
-                    registration_id: id.into(),
+                    registration_id: id.clone(),
                     subject_id: None,
                     managed: Default::default(),
                     session: None,
                 },
                 execution: execution.clone(),
-            })
-        });
+            }),
+            Stream::Container(_) => return Err("a container has no lifecycle facts".into()),
+        };
         let mut next = reduce(previous.as_ref(), event)?;
         if previous.is_none()
             && let Some(process) = self.processes.get(&next.attachment.registration_id)
@@ -590,39 +604,69 @@ impl Log {
         Ok(())
     }
 
+    /// Replays a stored event onto the record its key names. The key on disk is
+    /// untagged, so its kind is read from the transition and from what is already
+    /// recorded: a claim's events extend its attachment, and any other lifecycle
+    /// event extends a process no claim holds.
     fn replay(&mut self, event: &Event) -> Result<(), String> {
         if event.operation_id.is_some() {
             return self.replay_operation(event);
         }
-        let subject_id = event.subject_id.as_deref().ok_or("event has no subject")?;
+        let key = event.subject_id.as_deref().ok_or("event has no subject")?;
+        if event.transition.is_container() {
+            return self.apply(Stream::Container(key), event);
+        }
+        let unnamed = || format!("event key `{key}` is not an identity");
+        if !matches!(event.transition, Transition::ProcessCreated { .. }) {
+            let claim = ClaimId::parse(key).ok_or_else(unnamed)?;
+            if self.facts.contains_key(&claim)
+                || matches!(
+                    event.transition,
+                    Transition::Created(_) | Transition::Enrolled(_)
+                )
+            {
+                return self.apply(Stream::Claim(&claim), event);
+            }
+        }
+        let registration = RegistrationId::parse(key).ok_or_else(unnamed)?;
+        self.apply(Stream::Process(&registration), event)
+    }
+
+    fn apply(&mut self, stream: Stream<'_>, event: &Event) -> Result<(), String> {
+        let key = stream.key();
         if event
             .causation_id
             .as_ref()
-            .is_some_and(|id| self.last_subject_event.get(subject_id) != Some(id))
+            .is_some_and(|id| self.last_subject_event.get(key) != Some(id))
         {
             return Err("event causation is invalid".into());
         }
-        if let Transition::ProcessCreated {
-            registration_id,
-            facts,
-        } = &event.transition
-        {
-            self.validate_process_creation(subject_id, registration_id)?;
-            self.processes
-                .insert(registration_id.clone(), facts.clone());
-        } else if event.transition.is_container() {
-            let container = reduce_container(self.containers.get(subject_id), event)?;
-            self.containers.insert(subject_id.to_owned(), container);
-        } else {
-            let facts = self.reduce_event(event)?;
-            self.processes
-                .insert(facts.attachment.registration_id.clone(), facts.execution);
-            if subject_id != facts.attachment.registration_id {
-                self.facts.insert(subject_id.to_owned(), facts.attachment);
+        match (stream, &event.transition) {
+            (
+                Stream::Process(id),
+                Transition::ProcessCreated {
+                    registration_id,
+                    facts,
+                },
+            ) => {
+                self.validate_process_creation(id, registration_id)?;
+                self.processes.insert(id.clone(), facts.clone());
+            }
+            (Stream::Container(id), _) => {
+                let container = reduce_container(self.containers.get(id), event)?;
+                self.containers.insert(id.to_owned(), container);
+            }
+            _ => {
+                let facts = self.reduce_event(stream, event)?;
+                self.processes
+                    .insert(facts.attachment.registration_id.clone(), facts.execution);
+                if let Stream::Claim(claim) = stream {
+                    self.facts.insert(claim.clone(), facts.attachment);
+                }
             }
         }
         self.last_subject_event
-            .insert(subject_id.to_owned(), event.event_id.clone());
+            .insert(key.to_owned(), event.event_id.clone());
         Ok(())
     }
 }
