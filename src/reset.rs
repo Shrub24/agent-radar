@@ -220,8 +220,11 @@ fn stop_scopes(registry: Option<&Registry>) -> Result<(), String> {
             scopes.push(Scope::for_registration(&registration_id)?.verify_unit(&registration_id)?);
             continue;
         };
-        let process = lifecycle::read_process(registry, &registration_id)?
-            .ok_or_else(|| format!("active scope `{unit}` has no Radar process record"))?;
+        let process = lifecycle::read_process(
+            registry,
+            &crate::identity::RegistrationId::required(&registration_id, "registration_id")?,
+        )?
+        .ok_or_else(|| format!("active scope `{unit}` has no Radar process record"))?;
         verify_recorded_scope(&process, &registration_id)?;
         let scope = process.scope.as_ref().ok_or_else(|| {
             format!("active scope `{unit}` is not recorded as a Radar scope; refusing reset")
@@ -275,7 +278,9 @@ fn stop_scopes(registry: Option<&Registry>) -> Result<(), String> {
 
 fn verify_recorded_scope(process: &ProcessRecord, registration_id: &str) -> Result<(), String> {
     let expected = Scope::for_registration(registration_id)?;
-    if process.registration_id != registration_id || process.scope.as_ref() != Some(&expected) {
+    if process.registration_id.as_str() != registration_id
+        || process.scope.as_ref() != Some(&expected)
+    {
         return Err(format!(
             "process record for `{registration_id}` does not match its managed scope"
         ));
@@ -414,14 +419,14 @@ mod tests {
     fn subject(id: &str) -> SubjectRecord {
         SubjectRecord {
             version: 1,
-            subject_id: id.to_string(),
+            subject_id: crate::identity::SubjectId::parse(id).expect("a subject id"),
             managed: ManagedMetadata {
                 parent_subject_id: Some(PARENT_SUBJECT_ID.into()),
                 ..ManagedMetadata::default()
             },
             session: Some("session".into()),
-            current_claim: Some("claim".into()),
-            last_claim: Some("claim".into()),
+            current_claim: Some(crate::identity::ClaimId::random()),
+            last_claim: Some(crate::identity::ClaimId::random()),
             recorded_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
         }
@@ -491,7 +496,7 @@ mod tests {
             .0
             .join(format!("lifecycle/identity/{SUBJECT_ID}.json"));
         let record: SubjectRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(record.subject_id, SUBJECT_ID);
+        assert_eq!(record.subject_id.as_str(), SUBJECT_ID);
         assert_eq!(
             record.managed.parent_subject_id.as_deref(),
             Some(PARENT_SUBJECT_ID)
@@ -503,9 +508,12 @@ mod tests {
         drop(registry);
         let registry = Registry::open(&scratch.0).expect("registry reopens after reset");
         assert!(
-            lifecycle::current_attachment(&registry, SUBJECT_ID)
-                .unwrap()
-                .is_none()
+            lifecycle::current_attachment(
+                &registry,
+                &crate::identity::SubjectId::parse(SUBJECT_ID).expect("a subject id"),
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

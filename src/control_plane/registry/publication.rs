@@ -828,8 +828,11 @@ pub fn acquire_writer(
     request.validate()?;
     let _transition = registry.transition();
     if request.channel == Channel::Assignment {
-        crate::control_plane::lifecycle::read_subject_record(registry, &request.target_id)?
-            .ok_or("assignment subject is not recorded")?;
+        crate::control_plane::lifecycle::read_subject_record(
+            registry,
+            &crate::identity::SubjectId::required(&request.target_id, "target_id")?,
+        )?
+        .ok_or("assignment subject is not recorded")?;
     } else {
         registry
             .get(&request.target_id)?

@@ -164,14 +164,35 @@ pub(super) fn run_close(
     }
     if let Some(expected) = &close_request.execution {
         let registry = Arc::clone(&locked(core).registry);
-        let valid = subjects::read_subject_record(&registry, &expected.subject_id)
-            .ok().flatten().is_some_and(|subject| {
-                subject.current_claim.as_deref().or(subject.last_claim.as_deref()) == Some(expected.claim_id.as_str())
-            }) && subjects::read(&registry, &expected.claim_id).ok().flatten().is_some_and(|claim| {
-                claim.subject_id == expected.subject_id && claim.process.placement.as_ref().is_some_and(|placement| {
-                    matches!(&close_request.target, crate::CloseTarget::Pane(pane) if placement.location.pane.as_deref() == Some(pane.as_str()))
-                })
-            });
+        let valid = match (
+            SubjectId::parse(&expected.subject_id),
+            ClaimId::parse(&expected.claim_id),
+        ) {
+            (Some(subject_id), Some(claim_id)) => {
+                let current = subjects::read_subject_record(&registry, &subject_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|subject| {
+                        subject
+                            .current_claim
+                            .as_ref()
+                            .or(subject.last_claim.as_ref())
+                            == Some(&claim_id)
+                    });
+                current
+                    && subjects::read_claim(&registry, &claim_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|claim| {
+                            claim.subject_id == subject_id
+                                && claim.process.placement.as_ref().is_some_and(|placement| {
+                                    matches!(&close_request.target, crate::CloseTarget::Pane(pane)
+                                        if placement.location.pane.as_deref() == Some(pane.as_str()))
+                                })
+                        })
+            }
+            _ => false,
+        };
         if !valid {
             return write_refused(
                 record,

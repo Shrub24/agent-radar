@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::lifecycle::{self, State};
 use super::registry::{ProcessVerifier, Registry};
 use super::store::{RecordState, RequestOutcome, RequestRecord, Settlement, Store};
+use crate::identity::SubjectId;
 
 /// Most unresolved records one pass reports. A pass is bounded so a long history
 /// cannot make one response unbounded; `examined` still counts them all.
@@ -187,7 +188,11 @@ fn establish_lifecycle(
     let Some(target) = record.target.as_deref() else {
         return Ok((None, "the record names no subject to verify".into()));
     };
-    let Some(subject) = lifecycle::current_attachment(registry, target)? else {
+    let Some(subject) = SubjectId::parse(target)
+        .map(|target| lifecycle::current_attachment(registry, &target))
+        .transpose()?
+        .flatten()
+    else {
         return Ok((
             None,
             format!("the subject `{target}` it named is not recorded"),

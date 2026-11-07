@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control_plane::lifecycle;
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
+use crate::identity::{ClaimId, RegistrationId};
 use crate::model::{ProcessIdentity, SessionUuid};
 use crate::timestamp::timestamp_millis;
 
@@ -550,15 +551,20 @@ pub(super) fn launched_registration(
         .into_iter()
         .find(|edge| edge.token == token)
     else {
-        if lifecycle::managed_agent(registry, token)? {
+        if lifecycle::managed_agent(
+            registry,
+            &RegistrationId::required(token, "registration_id")?,
+        )? {
             return Ok(Some(token.to_owned()));
         }
         return Err("no recorded spawn edge was minted with this token".into());
     };
     match edge.claim_id {
-        Some(claim_id) => lifecycle::read(registry, &claim_id)?
-            .map(|launch| Some(launch.process.registration_id))
-            .ok_or_else(|| "launch reservation is missing".into()),
+        Some(claim_id) => {
+            lifecycle::read_claim(registry, &ClaimId::required(&claim_id, "claim_id")?)?
+                .map(|launch| Some(launch.process.registration_id.to_string()))
+                .ok_or_else(|| "launch reservation is missing".into())
+        }
         None => Ok(None),
     }
 }
@@ -578,10 +584,14 @@ pub(super) fn bind_presented_token(
     let Some(token) = request.spawn_token.as_deref() else {
         return Ok(());
     };
-    if lifecycle::managed_agent(registry, token)? {
-        lifecycle::bind_managed(registry, registration_id, request.process.as_ref(), now_ms)?;
-        let process = lifecycle::read_process(registry, registration_id)?
-            .ok_or("managed execution is missing")?;
+    if lifecycle::managed_agent(
+        registry,
+        &RegistrationId::required(token, "registration_id")?,
+    )? {
+        let typed = RegistrationId::required(registration_id, "registration_id")?;
+        lifecycle::bind_managed(registry, &typed, request.process.as_ref(), now_ms)?;
+        let process =
+            lifecycle::read_process(registry, &typed)?.ok_or("managed execution is missing")?;
         if let Some(edge) = edge(registry, &process.spawn_request_id)? {
             bind_locked(
                 registry,
@@ -655,8 +665,11 @@ fn bind_locked(
     // could not be written leaves the subject bound, which a same-content retry heals.
     let mut subject = None;
     if let Some(claim_id) = &stored.claim_id {
-        lifecycle::fence_registration(registry, claim_id, process, Some(registration_id), now_ms)?;
-        subject = lifecycle::read(registry, claim_id)?.map(|launch| launch.subject_id);
+        let claim_id = ClaimId::required(claim_id, "claim_id")?;
+        let typed = RegistrationId::required(registration_id, "registration_id")?;
+        lifecycle::fence_registration(registry, &claim_id, process, Some(&typed), now_ms)?;
+        subject =
+            lifecycle::read_claim(registry, &claim_id)?.map(|launch| launch.subject_id.to_string());
     }
     if let Some(bound) = &stored.bound {
         if bound.source == request.source && bound.incarnation == request.incarnation {

@@ -302,9 +302,10 @@ pub(super) fn dead_pane_evidence(
         }
     }
     match bounded_exit_observation(backend, pane_id, stopping, budget) {
-        Ok(PaneExitObservation::Exited { .. }) => {
-            DeadPane::Cleanup(recorded_exit(registry, edge.claim_id.as_deref()))
-        }
+        Ok(PaneExitObservation::Exited { .. }) => DeadPane::Cleanup(recorded_exit(
+            registry,
+            edge.claim_id.as_deref().and_then(ClaimId::parse).as_ref(),
+        )),
         // A pane reported running, undetermined, or unreadable is not a pane whose
         // command has exited: the live refusal stands.
         Ok(PaneExitObservation::Running | PaneExitObservation::Unknown) | Err(()) => {
@@ -315,7 +316,7 @@ pub(super) fn dead_pane_evidence(
 
 fn recorded_exit(
     registry: &Registry,
-    claim_id: Option<&str>,
+    claim_id: Option<&ClaimId>,
 ) -> Option<registry::SpawnExitObservation> {
     match subjects::spawn_exit(registry, claim_id) {
         registry::PublicSpawnExitObservation::Exited {
@@ -449,7 +450,7 @@ pub(super) enum CleanupIntent {
 pub(super) fn cleanup_launch_pane(
     core: &Arc<Mutex<Core>>,
     backend: &Arc<dyn RuntimeProvider>,
-    key: &str,
+    key: &ClaimId,
     intent: CleanupIntent,
     stopping: &Arc<AtomicBool>,
     budget: &Arc<VerificationBudget>,
@@ -460,7 +461,7 @@ pub(super) fn cleanup_launch_pane(
         let core = locked(core);
         (Arc::clone(&core.registry), Arc::clone(&core.verifier))
     };
-    let claim = match subjects::read(&registry, key) {
+    let claim = match subjects::read_claim(&registry, key) {
         Ok(Some(claim)) => claim,
         Ok(None) => return None,
         // A record that cannot be read is not an absence: nothing is dispatched
@@ -554,7 +555,7 @@ fn own_pane(
 pub(super) fn reusable_pane(
     core: &Arc<Mutex<Core>>,
     backend: &Arc<dyn RuntimeProvider>,
-    key: &str,
+    key: &ClaimId,
     anchor: &str,
     stopping: &Arc<AtomicBool>,
     budget: &Arc<VerificationBudget>,
@@ -563,7 +564,7 @@ pub(super) fn reusable_pane(
         let core = locked(core);
         (Arc::clone(&core.registry), Arc::clone(&core.verifier))
     };
-    let claim = subjects::read(&registry, key).ok()??;
+    let claim = subjects::read_claim(&registry, key).ok()??;
     let (pane, instance) = own_pane(
         claim.process.origin,
         claim.process.placement.as_ref(),

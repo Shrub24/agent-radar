@@ -720,7 +720,7 @@ fn recorded_subject(registry: &Registry) -> String {
     };
     let ticket = lifecycle::create(registry, &random_uuid(), launch, None, 1_000)
         .expect("a recorded subject");
-    ticket.subject_id
+    ticket.subject_id.to_string()
 }
 
 #[test]

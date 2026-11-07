@@ -55,7 +55,7 @@ pub(super) fn run_subject_control(
         }
         Admission::Dispatch(..) => {}
     }
-    let current_subject = match subjects::read(&registry, &subject_id) {
+    let current_subject = match subjects::read_claim(&registry, &subject_id) {
         Ok(subject) => subject,
         Err(error) => return Err(registry_refusal(error)),
     };
@@ -107,7 +107,7 @@ pub(super) fn run_subject_control(
     // The supervisor's report is read back here rather than at the pane, so a
     // close that removed the pane still reports how the program ended. It is
     // absent when nothing reported: never an error, and never a block.
-    let claim = subjects::read(&registry, &subject_id).ok().flatten();
+    let claim = subjects::read_claim(&registry, &subject_id).ok().flatten();
     let completion = claim
         .as_ref()
         .and_then(|claim| claim.process.completion.clone());
@@ -272,7 +272,9 @@ pub(super) fn record_enrollment(
     claim: &crate::model::ProcessIdentity,
     enrollment_id: &str,
     now: i64,
-) -> Result<String, String> {
+) -> Result<ClaimId, String> {
+    let enrollment_id = ClaimId::required(enrollment_id, "enrollment_id")?;
+    let registration_id = RegistrationId::required(&params.registration_id, "registration_id")?;
     let presence = registry::presence::current(registry, &params.registration_id)?
         .ok_or("lifecycle enrollment requires a current presence claim")?;
     if presence.session_id.as_deref() != Some(params.session.as_str())
@@ -291,8 +293,8 @@ pub(super) fn record_enrollment(
     let launch = subjects::captured_launch(&effective)?;
     subjects::enroll_subject(
         registry,
-        enrollment_id,
-        &params.registration_id,
+        &enrollment_id,
+        &registration_id,
         claim,
         &params.session,
         launch,
@@ -385,7 +387,8 @@ pub(super) fn run_restart(
         return response;
     }
     let registry = Arc::clone(&locked(core).registry);
-    let subject = match subjects::current_attachment(&registry, &params.subject_id) {
+    let subject_id = id_param(&params.subject_id, "subject_id", SubjectId::required)?;
+    let subject = match subjects::current_attachment(&registry, &subject_id) {
         Ok(Some(subject)) => subject,
         Ok(None) => {
             return Err(Refusal::new(
@@ -402,16 +405,21 @@ pub(super) fn run_restart(
         }
     };
     match (&params.claim_id, &params.parent) {
-        (Some(claim_id), _) if *claim_id != subject.claim_id => {
+        (Some(claim_id), _) if claim_id.as_str() != subject.claim_id.as_str() => {
             return Err(Refusal::new(
                 Code::Refused,
                 "the requested claim is not current; nothing was signalled",
             ));
         }
         (None, Some(parent)) => {
-            let owned = match subject.managed.parent_subject_id.as_deref() {
+            let owned = match subject
+                .managed
+                .parent_subject_id
+                .as_deref()
+                .and_then(SubjectId::parse)
+            {
                 Some(parent_subject) => matches!(
-                    subjects::current_attachment(&registry, parent_subject),
+                    subjects::current_attachment(&registry, &parent_subject),
                     Ok(Some(claim)) if claim.process.bound_registration_id.as_deref() == Some(parent.as_str())
                 ),
                 None => false,
@@ -450,7 +458,7 @@ pub(super) fn run_restart(
     // anything: the predecessor keeps running until the close decides its fate.
     super::closing::refuse_if_closing(core, &anchor)?;
     let now = store::now_ms();
-    let subject_key = subject.subject_id.clone();
+    let subject_key = subject.subject_id.to_string();
     let cancel = match admit(
         ops::Operation::Restart,
         request,
@@ -603,9 +611,11 @@ pub(super) fn restart_lead(
         Ok(prepared) => prepared,
         Err(error) => return Settlement::backend_refused(error),
     };
-    if let Err(error) =
-        registry.attach_subject(successor, &prepared.1.claim_id, &prepared.1.registration_id)
-    {
+    if let Err(error) = registry.attach_subject(
+        successor,
+        prepared.1.claim_id.as_str(),
+        prepared.1.registration_id.as_str(),
+    ) {
         return Settlement::backend_refused(error);
     }
     let mut effects = Vec::new();
@@ -767,7 +777,7 @@ pub(super) fn current_presence_grant(
     };
     let expected_subject = subject.subject_id.as_str();
     Ok(claim.standing == registry::presence::Standing::Granted
-        && claim.claim_id == subject.claim_id
+        && claim.claim_id == subject.claim_id.as_str()
         && claim.session_id.as_deref() == Some(session)
         && claim.subject_id.as_deref() == Some(expected_subject))
 }
@@ -775,24 +785,31 @@ pub(super) fn current_presence_grant(
 pub(super) fn cancel_target(
     registry: &Registry,
     params: &SubjectParams,
-) -> Result<(String, String), Refusal> {
+) -> Result<(ClaimId, String), Refusal> {
     let internal = |error: String| Refusal::new(Code::Internal, error);
     let subject = match (&params.subject_id, &params.spawn_request_id) {
-        (Some(subject_id), None) => subjects::current_attachment(registry, subject_id)
-            .map_err(internal)?
-            .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?,
+        (Some(subject_id), None) => subjects::current_attachment(
+            registry,
+            &id_param(subject_id, "subject_id", SubjectId::required)?,
+        )
+        .map_err(internal)?
+        .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?,
         (None, Some(request_id)) => {
             let edge = registry
                 .spawn_edge(request_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "spawn is not recorded"))?;
-            let subject_id = edge.claim_id.clone().ok_or_else(|| {
-                Refusal::new(Code::Refused, "spawn is not a lifecycle-tracked launch")
-            })?;
-            let launched = subjects::read(registry, &subject_id)
+            let claim_id = edge
+                .claim_id
+                .as_deref()
+                .and_then(ClaimId::parse)
+                .ok_or_else(|| {
+                    Refusal::new(Code::Refused, "spawn is not a lifecycle-tracked launch")
+                })?;
+            let launched = subjects::read_claim(registry, &claim_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
-            let subject = subjects::current_attachment(registry, launched.subject_id.as_str())
+            let subject = subjects::current_attachment(registry, &launched.subject_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
             if subject.process.registration_id != launched.process.registration_id {
@@ -810,18 +827,16 @@ pub(super) fn cancel_target(
             ));
         }
     };
-    let current =
-        subjects::read_subject_record(registry, subject.subject_id.as_str()).map_err(internal)?;
-    if params.claim_id != subject.claim_id
-        || current
-            .is_none_or(|record| record.current_claim.as_deref() != Some(subject.claim_id.as_str()))
+    let current = subjects::read_subject_record(registry, &subject.subject_id).map_err(internal)?;
+    if params.claim_id != subject.claim_id.as_str()
+        || current.is_none_or(|record| record.current_claim.as_ref() != Some(&subject.claim_id))
     {
         return Err(Refusal::new(
             Code::Refused,
             "the requested claim is not current; nothing was signalled",
         ));
     }
-    Ok((subject.claim_id.clone(), subject.subject_id))
+    Ok((subject.claim_id, subject.subject_id.to_string()))
 }
 
 /// What a cancel or stop established, in the parts a reader acts on.
@@ -842,8 +857,8 @@ pub(super) fn termination_outcome(
         executions: claim
             .map(|claim| {
                 vec![subjects::EndedExecution {
-                    subject_id: Some(claim.subject_id.clone()),
-                    registration_id: claim.process.registration_id.clone(),
+                    subject_id: Some(claim.subject_id.to_string()),
+                    registration_id: claim.process.registration_id.to_string(),
                     end: (&termination.exit).into(),
                     completion: completion.clone(),
                 }]
@@ -877,8 +892,8 @@ pub(super) fn termination_outcome(
 /// left behind names a launch that has ended, and the next wake removes it.
 pub(super) fn retire_wake(
     backend: &Arc<dyn RuntimeProvider>,
-    subject_id: &str,
+    claim_id: &ClaimId,
     stopping: &AtomicBool,
 ) {
-    let _ = backend.remove_exit_wake(subject_id, stopping);
+    let _ = backend.remove_exit_wake(claim_id.as_str(), stopping);
 }

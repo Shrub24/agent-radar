@@ -69,10 +69,12 @@ pub(crate) fn agent_entry(
     Ok(AgentEntry {
         registration: public,
         claim_standing: attachment.map(|claim| claim.standing),
-        scoped: match crate::control_plane::lifecycle::read_process(
-            registry,
+        scoped: match crate::identity::RegistrationId::required(
             &registration.registration_id,
-        ) {
+            "registration_id",
+        )
+        .and_then(|id| crate::control_plane::lifecycle::read_process(registry, &id))
+        {
             Ok(Some(process)) => Some(process.scope.is_some()),
             Ok(None) => Some(false),
             Err(_) => None,
@@ -199,7 +201,13 @@ fn topology(
         topology.extend(page.iter().map(|edge| {
             edge.topology(
                 location_evidence(inventory, edge),
-                crate::control_plane::lifecycle::spawn_exit(registry, edge.claim_id.as_deref()),
+                crate::control_plane::lifecycle::spawn_exit(
+                    registry,
+                    edge.claim_id
+                        .as_deref()
+                        .and_then(crate::identity::ClaimId::parse)
+                        .as_ref(),
+                ),
             )
         }));
         if page.len() < PAGE {
@@ -218,7 +226,7 @@ fn lifecycle(registry: &Registry) -> Result<Vec<LifecycleSubject>, String> {
     let mut after: Option<String> = None;
     loop {
         let page = subjects::list_subjects_after(registry, after.as_deref(), PAGE)?;
-        let last = page.last().map(|subject| subject.subject_id.clone());
+        let last = page.last().map(|subject| subject.subject_id.to_string());
         for subject in &page {
             let Some(current) = subjects::current_attachment(registry, &subject.subject_id)? else {
                 continue;

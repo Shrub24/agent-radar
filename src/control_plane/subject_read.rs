@@ -13,13 +13,13 @@ pub(crate) fn read(
 ) -> Result<Subject, String> {
     let claim = record
         .current_claim
-        .as_deref()
-        .or(record.last_claim.as_deref())
-        .map(|id| lifecycle::read(registry, id))
+        .as_ref()
+        .or(record.last_claim.as_ref())
+        .map(|id| lifecycle::read_claim(registry, id))
         .transpose()?
         .flatten();
     let mut result = Subject {
-        subject_id: record.subject_id.clone(),
+        subject_id: record.subject_id.to_string(),
         session_id: record.session,
         managed: record.managed,
         state: AttachmentState::Detached,
@@ -28,7 +28,7 @@ pub(crate) fn read(
         execution: None,
         assignment: crate::control_plane::registry::publication::assignment_facts(
             registry,
-            &record.subject_id,
+            record.subject_id.as_str(),
             now_ms,
         )?
         .map(|facts| ChannelFacts {
@@ -40,10 +40,10 @@ pub(crate) fn read(
     let Some(claim) = claim else {
         return Ok(result);
     };
-    let current = record.current_claim.as_deref() == Some(claim.claim_id.as_str());
+    let current = record.current_claim.as_ref() == Some(&claim.claim_id);
     let process = &claim.process;
     result.scoped = Some(process.scope.is_some());
-    let standing = presence::decision(registry, &claim.claim_id)?;
+    let standing = presence::decision(registry, claim.claim_id.as_str())?;
     result.state =
         if !current || process.exited_at.is_some() || process.ended_externally_at.is_some() {
             AttachmentState::Detached
@@ -61,7 +61,7 @@ pub(crate) fn read(
             }
         };
     if current {
-        let registration = registry.get(&process.registration_id)?;
+        let registration = registry.get(process.registration_id.as_str())?;
         if result.state == AttachmentState::Live {
             result.location = standing.and_then(|decision| decision.location).or_else(|| {
                 registration
@@ -71,7 +71,7 @@ pub(crate) fn read(
         }
         let channel = |kind| -> Result<Option<ChannelFacts>, String> {
             Ok(registry
-                .published_facts(&process.registration_id, kind, now_ms)?
+                .published_facts(process.registration_id.as_str(), kind, now_ms)?
                 .map(|facts| ChannelFacts {
                     writer: facts.writer,
                     snapshot: facts.snapshot,

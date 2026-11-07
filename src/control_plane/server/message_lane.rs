@@ -212,7 +212,9 @@ pub(super) fn message_identity(
         .ok_or_else(|| {
             messages::Error::Invalid("message operations require a current granted claim".into())
         })?;
-    let subject = subjects::read(registry, &attachment.claim_id)
+    let claim_id =
+        ClaimId::required(&attachment.claim_id, "claim_id").map_err(messages::Error::Internal)?;
+    let subject = subjects::read_claim(registry, &claim_id)
         .map_err(messages::Error::Internal)?
         .filter(|claim| claim.session.as_deref() == Some(session_id.as_str()))
         .ok_or_else(|| {
@@ -221,8 +223,8 @@ pub(super) fn message_identity(
     Ok(AgentIdentity {
         registration_id: registration_id.to_owned(),
         session_id,
-        subject_id: subject.subject_id.clone(),
-        claim_id: subject.claim_id,
+        subject_id: subject.subject_id.to_string(),
+        claim_id: subject.claim_id.to_string(),
     })
 }
 
@@ -240,7 +242,9 @@ pub(super) fn validate_producer_recipients(
             "a handoff names exactly one recipient".into(),
         ));
     };
-    let parent = subjects::current_attachment(registry, &producer.subject_id)
+    let producer_subject = SubjectId::required(&producer.subject_id, "subject_id")
+        .map_err(messages::Error::Internal)?;
+    let parent = subjects::current_attachment(registry, &producer_subject)
         .map_err(messages::Error::Internal)?
         .ok_or(messages::Error::NotFound)?
         .managed
@@ -248,7 +252,9 @@ pub(super) fn validate_producer_recipients(
     if !messages::is_parent_recipient(parent.as_deref(), recipient) {
         return Err(messages::Error::WrongRecipient);
     }
-    subjects::current_attachment(registry, recipient)
+    // A recipient that is not a subject id names no subject.
+    let recipient = SubjectId::parse(recipient).ok_or(messages::Error::NotFound)?;
+    subjects::current_attachment(registry, &recipient)
         .map_err(messages::Error::Internal)?
         .ok_or(messages::Error::NotFound)?;
     Ok(())

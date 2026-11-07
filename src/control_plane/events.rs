@@ -113,8 +113,8 @@ impl Facts {
     pub fn from_subject(subject: &Claim) -> Self {
         Self {
             attachment: AttachmentFacts {
-                registration_id: subject.process.registration_id.clone(),
-                subject_id: Some(subject.subject_id.clone()),
+                registration_id: subject.process.registration_id.to_string(),
+                subject_id: Some(subject.subject_id.to_string()),
                 managed: subject.managed.clone(),
                 session: subject.session.clone(),
             },

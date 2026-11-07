@@ -64,6 +64,12 @@ macro_rules! identity {
                 canonical(value).map(Self)
             }
 
+            /// Parses a field a caller supplied, refusing a value that is not a
+            /// canonical UUID by the field's name.
+            pub fn required(value: &str, field: &str) -> Result<Self, String> {
+                Self::parse(value).ok_or_else(|| format!("`{field}` must be a canonical UUID"))
+            }
+
             /// Mints a fresh id. This is the only place one is created.
             pub fn random() -> Self {
                 Self::parse(&crate::control_plane::store::random_uuid())

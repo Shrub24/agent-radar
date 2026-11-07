@@ -294,23 +294,23 @@ pub(super) fn continuation(
     core: &Arc<Mutex<Core>>,
     params: SpawnParams,
 ) -> Result<(SpawnParams, SpawnLineage), Refusal> {
-    let Some(subject_id) = params.continue_subject_id.clone() else {
+    let Some(subject_id) = params.continue_subject_id.as_deref() else {
         return Ok((params, SpawnLineage::default()));
     };
+    let subject_id = id_param(subject_id, "continue_subject_id", SubjectId::required)?;
     let refuse = |message: &str| Refusal::new(Code::Refused, message.to_string());
     let registry = Arc::clone(&locked(core).registry);
     let internal = |error: String| Refusal::new(Code::Internal, error);
     let record = subjects::read_subject_record(&registry, &subject_id)
         .map_err(|error| Refusal::new(Code::BadParams, error))?
         .ok_or_else(|| Refusal::new(Code::NotFound, "the subject to continue is not recorded"))?;
-    let (Some(session), Some(last)) = (record.session.as_deref(), record.last_claim.as_deref())
-    else {
+    let (Some(session), Some(last)) = (record.session.as_deref(), record.last_claim.clone()) else {
         return Err(refuse("the subject has no recorded session to continue"));
     };
     if record.current_claim.is_some() {
         return Err(refuse("the subject is attached; nothing was started"));
     }
-    let previous = subjects::read(&registry, last)
+    let previous = subjects::read_claim(&registry, &last)
         .map_err(internal)?
         .ok_or_else(|| refuse("the subject's last attachment is unavailable"))?;
     if previous.managed.parent_subject_id.is_none()
@@ -322,7 +322,7 @@ pub(super) fn continuation(
         .map_err(|message| refuse(&message))?;
     let lineage = SpawnLineage {
         session: Some(session.to_string()),
-        identity: Some((subject_id, last.to_string())),
+        identity: Some((subject_id, last)),
         prepared: None,
         reuse: None,
     };
@@ -341,7 +341,7 @@ pub(super) fn continuation(
 #[derive(Default)]
 pub(super) struct SpawnLineage {
     pub(super) session: Option<String>,
-    pub(super) identity: Option<(String, String)>,
+    pub(super) identity: Option<(SubjectId, ClaimId)>,
     pub(super) prepared: Option<(Bootstrap, subjects::Ticket)>,
     /// A verified dead pane of the predecessor to launch into instead of splitting
     /// a new one. Absent for everything but a restart that may reuse its pane.
@@ -369,8 +369,10 @@ pub(super) fn spawn_child(
     if lineage.prepared.is_none()
         && let Some(parent_subject_id) = params.managed.parent_subject_id.as_deref()
     {
+        let parent_subject_id =
+            id_param(parent_subject_id, "parent_subject_id", SubjectId::required)?;
         let registry = Arc::clone(&locked(core).registry);
-        match subjects::current_attachment(&registry, parent_subject_id) {
+        match subjects::current_attachment(&registry, &parent_subject_id) {
             Ok(Some(parent_subject))
                 if parent_subject.process.bound_registration_id.as_deref()
                     == Some(params.parent.as_str()) => {}
@@ -458,8 +460,8 @@ pub(super) fn spawn_child(
     if attach && let Some((_, ticket)) = &tracking {
         let attached = locked(core).registry.attach_subject(
             &request.id,
-            &ticket.claim_id,
-            &ticket.registration_id,
+            ticket.claim_id.as_str(),
+            ticket.registration_id.as_str(),
         );
         if let Err(message) = attached {
             let settled = record.complete(Settlement::backend_refused(&message), store::now_ms());
@@ -688,7 +690,10 @@ pub(super) fn spawn_child(
         Settlement::new(outcome, category, message, effects),
         store::now_ms(),
     );
-    let exit = subjects::spawn_exit(&locked(core).registry, edge.claim_id.as_deref());
+    let exit = subjects::spawn_exit(
+        &locked(core).registry,
+        edge.claim_id.as_deref().and_then(ClaimId::parse).as_ref(),
+    );
     write_settled_with(done, core, |answer| answer.with_spawn(edge.public(exit)))
 }
 
@@ -805,7 +810,7 @@ pub(super) fn track_launch(
     request_id: &str,
     launch: subjects::LaunchContext,
     session: Option<String>,
-    identity: Option<(String, String)>,
+    identity: Option<(SubjectId, ClaimId)>,
     managed: subjects::ManagedMetadata,
     now: i64,
 ) -> Result<(Bootstrap, subjects::Ticket), String> {
@@ -882,7 +887,10 @@ pub(super) fn claim_request(
     {
         return not_awaiting();
     }
-    let subject = match subjects::read(&registry, &params.claim_id) {
+    let Some(claim_id) = ClaimId::parse(&params.claim_id) else {
+        return not_awaiting();
+    };
+    let subject = match subjects::read_claim(&registry, &claim_id) {
         Ok(Some(subject))
             if subject.process.state == subjects::State::Pending
                 && subject.process.correlation.as_deref() == Some(params.correlation.as_str()) =>
@@ -959,7 +967,7 @@ pub(super) fn claim_request(
     }
     match subjects::capture(
         &registry,
-        &params.claim_id,
+        &claim_id,
         &params.correlation,
         &params.process,
         &effective,
@@ -969,13 +977,13 @@ pub(super) fn claim_request(
         Ok(()) => respond(
             &request.id,
             Ok(Claimed {
-                registration_id: subject.process.registration_id.clone(),
+                registration_id: subject.process.registration_id.to_string(),
                 executable: subject.process.launch.executable.clone(),
                 argv: subject.process.launch.argv.clone(),
             }),
         ),
         Err(error) => {
-            retire_wake(&backend, &params.claim_id, &stopping);
+            retire_wake(&backend, &claim_id, &stopping);
             Response::refused(&request.id, &Refusal::new(Code::Refused, error))
         }
     }
@@ -1189,7 +1197,7 @@ pub(super) fn admit_request(
     respond(
         &request.id,
         Ok(Admitted {
-            registration_id: process.registration_id,
+            registration_id: process.registration_id.to_string(),
         }),
     )
 }

@@ -1,5 +1,6 @@
 use super::{Registry, read_recorded, record_exit_locked, write};
 use crate::control_plane::registry::{ProcessVerifier, RegistryLocation};
+use crate::identity::ClaimId;
 use crate::model::ProcessIdentity;
 use crate::process_control::{self, Acquired};
 use crate::timestamp::timestamp_millis;
@@ -104,12 +105,12 @@ impl Drop for Collection<'_> {
 
 pub fn observe_exit_from(
     registry: &Registry,
-    subject_id: &str,
+    claim_id: &ClaimId,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
     source: Observer,
 ) -> Result<bool, String> {
-    let subject = read_recorded(registry, subject_id)?;
+    let subject = read_recorded(registry, claim_id)?;
     if subject.process.exited_at.is_some() {
         return Ok(true);
     }
@@ -117,14 +118,14 @@ pub fn observe_exit_from(
         return Ok(false);
     };
     let mut collecting = registry.observing.lock().unwrap_or_else(|e| e.into_inner());
-    if !collecting.insert(subject_id.to_owned()) {
+    if !collecting.insert(claim_id.to_string()) {
         // This is a coalesced hint, not evidence that the process is running.
         return Ok(false);
     }
     drop(collecting);
     let _collection = Collection {
         registry,
-        subject_id: subject_id.to_owned(),
+        subject_id: claim_id.to_string(),
     };
     // Physical I/O is outside the shared transition lock. Independent subjects
     // remain admissible even while one verifier is waiting on its source.
@@ -136,7 +137,7 @@ pub fn observe_exit_from(
         Err(_) => Evidence::Unavailable,
     };
     let _transition = registry.transition();
-    let mut current = read_recorded(registry, subject_id)?;
+    let mut current = read_recorded(registry, claim_id)?;
     if current.process.identity.as_ref() != Some(&process) {
         return Err("process binding changed during reconciliation".into());
     }
@@ -178,12 +179,12 @@ pub fn observe_exit_from(
 /// failed, stale or incomplete scan never counts as absence.
 pub fn observe_pane(
     registry: &Registry,
-    subject_id: &str,
+    claim_id: &ClaimId,
     location: &RegistryLocation,
     evidence: PaneEvidence,
     now_ms: i64,
 ) -> Result<bool, String> {
-    let subject = read_recorded(registry, subject_id)?;
+    let subject = read_recorded(registry, claim_id)?;
     if terminal(&subject) || subject.process.bound_registration_id.is_none() {
         return Ok(terminal(&subject));
     }
@@ -194,7 +195,7 @@ pub fn observe_pane(
         return Ok(false);
     }
     let _transition = registry.transition();
-    let mut current = read_recorded(registry, subject_id)?;
+    let mut current = read_recorded(registry, claim_id)?;
     if terminal(&current) {
         return Ok(true);
     }

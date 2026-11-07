@@ -135,7 +135,7 @@ pub(super) fn retire_pane(
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
     backend: &Arc<dyn RuntimeProvider>,
-    claim_id: &str,
+    claim_id: &ClaimId,
     stopping: &Arc<AtomicBool>,
     now_ms: i64,
 ) -> bool {
@@ -172,7 +172,7 @@ fn withdraw_unclaimed_launches(
     let (page, next) = subjects::unclaimed(&registry, cursor.as_deref(), now_ms);
     *cursor = next;
     for claim_id in page {
-        let mut cleanup = |claim_id: &str| -> Result<bool, String> {
+        let mut cleanup = |claim_id: &ClaimId| -> Result<bool, String> {
             let Some(backend) = &backend else {
                 return Err("this daemon has no backend to close a pane with".into());
             };
@@ -212,7 +212,7 @@ pub(super) fn withdraw_unpresented(
             Arc::clone(&core.stopping),
         )
     };
-    let cleanup = |claim_id: &str| {
+    let cleanup = |claim_id: &ClaimId| {
         if edge.location.is_none() {
             return Ok(edge.created == RequestOutcome::Refused);
         }
@@ -254,9 +254,12 @@ pub(super) fn management_view(
     let Some(session) = session else {
         return answers::Management::Unmanaged;
     };
-    match subjects::attachment(registry, registration_id, &session, now_ms) {
-        Ok(subjects::Attachment::Own(subject_id)) => answers::Management::Managed {
-            subject_id: subject_id.subject_id.clone(),
+    let Some(registration_id) = RegistrationId::parse(registration_id) else {
+        return answers::Management::Unmanaged;
+    };
+    match subjects::attachment(registry, &registration_id, &session, now_ms) {
+        Ok(subjects::Attachment::Own(subject)) => answers::Management::Managed {
+            subject_id: subject.subject_id.to_string(),
         },
         Ok(subjects::Attachment::Other(_)) => answers::Management::Duplicate,
         Ok(subjects::Attachment::Free) | Err(_) => answers::Management::Unmanaged,
@@ -306,7 +309,7 @@ pub(super) fn observe_launch_panes(
         if edge.bound.is_none() || edge.withdrawn.is_some() {
             continue;
         }
-        let Some(subject_id) = edge.claim_id.as_deref() else {
+        let Some(claim_id) = edge.claim_id.as_deref().and_then(ClaimId::parse) else {
             continue;
         };
         let Some(location) = edge.location.as_ref() else {
@@ -327,11 +330,11 @@ pub(super) fn observe_launch_panes(
                 }
             };
         match crate::control_plane::lifecycle::observe_pane(
-            registry, subject_id, location, evidence, now_ms,
+            registry, &claim_id, location, evidence, now_ms,
         ) {
             Ok(true) => ended += 1,
             Ok(false) => {}
-            Err(error) => tracing::warn!(%error, subject = %subject_id, "pane observation failed"),
+            Err(error) => tracing::warn!(%error, claim = %claim_id, "pane observation failed"),
         }
     }
     Ok(ended)
@@ -439,7 +442,12 @@ pub(super) fn wake_request(
             Arc::clone(&core.stopping),
         )
     };
-    let subject = match subjects::read(&registry, &params.subject_id) {
+    // The wake names the attempt it was armed for, under its wire field name.
+    let claim_id = match id_param(&params.subject_id, "subject_id", ClaimId::required) {
+        Ok(claim_id) => claim_id,
+        Err(refusal) => return Response::refused(&request.id, &refusal),
+    };
+    let subject = match subjects::read_claim(&registry, &claim_id) {
         Ok(Some(subject)) => subject,
         Ok(None) => {
             return Response::refused(
@@ -471,14 +479,14 @@ pub(super) fn wake_request(
     }
     match subjects::observe_exit_from(
         &registry,
-        &params.subject_id,
+        &claim_id,
         verifier.as_ref(),
         store::now_ms(),
         subjects::Observer::TmuxHook,
     ) {
         Ok(exited) => {
             if exited {
-                retire_wake(&backend, &params.subject_id, &stopping);
+                retire_wake(&backend, &claim_id, &stopping);
             }
             Response::ok(&request.id, json!({ "exited": exited }))
         }

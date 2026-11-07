@@ -49,6 +49,7 @@ use crate::control_plane::store::{
 use crate::control_plane::transport::{
     Dispatch, EventReady, IngestDispatch, ListenerSource, StreamOpen, Transport,
 };
+use crate::identity::{ClaimId, RegistrationId, SubjectId};
 use crate::lifecycle::{self, CloseRequest};
 use crate::model::SessionUuid;
 use crate::model::{FleetObservation, ProcessIdentity};
@@ -1068,6 +1069,16 @@ fn registry_refusal(error: impl Into<registry::Error>) -> Refusal {
     Refusal::new(code, error.to_string())
 }
 
+/// An id a request named, refused by its field name when it is not one. Typed
+/// ids enter the daemon here and nowhere else.
+fn id_param<T>(
+    value: &str,
+    field: &str,
+    parse: impl FnOnce(&str, &str) -> Result<T, String>,
+) -> Result<T, Refusal> {
+    parse(value, field).map_err(|error| Refusal::new(Code::BadParams, error))
+}
+
 fn registry_error(request: &Request, error: impl Into<registry::Error>) -> Response {
     Response::refused(&request.id, &registry_refusal(error))
 }
@@ -1097,7 +1108,13 @@ fn spawn_answer(request: &Request, reply: Reply, core: &Arc<Mutex<Core>>) -> Rep
     let registry = Arc::clone(&locked(core).registry);
     Ok(match registry.spawn_edge(&request.id) {
         Ok(Some(edge)) => {
-            let exit = subjects::spawn_exit(&registry, edge.claim_id.as_deref());
+            let exit = subjects::spawn_exit(
+                &registry,
+                edge.claim_id
+                    .as_deref()
+                    .and_then(crate::identity::ClaimId::parse)
+                    .as_ref(),
+            );
             answer.with_spawn(edge.public(exit))
         }
         _ => answer,
@@ -1310,15 +1327,15 @@ mod tests {
             "a restart must be fenced or owned"
         );
         let stale = SubjectParams {
-            subject_id: Some(claim.claim_id.clone()),
+            subject_id: Some(claim.subject_id.to_string()),
             claim_id: crate::control_plane::random_uuid(),
             spawn_request_id: None,
         };
         let refusal = cancel_target(&registry, &stale).expect_err("a stale claim is refused");
         assert!(refusal.message.contains("not current"), "{refusal:?}");
         let current = SubjectParams {
-            subject_id: Some(claim.claim_id.clone()),
-            claim_id: claim.claim_id.clone(),
+            subject_id: Some(claim.subject_id.to_string()),
+            claim_id: claim.claim_id.to_string(),
             spawn_request_id: None,
         };
         assert_eq!(

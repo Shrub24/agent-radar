@@ -12,7 +12,8 @@ pub(super) fn child_record(
     let parent = registry::presence::attachment(registry, registration_id)
         .map_err(|error| Refusal::new(Code::Internal, error))?
         .ok_or_else(|| Refusal::new(Code::Refused, "caller has no granted subject"))?;
-    let record = subjects::read_subject_record(registry, subject_id)
+    let subject_id = id_param(subject_id, "subject_id", SubjectId::required)?;
+    let record = subjects::read_subject_record(registry, &subject_id)
         .map_err(|error| Refusal::new(Code::Internal, error))?
         .ok_or_else(|| Refusal::new(Code::NotFound, "subject is not recorded"))?;
     if record.managed.parent_subject_id.as_deref() != Some(parent.subject_id.as_str()) {
@@ -145,7 +146,11 @@ pub(super) fn subject_read_request(
                 Ok(params) => params,
                 Err(refusal) => return Response::refused(&request.id, &refusal),
             };
-            match subjects::read_subject_record(&registry, &params.subject_id) {
+            let subject_id = match id_param(&params.subject_id, "subject_id", SubjectId::required) {
+                Ok(subject_id) => subject_id,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
+            };
+            match subjects::read_subject_record(&registry, &subject_id) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     return Response::refused(
@@ -157,6 +162,7 @@ pub(super) fn subject_read_request(
             }
         };
         let claim = record.current_claim.clone();
+        let subject_id = record.subject_id.clone();
         let projected = project(record);
         // A read that verified a process was already in flight when the daemon
         // started stopping: name the reason rather than answer with the
@@ -196,7 +202,7 @@ pub(super) fn subject_read_request(
                     Err(refusal) => return Response::refused(&request.id, &refusal),
                 };
                 let foreground = foreground_read(core, pane).ok();
-                let latest = match subjects::read_subject_record(&registry, &subject.subject_id) {
+                let latest = match subjects::read_subject_record(&registry, &subject_id) {
                     Ok(Some(record)) if record.current_claim == claim => project(record),
                     _ => {
                         return Response::refused(
@@ -281,7 +287,7 @@ pub(super) fn subject_read_request(
             };
         let complete = page.len() < MAX_REGISTRY_PAGE;
         for record in page {
-            after = Some(record.subject_id.clone());
+            after = Some(record.subject_id.to_string());
             if parent
                 .as_deref()
                 .is_some_and(|parent| record.managed.parent_subject_id.as_deref() != Some(parent))

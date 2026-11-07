@@ -44,6 +44,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::identity::{ClaimId, RegistrationId, SubjectId};
 use serde_json::{Value, json};
 
 use crate::control_plane::answer::{Admitted, Claimed};
@@ -223,7 +225,7 @@ impl ManagedMetadata {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubjectRecord {
     pub version: u32,
-    pub subject_id: String,
+    pub subject_id: SubjectId,
     #[serde(default)]
     pub managed: ManagedMetadata,
     /// The Pi session this subject runs, when one is known.
@@ -231,10 +233,10 @@ pub struct SubjectRecord {
     pub session: Option<String>,
     /// The attempt that is current for this subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_claim: Option<String>,
+    pub current_claim: Option<ClaimId>,
     /// Last attachment provenance retained when a claim still exists but is not current.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_claim: Option<String>,
+    pub last_claim: Option<ClaimId>,
     pub recorded_at: String,
     pub updated_at: String,
 }
@@ -271,8 +273,8 @@ impl Placement {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
-    pub claim_id: String,
-    pub subject_id: String,
+    pub claim_id: ClaimId,
+    pub subject_id: SubjectId,
     #[serde(default)]
     pub managed: ManagedMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,7 +292,7 @@ pub struct ProcessRecord {
     /// one. Written once at admission, by the path that wraps the launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<crate::managed_scope::Scope>,
-    pub registration_id: String,
+    pub registration_id: RegistrationId,
     pub spawn_request_id: String,
     #[serde(default)]
     pub origin: Origin,
@@ -345,11 +347,11 @@ pub struct ProcessRecord {
 /// What a spawn needs to launch a tracked child: the subject it belongs to and
 /// the correlation its launch claim presents.
 pub struct Ticket {
-    pub registration_id: String,
+    pub registration_id: RegistrationId,
     /// Exact execution record ID bound to the spawn edge.
-    pub claim_id: String,
+    pub claim_id: ClaimId,
     /// Stable logical subject identity issued for this process.
-    pub subject_id: String,
+    pub subject_id: SubjectId,
     /// The exact Radar launch operation that created this execution.
     pub launch_id: String,
     pub parent_subject_id: Option<String>,
@@ -599,20 +601,19 @@ fn draft(
     spawn_request_id: &str,
     launch: LaunchContext,
     session: Option<String>,
-    identity: Option<(String, String)>,
+    identity: Option<(SubjectId, ClaimId)>,
     managed: ManagedMetadata,
     now_ms: i64,
 ) -> Claim {
-    let execution_id = random_uuid();
-    let subject_id = identity
-        .map(|(id, _)| id)
-        .unwrap_or_else(|| execution_id.clone());
+    // A subject identity invented for a reservation is minted, never borrowed
+    // from the claim: one string cannot be both a claim and its subject.
+    let subject_id = identity.map(|(id, _)| id).unwrap_or_else(SubjectId::random);
     Claim {
-        claim_id: execution_id,
+        claim_id: ClaimId::random(),
         subject_id,
         managed,
         session,
-        process: draft_process(spawn_request_id, launch, random_uuid(), now_ms),
+        process: draft_process(spawn_request_id, launch, RegistrationId::random(), now_ms),
     }
 }
 
@@ -623,7 +624,7 @@ fn is_agent(kind: &ProcessKind) -> bool {
 fn draft_process(
     spawn_request_id: &str,
     launch: LaunchContext,
-    registration_id: String,
+    registration_id: RegistrationId,
     now_ms: i64,
 ) -> ProcessRecord {
     ProcessRecord {
@@ -631,7 +632,7 @@ fn draft_process(
         // Every launch Radar starts is wrapped into a scope of its own, named from
         // its registration. This records that intent; membership is established
         // again by `Scope::verify` before any stop or recovery acts on it.
-        scope: crate::managed_scope::Scope::for_registration(&registration_id).ok(),
+        scope: crate::managed_scope::Scope::for_registration(registration_id.as_str()).ok(),
         registration_id,
         spawn_request_id: spawn_request_id.to_string(),
         origin: Origin::Spawned,
@@ -677,7 +678,7 @@ pub fn create_process(
     if let Some(placement) = &admission.placement {
         placement.validate()?;
     }
-    let mut process = draft_process(spawn_request_id, launch, random_uuid(), now_ms);
+    let mut process = draft_process(spawn_request_id, launch, RegistrationId::random(), now_ms);
     process.kind = admission.kind;
     process.completion_key = Some(admission.completion_key);
     process.placement = admission.placement;
@@ -688,7 +689,7 @@ pub fn create_process(
     ensure_process(registry, &mut log, &process)?;
     // Captured here so the first presence fences its bind on the verified identity.
     log.append(
-        &process.registration_id,
+        process.registration_id.as_str(),
         &format_millis(now_ms),
         crate::control_plane::events::Source::Launch,
         crate::control_plane::events::Transition::Captured(admission.identity.clone()),
@@ -699,7 +700,10 @@ pub fn create_process(
 }
 
 /// A captured managed agent binds by its execution identity, independently of spawn provenance.
-pub(crate) fn managed_agent(registry: &Registry, registration_id: &str) -> Result<bool, String> {
+pub(crate) fn managed_agent(
+    registry: &Registry,
+    registration_id: &RegistrationId,
+) -> Result<bool, String> {
     Ok(
         read_process(registry, registration_id)?.is_some_and(|process| {
             process.kind == ProcessKind::Agent
@@ -713,11 +717,11 @@ pub(crate) fn managed_agent(registry: &Registry, registration_id: &str) -> Resul
 /// what was recorded and asks no backend, so a removed pane changes nothing.
 pub fn spawn_exit(
     registry: &Registry,
-    claim_id: Option<&str>,
+    claim_id: Option<&ClaimId>,
 ) -> crate::control_plane::registry::PublicSpawnExitObservation {
     use crate::control_plane::registry::PublicSpawnExitObservation::{Exited, Unknown};
     let process = claim_id
-        .and_then(|id| read(registry, id).ok().flatten())
+        .and_then(|id| read_claim(registry, id).ok().flatten())
         .map(|claim| claim.process);
     match process {
         Some(ProcessRecord {
@@ -758,7 +762,7 @@ pub(crate) fn record_completion(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .registration_of(process)
-        .map(str::to_string)
+        .and_then(RegistrationId::parse)
         .ok_or("no launch holds this process")?;
     let record = read_process(registry, &registration_id)?.ok_or("launch is not recorded")?;
     if record.completion_key.as_deref() != Some(key) {
@@ -783,7 +787,7 @@ pub(crate) fn record_completion(
 /// Binds a managed agent to its presented registration, fenced on the captured identity.
 pub(crate) fn bind_managed(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     process: Option<&ProcessIdentity>,
     now_ms: i64,
 ) -> Result<(), String> {
@@ -802,7 +806,11 @@ pub(crate) fn bind_managed(
             },
             now_ms,
         ),
-        State::Bound if record.bound_registration_id.as_deref() == Some(registration_id) => Ok(()),
+        State::Bound
+            if record.bound_registration_id.as_deref() == Some(registration_id.as_str()) =>
+        {
+            Ok(())
+        }
         _ => Err("launch is already bound to another registration".into()),
     }
 }
@@ -853,7 +861,7 @@ pub fn create_with_identity(
     spawn_request_id: &str,
     launch: LaunchContext,
     session: Option<String>,
-    identity: Option<(String, String)>,
+    identity: Option<(SubjectId, ClaimId)>,
     now_ms: i64,
 ) -> Result<Ticket, String> {
     create_with_intent(
@@ -872,7 +880,7 @@ pub fn create_with_intent(
     spawn_request_id: &str,
     launch: LaunchContext,
     session: Option<String>,
-    identity: Option<(String, String)>,
+    identity: Option<(SubjectId, ClaimId)>,
     managed: ManagedMetadata,
     now_ms: i64,
 ) -> Result<Ticket, String> {
@@ -882,26 +890,21 @@ pub fn create_with_intent(
         let record = read_subject_record(registry, subject_id)?.ok_or("subject is not recorded")?;
         // A released subject has no current claim, so its last one is what a
         // continuation succeeds.
-        if record
-            .current_claim
-            .as_deref()
-            .or(record.last_claim.as_deref())
-            != Some(expected.as_str())
-        {
+        if record.current_claim.as_ref().or(record.last_claim.as_ref()) != Some(expected) {
             return Err("the subject's current claim changed; no launch was reserved".into());
         }
     }
     let subject = draft(spawn_request_id, launch, session, identity, managed, now_ms);
     write(registry, &subject)?;
-    let id = subject.subject_id.as_str();
     crate::control_plane::registry::presence::reserve(
         registry,
-        &subject.process.registration_id,
-        &subject.claim_id,
-        id,
+        subject.process.registration_id.as_str(),
+        subject.claim_id.as_str(),
+        subject.subject_id.as_str(),
         subject.session.clone(),
     )?;
-    let mut record = read_subject_record(registry, id)?.ok_or("subject is not recorded")?;
+    let mut record =
+        read_subject_record(registry, &subject.subject_id)?.ok_or("subject is not recorded")?;
     record.current_claim = Some(subject.claim_id.clone());
     record.last_claim = Some(subject.claim_id.clone());
     record.updated_at = subject.process.recorded_at.clone();
@@ -916,28 +919,30 @@ pub fn create_with_intent(
     })
 }
 
-/// The subject with this id, or `None` when none was recorded.
-pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Claim>, String> {
-    if SessionUuid::parse(subject_id).is_none() {
-        return Err("`subject_id` must be a canonical UUID".into());
-    }
+/// The attempt with this id, or `None` when none was recorded.
+///
+/// Keyed on the claim; the subject it serves comes from the attachment, so an
+/// attempt is never found through the identity of a subject.
+pub fn read_claim(registry: &Registry, claim_id: &ClaimId) -> Result<Option<Claim>, String> {
     let Some(facts) = registry
         .events
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .facts(subject_id)
+        .facts(claim_id.as_str())
     else {
         return Ok(None);
     };
-    let registration_id = &facts.attachment.registration_id;
-    let execution = load_process(registry, registration_id, &facts.execution)?;
+    let registration_id = RegistrationId::parse(&facts.attachment.registration_id)
+        .ok_or("the attachment names an unreadable registration")?;
+    let execution = load_process(registry, &registration_id, &facts.execution)?;
     let subject = Claim {
-        claim_id: subject_id.into(),
+        claim_id: claim_id.clone(),
         subject_id: facts
             .attachment
             .subject_id
-            .clone()
-            .ok_or("execution has no subject identity")?,
+            .as_deref()
+            .and_then(SubjectId::parse)
+            .ok_or("execution has no readable subject identity")?,
         managed: facts.attachment.managed.clone(),
         session: facts.attachment.session.clone(),
         process: execution,
@@ -948,16 +953,13 @@ pub fn read(registry: &Registry, subject_id: &str) -> Result<Option<Claim>, Stri
 /// Process identity and evidence remain readable without any session attachment.
 pub fn read_process(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
 ) -> Result<Option<ProcessRecord>, String> {
-    if SessionUuid::parse(registration_id).is_none() {
-        return Err("`registration_id` must be a canonical UUID".into());
-    }
     let facts = registry
         .events
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .process(registration_id)
+        .process(registration_id.as_str())
         .cloned();
     facts
         .map(|facts| load_process(registry, registration_id, &facts))
@@ -975,10 +977,13 @@ pub(crate) fn verify(registry: &Registry) -> Result<(), String> {
         };
         for id in &page {
             read_subject_record(registry, id).map_err(|error| {
-                format!("{}: {error}", subject_record_path(registry, id).display())
+                format!(
+                    "{}: {error}",
+                    subject_record_path(registry, id.as_str()).display()
+                )
             })?;
         }
-        after = Some(last);
+        after = Some(last.to_string());
     }
     let processes: Vec<(String, crate::control_plane::events::ProcessFacts)> = registry
         .events
@@ -988,66 +993,65 @@ pub(crate) fn verify(registry: &Registry) -> Result<(), String> {
         .map(|(id, facts)| (id.clone(), facts.clone()))
         .collect();
     for (registration_id, facts) in processes {
-        load_process(registry, &registration_id, &facts).map_err(|error| {
-            format!(
-                "{}: {error}",
-                recipe_path(registry, &registration_id).display()
-            )
-        })?;
+        let path = recipe_path(registry, &registration_id);
+        let registration_id = RegistrationId::parse(&registration_id)
+            .ok_or_else(|| format!("{}: not named by a registration id", path.display()))?;
+        load_process(registry, &registration_id, &facts)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
     }
     Ok(())
 }
 
 fn load_process(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     facts: &crate::control_plane::events::ProcessFacts,
 ) -> Result<ProcessRecord, String> {
-    let bytes = read_record_file(&recipe_path(registry, registration_id), MAX_SUBJECT_BYTES)?;
+    let bytes = read_record_file(
+        &recipe_path(registry, registration_id.as_str()),
+        MAX_SUBJECT_BYTES,
+    )?;
     let mut process: ProcessRecord =
         serde_json::from_slice(&bytes).map_err(|error| format!("not a process recipe: {error}"))?;
-    if process.version != SUBJECT_VERSION || process.registration_id != registration_id {
+    if process.version != SUBJECT_VERSION || &process.registration_id != registration_id {
         return Err("process recipe does not match its registration or version".into());
     }
     facts.apply_to(&mut process);
     Ok(process)
 }
 
-fn read_recorded(registry: &Registry, subject_id: &str) -> Result<Claim, String> {
-    read(registry, subject_id)?.ok_or_else(|| "tracked launch subject is unavailable".to_string())
+fn read_recorded(registry: &Registry, claim_id: &ClaimId) -> Result<Claim, String> {
+    read_claim(registry, claim_id)?
+        .ok_or_else(|| "tracked launch subject is unavailable".to_string())
 }
 
 /// Resolve a subject's current attachment, or its last one when detached.
-pub fn current_attachment(registry: &Registry, subject_id: &str) -> Result<Option<Claim>, String> {
+pub fn current_attachment(
+    registry: &Registry,
+    subject_id: &SubjectId,
+) -> Result<Option<Claim>, String> {
     let Some(record) = read_subject_record(registry, subject_id)? else {
         return Ok(None);
     };
-    let Some(claim_id) = record
-        .current_claim
-        .as_deref()
-        .or(record.last_claim.as_deref())
-    else {
+    let Some(claim_id) = record.current_claim.as_ref().or(record.last_claim.as_ref()) else {
         return Ok(None);
     };
-    read(registry, claim_id)
+    read_claim(registry, claim_id)
 }
 
 /// One agent's durable identity, authority pointer and attachment history.
 pub fn read_subject_record(
     registry: &Registry,
-    subject_id: &str,
+    subject_id: &SubjectId,
 ) -> Result<Option<SubjectRecord>, String> {
-    if SessionUuid::parse(subject_id).is_none() {
-        return Err("`subject_id` must be a canonical UUID".into());
-    }
-    let path = subject_record_path(registry, subject_id);
+    let path = subject_record_path(registry, subject_id.as_str());
     if !path.try_exists().map_err(|e| e.to_string())? {
         return Ok(None);
     }
     let bytes = read_record_file(&path, MAX_SUBJECT_BYTES)?;
     let record: SubjectRecord =
         serde_json::from_slice(&bytes).map_err(|_| "not a subject record".to_string())?;
-    if record.subject_id != subject_id {
+    if &record.subject_id != subject_id {
         return Err("subject record is filed under another subject".into());
     }
     Ok(Some(record))
@@ -1076,8 +1080,9 @@ fn subject_record_for_session(
         let subject_id = path
             .file_stem()
             .and_then(|name| name.to_str())
-            .ok_or("invalid subject record filename")?;
-        let Some(record) = read_subject_record(registry, subject_id)? else {
+            .and_then(SubjectId::parse)
+            .ok_or("subject record is filed under a name that is not a subject id")?;
+        let Some(record) = read_subject_record(registry, &subject_id)? else {
             continue;
         };
         if record.session.as_deref() != Some(session) {
@@ -1094,14 +1099,13 @@ fn subject_record_for_session(
 /// Records which attempt is current for its subject, and which facts the subject
 /// carries. Called by the attempt writer, so every attempt change maintains it.
 fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
-    let id = claim.subject_id.as_str();
-    let existing = read_subject_record(registry, id)?;
+    let existing = read_subject_record(registry, &claim.subject_id)?;
     let mut record = match existing {
-        Some(record) if record.current_claim.as_deref() != Some(&claim.claim_id) => return Ok(()),
+        Some(record) if record.current_claim.as_ref() != Some(&claim.claim_id) => return Ok(()),
         Some(record) => record,
         None => SubjectRecord {
             version: SUBJECT_VERSION,
-            subject_id: id.into(),
+            subject_id: claim.subject_id.clone(),
             managed: claim.managed.clone(),
             session: claim.session.clone(),
             current_claim: Some(claim.claim_id.clone()),
@@ -1119,10 +1123,10 @@ fn note_attempt(registry: &Registry, claim: &Claim) -> Result<(), String> {
 
 /// One execution that is running where a placement puts it.
 pub struct Placed {
-    pub registration_id: String,
+    pub registration_id: RegistrationId,
     /// The logical subject this execution belongs to, when one is recorded. A
     /// directly admitted execution has none.
-    pub subject_id: Option<String>,
+    pub subject_id: Option<SubjectId>,
     pub placement: Placement,
 }
 
@@ -1134,7 +1138,7 @@ pub struct Placed {
 /// process's own claims about itself.
 pub fn place(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     placement: Placement,
     now_ms: i64,
 ) -> Result<(), String> {
@@ -1163,11 +1167,14 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
     // two places: the attachment of a registered process and the execution record
     // itself. Whichever carries the placement is the same execution, so they are
     // read together and keyed by registration.
-    let mut placements: BTreeMap<String, Placed> = BTreeMap::new();
+    let mut placements: BTreeMap<RegistrationId, Placed> = BTreeMap::new();
     let mut record = |registration_id: &str,
                       facts: &crate::control_plane::events::ProcessFacts,
-                      subject_id: Option<String>| {
-        let Some(placement) = facts.placement.clone() else {
+                      subject_id: Option<&str>| {
+        let (Some(placement), Some(registration_id)) = (
+            facts.placement.clone(),
+            RegistrationId::parse(registration_id),
+        ) else {
             return;
         };
         if ended(facts) {
@@ -1176,14 +1183,14 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
         // A subject is a fact of the attachment, so an execution read first
         // without one takes the one its attachment names.
         let known = placements
-            .entry(registration_id.to_string())
+            .entry(registration_id.clone())
             .or_insert_with(|| Placed {
-                registration_id: registration_id.to_string(),
+                registration_id,
                 subject_id: None,
                 placement,
             });
         if known.subject_id.is_none() {
-            known.subject_id = subject_id;
+            known.subject_id = subject_id.and_then(SubjectId::parse);
         }
     };
     for (registration_id, facts) in log.processes() {
@@ -1194,7 +1201,7 @@ pub fn placements(registry: &Registry) -> Vec<Placed> {
             record(
                 &facts.attachment.registration_id,
                 &facts.execution,
-                facts.attachment.subject_id.clone(),
+                facts.attachment.subject_id.as_deref(),
             );
         }
     }
@@ -1237,8 +1244,9 @@ pub(crate) fn clear_subject_attachments(registry: &Registry) -> Result<(), Strin
         let subject_id = path
             .file_stem()
             .and_then(|name| name.to_str())
-            .ok_or("invalid subject record filename")?;
-        let mut record = read_subject_record(registry, subject_id)?
+            .and_then(SubjectId::parse)
+            .ok_or("subject record is filed under a name that is not a subject id")?;
+        let mut record = read_subject_record(registry, &subject_id)?
             .ok_or("subject record disappeared during reset")?;
         record.current_claim = None;
         record.last_claim = None;
@@ -1253,7 +1261,7 @@ fn write_subject_record(registry: &Registry, record: &SubjectRecord) -> Result<(
     let bytes = serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?;
     write_atomic(
         &directory,
-        &subject_record_path(registry, &record.subject_id),
+        &subject_record_path(registry, record.subject_id.as_str()),
         &bytes,
         MAX_SUBJECT_BYTES,
     )
@@ -1262,15 +1270,15 @@ fn write_subject_record(registry: &Registry, record: &SubjectRecord) -> Result<(
 /// Release authority, not the process or the attempt's recorded facts.
 pub fn release_attachment(
     registry: &Registry,
-    claim_id: &str,
-    subject_id: Option<&str>,
+    claim_id: &ClaimId,
+    subject_id: Option<&SubjectId>,
 ) -> Result<(), String> {
     let Some(subject_id) = subject_id else {
         return Ok(());
     };
     let _transition = registry.transition();
     if let Some(mut record) = read_subject_record(registry, subject_id)?
-        && record.current_claim.as_deref() == Some(claim_id)
+        && record.current_claim.as_ref() == Some(claim_id)
     {
         record.current_claim = None;
         write_subject_record(registry, &record)?;
@@ -1305,7 +1313,7 @@ fn subject_ids_after(
     registry: &Registry,
     after: Option<&str>,
     limit: usize,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<SubjectId>, String> {
     let directory = registry.subjects().join("identity");
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -1322,9 +1330,10 @@ fn subject_ids_after(
         let id = path
             .file_stem()
             .and_then(|value| value.to_str())
-            .ok_or("invalid subject filename")?;
-        if after.is_none_or(|cut| id > cut) {
-            ids.insert(id.to_owned());
+            .and_then(SubjectId::parse)
+            .ok_or_else(|| format!("{}: not named by a subject id", path.display()))?;
+        if after.is_none_or(|cut| id.as_str() > cut) {
+            ids.insert(id);
         }
     }
     Ok(ids.into_iter().take(limit).collect())
@@ -1344,7 +1353,7 @@ pub fn list_subjects_after(
             break;
         }
         for record in page {
-            after = Some(record.subject_id.clone());
+            after = Some(record.subject_id.to_string());
             if let Some(claim) = current_attachment(registry, &record.subject_id)? {
                 claims.push(claim);
             }
@@ -1358,12 +1367,12 @@ pub fn list_subjects_after(
 /// closed twice, and an uncertain cleanup is never retried into a second one.
 pub fn record_pane_cleanup(
     registry: &Registry,
-    subject_id: &str,
+    claim_id: &ClaimId,
     outcome: PaneCleanup,
     now_ms: i64,
 ) -> Result<PaneCleanup, String> {
     let _transition = registry.transition();
-    let mut subject = read_recorded(registry, subject_id)?;
+    let mut subject = read_recorded(registry, claim_id)?;
     if let Some(recorded) = subject.process.pane_cleanup.clone() {
         return Ok(recorded);
     }
@@ -1386,7 +1395,7 @@ pub fn record_pane_cleanup(
 /// revoked the subject; a replayed claim finds the spent correlation.
 pub fn capture(
     registry: &Registry,
-    subject_id: &str,
+    claim_id: &ClaimId,
     correlation: &str,
     process: &ProcessIdentity,
     effective: &Effective,
@@ -1394,7 +1403,7 @@ pub fn capture(
     now_ms: i64,
 ) -> Result<(), String> {
     let _transition = registry.transition();
-    let mut subject = read(registry, subject_id)?.ok_or_else(|| NOT_AWAITING.to_string())?;
+    let mut subject = read_claim(registry, claim_id)?.ok_or_else(|| NOT_AWAITING.to_string())?;
     if subject.process.state != State::Pending
         || subject.process.correlation.as_deref() != Some(correlation)
     {
@@ -1420,18 +1429,18 @@ pub fn capture(
 /// replaying its bind is answered, and any other presenter is refused.
 pub(crate) fn fence_registration(
     registry: &Registry,
-    subject_id: &str,
+    claim_id: &ClaimId,
     process: Option<&ProcessIdentity>,
-    registration_id: Option<&str>,
+    registration_id: Option<&RegistrationId>,
     now_ms: i64,
 ) -> Result<(), String> {
-    let mut subject = read_recorded(registry, subject_id)?;
-    if registration_id.is_some_and(|id| id != subject.process.registration_id) {
+    let mut subject = read_recorded(registry, claim_id)?;
+    if registration_id.is_some_and(|id| id != &subject.process.registration_id) {
         return Err("registration does not identify the launched process".into());
     }
     match (subject.process.state, registration_id) {
         (State::Bound, Some(agent))
-            if subject.process.bound_registration_id.as_deref() == Some(agent)
+            if subject.process.bound_registration_id.as_deref() == Some(agent.as_str())
                 && subject.process.identity.as_ref() == process =>
         {
             Ok(())
@@ -1455,14 +1464,15 @@ pub(crate) fn fence_registration(
 /// captured process. A revoked launch never binds afterwards.
 pub fn cancel(
     registry: &Registry,
-    subject_id: &str,
+    claim_id: &ClaimId,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
 ) -> Result<Termination, String> {
-    let revoked = revoke(registry, subject_id, now_ms)?;
+    let revoked = revoke(registry, claim_id, now_ms)?;
+    let execution = process_of_claim(registry, claim_id)?.registration_id;
     terminate(
         registry,
-        subject_id,
+        &execution,
         verifier,
         now_ms,
         revoked,
@@ -1474,13 +1484,14 @@ pub fn cancel(
 /// a bound launch stays bound, and an unbound one is not revoked.
 pub fn stop(
     registry: &Registry,
-    subject_id: &str,
+    claim_id: &ClaimId,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
 ) -> Result<Termination, String> {
+    let execution = process_of_claim(registry, claim_id)?.registration_id;
     terminate(
         registry,
-        subject_id,
+        &execution,
         verifier,
         now_ms,
         false,
@@ -1497,8 +1508,8 @@ const COMPLETION_GRACE: Duration = Duration::from_millis(500);
 /// The report is what carries the code, and the supervisor is what sends it, so a
 /// close that removes the pane first can destroy it. The wait never becomes a
 /// claim to have one: an absent report is a diagnostic, not a blocker.
-pub fn await_completion(registry: &Registry, registration: &str) -> Option<Completion> {
-    await_completions(registry, std::slice::from_ref(&registration.to_string()));
+pub fn await_completion(registry: &Registry, registration: &RegistrationId) -> Option<Completion> {
+    await_completions(registry, std::slice::from_ref(registration));
     process_of_registration(registry, registration)
         .ok()
         .and_then(|process| process.completion)
@@ -1509,7 +1520,7 @@ pub fn await_completion(registry: &Registry, registration: &str) -> Option<Compl
 /// One window for the whole set, not one per member: a branch of five agents must
 /// not pay five graces before its root is removed, and the reports are all on their
 /// way at the same time. Reads the records only: nothing here dispatches.
-pub fn await_completions(registry: &Registry, registrations: &[String]) {
+pub fn await_completions(registry: &Registry, registrations: &[RegistrationId]) {
     let until = std::time::Instant::now() + COMPLETION_GRACE;
     loop {
         let outstanding = registrations.iter().any(|registration| {
@@ -1527,11 +1538,11 @@ pub fn await_completions(registry: &Registry, registrations: &[String]) {
 /// reports whether it is. A notification calls this; it is never itself proof.
 pub fn observe_exit(
     registry: &Registry,
-    subject_id: &str,
+    claim_id: &ClaimId,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
 ) -> Result<bool, String> {
-    observe_exit_from(registry, subject_id, verifier, now_ms, Observer::Read)
+    observe_exit_from(registry, claim_id, verifier, now_ms, Observer::Read)
 }
 
 /// How a registration stands against one Pi session. A session has at most one
@@ -1554,9 +1565,8 @@ pub enum Attachment {
 /// because absence of a pane is not proof that the process is gone; a stale
 /// heartbeat does not release it either.
 pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<bool, String> {
-    let id = subject.subject_id.as_str();
-    if read_subject_record(registry, id)?
-        .is_none_or(|record| record.current_claim.as_deref() != Some(&subject.claim_id))
+    if read_subject_record(registry, &subject.subject_id)?
+        .is_none_or(|record| record.current_claim.as_ref() != Some(&subject.claim_id))
     {
         return Ok(false);
     }
@@ -1574,14 +1584,16 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
     if subject.process.state != State::Bound || subject.process.exited_at.is_some() {
         return Ok(false);
     }
-    if crate::control_plane::registry::presence::decision(registry, &subject.claim_id)?.is_some_and(
-        |claim| claim.standing == crate::control_plane::registry::presence::Standing::Reserved,
-    ) {
+    if crate::control_plane::registry::presence::decision(registry, subject.claim_id.as_str())?
+        .is_some_and(|claim| {
+            claim.standing == crate::control_plane::registry::presence::Standing::Reserved
+        })
+    {
         return Ok(true);
     }
     if let Some(claim) = crate::control_plane::registry::presence::current(registry, agent)? {
         return Ok(claim.session_id.as_deref() == Some(session)
-            && claim.claim_id == subject.claim_id
+            && claim.claim_id == subject.claim_id.as_str()
             && matches!(
                 claim.standing,
                 crate::control_plane::registry::presence::Standing::Granted
@@ -1601,7 +1613,7 @@ pub fn is_attached(registry: &Registry, subject: &Claim, now_ms: i64) -> Result<
 /// not recorded, so the launch stays unattached rather than duplicating it.
 pub fn record_launch_session(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     session: &str,
     now_ms: i64,
 ) -> Result<(), String> {
@@ -1610,7 +1622,7 @@ pub fn record_launch_session(
     loop {
         let page = list_after(registry, after.as_deref(), SWEEP_LIMIT)?;
         if let Some(found) = page.iter().find(|subject| {
-            subject.process.bound_registration_id.as_deref() == Some(registration_id)
+            subject.process.bound_registration_id.as_deref() == Some(registration_id.as_str())
                 && subject.process.state == State::Bound
                 && subject.process.exited_at.is_none()
                 && subject.process.ended_externally_at.is_none()
@@ -1652,7 +1664,7 @@ pub fn record_launch_session(
             return Ok(());
         }
         match page.last() {
-            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.claim_id.clone()),
+            Some(last) if page.len() == SWEEP_LIMIT => after = Some(last.claim_id.to_string()),
             _ => return Ok(()),
         }
     }
@@ -1690,7 +1702,7 @@ pub fn release_if_gone(
 /// has one authority pointer, so this is the only place that decides who holds it.
 pub fn attachment(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     session: &str,
     now_ms: i64,
 ) -> Result<Attachment, String> {
@@ -1699,8 +1711,8 @@ pub fn attachment(
     };
     let Some(holder) = record
         .current_claim
-        .as_deref()
-        .map(|claim_id| read(registry, claim_id))
+        .as_ref()
+        .map(|claim_id| read_claim(registry, claim_id))
         .transpose()?
         .flatten()
     else {
@@ -1711,8 +1723,8 @@ pub fn attachment(
     }
     let process = &holder.process;
     Ok(
-        if process.bound_registration_id.as_deref() == Some(registration_id)
-            || process.registration_id == registration_id
+        if process.bound_registration_id.as_deref() == Some(registration_id.as_str())
+            || &process.registration_id == registration_id
         {
             Attachment::Own(Box::new(holder))
         } else {
@@ -1735,13 +1747,13 @@ pub fn attachment(
 /// report cannot create a second binding.
 pub fn enroll_subject(
     registry: &Registry,
-    enrollment_id: &str,
-    registration_id: &str,
+    enrollment_id: &ClaimId,
+    registration_id: &RegistrationId,
     process: &ProcessIdentity,
     session: &str,
     launch: LaunchContext,
     now_ms: i64,
-) -> Result<String, String> {
+) -> Result<ClaimId, String> {
     let _transition = registry.transition();
     let execution = read_process(registry, registration_id)?;
     if execution
@@ -1754,7 +1766,7 @@ pub fn enroll_subject(
         Attachment::Other(_) => {
             return Err("the session is already attached to another live process".into());
         }
-        Attachment::Own(own) if own.claim_id == enrollment_id => return Ok(own.claim_id),
+        Attachment::Own(own) if &own.claim_id == enrollment_id => return Ok(own.claim_id),
         Attachment::Own(_) | Attachment::Free => {}
     }
     // A reattachment continues the session's subject, so its children, inbox and
@@ -1763,16 +1775,22 @@ pub fn enroll_subject(
         Some(record) => (Some(record.subject_id), record.managed),
         None => (None, ManagedMetadata::default()),
     };
-    let subject_id = enrollment_id.to_string();
-    let logical = logical.unwrap_or_else(|| subject_id.clone());
+    // A session with no subject yet gets a new one, minted rather than borrowed
+    // from the enrollment's claim.
+    let logical = logical.unwrap_or_else(SubjectId::random);
     let execution = execution.unwrap_or_else(|| {
-        let mut adopted = draft_process(enrollment_id, launch, registration_id.into(), now_ms);
+        let mut adopted = draft_process(
+            enrollment_id.as_str(),
+            launch,
+            registration_id.clone(),
+            now_ms,
+        );
         adopted.origin = Origin::Enrolled;
         adopted.scope = None;
         adopted
     });
     let mut subject = Claim {
-        claim_id: subject_id.clone(),
+        claim_id: enrollment_id.clone(),
         subject_id: logical,
         managed,
         session: Some(session.to_string()),
@@ -1784,20 +1802,20 @@ pub fn enroll_subject(
     subject.process.bound_registration_id = Some(registration_id.to_string());
     subject.process.recorded_at = format_millis(now_ms);
     write(registry, &subject)?;
-    let logical_id = subject.subject_id.as_str();
-    let mut record = read_subject_record(registry, logical_id)?.ok_or("subject is not recorded")?;
+    let mut record =
+        read_subject_record(registry, &subject.subject_id)?.ok_or("subject is not recorded")?;
     record.current_claim = Some(subject.claim_id.clone());
     record.last_claim = Some(subject.claim_id.clone());
     write_subject_record(registry, &record)?;
-    Ok(subject_id)
+    Ok(subject.claim_id)
 }
 
 /// Withdraw an attempt that never dispatched after its incumbent could not stop.
 /// Pointer restoration is exact: a later claim can never be displaced here.
 pub fn cancel_reservation(
     registry: &Registry,
-    predecessor: &str,
-    pending: &str,
+    predecessor: &ClaimId,
+    pending: &ClaimId,
     now_ms: i64,
 ) -> Result<(), String> {
     let _transition = registry.transition();
@@ -1807,17 +1825,17 @@ pub fn cancel_reservation(
             "the successor may have dispatched; its reservation cannot be withdrawn".into(),
         );
     }
-    let id = next.subject_id.as_str();
-    let mut record = read_subject_record(registry, id)?.ok_or("subject is not recorded")?;
-    if record.current_claim.as_deref() != Some(pending) {
+    let mut record =
+        read_subject_record(registry, &next.subject_id)?.ok_or("subject is not recorded")?;
+    if record.current_claim.as_ref() != Some(pending) {
         return Err("the subject's claim changed while stopping its previous process".into());
     }
     next.process.state = State::Revoked;
     next.process.correlation = None;
     next.process.recorded_at = format_millis(now_ms);
     write(registry, &next)?;
-    record.current_claim = Some(predecessor.into());
-    record.last_claim = Some(predecessor.into());
+    record.current_claim = Some(predecessor.clone());
+    record.last_claim = Some(predecessor.clone());
     record.updated_at = format_millis(now_ms);
     write_subject_record(registry, &record)
 }
@@ -1853,50 +1871,53 @@ fn stop_and_release(
     claim: &Claim,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
-    cleanup: &mut impl FnMut(&str) -> Result<bool, String>,
+    cleanup: &mut impl FnMut(&ClaimId) -> Result<bool, String>,
 ) -> Result<bool, String> {
     revoke(registry, &claim.claim_id, now_ms)?;
     // A revoked launch captures nothing afterwards, so one with no identity has
     // no process to stop.
     let stopped = match cancel(registry, &claim.claim_id, verifier, now_ms)?.exit {
         Exit::Exited => true,
-        Exit::Unresolved => {
-            read(registry, &claim.claim_id)?.is_some_and(|claim| claim.process.identity.is_none())
-        }
+        Exit::Unresolved => read_claim(registry, &claim.claim_id)?
+            .is_some_and(|claim| claim.process.identity.is_none()),
         Exit::Unverified(_) => false,
     };
     if !stopped || !cleanup(&claim.claim_id)? {
         return Ok(false);
     }
-    release_attachment(registry, &claim.claim_id, Some(claim.subject_id.as_str()))?;
+    release_attachment(registry, &claim.claim_id, Some(&claim.subject_id))?;
     Ok(true)
 }
 
 /// Whether this claim is already withdrawn: only a withdrawal releases a revoked
 /// claim from its subject while leaving the claim itself recorded.
-fn released(registry: &Registry, subject_id: Option<&str>, claim_id: &str) -> Result<bool, String> {
+fn released(
+    registry: &Registry,
+    subject_id: Option<&SubjectId>,
+    claim_id: &ClaimId,
+) -> Result<bool, String> {
     let Some(subject_id) = subject_id else {
         return Ok(false);
     };
     Ok(read_subject_record(registry, subject_id)?
-        .is_some_and(|record| record.current_claim.as_deref() != Some(claim_id)))
+        .is_some_and(|record| record.current_claim.as_ref() != Some(claim_id)))
 }
 
 /// One claim, under the presence lock both withdrawal paths hold.
 fn withdraw_locked(
     registry: &Registry,
-    claim_id: &str,
+    claim_id: &ClaimId,
     deadline_from: Option<&str>,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
-    cleanup: &mut impl FnMut(&str) -> Result<bool, String>,
+    cleanup: &mut impl FnMut(&ClaimId) -> Result<bool, String>,
 ) -> Result<Option<&'static str>, String> {
-    let Some(claim) = read(registry, claim_id)? else {
+    let Some(claim) = read_claim(registry, claim_id)? else {
         return Ok(None);
     };
     if crate::control_plane::registry::presence::attachment(
         registry,
-        &claim.process.registration_id,
+        claim.process.registration_id.as_str(),
     )?
     .is_some()
     {
@@ -1925,10 +1946,10 @@ fn withdraw_locked(
 /// launch that granted while its page was being read.
 pub fn withdraw_unclaimed(
     registry: &Registry,
-    claim_id: &str,
+    claim_id: &ClaimId,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
-    mut cleanup: impl FnMut(&str) -> Result<bool, String>,
+    mut cleanup: impl FnMut(&ClaimId) -> Result<bool, String>,
 ) -> Result<Option<&'static str>, String> {
     let _presence = registry.presence.lock().unwrap_or_else(|e| e.into_inner());
     withdraw_locked(registry, claim_id, None, verifier, now_ms, &mut cleanup)
@@ -1941,22 +1962,33 @@ pub fn unclaimed(
     registry: &Registry,
     after: Option<&str>,
     now_ms: i64,
-) -> (Vec<String>, Option<String>) {
+) -> (Vec<ClaimId>, Option<String>) {
     let ids: Vec<String> = {
         let log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
         log.ids()
             .filter(|id| {
+                let Some(claim) = ClaimId::parse(id) else {
+                    return false;
+                };
                 log.facts(id).is_some_and(|facts| {
+                    let subject = facts
+                        .attachment
+                        .subject_id
+                        .as_deref()
+                        .and_then(SubjectId::parse);
                     withdrawal(facts.execution.state, &facts.execution.recorded_at, now_ms)
                         .is_some()
-                        && !released(registry, facts.attachment.subject_id.as_deref(), id)
-                            .unwrap_or(false)
+                        && !released(registry, subject.as_ref(), &claim).unwrap_or(false)
                 })
             })
             .cloned()
             .collect()
     };
-    crate::control_plane::store::page_after(&ids, after, SWEEP_LIMIT)
+    let (page, next) = crate::control_plane::store::page_after(&ids, after, SWEEP_LIMIT);
+    (
+        page.iter().filter_map(|id| ClaimId::parse(id)).collect(),
+        next,
+    )
 }
 
 /// Withdraws a launch whose process never presented and marks its edge, so a
@@ -1969,14 +2001,17 @@ pub fn withdraw_unpresented(
     edge: &crate::control_plane::registry::SpawnEdge,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
-    mut cleanup: impl FnMut(&str) -> Result<bool, String>,
-) -> Result<Option<String>, String> {
+    mut cleanup: impl FnMut(&ClaimId) -> Result<bool, String>,
+) -> Result<Option<ClaimId>, String> {
     // A page read before a grant must not mark an edge that has since granted.
     let _presence = registry.presence.lock().unwrap_or_else(|e| e.into_inner());
     let Some(edge) = registry.spawn_edge(&edge.request_id)? else {
         return Ok(None);
     };
-    let (Some(claim_id), true) = (edge.claim_id.clone(), edge.granted_at.is_none()) else {
+    let (Some(claim_id), true) = (
+        edge.claim_id.as_deref().and_then(ClaimId::parse),
+        edge.granted_at.is_none(),
+    ) else {
         return Ok(None);
     };
     if edge.withdrawn.is_some() {
@@ -2146,8 +2181,8 @@ pub struct PublicClaim {
 pub fn public_view(subject: &Claim) -> PublicClaim {
     PublicClaim {
         subject_id: subject.subject_id.as_str().to_owned(),
-        claim_id: subject.claim_id.clone(),
-        registration_id: subject.process.registration_id.clone(),
+        claim_id: subject.claim_id.to_string(),
+        registration_id: subject.process.registration_id.to_string(),
         managed: subject.managed.clone(),
         spawn_request_id: subject.process.spawn_request_id.clone(),
         state: subject.process.state,
@@ -2220,7 +2255,12 @@ pub fn list_after(
     ids.sort();
     ids.dedup();
     ids.truncate(limit);
-    ids.iter().map(|id| read_recorded(registry, id)).collect()
+    ids.iter()
+        .map(|id| {
+            let claim = ClaimId::parse(id).ok_or("a recorded claim is not named by a claim id")?;
+            read_recorded(registry, &claim)
+        })
+        .collect()
 }
 
 /// Most subject records one recovery pass examines. A pass is bounded so a long
@@ -2267,7 +2307,7 @@ pub fn sweep(
     ids.dedup();
     let (page, next) = crate::control_plane::store::page_after(&ids, after, SWEEP_LIMIT);
     let mut exited = 0;
-    for id in page {
+    for id in page.iter().filter_map(|id| ClaimId::parse(id)) {
         if observe_exit_from(registry, &id, verifier, now_ms, Observer::Sweep) == Ok(true) {
             exited += 1;
         }
@@ -2279,7 +2319,7 @@ pub fn sweep(
 ///
 /// A reservation whose launch was refused will never present, and a claim left
 /// pending draws a lifecycle row that nothing resolves.
-pub(crate) fn revoke(registry: &Registry, claim_id: &str, now_ms: i64) -> Result<bool, String> {
+pub(crate) fn revoke(registry: &Registry, claim_id: &ClaimId, now_ms: i64) -> Result<bool, String> {
     let _transition = registry.transition();
     let mut subject = read_recorded(registry, claim_id)?;
     if !matches!(subject.process.state, State::Pending | State::Captured) {
@@ -2449,7 +2489,7 @@ fn still_running(process: Option<&ProcessRecord>, note: Option<&str>) -> Exit {
 /// scope, and the exit it establishes.
 fn terminate(
     registry: &Registry,
-    execution: &str,
+    execution: &RegistrationId,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
     revoked: bool,
@@ -2474,7 +2514,7 @@ fn terminate(
         };
     // The record the exit is written against, read once the signal intent is
     // known: `stage` already established that the identity has not moved.
-    let process = process_by(registry, execution)?;
+    let process = process_of_registration(registry, execution)?;
     let mut signal_attempted = false;
     if signal {
         signal_attempted = true;
@@ -2508,12 +2548,12 @@ fn terminate(
 /// Settles without waiting when there is no captured process to signal.
 fn stage(
     registry: &Registry,
-    execution: &str,
+    execution: &RegistrationId,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
     shutdown: &Shutdown,
 ) -> Result<Stage, String> {
-    let process = process_by(registry, execution)?;
+    let process = process_of_registration(registry, execution)?;
     let Some(identity) = process.identity.as_ref() else {
         return Ok(Stage::Settled(Exit::Unresolved));
     };
@@ -2529,13 +2569,13 @@ fn stage(
     let (scope, scope_note) = match process.scope.clone() {
         Some(scope) => match if descriptor.is_some() {
             scope.verify_until(
-                &process.registration_id,
+                process.registration_id.as_str(),
                 identity,
                 verifier,
                 shutdown.graceful_until,
             )
         } else {
-            scope.verify_unit_until(&process.registration_id, shutdown.graceful_until)
+            scope.verify_unit_until(process.registration_id.as_str(), shutdown.graceful_until)
         } {
             Ok(scope) => (Some(scope), None),
             // The process is fenced by its own identity, so an unreadable scope
@@ -2554,7 +2594,7 @@ fn stage(
         return Ok(Stage::Settled(Exit::Exited));
     }
     let _transition = registry.transition();
-    let current = process_by(registry, execution)?;
+    let current = process_of_registration(registry, execution)?;
     if current.identity != process.identity {
         return Ok(Stage::Settled(Exit::Unresolved));
     }
@@ -2601,8 +2641,8 @@ impl Cancelled {
 /// One execution a batch addresses: the process incarnation to stop, and the agent
 /// it runs as when one is recorded.
 pub struct ExecutionRef {
-    pub registration_id: String,
-    pub subject_id: Option<String>,
+    pub registration_id: RegistrationId,
+    pub subject_id: Option<SubjectId>,
 }
 
 /// Cancels every named execution together: each is fenced, signalled once, and
@@ -2729,8 +2769,8 @@ const UNRESPONSIVE: &str = "the process outlived the shutdown window";
 /// The execution a batch addressed, with what the records say about it.
 fn ended_execution(registry: &Registry, target: &ExecutionRef, exit: Exit) -> EndedExecution {
     EndedExecution {
-        subject_id: target.subject_id.clone(),
-        registration_id: target.registration_id.clone(),
+        subject_id: target.subject_id.as_ref().map(ToString::to_string),
+        registration_id: target.registration_id.to_string(),
         end: ExecutionEnd::from(&exit),
         completion: read_process(registry, &target.registration_id)
             .ok()
@@ -2748,18 +2788,6 @@ fn unverified_execution(
     ended_execution(registry, target, Exit::Unverified(reason))
 }
 
-/// The execution one key addresses, whichever key the caller holds.
-///
-/// A close may know only the claim it resolved, or only the registration a
-/// placement named; both are durable keys of the same execution, and the two
-/// named readers below exist for the callers that hold exactly one of them.
-fn process_by(registry: &Registry, execution: &str) -> Result<ProcessRecord, String> {
-    if let Some(process) = read_process(registry, execution)? {
-        return Ok(process);
-    }
-    process_of_claim(registry, execution)
-}
-
 /// Records the exit of the execution a batch addressed.
 fn record_exit_of_registration(
     registry: &Registry,
@@ -2771,21 +2799,21 @@ fn record_exit_of_registration(
 }
 
 /// The execution a claim addresses, through the attempt it belongs to.
-fn process_of_claim(registry: &Registry, claim: &str) -> Result<ProcessRecord, String> {
+fn process_of_claim(registry: &Registry, claim: &ClaimId) -> Result<ProcessRecord, String> {
     Ok(read_recorded(registry, claim)?.process)
 }
 
 /// The execution one process incarnation is, without needing its attempt.
 fn process_of_registration(
     registry: &Registry,
-    registration: &str,
+    registration: &RegistrationId,
 ) -> Result<ProcessRecord, String> {
     read_process(registry, registration)?.ok_or_else(|| "the execution is not recorded".into())
 }
 
 fn record_process_transition(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     source: crate::control_plane::events::Source,
     transition: crate::control_plane::events::Transition,
     now_ms: i64,
@@ -2794,7 +2822,12 @@ fn record_process_transition(
         .events
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .append(registration_id, &format_millis(now_ms), source, transition)
+        .append(
+            registration_id.as_str(),
+            &format_millis(now_ms),
+            source,
+            transition,
+        )
 }
 
 fn record_exit(registry: &Registry, process: &ProcessRecord, now_ms: i64) -> Result<(), String> {
@@ -2843,7 +2876,7 @@ pub fn wrap(
         mut env,
         ..
     } = target;
-    env.insert(CLAIM_ENV.to_string(), ticket.claim_id.clone());
+    env.insert(CLAIM_ENV.to_string(), ticket.claim_id.to_string());
     env.insert(CORRELATION_ENV.to_string(), ticket.correlation.clone());
     if let Some(parent_subject_id) = &ticket.parent_subject_id {
         env.insert(
@@ -2853,7 +2886,8 @@ pub fn wrap(
     }
     // A launch that could not enter its scope would run nothing, so it is refused
     // here, before a pane is typed into.
-    crate::managed_scope::Scope::for_registration(&ticket.registration_id)?.wrap("", &[])?;
+    crate::managed_scope::Scope::for_registration(ticket.registration_id.as_str())?
+        .wrap("", &[])?;
     Ok(LaunchRequest {
         pane_id,
         executable: bootstrap.executable.clone(),
@@ -3192,7 +3226,7 @@ fn store_recipe(registry: &Registry, process: &ProcessRecord) -> Result<(), Stri
         serde_json::to_vec_pretty(process).map_err(|_| "cannot encode private process recipe")?;
     write_atomic(
         &directory,
-        &recipe_path(registry, &process.registration_id),
+        &recipe_path(registry, process.registration_id.as_str()),
         &bytes,
         MAX_SUBJECT_BYTES,
     )
@@ -3203,19 +3237,19 @@ fn ensure_process(
     log: &mut crate::control_plane::events::Log,
     process: &ProcessRecord,
 ) -> Result<(), String> {
-    if log.process(&process.registration_id).is_some() {
+    if log.process(process.registration_id.as_str()).is_some() {
         return Ok(());
     }
     let directory = registry.subjects().join("private");
     crate::control_plane::registry::prepare_directory(&directory)?;
-    let recipe = recipe_path(registry, &process.registration_id);
+    let recipe = recipe_path(registry, process.registration_id.as_str());
     if !recipe.try_exists().map_err(|e| e.to_string())? {
         let bytes = serde_json::to_vec_pretty(process)
             .map_err(|_| "cannot encode private process recipe")?;
         write_atomic(&directory, &recipe, &bytes, MAX_SUBJECT_BYTES)?;
     }
     log.append(
-        &process.registration_id,
+        process.registration_id.as_str(),
         &process.recorded_at,
         if process.origin != Origin::Enrolled {
             crate::control_plane::events::Source::Launch
@@ -3223,7 +3257,7 @@ fn ensure_process(
             crate::control_plane::events::Source::Registration
         },
         crate::control_plane::events::Transition::ProcessCreated {
-            registration_id: process.registration_id.clone(),
+            registration_id: process.registration_id.to_string(),
             facts: crate::control_plane::events::ProcessFacts::from(process),
         },
     )
@@ -3233,7 +3267,7 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
     use crate::control_plane::events::{Facts, Source, Transition};
     let mut log = registry.events.lock().unwrap_or_else(|e| e.into_inner());
     ensure_process(registry, &mut log, &subject.process)?;
-    let previous = match log.facts(&subject.claim_id) {
+    let previous = match log.facts(subject.claim_id.as_str()) {
         Some(facts) => facts,
         None => {
             let facts = Facts::from_subject(subject);
@@ -3243,7 +3277,7 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
                 Origin::Admitted => return Err("an admitted process has no subject".into()),
             };
             return log.append(
-                &subject.claim_id,
+                subject.claim_id.as_str(),
                 &subject.process.recorded_at,
                 source,
                 transition,
@@ -3347,7 +3381,7 @@ fn write_attempt(registry: &Registry, subject: &Claim) -> Result<(), String> {
         return Err("unsupported lifecycle transition".into());
     };
     log.append_checked(
-        &subject.claim_id,
+        subject.claim_id.as_str(),
         &subject.process.recorded_at,
         source,
         transition,
@@ -3460,7 +3494,7 @@ mod tests {
         let scratch = Scratch::new("before-capture");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.claim_id.as_str();
+        let subject = &ticket.claim_id;
 
         let cancelled = cancel(&registry, subject, &Uninspected, 2).expect("cancel");
         assert_eq!(
@@ -3486,7 +3520,7 @@ mod tests {
         // Revocation is durable: a reopened registry still refuses every bind.
         let reopened = scratch.registry();
         assert_eq!(
-            read(&reopened, subject)
+            read_claim(&reopened, subject)
                 .expect("read")
                 .expect("subject")
                 .process
@@ -3530,7 +3564,7 @@ mod tests {
         let first = create_with_intent(&registry, SPAWN, launch(), None, None, metadata.clone(), 1)
             .expect("accepted launch intent");
         assert_eq!(first.parent_subject_id, metadata.parent_subject_id);
-        let persisted = read(&registry, &first.claim_id)
+        let persisted = read_claim(&registry, &first.claim_id)
             .expect("read subject")
             .expect("subject");
         assert_eq!(persisted.managed, metadata);
@@ -3544,14 +3578,14 @@ mod tests {
             &random_uuid(),
             launch(),
             None,
-            Some((first.claim_id.clone(), first.claim_id.clone())),
+            Some((first.subject_id.clone(), first.claim_id.clone())),
             persisted.managed.clone(),
             2,
         )
         .expect("successor intent");
         assert_eq!(successor.parent_subject_id, metadata.parent_subject_id);
         assert_eq!(
-            read(&registry, &successor.claim_id)
+            read_claim(&registry, &successor.claim_id)
                 .expect("read successor")
                 .expect("successor")
                 .managed,
@@ -3587,7 +3621,7 @@ mod tests {
             Attachment::Own(_)
         ));
         assert!(matches!(
-            attachment(&registry, &random_uuid(), &session, 2).expect("other"),
+            attachment(&registry, &RegistrationId::random(), &session, 2).expect("other"),
             Attachment::Other(_)
         ));
     }
@@ -3597,13 +3631,13 @@ mod tests {
         let scratch = Scratch::new("logical-current");
         let registry = scratch.registry();
         let first = create(&registry, SPAWN, launch(), None, 1).expect("first execution");
-        let logical_id = first.claim_id.clone();
+        let logical_id = first.subject_id.clone();
         let second = create_with_identity(
             &registry,
             &random_uuid(),
             launch(),
             None,
-            Some((logical_id.clone(), logical_id.clone())),
+            Some((logical_id.clone(), first.claim_id.clone())),
             2,
         )
         .expect("successor execution");
@@ -3615,8 +3649,8 @@ mod tests {
         assert_eq!(current.subject_id, logical_id);
         // The agent carries the plain name; the attempt is named by its claim.
         let view = json!(public_view(&current));
-        assert_eq!(view["subject_id"], logical_id);
-        assert_eq!(view["claim_id"], second.claim_id);
+        assert_eq!(view["subject_id"], logical_id.as_str());
+        assert_eq!(view["claim_id"], second.claim_id.as_str());
         assert!(view.get("execution_id").is_none(), "{view}");
 
         let listed = list_subjects_after(&registry, None, 10).expect("subject list");
@@ -3658,13 +3692,13 @@ mod tests {
                 run: None,
                 label: None,
                 launch: None,
-                spawn_token: Some(admitted.clone()),
+                spawn_token: Some(admitted.to_string()),
             };
 
         let registration = registry
             .register(&presenting(identity.clone()), 2)
             .expect("presence binds the admitted registration");
-        assert_eq!(registration.registration_id, admitted);
+        assert_eq!(registration.registration_id, admitted.as_str());
 
         let other = ProcessIdentity {
             pid: 4243,
@@ -3699,13 +3733,16 @@ mod tests {
         .expect("admitted process");
         verify(&registry).expect("a record this build wrote verifies");
 
-        let path = recipe_path(&registry, &process.registration_id);
+        let path = recipe_path(&registry, process.registration_id.as_str());
         let mut recipe: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("recipe")).expect("json");
         recipe["version"] = (SUBJECT_VERSION - 1).into();
         fs::write(&path, serde_json::to_vec(&recipe).expect("json")).expect("old recipe");
         let refusal = verify(&registry).expect_err("an old recipe refuses");
-        assert!(refusal.contains(&process.registration_id), "{refusal}");
+        assert!(
+            refusal.contains(process.registration_id.as_str()),
+            "{refusal}"
+        );
     }
 
     #[test]
@@ -3869,7 +3906,7 @@ mod tests {
         assert!(
             place(
                 &registry,
-                "00000000-0000-4000-8000-000000000999",
+                &RegistrationId::parse("00000000-0000-4000-8000-000000000999").expect("id"),
                 placement(Some("wA:p1")),
                 2
             )
@@ -3899,17 +3936,48 @@ mod tests {
     }
 
     #[test]
+    fn an_enrollment_of_a_new_session_mints_a_subject_of_its_own() {
+        let scratch = Scratch::new("enroll-mints");
+        let registry = scratch.registry();
+        let claim_id = ClaimId::random();
+        let process = ProcessIdentity {
+            boot_id: "test-boot".into(),
+            pid: 1,
+            start_ticks: 1,
+        };
+        enroll_subject(
+            &registry,
+            &claim_id,
+            &RegistrationId::random(),
+            &process,
+            &random_uuid(),
+            launch(),
+            1,
+        )
+        .expect("enrolled");
+
+        let claim = read_claim(&registry, &claim_id)
+            .expect("read claim")
+            .expect("claim");
+        assert_ne!(claim.subject_id.as_str(), claim_id.as_str());
+        let record = read_subject_record(&registry, &claim.subject_id)
+            .expect("read subject")
+            .expect("the minted subject is recorded");
+        assert_eq!(record.current_claim.as_ref(), Some(&claim_id));
+    }
+
+    #[test]
     fn a_new_claim_after_reset_reuses_the_subject_for_its_session() {
         let scratch = Scratch::new("reset-session-reattach");
         let registry = scratch.registry();
-        let subject_id = "00000000-0000-4000-8000-000000000101";
+        let subject_id = SubjectId::parse("00000000-0000-4000-8000-000000000101").expect("id");
         let parent_id = "00000000-0000-4000-8000-000000000102";
         let session = random_uuid();
         write_subject_record(
             &registry,
             &SubjectRecord {
                 version: SUBJECT_VERSION,
-                subject_id: subject_id.into(),
+                subject_id: subject_id.clone(),
                 managed: ManagedMetadata {
                     parent_subject_id: Some(parent_id.into()),
                     ..ManagedMetadata::default()
@@ -3923,8 +3991,8 @@ mod tests {
         )
         .expect("retained subject record");
 
-        let claim_id = random_uuid();
-        let registration_id = random_uuid();
+        let claim_id = ClaimId::random();
+        let registration_id = RegistrationId::random();
         let process = ProcessIdentity {
             boot_id: "test-boot".into(),
             pid: 1,
@@ -3941,7 +4009,7 @@ mod tests {
         )
         .expect("fresh attachment");
 
-        let claim = read(&registry, &claim_id)
+        let claim = read_claim(&registry, &claim_id)
             .expect("read claim")
             .expect("new claim");
         assert_eq!(claim.subject_id, subject_id);
@@ -3953,16 +4021,13 @@ mod tests {
         let scratch = Scratch::new("subject-record");
         let registry = scratch.registry();
         let first = create(&registry, SPAWN, launch(), None, 1).expect("first attempt");
-        let logical_id = first.claim_id.clone();
+        let logical_id = first.subject_id.clone();
 
         let record = read_subject_record(&registry, &logical_id)
             .expect("read record")
             .expect("the attempt created its subject");
         assert_eq!(record.subject_id, logical_id);
-        assert_eq!(
-            record.current_claim.as_deref(),
-            Some(first.claim_id.as_str())
-        );
+        assert_eq!(record.current_claim.as_ref(), Some(&first.claim_id));
 
         // A successor moves the pointer, and the subject itself is unchanged.
         let second = create_with_identity(
@@ -3970,30 +4035,24 @@ mod tests {
             &random_uuid(),
             launch(),
             None,
-            Some((logical_id.clone(), logical_id.clone())),
+            Some((logical_id.clone(), first.claim_id.clone())),
             2,
         )
         .expect("successor attempt");
         let record = read_subject_record(&registry, &logical_id)
             .expect("read record")
             .expect("the subject still exists");
-        assert_eq!(
-            record.current_claim.as_deref(),
-            Some(second.claim_id.as_str())
-        );
+        assert_eq!(record.current_claim.as_ref(), Some(&second.claim_id));
 
         // An earlier attempt reporting late does not displace the current one.
-        let earlier = read(&registry, &first.claim_id)
+        let earlier = read_claim(&registry, &first.claim_id)
             .expect("read")
             .expect("attempt");
         note_attempt(&registry, &earlier).expect("note the earlier attempt");
         let record = read_subject_record(&registry, &logical_id)
             .expect("read record")
             .expect("subject");
-        assert_eq!(
-            record.current_claim.as_deref(),
-            Some(second.claim_id.as_str())
-        );
+        assert_eq!(record.current_claim.as_ref(), Some(&second.claim_id));
     }
 
     #[test]
@@ -4001,36 +4060,43 @@ mod tests {
         let scratch = Scratch::new("claim-facts");
         let registry = scratch.registry();
         let claim = create(&registry, SPAWN, launch(), None, 1).expect("claim");
-        let subject_id = claim.claim_id.clone();
+        let subject_id = claim.subject_id.clone();
 
         // The attempt's facts survive a daemon restart on the attempt itself.
         let reopened = scratch.registry();
-        let read_back = read(&reopened, &claim.claim_id)
+        let read_back = read_claim(&reopened, &claim.claim_id)
             .expect("read")
             .expect("claim");
         assert_eq!(read_back.process.registration_id, claim.registration_id);
-        assert_ne!(claim.registration_id, claim.claim_id);
-        let reserved =
-            crate::control_plane::registry::presence::current(&reopened, &claim.registration_id)
-                .expect("reservation read")
-                .expect("reservation");
+        assert_ne!(claim.registration_id.as_str(), claim.claim_id.as_str());
+        // A subject invented for a reservation is its own identity, not its claim.
+        assert_ne!(claim.subject_id.as_str(), claim.claim_id.as_str());
+        let reserved = crate::control_plane::registry::presence::current(
+            &reopened,
+            claim.registration_id.as_str(),
+        )
+        .expect("reservation read")
+        .expect("reservation");
         assert_eq!(
             reserved.standing,
             crate::control_plane::registry::presence::Standing::Reserved
         );
-        assert!(crate::control_plane::registry::presence::attachment(
-            &reopened, &claim.registration_id,
-        ).expect("authority read").is_none(), "a reservation grants no attachment authority");
+        assert!(
+            crate::control_plane::registry::presence::attachment(
+                &reopened,
+                claim.registration_id.as_str(),
+            )
+            .expect("authority read")
+            .is_none(),
+            "a reservation grants no attachment authority"
+        );
 
         let record = read_subject_record(&reopened, &subject_id)
             .expect("read record")
             .expect("subject");
-        assert_eq!(
-            record.current_claim.as_deref(),
-            Some(claim.claim_id.as_str())
-        );
-        let stored =
-            fs::read_to_string(subject_record_path(&reopened, &subject_id)).expect("record file");
+        assert_eq!(record.current_claim.as_ref(), Some(&claim.claim_id));
+        let stored = fs::read_to_string(subject_record_path(&reopened, subject_id.as_str()))
+            .expect("record file");
         for attempt_only in ["successor", "signalled_at", "exited_at", "pane_cleanup"] {
             assert!(
                 !stored.contains(attempt_only),
@@ -4044,7 +4110,7 @@ mod tests {
         let scratch = Scratch::new("claim-exclusive");
         let registry = scratch.registry();
         let first = create(&registry, SPAWN, launch(), None, 1).expect("first claim");
-        let subject_id = first.claim_id.clone();
+        let subject_id = first.subject_id.clone();
         let reserved = create_with_identity(
             &registry,
             &random_uuid(),
@@ -4069,10 +4135,7 @@ mod tests {
         let record = read_subject_record(&registry, &subject_id)
             .expect("read record")
             .expect("subject");
-        assert_eq!(
-            record.current_claim.as_deref(),
-            Some(reserved.claim_id.as_str())
-        );
+        assert_eq!(record.current_claim.as_ref(), Some(&reserved.claim_id));
     }
 
     #[test]
@@ -4097,7 +4160,7 @@ mod tests {
             .unwrap();
         assert_eq!(current.claim_id, first.claim_id);
         assert_eq!(
-            read(&reopened, &pending.claim_id)
+            read_claim(&reopened, &pending.claim_id)
                 .unwrap()
                 .unwrap()
                 .process
@@ -4120,15 +4183,15 @@ mod tests {
         let scratch = Scratch::new("claim-release");
         let registry = scratch.registry();
         let claim = create(&registry, SPAWN, launch(), None, 1).expect("claim");
-        let subject_id = claim.claim_id.clone();
-        let pending = read(&registry, &claim.claim_id)
+        let subject_id = claim.subject_id.clone();
+        let pending = read_claim(&registry, &claim.claim_id)
             .expect("read")
             .expect("claim");
         assert!(is_attached(&registry, &pending, 2).expect("attached"));
 
         release_attachment(&registry, &claim.claim_id, Some(&subject_id)).expect("release");
 
-        let attempt = read(&registry, &claim.claim_id)
+        let attempt = read_claim(&registry, &claim.claim_id)
             .expect("read")
             .expect("the attempt stays readable");
         assert_eq!(attempt.process.state, State::Pending);
@@ -4144,7 +4207,7 @@ mod tests {
         let scratch = Scratch::new("spent");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.claim_id.as_str();
+        let subject = &ticket.claim_id;
         capture(
             &registry,
             subject,
@@ -4203,13 +4266,15 @@ mod tests {
         );
         crate::control_plane::registry::presence::begin(
             &reopened,
-            &ticket.registration_id,
+            ticket.registration_id.as_str(),
             &random_uuid(),
             &session,
             None,
         )
         .expect("pending report");
-        let reserved = read(&reopened, subject).expect("read").expect("launch");
+        let reserved = read_claim(&reopened, subject)
+            .expect("read")
+            .expect("launch");
         assert!(
             is_attached(&reopened, &reserved, 4).expect("reservation held"),
             "an unverified report must not free the launch's reserved attachment"
@@ -4231,7 +4296,7 @@ mod tests {
         let scratch = Scratch::new("mismatch");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.claim_id.as_str();
+        let subject = &ticket.claim_id;
 
         let mut altered = started_as(&launch());
         altered
@@ -4249,7 +4314,9 @@ mod tests {
             ),
             Err(LAUNCH_MISMATCH.to_string())
         );
-        let still_pending = read(&registry, subject).expect("read").expect("subject");
+        let still_pending = read_claim(&registry, subject)
+            .expect("read")
+            .expect("subject");
         assert_eq!(still_pending.process.state, State::Pending);
         assert_eq!(
             still_pending.process.correlation.as_deref(),
@@ -4263,7 +4330,7 @@ mod tests {
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
         unscoped(&registry, &ticket);
-        let subject = ticket.claim_id.as_str();
+        let subject = &ticket.claim_id;
         let mut child = Child(Command::new("sleep").arg("300").spawn().expect("sleep"));
         let pid = child.0.id() as i32;
         let process = LocalProcfsVerifier
@@ -4305,7 +4372,7 @@ mod tests {
             Some(rustix::process::Signal::TERM.as_raw())
         );
         assert_eq!(
-            read(&registry, subject)
+            read_claim(&registry, subject)
                 .expect("read")
                 .expect("subject")
                 .process
@@ -4326,9 +4393,9 @@ mod tests {
 
     /// A captured child bound to the test's agent, which is what a pane's absence
     /// is evidence about.
-    fn bound_child(registry: &Registry) -> (String, Child) {
+    fn bound_child(registry: &Registry) -> (ClaimId, Child) {
         let (subject_id, child, process) = captured_child(registry);
-        let registration = read(registry, &subject_id)
+        let registration = read_claim(registry, &subject_id)
             .expect("read")
             .expect("launch")
             .process
@@ -4361,7 +4428,7 @@ mod tests {
             )
             .expect("absent")
         );
-        let pending = read(&registry, &subject_id)
+        let pending = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject")
             .process
@@ -4379,7 +4446,7 @@ mod tests {
             )
             .expect("present")
         );
-        let subject = read(&registry, &subject_id)
+        let subject = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject");
         assert!(
@@ -4403,7 +4470,7 @@ mod tests {
                     .expect("absent")
             );
         }
-        let subject = read(&registry, &subject_id)
+        let subject = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject");
         assert!(
@@ -4454,7 +4521,7 @@ mod tests {
             .expect("absent")
         );
 
-        let subject = read(&registry, &subject_id)
+        let subject = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject");
         assert!(
@@ -4490,7 +4557,7 @@ mod tests {
                 .expect("unavailable")
             );
         }
-        let subject = read(&registry, &subject_id)
+        let subject = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject");
         assert!(
@@ -4521,7 +4588,7 @@ mod tests {
             .expect("already ended")
         );
 
-        let subject = read(&registry, &subject_id)
+        let subject = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject");
         assert!(
@@ -4545,7 +4612,7 @@ mod tests {
                     .expect("absent")
             );
         }
-        let subject = read(&registry, &subject_id)
+        let subject = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject");
         assert!(subject.process.pane_absence.is_none());
@@ -4556,14 +4623,14 @@ mod tests {
     /// Most fixtures start a bare process, so what they exercise is the signal
     /// path: the launch they record never entered a scope, and nothing claims one.
     fn unscoped(registry: &Registry, ticket: &Ticket) {
-        let path = recipe_path(registry, &ticket.registration_id);
+        let path = recipe_path(registry, ticket.registration_id.as_str());
         let mut recipe: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("recipe")).expect("json");
         recipe.as_object_mut().expect("object").remove("scope");
         std::fs::write(&path, serde_json::to_vec(&recipe).expect("encode")).expect("rewrite");
     }
 
-    fn captured_child(registry: &Registry) -> (String, Child, ProcessIdentity) {
+    fn captured_child(registry: &Registry) -> (ClaimId, Child, ProcessIdentity) {
         let ticket = create(registry, SPAWN, launch(), None, 1).expect("subject");
         unscoped(registry, &ticket);
         // A sleep outside any scope: the fixture is about the signal path.
@@ -4594,19 +4661,21 @@ mod tests {
         // collected, expired, or never created. That is not evidence of an exit.
         let recipe = recipe_path(
             &registry,
-            &read_recorded(&registry, &subject)
+            read_recorded(&registry, &subject)
                 .expect("claim")
                 .process
-                .registration_id,
+                .registration_id
+                .as_str(),
         );
         let mut json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&recipe).expect("recipe")).expect("json");
         json["scope"] = serde_json::to_value(
             crate::managed_scope::Scope::for_registration(
-                &read_recorded(&registry, &subject)
+                read_recorded(&registry, &subject)
                     .expect("claim")
                     .process
-                    .registration_id,
+                    .registration_id
+                    .as_str(),
             )
             .expect("scope"),
         )
@@ -4627,7 +4696,9 @@ mod tests {
             "a scope that could not be read is never killed"
         );
         assert_eq!(cancelled.exit, Exit::Exited, "the fenced process ended");
-        let record = read(&registry, &subject).expect("read").expect("subject");
+        let record = read_claim(&registry, &subject)
+            .expect("read")
+            .expect("subject");
         assert!(record.process.exited_at.is_some(), "the exit was recorded");
         assert!(
             child.0.try_wait().expect("wait").is_some(),
@@ -4664,13 +4735,13 @@ mod tests {
         let scratch = Scratch::new("holder-alive");
         let registry = scratch.registry();
         let (subject_id, _child, _process) = captured_child(&registry);
-        let holder = read(&registry, &subject_id)
+        let holder = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject");
 
         assert!(!release_if_gone(&registry, &holder, &LocalProcfsVerifier, 3).expect("verify"));
         assert!(!release_if_gone(&registry, &holder, &Unreadable, 3).expect("verify"));
-        let held = read(&registry, &subject_id)
+        let held = read_claim(&registry, &subject_id)
             .expect("read")
             .expect("subject");
         assert!(
@@ -4685,9 +4756,13 @@ mod tests {
         let registry = scratch.registry();
 
         let (gone_id, _gone, _) = captured_child(&registry);
-        let holder = read(&registry, &gone_id).expect("read").expect("subject");
+        let holder = read_claim(&registry, &gone_id)
+            .expect("read")
+            .expect("subject");
         assert!(release_if_gone(&registry, &holder, &Gone, 3).expect("verify"));
-        let exited = read(&registry, &gone_id).expect("read").expect("subject");
+        let exited = read_claim(&registry, &gone_id)
+            .expect("read")
+            .expect("subject");
         assert!(exited.process.exited_at.is_some());
         assert!(
             exited.process.ended_externally_at.is_none(),
@@ -4695,10 +4770,12 @@ mod tests {
         );
 
         let (reused_id, _reused, _) = captured_child(&registry);
-        let holder = read(&registry, &reused_id).expect("read").expect("subject");
+        let holder = read_claim(&registry, &reused_id)
+            .expect("read")
+            .expect("subject");
         assert!(release_if_gone(&registry, &holder, &Reused, 4).expect("verify"));
         assert!(
-            read(&registry, &reused_id)
+            read_claim(&registry, &reused_id)
                 .expect("read")
                 .expect("subject")
                 .process
@@ -4721,7 +4798,9 @@ mod tests {
             sweep(&restarted, &LocalProcfsVerifier, None, 3),
             Ok((1, None))
         );
-        let recorded = read(&restarted, &subject).expect("read").expect("subject");
+        let recorded = read_claim(&restarted, &subject)
+            .expect("read")
+            .expect("subject");
         assert!(recorded.process.exited_at.is_some());
         assert!(
             recorded.process.signalled_at.is_none(),
@@ -4743,7 +4822,9 @@ mod tests {
             child.0.try_wait().expect("try_wait").is_none(),
             "still running"
         );
-        let kept = read(&registry, &subject).expect("read").expect("subject");
+        let kept = read_claim(&registry, &subject)
+            .expect("read")
+            .expect("subject");
         assert!(kept.process.exited_at.is_none());
         assert!(kept.process.signalled_at.is_none());
         let observation = kept.process.observation.expect("running observation");
@@ -4767,7 +4848,7 @@ mod tests {
         let registry = scratch.registry();
         let (subject, mut child, _) = captured_child(&registry);
         assert!(observe_exit(&registry, &subject, &Unreadable, 3).is_err());
-        let unknown = read(&registry, &subject).unwrap().unwrap();
+        let unknown = read_claim(&registry, &subject).unwrap().unwrap();
         assert_eq!(
             unknown.process.observation.unwrap().evidence,
             Evidence::Unavailable
@@ -4779,7 +4860,7 @@ mod tests {
             Ok(false)
         );
         assert_eq!(
-            read(&registry, &subject)
+            read_claim(&registry, &subject)
                 .unwrap()
                 .unwrap()
                 .process
@@ -4796,7 +4877,7 @@ mod tests {
         let scratch = Scratch::new("pane-cleanup");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.claim_id.as_str();
+        let subject = &ticket.claim_id;
 
         // A launch no cancel revoked is not cleaned up: its pane is still the
         // launch's, and only a cancel acts on it.
@@ -4820,7 +4901,9 @@ mod tests {
 
         // The outcome is replayed from the log, not read from a mutable file.
         let reopened = crate::control_plane::Registry::open(&scratch.0).expect("reopen");
-        let restored = read(&reopened, subject).expect("read").expect("subject");
+        let restored = read_claim(&reopened, subject)
+            .expect("read")
+            .expect("subject");
         assert_eq!(restored.process.pane_cleanup, Some(refused));
         assert_eq!(restored.process.state, State::Revoked);
     }
@@ -4867,7 +4950,7 @@ mod tests {
         assert!(observation.is_ok());
         assert!(child.0.try_wait().expect("wait child").is_some());
 
-        let subject = read(&registry, &subject_id)
+        let subject = read_claim(&registry, &subject_id)
             .expect("read terminal subject")
             .expect("subject");
         assert!(subject.process.exited_at.is_some());
@@ -4962,7 +5045,7 @@ mod tests {
                 exit: Exit::Unresolved,
             }
         );
-        let subject = read(&registry, &ticket.claim_id)
+        let subject = read_claim(&registry, &ticket.claim_id)
             .expect("read")
             .expect("subject");
         assert_eq!(subject.process.state, State::Pending);
@@ -4970,11 +5053,11 @@ mod tests {
 
     /// The executions a batch addresses, as a place's placements name them: the
     /// process incarnation, not the attempt it belongs to.
-    fn targets(registry: &Registry, claims: &[String]) -> Vec<ExecutionRef> {
+    fn targets(registry: &Registry, claims: &[ClaimId]) -> Vec<ExecutionRef> {
         claims
             .iter()
             .map(|claim| {
-                let process = read(registry, claim)
+                let process = read_claim(registry, claim)
                     .expect("read")
                     .expect("subject")
                     .process;
@@ -5016,7 +5099,9 @@ mod tests {
             "both executions exited"
         );
         for subject_id in &subjects {
-            let subject = read(&registry, subject_id).expect("read").expect("subject");
+            let subject = read_claim(&registry, subject_id)
+                .expect("read")
+                .expect("subject");
             assert!(subject.process.exited_at.is_some(), "an exit was recorded");
         }
         for child in &mut children {
@@ -5067,10 +5152,10 @@ mod tests {
                 .survivors()
                 .map(|ended| ended.registration_id.clone())
                 .collect::<Vec<_>>(),
-            vec![ticket.registration_id.clone()]
+            vec![ticket.registration_id.to_string()]
         );
         assert!(cancelled.ended[0].end != ExecutionEnd::Exited);
-        let subject = read(&registry, &ticket.claim_id)
+        let subject = read_claim(&registry, &ticket.claim_id)
             .expect("read")
             .expect("subject");
         assert!(subject.process.exited_at.is_none(), "no exit was recorded");
@@ -5083,7 +5168,7 @@ mod tests {
         let scratch = Scratch::new("stop-reused");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.claim_id.as_str();
+        let subject = &ticket.claim_id;
         let mut child = Child(Command::new("sleep").arg("300").spawn().expect("sleep"));
         let pid = child.0.id() as i32;
         let live = LocalProcfsVerifier
@@ -5124,7 +5209,7 @@ mod tests {
         let scratch = Scratch::new("stop-unreadable");
         let registry = scratch.registry();
         let ticket = create(&registry, SPAWN, launch(), None, 1).expect("subject");
-        let subject = ticket.claim_id.as_str();
+        let subject = &ticket.claim_id;
         capture(
             &registry,
             subject,
@@ -5146,7 +5231,9 @@ mod tests {
                 exit: Exit::Unresolved,
             }
         );
-        let record = read(&registry, subject).expect("read").expect("subject");
+        let record = read_claim(&registry, subject)
+            .expect("read")
+            .expect("subject");
         assert_eq!(record.process.signalled_at, None);
         assert_eq!(record.process.exited_at, None);
     }

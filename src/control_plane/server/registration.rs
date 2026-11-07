@@ -47,6 +47,8 @@ pub(super) fn presence_request(
             Ok(_) => return Err("process birth identity is absent or mismatched".into()),
         }
         let registration = presence::registration(&registry, &report, now)?;
+        let registration_id =
+            RegistrationId::required(&registration.registration_id, "registration_id")?;
         let mut claim = presence::begin(
             &registry,
             &registration.registration_id,
@@ -60,21 +62,13 @@ pub(super) fn presence_request(
         if process_observation.is_err() {
             return Ok(claim);
         }
-        let mut attachment = subjects::attachment(
-            &registry,
-            &registration.registration_id,
-            &report.session_id,
-            now,
-        )?;
+        let mut attachment =
+            subjects::attachment(&registry, &registration_id, &report.session_id, now)?;
         if let subjects::Attachment::Other(holder) = &attachment
             && subjects::release_if_gone(&registry, holder, verifier.as_ref(), now)?
         {
-            attachment = subjects::attachment(
-                &registry,
-                &registration.registration_id,
-                &report.session_id,
-                now,
-            )?;
+            attachment =
+                subjects::attachment(&registry, &registration_id, &report.session_id, now)?;
         }
         if matches!(attachment, subjects::Attachment::Other(_)) {
             claim.standing = Standing::Duplicate;
@@ -122,18 +116,8 @@ pub(super) fn presence_request(
             Some(report.session_id.clone()),
             now,
         )?;
-        subjects::record_launch_session(
-            &registry,
-            &registration.registration_id,
-            &report.session_id,
-            now,
-        )?;
-        attachment = subjects::attachment(
-            &registry,
-            &registration.registration_id,
-            &report.session_id,
-            now,
-        )?;
+        subjects::record_launch_session(&registry, &registration_id, &report.session_id, now)?;
+        attachment = subjects::attachment(&registry, &registration_id, &report.session_id, now)?;
         let subject = match attachment {
             subjects::Attachment::Other(_) => {
                 claim.standing = Standing::Duplicate;
@@ -141,7 +125,9 @@ pub(super) fn presence_request(
                 presence::save(&registry, &claim)?;
                 return Ok(claim);
             }
-            subjects::Attachment::Own(subject) if subject.claim_id == report.claim_id => *subject,
+            subjects::Attachment::Own(subject) if subject.claim_id.as_str() == report.claim_id => {
+                *subject
+            }
             subjects::Attachment::Own(_) | subjects::Attachment::Free => {
                 let id = record_enrollment(
                     &registry,
@@ -154,18 +140,18 @@ pub(super) fn presence_request(
                     &report.claim_id,
                     now,
                 )?;
-                subjects::read(&registry, &id)?.ok_or("enrolled subject is missing")?
+                subjects::read_claim(&registry, &id)?.ok_or("enrolled subject is missing")?
             }
         };
         let subject_id = subject.subject_id;
         if report
             .subject_id
             .as_deref()
-            .is_some_and(|known| known != subject_id)
+            .is_some_and(|known| known != subject_id.as_str())
         {
             return Err("reported subject does not match Radar's stored claim".into());
         }
-        claim.subject_id = Some(subject_id);
+        claim.subject_id = Some(subject_id.to_string());
         claim.standing = Standing::Granted;
         presence::save(&registry, &claim)?;
         if registry
@@ -283,12 +269,16 @@ pub(super) fn registry_request(
                     // on its bound subject, so that subject can be attached. A failure
                     // leaves the subject unattached, which is reported, not retried here.
                     if let Some(session) = publish.context.session.as_deref()
-                        && let Err(error) = subjects::record_launch_session(
-                            &core.registry,
-                            &publish.registration_id,
-                            session,
-                            now_ms,
-                        )
+                        && let Err(error) =
+                            RegistrationId::required(&publish.registration_id, "registration_id")
+                                .and_then(|registration_id| {
+                                    subjects::record_launch_session(
+                                        &core.registry,
+                                        &registration_id,
+                                        session,
+                                        now_ms,
+                                    )
+                                })
                     {
                         tracing::warn!(%error, "could not record a launched session");
                     }
@@ -405,7 +395,10 @@ pub(super) fn registry_request(
             let inventory = observed_inventory(core);
             let evidence =
                 crate::control_plane::registry_read::location_evidence(inventory.as_ref(), &stored);
-            let exit = subjects::spawn_exit(&locked(core).registry, stored.claim_id.as_deref());
+            let exit = subjects::spawn_exit(
+                &locked(core).registry,
+                stored.claim_id.as_deref().and_then(ClaimId::parse).as_ref(),
+            );
             respond(
                 &request.id,
                 Ok(answers::Spawn {
@@ -428,7 +421,11 @@ pub(super) fn registry_request(
                 let core = locked(core);
                 (Arc::clone(&core.registry), Arc::clone(&core.verifier))
             };
-            let current = match subjects::current_attachment(&registry, &params.subject_id) {
+            let subject_id = match id_param(&params.subject_id, "subject_id", SubjectId::required) {
+                Ok(subject_id) => subject_id,
+                Err(refusal) => return Response::refused(&request.id, &refusal),
+            };
+            let current = match subjects::current_attachment(&registry, &subject_id) {
                 Ok(Some(subject)) => subject,
                 Ok(None) => {
                     return Response::refused(
@@ -448,7 +445,7 @@ pub(super) fn registry_request(
             {
                 return registry_error(request, error);
             }
-            match subjects::current_attachment(&registry, &params.subject_id) {
+            match subjects::current_attachment(&registry, &subject_id) {
                 Ok(Some(subject)) => respond(
                     &request.id,
                     Ok(answers::Subject {
@@ -511,7 +508,7 @@ pub(super) fn registry_request(
                 Err(error) => return registry_error(request, error),
             };
             let has_more = read.len() > limit;
-            let page: Vec<(String, String)> = read
+            let page: Vec<(SubjectId, ClaimId)> = read
                 .iter()
                 .take(limit)
                 .map(|subject| (subject.subject_id.clone(), subject.claim_id.clone()))
@@ -531,7 +528,7 @@ pub(super) fn registry_request(
                 }
             }
             let next_after = if has_more {
-                page.last().map(|(subject, _)| subject.clone())
+                page.last().map(|(subject, _)| subject.to_string())
             } else {
                 None
             };
@@ -832,7 +829,10 @@ pub(super) fn registry_request(
                         inventory.as_ref(),
                         edge,
                     ),
-                    subjects::spawn_exit(&registry, edge.claim_id.as_deref()),
+                    subjects::spawn_exit(
+                        &registry,
+                        edge.claim_id.as_deref().and_then(ClaimId::parse).as_ref(),
+                    ),
                 );
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
                 if used + size > MAX_LIST_RESPONSE_BYTES {

@@ -77,9 +77,12 @@ fn a_process_can_be_recovered_without_fabricating_a_claim() {
         "process identity and private recipe survive replay without a claim"
     );
     assert!(
-        crate::control_plane::registry::presence::attachment(&restored, &process.registration_id,)
-            .unwrap()
-            .is_none()
+        crate::control_plane::registry::presence::attachment(
+            &restored,
+            process.registration_id.as_str(),
+        )
+        .unwrap()
+        .is_none()
     );
 }
 
@@ -91,7 +94,7 @@ fn attachment_views_share_process_evidence_across_replay() {
     {
         let mut log = registry.events.lock().unwrap();
         log.append(
-            &ticket.claim_id,
+            ticket.claim_id.as_str(),
             "2026-01-01T00:00:00.000Z",
             Source::Bootstrap,
             Transition::Captured(ProcessIdentity {
@@ -101,7 +104,7 @@ fn attachment_views_share_process_evidence_across_replay() {
             }),
         )
         .unwrap();
-        let before_signal = log.facts(&ticket.claim_id).unwrap();
+        let before_signal = log.facts(ticket.claim_id.as_str()).unwrap();
         let next_claim = random_uuid();
         log.append(
             &next_claim,
@@ -118,7 +121,7 @@ fn attachment_views_share_process_evidence_across_replay() {
         )
         .unwrap();
         assert!(
-            log.facts(&ticket.claim_id)
+            log.facts(ticket.claim_id.as_str())
                 .unwrap()
                 .execution
                 .signalled_at
@@ -153,14 +156,14 @@ fn replay_restores_revocation_without_credentials_in_events() {
     let registry = fixture.registry();
     let ticket = create(&registry);
     lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).unwrap();
-    let before = lifecycle::read(&registry, &ticket.claim_id)
+    let before = lifecycle::read_claim(&registry, &ticket.claim_id)
         .unwrap()
         .unwrap();
     assert_eq!(before.process.state, State::Revoked);
     assert!(before.process.correlation.is_none());
     drop(registry);
     let restored = fixture.registry();
-    let after = lifecycle::read(&restored, &ticket.claim_id)
+    let after = lifecycle::read_claim(&restored, &ticket.claim_id)
         .unwrap()
         .unwrap();
     assert!(
@@ -196,7 +199,7 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
     fs::rename(&directory, &displaced).unwrap();
     assert!(lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).is_err());
     assert_eq!(
-        lifecycle::read(&registry, &ticket.claim_id)
+        lifecycle::read_claim(&registry, &ticket.claim_id)
             .unwrap()
             .unwrap()
             .process
@@ -211,7 +214,7 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
     drop(registry);
     let restored = fixture.registry();
     assert_eq!(
-        lifecycle::read(&restored, &ticket.claim_id)
+        lifecycle::read_claim(&restored, &ticket.claim_id)
             .unwrap()
             .unwrap()
             .process
@@ -281,7 +284,7 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
     lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).unwrap();
     assert!(store.events().is_err());
     assert_eq!(
-        lifecycle::read(&registry, &ticket.claim_id)
+        lifecycle::read_claim(&registry, &ticket.claim_id)
             .unwrap()
             .unwrap()
             .process
@@ -320,7 +323,7 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
         pointers
             .iter()
             .filter(|event| event.kind.starts_with("lifecycle."))
-            .all(|event| event.subject_id.as_deref() == Some(&ticket.subject_id))
+            .all(|event| event.subject_id.as_deref() == Some(ticket.subject_id.as_str()))
     );
     assert_eq!(store.events().unwrap(), pointers);
     drop(store);

@@ -2,6 +2,7 @@
 
 use super::publication::write_atomic;
 use super::{Registry, RegistryLocation, read_record_file, validate_registration_id};
+use crate::identity::{ClaimId, RegistrationId, SubjectId};
 use serde::{Deserialize, Serialize};
 
 const MAX_BYTES: usize = 64 * 1024;
@@ -71,7 +72,11 @@ pub fn registration(
             super::spawn::heal_binding(registry, &existing.request, now_ms)?;
             return Ok(existing);
         }
-        if crate::control_plane::lifecycle::read_process(registry, id)?.is_some_and(|process| {
+        if crate::control_plane::lifecycle::read_process(
+            registry,
+            &RegistrationId::required(id, "registration_id")?,
+        )?
+        .is_some_and(|process| {
             process.kind == crate::control_plane::lifecycle::ProcessKind::Command
         }) {
             return Err("a managed command is not an agent and cannot be attached".into());
@@ -187,8 +192,13 @@ pub fn attachment(
         return Ok(None);
     };
     if claim.standing != Standing::Granted
-        || crate::control_plane::lifecycle::read_subject_record(registry, &subject_id)?
-            .is_none_or(|record| record.current_claim.as_deref() != Some(claim.claim_id.as_str()))
+        || crate::control_plane::lifecycle::read_subject_record(
+            registry,
+            &SubjectId::required(&subject_id, "subject_id")?,
+        )?
+        .is_none_or(|record| {
+            record.current_claim.as_ref().map(ClaimId::as_str) != Some(claim.claim_id.as_str())
+        })
     {
         return Ok(None);
     }
@@ -248,8 +258,13 @@ pub fn begin(
     {
         crate::control_plane::lifecycle::release_attachment(
             registry,
-            &previous.claim_id,
-            previous.subject_id.as_deref(),
+            &ClaimId::required(&previous.claim_id, "claim_id")?,
+            previous
+                .subject_id
+                .as_deref()
+                .map(|id| SubjectId::required(id, "subject_id"))
+                .transpose()?
+                .as_ref(),
         )?;
         previous.standing = Standing::Released;
         previous.subject_id = None;
@@ -317,8 +332,13 @@ pub fn release(
     }
     crate::control_plane::lifecycle::release_attachment(
         registry,
-        claim_id,
-        claim.subject_id.as_deref(),
+        &ClaimId::required(claim_id, "claim_id")?,
+        claim
+            .subject_id
+            .as_deref()
+            .map(|id| SubjectId::required(id, "subject_id"))
+            .transpose()?
+            .as_ref(),
     )?;
     claim.standing = Standing::Released;
     claim.subject_id = None;
