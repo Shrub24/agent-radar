@@ -2,7 +2,7 @@
 
 ## 1. Types and lifecycle domain
 
-- [ ] 1.1 Add `SubjectId`, `ClaimId` and `RegistrationId` with transparent serde, string schemas, `parse`, `random`, `as_str` and `Display`, and no conversions between them. Test that a non-canonical string is refused on parse and on deserialize, and that serialization is the bare string.
+- [x] 1.1 Add `SubjectId`, `ClaimId` and `RegistrationId` with transparent serde, string schemas, `parse`, `random`, `as_str` and `Display`, and no conversions between them. Test that a non-canonical string is refused on parse and on deserialize, and that serialization is the bare string.
 - [ ] 1.2 Type the lifecycle records and leaf operations. Gate green; schemas and fixtures unchanged.
 
 ## 2. Registry and events

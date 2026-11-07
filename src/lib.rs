@@ -10,6 +10,7 @@ pub mod config;
 pub mod content;
 pub mod control_plane;
 pub mod focus;
+pub mod identity;
 pub mod lifecycle;
 pub mod log;
 pub mod managed_scope;
@@ -48,8 +49,8 @@ pub use control_plane::{
 pub use lifecycle::{CloseRequest, Containment};
 pub use model::{
     AgentObservation, BinaryFreshness, BinaryIdentity, BinaryUnknown, FleetObservation,
-    ForegroundEvidence, Lineage, LocalFacts, Location, Pane, RuntimeStatus, SessionIdentity,
-    SessionUuid, Tab, TerminalMode, Workspace,
+    ForegroundEvidence, LocalFacts, Location, Pane, RuntimeStatus, SessionIdentity, SessionUuid,
+    Tab, TerminalMode, Workspace,
 };
 pub use observation::{ObservationState, RetainedAgent, RetentionBasis, SourceFreshness};
 pub use runtime::{CloseOutcome, CloseTarget, FocusOutcome, RuntimeProvider, Target};

@@ -5,11 +5,11 @@
 //! same-workspace owners (any tab), and at most one ordinary-pane row per
 //! pane. Tabs stay location detail on the rows rather than a tree level.
 //!
-//! Ownership fallbacks (spec: *Workspace-grouped fleet tree*): links that are
-//! missing, ambiguous (two agents claiming one session UUID), cyclic, or
-//! resolved outside the workspace leave the affected agent visible at its
-//! physical workspace root instead of nesting unsafely. Lineage is consulted
-//! here only as already-decoded UUIDs — presentation never sees tokens.
+//! Ownership fallbacks (spec: *Workspace-grouped fleet tree*): a spawn edge that
+//! is missing, ambiguous (two rows answering to one registration), cyclic, or
+//! resolved outside the workspace leaves the affected agent visible at its
+//! physical workspace root instead of nesting unsafely. Presentation reads the
+//! projection's own rows and never a raw token.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

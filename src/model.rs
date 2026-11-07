@@ -115,17 +115,6 @@ pub enum SessionIdentity {
     },
 }
 
-/// Explicit ownership lineage from `pi_herdsman_session` /
-/// `pi_herdsman_parent_session` UUID metadata.
-///
-/// Used only for ownership joins (worker → owner). Lineage is never used as
-/// session identity, and absent or malformed tokens yield no lineage at all.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct Lineage {
-    pub session: SessionUuid,
-    pub parent: Option<SessionUuid>,
-}
-
 /// Runtime lifecycle exactly as the source reports it.
 ///
 /// This is not a semantic control state: `Idle` says nothing about
