@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
-use crate::identity::{ClaimId, RegistrationId, SubjectId};
+use crate::identity::{RegistrationId, SubjectId};
 use crate::model::{ProcessIdentity, SessionUuid};
 
 /// Missing registry authority is distinct from a rejected write.
@@ -419,7 +419,7 @@ pub struct Registry {
     admission: Mutex<()>,
     pub(crate) presence: Mutex<()>,
     journal: std::sync::Mutex<Option<crate::control_plane::store::Store>>,
-    pub(crate) observing: Mutex<std::collections::HashSet<ClaimId>>,
+    pub(crate) observing: Mutex<std::collections::HashSet<RegistrationId>>,
     pub(crate) events: std::sync::Arc<Mutex<crate::control_plane::events::Log>>,
 }
 
@@ -693,8 +693,13 @@ impl Registry {
         spawn::record_launched(self, request_id, launched)
     }
 
-    pub fn record_spawn_granted(&self, request_id: &str, now_ms: i64) -> Result<(), String> {
-        spawn::record_granted(self, request_id, now_ms)
+    pub fn record_spawn_granted(
+        &self,
+        request_id: &str,
+        subject_id: &SubjectId,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        spawn::record_granted(self, request_id, subject_id, now_ms)
     }
 
     pub fn record_spawn_withdrawn(
@@ -707,13 +712,12 @@ impl Registry {
     }
 
     /// Records the launch subject a tracked spawn's edge belongs to.
-    pub fn attach_subject(
+    pub fn attach_execution(
         &self,
         request_id: &str,
-        claim_id: &ClaimId,
         registration_id: &RegistrationId,
     ) -> Result<SpawnEdge, String> {
-        spawn::attach_subject(self, request_id, claim_id, registration_id)
+        spawn::attach_execution(self, request_id, registration_id)
     }
 
     /// The opaque serving epoch of this registry instance.

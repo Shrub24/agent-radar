@@ -303,7 +303,7 @@ pub(super) fn dead_pane_evidence(
     }
     match bounded_exit_observation(backend, pane_id, stopping, budget) {
         Ok(PaneExitObservation::Exited { .. }) => {
-            DeadPane::Cleanup(recorded_exit(registry, edge.claim_id.as_ref()))
+            DeadPane::Cleanup(recorded_exit(registry, edge.registration_id.as_ref()))
         }
         // A pane reported running, undetermined, or unreadable is not a pane whose
         // command has exited: the live refusal stands.
@@ -315,9 +315,9 @@ pub(super) fn dead_pane_evidence(
 
 fn recorded_exit(
     registry: &Registry,
-    claim_id: Option<&ClaimId>,
+    registration_id: Option<&RegistrationId>,
 ) -> Option<registry::SpawnExitObservation> {
-    match subjects::spawn_exit(registry, claim_id) {
+    match subjects::spawn_exit(registry, registration_id) {
         registry::PublicSpawnExitObservation::Exited {
             code: None,
             signal: None,
@@ -449,7 +449,7 @@ pub(super) enum CleanupIntent {
 pub(super) fn cleanup_launch_pane(
     core: &Arc<Mutex<Core>>,
     backend: &Arc<dyn RuntimeProvider>,
-    key: &ClaimId,
+    key: &crate::identity::RegistrationId,
     intent: CleanupIntent,
     stopping: &Arc<AtomicBool>,
     budget: &Arc<VerificationBudget>,
@@ -460,8 +460,14 @@ pub(super) fn cleanup_launch_pane(
         let core = locked(core);
         (Arc::clone(&core.registry), Arc::clone(&core.verifier))
     };
-    let claim = match subjects::read_claim(&registry, key) {
-        Ok(Some(claim)) => claim,
+    let claim = match subjects::read_process(&registry, key) {
+        Ok(Some(execution)) => subjects::Claim {
+            claim_id: crate::identity::ClaimId::random(),
+            subject_id: crate::identity::SubjectId::random(),
+            managed: execution.managed.clone(),
+            session: None,
+            process: execution,
+        },
         Ok(None) => return None,
         // A record that cannot be read is not an absence: nothing is dispatched
         // on evidence this daemon could not check, and the reason says so.

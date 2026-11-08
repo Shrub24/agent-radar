@@ -695,18 +695,39 @@ fn published(
         .expect("a channel")
 }
 
+/// A session UUID for a fixture.
+fn uuid_like() -> String {
+    agent_radar::control_plane::store::random_uuid()
+}
+
 /// Records one durable subject, which is what an owner assignment names.
 fn recorded_subject(registry: &Registry) -> String {
-    use agent_radar::control_plane::lifecycle::{self, LaunchContext};
+    use agent_radar::control_plane::lifecycle::LaunchContext;
     let launch = LaunchContext {
         executable: "/bin/true".into(),
         argv: Vec::new(),
         cwd: None,
         env: BTreeMap::new(),
     };
-    let ticket = lifecycle::create(registry, &random_uuid(), launch, None, 1_000)
-        .expect("a recorded subject");
-    ticket.subject_id.to_string()
+    let claim = agent_radar::control_plane::lifecycle::enroll_subject(
+        registry,
+        &agent_radar::identity::ClaimId::random(),
+        &agent_radar::identity::RegistrationId::random(),
+        &ProcessIdentity {
+            pid: 7,
+            boot_id: "test-boot".into(),
+            start_ticks: 1,
+        },
+        &uuid_like(),
+        launch,
+        1_000,
+    )
+    .expect("an enrolled subject");
+    agent_radar::control_plane::lifecycle::read_claim(registry, &claim)
+        .expect("read the enrollment")
+        .expect("the subject is recorded")
+        .subject_id
+        .to_string()
 }
 
 #[test]

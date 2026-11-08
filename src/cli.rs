@@ -21,7 +21,7 @@ else `~/.config/radar/config.toml`. Radar draws without one.";
 /// The crate version and the control-plane wire revision this build speaks. The
 /// revision is the compatibility contract pi-radar checks; the version is for
 /// people. A test pins the literal to [`crate::control_plane::ops::PROTOCOL_REVISION`].
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (wire 17)");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (wire 18)");
 
 /// Everything Radar can be asked to do.
 #[derive(Debug, Parser)]
@@ -114,9 +114,9 @@ pub enum Invocation {
         /// The daemon's control socket.
         #[arg(long)]
         socket: String,
-        /// The subject this launch was created for.
+        /// The execution this wake reports on.
         #[arg(long)]
-        subject: String,
+        execution: String,
         /// The launching process, as `pid:start_ticks:boot_id`.
         #[arg(long)]
         server: String,
@@ -252,7 +252,7 @@ mod tests {
             crate::control_plane::lifecycle::WAKE_COMMAND,
             "--socket",
             "/run/user/1000/agent-radar/control.sock",
-            "--subject",
+            "--execution",
             "6b1f3d0e-0000-4000-8000-000000000000",
             "--server",
             "4242:991122:0f3d",
@@ -260,14 +260,14 @@ mod tests {
         .expect("a generated wake invocation parses");
         let Some(Invocation::LifecycleWake {
             socket,
-            subject,
+            execution,
             server,
         }) = cli.invocation
         else {
             panic!("not a wake invocation");
         };
         assert_eq!(socket, "/run/user/1000/agent-radar/control.sock");
-        assert_eq!(subject, "6b1f3d0e-0000-4000-8000-000000000000");
+        assert_eq!(execution, "6b1f3d0e-0000-4000-8000-000000000000");
         assert_eq!(server, "4242:991122:0f3d");
     }
 

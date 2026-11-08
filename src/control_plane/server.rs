@@ -1098,7 +1098,7 @@ fn spawn_answer(request: &Request, reply: Reply, core: &Arc<Mutex<Core>>) -> Rep
     let registry = Arc::clone(&locked(core).registry);
     Ok(match registry.spawn_edge(&request.id) {
         Ok(Some(edge)) => {
-            let exit = subjects::spawn_exit(&registry, edge.claim_id.as_ref());
+            let exit = subjects::spawn_exit(&registry, edge.registration_id.as_ref());
             answer.with_spawn(edge.public(exit))
         }
         _ => answer,
@@ -1290,9 +1290,8 @@ mod tests {
             .create(&root)
             .expect("scratch root");
         let registry = Registry::open(&root).expect("registry");
-        let claim = crate::control_plane::lifecycle::create(
+        let claim = crate::control_plane::lifecycle::reserved_ticket(
             &registry,
-            "01a10c77-8a6b-7035-8a0e-b1fa607bb507",
             crate::control_plane::lifecycle::LaunchContext {
                 executable: "/bin/true".into(),
                 argv: Vec::new(),
@@ -1301,33 +1300,41 @@ mod tests {
             },
             None,
             1,
-        )
-        .expect("claim");
-        let missing = json!({"subject_id": claim.subject_id});
-        assert!(serde_json::from_value::<SubjectParams>(missing.clone()).is_err());
+        );
+        let subject_id = claim.subject_id.clone().expect("a subject");
+        let reserved = claim.claim_id.clone().expect("a claim");
+        let missing = json!({"subject_id": subject_id});
+        assert!(
+            serde_json::from_value::<SubjectParams>(missing.clone()).is_ok(),
+            "a claim is a fence a caller may add, not a field it must guess"
+        );
         let named = serde_json::from_value::<RestartParams>(missing).expect("shape");
         assert!(
             named.parent_launch().is_err(),
             "a restart must be fenced or owned"
         );
         let stale = SubjectParams {
-            subject_id: Some(claim.subject_id.clone()),
-            claim_id: ClaimId::random(),
+            subject_id: Some(subject_id.clone()),
+            claim_id: Some(ClaimId::random()),
             spawn_request_id: None,
         };
-        let refusal = cancel_target(&registry, &stale).expect_err("a stale claim is refused");
+        let Err(refusal) = cancel_target(&registry, &stale) else {
+            panic!("a stale claim is refused");
+        };
         assert!(refusal.message.contains("not current"), "{refusal:?}");
         let current = SubjectParams {
-            subject_id: Some(claim.subject_id.clone()),
-            claim_id: claim.claim_id.clone(),
+            subject_id: Some(subject_id),
+            claim_id: Some(reserved.clone()),
             spawn_request_id: None,
         };
+        let (execution, claim, _) =
+            cancel_target(&registry, &current).expect("the current claim is admitted");
+        let claim = claim.expect("the recorded attachment");
         assert_eq!(
-            cancel_target(&registry, &current)
-                .expect("the current claim is admitted")
-                .0,
-            claim.claim_id
+            claim.claim_id, reserved,
+            "the fence names the current claim"
         );
+        assert_eq!(execution, claim.process.registration_id);
         let _ = std::fs::remove_dir_all(&root);
     }
 

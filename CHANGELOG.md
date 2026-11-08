@@ -2,7 +2,15 @@
 
 Radar is alpha: breaking changes are expected and bump the minor version. The wire revision (`radar --version` prints it) is the compatibility contract with pi-radar; the version is for people.
 
-## Radar 0.11.0
+## Radar 0.12.0
+
+- **Breaking (lifecycle):** a launch reserves an execution and nothing else. An execution is identified by its registration from the moment it is reserved; the process identity is recorded when it is verified, and a claim with its subject attaches only when a session reports presence. `L`, container recipes and `spawn.create` no longer mint a subject or a claim, and the claimed "reserved subject" row for a launch in flight is gone.
+- Restart is unchanged from the operator's side: the subject already exists, so restart reserves its successor claim up front and attaches it to that subject.
+- **Breaking (library):** `lifecycle::create` and `lifecycle::create_with_identity` are deleted; `create_with_intent` is the one constructor and takes an optional successor `(subject, claim)`.
+- Claiming (`launch.claim`), capture, the pane-death wake, withdrawal, pane cleanup and the sweeper cursor are keyed on the registration, and the spawned child carries `PI_RADAR_LAUNCH_EXECUTION` instead of `PI_RADAR_LAUNCH_CLAIM`.
+- The spawn edge is keyed on the child's registration and binds the child's subject at grant. A subject row publishes the execution its claim attaches, so a spawn edge joins a subject on the execution.
+- **Breaking:** a registration identifies one process incarnation whether or not its launch is bound. Fencing a bound launch with a different process identity is refused instead of accepted.
+- Wire revision 18, paired with pi-radar 0.16.0. The wire revision moves because the spawn binding and the subject row carry the execution id. Earlier launch records are refused at startup; `radar reset` clears them.
 
 - **Breaking (library):** APIs distinguish subject, claim and registration IDs with validated types; their JSON representation and schemas remain strings.
 - The paired client release is pi-radar 0.15.0, requiring exactly daemon wire revision 17.

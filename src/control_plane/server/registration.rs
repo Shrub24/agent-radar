@@ -146,14 +146,14 @@ pub(super) fn presence_request(
         {
             return Err("reported subject does not match Radar's stored claim".into());
         }
-        claim.subject_id = Some(subject_id);
+        claim.subject_id = Some(subject_id.clone());
         claim.standing = Standing::Granted;
         presence::save(&registry, &claim)?;
         if registry
             .spawn_edge(&subject.process.spawn_request_id)?
             .is_some()
         {
-            registry.record_spawn_granted(&subject.process.spawn_request_id, now)?;
+            registry.record_spawn_granted(&subject.process.spawn_request_id, &subject_id, now)?;
         }
         Ok(claim)
     })();
@@ -384,7 +384,8 @@ pub(super) fn registry_request(
             let inventory = observed_inventory(core);
             let evidence =
                 crate::control_plane::registry_read::location_evidence(inventory.as_ref(), &stored);
-            let exit = subjects::spawn_exit(&locked(core).registry, stored.claim_id.as_ref());
+            let exit =
+                subjects::spawn_exit(&locked(core).registry, stored.registration_id.as_ref());
             respond(
                 &request.id,
                 Ok(answers::Spawn {
@@ -417,9 +418,12 @@ pub(super) fn registry_request(
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as i64);
-            if let Err(error) =
-                subjects::observe_exit(&registry, &current.claim_id, verifier.as_ref(), now)
-            {
+            if let Err(error) = subjects::observe_exit(
+                &registry,
+                &current.process.registration_id,
+                verifier.as_ref(),
+                now,
+            ) {
                 return registry_error(request, error);
             }
             match subjects::current_attachment(&registry, subject_id) {
@@ -485,16 +489,21 @@ pub(super) fn registry_request(
                 Err(error) => return registry_error(request, error),
             };
             let has_more = read.len() > limit;
-            let page: Vec<(SubjectId, ClaimId)> = read
+            let page: Vec<(SubjectId, RegistrationId)> = read
                 .iter()
                 .take(limit)
-                .map(|subject| (subject.subject_id.clone(), subject.claim_id.clone()))
+                .map(|subject| {
+                    (
+                        subject.subject_id.clone(),
+                        subject.process.registration_id.clone(),
+                    )
+                })
                 .collect();
             let now = unix_millis();
             let mut views = Vec::with_capacity(page.len());
-            for (subject_id, claim_id) in &page {
+            for (subject_id, registration_id) in &page {
                 if let Err(error) =
-                    subjects::observe_exit(&registry, claim_id, verifier.as_ref(), now)
+                    subjects::observe_exit(&registry, registration_id, verifier.as_ref(), now)
                 {
                     return registry_error(request, error);
                 }
@@ -806,7 +815,7 @@ pub(super) fn registry_request(
                         inventory.as_ref(),
                         edge,
                     ),
-                    subjects::spawn_exit(&registry, edge.claim_id.as_ref()),
+                    subjects::spawn_exit(&registry, edge.registration_id.as_ref()),
                 );
                 let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
                 if used + size > MAX_LIST_RESPONSE_BYTES {

@@ -1015,7 +1015,7 @@ pub trait RuntimeProvider: Send + Sync {
     /// by [`RuntimeProvider::remove_exit_wake`] once the exit is recorded.
     fn install_exit_wake(
         &self,
-        _subject_id: &str,
+        _registration_id: &str,
         _command: &str,
         _cancel: &AtomicBool,
     ) -> Result<(), String> {
@@ -1023,7 +1023,7 @@ pub trait RuntimeProvider: Send + Sync {
     }
 
     /// Removes only the wake installed for `subject_id`, leaving every other hook.
-    fn remove_exit_wake(&self, _subject_id: &str, _cancel: &AtomicBool) -> Result<(), String> {
+    fn remove_exit_wake(&self, _registration_id: &str, _cancel: &AtomicBool) -> Result<(), String> {
         Ok(())
     }
 
@@ -1155,15 +1155,15 @@ impl<T: RuntimeProvider + ?Sized> RuntimeProvider for Arc<T> {
 
     fn install_exit_wake(
         &self,
-        subject_id: &str,
+        registration_id: &str,
         command: &str,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        (**self).install_exit_wake(subject_id, command, cancel)
+        (**self).install_exit_wake(registration_id, command, cancel)
     }
 
-    fn remove_exit_wake(&self, subject_id: &str, cancel: &AtomicBool) -> Result<(), String> {
-        (**self).remove_exit_wake(subject_id, cancel)
+    fn remove_exit_wake(&self, registration_id: &str, cancel: &AtomicBool) -> Result<(), String> {
+        (**self).remove_exit_wake(registration_id, cancel)
     }
 
     fn primitives(&self) -> Primitives {

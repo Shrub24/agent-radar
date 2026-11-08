@@ -1621,8 +1621,8 @@ export interface ManagedMetadata {
 export interface SpawnBinding {
   child_incarnation: string | null;
   child_source: string | null;
-  claim_id: string | null;
   parent: string;
+  registration_id: string | null;
   request_id: string;
   state: SpawnState;
 }
@@ -1816,7 +1816,6 @@ export interface SpawnListPageSerialize {
  */
 export interface SpawnListPageSerializePublicSpawnTopology {
   bound?: SpawnListPageSerializeBoundChild | null;
-  claim_id?: string | null;
   created: SpawnListPageSerializeRequestOutcome;
   exit_observation: SpawnListPageSerializePublicSpawnExitObservation;
   /**
@@ -1834,6 +1833,7 @@ export interface SpawnListPageSerializePublicSpawnTopology {
   parent_session_id: string;
   parent_subject_id?: string | null;
   recorded_at: string;
+  registration_id?: string | null;
   request_id: string;
   state: SpawnListPageSerializeSpawnState;
   version: number;

@@ -44,7 +44,7 @@ export const RADAR_PROTOCOL_VERSION = 2;
  * The one wire revision this port speaks. A daemon of any other revision outlived
  * an install or precedes one, and is told to restart rather than served around.
  */
-export const RADAR_WIRE_REVISION = 17;
+export const RADAR_WIRE_REVISION = 18;
 /** Public daemon contracts this client may preflight. */
 export const RADAR_REGISTRY_CONTRACT = "registry.v1";
 export const RADAR_REGISTRY_FACTS_CONTRACT = "registry.facts.v1";

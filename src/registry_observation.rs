@@ -79,9 +79,12 @@ pub struct RegistryRead {
 pub struct LifecycleSubject {
     /// The subject used by public control requests.
     pub subject_id: SubjectId,
-    /// Exact execution record ID used to match its spawn edge and process.
+    /// Exact execution record ID the subject's current claim names.
     #[serde(default)]
     pub claim_id: Option<ClaimId>,
+    /// The execution the subject's current claim attaches.
+    #[serde(default)]
+    pub registration_id: Option<RegistrationId>,
     #[serde(default)]
     pub spawn_request_id: Option<String>,
     #[serde(default)]
@@ -172,7 +175,7 @@ pub enum Binding {
 pub struct SpawnBinding {
     pub parent: crate::identity::RegistrationId,
     pub request_id: String,
-    pub claim_id: Option<ClaimId>,
+    pub registration_id: Option<RegistrationId>,
     pub child_source: Option<String>,
     pub child_incarnation: Option<String>,
     pub state: SpawnState,
@@ -419,12 +422,18 @@ fn managed_subject(
         return None;
     }
     let claim_id = subject.claim_id.clone()?;
+    let bound = subject
+        .registration_id
+        .clone()
+        .or(subject.bound_registration_id.clone());
     Some(ManagedSubject {
         subject_id: subject.subject_id.clone(),
         process: claim.clone(),
         metadata: subject.managed.clone(),
         child_close: spawn
-            .filter(|spawn| spawn.claim_id.as_ref() == Some(&claim_id))
+            .filter(|spawn| {
+                spawn.registration_id.is_some() && spawn.registration_id.as_ref() == bound.as_ref()
+            })
             .and_then(|spawn| {
                 Some(ChildCloseTarget {
                     spawn_request_id: spawn.request_id.clone(),
@@ -453,7 +462,7 @@ fn spawn_binding(agent: &RegistryAgent, topology: &[PublicSpawnTopology]) -> Opt
         .map(|edge| SpawnBinding {
             parent: edge.edge.parent.clone(),
             request_id: edge.edge.request_id.clone(),
-            claim_id: edge.edge.claim_id.clone(),
+            registration_id: edge.edge.registration_id.clone(),
             child_source: edge.edge.bound.as_ref().map(|bound| bound.source.clone()),
             child_incarnation: edge
                 .edge
@@ -683,6 +692,7 @@ mod tests {
         serde_json::from_value(json!({
             "version": 1,
             "request_id": "r1",
+            "registration_id": "0e000000-0000-4000-8000-0000000a7e01",
             "parent": "0e000000-0000-4000-8000-0000000a7e00",
             "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
             "exit_observation": {"state": "unknown"},
@@ -1010,6 +1020,7 @@ mod tests {
         let edge: PublicSpawnTopology = serde_json::from_value(json!({
             "version": 1,
             "request_id": "r1",
+            "registration_id": "0e000000-0000-4000-8000-0000000a7e01",
             "parent": "0e000000-0000-4000-8000-0000000a7e00",
             "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
             "exit_observation": {"state": "unknown"},
@@ -1033,7 +1044,10 @@ mod tests {
                 parent: RegistrationId::parse("0e000000-0000-4000-8000-0000000a7e00")
                     .expect("parent registration"),
                 request_id: "r1".into(),
-                claim_id: None,
+                registration_id: Some(
+                    RegistrationId::parse("0e000000-0000-4000-8000-0000000a7e01")
+                        .expect("launched registration"),
+                ),
                 child_source: Some("test".into()),
                 child_incarnation: Some("11111111-1111-4111-8111-111111111111".into()),
                 state: SpawnState::Bound,
@@ -1049,6 +1063,7 @@ mod tests {
         let subject = LifecycleSubject {
             subject_id: SubjectId::parse(LOGICAL_SUBJECT).expect("a subject id"),
             claim_id: ClaimId::parse(CLAIM),
+            registration_id: Some(RegistrationId::parse(LEAD).expect("the execution")),
 
             spawn_request_id: Some("subject-1".into()),
             bound_registration_id: RegistrationId::parse(LEAD),
@@ -1062,6 +1077,7 @@ mod tests {
         let edge: PublicSpawnTopology = serde_json::from_value(json!({
             "version": 1,
             "request_id": "spawn-1",
+            "registration_id": "01ead000-0000-4000-8000-00000001ead0",
             "parent": "0e000000-0000-4000-8000-0000000a7e00",
             "parent_session_id": "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
             "exit_observation": {"state": "unknown"},

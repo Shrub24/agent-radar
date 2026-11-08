@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control_plane::lifecycle;
 use crate::control_plane::store::{RequestOutcome, format_millis, random_uuid};
-use crate::identity::{ClaimId, RegistrationId, SubjectId};
+use crate::identity::{RegistrationId, SubjectId};
 use crate::model::{ProcessIdentity, SessionUuid};
 use crate::timestamp::timestamp_millis;
 
@@ -33,7 +33,7 @@ use super::{Freshness, Registry, RegistryLocation, bounded_text, read_record_fil
 
 /// The record shape this build writes and reads. A record naming another version
 /// fails explicitly rather than being read as this one.
-pub const SPAWN_VERSION: u32 = 3;
+pub const SPAWN_VERSION: u32 = 4;
 
 /// The largest spawn edge this daemon reads or writes, so a planted file cannot
 /// be read into memory whole.
@@ -117,10 +117,11 @@ pub struct SpawnEdge {
     /// parentage: a session moves on `/resume`, so it is not the parent key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_subject_id: Option<SubjectId>,
-    /// Exact tracked attempt.
+    /// Exact execution this edge launched, once a tracked launch was reserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_id: Option<ClaimId>,
-    /// Binding credential: the claim id for tracked launches, private otherwise.
+    pub registration_id: Option<RegistrationId>,
+    /// Binding credential: the child registration for tracked launches, private
+    /// otherwise.
     pub token: String,
     /// Where the child was created, once a create answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,7 +162,7 @@ impl SpawnEdge {
             parent: self.parent.clone(),
             parent_session_id: self.parent_session_id.clone(),
             parent_subject_id: self.parent_subject_id.clone(),
-            claim_id: self.claim_id.clone(),
+            registration_id: self.registration_id.clone(),
             location: self.location.clone(),
             created: self.created,
             launched: self.launched,
@@ -228,7 +229,7 @@ pub struct PublicSpawnEdge {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_subject_id: Option<SubjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_id: Option<ClaimId>,
+    pub registration_id: Option<RegistrationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<RegistryLocation>,
     pub created: RequestOutcome,
@@ -346,7 +347,7 @@ pub fn record(
         parent: request.parent.clone(),
         parent_session_id: request.parent_session_id.clone(),
         parent_subject_id: request.parent_subject_id.clone(),
-        claim_id: None,
+        registration_id: None,
         token: random_uuid(),
         location: None,
         instance: None,
@@ -369,22 +370,23 @@ pub fn record(
 
 /// Attach a launch reservation. The child presents its pre-minted registration,
 /// not the claim; binding still requires the captured process birth identity.
-pub fn attach_subject(
+/// Records the execution a tracked spawn launches, and the token its child will
+/// register with. The edge binds to the child when that token is presented.
+pub fn attach_execution(
     registry: &Registry,
     request_id: &str,
-    claim_id: &ClaimId,
     registration_id: &RegistrationId,
 ) -> Result<SpawnEdge, String> {
     canonical_uuid("request_id", request_id)?;
     let _transition = registry.transition();
     let stored = stored_edge(registry, request_id)?;
-    if stored.claim_id.is_some() {
+    if stored.registration_id.is_some() {
         return Err(format!(
-            "spawn request {request_id} already names a launch subject"
+            "spawn request {request_id} already names a launch execution"
         ));
     }
     let edge = SpawnEdge {
-        claim_id: Some(claim_id.clone()),
+        registration_id: Some(registration_id.clone()),
         token: registration_id.to_string(),
         ..stored
     };
@@ -442,11 +444,21 @@ pub fn record_launched(
     Ok(edge)
 }
 
-pub fn record_granted(registry: &Registry, request_id: &str, now_ms: i64) -> Result<(), String> {
+/// Records that the child this edge launched attached its session, and which
+/// subject that session holds.
+pub fn record_granted(
+    registry: &Registry,
+    request_id: &str,
+    subject_id: &SubjectId,
+    now_ms: i64,
+) -> Result<(), String> {
     let _transition = registry.transition();
     let mut edge = stored_edge(registry, request_id)?;
     if edge.withdrawn.is_some() {
         return Err("the launch was withdrawn".into());
+    }
+    if let Some(bound) = &mut edge.bound {
+        bound.subject_id = Some(subject_id.clone());
     }
     if edge.granted_at.is_none() {
         edge.granted_at = Some(format_millis(now_ms));
@@ -548,12 +560,7 @@ pub(super) fn launched_registration(
         }
         return Err("no recorded spawn edge was minted with this token".into());
     };
-    match edge.claim_id {
-        Some(claim_id) => lifecycle::read_claim(registry, &claim_id)?
-            .map(|launch| Some(launch.process.registration_id))
-            .ok_or_else(|| "launch reservation is missing".into()),
-        None => Ok(None),
-    }
+    Ok(edge.registration_id)
 }
 
 /// Binds the edge a registration's token names to that exact registration.
@@ -649,10 +656,11 @@ fn bind_locked(
     // A tracked launch binds only to the process its daemon captured, and only
     // while its subject is still live. The subject is written first: an edge that
     // could not be written leaves the subject bound, which a same-content retry heals.
-    let mut subject = None;
-    if let Some(claim_id) = &stored.claim_id {
-        lifecycle::fence_registration(registry, claim_id, process, Some(registration_id), now_ms)?;
-        subject = lifecycle::read_claim(registry, claim_id)?.map(|launch| launch.subject_id);
+    if let Some(expected) = &stored.registration_id {
+        if expected != registration_id {
+            return Err("spawn binding names a different registry identity".into());
+        }
+        lifecycle::fence_registration(registry, registration_id, process, now_ms)?;
     }
     if let Some(bound) = &stored.bound {
         if bound.source == request.source && bound.incarnation == request.incarnation {
@@ -668,7 +676,7 @@ fn bind_locked(
             source: request.source.clone(),
             incarnation: request.incarnation.clone(),
             registration_id: registration_id.clone(),
-            subject_id: subject,
+            subject_id: None,
             bound_at: format_millis(now_ms),
         }),
         ..stored

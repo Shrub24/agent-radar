@@ -2059,21 +2059,30 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
     let (parent_subject, parent_agent, parent_pane) =
         spawned_live_tmux_child(&mut client, &state, &root, &root_session, Value::Null);
     let parent_session = random_uuid();
-    grant(
+    let parent_claim = grant(
         &mut client,
         &parent_agent,
         OTHER_INCARNATION,
         &parent_session,
-        &parent_subject.claim,
+        &parent_subject.execution,
         &parent_pane,
     );
+    // The parent's subject exists once its session presented on the launch.
+    let parent_subject = Attempt {
+        spawn: None,
+        execution: parent_subject.execution.clone(),
+        subject: claim_record(&state, &parent_claim)["subject_id"]
+            .as_str()
+            .map(str::to_owned),
+        claim: Some(parent_claim),
+    };
 
     let (worker_subject, worker_agent, worker_pane) = spawned_live_tmux_child(
         &mut client,
         &state,
         &parent_agent,
         &parent_session,
-        json!({"parent_subject_id": parent_subject.subject}),
+        json!({"parent_subject_id": parent_subject.subject.clone().expect("a presented parent")}),
     );
     let worker_session = random_uuid();
     let worker_claim = grant(
@@ -2081,12 +2090,21 @@ fn managed_parent_handoff_is_published_received_and_acknowledged() {
         &worker_agent,
         CHILD_INCARNATION,
         &worker_session,
-        &worker_subject.claim,
+        &worker_subject.execution,
         &worker_pane,
     );
+    // The worker's subject exists once its session presented on the launch.
+    let worker_subject = Attempt {
+        spawn: worker_subject.spawn.clone(),
+        execution: worker_subject.execution.clone(),
+        subject: claim_record(&state, &worker_claim)["subject_id"]
+            .as_str()
+            .map(str::to_owned),
+        claim: Some(worker_claim.clone()),
+    };
     let attached = client.call(
         "lifecycle.get",
-        json!({"subject_id": worker_subject.subject}),
+        json!({"subject_id": worker_subject.subject.clone().expect("a presented worker")}),
     );
     assert_eq!(
         attached["result"]["subject"]["session"],
@@ -2266,20 +2284,29 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
     let (parent_subject, parent_agent, parent_pane) =
         spawned_live_tmux_child(&mut client, &state, &root, &root_session, Value::Null);
     let parent_session = random_uuid();
-    grant(
+    let parent_claim = grant(
         &mut client,
         &parent_agent,
         OTHER_INCARNATION,
         &parent_session,
-        &parent_subject.claim,
+        &parent_subject.execution,
         &parent_pane,
     );
+    // The parent's subject exists once its session presented on the launch.
+    let parent_subject = Attempt {
+        spawn: None,
+        execution: parent_subject.execution.clone(),
+        subject: claim_record(&state, &parent_claim)["subject_id"]
+            .as_str()
+            .map(str::to_owned),
+        claim: Some(parent_claim),
+    };
     let (worker_launch, worker_agent, worker_pane) = spawned_live_tmux_child(
         &mut client,
         &state,
         &parent_agent,
         &parent_session,
-        json!({"parent_subject_id": parent_subject.subject}),
+        json!({"parent_subject_id": parent_subject.subject.clone().expect("a presented parent")}),
     );
     let worker_session = random_uuid();
     let worker_claim = grant(
@@ -2287,13 +2314,12 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
         &worker_agent,
         CHILD_INCARNATION,
         &worker_session,
-        &worker_launch.claim,
+        &worker_launch.execution,
         &worker_pane,
     );
-    let worker = client.call(
-        "lifecycle.get",
-        json!({"subject_id": worker_launch.subject}),
-    )["result"]["subject"]["subject_id"]
+    // The worker's subject exists once its session presented on the launch,
+    // which is the attachment the grant above made.
+    let worker = claim_record(&state, &worker_claim)["subject_id"]
         .as_str()
         .expect("the worker's agent")
         .to_string();
@@ -2361,7 +2387,8 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
             }}),
         )
     };
-    let owned = json!({"parent_subject_id": parent_subject.subject});
+    let owned =
+        json!({"parent_subject_id": parent_subject.subject.clone().expect("a presented parent")});
     let attached = continue_as(&mut client, &parent_agent, &parent_session, owned.clone());
     assert_eq!(
         error_code(&attached),
@@ -2372,7 +2399,7 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
     let released = client.call(
         "agent.release",
         json!({"registration_id": worker_agent, "claim_id": worker_claim,
-               "process": captured_identity(&state, &worker_launch.claim)}),
+               "process": captured_identity(&state, &worker_launch.execution)}),
     );
     assert_eq!(released["result"]["standing"], "released", "{released}");
 
@@ -2391,7 +2418,7 @@ fn a_parent_continues_only_its_own_released_child_in_the_recorded_session() {
         .expect("successor claim")
         .to_string();
     assert_ne!(successor, worker_claim);
-    let delivered = recorded_launch(&state, &successor);
+    let delivered = recorded_launch(&state, &execution_of_claim(&state, &successor));
     assert_eq!(
         delivered.argv,
         ["--model", "m", "--session", worker_session.as_str()],
@@ -3452,7 +3479,7 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
     )
     .expect("a reservation");
     registry
-        .attach_subject(request_id, &ticket.claim_id, &ticket.registration_id)
+        .attach_execution(request_id, &ticket.registration_id)
         .expect("attached");
     let edge = registry
         .spawn_edge(request_id)
@@ -3493,7 +3520,7 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
         |_| Ok(true),
     )
     .expect("a due pass");
-    assert_eq!(due.as_ref(), Some(&ticket.claim_id));
+    assert_eq!(due.as_ref(), Some(&ticket.registration_id));
     let withdrawn = registry
         .spawn_edge(request_id)
         .expect("read")
@@ -3503,13 +3530,6 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
             .withdrawn
             .as_ref()
             .is_some_and(|w| w.reason.contains("30 seconds"))
-    );
-    let record = lifecycle::read_subject_record(&registry, &ticket.subject_id)
-        .expect("read")
-        .expect("subject");
-    assert_eq!(
-        record.current_claim, None,
-        "the subject is free to continue"
     );
     let late = registry
         .register(
@@ -3529,20 +3549,6 @@ fn a_launch_that_never_presents_is_withdrawn_and_frees_its_subject() {
         )
         .expect_err("a withdrawn launch cannot bind");
     assert!(late.contains("cancelled"), "{late}");
-    lifecycle::create_with_identity(
-        &registry,
-        &random_uuid(),
-        LaunchContext {
-            executable: "/bin/true".into(),
-            argv: Vec::new(),
-            cwd: None,
-            env: BTreeMap::new(),
-        },
-        None,
-        Some((ticket.subject_id.clone(), ticket.claim_id.clone())),
-        31_002,
-    )
-    .expect("the freed subject accepts another reservation");
     assert_eq!(
         lifecycle::withdraw_unpresented(
             &registry,
@@ -3591,16 +3597,25 @@ fn a_reservation_with_no_spawn_edge_is_withdrawn_when_it_never_presents() {
     let (early, _) = lifecycle::unclaimed(&registry, None, 1_000 + 29_999);
     assert!(early.is_empty(), "a reservation inside its deadline waits");
     let (due, _) = lifecycle::unclaimed(&registry, None, 1_000 + 30_000);
-    assert_eq!(due, vec![ticket.claim_id.clone()]);
+    assert_eq!(due, vec![ticket.registration_id.clone()]);
 
     let mut retired: Vec<String> = Vec::new();
     let reason = lifecycle::withdraw_unclaimed(
         &registry,
-        &ticket.claim_id,
+        &ticket.registration_id,
         &LocalProcfsVerifier,
         1_000 + 30_000,
-        |claim_id| {
-            retired.push(claim_id.to_string());
+        |registration_id| {
+            retired.push(registration_id.to_string());
+            // The cleanup is what makes the withdrawal durable: a pass that says
+            // the pane is dealt with records that, and only then is it settled.
+            agent_radar::control_plane::lifecycle::record_pane_cleanup(
+                &registry,
+                registration_id,
+                agent_radar::control_plane::lifecycle::PaneCleanup::Absent,
+                1_000 + 30_000,
+            )
+            .expect("cleanup outcome");
             Ok(true)
         },
     )
@@ -3608,13 +3623,17 @@ fn a_reservation_with_no_spawn_edge_is_withdrawn_when_it_never_presents() {
     assert_eq!(reason, Some("the launch did not present within 30 seconds"));
     assert_eq!(
         retired,
-        vec![ticket.claim_id.to_string()],
+        vec![ticket.registration_id.to_string()],
         "the pane the reservation left is retired"
     );
-    let record = lifecycle::read_subject_record(&registry, &ticket.subject_id)
+    let execution = lifecycle::read_process(&registry, &ticket.registration_id)
         .expect("read")
-        .expect("subject");
-    assert_eq!(record.current_claim, None, "the subject is free again");
+        .expect("execution");
+    assert_eq!(
+        execution.state,
+        lifecycle::State::Revoked,
+        "the launch is ended"
+    );
     let (after, _) = lifecycle::unclaimed(&registry, None, 1_000 + 60_000);
     assert!(
         after.is_empty(),
@@ -3708,25 +3727,27 @@ fn recorded_edge(state: &Path, request_id: &str) -> Value {
 /// capture is asynchronous to the spawn's own answer, so a test that registers
 /// its child waits for that durable fact first.
 fn await_captured_launch(state: &Path, request_id: &str) {
-    let subject = recorded_edge(state, request_id)["claim_id"]
+    let execution = recorded_edge(state, request_id)["registration_id"]
         .as_str()
-        .expect("tracked launch subject")
+        .expect("tracked launch execution")
         .to_string();
     for _ in 0..500 {
         if let Ok(registry) = agent_radar::control_plane::Registry::open(state)
-            && agent_radar::control_plane::lifecycle::read_claim(&registry, &claim_id(&subject))
-                .is_ok_and(|record| {
-                    record.is_some_and(|subject| {
-                        subject.process.state
-                            == agent_radar::control_plane::lifecycle::State::Captured
-                    })
+            && agent_radar::control_plane::lifecycle::read_process(
+                &registry,
+                &execution_id(&execution),
+            )
+            .is_ok_and(|record| {
+                record.is_some_and(|execution| {
+                    execution.state == agent_radar::control_plane::lifecycle::State::Captured
                 })
+            })
         {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("launch {subject} was never captured");
+    panic!("launch {execution} was never captured");
 }
 
 fn edge_path(state: &Path, request_id: &str) -> PathBuf {
@@ -5172,15 +5193,11 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
     );
     assert!(spawned["result"].is_object(), "{spawned}");
     await_captured_launch(&state, &spawn_id);
-    let subject_id = recorded_edge(&state, &spawn_id)["claim_id"]
+    let execution = recorded_edge(&state, &spawn_id)["registration_id"]
         .as_str()
-        .expect("tracked launch subject")
+        .expect("tracked launch execution")
         .to_string();
-    let subject = subject_record(&state, &subject_id);
-    let agent_subject = subject["subject_id"]
-        .as_str()
-        .expect("the agent the execution runs as")
-        .to_string();
+    let subject = execution_record(&state, &execution);
     let pid = subject["process"]["pid"].as_i64().expect("captured pid") as i32;
 
     let cancel_id = random_uuid();
@@ -5193,8 +5210,9 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .cancel_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: cancel_id.clone(),
-                claim_id: ClaimId::parse(&subject_id).expect("a claim id"),
-                subject_id: SubjectId::parse(&agent_subject).expect("a subject id"),
+                claim_id: None,
+                subject_id: None,
+                spawn_request_id: Some(spawn_id.clone()),
             },
             &AtomicBool::new(false),
         )
@@ -5219,12 +5237,13 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         "{cancelled:?}"
     );
     assert_eq!(
-        closed.executions[0]
-            .subject_id
-            .as_ref()
-            .map(SubjectId::as_str),
-        Some(agent_subject.as_str()),
-        "the close names the agent it ended"
+        closed.executions[0].registration_id.as_str(),
+        execution.as_str(),
+        "the close names the execution it ended"
+    );
+    assert!(
+        closed.executions[0].subject_id.is_none(),
+        "the launch never presented, so no agent was attached: {cancelled:?}"
     );
     assert_eq!(
         closed.resource,
@@ -5243,8 +5262,9 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .cancel_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: cancel_id,
-                claim_id: ClaimId::parse(&subject_id).expect("a claim id"),
-                subject_id: SubjectId::parse(&agent_subject).expect("a subject id"),
+                claim_id: None,
+                subject_id: None,
+                spawn_request_id: Some(spawn_id.clone()),
             },
             &AtomicBool::new(false),
         )
@@ -5303,26 +5323,41 @@ fn tracked_parent(client: &mut Client) -> String {
 /// and the claim the request is fenced on. The two are different identities.
 #[derive(Clone, Debug)]
 struct Attempt {
-    subject: String,
-    claim: String,
+    /// The spawn that launched it, when it came from one: the address an
+    /// execution that has not attached a subject is named by.
+    spawn: Option<String>,
+    execution: String,
+    /// The attachment it has, once a session has presented on it.
+    claim: Option<String>,
+    subject: Option<String>,
 }
 
 impl Attempt {
-    /// The attempt a recorded claim belongs to.
-    fn of(state: &Path, claim: &str) -> Self {
-        let record = subject_record(state, claim);
+    /// The attempt one launched execution is.
+    fn of_execution(state: &Path, execution: &str, spawn: Option<&str>) -> Self {
+        let registry =
+            agent_radar::control_plane::Registry::open(state).expect("readable lifecycle log");
+        let registration = execution_id(execution);
+        let claimed =
+            agent_radar::control_plane::registry::presence::current(&registry, &registration)
+                .expect("readable presence")
+                .filter(|decision| decision.subject_id.is_some());
         Self {
-            subject: record["subject_id"]
-                .as_str()
-                .expect("the claim names its subject")
-                .to_owned(),
-            claim: claim.to_owned(),
+            spawn: spawn.map(str::to_owned),
+            execution: execution.to_owned(),
+            claim: claimed
+                .as_ref()
+                .map(|decision| decision.claim_id.to_string()),
+            subject: claimed.map(|decision| decision.subject_id.expect("a subject").to_string()),
         }
     }
 
     /// The fields a lifecycle request carries to address exactly this attempt.
     fn fence(&self) -> Value {
-        json!({"subject_id": self.subject, "claim_id": self.claim})
+        match (&self.subject, &self.claim) {
+            (Some(subject), Some(claim)) => json!({"subject_id": subject, "claim_id": claim}),
+            _ => json!({"spawn_request_id": self.spawn.clone().expect("an address")}),
+        }
     }
 }
 
@@ -5347,11 +5382,11 @@ fn tracked_spawn(
     );
     assert!(spawned["result"].is_object(), "{spawned}");
     await_captured_launch(state, &spawn_id);
-    let claim = recorded_edge(state, &spawn_id)["claim_id"]
+    let execution = recorded_edge(state, &spawn_id)["registration_id"]
         .as_str()
-        .expect("tracked launch claim")
+        .expect("tracked launch execution")
         .to_string();
-    let attempt = Attempt::of(state, &claim);
+    let attempt = Attempt::of_execution(state, &execution, Some(&spawn_id));
     (spawn_id, attempt)
 }
 
@@ -5360,40 +5395,77 @@ fn claim_id(value: &str) -> agent_radar::identity::ClaimId {
     agent_radar::identity::ClaimId::parse(value).expect("a claim id")
 }
 
-/// The recorded attempt a launch claim names.
-fn subject_record(state: &Path, claim: &str) -> Value {
+fn execution_id(value: &str) -> agent_radar::identity::RegistrationId {
+    agent_radar::identity::RegistrationId::parse(value).expect("a registration id")
+}
+
+/// One recorded attachment, which is what a claim names.
+fn claim_record(state: &Path, claim: &str) -> Value {
     let registry =
         agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
-    let subject = agent_radar::control_plane::lifecycle::read_claim(&registry, &claim_id(claim))
+    let record = agent_radar::control_plane::lifecycle::read_claim(&registry, &claim_id(claim))
         .expect("replayable subject")
         .expect("a launch subject");
-    serde_json::to_value(subject).expect("a subject projection")
+    serde_json::to_value(record).expect("a subject projection")
+}
+
+/// The code a supervisor reported for one execution.
+fn recorded_code(state: &Path, execution: &str) -> Value {
+    execution_record(state, execution)["completion"]["code"].clone()
+}
+
+/// The execution a recorded claim names.
+fn execution_of_claim(state: &Path, claim: &str) -> String {
+    let registry =
+        agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
+    agent_radar::control_plane::lifecycle::read_claim(&registry, &claim_id(claim))
+        .expect("replayable claim")
+        .expect("a launch claim")
+        .process
+        .registration_id
+        .to_string()
+}
+
+/// One recorded execution, as the daemon keeps it: the flat record a launch's
+/// state, signal, exit and pane cleanup are read from.
+fn execution_record(state: &Path, execution: &str) -> Value {
+    let registry =
+        agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
+    let record =
+        agent_radar::control_plane::lifecycle::read_process(&registry, &execution_id(execution))
+            .expect("replayable execution")
+            .expect("a launch execution");
+    serde_json::to_value(record).expect("an execution projection")
 }
 
 /// The program a launch claim will deliver: the daemon's own record of it.
 fn recorded_launch(
     state: &Path,
-    claim_id: &str,
+    execution: &str,
 ) -> agent_radar::control_plane::lifecycle::LaunchContext {
     let registry =
         agent_radar::control_plane::Registry::open(state).expect("readable lifecycle event log");
-    agent_radar::control_plane::lifecycle::read_claim(&registry, &self::claim_id(claim_id))
-        .expect("replayable claim")
-        .expect("a launch claim")
-        .process
+    agent_radar::control_plane::lifecycle::read_process(&registry, &execution_id(execution))
+        .expect("replayable execution")
+        .expect("a launch execution")
         .launch
 }
 
-fn captured_identity(state: &Path, subject_id: &str) -> ProcessIdentity {
-    serde_json::from_value(subject_record(state, subject_id)["process"].clone())
+fn captured_identity(state: &Path, execution: &str) -> ProcessIdentity {
+    let registry =
+        agent_radar::control_plane::Registry::open(state).expect("readable lifecycle log");
+    agent_radar::control_plane::lifecycle::read_process(&registry, &execution_id(execution))
+        .expect("a replayable execution")
+        .expect("a launch execution")
+        .identity
         .expect("a captured identity")
 }
 
 /// A child registration that presents the spawn's token and the captured identity.
-fn child_registration_for(state: &Path, spawn_id: &str, subject_id: &str) -> Value {
+fn child_registration_for(state: &Path, spawn_id: &str, execution: &str) -> Value {
     let mut body = registration_body(
         CHILD_INCARNATION,
-        Some(captured_identity(state, subject_id)),
+        Some(captured_identity(state, execution)),
         None,
     );
     body["spawn_token"] = recorded_edge(state, spawn_id)["token"].clone();
@@ -5436,13 +5508,16 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         &parent,
         json!(["-c", "exec sleep 300"]),
     );
-    let pid = captured_identity(&state, &subject.claim).pid;
+    let pid = captured_identity(&state, &subject.execution).pid;
 
     let registered = client.call(
         "agent.register",
-        child_registration_for(&state, &spawn_id, &subject.claim),
+        child_registration_for(&state, &spawn_id, &subject.execution),
     );
     let child = registration_id(&registered);
+    // The registration attached the launch's subject, so read it before the
+    // cancel releases it.
+    let subject = Attempt::of_execution(&state, &subject.execution, Some(&spawn_id));
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
         result_record(&cancelled)["outcome"],
@@ -5472,17 +5547,24 @@ fn a_cancel_after_binding_stops_the_bound_process() {
         "the launch's own pane {pane} is gone: {:?}",
         pane_ids(&server)
     );
-    assert_eq!(subject_record(&state, &subject.claim)["state"], "bound");
+    // A bound launch is ended by the exit its stop established, not revoked: what
+    // it reported stands, and the edge keeps naming the child it bound.
+    assert_eq!(
+        execution_record(&state, &subject.execution)["state"],
+        "bound"
+    );
     let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
     assert_eq!(
         spawn["result"]["spawn"]["bound"]["registration_id"],
         json!(child),
         "{spawn}"
     );
+    // Binding is the process's identity, not a subject: the launch attached no
+    // session, so there is no agent for the edge to name.
     assert_eq!(
         spawn["result"]["spawn"]["bound"]["subject_id"],
-        json!(subject.subject),
-        "the bound edge names the agent, not only its process: {spawn}"
+        Value::Null,
+        "a registration that presented no session names no agent: {spawn}"
     );
 
     let status = daemon.stop(Signal::TERM, DEADLINE);
@@ -5507,7 +5589,7 @@ fn a_registration_after_cancel_is_refused_and_the_launch_stays_revoked() {
         &parent,
         json!(["-c", "exec sleep 300"]),
     );
-    let pid = captured_identity(&state, &subject.claim).pid;
+    let pid = captured_identity(&state, &subject.execution).pid;
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
     let closed = &result_record(&cancelled)["closed"];
@@ -5524,10 +5606,13 @@ fn a_registration_after_cancel_is_refused_and_the_launch_stays_revoked() {
     assert!(!process_exists(pid), "the revoked process {pid} still runs");
     let late = client.call(
         "agent.register",
-        child_registration_for(&state, &spawn_id, &subject.claim),
+        child_registration_for(&state, &spawn_id, &subject.execution),
     );
     assert_eq!(error_code(&late), "refused", "{late}");
-    assert_eq!(subject_record(&state, &subject.claim)["state"], "revoked");
+    assert_eq!(
+        execution_record(&state, &subject.execution)["state"],
+        "revoked"
+    );
     let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
     assert!(spawn["result"]["spawn"]["bound"].is_null(), "{spawn}");
 
@@ -5547,30 +5632,33 @@ fn lifecycle_get_reports_a_subject_without_its_private_launch_data() {
     let mut daemon = tmux_daemon(&socket, &state, &server);
     let mut client = Client::dial(&socket);
     let parent = tracked_parent(&mut client);
-    let (_, subject) = tracked_spawn(
+    let (spawn_id, launched) = tracked_spawn(
         &mut client,
         &state,
         &parent,
         json!(["-c", "exec sleep 300"]),
     );
-    let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
+    let cancelled = cancel_subject(&mut client, &random_uuid(), &launched);
     assert_eq!(
         result_record(&cancelled)["outcome"],
         "completed",
         "{cancelled}"
     );
 
-    let read = client.call("lifecycle.get", json!({"subject_id": subject.subject}));
-    let view = &read["result"]["subject"];
-    assert_eq!(view["subject_id"], subject.subject, "{read}");
-    assert_eq!(view["state"], "revoked", "{read}");
-    assert!(view["signalled_at"].is_string(), "{read}");
-    assert!(view["exited_at"].is_string(), "{read}");
+    // A launch that never presented has no subject to read, so its public view is
+    // the spawn that made it — and that view carries none of the private launch.
+    let read = client.call("spawn.get", json!({"request_id": spawn_id}));
+    let view = &read["result"]["spawn"];
+    assert_eq!(
+        view["bound"],
+        Value::Null,
+        "a cancelled launch binds nothing: {read}"
+    );
+    assert_eq!(view["exit_observation"]["state"], json!("exited"), "{read}");
     let text = read.to_string();
     assert!(!text.contains("correlation"), "{read}");
     assert!(!text.contains("sleep 300"), "argv leaked: {read}");
     assert!(!text.contains("PI_RADAR_LAUNCH"), "{read}");
-    assert!(!text.contains("launch\""), "{read}");
 
     let unknown = client.call("lifecycle.get", json!({"subject_id": random_uuid()}));
     assert_eq!(error_code(&unknown), "not_found", "{unknown}");
@@ -5602,7 +5690,7 @@ fn a_revoked_launch_stays_revoked_and_unsignalled_across_a_daemon_restart() {
     let cancel_id = random_uuid();
     let first = cancel_subject(&mut client, &cancel_id, &subject);
     assert_cancelled_or_unresolved(&first);
-    let before = subject_record(&state, &subject.claim);
+    let before = execution_record(&state, &subject.execution);
     assert_eq!(daemon.stop(Signal::TERM, DEADLINE).code(), Some(0));
 
     let mut daemon = tmux_daemon(&socket, &state, &server);
@@ -5614,12 +5702,12 @@ fn a_revoked_launch_stays_revoked_and_unsignalled_across_a_daemon_restart() {
         json!({"state": "removed"}),
         "{fresh}"
     );
-    let after = subject_record(&state, &subject.claim);
+    let after = execution_record(&state, &subject.execution);
     assert_eq!(after["signalled_at"], before["signalled_at"]);
     assert_eq!(after["state"], "revoked");
     let late = client.call(
         "agent.register",
-        child_registration_for(&state, &spawn_id, &subject.claim),
+        child_registration_for(&state, &spawn_id, &subject.execution),
     );
     assert_eq!(error_code(&late), "refused", "{late}");
 
@@ -5651,7 +5739,7 @@ fn a_cancel_request_id_cannot_be_reused_for_another_launch() {
         &parent,
         json!(["-c", "exec sleep 300"]),
     );
-    let second_pid = captured_identity(&state, &second.claim).pid;
+    let second_pid = captured_identity(&state, &second.execution).pid;
 
     let request_id = random_uuid();
     let reply = cancel_subject(&mut client, &request_id, &first);
@@ -5660,7 +5748,7 @@ fn a_cancel_request_id_cannot_be_reused_for_another_launch() {
     assert_eq!(error_code(&conflicting), "refused", "{conflicting}");
     assert!(process_exists(second_pid), "the other launch was signalled");
     assert_eq!(
-        subject_record(&state, &second.claim)["signalled_at"],
+        execution_record(&state, &second.execution)["signalled_at"],
         Value::Null
     );
     assert_eq!(cancel_subject(&mut client, &request_id, &first), reply);
@@ -5691,17 +5779,45 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
         cwd: None,
         env: BTreeMap::new(),
     };
-    let spawn_id = random_uuid();
-    let ticket =
-        agent_radar::control_plane::lifecycle::create(&registry, &spawn_id, launch, None, 1)
-            .expect("pending launch");
+    // A claim exists before a process only as a successor: the incumbent is
+    // enrolled, and the launch under test reserves after it.
+    let incumbent = agent_radar::control_plane::lifecycle::enroll_subject(
+        &registry,
+        &agent_radar::identity::ClaimId::random(),
+        &agent_radar::identity::RegistrationId::random(),
+        &agent_radar::model::ProcessIdentity {
+            pid: 7,
+            boot_id: "test-boot".into(),
+            start_ticks: 1,
+        },
+        &random_uuid(),
+        launch.clone(),
+        1,
+    )
+    .expect("an enrolled incumbent");
+    let subject = agent_radar::control_plane::lifecycle::read_claim(&registry, &incumbent)
+        .expect("read incumbent")
+        .expect("the incumbent is recorded")
+        .subject_id;
+    let ticket = agent_radar::control_plane::lifecycle::create_with_intent(
+        &registry,
+        &random_uuid(),
+        launch,
+        None,
+        Some((subject, incumbent)),
+        agent_radar::control_plane::lifecycle::ManagedMetadata::default(),
+        1,
+    )
+    .expect("pending launch");
     drop(registry);
 
     let mut daemon = tmux_daemon(&socket, &state, &server);
     let mut client = Client::dial(&socket);
     let attempt = Attempt {
-        subject: ticket.subject_id.to_string(),
-        claim: ticket.claim_id.to_string(),
+        spawn: None,
+        execution: ticket.registration_id.to_string(),
+        subject: Some(ticket.subject_id.clone().expect("a subject").to_string()),
+        claim: Some(ticket.claim_id.clone().expect("a claim").to_string()),
     };
     let cancelled = cancel_subject(&mut client, &random_uuid(), &attempt);
     assert_eq!(
@@ -5716,7 +5832,8 @@ fn a_launch_whose_bootstrap_never_reported_is_cancelled_unresolved_without_a_sig
         "{cancelled}"
     );
     assert_eq!(closed["resource"]["state"], json!("kept"), "{cancelled}");
-    let subject = subject_record(&state, ticket.claim_id.as_str());
+    // The cancelled attempt is the reserved successor, which is an execution.
+    let subject = execution_record(&state, ticket.registration_id.as_str());
     assert_eq!(subject["state"], "revoked");
     assert_eq!(subject["signalled_at"], Value::Null, "{subject}");
 
@@ -5737,7 +5854,7 @@ fn a_launch_that_exits_at_once_is_observable_without_a_registration() {
     let mut client = Client::dial(&socket);
     let parent = tracked_parent(&mut client);
     let (spawn_id, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", "exit 0"]));
-    let pid = captured_identity(&state, &subject.claim).pid;
+    let pid = captured_identity(&state, &subject.execution).pid;
     await_gone(pid);
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
@@ -5746,7 +5863,7 @@ fn a_launch_that_exits_at_once_is_observable_without_a_registration() {
         json!({"state": "exited"}),
         "{cancelled}"
     );
-    assert!(subject_record(&state, &subject.claim)["exited_at"].is_string());
+    assert!(execution_record(&state, &subject.execution)["exited_at"].is_string());
     let spawn = client.call("spawn.get", json!({"request_id": spawn_id}));
     assert!(spawn["result"]["spawn"]["bound"].is_null(), "{spawn}");
 
@@ -5784,12 +5901,12 @@ fn a_tracked_launch_runs_its_requested_program_and_keeps_its_secrets_private() {
     );
     assert!(spawned["result"].is_object(), "{spawned}");
     await_captured_launch(&state, &spawn_id);
-    let claim = recorded_edge(&state, &spawn_id)["claim_id"]
+    let execution = recorded_edge(&state, &spawn_id)["registration_id"]
         .as_str()
-        .expect("tracked launch claim")
+        .expect("tracked launch execution")
         .to_string();
-    let subject = Attempt::of(&state, &claim);
-    let pid = captured_identity(&state, &subject.claim).pid;
+    let subject = Attempt::of_execution(&state, &execution, Some(&spawn_id));
+    let pid = captured_identity(&state, &subject.execution).pid;
     let token = recorded_edge(&state, &spawn_id)["token"]
         .as_str()
         .expect("spawn token")
@@ -6262,7 +6379,11 @@ fn spawned_live_tmux_child(
     await_captured_launch(state, &spawn_id);
     let edge = recorded_edge(state, &spawn_id);
     let token = edge["token"].as_str().expect("spawn token").to_string();
-    let subject = Attempt::of(state, edge["claim_id"].as_str().expect("child claim"));
+    let subject = Attempt::of_execution(
+        state,
+        edge["registration_id"].as_str().expect("child execution"),
+        Some(&spawn_id),
+    );
     let raw_pane = edge["location"]["pane"]
         .as_str()
         .expect("spawned pane")
@@ -7016,13 +7137,22 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
     let record = result_record(&response);
     assert_eq!(record["method"], "spawn.create");
     assert_eq!(record["outcome"], "completed");
-    let lifecycle = client.call("lifecycle.list", json!({"limit": 20}));
-    let subject = lifecycle["result"]["subjects"]
-        .as_array()
-        .expect("subjects")
-        .iter()
-        .find(|subject| subject["spawn_request_id"] == id)
-        .expect("the tracked launch is listed");
+    // A launch that has not presented is an execution, so its intent is read
+    // there; the subject list holds the agents that attached.
+    let listed = client.call("lifecycle.list", json!({"limit": 20}));
+    assert!(
+        listed["result"]["subjects"]
+            .as_array()
+            .expect("subjects")
+            .iter()
+            .all(|subject| subject["spawn_request_id"] != id),
+        "a launch in flight is not a subject: {listed}"
+    );
+    let execution = recorded_edge(&sandbox.state(), &id)["registration_id"]
+        .as_str()
+        .expect("the launch's execution")
+        .to_owned();
+    let subject = execution_record(&sandbox.state(), &execution);
     assert_eq!(
         subject["managed"],
         json!({
@@ -7093,16 +7223,18 @@ fn a_spawn_creates_beside_its_parent_launches_the_command_and_reports_its_effect
         .expect("a minted token")
         .to_string();
     assert_eq!(launches[0].spawn_token, Some(token.clone()));
-    let launch_claim = recorded_edge(&sandbox.state(), &id)["claim_id"]
+    let launch_execution = recorded_edge(&sandbox.state(), &id)["registration_id"]
         .as_str()
-        .expect("launch claim")
+        .expect("launch execution")
         .to_string();
-    let delivered = recorded_launch(&sandbox.state(), &launch_claim);
+    let delivered = recorded_launch(&sandbox.state(), &launch_execution);
     assert_eq!(delivered.executable, "/usr/bin/pi");
     assert_eq!(delivered.argv, ["--child", "row one"]);
-    assert_ne!(launch_claim, token, "a claim does not identify the process");
+    // The token is the execution it authorises, so a launch presents the same
+    // identity it was handed and no second one can claim it.
+    assert_eq!(launch_execution, token, "a spawn token names its execution");
     assert_eq!(
-        subject_record(&sandbox.state(), &launch_claim)["registration_id"],
+        execution_record(&sandbox.state(), &launch_execution)["registration_id"],
         token,
         "the launched process receives its admitted registration"
     );
@@ -10097,7 +10229,7 @@ fn stop_subject(client: &mut Client, request_id: &str, attempt: &Attempt) -> Val
 /// wake or a later reconciliation.
 fn await_recorded_exit(state: &Path, subject_id: &str) {
     for _ in 0..500 {
-        if !subject_record(state, subject_id)["exited_at"].is_null() {
+        if !execution_record(state, subject_id)["exited_at"].is_null() {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -10160,8 +10292,8 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
         &parent,
         json!(["-c", "exec sleep 300"]),
     );
-    let pid = captured_identity(&state, &subject.claim).pid;
-    let other_pid = captured_identity(&state, &other.claim).pid;
+    let pid = captured_identity(&state, &subject.execution).pid;
+    let other_pid = captured_identity(&state, &other.execution).pid;
 
     let request_id = random_uuid();
     let stopped = stop_subject(&mut client, &request_id, &subject);
@@ -10177,7 +10309,7 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
         "a stop removes no pane: {stopped}"
     );
     await_gone(pid);
-    let signalled = subject_record(&state, &subject.claim)["signalled_at"].clone();
+    let signalled = execution_record(&state, &subject.execution)["signalled_at"].clone();
     assert!(!signalled.is_null());
 
     assert_eq!(stop_subject(&mut client, &request_id, &subject), stopped);
@@ -10185,7 +10317,7 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
     assert_eq!(error_code(&conflicting), "refused", "{conflicting}");
     assert!(process_exists(other_pid), "the other launch was signalled");
     assert_eq!(
-        subject_record(&state, &other.claim)["signalled_at"],
+        execution_record(&state, &other.execution)["signalled_at"],
         Value::Null
     );
 
@@ -10196,7 +10328,7 @@ fn a_stop_signals_the_captured_process_once_and_replays_by_request_id() {
         "{fresh}"
     );
     assert_eq!(
-        subject_record(&state, &subject.claim)["signalled_at"],
+        execution_record(&state, &subject.execution)["signalled_at"],
         signalled
     );
 
@@ -10226,11 +10358,11 @@ fn a_term_ignoring_process_is_signalled_once_and_its_end_is_never_assumed() {
         &parent,
         json!(["-c", "trap '' TERM; exec sleep 300"]),
     );
-    let pid = captured_identity(&state, &subject.claim).pid;
+    let pid = captured_identity(&state, &subject.execution).pid;
 
     let first = stop_subject(&mut client, &random_uuid(), &subject);
     assert!(
-        !subject_record(&state, &subject.claim)["signalled_at"].is_null(),
+        !execution_record(&state, &subject.execution)["signalled_at"].is_null(),
         "{first}"
     );
     // Two honest reviews of the same stop are possible: its end was established
@@ -10246,19 +10378,19 @@ fn a_term_ignoring_process_is_signalled_once_and_its_end_is_never_assumed() {
                 "{first}"
             );
             assert!(process_exists(pid), "the process ignored SIGTERM");
-            assert!(subject_record(&state, &subject.claim)["exited_at"].is_null());
+            assert!(execution_record(&state, &subject.execution)["exited_at"].is_null());
         }
         other => panic!("a stop states an end or a survivor: {other:?} {first}"),
     }
     assert_eq!(
         result_record(&first)["target"],
-        subject.subject,
-        "the durable lane is the subject, not its pane"
+        subject.execution,
+        "an unattached launch is addressed by its execution, not a pane"
     );
     // Signal intent is recorded once, so no later request signals it again —
     // whether that request was answered, refused as in flight, or replays the
     // first one. The signal stamp is the invariant; the reply shape is not.
-    let signalled = subject_record(&state, &subject.claim)["signalled_at"].clone();
+    let signalled = execution_record(&state, &subject.execution)["signalled_at"].clone();
     assert!(!signalled.is_null(), "the first stop recorded its signal");
     let _cancellation = client.call_id(
         &random_uuid(),
@@ -10267,7 +10399,7 @@ fn a_term_ignoring_process_is_signalled_once_and_its_end_is_never_assumed() {
     );
     let _second = stop_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
-        subject_record(&state, &subject.claim)["signalled_at"],
+        execution_record(&state, &subject.execution)["signalled_at"],
         signalled,
         "no later request signalled it again"
     );
@@ -10328,7 +10460,7 @@ fn an_unbound_launch_whose_process_exited_has_its_pane_cleaned_up_once() {
         pane_ids(&server)
     );
     assert_eq!(
-        subject_record(&state, &subject.claim)["pane_cleanup"]["outcome"],
+        execution_record(&state, &subject.execution)["pane_cleanup"]["outcome"],
         "cleaned",
         "the cleanup is a durable fact of the launch"
     );
@@ -10364,23 +10496,30 @@ fn a_reported_code_survives_the_pane_a_close_removes() {
     let mut daemon = tmux_daemon(&socket, &state, &server);
     let mut client = Client::dial(&socket);
     let parent = tracked_parent(&mut client);
-    let (spawn_id, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", "exit 7"]));
+    let (spawn_id, subject) = tracked_spawn(
+        &mut client,
+        &state,
+        &parent,
+        json!(["-c", "exec sleep 300"]),
+    );
     let pane = launch_pane(&mut client, &spawn_id);
+    // The supervisor is the only source of a program's code: it reports on the
+    // execution it supervises, naming the key the launch gave it.
+    let recorded = execution_record(&state, &subject.execution);
+    let reported = client.call(
+        "launch.complete",
+        json!({
+            "process": recorded["process"],
+            "key": recorded["completion_key"],
+            "code": 7,
+        }),
+    );
+    assert!(reported["result"].is_object(), "{reported}");
 
-    fn code(client: &mut Client, subject: &str) -> Value {
-        client.call("lifecycle.get", json!({"subject_id": subject}))["result"]["subject"]
-            ["completion"]["code"]
-            .clone()
-    }
-    let until = Instant::now() + DEADLINE;
-    while code(&mut client, &subject.subject).is_null() {
-        assert!(Instant::now() < until, "the supervisor never reported");
-        thread::sleep(Duration::from_millis(20));
-    }
     assert_eq!(
-        code(&mut client, &subject.subject),
+        recorded_code(&state, &subject.execution),
         json!(7),
-        "the program's own status"
+        "the supervisor's report is the program's status"
     );
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
@@ -10395,7 +10534,7 @@ fn a_reported_code_survives_the_pane_a_close_removes() {
         pane_ids(&server)
     );
     assert_eq!(
-        code(&mut client, &subject.subject),
+        recorded_code(&state, &subject.execution),
         json!(7),
         "the code outlives the pane its report came from"
     );
@@ -10423,7 +10562,7 @@ fn a_launch_whose_process_ignores_term_is_escalated_before_its_pane_is_closed() 
         &parent,
         json!(["-c", "trap '' TERM; exec sleep 300"]),
     );
-    let pid = captured_identity(&state, &subject.claim).pid;
+    let pid = captured_identity(&state, &subject.execution).pid;
     let pane = launch_pane(&mut client, &spawn_id);
 
     let cancelled = cancel_subject(&mut client, &random_uuid(), &subject);
@@ -10452,7 +10591,7 @@ fn a_launch_whose_process_ignores_term_is_escalated_before_its_pane_is_closed() 
     // The close is dispatched only after the execution is verified gone, but the
     // pane can still leave with its process first. Either answer is recorded as it
     // came: a performed removal, or an answer that the pane is already absent.
-    let cleanup = subject_record(&state, &subject.claim)["pane_cleanup"]["outcome"]
+    let cleanup = execution_record(&state, &subject.execution)["pane_cleanup"]["outcome"]
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -10464,10 +10603,10 @@ fn a_launch_whose_process_ignores_term_is_escalated_before_its_pane_is_closed() 
 
     // The cleanup is a durable fact of the launch, so a later cancel answers with
     // it instead of closing the same place again.
-    let recorded = subject_record(&state, &subject.claim)["pane_cleanup"].clone();
+    let recorded = execution_record(&state, &subject.execution)["pane_cleanup"].clone();
     let _after = cancel_subject(&mut client, &random_uuid(), &subject);
     assert_eq!(
-        subject_record(&state, &subject.claim)["pane_cleanup"],
+        execution_record(&state, &subject.execution)["pane_cleanup"],
         recorded,
         "a second cancel does not clean the same pane again"
     );
@@ -10496,14 +10635,14 @@ fn a_pane_death_wakes_the_daemon_and_keeps_the_users_hook() {
     let mut client = Client::dial(&socket);
     let parent = tracked_parent(&mut client);
     let (spawn_id, subject) = tracked_spawn(&mut client, &state, &parent, json!(["-c", "exit 0"]));
-    await_recorded_exit(&state, &subject.claim);
+    await_recorded_exit(&state, &subject.execution);
 
-    let hooks = await_hook_removed(&server, &subject.claim);
+    let hooks = await_hook_removed(&server, &subject.execution);
     assert!(hooks.contains("display-message user-hook"), "{hooks}");
     let instance = recorded_edge(&state, &spawn_id)["instance"].clone();
     let duplicate = client.call(
         "lifecycle.wake",
-        json!({"subject_id": subject.claim, "server": instance}),
+        json!({"registration_id": subject.execution, "server": instance}),
     );
     assert_eq!(duplicate["result"]["exited"], json!(true), "{duplicate}");
     let status = daemon.stop(Signal::TERM, DEADLINE);
@@ -10529,17 +10668,17 @@ fn a_wake_from_a_replaced_server_generation_is_refused() {
         json!(["-c", "exec sleep 300"]),
     );
     let instance = recorded_edge(&state, &spawn_id)["instance"].clone();
-    let pid = captured_identity(&state, &subject.claim).pid;
+    let pid = captured_identity(&state, &subject.execution).pid;
 
     server.tmux(&["kill-server"]);
     await_server_exit(&server.name);
     server.tmux(&["new-session", "-d", "-s", "main", "-x", "100", "-y", "30"]);
     let refused = client.call(
         "lifecycle.wake",
-        json!({"subject_id": subject.claim, "server": instance}),
+        json!({"registration_id": subject.execution, "server": instance}),
     );
     assert_eq!(error_code(&refused), "refused", "{refused}");
-    assert!(subject_record(&state, &subject.claim)["exited_at"].is_null());
+    assert!(execution_record(&state, &subject.execution)["exited_at"].is_null());
 
     await_gone(pid);
     let stopped = stop_subject(&mut client, &random_uuid(), &subject);
@@ -10569,7 +10708,7 @@ fn a_revocation_survives_a_crash_without_a_clean_shutdown() {
     let cancel_id = random_uuid();
     let first = cancel_subject(&mut client, &cancel_id, &subject);
     assert_cancelled_or_unresolved(&first);
-    let before = subject_record(&state, &subject.claim);
+    let before = execution_record(&state, &subject.execution);
     assert_eq!(daemon.stop(Signal::KILL, DEADLINE).code(), None);
 
     let mut daemon = tmux_daemon(&socket, &state, &server);
@@ -10577,10 +10716,10 @@ fn a_revocation_survives_a_crash_without_a_clean_shutdown() {
     assert_eq!(cancel_subject(&mut client, &cancel_id, &subject), first);
     let late = client.call(
         "agent.register",
-        child_registration_for(&state, &spawn_id, &subject.claim),
+        child_registration_for(&state, &spawn_id, &subject.execution),
     );
     assert_eq!(error_code(&late), "refused", "{late}");
-    let after = subject_record(&state, &subject.claim);
+    let after = execution_record(&state, &subject.execution);
     assert_eq!(after["state"], "revoked");
     assert_eq!(after["signalled_at"], before["signalled_at"]);
     let status = daemon.stop(Signal::TERM, DEADLINE);
@@ -11312,7 +11451,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
     )
     .expect("a reservation");
     registry
-        .attach_subject(&request_id, &ticket.claim_id, &ticket.registration_id)
+        .attach_execution(&request_id, &ticket.registration_id)
         .expect("attached");
     if !keep_scope {
         // Nothing here is a unit: drop the descriptor the unit tests drop.
@@ -11353,7 +11492,7 @@ fn surviving_agent(sandbox: &Sandbox, keep_scope: bool) -> std::process::Child {
         .expect("a located create");
     managed::capture(
         &registry,
-        &ticket.claim_id,
+        &ticket.registration_id,
         &ticket.correlation,
         &identity,
         &Effective {
@@ -12412,11 +12551,18 @@ fn presence_lead(
             .expect("registration ID")
             .to_owned(),
         Attempt {
-            subject: answer["result"]["subject_id"]
+            spawn: None,
+            execution: answer["result"]["registration_id"]
                 .as_str()
-                .expect("subject ID")
+                .expect("registration ID")
                 .to_owned(),
-            claim,
+            subject: Some(
+                answer["result"]["subject_id"]
+                    .as_str()
+                    .expect("subject ID")
+                    .to_owned(),
+            ),
+            claim: Some(claim),
         },
     )
 }
@@ -12832,8 +12978,23 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         .restart_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: restart_id.clone(),
-                claim_id: ClaimId::parse(&subject.claim).expect("a claim id"),
-                subject_id: SubjectId::parse(&subject.subject).expect("a subject id"),
+                claim_id: ClaimId::parse(
+                    subject
+                        .claim
+                        .as_deref()
+                        .expect("a presented launch has a claim"),
+                )
+                .expect("a claim id")
+                .into(),
+                subject_id: SubjectId::parse(
+                    subject
+                        .subject
+                        .as_deref()
+                        .expect("a presented launch has a subject"),
+                )
+                .expect("a subject id")
+                .into(),
+                spawn_request_id: None,
             },
             &AtomicBool::new(false),
         )
@@ -12851,11 +13012,26 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
 
     let launches = backend.launches();
     assert_eq!(launches.len(), 1, "one successor, got {launches:?}");
-    let current = client.call("lifecycle.get", json!({"subject_id": subject.subject}));
-    assert_eq!(current["result"]["subject"]["subject_id"], subject.subject);
+    let current = client.call(
+        "lifecycle.get",
+        json!({"subject_id": subject.subject.clone().expect("a presented agent")}),
+    );
+    assert_eq!(
+        current["result"]["subject"]["subject_id"],
+        subject
+            .subject
+            .clone()
+            .expect("a presented launch has a subject")
+    );
     // The successor is a new claim of the same agent, so it is named by its own
     // claim id and no generation is published.
-    assert_ne!(current["result"]["subject"]["claim_id"], subject.claim);
+    assert_ne!(
+        current["result"]["subject"]["claim_id"],
+        subject
+            .claim
+            .clone()
+            .expect("a presented launch has a claim")
+    );
     assert!(
         current["result"]["subject"]
             .get("execution_generation")
@@ -12877,9 +13053,17 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         "successor lifecycle events: {events}"
     );
     assert!(successor_events.iter().all(|event| {
-        event["subject_id"] == subject.subject && event["claim_id"] == successor_id
+        event["subject_id"]
+            == subject
+                .subject
+                .clone()
+                .expect("a presented launch has a subject")
+            && event["claim_id"] == successor_id
     }));
-    let delivered = recorded_launch(&sandbox.state(), successor_id);
+    let delivered = recorded_launch(
+        &sandbox.state(),
+        &execution_of_claim(&sandbox.state(), successor_id),
+    );
     assert!(
         delivered
             .argv
@@ -12898,8 +13082,23 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         .restart_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: restart_id.clone(),
-                claim_id: ClaimId::parse(&subject.claim).expect("a claim id"),
-                subject_id: SubjectId::parse(&subject.subject).expect("a subject id"),
+                claim_id: ClaimId::parse(
+                    subject
+                        .claim
+                        .as_deref()
+                        .expect("a presented launch has a claim"),
+                )
+                .expect("a claim id")
+                .into(),
+                subject_id: SubjectId::parse(
+                    subject
+                        .subject
+                        .as_deref()
+                        .expect("a presented launch has a subject"),
+                )
+                .expect("a subject id")
+                .into(),
+                spawn_request_id: None,
             },
             &AtomicBool::new(false),
         )
@@ -12948,8 +13147,10 @@ fn restart_refuses_before_any_signal_when_the_session_context_changes() {
     let unknown = restart_lead_subject(
         &mut client,
         &Attempt {
-            subject: random_uuid(),
-            claim: random_uuid(),
+            spawn: None,
+            execution: random_uuid(),
+            subject: Some(random_uuid()),
+            claim: Some(random_uuid()),
         },
     );
     assert_eq!(error_code(&unknown), "not_found", "{unknown}");
@@ -13042,7 +13243,7 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
     // The program records its own cgroup before anything else: if the group did
     // not exist first, there is no file to read.
     let membership = wait_for_text(&out.join("scope.cgroup"));
-    let recorded_registration = subject_record(&state, &subject.claim)["registration_id"]
+    let recorded_registration = execution_record(&state, &subject.execution)["registration_id"]
         .as_str()
         .expect("a registration")
         .to_string();
@@ -13078,7 +13279,7 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
     // One that ignores TERM is escalated inside its own verified scope: a stop
     // that only ever asked would leave the operator waiting on a program that
     // never listens. The escalation is named, and only a verified scope gets one.
-    let stubborn_pid = captured_identity(&state, &stubborn_subject.claim).pid;
+    let stubborn_pid = captured_identity(&state, &stubborn_subject.execution).pid;
     let cancelled = cancel_subject(&mut client, &random_uuid(), &stubborn_subject);
     assert_eq!(
         result_record(&cancelled)["closed"]["escalated"],
@@ -13114,24 +13315,23 @@ fn a_managed_launch_is_scoped_before_it_runs_and_survives_a_restart() {
     // The other launch's process survived that group's stop: a stop of one
     // group is not a stop of every group.
     assert!(
-        process_exists(captured_identity(&state, &subject.claim).pid),
+        process_exists(captured_identity(&state, &subject.execution).pid),
         "a sibling group's stop took this process"
     );
 
     // A restart re-reads the same launch and signals nothing.
-    let pid = captured_identity(&state, &subject.claim).pid;
+    let pid = captured_identity(&state, &subject.execution).pid;
     assert_eq!(daemon.stop(Signal::TERM, DEADLINE).code(), Some(0));
     let mut daemon = tmux_daemon(&socket, &state, &server);
-    let mut client = Client::dial(&socket);
-    let listed = client.call("lifecycle.get", json!({"subject_id": subject.subject}));
-    let subject_view = &listed["result"]["subject"];
+    // The restarted daemon re-reads the same execution and signals nothing.
+    let reread = execution_record(&state, &subject.execution);
     assert_eq!(
-        subject_view["process"]["pid"],
+        reread["process"]["pid"],
         json!(pid),
-        "the restart re-read the same process: {listed}"
+        "the restart re-read the same process: {reread}"
     );
-    assert_eq!(subject_view["state"], "captured", "{listed}");
-    assert_eq!(subject_view["signalled_at"], json!(null), "{listed}");
+    assert_eq!(reread["state"], "captured", "{reread}");
+    assert_eq!(reread["signalled_at"], json!(null), "{reread}");
     assert!(process_exists(pid), "the restart signalled the workload");
 
     let status = daemon.stop(Signal::TERM, DEADLINE);

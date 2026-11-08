@@ -796,8 +796,8 @@ fn abandon_reservation(
         return;
     };
     let registry = Arc::clone(&locked(core).registry);
-    if let Err(error) = subjects::revoke(&registry, &ticket.claim_id, store::now_ms()) {
-        tracing::warn!(%error, claim = %ticket.claim_id, "the abandoned reservation was not revoked");
+    if let Err(error) = subjects::abandon(&registry, &ticket.registration_id, store::now_ms()) {
+        tracing::warn!(%error, execution = %ticket.registration_id, "the abandoned reservation was not revoked");
     }
 }
 

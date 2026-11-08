@@ -4,7 +4,7 @@ use crate::control_plane::answer as answers;
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WakeParams {
-    pub(super) subject_id: ClaimId,
+    pub(super) registration_id: crate::identity::RegistrationId,
     pub(super) server: crate::model::ProcessIdentity,
 }
 
@@ -135,7 +135,7 @@ pub(super) fn retire_pane(
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
     backend: &Arc<dyn RuntimeProvider>,
-    claim_id: &ClaimId,
+    registration_id: &crate::identity::RegistrationId,
     stopping: &Arc<AtomicBool>,
     now_ms: i64,
 ) -> bool {
@@ -143,7 +143,7 @@ pub(super) fn retire_pane(
         cleanup_launch_pane(
             core,
             backend,
-            claim_id,
+            registration_id,
             CleanupIntent::Retire,
             stopping,
             verification,
@@ -171,23 +171,24 @@ fn withdraw_unclaimed_launches(
     };
     let (page, next) = subjects::unclaimed(&registry, cursor.as_deref(), now_ms);
     *cursor = next;
-    for claim_id in page {
-        let mut cleanup = |claim_id: &ClaimId| -> Result<bool, String> {
-            let Some(backend) = &backend else {
-                return Err("this daemon has no backend to close a pane with".into());
+    for registration_id in page {
+        let mut cleanup =
+            |registration_id: &crate::identity::RegistrationId| -> Result<bool, String> {
+                let Some(backend) = &backend else {
+                    return Err("this daemon has no backend to close a pane with".into());
+                };
+                Ok(retire_pane(
+                    core,
+                    verification,
+                    backend,
+                    registration_id,
+                    &stopping,
+                    now_ms,
+                ))
             };
-            Ok(retire_pane(
-                core,
-                verification,
-                backend,
-                claim_id,
-                &stopping,
-                now_ms,
-            ))
-        };
         subjects::withdraw_unclaimed(
             &registry,
-            &claim_id,
+            &registration_id,
             verifier.as_ref(),
             now_ms,
             &mut cleanup,
@@ -212,7 +213,7 @@ pub(super) fn withdraw_unpresented(
             Arc::clone(&core.stopping),
         )
     };
-    let cleanup = |claim_id: &ClaimId| {
+    let cleanup = |registration_id: &crate::identity::RegistrationId| {
         if edge.location.is_none() {
             return Ok(edge.created == RequestOutcome::Refused);
         }
@@ -223,7 +224,7 @@ pub(super) fn withdraw_unpresented(
             core,
             verification,
             backend,
-            claim_id,
+            registration_id,
             &stopping,
             now_ms,
         ))
@@ -306,7 +307,16 @@ pub(super) fn observe_launch_panes(
         if edge.bound.is_none() || edge.withdrawn.is_some() {
             continue;
         }
-        let Some(claim_id) = edge.claim_id.clone() else {
+        let Some(registration_id) = edge.registration_id.clone() else {
+            continue;
+        };
+        // A pane observation is about the subject the execution carries, which a
+        // launch only has once its session attached.
+        let Some(claim_id) = registry::presence::current(registry, &registration_id)
+            .ok()
+            .flatten()
+            .map(|claim| claim.claim_id)
+        else {
             continue;
         };
         let Some(location) = edge.location.as_ref() else {
@@ -327,7 +337,11 @@ pub(super) fn observe_launch_panes(
                 }
             };
         match crate::control_plane::lifecycle::observe_pane(
-            registry, &claim_id, location, evidence, now_ms,
+            registry,
+            &registration_id,
+            location,
+            evidence,
+            now_ms,
         ) {
             Ok(true) => ended += 1,
             Ok(false) => {}
@@ -440,18 +454,22 @@ pub(super) fn wake_request(
         )
     };
     // The wake names the attempt it was armed for, under its wire field name.
-    let claim_id = &params.subject_id;
-    let subject = match subjects::read_claim(&registry, claim_id) {
-        Ok(Some(subject)) => subject,
+    let registration_id = &params.registration_id;
+    // The wake names the execution, which exists from its reservation whether or
+    // not a session has attached a subject. A launch that never presented still
+    // has a pane whose death must be observed.
+    let execution = match crate::control_plane::lifecycle::read_process(&registry, registration_id)
+    {
+        Ok(Some(execution)) => execution,
         Ok(None) => {
             return Response::refused(
                 &request.id,
-                &Refusal::new(Code::NotFound, "launch subject is not recorded"),
+                &Refusal::new(Code::NotFound, "the execution is not recorded"),
             );
         }
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    let edge = match registry.spawn_edge(&subject.process.spawn_request_id) {
+    let edge = match registry.spawn_edge(&execution.spawn_request_id) {
         Ok(Some(edge)) => edge,
         Ok(None) => {
             return Response::refused(
@@ -473,14 +491,14 @@ pub(super) fn wake_request(
     }
     match subjects::observe_exit_from(
         &registry,
-        claim_id,
+        registration_id,
         verifier.as_ref(),
         store::now_ms(),
         subjects::Observer::TmuxHook,
     ) {
         Ok(exited) => {
             if exited {
-                retire_wake(&backend, claim_id, &stopping);
+                retire_wake(&backend, registration_id, &stopping);
             }
             Response::ok(&request.id, json!({ "exited": exited }))
         }

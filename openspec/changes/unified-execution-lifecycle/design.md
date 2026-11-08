@@ -78,3 +78,15 @@ recipes; (2) restart on the same constructor; (3) `spawn.create` and the edge;
 - The observation's spawn binding carries a claim today. If the binding is keyed on
   the registration, the wire revision moves; the target is revision 18 unless the
   implementation shows the binding can stay.
+
+## The read path follows the same split
+
+`lifecycle.get` and `lifecycle.list` answer **subjects**: an agent that has attached a
+session. A launch in flight has no subject, so it is read where it lives — its
+execution record and `spawn.get` — and the tree draws no subject row for it. The
+pane-death wake, the exit sweep and pane observation are keyed on the execution for
+the same reason: they must see a launch that has not presented.
+
+A grant is what creates the subject, and it carries the launch's intent: the
+execution records the parent, owner, run and label, and `enroll_subject` takes them
+from there rather than defaulting, so a spawned child keeps its parent link.

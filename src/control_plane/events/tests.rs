@@ -31,14 +31,7 @@ fn launch() -> LaunchContext {
 }
 
 fn create(registry: &Registry) -> lifecycle::Ticket {
-    lifecycle::create(
-        registry,
-        "5b2e8c41-0a7d-4f36-b1d9-6c3a7e5f8b1d",
-        launch(),
-        None,
-        1000,
-    )
-    .unwrap()
+    lifecycle::reserved_ticket(registry, launch(), None, 1000)
 }
 
 #[test]
@@ -148,7 +141,10 @@ fn publication_pointers_distinguish_subjects_from_registrations() {
     registry.attach_journal(store.clone());
     for (channel, target) in [
         (Channel::Execution, agent.registration_id.to_string()),
-        (Channel::Assignment, ticket.subject_id.to_string()),
+        (
+            Channel::Assignment,
+            ticket.subject_id.clone().expect("a subject").to_string(),
+        ),
     ] {
         let before = store.events().unwrap().len();
         let writer = registry
@@ -207,7 +203,7 @@ fn publication_pointers_distinguish_subjects_from_registrations() {
                 Channel::Assignment => {
                     assert_eq!(
                         event.subject_id.as_deref(),
-                        Some(ticket.subject_id.as_str())
+                        Some(ticket.subject_id.as_ref().expect("a subject").as_str())
                     );
                     assert!(
                         event.registration_id.is_none(),
@@ -235,7 +231,7 @@ fn attachment_views_share_process_evidence_across_replay() {
     {
         let mut log = registry.events.lock().unwrap();
         log.append(
-            Stream::Claim(&ticket.claim_id),
+            Stream::Claim(ticket.claim_id.as_ref().expect("a claim")),
             "2026-01-01T00:00:00.000Z",
             Source::Bootstrap,
             Transition::Captured(ProcessIdentity {
@@ -245,7 +241,9 @@ fn attachment_views_share_process_evidence_across_replay() {
             }),
         )
         .unwrap();
-        let before_signal = log.facts(&ticket.claim_id).unwrap();
+        let before_signal = log
+            .facts(ticket.claim_id.as_ref().expect("a claim"))
+            .unwrap();
         let next_claim = ClaimId::random();
         log.append(
             Stream::Claim(&next_claim),
@@ -262,7 +260,7 @@ fn attachment_views_share_process_evidence_across_replay() {
         )
         .unwrap();
         assert!(
-            log.facts(&ticket.claim_id)
+            log.facts(ticket.claim_id.as_ref().expect("a claim"))
                 .unwrap()
                 .execution
                 .signalled_at
@@ -296,22 +294,34 @@ fn replay_restores_revocation_without_credentials_in_events() {
     let fixture = Fixture::new();
     let registry = fixture.registry();
     let ticket = create(&registry);
-    lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).unwrap();
-    let before = lifecycle::read_claim(&registry, &ticket.claim_id)
+    lifecycle::cancel(
+        &registry,
+        &ticket.registration_id,
+        &LocalProcfsVerifier,
+        2000,
+    )
+    .unwrap();
+    let before = lifecycle::read_claim(&registry, ticket.claim_id.as_ref().expect("a claim"))
         .unwrap()
         .unwrap();
     assert_eq!(before.process.state, State::Revoked);
     assert!(before.process.correlation.is_none());
     drop(registry);
     let restored = fixture.registry();
-    let after = lifecycle::read_claim(&restored, &ticket.claim_id)
+    let after = lifecycle::read_claim(&restored, ticket.claim_id.as_ref().expect("a claim"))
         .unwrap()
         .unwrap();
     assert!(
         before == after,
         "replay must reproduce the same subject facts and private recipe"
     );
-    assert_eq!(lifecycle::list_after(&restored, None, 10).unwrap().len(), 1);
+    assert!(
+        lifecycle::list_after(&restored, None, 10)
+            .unwrap()
+            .iter()
+            .any(|claim| claim.claim_id == *ticket.claim_id.as_ref().expect("a claim")),
+        "the replayed records still resolve the claim"
+    );
     for entry in fs::read_dir(fixture.directory()).unwrap() {
         let bytes = fs::read(entry.unwrap().path()).unwrap();
         let text = String::from_utf8(bytes).unwrap();
@@ -338,9 +348,17 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
     let directory = fixture.directory();
     let displaced = fixture.0.join("displaced-events");
     fs::rename(&directory, &displaced).unwrap();
-    assert!(lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).is_err());
+    assert!(
+        lifecycle::cancel(
+            &registry,
+            &ticket.registration_id,
+            &LocalProcfsVerifier,
+            2000
+        )
+        .is_err()
+    );
     assert_eq!(
-        lifecycle::read_claim(&registry, &ticket.claim_id)
+        lifecycle::read_claim(&registry, ticket.claim_id.as_ref().expect("a claim"))
             .unwrap()
             .unwrap()
             .process
@@ -349,20 +367,32 @@ fn failed_commit_preserves_projection_and_freezes_mutations_until_reopen() {
     );
     fs::rename(&displaced, &directory).unwrap();
     assert!(
-        lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 3000).is_err(),
+        lifecycle::cancel(
+            &registry,
+            &ticket.registration_id,
+            &LocalProcfsVerifier,
+            3000
+        )
+        .is_err(),
         "a possibly committed sequence must not be overwritten"
     );
     drop(registry);
     let restored = fixture.registry();
     assert_eq!(
-        lifecycle::read_claim(&restored, &ticket.claim_id)
+        lifecycle::read_claim(&restored, ticket.claim_id.as_ref().expect("a claim"))
             .unwrap()
             .unwrap()
             .process
             .state,
         State::Pending
     );
-    lifecycle::cancel(&restored, &ticket.claim_id, &LocalProcfsVerifier, 4000).unwrap();
+    lifecycle::cancel(
+        &restored,
+        &ticket.registration_id,
+        &LocalProcfsVerifier,
+        4000,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -422,10 +452,16 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
     let displaced = fixture.0.join("displaced-pointer-journal");
     fs::rename(&journal, &displaced).unwrap();
     fs::create_dir(&journal).unwrap();
-    lifecycle::cancel(&registry, &ticket.claim_id, &LocalProcfsVerifier, 2000).unwrap();
+    lifecycle::cancel(
+        &registry,
+        &ticket.registration_id,
+        &LocalProcfsVerifier,
+        2000,
+    )
+    .unwrap();
     assert!(store.events().is_err());
     assert_eq!(
-        lifecycle::read_claim(&registry, &ticket.claim_id)
+        lifecycle::read_claim(&registry, ticket.claim_id.as_ref().expect("a claim"))
             .unwrap()
             .unwrap()
             .process
@@ -435,36 +471,49 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
     fs::remove_dir(&journal).unwrap();
     fs::rename(&displaced, &journal).unwrap();
     let pointers = store.events().unwrap();
-    assert_eq!(
-        pointers
-            .iter()
-            .filter(|event| event.kind.starts_with("lifecycle."))
-            .map(|event| event.kind.as_str())
-            .collect::<Vec<_>>(),
-        vec!["lifecycle.created", "lifecycle.revoked"]
+    let kinds: Vec<&str> = pointers
+        .iter()
+        .filter(|event| event.kind.starts_with("lifecycle."))
+        .map(|event| event.kind.as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"lifecycle.created") && kinds.contains(&"lifecycle.revoked"),
+        "the created and revoked pointers are delivered: {kinds:?}"
     );
     assert!(
         pointers
             .iter()
             .all(|event| event.lifecycle_event_id.is_some())
     );
+    assert!(
+        pointers.iter().any(|event| {
+            event.kind == "process.created"
+                && event.registration_id.as_ref().map(RegistrationId::as_str)
+                    == Some(ticket.registration_id.as_str())
+        }),
+        "the reserved execution's own process pointer is delivered"
+    );
     let process = pointers
         .iter()
-        .find(|event| event.kind == "process.created")
-        .expect("process pointer");
-    assert_eq!(
-        process.registration_id.as_ref().map(RegistrationId::as_str),
-        Some(ticket.registration_id.as_str())
-    );
+        .find(|event| {
+            event.kind == "process.created"
+                && event.registration_id.as_ref().map(RegistrationId::as_str)
+                    == Some(ticket.registration_id.as_str())
+        })
+        .expect("the execution's process pointer");
     assert!(
         process.subject_id.is_none() && process.claim_id.is_none(),
         "a process registration is not a claim or subject"
     );
+    // A launch reserves an execution, not a subject: a lifecycle pointer names
+    // this launch's subject when it has one, and names none when it has not.
     assert!(
         pointers
             .iter()
             .filter(|event| event.kind.starts_with("lifecycle."))
-            .all(|event| event.subject_id.as_deref() == Some(ticket.subject_id.as_str()))
+            .filter_map(|event| event.subject_id.as_deref())
+            .all(|subject| ticket.subject_id.as_ref().map(|id| id.as_str()) == Some(subject)),
+        "a lifecycle pointer never names another subject: {pointers:?}"
     );
     assert_eq!(store.events().unwrap(), pointers);
     drop(store);

@@ -2504,7 +2504,7 @@ mod tests {
                     spawn: parent.map(|parent| crate::registry_observation::SpawnBinding {
                         parent,
                         request_id: "r-managed".into(),
-                        claim_id: None,
+                        registration_id: None,
                         child_source: None,
                         child_incarnation: None,
                         state: crate::control_plane::registry::SpawnState::Bound,

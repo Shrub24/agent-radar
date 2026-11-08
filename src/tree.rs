@@ -1764,7 +1764,7 @@ mod tests {
                         )
                         .expect("fixture registration"),
                         request_id: format!("req-{pane}"),
-                        claim_id: None,
+                        registration_id: None,
                         child_source: None,
                         child_incarnation: None,
                         state: crate::control_plane::registry::SpawnState::Bound,

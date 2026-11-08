@@ -538,7 +538,7 @@ impl RuntimeProvider for TmuxRuntime {
     /// an earlier slot is left alone.
     fn install_exit_wake(
         &self,
-        _subject_id: &str,
+        _registration_id: &str,
         command: &str,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
@@ -556,11 +556,11 @@ impl RuntimeProvider for TmuxRuntime {
             .map(|_| ())
     }
 
-    /// Unsets only the slots whose command names this launch. tmux indices are
+    /// Unsets only the slots whose command names this execution. tmux indices are
     /// stable across an unset, so the slot read is the slot removed.
-    fn remove_exit_wake(&self, subject_id: &str, cancel: &AtomicBool) -> Result<(), String> {
+    fn remove_exit_wake(&self, registration_id: &str, cancel: &AtomicBool) -> Result<(), String> {
         let listing = self.run_whole(&["show-hooks", "-g", PANE_DIED_HOOK], cancel)?;
-        let marker = format!("--subject {subject_id} ");
+        let marker = format!("--execution {registration_id} ");
         for line in listing.lines() {
             let Some(rest) = line.strip_prefix(PANE_DIED_HOOK) else {
                 continue;

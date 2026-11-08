@@ -1,6 +1,7 @@
-use super::{Registry, read_recorded, record_exit_locked, write};
+use super::{Registry, record_exit_locked};
+use crate::control_plane::events::{Source, Transition};
 use crate::control_plane::registry::{ProcessVerifier, RegistryLocation};
-use crate::identity::ClaimId;
+use crate::identity::RegistrationId;
 use crate::model::ProcessIdentity;
 use crate::process_control::{self, Acquired};
 use crate::timestamp::timestamp_millis;
@@ -91,7 +92,7 @@ pub struct EndedEvidence {
 
 struct Collection<'a> {
     registry: &'a Registry,
-    claim_id: ClaimId,
+    registration_id: RegistrationId,
 }
 impl Drop for Collection<'_> {
     fn drop(&mut self) {
@@ -99,33 +100,35 @@ impl Drop for Collection<'_> {
             .observing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.claim_id);
+            .remove(&self.registration_id);
     }
 }
 
 pub fn observe_exit_from(
     registry: &Registry,
-    claim_id: &ClaimId,
+    registration_id: &RegistrationId,
     verifier: &dyn ProcessVerifier,
     now_ms: i64,
     source: Observer,
 ) -> Result<bool, String> {
-    let subject = read_recorded(registry, claim_id)?;
-    if subject.process.exited_at.is_some() {
+    let Some(execution) = super::read_process(registry, registration_id)? else {
+        return Ok(false);
+    };
+    if execution.exited_at.is_some() {
         return Ok(true);
     }
-    let Some(process) = subject.process.identity else {
+    let Some(process) = execution.identity else {
         return Ok(false);
     };
     let mut collecting = registry.observing.lock().unwrap_or_else(|e| e.into_inner());
-    if !collecting.insert(claim_id.clone()) {
+    if !collecting.insert(registration_id.clone()) {
         // This is a coalesced hint, not evidence that the process is running.
         return Ok(false);
     }
     drop(collecting);
     let _collection = Collection {
         registry,
-        claim_id: claim_id.clone(),
+        registration_id: registration_id.clone(),
     };
     // Physical I/O is outside the shared transition lock. Independent subjects
     // remain admissible even while one verifier is waiting on its source.
@@ -137,28 +140,33 @@ pub fn observe_exit_from(
         Err(_) => Evidence::Unavailable,
     };
     let _transition = registry.transition();
-    let mut current = read_recorded(registry, claim_id)?;
-    if current.process.identity.as_ref() != Some(&process) {
+    let Some(mut current) = super::read_process(registry, registration_id)? else {
+        return Ok(false);
+    };
+    if current.identity.as_ref() != Some(&process) {
         return Err("process binding changed during reconciliation".into());
     }
-    if current.process.exited_at.is_some() {
+    if current.exited_at.is_some() {
         return Ok(true);
     }
     if current
-        .process
         .observation
         .as_ref()
         .is_none_or(|previous| previous.evidence != evidence)
     {
-        let at = crate::control_plane::store::format_millis(now_ms);
-        current.process.observation = Some(Observation {
-            process,
-            evidence,
-            source,
-            changed_at: at.clone(),
-        });
-        current.process.recorded_at = at;
-        write(registry, &current)?;
+        super::record_process_transition(
+            registry,
+            registration_id,
+            Source::ProcessObservation,
+            Transition::Observed(Observation {
+                process,
+                evidence,
+                source,
+                changed_at: crate::control_plane::store::format_millis(now_ms),
+            }),
+            now_ms,
+        )?;
+        super::sync_claim(registry, registration_id)?;
     }
     match acquired {
         Ok(Acquired::Process(_)) => Ok(false),
@@ -179,13 +187,15 @@ pub fn observe_exit_from(
 /// failed, stale or incomplete scan never counts as absence.
 pub fn observe_pane(
     registry: &Registry,
-    claim_id: &ClaimId,
+    registration_id: &RegistrationId,
     location: &RegistryLocation,
     evidence: PaneEvidence,
     now_ms: i64,
 ) -> Result<bool, String> {
-    let subject = read_recorded(registry, claim_id)?;
-    if terminal(&subject) || subject.process.bound_registration_id.is_none() {
+    let Some(subject) = super::read_process(registry, registration_id)? else {
+        return Ok(false);
+    };
+    if terminal(&subject) || subject.bound_registration_id.is_none() {
         return Ok(terminal(&subject));
     }
     let at = crate::control_plane::store::format_millis(now_ms);
@@ -195,25 +205,36 @@ pub fn observe_pane(
         return Ok(false);
     }
     let _transition = registry.transition();
-    let mut current = read_recorded(registry, claim_id)?;
+    let Some(mut current) = super::read_process(registry, registration_id)? else {
+        return Ok(false);
+    };
     if terminal(&current) {
         return Ok(true);
     }
-    if current.process.bound_registration_id.is_none() {
+    if current.bound_registration_id.is_none() {
         return Ok(false);
     }
+    let record = |transition: Transition| {
+        super::record_process_transition(
+            registry,
+            registration_id,
+            Source::ProcessObservation,
+            transition,
+            now_ms,
+        )
+    };
     match evidence {
         PaneEvidence::Unavailable => Ok(false),
         PaneEvidence::Present => {
             // A contradicting observation clears pending confirmation.
-            if current.process.pane_absence.take().is_some() {
-                current.process.recorded_at = at;
-                write(registry, &current)?;
+            if current.pane_absence.take().is_some() {
+                record(Transition::AbsencePending(None))?;
+                super::sync_claim(registry, registration_id)?;
             }
             Ok(false)
         }
         PaneEvidence::Absent => {
-            let pending = match current.process.pane_absence.take() {
+            let pending = match current.pane_absence.take() {
                 Some(pending) if pending.location == *location => PaneAbsence {
                     location: location.clone(),
                     first_seen_at: pending.first_seen_at,
@@ -229,29 +250,26 @@ pub fn observe_pane(
                 },
             };
             if confirmed(&pending, now_ms) {
-                current.process.pane_absence = None;
-                current.process.ended_externally_at = Some(at.clone());
-                current.process.ended_evidence = Some(EndedEvidence {
+                record(Transition::AbsencePending(None))?;
+                record(Transition::EndedExternally(EndedEvidence {
                     reason: EndedReason::PaneLost,
                     source: location.backend.clone(),
                     location: location.clone(),
                     confirmations: pending.confirmations,
                     observed_at: at.clone(),
-                });
-                current.process.recorded_at = at;
-                write(registry, &current)?;
+                }))?;
+                super::sync_claim(registry, registration_id)?;
                 return Ok(true);
             }
-            current.process.pane_absence = Some(pending);
-            current.process.recorded_at = at;
-            write(registry, &current)?;
+            record(Transition::AbsencePending(Some(pending)))?;
+            super::sync_claim(registry, registration_id)?;
             Ok(false)
         }
     }
 }
 
-fn terminal(subject: &super::Claim) -> bool {
-    subject.process.exited_at.is_some() || subject.process.ended_externally_at.is_some()
+fn terminal(execution: &super::ProcessRecord) -> bool {
+    execution.exited_at.is_some() || execution.ended_externally_at.is_some()
 }
 
 /// Whether the window has elapsed with enough fresh confirmations. An unreadable

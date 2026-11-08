@@ -61,8 +61,11 @@ pub trait LifecycleControls: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LifecycleControlRequest {
     pub request_id: String,
-    pub subject_id: crate::identity::SubjectId,
-    pub claim_id: crate::identity::ClaimId,
+    /// The subject the selected row names, with the attachment the caller saw. A
+    /// launch that never presented has neither, and is named by its spawn.
+    pub subject_id: Option<crate::identity::SubjectId>,
+    pub claim_id: Option<crate::identity::ClaimId>,
+    pub spawn_request_id: Option<String>,
 }
 
 /// The operation record the daemon committed, without private launch data.
@@ -202,11 +205,23 @@ impl DaemonRuntime {
         if !self.serves(contract) {
             return Err(self.describe(format!("does not provide `{}`", contract.as_str())));
         }
+        // Each method takes its own shape, and a field it does not take is
+        // refused, so only what the selected row named is sent.
+        let mut params = serde_json::Map::new();
+        if let Some(subject_id) = &request.subject_id {
+            params.insert("subject_id".into(), json!(subject_id));
+        }
+        if let Some(claim_id) = &request.claim_id {
+            params.insert("claim_id".into(), json!(claim_id));
+        }
+        if let Some(spawn_request_id) = &request.spawn_request_id {
+            params.insert("spawn_request_id".into(), json!(spawn_request_id));
+        }
         let result = exchange_with_id_at(
             &self.socket,
             &request.request_id,
             method,
-            json!({"request": {"subject_id": request.subject_id, "claim_id": request.claim_id}, "requester": REQUESTER}),
+            json!({ "request": params, "requester": REQUESTER }),
             cancel,
         )
         .map_err(|failure| failure.message)?;

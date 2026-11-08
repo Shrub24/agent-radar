@@ -19,7 +19,7 @@
           "type": "string"
         },
         "subject_id": {
-          "description": "The durable agent the bound child attaches as. Absent for an edge without\na tracked launch and in records written before it was recorded.",
+          "description": "The durable agent the bound child attaches as. Absent for an edge without\na tracked launch.",
           "type": [
             "string",
             "null"
@@ -109,12 +109,6 @@
             }
           ]
         },
-        "claim_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "created": {
           "$ref": "#/$defs/RequestOutcome"
         },
@@ -165,6 +159,12 @@
         },
         "recorded_at": {
           "type": "string"
+        },
+        "registration_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "request_id": {
           "type": "string"

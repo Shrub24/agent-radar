@@ -455,11 +455,9 @@ pub(super) fn spawn_child(
         None
     };
     if attach && let Some((_, ticket)) = &tracking {
-        let attached = locked(core).registry.attach_subject(
-            &request.id,
-            &ticket.claim_id,
-            &ticket.registration_id,
-        );
+        let attached = locked(core)
+            .registry
+            .attach_execution(&request.id, &ticket.registration_id);
         if let Err(message) = attached {
             let settled = record.complete(Settlement::backend_refused(&message), store::now_ms());
             let _ = write_settled(settled, core);
@@ -687,7 +685,7 @@ pub(super) fn spawn_child(
         Settlement::new(outcome, category, message, effects),
         store::now_ms(),
     );
-    let exit = subjects::spawn_exit(&locked(core).registry, edge.claim_id.as_ref());
+    let exit = subjects::spawn_exit(&locked(core).registry, edge.registration_id.as_ref());
     write_settled_with(done, core, |answer| answer.with_spawn(edge.public(exit)))
 }
 
@@ -832,7 +830,7 @@ pub(super) fn requested_launch(params: &SpawnParams) -> subjects::LaunchContext 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ClaimParams {
-    pub(super) claim_id: ClaimId,
+    pub(super) registration_id: crate::identity::RegistrationId,
     pub(super) correlation: String,
     pub(super) process: ProcessIdentity,
     pub(super) completion_key: String,
@@ -881,18 +879,18 @@ pub(super) fn claim_request(
     {
         return not_awaiting();
     }
-    let claim_id = &params.claim_id;
-    let subject = match subjects::read_claim(&registry, claim_id) {
-        Ok(Some(subject))
-            if subject.process.state == subjects::State::Pending
-                && subject.process.correlation.as_deref() == Some(params.correlation.as_str()) =>
+    let registration_id = &params.registration_id;
+    let execution = match subjects::read_process(&registry, registration_id) {
+        Ok(Some(execution))
+            if execution.state == subjects::State::Pending
+                && execution.correlation.as_deref() == Some(params.correlation.as_str()) =>
         {
-            subject
+            execution
         }
         Ok(_) => return not_awaiting(),
         Err(error) => return Response::refused(&request.id, &Refusal::new(Code::Internal, error)),
     };
-    let Some(placement) = subject.process.placement.clone() else {
+    let Some(placement) = execution.placement.clone() else {
         return not_awaiting();
     };
     let Some(pane) = placement.location.pane.clone() else {
@@ -950,8 +948,13 @@ pub(super) fn claim_request(
     // The wake is installed before the launch is captured, so the program's exit
     // is noticed from the moment it can run. A launch whose wake cannot be
     // installed is never released.
-    if let Err(message) = install_exit_wake(core, &backend, &params.claim_id, &placement, &stopping)
-    {
+    if let Err(message) = install_exit_wake(
+        core,
+        &backend,
+        &params.registration_id,
+        &placement,
+        &stopping,
+    ) {
         return Response::refused(
             &request.id,
             &Refusal::new(Code::BackendUnavailable, message),
@@ -959,7 +962,7 @@ pub(super) fn claim_request(
     }
     match subjects::capture(
         &registry,
-        claim_id,
+        registration_id,
         &params.correlation,
         &params.process,
         &effective,
@@ -969,13 +972,13 @@ pub(super) fn claim_request(
         Ok(()) => respond(
             &request.id,
             Ok(Claimed {
-                registration_id: subject.process.registration_id.clone(),
-                executable: subject.process.launch.executable.clone(),
-                argv: subject.process.launch.argv.clone(),
+                registration_id: execution.registration_id.clone(),
+                executable: execution.launch.executable.clone(),
+                argv: execution.launch.argv.clone(),
             }),
         ),
         Err(error) => {
-            retire_wake(&backend, claim_id, &stopping);
+            retire_wake(&backend, registration_id, &stopping);
             Response::refused(&request.id, &Refusal::new(Code::Refused, error))
         }
     }
@@ -1228,7 +1231,7 @@ pub(super) fn parent_of(pid: i32) -> Option<i32> {
 pub(super) fn install_exit_wake(
     core: &Arc<Mutex<Core>>,
     backend: &Arc<dyn RuntimeProvider>,
-    claim_id: &ClaimId,
+    registration_id: &RegistrationId,
     placement: &subjects::Placement,
     stopping: &AtomicBool,
 ) -> Result<(), String> {
@@ -1240,6 +1243,6 @@ pub(super) fn install_exit_wake(
         .instance
         .as_ref()
         .ok_or("the launch's server generation is unrecorded, so its exit cannot be notified")?;
-    let command = subjects::wake_command(&bootstrap, claim_id, instance)?;
-    backend.install_exit_wake(claim_id.as_str(), &command, stopping)
+    let command = subjects::wake_command(&bootstrap, registration_id, instance)?;
+    backend.install_exit_wake(registration_id.as_str(), &command, stopping)
 }

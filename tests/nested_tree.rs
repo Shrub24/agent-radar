@@ -199,7 +199,7 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                             )
                             .expect("parent registration"),
                             request_id: format!("r-{}", agent.pane_id),
-                            claim_id: None,
+                            registration_id: None,
                             child_source: None,
                             child_incarnation: None,
                             state: agent_radar::control_plane::registry::SpawnState::Bound,

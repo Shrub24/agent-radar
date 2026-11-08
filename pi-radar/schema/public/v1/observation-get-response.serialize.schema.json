@@ -2525,14 +2525,14 @@
             "null"
           ]
         },
-        "claim_id": {
+        "parent": {
+          "type": "string"
+        },
+        "registration_id": {
           "type": [
             "string",
             "null"
           ]
-        },
-        "parent": {
-          "type": "string"
         },
         "request_id": {
           "type": "string"
@@ -2544,7 +2544,7 @@
       "required": [
         "parent",
         "request_id",
-        "claim_id",
+        "registration_id",
         "child_source",
         "child_incarnation",
         "state"

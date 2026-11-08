@@ -115,9 +115,9 @@ fn invoke(invocation: agent_radar::cli::Invocation) -> i32 {
         }
         Invocation::LifecycleWake {
             socket,
-            subject,
+            execution,
             server,
-        } => control_plane::lifecycle::run_wake(&socket, &subject, &server),
+        } => control_plane::lifecycle::run_wake(&socket, &execution, &server),
     }
 }
 

@@ -52,10 +52,12 @@ and Herdsman spawn. The pre-minted registration is handed to the child as
 launches children.
 
 A daemon-created launch starts `radar run --launch` in its pane. It receives the
-launch claim in `PI_RADAR_LAUNCH_CLAIM` and a one-use correlation in
+execution it reserved, in `PI_RADAR_LAUNCH_EXECUTION`, and a one-use correlation in
 `PI_RADAR_LAUNCH_CORRELATION`, asks the daemon (`launch.claim`) to verify its birth
 identity and release the program from the daemon's own record, removes both
-variables, enters the scope and execs the program. The caller never supplies the
+variables, enters the scope and execs the program. The execution is named by its
+registration from the moment it is reserved; a claim exists only for a subject
+that already exists, so a launch reserves none. The caller never supplies the
 program that runs.
 
 A daemon-created agent launch succeeds when its first verified presence is

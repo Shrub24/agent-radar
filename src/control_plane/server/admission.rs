@@ -386,7 +386,7 @@ pub(super) fn execute_command(
             &request,
             SubjectParams {
                 subject_id: Some(subject.subject_id),
-                claim_id: subject.claim_id,
+                claim_id: Some(subject.claim_id),
                 spawn_request_id: None,
             },
             requester,

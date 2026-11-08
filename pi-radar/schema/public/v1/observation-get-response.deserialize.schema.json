@@ -2406,14 +2406,14 @@
             "null"
           ]
         },
-        "claim_id": {
+        "parent": {
+          "type": "string"
+        },
+        "registration_id": {
           "type": [
             "string",
             "null"
           ]
-        },
-        "parent": {
-          "type": "string"
         },
         "request_id": {
           "type": "string"

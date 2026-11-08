@@ -5,7 +5,10 @@ use super::*;
 pub(super) struct SubjectParams {
     #[serde(default)]
     pub(super) subject_id: Option<SubjectId>,
-    pub(super) claim_id: ClaimId,
+    /// The attachment the caller saw, when it saw one. A launch that never
+    /// presented has no claim, so its execution is addressed without one.
+    #[serde(default)]
+    pub(super) claim_id: Option<ClaimId>,
     #[serde(default)]
     pub(super) spawn_request_id: Option<String>,
 }
@@ -46,7 +49,7 @@ pub(super) fn run_subject_control(
     verification: &Arc<VerificationBudget>,
 ) -> Reply {
     let registry = Arc::clone(&locked(core).registry);
-    let (subject_id, target) = cancel_target(&registry, &params)?;
+    let (execution, claimed, target) = cancel_target(&registry, &params)?;
     let now = store::now_ms();
     match admit(operation, request, Some(&target), &requester, now, core) {
         Admission::Answered(response) => return *response,
@@ -55,9 +58,12 @@ pub(super) fn run_subject_control(
         }
         Admission::Dispatch(..) => {}
     }
-    let current_subject = match subjects::read_claim(&registry, &subject_id) {
-        Ok(subject) => subject,
-        Err(error) => return Err(registry_refusal(error)),
+    let current_subject = match &claimed {
+        Some(claim) => match subjects::read_claim(&registry, &claim.claim_id) {
+            Ok(subject) => subject,
+            Err(error) => return Err(registry_refusal(error)),
+        },
+        None => None,
     };
     if current_subject
         .as_ref()
@@ -86,17 +92,18 @@ pub(super) fn run_subject_control(
         )
     };
     let termination = match operation {
-        ops::Operation::Stop => subjects::stop(&registry, &subject_id, verifier.as_ref(), now),
-        _ => subjects::cancel(&registry, &subject_id, verifier.as_ref(), now),
+        ops::Operation::Stop => subjects::stop(&registry, &execution, verifier.as_ref(), now),
+        _ => subjects::cancel(&registry, &execution, verifier.as_ref(), now),
     };
     // Every cancel asks about the launch's own pane, so a launch already cleaned
     // up reports that instead of closing anything again. A bound launch's pane
     // belongs to its child, and a stop leaves the launch exactly as it is.
-    let cleanup = match (&termination, operation, &backend) {
-        (Ok(_), ops::Operation::Cancel, Some(backend)) => cleanup_launch_pane(
+    let execution_key = Some(execution.clone());
+    let cleanup = match (&termination, operation, &backend, &execution_key) {
+        (Ok(_), ops::Operation::Cancel, Some(backend), Some(key)) => cleanup_launch_pane(
             core,
             backend,
-            &subject_id,
+            key,
             CleanupIntent::Close,
             &stopping,
             verification,
@@ -107,21 +114,22 @@ pub(super) fn run_subject_control(
     // The supervisor's report is read back here rather than at the pane, so a
     // close that removed the pane still reports how the program ended. It is
     // absent when nothing reported: never an error, and never a block.
-    let claim = subjects::read_claim(&registry, &subject_id).ok().flatten();
-    let completion = claim
-        .as_ref()
-        .and_then(|claim| claim.process.completion.clone());
+    let ended = subjects::read_process(&registry, &execution).ok().flatten();
+    let completion = ended.as_ref().and_then(|ended| ended.completion.clone());
     let settlement = match termination {
         Ok(termination) => {
-            if let (subjects::Exit::Exited, Some(backend)) = (&termination.exit, &backend) {
-                retire_wake(backend, &subject_id, &stopping);
+            if let (subjects::Exit::Exited, Some(backend), Some(key)) =
+                (&termination.exit, &backend, &execution_key)
+            {
+                retire_wake(backend, key, &stopping);
             }
             // The subject's own attempt is what the close addressed: a read that
             // went astray after the stop leaves the report unexecutioned rather
             // than inventing an identity.
             termination_outcome(
                 &termination,
-                claim.as_ref(),
+                ended.as_ref(),
+                claimed.as_ref().map(|claim| &claim.subject_id),
                 operation,
                 cleanup.as_ref(),
                 completion,
@@ -600,18 +608,25 @@ pub(super) fn restart_lead(
         Ok(prepared) => prepared,
         Err(error) => return Settlement::backend_refused(error),
     };
-    if let Err(error) =
-        registry.attach_subject(successor, &prepared.1.claim_id, &prepared.1.registration_id)
-    {
+    if let Err(error) = registry.attach_execution(successor, &prepared.1.registration_id) {
         return Settlement::backend_refused(error);
     }
+    let reserved = prepared.1.claim_id.as_ref().cloned();
+    let Some(successor_claim) = reserved else {
+        return Settlement::backend_unknown("a restart reserves its successor claim");
+    };
     let mut effects = Vec::new();
-    let termination = subjects::stop(&registry, &subject.claim_id, verifier.as_ref(), now);
+    let termination = subjects::stop(
+        &registry,
+        &subject.process.registration_id,
+        verifier.as_ref(),
+        now,
+    );
     if !termination
         .as_ref()
         .is_ok_and(|result| matches!(result.exit, subjects::Exit::Exited))
         && let Err(error) =
-            subjects::cancel_reservation(&registry, &subject.claim_id, &prepared.1.claim_id, now)
+            subjects::cancel_reservation(&registry, &subject.claim_id, &successor_claim, now)
     {
         return Settlement {
             effects,
@@ -695,7 +710,7 @@ pub(super) fn restart_lead(
             match cleanup_launch_pane(
                 core,
                 &backend,
-                &subject.claim_id,
+                &subject.process.registration_id,
                 CleanupIntent::Retire,
                 &stopping,
                 verification,
@@ -771,33 +786,57 @@ pub(super) fn current_presence_grant(
 pub(super) fn cancel_target(
     registry: &Registry,
     params: &SubjectParams,
-) -> Result<(ClaimId, String), Refusal> {
+) -> Result<(RegistrationId, Option<subjects::Claim>, String), Refusal> {
     let internal = |error: String| Refusal::new(Code::Internal, error);
-    let subject = match (&params.subject_id, &params.spawn_request_id) {
-        (Some(subject_id), None) => subjects::current_attachment(registry, subject_id)
-            .map_err(internal)?
-            .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?,
+    let (execution, claim, target) = match (&params.subject_id, &params.spawn_request_id) {
+        (Some(subject_id), None) => {
+            let subject = subjects::current_attachment(registry, subject_id)
+                .map_err(internal)?
+                .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
+            (
+                subject.process.registration_id.clone(),
+                Some(subject),
+                subject_id.to_string(),
+            )
+        }
         (None, Some(request_id)) => {
             let edge = registry
                 .spawn_edge(request_id)
                 .map_err(internal)?
                 .ok_or_else(|| Refusal::new(Code::NotFound, "spawn is not recorded"))?;
-            let claim_id = edge.claim_id.ok_or_else(|| {
+            let registration_id = edge.registration_id.ok_or_else(|| {
                 Refusal::new(Code::Refused, "spawn is not a lifecycle-tracked launch")
             })?;
-            let launched = subjects::read_claim(registry, &claim_id)
+            let launched = subjects::read_process(registry, &registration_id)
                 .map_err(internal)?
-                .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
-            let subject = subjects::current_attachment(registry, &launched.subject_id)
+                .ok_or_else(|| Refusal::new(Code::NotFound, "launch execution is not recorded"))?;
+            // A launch that never presented has no subject to name, which is the
+            // ordinary state of one that is still in flight.
+            let subject = match registry::presence::current(registry, &launched.registration_id)
                 .map_err(internal)?
-                .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?;
-            if subject.process.registration_id != launched.process.registration_id {
-                return Err(Refusal::new(
-                    Code::Refused,
-                    "the spawn's process was replaced; nothing was signalled",
-                ));
-            }
-            subject
+                .and_then(|claim| claim.subject_id)
+            {
+                Some(subject_id) => {
+                    let subject = subjects::current_attachment(registry, &subject_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| {
+                            Refusal::new(Code::NotFound, "launch subject is not recorded")
+                        })?;
+                    if subject.process.registration_id != launched.registration_id {
+                        return Err(Refusal::new(
+                            Code::Refused,
+                            "the spawn's process was replaced; nothing was signalled",
+                        ));
+                    }
+                    Some(subject)
+                }
+                None => None,
+            };
+            (
+                launched.registration_id.clone(),
+                subject,
+                launched.registration_id.to_string(),
+            )
         }
         _ => {
             return Err(Refusal::new(
@@ -806,16 +845,46 @@ pub(super) fn cancel_target(
             ));
         }
     };
-    let current = subjects::read_subject_record(registry, &subject.subject_id).map_err(internal)?;
-    if params.claim_id != subject.claim_id
-        || current.is_none_or(|record| record.current_claim.as_ref() != Some(&subject.claim_id))
-    {
-        return Err(Refusal::new(
-            Code::Refused,
-            "the requested claim is not current; nothing was signalled",
-        ));
+    // An attached subject is only acted on for the claim the caller saw, so a
+    // stale release cannot revoke a newer grant. An execution with no attachment
+    // has no claim to name, which is the ordinary state of a launch in flight.
+    match (params.claim_id.as_ref(), claim.as_ref()) {
+        (Some(requested), Some(claim)) => {
+            let current =
+                subjects::read_subject_record(registry, &claim.subject_id).map_err(internal)?;
+            // The newest attempt is what a caller may act on, and a reserved
+            // successor is the subject's current claim from the moment the
+            // restart reserves it; a stale release still cannot act.
+            if requested != &claim.claim_id
+                || current.is_none_or(|record| {
+                    record.current_claim.as_ref().or(record.last_claim.as_ref())
+                        != Some(&claim.claim_id)
+                })
+            {
+                return Err(Refusal::new(
+                    Code::Refused,
+                    "the requested claim is not current; nothing was signalled",
+                ));
+            }
+        }
+        // Naming a subject names its attachment: the caller says which claim it
+        // saw, so a stale release cannot act on a newer grant. Only a launch
+        // addressed by its spawn may omit the claim, because it may not have one.
+        (None, Some(_)) => {
+            return Err(Refusal::new(
+                Code::BadParams,
+                "`claim_id` is required when a subject is named",
+            ));
+        }
+        (Some(_), None) => {
+            return Err(Refusal::new(
+                Code::Refused,
+                "the execution has no claim to fence; nothing was signalled",
+            ));
+        }
+        (None, None) => {}
     }
-    Ok((subject.claim_id, subject.subject_id.to_string()))
+    Ok((execution, claim, target))
 }
 
 /// What a cancel or stop established, in the parts a reader acts on.
@@ -827,17 +896,20 @@ pub(super) fn cancel_target(
 /// because only a cancel acts on one.
 pub(super) fn termination_outcome(
     termination: &subjects::Termination,
-    claim: Option<&subjects::Claim>,
+    execution: Option<&subjects::ProcessRecord>,
+    subject_id: Option<&SubjectId>,
     operation: ops::Operation,
     cleanup: Option<&subjects::PaneCleanup>,
     completion: Option<subjects::Completion>,
 ) -> Settlement {
     let closed = subjects::ClosedExecution {
-        executions: claim
-            .map(|claim| {
+        // The execution that was addressed, whether or not it ever attached a
+        // subject: a launch cancelled in flight still ended.
+        executions: execution
+            .map(|execution| {
                 vec![subjects::EndedExecution {
-                    subject_id: Some(claim.subject_id.clone()),
-                    registration_id: claim.process.registration_id.clone(),
+                    subject_id: subject_id.cloned(),
+                    registration_id: execution.registration_id.clone(),
                     end: (&termination.exit).into(),
                     completion: completion.clone(),
                 }]
@@ -871,8 +943,8 @@ pub(super) fn termination_outcome(
 /// left behind names a launch that has ended, and the next wake removes it.
 pub(super) fn retire_wake(
     backend: &Arc<dyn RuntimeProvider>,
-    claim_id: &ClaimId,
+    registration_id: &crate::identity::RegistrationId,
     stopping: &AtomicBool,
 ) {
-    let _ = backend.remove_exit_wake(claim_id.as_str(), stopping);
+    let _ = backend.remove_exit_wake(registration_id.as_str(), stopping);
 }
