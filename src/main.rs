@@ -761,6 +761,8 @@ fn run(sidebar: bool) -> io::Result<()> {
                 dirty |= app.apply_session_update();
                 if offer_workspace && app.session_mirror().is_some() {
                     offer_workspace = false;
+                    // The host starts zoomed, so the picker shows inline in the dashboard.
+                    app.toggle_expanded();
                     app.new_workspace();
                     dirty = true;
                 }

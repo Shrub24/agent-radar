@@ -41,7 +41,8 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
     }
     // A server with no session is offered a workspace picker rather than a
     // placeholder session nobody asked for: the inner pane waits for the first
-    // session to exist, and the sidebar opens the picker.
+    // session to exist, and the sidebar opens the picker. It starts zoomed and
+    // expanded because no client is attached yet for a popup to draw on.
     let empty = String::from_utf8_lossy(&sessions.stdout).trim().is_empty();
     let result = (|| {
         run(&[
@@ -116,7 +117,11 @@ pub fn launch(backend: &str, session: Option<&str>) -> io::Result<()> {
             "client-attached",
             "set-option -t workspace destroy-unattached on",
         ])?;
-        run(&["select-pane", "-t", "%1"])?;
+        if empty {
+            run(&["resize-pane", "-Z", "-t", "%0"])?;
+        } else {
+            run(&["select-pane", "-t", "%1"])?;
+        }
         let status = Command::new(&tmux)
             .args(["-L", &host, "attach-session", "-t", "workspace"])
             .env_remove("TMUX")
