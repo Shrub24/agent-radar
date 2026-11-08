@@ -419,7 +419,7 @@ pub struct Registry {
     admission: Mutex<()>,
     pub(crate) presence: Mutex<()>,
     journal: std::sync::Mutex<Option<crate::control_plane::store::Store>>,
-    pub(crate) observing: Mutex<std::collections::HashSet<String>>,
+    pub(crate) observing: Mutex<std::collections::HashSet<ClaimId>>,
     pub(crate) events: std::sync::Arc<Mutex<crate::control_plane::events::Log>>,
 }
 

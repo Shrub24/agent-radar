@@ -439,8 +439,10 @@ def main():
             "target": {"pane": target},
             "identity": {"pane": {"pane_id": target, "occupant": None}}}, "requester": "acceptance"})
         assert closed["request"]["outcome"] == "completed", closed
-        assert closed["request"]["closed"]["execution"] == {"state": "exited"}, closed
-        assert closed["request"]["closed"]["completion"]["signal"] == 15, closed
+        execution, = closed["request"]["closed"]["executions"]
+        assert execution["registration_id"] == created["registration_id"], closed
+        assert execution["end"] == {"state": "exited"}, closed
+        assert execution["completion"]["signal"] == 15, closed
         assert subprocess.run(["systemctl", "--user", "is-active", unit],
                               capture_output=True).returncode != 0, "pane close left the scope active"
         remaining = accept.tmux("list-panes", "-a", "-F", "#{pane_id}").split()

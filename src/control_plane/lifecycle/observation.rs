@@ -91,7 +91,7 @@ pub struct EndedEvidence {
 
 struct Collection<'a> {
     registry: &'a Registry,
-    subject_id: String,
+    claim_id: ClaimId,
 }
 impl Drop for Collection<'_> {
     fn drop(&mut self) {
@@ -99,7 +99,7 @@ impl Drop for Collection<'_> {
             .observing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.subject_id);
+            .remove(&self.claim_id);
     }
 }
 
@@ -118,14 +118,14 @@ pub fn observe_exit_from(
         return Ok(false);
     };
     let mut collecting = registry.observing.lock().unwrap_or_else(|e| e.into_inner());
-    if !collecting.insert(claim_id.to_string()) {
+    if !collecting.insert(claim_id.clone()) {
         // This is a coalesced hint, not evidence that the process is running.
         return Ok(false);
     }
     drop(collecting);
     let _collection = Collection {
         registry,
-        subject_id: claim_id.to_string(),
+        claim_id: claim_id.clone(),
     };
     // Physical I/O is outside the shared transition lock. Independent subjects
     // remain admissible even while one verifier is waiting on its source.

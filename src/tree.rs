@@ -134,13 +134,13 @@ pub enum RowId {
     Agent(String),
     /// An unresolved registration's row, keyed by its agent id: it has no pane
     /// to key by, and two registrations may name the same reported pane.
-    Registered(String),
+    Registered(crate::identity::RegistrationId),
     /// Ordinary pane row, keyed by its connector-scoped pane id.
     Pane(String),
     /// Background-task row, keyed by owner, session and task id.
     Task(TaskId),
     /// A daemon lifecycle subject not yet represented by a joined agent row.
-    Lifecycle(String),
+    Lifecycle(crate::identity::SubjectId),
 }
 
 /// A display-ready row: everything the tree needs to place it and the detail
@@ -654,7 +654,7 @@ impl FleetTree {
             let title = format!("{state} · subject {short_id}");
             roots.push(TreeNode {
                 row: TreeRow {
-                    id: RowId::Lifecycle(subject.subject_id.to_string()),
+                    id: RowId::Lifecycle(subject.subject_id.clone()),
                     kind: RowKind::Lifecycle(Box::new(LifecycleRow {
                         subject: subject.clone(),
                         title,
@@ -734,14 +734,14 @@ fn agent_node(
     let registry = &agent.registry;
     let id = match registry.binding {
         Binding::Joined => RowId::Agent(location.pane_id.clone()),
-        _ => RowId::Registered(registry.agent.registration.registration_id.to_string()),
+        _ => RowId::Registered(registry.agent.registration.registration_id.clone()),
     };
     // The name a row shows is what Herdsman publishes for this agent — a
     // managed worker's runtime label, a lead's session name — and only then
     // the reported title. A known vendor prefix supplies the identity when
     // the report has none; the prefix itself is stripped from the words.
     let fallback = match &id {
-        RowId::Registered(registration_id) => registration_id.clone(),
+        RowId::Registered(registration_id) => registration_id.to_string(),
         _ => location.pane_id.clone(),
     };
     let raw = agent
@@ -1017,8 +1017,8 @@ fn mark_tab_root(node: &mut TreeNode) {
 /// claimed must not be linked by accident.
 struct Nestable {
     node: TreeNode,
-    parent: Option<String>,
-    registration_id: String,
+    parent: Option<crate::identity::RegistrationId>,
+    registration_id: crate::identity::RegistrationId,
 }
 
 /// What a row claims as its parent.
@@ -1026,7 +1026,7 @@ struct Nestable {
 /// A managed child's parent is the daemon's own spawn edge: Radar recorded which
 /// registration launched it, and that edge is the durable relationship. A
 /// registration with no edge nests nowhere.
-fn parent_claim(agent: &AgentObservation) -> Option<String> {
+fn parent_claim(agent: &AgentObservation) -> Option<crate::identity::RegistrationId> {
     agent
         .registry
         .spawn
@@ -1035,13 +1035,8 @@ fn parent_claim(agent: &AgentObservation) -> Option<String> {
 }
 
 /// The registration id a row is addressed by.
-fn claimed_registration_id(agent: &AgentObservation) -> String {
-    agent
-        .registry
-        .agent
-        .registration
-        .registration_id
-        .to_string()
+fn claimed_registration_id(agent: &AgentObservation) -> crate::identity::RegistrationId {
+    agent.registry.agent.registration.registration_id.clone()
 }
 
 /// Nests agent rows under unambiguous owners within the same group and returns the
@@ -1057,12 +1052,11 @@ fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
         return Vec::new();
     }
 
-    // Registration ids identify agents uniquely; the map is keyed by their
-    // canonical text so no ordering/hashing derive is needed on the id type.
-    let mut by_registration_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_registration_id: HashMap<&crate::identity::RegistrationId, Vec<usize>> =
+        HashMap::new();
     for (index, nestable) in agents.iter().enumerate() {
         by_registration_id
-            .entry(nestable.registration_id.as_str())
+            .entry(&nestable.registration_id)
             .or_default()
             .push(index);
     }
@@ -1071,7 +1065,7 @@ fn nest(mut agents: Vec<Nestable>) -> Vec<TreeNode> {
     for (index, nestable) in agents.iter().enumerate() {
         let owners = nestable
             .parent
-            .as_deref()
+            .as_ref()
             .and_then(|registration_id| by_registration_id.get(registration_id));
         if let Some(owners) = owners
             && owners.len() == 1
@@ -1765,7 +1759,10 @@ mod tests {
                     .agent,
                     binding: crate::registry_observation::Binding::Joined,
                     spawn: parent.map(|parent| crate::registry_observation::SpawnBinding {
-                        parent: crate::test_support::registration_id(parent),
+                        parent: crate::identity::RegistrationId::parse(
+                            &crate::test_support::registration_id(parent),
+                        )
+                        .expect("fixture registration"),
                         request_id: format!("req-{pane}"),
                         claim_id: None,
                         child_source: None,
@@ -2037,9 +2034,15 @@ mod tests {
         let tree = FleetTree::build(&state);
         let rows = flatten(&tree);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, RowId::Lifecycle(PENDING.into()));
+        assert_eq!(
+            rows[0].1,
+            RowId::Lifecycle(SubjectId::parse(PENDING).expect("subject id"))
+        );
         assert!(rows[0].2.contains("pending"));
-        assert_eq!(rows[1].1, RowId::Lifecycle(UNJOINED.into()));
+        assert_eq!(
+            rows[1].1,
+            RowId::Lifecycle(SubjectId::parse(UNJOINED).expect("subject id"))
+        );
         assert!(rows[1].2.contains("unresolved"));
         assert!(rows.iter().all(|(_, id, _)| !matches!(id, RowId::Pane(_))));
     }

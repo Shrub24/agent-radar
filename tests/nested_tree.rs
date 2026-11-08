@@ -194,7 +194,10 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                         agent: registered,
                         binding: registry_observation::Binding::Joined,
                         spawn: agent.parent.and_then(pane_of).map(|parent| SpawnBinding {
-                            parent: support::registration_id(&format!("test-{parent}")),
+                            parent: agent_radar::identity::RegistrationId::parse(
+                                &support::registration_id(&format!("test-{parent}")),
+                            )
+                            .expect("parent registration"),
                             request_id: format!("r-{}", agent.pane_id),
                             claim_id: None,
                             child_source: None,
@@ -1931,14 +1934,25 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
             "00000000-0000-4000-b67a-6ae3a13ae5da",
         ] {
             assert!(
-                node_of(&tree.roots, &RowId::Registered(id.into())).is_some(),
+                node_of(
+                    &tree.roots,
+                    &RowId::Registered(
+                        agent_radar::identity::RegistrationId::parse(id).expect("registration id")
+                    )
+                )
+                .is_some(),
                 "{id} lost its row"
             );
         }
         assert!(
             node_of(
                 &tree.roots,
-                &RowId::Registered("00000000-0000-4000-a4c2-c55cab310d83".into())
+                &RowId::Registered(
+                    agent_radar::identity::RegistrationId::parse(
+                        "00000000-0000-4000-a4c2-c55cab310d83"
+                    )
+                    .expect("registration id")
+                )
             )
             .is_none(),
             "a registration naming no place in this server was shown"
@@ -1958,7 +1972,10 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
         let targets = focus::targets(tree, &state);
         assert!(
             !targets.contains_key(&RowId::Registered(
-                "00000000-0000-4000-876e-ec1b078242f8".into()
+                agent_radar::identity::RegistrationId::parse(
+                    "00000000-0000-4000-876e-ec1b078242f8"
+                )
+                .expect("registration id")
             )),
             "an unresolved row focuses a pane"
         );
@@ -1970,7 +1987,10 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
 
     select(
         &mut app,
-        &RowId::Registered("00000000-0000-4000-876e-ec1b078242f8".into()),
+        &RowId::Registered(
+            agent_radar::identity::RegistrationId::parse("00000000-0000-4000-876e-ec1b078242f8")
+                .expect("registration id"),
+        ),
     );
     // An unresolved agent's refusal belongs to the shared target model, which
     // owns eligibility now.
@@ -2012,7 +2032,10 @@ fn each_authority_is_its_own_line_with_its_publisher_named() {
     );
     let text = details(
         &state,
-        &RowId::Registered("00000000-0000-4000-881f-933511522d40".into()),
+        &RowId::Registered(
+            agent_radar::identity::RegistrationId::parse("00000000-0000-4000-881f-933511522d40")
+                .expect("registration id"),
+        ),
     );
     assert!(text.contains("execution: idle · from pi"), "{text}");
     assert!(
@@ -2058,7 +2081,10 @@ fn execution_done_is_not_assignment_completion_and_silence_is_unknown() {
     );
     let done = details(
         &state,
-        &RowId::Registered("00000000-0000-4000-af68-bc0b24f2e4cc".into()),
+        &RowId::Registered(
+            agent_radar::identity::RegistrationId::parse("00000000-0000-4000-af68-bc0b24f2e4cc")
+                .expect("registration id"),
+        ),
     );
     assert!(done.contains("execution: done · from pi"), "{done}");
     assert!(
@@ -2069,7 +2095,10 @@ fn execution_done_is_not_assignment_completion_and_silence_is_unknown() {
 
     let silent = details(
         &state,
-        &RowId::Registered("00000000-0000-4000-9850-a1102c0d20d8".into()),
+        &RowId::Registered(
+            agent_radar::identity::RegistrationId::parse("00000000-0000-4000-9850-a1102c0d20d8")
+                .expect("registration id"),
+        ),
     );
     assert!(
         silent.contains("execution: unknown — nothing reported"),
@@ -2114,7 +2143,10 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
     );
     let lost = details(
         &state,
-        &RowId::Registered("00000000-0000-4000-bb50-4290f52bcf9f".into()),
+        &RowId::Registered(
+            agent_radar::identity::RegistrationId::parse("00000000-0000-4000-bb50-4290f52bcf9f")
+                .expect("registration id"),
+        ),
     );
     assert!(
         lost.contains("execution: stale — last report expired"),
@@ -2131,7 +2163,10 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
 
     let settling = details(
         &state,
-        &RowId::Registered("00000000-0000-4000-b673-72a6abc84c44".into()),
+        &RowId::Registered(
+            agent_radar::identity::RegistrationId::parse("00000000-0000-4000-b673-72a6abc84c44")
+                .expect("registration id"),
+        ),
     );
     assert!(settling.contains("execution: idle · from pi"), "{settling}");
     assert!(
@@ -2169,14 +2204,24 @@ fn a_child_names_its_exact_parent_and_an_absent_parent_is_said_so() {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let child = unwrapped(details(&state, &RowId::Registered(CHILD.into())));
+    let child = unwrapped(details(
+        &state,
+        &RowId::Registered(
+            agent_radar::identity::RegistrationId::parse(CHILD).expect("registration id"),
+        ),
+    ));
     assert!(
         child.contains(&format!("spawn: child of {OTHER} label ({OTHER}) (bound)")),
         "{child}"
     );
     assert!(!child.contains(&format!("child of {LEAD}")), "{child}");
 
-    let orphan = unwrapped(details(&state, &RowId::Registered(ORPHAN.into())));
+    let orphan = unwrapped(details(
+        &state,
+        &RowId::Registered(
+            agent_radar::identity::RegistrationId::parse(ORPHAN).expect("registration id"),
+        ),
+    ));
     assert!(
         orphan.contains(&format!(
             "spawn: child of {GONE} (not in this view) (bound)"

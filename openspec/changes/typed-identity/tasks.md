@@ -17,4 +17,4 @@
 
 ## 4. UI session
 
-- [ ] 4.1 Type execution references in close and restart plans. Gate green.
+- [x] 4.1 Type execution references in close and restart plans, row identities, frozen occupants and spawn parentage. Keep exit-observation claims and wake/scope inputs typed until their transport boundaries. Formatting, strict Clippy, all Rust targets, SDK typecheck/contracts and 133 tests, OpenSpec validation and checked Nix package build passed. Disposable real-scope acceptance passed: L, same-subject/same-pane restart, D, shared batch escalation, admitted pane close, native pane move, nested workspace close, completion, Ctrl-C and shell return. The harness now checks the exact registration's per-execution close result.

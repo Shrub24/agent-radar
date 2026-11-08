@@ -950,13 +950,8 @@ pub(super) fn claim_request(
     // The wake is installed before the launch is captured, so the program's exit
     // is noticed from the moment it can run. A launch whose wake cannot be
     // installed is never released.
-    if let Err(message) = install_exit_wake(
-        core,
-        &backend,
-        params.claim_id.as_str(),
-        &placement,
-        &stopping,
-    ) {
+    if let Err(message) = install_exit_wake(core, &backend, &params.claim_id, &placement, &stopping)
+    {
         return Response::refused(
             &request.id,
             &Refusal::new(Code::BackendUnavailable, message),
@@ -1233,7 +1228,7 @@ pub(super) fn parent_of(pid: i32) -> Option<i32> {
 pub(super) fn install_exit_wake(
     core: &Arc<Mutex<Core>>,
     backend: &Arc<dyn RuntimeProvider>,
-    subject_id: &str,
+    claim_id: &ClaimId,
     placement: &subjects::Placement,
     stopping: &AtomicBool,
 ) -> Result<(), String> {
@@ -1245,6 +1240,6 @@ pub(super) fn install_exit_wake(
         .instance
         .as_ref()
         .ok_or("the launch's server generation is unrecorded, so its exit cannot be notified")?;
-    let command = subjects::wake_command(&bootstrap, subject_id, instance)?;
-    backend.install_exit_wake(subject_id, &command, stopping)
+    let command = subjects::wake_command(&bootstrap, claim_id, instance)?;
+    backend.install_exit_wake(claim_id.as_str(), &command, stopping)
 }

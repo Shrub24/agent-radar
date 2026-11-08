@@ -7,9 +7,8 @@
 //! never become a second effect.
 //!
 //! Eligibility reads evidence, never the cursor: a stale inventory or a
-//! disappeared target refuses before a question is asked, a managed location is
-//! routed to its owner rather than the runtime, and only positive unmanaged
-//! evidence reaches a direct close.
+//! disappeared target refuses before a question is asked. A managed row freezes
+//! its exact subject and claim; the daemon owns execution and pane closure.
 
 use crate::control_plane::command::{Action as DomainAction, Command, Subject};
 use crate::control_plane::containers::{DeleteRequest, ReloadRequest};

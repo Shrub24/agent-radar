@@ -2880,7 +2880,7 @@ pub fn wrap(
 /// and the server generation the pane was created in; it is a hint, not evidence.
 pub fn wake_command(
     bootstrap: &Bootstrap,
-    subject_id: &str,
+    claim_id: &ClaimId,
     server: &ProcessIdentity,
 ) -> Result<String, String> {
     // The paths are single-quoted for the shell, so a quote in either would end
@@ -2892,7 +2892,7 @@ pub fn wake_command(
         return Err("the daemon's paths cannot be quoted for a pane-death hook".into());
     }
     Ok(format!(
-        "'{}' {WAKE_COMMAND} --socket '{}' --subject {subject_id} --server {}:{}:{}",
+        "'{}' {WAKE_COMMAND} --socket '{}' --subject {claim_id} --server {}:{}:{}",
         bootstrap.executable, bootstrap.socket, server.pid, server.start_ticks, server.boot_id
     ))
 }
@@ -2948,7 +2948,7 @@ pub fn run_launch(socket: &str) -> i32 {
         }
     };
     enter_scope(
-        claimed.registration_id.as_str(),
+        &claimed.registration_id,
         &claimed.executable,
         &claimed.argv,
         ProcessKind::Agent,
@@ -3085,13 +3085,7 @@ fn admit_and_enter(socket: &str, kind: ProcessKind, program: &[String], key: Str
         eprintln!("radar run: the daemon admitted the launch without a registration");
         return 1;
     };
-    enter_scope(
-        registration_id.as_str(),
-        &program[0],
-        &program[1..],
-        kind,
-        false,
-    )
+    enter_scope(&registration_id, &program[0], &program[1..], kind, false)
 }
 
 /// Becomes `executable argv` inside the registration's scope, so the group exists
@@ -3099,13 +3093,13 @@ fn admit_and_enter(socket: &str, kind: ProcessKind, program: &[String], key: Str
 /// an agent is given its registration: a command's children must never inherit an
 /// identity they could present. A claimed launch also drops its launch variables.
 fn enter_scope(
-    registration_id: &str,
+    registration_id: &RegistrationId,
     executable: &str,
     argv: &[String],
     kind: ProcessKind,
     claimed: bool,
 ) -> i32 {
-    let scope = match crate::managed_scope::Scope::for_registration(registration_id) {
+    let scope = match crate::managed_scope::Scope::for_registration(registration_id.as_str()) {
         Ok(scope) => scope,
         Err(message) => {
             eprintln!("radar run: {message}");
@@ -3126,7 +3120,7 @@ fn enter_scope(
     }
     match kind {
         ProcessKind::Agent => {
-            launch.env(crate::runtime::LAUNCH_TOKEN_ENV, registration_id);
+            launch.env(crate::runtime::LAUNCH_TOKEN_ENV, registration_id.as_str());
         }
         ProcessKind::Command => {
             launch.env_remove(crate::runtime::LAUNCH_TOKEN_ENV);

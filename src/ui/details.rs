@@ -975,11 +975,11 @@ pub(super) fn spawn_text(state: &ObservationState, spawn: &SpawnBinding) -> Stri
         .into_iter()
         .flat_map(|inventory| inventory.agents.iter())
         .map(|agent| &agent.registry)
-        .find(|view| view.agent.registration.registration_id.as_str() == spawn.parent);
+        .find(|view| view.agent.registration.registration_id == spawn.parent);
     let parent = match parent.and_then(|view| view.agent.registration.label.as_deref()) {
-        Some(label) => format!("{} ({})", sanitize(label), sanitize(&spawn.parent)),
-        None if parent.is_some() => sanitize(&spawn.parent),
-        None => format!("{} (not in this view)", sanitize(&spawn.parent)),
+        Some(label) => format!("{} ({})", sanitize(label), sanitize(spawn.parent.as_str())),
+        None if parent.is_some() => sanitize(spawn.parent.as_str()),
+        None => format!("{} (not in this view)", sanitize(spawn.parent.as_str())),
     };
     let edge = match spawn.state {
         crate::control_plane::registry::SpawnState::Unbound => "not yet bound",

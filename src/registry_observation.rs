@@ -170,9 +170,9 @@ pub enum Binding {
 /// state is never a process-exit claim: an unresolved child is shown as such.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SpawnBinding {
-    pub parent: String,
+    pub parent: crate::identity::RegistrationId,
     pub request_id: String,
-    pub claim_id: Option<String>,
+    pub claim_id: Option<ClaimId>,
     pub child_source: Option<String>,
     pub child_incarnation: Option<String>,
     pub state: SpawnState,
@@ -424,7 +424,7 @@ fn managed_subject(
         process: claim.clone(),
         metadata: subject.managed.clone(),
         child_close: spawn
-            .filter(|spawn| spawn.claim_id.as_deref() == Some(claim_id.as_str()))
+            .filter(|spawn| spawn.claim_id.as_ref() == Some(&claim_id))
             .and_then(|spawn| {
                 Some(ChildCloseTarget {
                     spawn_request_id: spawn.request_id.clone(),
@@ -451,9 +451,9 @@ fn spawn_binding(agent: &RegistryAgent, topology: &[PublicSpawnTopology]) -> Opt
                 .is_some_and(|bound| bound.registration_id.as_str() == id)
         })
         .map(|edge| SpawnBinding {
-            parent: edge.edge.parent.to_string(),
+            parent: edge.edge.parent.clone(),
             request_id: edge.edge.request_id.clone(),
-            claim_id: edge.edge.claim_id.as_ref().map(ToString::to_string),
+            claim_id: edge.edge.claim_id.clone(),
             child_source: edge.edge.bound.as_ref().map(|bound| bound.source.clone()),
             child_incarnation: edge
                 .edge
@@ -1030,7 +1030,8 @@ mod tests {
         assert_eq!(
             view.spawn,
             Some(SpawnBinding {
-                parent: "0e000000-0000-4000-8000-0000000a7e00".into(),
+                parent: RegistrationId::parse("0e000000-0000-4000-8000-0000000a7e00")
+                    .expect("parent registration"),
                 request_id: "r1".into(),
                 claim_id: None,
                 child_source: Some("test".into()),

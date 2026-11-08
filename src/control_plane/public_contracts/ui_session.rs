@@ -35,7 +35,7 @@ pub enum UiRowId {
         pane_id: String,
     },
     Registered {
-        agent_id: String,
+        agent_id: crate::identity::RegistrationId,
     },
     Pane {
         pane_id: String,
@@ -46,7 +46,7 @@ pub enum UiRowId {
         id: String,
     },
     Lifecycle {
-        subject_id: String,
+        subject_id: crate::identity::SubjectId,
     },
 }
 

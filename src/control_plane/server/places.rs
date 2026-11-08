@@ -1348,7 +1348,7 @@ mod tests {
             identity: TargetIdentity::Pane(PaneIdentity {
                 pane_id: "p".into(),
                 occupant: Some(AgentIdentity {
-                    registration_id: "r".into(),
+                    registration_id: RegistrationId::random(),
                     session: None,
                     run: None,
                 }),

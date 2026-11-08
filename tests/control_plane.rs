@@ -4148,8 +4148,7 @@ fn a_request_id_is_at_most_once_across_methods() {
     // Same id, same target, different contents: the occupant differs, so the
     // stored request does not describe this one.
     let mut changed_contents = frozen_pane("pane:3");
-    changed_contents["request"]["identity"]["pane"]["occupant"] =
-        json!({"registration_id": "another-registration", "session": null, "run": null});
+    changed_contents["request"]["identity"]["pane"]["occupant"] = json!({"registration_id": "00000000-0000-4000-8000-0000000000a4", "session": null, "run": null});
     let reordered = client.call_id(&id, "mux.close", changed_contents);
     assert_eq!(error_code(&reordered), "refused");
     daemon.stop();

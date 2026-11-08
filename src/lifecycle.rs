@@ -136,7 +136,7 @@ pub struct CloseRequest {
 /// occupant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentIdentity {
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
     pub session: Option<SessionIdentity>,
     pub run: Option<String>,
 }
@@ -231,12 +231,7 @@ fn pane_identity(inventory: &FleetObservation, pane_id: &str) -> PaneIdentity {
 
 fn registration_identity(agent: &AgentObservation) -> AgentIdentity {
     AgentIdentity {
-        registration_id: agent
-            .registry
-            .agent
-            .registration
-            .registration_id
-            .to_string(),
+        registration_id: agent.registry.agent.registration.registration_id.clone(),
         session: agent.session.clone(),
         run: agent.facts.run.clone(),
     }

@@ -2449,7 +2449,12 @@ mod tests {
             pane_id: "wM:p1".into(),
         };
         // A parent link is a spawn edge naming the parent's registration now.
-        let parent = owner.map(|owner| format!("reg-{owner}"));
+        let parent = owner.map(|owner| {
+            crate::identity::RegistrationId::parse(&crate::test_support::registration_id(&format!(
+                "reg-{owner}"
+            )))
+            .expect("fixture parent registration")
+        });
         let mut state = ObservationState::new();
         state.apply_success(FleetObservation {
             focus: Default::default(),
