@@ -948,7 +948,7 @@ fn handle_line(
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessGetParams {
-    registration_id: String,
+    registration_id: RegistrationId,
 }
 
 #[derive(serde::Deserialize)]
@@ -963,7 +963,7 @@ struct TasksListParams {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentRetireParams {
-    registration_id: String,
+    registration_id: RegistrationId,
     channel: Channel,
     writer_handle: String,
 }
@@ -977,7 +977,7 @@ struct SpawnGetParams {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LifecycleGetParams {
-    subject_id: String,
+    subject_id: SubjectId,
 }
 
 #[derive(serde::Deserialize)]
@@ -1067,16 +1067,6 @@ fn registry_refusal(error: impl Into<registry::Error>) -> Refusal {
         registry::Error::Refused(_) => Code::Refused,
     };
     Refusal::new(code, error.to_string())
-}
-
-/// An id a request named, refused by its field name when it is not one. Typed
-/// ids enter the daemon here and nowhere else.
-fn id_param<T>(
-    value: &str,
-    field: &str,
-    parse: impl FnOnce(&str, &str) -> Result<T, String>,
-) -> Result<T, Refusal> {
-    parse(value, field).map_err(|error| Refusal::new(Code::BadParams, error))
 }
 
 fn registry_error(request: &Request, error: impl Into<registry::Error>) -> Response {
@@ -1321,15 +1311,15 @@ mod tests {
             "a restart must be fenced or owned"
         );
         let stale = SubjectParams {
-            subject_id: Some(claim.subject_id.to_string()),
-            claim_id: crate::control_plane::random_uuid(),
+            subject_id: Some(claim.subject_id.clone()),
+            claim_id: ClaimId::random(),
             spawn_request_id: None,
         };
         let refusal = cancel_target(&registry, &stale).expect_err("a stale claim is refused");
         assert!(refusal.message.contains("not current"), "{refusal:?}");
         let current = SubjectParams {
-            subject_id: Some(claim.subject_id.to_string()),
-            claim_id: claim.claim_id.to_string(),
+            subject_id: Some(claim.subject_id.clone()),
+            claim_id: claim.claim_id.clone(),
             spawn_request_id: None,
         };
         assert_eq!(

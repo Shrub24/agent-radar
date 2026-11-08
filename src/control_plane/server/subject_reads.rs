@@ -6,15 +6,13 @@ use crate::control_plane::public_contracts::subject::{
 
 pub(super) fn child_record(
     registry: &Registry,
-    registration_id: &str,
-    subject_id: &str,
+    registration_id: &RegistrationId,
+    subject_id: &SubjectId,
 ) -> Result<subjects::SubjectRecord, Refusal> {
-    let registration_id = id_param(registration_id, "registration_id", RegistrationId::required)?;
-    let parent = registry::presence::attachment(registry, &registration_id)
+    let parent = registry::presence::attachment(registry, registration_id)
         .map_err(|error| Refusal::new(Code::Internal, error))?
         .ok_or_else(|| Refusal::new(Code::Refused, "caller has no granted subject"))?;
-    let subject_id = id_param(subject_id, "subject_id", SubjectId::required)?;
-    let record = subjects::read_subject_record(registry, &subject_id)
+    let record = subjects::read_subject_record(registry, subject_id)
         .map_err(|error| Refusal::new(Code::Internal, error))?
         .ok_or_else(|| Refusal::new(Code::NotFound, "subject is not recorded"))?;
     if record.managed.parent_subject_id.as_ref() != Some(&parent.subject_id) {
@@ -51,7 +49,7 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
             child!(params);
             match registry.acquire_writer(
                 &AcquireRequest {
-                    target_id: params.subject_id,
+                    target_id: params.subject_id.to_string(),
                     channel: Channel::Assignment,
                     publisher: params.publisher,
                     replace: params.replace,
@@ -70,7 +68,7 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
             child!(params);
             match registry.publish(
                 &registry::PublishRequest {
-                    target_id: params.subject_id,
+                    target_id: params.subject_id.to_string(),
                     channel: Channel::Assignment,
                     update: params.update,
                 },
@@ -92,7 +90,7 @@ pub(super) fn assignment_request(core: &Arc<Mutex<Core>>, request: &Request) -> 
             };
             child!(params);
             match registry.retire(
-                &params.subject_id,
+                params.subject_id.as_str(),
                 Channel::Assignment,
                 &params.writer_handle,
                 now,
@@ -147,11 +145,7 @@ pub(super) fn subject_read_request(
                 Ok(params) => params,
                 Err(refusal) => return Response::refused(&request.id, &refusal),
             };
-            let subject_id = match id_param(&params.subject_id, "subject_id", SubjectId::required) {
-                Ok(subject_id) => subject_id,
-                Err(refusal) => return Response::refused(&request.id, &refusal),
-            };
-            match subjects::read_subject_record(&registry, &subject_id) {
+            match subjects::read_subject_record(&registry, &params.subject_id) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     return Response::refused(
@@ -237,15 +231,7 @@ pub(super) fn subject_read_request(
             Ok(params) => params,
             Err(refusal) => return Response::refused(&request.id, &refusal),
         };
-        let registration_id = match id_param(
-            &params.registration_id,
-            "registration_id",
-            RegistrationId::required,
-        ) {
-            Ok(registration_id) => registration_id,
-            Err(refusal) => return Response::refused(&request.id, &refusal),
-        };
-        let attachment = match registry::presence::attachment(&registry, &registration_id) {
+        let attachment = match registry::presence::attachment(&registry, &params.registration_id) {
             Ok(Some(attachment)) => attachment,
             Ok(None) => {
                 return Response::refused(
@@ -323,7 +309,7 @@ pub(super) fn subject_read_request(
                 }
                 let next = entries.last().map(
                     |entry: &crate::control_plane::public_contracts::subject::Subject| {
-                        entry.subject_id.clone()
+                        entry.subject_id.to_string()
                     },
                 );
                 return respond(

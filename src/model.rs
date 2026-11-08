@@ -601,8 +601,8 @@ impl AgentObservation {
 /// Public lifecycle identity carried into the display projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LifecycleObservation {
-    pub subject_id: String,
-    pub bound_registration_id: Option<String>,
+    pub subject_id: crate::identity::SubjectId,
+    pub bound_registration_id: Option<crate::identity::RegistrationId>,
     pub process: Option<ProcessIdentity>,
     pub state: LifecycleState,
     pub session: Option<String>,
@@ -1108,7 +1108,10 @@ mod tests {
             status,
             session: None,
             facts,
-            registry: crate::registry_observation::RegistryView::test_joined("test-wA:p1", "wA:p1"),
+            registry: crate::registry_observation::RegistryView::test_joined(
+                "00000000-0000-4000-b32b-496fcfe9f8a8",
+                "wA:p1",
+            ),
         }
     }
 

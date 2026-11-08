@@ -25,7 +25,7 @@ const REVALIDATE: std::time::Duration = std::time::Duration::from_secs(5);
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WatchOpen {
-    registration_id: String,
+    registration_id: crate::identity::RegistrationId,
 }
 
 pub(super) fn open(
@@ -143,7 +143,7 @@ async fn attention(registry: Arc<Registry>, messages: Arc<MessageStore>, open: &
     let resolved = tokio::task::spawn_blocking(move || {
         let registry = registry;
         match super::message_lane::message_identity(&registry, &registration) {
-            Ok(identity) => Ok(Some(messages.attention(&identity.subject_id))),
+            Ok(identity) => Ok(Some(messages.attention(identity.subject_id.as_str()))),
             Err(crate::control_plane::messages::Error::NotFound)
             | Err(crate::control_plane::messages::Error::Invalid(_))
             | Err(crate::control_plane::messages::Error::WrongRecipient) => Ok(None),

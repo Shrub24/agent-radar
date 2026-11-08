@@ -14,11 +14,11 @@ pub struct Report {
     pub incarnation: String,
     pub process: crate::model::ProcessIdentity,
     pub session_id: String,
-    pub claim_id: String,
+    pub claim_id: crate::identity::ClaimId,
     #[serde(default)]
-    pub registration_id: Option<String>,
+    pub registration_id: Option<crate::identity::RegistrationId>,
     #[serde(default)]
-    pub subject_id: Option<String>,
+    pub subject_id: Option<crate::identity::SubjectId>,
     #[serde(default)]
     pub location: Option<RegistryLocation>,
     #[serde(default)]
@@ -32,8 +32,8 @@ pub struct Report {
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
-    pub registration_id: String,
-    pub claim_id: String,
+    pub registration_id: crate::identity::RegistrationId,
+    pub claim_id: crate::identity::ClaimId,
     pub process: crate::model::ProcessIdentity,
 }
 
@@ -55,13 +55,13 @@ pub fn registration(
                 run: report.run.clone(),
                 label: report.label.clone(),
                 launch: None,
-                spawn_token: report.registration_id.clone(),
+                spawn_token: report.registration_id.as_ref().map(ToString::to_string),
             },
             now_ms,
         )
     };
     if let Some(id) = &report.registration_id {
-        if let Some(existing) = registry.get(&RegistrationId::required(id, "registration_id")?)? {
+        if let Some(existing) = registry.get(id)? {
             if existing.request.process.as_ref() != Some(&report.process)
                 || existing.request.source != report.source
                 || existing.request.incarnation != report.incarnation
@@ -72,17 +72,13 @@ pub fn registration(
             super::spawn::heal_binding(registry, &existing.request, now_ms)?;
             return Ok(existing);
         }
-        if crate::control_plane::lifecycle::read_process(
-            registry,
-            &RegistrationId::required(id, "registration_id")?,
-        )?
-        .is_some_and(|process| {
+        if crate::control_plane::lifecycle::read_process(registry, id)?.is_some_and(|process| {
             process.kind == crate::control_plane::lifecycle::ProcessKind::Command
         }) {
             return Err("a managed command is not an agent and cannot be attached".into());
         }
-        if super::spawn::launched_registration(registry, Some(id))?
-            .is_none_or(|admitted| admitted.as_str() != id)
+        if super::spawn::launched_registration(registry, Some(id.as_str()))?
+            .is_none_or(|admitted| &admitted != id)
         {
             return Err("registration was not admitted by a managed launch".into());
         }
@@ -136,20 +132,20 @@ pub struct Decision {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Answer {
-    pub registration_id: String,
-    pub claim_id: String,
+    pub registration_id: crate::identity::RegistrationId,
+    pub claim_id: crate::identity::ClaimId,
     pub standing: Standing,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub subject_id: Option<String>,
+    pub subject_id: Option<crate::identity::SubjectId>,
 }
 
 impl From<&Decision> for Answer {
     fn from(claim: &Decision) -> Self {
         Self {
-            registration_id: claim.registration_id.to_string(),
-            claim_id: claim.claim_id.to_string(),
+            registration_id: claim.registration_id.clone(),
+            claim_id: claim.claim_id.clone(),
             standing: claim.standing.clone(),
-            subject_id: claim.subject_id.as_ref().map(ToString::to_string),
+            subject_id: claim.subject_id.clone(),
         }
     }
 }

@@ -2073,7 +2073,11 @@ mod tests {
                 status: Some(status),
                 session: None,
                 facts,
-                registry: joined("test-wH:p1", "wH:p1", "worker task"),
+                registry: joined(
+                    "00000000-0000-4000-ac8c-2f347aceb4ef",
+                    "wH:p1",
+                    "worker task",
+                ),
             }],
         });
         state
@@ -2306,7 +2310,7 @@ mod tests {
                 session: None,
                 facts: crate::model::HerdsmanFacts::default(),
                 registry: joined(
-                    &format!("test-wL:p{i:02}"),
+                    &crate::test_support::registration_id(&format!("test-wL:p{i:02}")),
                     "wL:p01",
                     &format!("agent number {i:02}"),
                 ),
@@ -3166,7 +3170,7 @@ mod tests {
                         "agent": {
                             "registration": {
                                 "version": 1,
-                                "registration_id": format!("test-{pane}"),
+                                "registration_id": crate::test_support::registration_id(&format!("test-{pane}")),
                                 "registered_at": "2026-01-01T00:00:00.000Z",
                                 "source": "pi",
                                 "incarnation": format!("inc-{pane}"),
@@ -5910,7 +5914,7 @@ mod tests {
         row.registry = serde_json::from_value(serde_json::json!({
             "agent": {
                 "registration": {
-                    "version": 1, "registration_id": "process-registration",
+                    "version": 1, "registration_id": "00000000-0000-4000-acaa-0310e03befab",
                     "registered_at": "2026-01-01T00:00:00Z", "source": "herdsman-pi",
                     "incarnation": "11111111-1111-4111-8111-111111111111",
                     "process_claimed": true, "launch": {"available": false}
@@ -6919,7 +6923,7 @@ mod tests {
                     agent: serde_json::from_value(serde_json::json!({
                         "registration": {
                             "version": 1,
-                            "registration_id": "managed-agent",
+                            "registration_id": "00000000-0000-4000-b59c-aa3ea5c0e3e4",
                             "registered_at": "2026-01-01T00:00:00Z",
                             "source": "test",
                             "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -6935,8 +6939,8 @@ mod tests {
                     binding: crate::registry_observation::Binding::Joined,
                     spawn: None,
                     managed: Some(crate::registry_observation::ManagedSubject {
-                        subject_id: "subject-managed".into(),
-                    claim_id: "claim-managed".into(),
+                        subject_id: crate::identity::SubjectId::random(),
+                    claim_id: crate::identity::ClaimId::random(),
                         process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
                         metadata: crate::control_plane::lifecycle::ManagedMetadata::default(),
                         child_close: None,

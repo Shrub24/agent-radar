@@ -19,7 +19,7 @@ pub(crate) fn read(
         .transpose()?
         .flatten();
     let mut result = Subject {
-        subject_id: record.subject_id.to_string(),
+        subject_id: record.subject_id.clone(),
         session_id: record.session,
         managed: record.managed,
         state: AttachmentState::Detached,

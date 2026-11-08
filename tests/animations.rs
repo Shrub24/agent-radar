@@ -45,9 +45,10 @@ unknown = "diamond"
         }
     }
 
+    let subject_id = agent_radar::identity::SubjectId::random();
     let mut observation = FleetObservation::default();
     observation.lifecycle_subjects.push(LifecycleObservation {
-        subject_id: "pending-subject".into(),
+        subject_id: subject_id.clone(),
         bound_registration_id: None,
         process: None,
         state: LifecycleState::Pending,
@@ -77,7 +78,10 @@ unknown = "diamond"
         .collect::<Vec<_>>()
         .join("\\n");
     let loading = theme::frame(theme::command_frames().expect("configured frames"), 0);
-    assert!(rendered.contains(&format!("{loading} pending · subject pending-")));
+    assert!(rendered.contains(&format!(
+        "{loading} pending · subject {}",
+        &subject_id.as_str()[..8]
+    )));
 
     for (state, mark) in [
         (AgentState::Working, '⣀'),

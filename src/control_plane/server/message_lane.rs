@@ -8,7 +8,7 @@ use crate::control_plane::public_contracts::{
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MessageInboxParams {
-    pub(super) registration_id: String,
+    pub(super) registration_id: RegistrationId,
     #[serde(default)]
     pub(super) after: Option<String>,
     #[serde(default)]
@@ -18,7 +18,7 @@ pub(super) struct MessageInboxParams {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MessageReadParams {
-    pub(super) registration_id: String,
+    pub(super) registration_id: RegistrationId,
     pub(super) message_id: String,
 }
 
@@ -76,8 +76,8 @@ pub(super) fn message_request(core: &Arc<Mutex<Core>>, request: &Request) -> Res
                             &store,
                             "communication.message_published",
                             &message.id,
-                            message.recipients.first().cloned(),
-                            &message.producer.registration_id,
+                            message.recipients.first().map(ToString::to_string),
+                            message.producer.registration_id.as_str(),
                         );
                     }
                     respond(
@@ -98,7 +98,7 @@ pub(super) fn message_request(core: &Arc<Mutex<Core>>, request: &Request) -> Res
                 Err(error) => return message_error(request, error),
             };
             let limit = params.limit.unwrap_or(messages::MAX_PAGE);
-            match messages.page(&identity.subject_id, params.after.as_deref(), limit) {
+            match messages.page(identity.subject_id.as_str(), params.after.as_deref(), limit) {
                 Ok((message_ids, next)) => respond(
                     &request.id,
                     Ok(crate::control_plane::public_contracts::MessagePage { message_ids, next }),
@@ -115,7 +115,7 @@ pub(super) fn message_request(core: &Arc<Mutex<Core>>, request: &Request) -> Res
                 Ok(identity) => identity,
                 Err(error) => return message_error(request, error),
             };
-            match messages.get(&params.message_id, &identity.subject_id) {
+            match messages.get(&params.message_id, identity.subject_id.as_str()) {
                 Ok((message, receipt)) => {
                     respond(&request.id, Ok(answers::ReadMessage { message, receipt }))
                 }
@@ -140,8 +140,8 @@ pub(super) fn message_request(core: &Arc<Mutex<Core>>, request: &Request) -> Res
                             &store,
                             "communication.message_received",
                             &receipt.message_id,
-                            Some(identity.subject_id.clone()),
-                            &identity.registration_id,
+                            Some(identity.subject_id.to_string()),
+                            identity.registration_id.as_str(),
                         );
                     }
                     respond(
@@ -173,7 +173,10 @@ pub(super) fn attention_for(
     messages: &MessageStore,
     registration_id: &str,
 ) -> AttentionHint {
-    let identity = match message_identity(registry, registration_id) {
+    let Ok(registration_id) = RegistrationId::required(registration_id, "registration_id") else {
+        return AttentionHint::None;
+    };
+    let identity = match message_identity(registry, &registration_id) {
         Ok(identity) => identity,
         Err(
             messages::Error::NotFound
@@ -182,17 +185,15 @@ pub(super) fn attention_for(
         ) => return AttentionHint::None,
         Err(_) => return AttentionHint::Unavailable,
     };
-    AttentionHint::Waiting(messages.attention(&identity.subject_id))
+    AttentionHint::Waiting(messages.attention(identity.subject_id.as_str()))
 }
 
 pub(super) fn message_identity(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
 ) -> Result<AgentIdentity, messages::Error> {
-    let registration_id = RegistrationId::required(registration_id, "registration_id")
-        .map_err(messages::Error::Invalid)?;
     let context = registry
-        .context(&registration_id, unix_millis())
+        .context(registration_id, unix_millis())
         .map_err(messages::Error::Internal)?
         .ok_or(messages::Error::NotFound)?;
     if context.context.freshness != crate::control_plane::registry::publication::Freshness::Fresh {
@@ -204,7 +205,7 @@ pub(super) fn message_identity(
         .context
         .session
         .ok_or_else(|| messages::Error::Invalid("sender has no current Pi session".into()))?;
-    let attachment = registry::presence::attachment(registry, &registration_id)
+    let attachment = registry::presence::attachment(registry, registration_id)
         .map_err(messages::Error::Internal)?
         .ok_or_else(|| {
             messages::Error::Invalid("message operations require a current granted claim".into())
@@ -216,10 +217,10 @@ pub(super) fn message_identity(
             messages::Error::Invalid("the granted claim does not match the current session".into())
         })?;
     Ok(AgentIdentity {
-        registration_id: registration_id.to_string(),
+        registration_id: registration_id.clone(),
         session_id,
-        subject_id: subject.subject_id.to_string(),
-        claim_id: subject.claim_id.to_string(),
+        subject_id: subject.subject_id,
+        claim_id: subject.claim_id,
     })
 }
 
@@ -229,7 +230,7 @@ pub(super) fn validate_producer_recipients(
     registry: &Registry,
     producer: &AgentIdentity,
     body: &PublishBody,
-    recipients: &[String],
+    recipients: &[SubjectId],
 ) -> Result<(), messages::Error> {
     let PublishBody::Handoff { .. } = body;
     let [recipient] = recipients else {
@@ -237,19 +238,15 @@ pub(super) fn validate_producer_recipients(
             "a handoff names exactly one recipient".into(),
         ));
     };
-    let producer_subject = SubjectId::required(&producer.subject_id, "subject_id")
-        .map_err(messages::Error::Internal)?;
-    let parent = subjects::current_attachment(registry, &producer_subject)
+    let parent = subjects::current_attachment(registry, &producer.subject_id)
         .map_err(messages::Error::Internal)?
         .ok_or(messages::Error::NotFound)?
         .managed
         .parent_subject_id;
-    if !messages::is_parent_recipient(parent.as_ref().map(SubjectId::as_str), recipient) {
+    if !messages::is_parent_recipient(parent.as_ref().map(SubjectId::as_str), recipient.as_str()) {
         return Err(messages::Error::WrongRecipient);
     }
-    // A recipient that is not a subject id names no subject.
-    let recipient = SubjectId::parse(recipient).ok_or(messages::Error::NotFound)?;
-    subjects::current_attachment(registry, &recipient)
+    subjects::current_attachment(registry, recipient)
         .map_err(messages::Error::Internal)?
         .ok_or(messages::Error::NotFound)?;
     Ok(())

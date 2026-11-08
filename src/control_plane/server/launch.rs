@@ -832,7 +832,7 @@ pub(super) fn requested_launch(params: &SpawnParams) -> subjects::LaunchContext 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ClaimParams {
-    pub(super) claim_id: String,
+    pub(super) claim_id: ClaimId,
     pub(super) correlation: String,
     pub(super) process: ProcessIdentity,
     pub(super) completion_key: String,
@@ -881,10 +881,8 @@ pub(super) fn claim_request(
     {
         return not_awaiting();
     }
-    let Some(claim_id) = ClaimId::parse(&params.claim_id) else {
-        return not_awaiting();
-    };
-    let subject = match subjects::read_claim(&registry, &claim_id) {
+    let claim_id = &params.claim_id;
+    let subject = match subjects::read_claim(&registry, claim_id) {
         Ok(Some(subject))
             if subject.process.state == subjects::State::Pending
                 && subject.process.correlation.as_deref() == Some(params.correlation.as_str()) =>
@@ -952,8 +950,13 @@ pub(super) fn claim_request(
     // The wake is installed before the launch is captured, so the program's exit
     // is noticed from the moment it can run. A launch whose wake cannot be
     // installed is never released.
-    if let Err(message) = install_exit_wake(core, &backend, &params.claim_id, &placement, &stopping)
-    {
+    if let Err(message) = install_exit_wake(
+        core,
+        &backend,
+        params.claim_id.as_str(),
+        &placement,
+        &stopping,
+    ) {
         return Response::refused(
             &request.id,
             &Refusal::new(Code::BackendUnavailable, message),
@@ -961,7 +964,7 @@ pub(super) fn claim_request(
     }
     match subjects::capture(
         &registry,
-        &claim_id,
+        claim_id,
         &params.correlation,
         &params.process,
         &effective,
@@ -971,13 +974,13 @@ pub(super) fn claim_request(
         Ok(()) => respond(
             &request.id,
             Ok(Claimed {
-                registration_id: subject.process.registration_id.to_string(),
+                registration_id: subject.process.registration_id.clone(),
                 executable: subject.process.launch.executable.clone(),
                 argv: subject.process.launch.argv.clone(),
             }),
         ),
         Err(error) => {
-            retire_wake(&backend, &claim_id, &stopping);
+            retire_wake(&backend, claim_id, &stopping);
             Response::refused(&request.id, &Refusal::new(Code::Refused, error))
         }
     }
@@ -1191,7 +1194,7 @@ pub(super) fn admit_request(
     respond(
         &request.id,
         Ok(Admitted {
-            registration_id: process.registration_id.to_string(),
+            registration_id: process.registration_id.clone(),
         }),
     )
 }

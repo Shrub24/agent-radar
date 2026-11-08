@@ -4,7 +4,7 @@ use crate::control_plane::answer as answers;
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WakeParams {
-    pub(super) subject_id: String,
+    pub(super) subject_id: ClaimId,
     pub(super) server: crate::model::ProcessIdentity,
 }
 
@@ -256,7 +256,7 @@ pub(super) fn management_view(
     };
     match subjects::attachment(registry, registration_id, &session, now_ms) {
         Ok(subjects::Attachment::Own(subject)) => answers::Management::Managed {
-            subject_id: subject.subject_id.to_string(),
+            subject_id: subject.subject_id,
         },
         Ok(subjects::Attachment::Other(_)) => answers::Management::Duplicate,
         Ok(subjects::Attachment::Free) | Err(_) => answers::Management::Unmanaged,
@@ -440,11 +440,8 @@ pub(super) fn wake_request(
         )
     };
     // The wake names the attempt it was armed for, under its wire field name.
-    let claim_id = match id_param(&params.subject_id, "subject_id", ClaimId::required) {
-        Ok(claim_id) => claim_id,
-        Err(refusal) => return Response::refused(&request.id, &refusal),
-    };
-    let subject = match subjects::read_claim(&registry, &claim_id) {
+    let claim_id = &params.subject_id;
+    let subject = match subjects::read_claim(&registry, claim_id) {
         Ok(Some(subject)) => subject,
         Ok(None) => {
             return Response::refused(
@@ -476,14 +473,14 @@ pub(super) fn wake_request(
     }
     match subjects::observe_exit_from(
         &registry,
-        &claim_id,
+        claim_id,
         verifier.as_ref(),
         store::now_ms(),
         subjects::Observer::TmuxHook,
     ) {
         Ok(exited) => {
             if exited {
-                retire_wake(&backend, &claim_id, &stopping);
+                retire_wake(&backend, claim_id, &stopping);
             }
             Response::ok(&request.id, json!({ "exited": exited }))
         }

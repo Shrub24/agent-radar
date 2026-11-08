@@ -381,7 +381,10 @@ mod tests {
             status: Some(status),
             session,
             facts: crate::model::HerdsmanFacts::default(),
-            registry: crate::registry_observation::RegistryView::test_joined("test-wA:p1", "wA:p1"),
+            registry: crate::registry_observation::RegistryView::test_joined(
+                "00000000-0000-4000-b32b-496fcfe9f8a8",
+                "wA:p1",
+            ),
         }
     }
 

@@ -757,7 +757,7 @@ pub(super) fn overview_lines(
         RowKind::Lifecycle(lifecycle) => {
             let subject = &lifecycle.subject;
             page.push(field("kind", "unjoined lifecycle subject".to_string()));
-            page.push(field("subject", subject.subject_id.clone()));
+            page.push(field("subject", subject.subject_id.to_string()));
             page.push(field(
                 "state",
                 format!("{:?}", subject.state).to_lowercase(),
@@ -766,7 +766,7 @@ pub(super) fn overview_lines(
                 "binding",
                 subject
                     .bound_registration_id
-                    .as_deref()
+                    .as_ref()
                     .map(|agent| format!("unresolved registration {agent}"))
                     .unwrap_or_else(|| "awaiting registration".to_string()),
             ));
@@ -815,7 +815,7 @@ pub(super) fn registration_identifier(agent: &AgentRow) -> String {
     if let Some(view) = agent.registry.as_ref() {
         return match view.agent.registration.label.as_deref() {
             Some(label) => sanitize(label),
-            None => sanitize(&view.agent.registration.registration_id),
+            None => sanitize(view.agent.registration.registration_id.as_str()),
         };
     }
     unavailable()
@@ -975,7 +975,7 @@ pub(super) fn spawn_text(state: &ObservationState, spawn: &SpawnBinding) -> Stri
         .into_iter()
         .flat_map(|inventory| inventory.agents.iter())
         .map(|agent| &agent.registry)
-        .find(|view| view.agent.registration.registration_id == spawn.parent);
+        .find(|view| view.agent.registration.registration_id.as_str() == spawn.parent);
     let parent = match parent.and_then(|view| view.agent.registration.label.as_deref()) {
         Some(label) => format!("{} ({})", sanitize(label), sanitize(&spawn.parent)),
         None if parent.is_some() => sanitize(&spawn.parent),

@@ -187,7 +187,7 @@ impl TreeRow {
             // it: the id is what a filter is usually typed from.
             RowKind::Task(task) => [Some(&task.id.id), None],
             RowKind::Lifecycle(lifecycle) => [
-                Some(&lifecycle.subject.subject_id),
+                Some(lifecycle.subject.subject_id.as_str()),
                 Some(lifecycle_state_label(lifecycle.subject.state)),
             ],
             _ => [None, None],
@@ -650,11 +650,11 @@ impl FleetTree {
                 continue;
             }
             let state = lifecycle_state_label(subject.state);
-            let short_id = subject.subject_id.get(..8).unwrap_or(&subject.subject_id);
+            let short_id = &subject.subject_id.as_str()[..8];
             let title = format!("{state} · subject {short_id}");
             roots.push(TreeNode {
                 row: TreeRow {
-                    id: RowId::Lifecycle(subject.subject_id.clone()),
+                    id: RowId::Lifecycle(subject.subject_id.to_string()),
                     kind: RowKind::Lifecycle(Box::new(LifecycleRow {
                         subject: subject.clone(),
                         title,
@@ -734,7 +734,7 @@ fn agent_node(
     let registry = &agent.registry;
     let id = match registry.binding {
         Binding::Joined => RowId::Agent(location.pane_id.clone()),
-        _ => RowId::Registered(registry.agent.registration.registration_id.clone()),
+        _ => RowId::Registered(registry.agent.registration.registration_id.to_string()),
     };
     // The name a row shows is what Herdsman publishes for this agent — a
     // managed worker's runtime label, a lead's session name — and only then
@@ -1036,7 +1036,12 @@ fn parent_claim(agent: &AgentObservation) -> Option<String> {
 
 /// The registration id a row is addressed by.
 fn claimed_registration_id(agent: &AgentObservation) -> String {
-    agent.registry.agent.registration.registration_id.clone()
+    agent
+        .registry
+        .agent
+        .registration
+        .registration_id
+        .to_string()
 }
 
 /// Nests agent rows under unambiguous owners within the same group and returns the
@@ -1524,7 +1529,12 @@ mod tests {
 
     #[test]
     fn a_bolt_title_selects_the_pi_bolt_row_identity() {
-        let mut agent = registered_agent("lead", "wA:p1", "wA:t1", None);
+        let mut agent = registered_agent(
+            "00000000-0000-4000-9df1-b3bfe1a3bd2a",
+            "wA:p1",
+            "wA:t1",
+            None,
+        );
         agent.registry.agent.registration.label = Some("Bolt - Inspect Bifrost".into());
 
         let tree = FleetTree::build(&two_agent_window(vec![agent]));
@@ -1542,8 +1552,18 @@ mod tests {
         // produces: the daemon's own spawn edge is the only parent relationship,
         // and the child must still nest under the parent it names.
         let state = two_agent_window(vec![
-            registered_agent("parent-1", "wA:p1", "wA:t1", None),
-            registered_agent("child-1", "wA:p2", "wA:t1", Some("parent-1")),
+            registered_agent(
+                "00000000-0000-4000-a867-8ccab8ecaaaa",
+                "wA:p1",
+                "wA:t1",
+                None,
+            ),
+            registered_agent(
+                "00000000-0000-4000-96a1-9730cb1b564c",
+                "wA:p2",
+                "wA:t1",
+                Some("00000000-0000-4000-a867-8ccab8ecaaaa"),
+            ),
         ]);
         let tree = FleetTree::build(&state);
 
@@ -1570,8 +1590,18 @@ mod tests {
         // The edge names a registration this window does not hold: the child is
         // its own root rather than being hung on an unrelated row.
         let state = two_agent_window(vec![
-            registered_agent("parent-1", "wA:p1", "wA:t1", None),
-            registered_agent("child-1", "wA:p2", "wA:t1", Some("parent-gone")),
+            registered_agent(
+                "00000000-0000-4000-a867-8ccab8ecaaaa",
+                "wA:p1",
+                "wA:t1",
+                None,
+            ),
+            registered_agent(
+                "00000000-0000-4000-96a1-9730cb1b564c",
+                "wA:p2",
+                "wA:t1",
+                Some("00000000-0000-4000-963a-a494a7e4b63d"),
+            ),
         ]);
         let tree = FleetTree::build(&state);
 
@@ -1722,9 +1752,9 @@ mod tests {
                 registry: crate::registry_observation::RegistryView {
                     agent: registered_agent(
                         if matches!(pane, "wX:p3" | "wX:p4") {
-                            "dup".to_string()
+                            crate::test_support::registration_id("dup")
                         } else {
-                            format!("reg-{pane}")
+                            crate::test_support::registration_id(&format!("reg-{pane}"))
                         }
                         .as_str(),
                         pane,
@@ -1735,7 +1765,7 @@ mod tests {
                     .agent,
                     binding: crate::registry_observation::Binding::Joined,
                     spawn: parent.map(|parent| crate::registry_observation::SpawnBinding {
-                        parent: parent.to_string(),
+                        parent: crate::test_support::registration_id(parent),
                         request_id: format!("req-{pane}"),
                         claim_id: None,
                         child_source: None,
@@ -1827,7 +1857,8 @@ mod tests {
             .iter_mut()
             .find(|agent| agent.location.pane_id == "wB:p1")
             .expect("reviewer");
-        reviewer.registry.agent.registration.registration_id = "reviewer-session".into();
+        reviewer.registry.agent.registration.registration_id =
+            crate::identity::RegistrationId::random();
         state.apply_success(observation);
         let tree = FleetTree::build(&state);
 
@@ -1962,10 +1993,13 @@ mod tests {
 
     #[test]
     fn unmatched_active_lifecycle_subjects_have_logical_rows_without_fake_panes() {
+        use crate::identity::{RegistrationId, SubjectId};
+        const PENDING: &str = "00000000-0000-4000-8000-0000000000a1";
+        const UNJOINED: &str = "00000000-0000-4000-8000-0000000000a2";
         let observation = FleetObservation {
             lifecycle_subjects: vec![
                 LifecycleObservation {
-                    subject_id: "subject-pending".into(),
+                    subject_id: SubjectId::parse(PENDING).expect("a subject id"),
                     bound_registration_id: None,
                     process: None,
                     state: crate::control_plane::lifecycle::State::Pending,
@@ -1973,8 +2007,10 @@ mod tests {
                     ended: false,
                 },
                 LifecycleObservation {
-                    subject_id: "subject-bound-unjoined".into(),
-                    bound_registration_id: Some("agent-old".into()),
+                    subject_id: SubjectId::parse(UNJOINED).expect("a subject id"),
+                    bound_registration_id: RegistrationId::parse(
+                        "00000000-0000-4000-8000-0000000000e1",
+                    ),
                     process: Some(crate::model::ProcessIdentity {
                         boot_id: "boot".into(),
                         pid: 42,
@@ -1985,7 +2021,8 @@ mod tests {
                     ended: false,
                 },
                 LifecycleObservation {
-                    subject_id: "subject-revoked".into(),
+                    subject_id: SubjectId::parse("00000000-0000-4000-8000-0000000000a3")
+                        .expect("a subject id"),
                     bound_registration_id: None,
                     process: None,
                     state: crate::control_plane::lifecycle::State::Revoked,
@@ -2000,9 +2037,9 @@ mod tests {
         let tree = FleetTree::build(&state);
         let rows = flatten(&tree);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, RowId::Lifecycle("subject-pending".into()));
+        assert_eq!(rows[0].1, RowId::Lifecycle(PENDING.into()));
         assert!(rows[0].2.contains("pending"));
-        assert_eq!(rows[1].1, RowId::Lifecycle("subject-bound-unjoined".into()));
+        assert_eq!(rows[1].1, RowId::Lifecycle(UNJOINED.into()));
         assert!(rows[1].2.contains("unresolved"));
         assert!(rows.iter().all(|(_, id, _)| !matches!(id, RowId::Pane(_))));
     }

@@ -22,6 +22,7 @@ use crate::control_plane::registry::{
     Report, SpawnState,
 };
 use crate::control_plane::store::format_millis;
+use crate::identity::{ClaimId, RegistrationId, SubjectId};
 use crate::model::{
     AgentObservation, FleetObservation, ForegroundEvidence, HerdsmanFacts, Location,
     ProcessIdentity, RuntimeStatus, SemanticState, SessionIdentity, SessionUuid,
@@ -77,14 +78,14 @@ pub struct RegistryRead {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LifecycleSubject {
     /// The subject used by public control requests.
-    pub subject_id: String,
+    pub subject_id: SubjectId,
     /// Exact execution record ID used to match its spawn edge and process.
     #[serde(default)]
-    pub claim_id: Option<String>,
+    pub claim_id: Option<ClaimId>,
     #[serde(default)]
     pub spawn_request_id: Option<String>,
     #[serde(default)]
-    pub bound_registration_id: Option<String>,
+    pub bound_registration_id: Option<RegistrationId>,
     #[serde(default)]
     pub process: Option<ProcessIdentity>,
     pub state: crate::control_plane::lifecycle::State,
@@ -113,8 +114,8 @@ impl LifecycleSubject {
 /// agent id and process birth identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ManagedSubject {
-    pub subject_id: String,
-    pub claim_id: String,
+    pub subject_id: SubjectId,
+    pub claim_id: ClaimId,
     pub process: ProcessIdentity,
     pub metadata: crate::control_plane::lifecycle::ManagedMetadata,
     pub child_close: Option<ChildCloseTarget>,
@@ -410,24 +411,20 @@ fn managed_subject(
 ) -> Option<ManagedSubject> {
     let claim = agent.process.claim.as_ref()?;
     let mut matches = subjects.iter().filter(|subject| {
-        subject.bound_registration_id.as_deref()
-            == Some(agent.registration.registration_id.as_str())
+        subject.bound_registration_id.as_ref() == Some(&agent.registration.registration_id)
             && subject.process.as_ref() == Some(claim)
     });
     let subject = matches.next()?;
     if matches.next().is_some() {
         return None;
     }
+    let claim_id = subject.claim_id.clone()?;
     Some(ManagedSubject {
         subject_id: subject.subject_id.clone(),
-        claim_id: subject.claim_id.clone()?,
         process: claim.clone(),
         metadata: subject.managed.clone(),
         child_close: spawn
-            .filter(|spawn| {
-                spawn.claim_id.as_deref()
-                    == Some(subject.claim_id.as_deref().unwrap_or(&subject.subject_id))
-            })
+            .filter(|spawn| spawn.claim_id.as_deref() == Some(claim_id.as_str()))
             .and_then(|spawn| {
                 Some(ChildCloseTarget {
                     spawn_request_id: spawn.request_id.clone(),
@@ -435,6 +432,7 @@ fn managed_subject(
                     incarnation: spawn.child_incarnation.clone()?,
                 })
             }),
+        claim_id,
         state: subject.state,
         session: subject.session.clone(),
         ended: subject.ended(),
@@ -678,6 +676,7 @@ mod tests {
     const CHILD: &str = "0c000000-0000-4000-8000-0000000c41d0";
     const LEAD: &str = "01ead000-0000-4000-8000-00000001ead0";
     const CLAIM: &str = "0c1a0000-0000-4000-8000-00000000c1a1";
+    const LOGICAL_SUBJECT: &str = "05b1ec70-0000-4000-8000-0000005b1ec7";
 
     /// The daemon's spawn edge for a child already bound to `registration_id`.
     fn spawn_edge(registration_id: &str) -> PublicSpawnTopology {
@@ -737,8 +736,12 @@ mod tests {
             &inventory(vec![pane("p1", "t1")]),
             &tmux,
             read(vec![
-                leased(registered("live", elsewhere.clone(), None)),
-                registered("dead", elsewhere, None),
+                leased(registered(
+                    "00000000-0000-4000-9be3-59b306abe3f2",
+                    elsewhere.clone(),
+                    None,
+                )),
+                registered("00000000-0000-4000-88b3-88d97bb260fb", elsewhere, None),
             ]),
             &[],
         );
@@ -757,15 +760,36 @@ mod tests {
             };
             project(&panes, &backend(), read, &[])
                 .into_iter()
-                .map(|agent| agent.registry.agent.registration.registration_id.clone())
+                .map(|agent| {
+                    agent
+                        .registry
+                        .agent
+                        .registration
+                        .registration_id
+                        .to_string()
+                })
                 .collect()
         };
         // Radar reaches only what is inside its own server: a pane it does not
         // hold is not shown, however live its publisher is.
-        assert!(ids(vec![registered("dead", gone.clone(), None)], Vec::new()).is_empty());
         assert!(
             ids(
-                vec![leased(registered("live", gone.clone(), None))],
+                vec![registered(
+                    "00000000-0000-4000-88b3-88d97bb260fb",
+                    gone.clone(),
+                    None
+                )],
+                Vec::new()
+            )
+            .is_empty()
+        );
+        assert!(
+            ids(
+                vec![leased(registered(
+                    "00000000-0000-4000-9be3-59b306abe3f2",
+                    gone.clone(),
+                    None
+                ))],
                 Vec::new()
             )
             .is_empty()
@@ -778,8 +802,15 @@ mod tests {
         // A pane that is here keeps its registration however stale: the pane stays
         // protected.
         assert_eq!(
-            ids(vec![registered("held", at("p1"), None)], Vec::new()),
-            ["held"]
+            ids(
+                vec![registered(
+                    "00000000-0000-4000-b63d-073187a1dcb8",
+                    at("p1"),
+                    None
+                )],
+                Vec::new()
+            ),
+            ["00000000-0000-4000-b63d-073187a1dcb8"]
         );
     }
 
@@ -820,7 +851,11 @@ mod tests {
             let projected = project(
                 &panes,
                 &backend(),
-                read(vec![registered("a", at("p1"), Some(claim))]),
+                read(vec![registered(
+                    "00000000-0000-4000-b19b-50b9a4f0e9f3",
+                    at("p1"),
+                    Some(claim),
+                )]),
                 &evidence,
             );
             assert_eq!(projected[0].registry.binding, expected);
@@ -834,32 +869,44 @@ mod tests {
         let cases = [
             (
                 "exact",
-                registered("a", at("p1"), Some(live.clone())),
+                registered(
+                    "00000000-0000-4000-b19b-50b9a4f0e9f3",
+                    at("p1"),
+                    Some(live.clone()),
+                ),
                 vec![foreground("p1", live.clone())],
                 Binding::Joined,
             ),
             (
                 "pid reused by a later incarnation",
-                registered("a", at("p1"), Some(live.clone())),
+                registered(
+                    "00000000-0000-4000-b19b-50b9a4f0e9f3",
+                    at("p1"),
+                    Some(live.clone()),
+                ),
                 vec![foreground("p1", identity(42, 901))],
                 Binding::Unjoined(Unjoined::IdentityMismatch),
             ),
             (
                 "foreground not sampled",
-                registered("a", at("p1"), Some(live.clone())),
+                registered(
+                    "00000000-0000-4000-b19b-50b9a4f0e9f3",
+                    at("p1"),
+                    Some(live.clone()),
+                ),
                 Vec::new(),
                 Binding::Unjoined(Unjoined::ForegroundUnreadable),
             ),
             (
                 "no claimed identity",
-                registered("a", at("p1"), None),
+                registered("00000000-0000-4000-b19b-50b9a4f0e9f3", at("p1"), None),
                 vec![foreground("p1", live.clone())],
                 Binding::Unjoined(Unjoined::NoClaim),
             ),
             (
                 "tab disagrees with the pane",
                 registered(
-                    "a",
+                    "00000000-0000-4000-b19b-50b9a4f0e9f3",
                     json!({"backend": "tmux", "tab": "t9", "pane": "p1"}),
                     Some(live.clone()),
                 ),
@@ -900,7 +947,11 @@ mod tests {
         // borrow the pane's own tab.
         let panes = inventory(vec![pane("p1", "t1")]);
         let reported = json!({"backend": "tmux", "workspace": "w1", "tab": "t9", "pane": "p1"});
-        let agent = registered("a", reported, Some(identity(7, 5)));
+        let agent = registered(
+            "00000000-0000-4000-b19b-50b9a4f0e9f3",
+            reported,
+            Some(identity(7, 5)),
+        );
         let projected = project(&panes, &backend(), read(vec![agent]), &[]);
         assert_eq!(
             projected[0].registry.binding,
@@ -918,7 +969,11 @@ mod tests {
             if let Some(instance) = instance {
                 location["instance"] = json!(instance);
             }
-            registered("a", location, Some(live.clone()))
+            registered(
+                "00000000-0000-4000-b19b-50b9a4f0e9f3",
+                location,
+                Some(live.clone()),
+            )
         };
         let on = |instance: Option<&str>| BackendIdentity {
             name: "tmux".into(),
@@ -991,11 +1046,11 @@ mod tests {
         let panes = inventory(vec![pane("p1", "t1")]);
         let agent = registered(LEAD, at("p1"), Some(claim.clone()));
         let subject = LifecycleSubject {
-            subject_id: "logical-subject-1".into(),
-            claim_id: Some(CLAIM.into()),
+            subject_id: SubjectId::parse(LOGICAL_SUBJECT).expect("a subject id"),
+            claim_id: ClaimId::parse(CLAIM),
 
             spawn_request_id: Some("subject-1".into()),
-            bound_registration_id: Some(LEAD.into()),
+            bound_registration_id: RegistrationId::parse(LEAD),
             process: Some(claim.clone()),
             state: crate::control_plane::lifecycle::State::Bound,
             managed: crate::control_plane::lifecycle::ManagedMetadata::default(),
@@ -1029,7 +1084,7 @@ mod tests {
                 .managed
                 .as_ref()
                 .map(|managed| managed.subject_id.as_str()),
-            Some("logical-subject-1")
+            Some(LOGICAL_SUBJECT)
         );
         assert_eq!(
             projected[0]
@@ -1049,7 +1104,7 @@ mod tests {
             ..subject.clone()
         };
         let duplicate = LifecycleSubject {
-            subject_id: "subject-2".into(),
+            subject_id: SubjectId::random(),
             ..subject.clone()
         };
         for lifecycle in [vec![replaced], vec![duplicate.clone(), duplicate.clone()]] {
@@ -1078,8 +1133,16 @@ mod tests {
         let panes = inventory(vec![pane("p1", "t1"), pane("p2", "t1")]);
         let (first, second) = (identity(10, 1), identity(11, 2));
         let agents = vec![
-            registered("a", at("p1"), Some(first.clone())),
-            registered("b", at("p2"), Some(second.clone())),
+            registered(
+                "00000000-0000-4000-b19b-50b9a4f0e9f3",
+                at("p1"),
+                Some(first.clone()),
+            ),
+            registered(
+                "00000000-0000-4000-abd3-e4fd8943240a",
+                at("p2"),
+                Some(second.clone()),
+            ),
         ];
         let evidence = [foreground("p1", first), foreground("p2", second)];
         let projected = project(&panes, &backend(), read(agents), &evidence);
@@ -1097,8 +1160,16 @@ mod tests {
         let panes = inventory(vec![pane("p1", "t1")]);
         let shared = identity(10, 1);
         let agents = vec![
-            registered("a", at("p1"), Some(shared.clone())),
-            registered("b", at("p1"), Some(shared.clone())),
+            registered(
+                "00000000-0000-4000-b19b-50b9a4f0e9f3",
+                at("p1"),
+                Some(shared.clone()),
+            ),
+            registered(
+                "00000000-0000-4000-abd3-e4fd8943240a",
+                at("p1"),
+                Some(shared.clone()),
+            ),
         ];
         let projected = project(
             &panes,
@@ -1118,7 +1189,7 @@ mod tests {
     #[test]
     fn a_stale_execution_snapshot_is_unknown_not_idle() {
         let panes = inventory(vec![pane("p1", "t1")]);
-        let mut agent = registered("a", at("p1"), None);
+        let mut agent = registered("00000000-0000-4000-b19b-50b9a4f0e9f3", at("p1"), None);
         agent.execution = serde_json::from_value(json!({
             "version": 1,
             "channel": "execution",

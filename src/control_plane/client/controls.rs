@@ -61,8 +61,8 @@ pub trait LifecycleControls: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LifecycleControlRequest {
     pub request_id: String,
-    pub subject_id: String,
-    pub claim_id: String,
+    pub subject_id: crate::identity::SubjectId,
+    pub claim_id: crate::identity::ClaimId,
 }
 
 /// The operation record the daemon committed, without private launch data.

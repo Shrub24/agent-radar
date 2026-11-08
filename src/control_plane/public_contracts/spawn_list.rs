@@ -12,7 +12,7 @@ use crate::control_plane::registry::PublicSpawnTopology;
 #[serde(deny_unknown_fields)]
 pub struct SpawnListParams {
     #[serde(default)]
-    pub registration_id: Option<String>,
+    pub registration_id: Option<crate::identity::RegistrationId>,
     #[serde(default)]
     pub after: Option<String>,
     #[serde(default)]

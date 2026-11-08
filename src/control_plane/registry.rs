@@ -342,7 +342,7 @@ impl Registration {
     pub fn public(&self) -> PublicRegistration {
         PublicRegistration {
             version: self.version,
-            registration_id: self.registration_id.to_string(),
+            registration_id: self.registration_id.clone(),
             registered_at: self.registered_at.clone(),
             source: self.request.source.clone(),
             incarnation: self.request.incarnation.clone(),
@@ -370,7 +370,7 @@ impl Registration {
 #[serde(deny_unknown_fields)]
 pub struct PublicRegistration {
     pub version: u32,
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
     pub registered_at: String,
     pub source: String,
     pub incarnation: String,
@@ -788,7 +788,7 @@ impl Registry {
     /// Retire this agent's context writer without retracting its last report.
     pub fn retire_context(
         &self,
-        registration_id: &str,
+        registration_id: &RegistrationId,
         writer_handle: &str,
         now_ms: i64,
     ) -> Result<SessionContext, Error> {
@@ -802,7 +802,7 @@ impl Registry {
         registration_id: &RegistrationId,
         now_ms: i64,
     ) -> Result<Option<PublicContext>, String> {
-        context::published(self, registration_id.as_str(), now_ms)
+        context::published(self, registration_id, now_ms)
     }
 
     pub(crate) fn transition(&self) -> std::sync::MutexGuard<'_, ()> {

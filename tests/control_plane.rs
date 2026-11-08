@@ -13,6 +13,8 @@
 //! by a daemon bound over the same state root — which is what makes "did this
 //! run" answerable after a restart.
 
+mod support;
+
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -74,6 +76,7 @@ use agent_radar::control_plane::{
     Category, DaemonRuntime, Derived, MAX_LINE_BYTES, MAX_VERIFICATION_JOBS, PROTOCOL_VERSION,
     RecordState, RequestOutcome, RequestRecord, Settlement, Store, connect_at, now_ms, random_uuid,
 };
+use agent_radar::identity::{ClaimId, SubjectId};
 use agent_radar::lifecycle;
 use agent_radar::model::{
     AgentObservation, BinaryFreshness, BinaryIdentity, FleetObservation, ForegroundEvidence,
@@ -300,7 +303,7 @@ impl RuntimeProvider for GatedBackend {
 /// A joined registration on `pane_id`, as the close policy reads it.
 fn registered_on(pane_id: &str) -> agent_radar::registry_observation::RegistryView {
     use agent_radar::registry_observation::{Binding, RegistryView};
-    let registration_id = format!("test-{pane_id}");
+    let registration_id = support::registration_id(&format!("test-{pane_id}"));
     let agent = serde_json::from_value(json!({
         "registration": {
             "version": 1,
@@ -3342,7 +3345,7 @@ fn registry_parent_at(
     registry
         .publish_context(
             &agent_radar::control_plane::registry::ContextRequest {
-                registration_id: parent.registration_id.to_string(),
+                registration_id: parent.registration_id.clone(),
                 publisher: agent_radar::control_plane::registry::PublisherIdentity {
                     source: parent.request.source.clone(),
                     incarnation: parent.request.incarnation.clone(),
@@ -3366,7 +3369,6 @@ fn registry_parent_at(
 #[test]
 fn a_subject_filtered_page_holds_only_that_subject_and_filters_before_cutting() {
     use agent_radar::control_plane::registry::{Registry, SpawnRequest};
-    use agent_radar::identity::SubjectId;
 
     let sandbox = Sandbox::new("spawn-subject-filter");
     let registry = Registry::open(&sandbox.state()).expect("a registry");
@@ -4790,16 +4792,10 @@ fn a_spawn_edge_from_another_version_refuses_startup_naming_the_file() {
     }
     let id = "11111111-1111-4111-8111-111111111111";
     std::fs::write(spawns.join(format!("{id}.json")), r#"{"version":2}"#).expect("old edge");
-    let mut child = DaemonChild::spawn_with(&sandbox.socket(), &state, &[]);
-    assert_eq!(child.wait(DEADLINE).code(), Some(1));
-    let mut diagnostic = String::new();
-    child
-        .process
-        .stderr
-        .take()
-        .expect("stderr")
-        .read_to_string(&mut diagnostic)
-        .expect("the diagnostic");
+    let diagnostic = match Daemon::bind_without_backend(&sandbox.socket(), &state) {
+        Ok(_) => panic!("a daemon accepted an unreadable spawn edge"),
+        Err(diagnostic) => diagnostic,
+    };
     assert!(diagnostic.contains(id), "{diagnostic}");
     assert!(
         !sandbox.socket().exists(),
@@ -5198,8 +5194,8 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .cancel_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: cancel_id.clone(),
-                claim_id: subject_id.clone(),
-                subject_id: agent_subject.clone(),
+                claim_id: ClaimId::parse(&subject_id).expect("a claim id"),
+                subject_id: SubjectId::parse(&agent_subject).expect("a subject id"),
             },
             &AtomicBool::new(false),
         )
@@ -5224,7 +5220,10 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         "{cancelled:?}"
     );
     assert_eq!(
-        closed.executions[0].subject_id.as_deref(),
+        closed.executions[0]
+            .subject_id
+            .as_ref()
+            .map(SubjectId::as_str),
         Some(agent_subject.as_str()),
         "the close names the agent it ended"
     );
@@ -5245,8 +5244,8 @@ fn a_tracked_launch_is_cancelled_by_signalling_its_captured_process() {
         .cancel_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: cancel_id,
-                claim_id: subject_id,
-                subject_id: agent_subject,
+                claim_id: ClaimId::parse(&subject_id).expect("a claim id"),
+                subject_id: SubjectId::parse(&agent_subject).expect("a subject id"),
             },
             &AtomicBool::new(false),
         )
@@ -12834,8 +12833,8 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         .restart_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: restart_id.clone(),
-                claim_id: subject.claim.clone(),
-                subject_id: subject.subject.clone(),
+                claim_id: ClaimId::parse(&subject.claim).expect("a claim id"),
+                subject_id: SubjectId::parse(&subject.subject).expect("a subject id"),
             },
             &AtomicBool::new(false),
         )
@@ -12900,8 +12899,8 @@ fn restart_stops_the_verified_lead_then_launches_one_resumed_successor() {
         .restart_subject(
             &agent_radar::control_plane::client::LifecycleControlRequest {
                 request_id: restart_id.clone(),
-                claim_id: subject.claim.clone(),
-                subject_id: subject.subject.clone(),
+                claim_id: ClaimId::parse(&subject.claim).expect("a claim id"),
+                subject_id: SubjectId::parse(&subject.subject).expect("a subject id"),
             },
             &AtomicBool::new(false),
         )

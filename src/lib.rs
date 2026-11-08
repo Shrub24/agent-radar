@@ -11,6 +11,7 @@ pub mod content;
 pub mod control_plane;
 pub mod focus;
 pub mod identity;
+
 pub mod lifecycle;
 pub mod log;
 pub mod managed_scope;
@@ -26,6 +27,9 @@ pub mod reset;
 pub mod runtime;
 pub mod service;
 pub mod tasks;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod theme;

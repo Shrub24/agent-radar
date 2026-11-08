@@ -7,6 +7,8 @@
 //! [`App::apply_task_event`] — so the join, the child rows, the parent badge and
 //! the detail summary are exercised together rather than asserted apart.
 
+mod support;
+
 use std::collections::HashMap;
 
 use agent_radar::Target;
@@ -148,7 +150,8 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                     ..HerdsmanFacts::default()
                 },
                 registry: {
-                    let registration_id = format!("test-{}", agent.pane_id);
+                    let registration_id =
+                        support::registration_id(&format!("test-{}", agent.pane_id));
                     let session = agent.session;
                     let mut registered = registration(
                         &registration_id,
@@ -191,7 +194,7 @@ fn observation(agents: &[Agent<'_>], panes: &[&str]) -> FleetObservation {
                         agent: registered,
                         binding: registry_observation::Binding::Joined,
                         spawn: agent.parent.and_then(pane_of).map(|parent| SpawnBinding {
-                            parent: format!("test-{parent}"),
+                            parent: support::registration_id(&format!("test-{parent}")),
                             request_id: format!("r-{}", agent.pane_id),
                             claim_id: None,
                             child_source: None,
@@ -1897,25 +1900,47 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
     let state = registry_state(
         wa_inventory(&["wA:p1"]),
         vec![
-            registration("r1", at("wA:p1"), false, Vec::new()),
-            registration("r2", at("wA:p1"), false, Vec::new()),
+            registration(
+                "00000000-0000-4000-876e-ec1b078242f8",
+                at("wA:p1"),
+                false,
+                Vec::new(),
+            ),
+            registration(
+                "00000000-0000-4000-b67a-6ae3a13ae5da",
+                at("wA:p1"),
+                false,
+                Vec::new(),
+            ),
             // Names no place: Radar reaches only what is inside its own server, so
             // it is not a row at all.
-            registration("r3", Value::Null, false, Vec::new()),
+            registration(
+                "00000000-0000-4000-a4c2-c55cab310d83",
+                Value::Null,
+                false,
+                Vec::new(),
+            ),
         ],
         Vec::new(),
     );
     let mut app = app_with_history(&state);
     {
         let tree = app.tree();
-        for id in ["r1", "r2"] {
+        for id in [
+            "00000000-0000-4000-876e-ec1b078242f8",
+            "00000000-0000-4000-b67a-6ae3a13ae5da",
+        ] {
             assert!(
                 node_of(&tree.roots, &RowId::Registered(id.into())).is_some(),
                 "{id} lost its row"
             );
         }
         assert!(
-            node_of(&tree.roots, &RowId::Registered("r3".into())).is_none(),
+            node_of(
+                &tree.roots,
+                &RowId::Registered("00000000-0000-4000-a4c2-c55cab310d83".into())
+            )
+            .is_none(),
             "a registration naming no place in this server was shown"
         );
         assert!(
@@ -1932,7 +1957,9 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
         );
         let targets = focus::targets(tree, &state);
         assert!(
-            !targets.contains_key(&RowId::Registered("r1".into())),
+            !targets.contains_key(&RowId::Registered(
+                "00000000-0000-4000-876e-ec1b078242f8".into()
+            )),
             "an unresolved row focuses a pane"
         );
         assert_eq!(
@@ -1941,7 +1968,10 @@ fn unresolved_registrations_stay_distinct_rows_that_own_no_pane() {
         );
     }
 
-    select(&mut app, &RowId::Registered("r1".into()));
+    select(
+        &mut app,
+        &RowId::Registered("00000000-0000-4000-876e-ec1b078242f8".into()),
+    );
     // An unresolved agent's refusal belongs to the shared target model, which
     // owns eligibility now.
 }
@@ -1954,7 +1984,7 @@ fn each_authority_is_its_own_line_with_its_publisher_named() {
     let state = registry_state(
         wa_inventory(&["wA:p1"]),
         vec![registration(
-            "w",
+            "00000000-0000-4000-881f-933511522d40",
             at("wA:p1"),
             false,
             vec![
@@ -1980,7 +2010,10 @@ fn each_authority_is_its_own_line_with_its_publisher_named() {
         )],
         Vec::new(),
     );
-    let text = details(&state, &RowId::Registered("w".into()));
+    let text = details(
+        &state,
+        &RowId::Registered("00000000-0000-4000-881f-933511522d40".into()),
+    );
     assert!(text.contains("execution: idle · from pi"), "{text}");
     assert!(
         text.contains("assignment: waiting · from herdsman for herdsman-owner"),
@@ -2006,7 +2039,7 @@ fn execution_done_is_not_assignment_completion_and_silence_is_unknown() {
         wa_inventory(&["wA:p1"]),
         vec![
             registration(
-                "done",
+                "00000000-0000-4000-af68-bc0b24f2e4cc",
                 at("wA:p1"),
                 false,
                 vec![
@@ -2014,11 +2047,19 @@ fn execution_done_is_not_assignment_completion_and_silence_is_unknown() {
                     report("assignment", "fresh", json!({"activity": "working"})),
                 ],
             ),
-            registration("silent", at("wA:p1"), false, Vec::new()),
+            registration(
+                "00000000-0000-4000-9850-a1102c0d20d8",
+                at("wA:p1"),
+                false,
+                Vec::new(),
+            ),
         ],
         Vec::new(),
     );
-    let done = details(&state, &RowId::Registered("done".into()));
+    let done = details(
+        &state,
+        &RowId::Registered("00000000-0000-4000-af68-bc0b24f2e4cc".into()),
+    );
     assert!(done.contains("execution: done · from pi"), "{done}");
     assert!(
         done.contains("assignment: working · from herdsman for herdsman-owner"),
@@ -2026,7 +2067,10 @@ fn execution_done_is_not_assignment_completion_and_silence_is_unknown() {
     );
     assert!(!done.contains("assignment: done"), "{done}");
 
-    let silent = details(&state, &RowId::Registered("silent".into()));
+    let silent = details(
+        &state,
+        &RowId::Registered("00000000-0000-4000-9850-a1102c0d20d8".into()),
+    );
     assert!(
         silent.contains("execution: unknown — nothing reported"),
         "{silent}"
@@ -2048,7 +2092,7 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
         wa_inventory(&["wA:p1"]),
         vec![
             registration(
-                "stale",
+                "00000000-0000-4000-bb50-4290f52bcf9f",
                 at("wA:p1"),
                 false,
                 vec![
@@ -2057,7 +2101,7 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
                 ],
             ),
             registration(
-                "settles",
+                "00000000-0000-4000-b673-72a6abc84c44",
                 at("wA:p1"),
                 false,
                 vec![
@@ -2068,7 +2112,10 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
         ],
         Vec::new(),
     );
-    let lost = details(&state, &RowId::Registered("stale".into()));
+    let lost = details(
+        &state,
+        &RowId::Registered("00000000-0000-4000-bb50-4290f52bcf9f".into()),
+    );
     assert!(
         lost.contains("execution: stale — last report expired"),
         "{lost}"
@@ -2082,7 +2129,10 @@ fn freshness_is_per_channel_and_the_owners_state_never_rewrites_execution() {
         "{lost}"
     );
 
-    let settling = details(&state, &RowId::Registered("settles".into()));
+    let settling = details(
+        &state,
+        &RowId::Registered("00000000-0000-4000-b673-72a6abc84c44".into()),
+    );
     assert!(settling.contains("execution: idle · from pi"), "{settling}");
     assert!(
         settling.contains("state: settling (the assignment reports settling)"),

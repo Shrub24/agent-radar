@@ -490,9 +490,9 @@ pub struct EndedExecution {
     /// The logical agent this execution ran as, when one is recorded. A directly
     /// admitted command has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<String>,
+    pub subject_id: Option<crate::identity::SubjectId>,
     /// The process incarnation, which every recorded execution has.
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
     pub end: ExecutionEnd,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<Completion>,
@@ -503,8 +503,8 @@ impl EndedExecution {
     /// the process it ran as.
     pub fn name(&self) -> &str {
         self.subject_id
-            .as_deref()
-            .unwrap_or(&self.registration_id)
+            .as_ref()
+            .map_or(self.registration_id.as_str(), SubjectId::as_str)
             .get(..8)
             .unwrap_or_default()
     }
@@ -2130,9 +2130,9 @@ pub fn captured_launch(effective: &Effective) -> Result<LaunchContext, String> {
 /// It carries no launch data and no correlation, which are private.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicClaim {
-    pub subject_id: String,
-    pub claim_id: String,
-    pub registration_id: String,
+    pub subject_id: crate::identity::SubjectId,
+    pub claim_id: crate::identity::ClaimId,
+    pub registration_id: crate::identity::RegistrationId,
     pub managed: ManagedMetadata,
     pub spawn_request_id: String,
     pub state: State,
@@ -2143,7 +2143,7 @@ pub struct PublicClaim {
     pub ended_evidence: Option<EndedEvidence>,
     pub pane_cleanup: Option<PaneCleanup>,
     pub completion: Option<Completion>,
-    pub bound_registration_id: Option<String>,
+    pub bound_registration_id: Option<crate::identity::RegistrationId>,
     pub signalled_at: Option<String>,
     pub exited_at: Option<String>,
     pub recorded_at: String,
@@ -2153,9 +2153,9 @@ pub struct PublicClaim {
 
 pub fn public_view(subject: &Claim) -> PublicClaim {
     PublicClaim {
-        subject_id: subject.subject_id.as_str().to_owned(),
-        claim_id: subject.claim_id.to_string(),
-        registration_id: subject.process.registration_id.to_string(),
+        subject_id: subject.subject_id.clone(),
+        claim_id: subject.claim_id.clone(),
+        registration_id: subject.process.registration_id.clone(),
         managed: subject.managed.clone(),
         spawn_request_id: subject.process.spawn_request_id.clone(),
         state: subject.process.state,
@@ -2166,11 +2166,7 @@ pub fn public_view(subject: &Claim) -> PublicClaim {
         ended_evidence: subject.process.ended_evidence.clone(),
         pane_cleanup: subject.process.pane_cleanup.clone(),
         completion: subject.process.completion.clone(),
-        bound_registration_id: subject
-            .process
-            .bound_registration_id
-            .as_ref()
-            .map(ToString::to_string),
+        bound_registration_id: subject.process.bound_registration_id.clone(),
         signalled_at: subject.process.signalled_at.clone(),
         exited_at: subject.process.exited_at.clone(),
         recorded_at: subject.process.recorded_at.clone(),
@@ -2746,8 +2742,8 @@ const UNRESPONSIVE: &str = "the process outlived the shutdown window";
 /// The execution a batch addressed, with what the records say about it.
 fn ended_execution(registry: &Registry, target: &ExecutionRef, exit: Exit) -> EndedExecution {
     EndedExecution {
-        subject_id: target.subject_id.as_ref().map(ToString::to_string),
-        registration_id: target.registration_id.to_string(),
+        subject_id: target.subject_id.clone(),
+        registration_id: target.registration_id.clone(),
         end: ExecutionEnd::from(&exit),
         completion: read_process(registry, &target.registration_id)
             .ok()
@@ -2952,7 +2948,7 @@ pub fn run_launch(socket: &str) -> i32 {
         }
     };
     enter_scope(
-        &claimed.registration_id,
+        claimed.registration_id.as_str(),
         &claimed.executable,
         &claimed.argv,
         ProcessKind::Agent,
@@ -3089,7 +3085,13 @@ fn admit_and_enter(socket: &str, kind: ProcessKind, program: &[String], key: Str
         eprintln!("radar run: the daemon admitted the launch without a registration");
         return 1;
     };
-    enter_scope(&registration_id, &program[0], &program[1..], kind, false)
+    enter_scope(
+        registration_id.as_str(),
+        &program[0],
+        &program[1..],
+        kind,
+        false,
+    )
 }
 
 /// Becomes `executable argv` inside the registration's scope, so the group exists
@@ -5134,7 +5136,7 @@ mod tests {
                 .survivors()
                 .map(|ended| ended.registration_id.clone())
                 .collect::<Vec<_>>(),
-            vec![ticket.registration_id.to_string()]
+            vec![ticket.registration_id.clone()]
         );
         assert!(cancelled.ended[0].end != ExecutionEnd::Exited);
         let subject = read_claim(&registry, &ticket.claim_id)

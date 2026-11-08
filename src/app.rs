@@ -2328,7 +2328,7 @@ mod tests {
                     ..Default::default()
                 },
                 registry: crate::registry_observation::RegistryView::test_joined(
-                    "test-wX:p1",
+                    "00000000-0000-4000-882c-4a8385933d0f",
                     "wX:p1",
                 ),
             }],
@@ -2482,7 +2482,7 @@ mod tests {
                     agent: serde_json::from_value(serde_json::json!({
                         "registration": {
                             "version": 1,
-                            "registration_id": "managed-agent",
+                            "registration_id": "00000000-0000-4000-b59c-aa3ea5c0e3e4",
                             "registered_at": "2026-01-01T00:00:00Z",
                             "source": "test",
                             "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -2505,8 +2505,8 @@ mod tests {
                         state: crate::control_plane::registry::SpawnState::Bound,
                     }),
                     managed: Some(crate::registry_observation::ManagedSubject {
-                        subject_id: "subject-managed".into(),
-                    claim_id: "claim-managed".into(),
+                        subject_id: crate::identity::SubjectId::random(),
+                    claim_id: crate::identity::ClaimId::random(),
                         process: crate::model::ProcessIdentity { boot_id: "boot".into(), pid: 1234, start_ticks: 55 },
                         metadata: crate::control_plane::lifecycle::ManagedMetadata::default(),
                         child_close: None,

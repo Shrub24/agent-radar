@@ -30,8 +30,8 @@ pub enum Action {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Subject {
-    pub subject_id: String,
-    pub claim_id: String,
+    pub subject_id: crate::identity::SubjectId,
+    pub claim_id: crate::identity::ClaimId,
 }
 
 #[derive(Serialize)]

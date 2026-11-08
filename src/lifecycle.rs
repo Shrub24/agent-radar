@@ -231,7 +231,12 @@ fn pane_identity(inventory: &FleetObservation, pane_id: &str) -> PaneIdentity {
 
 fn registration_identity(agent: &AgentObservation) -> AgentIdentity {
     AgentIdentity {
-        registration_id: agent.registry.agent.registration.registration_id.clone(),
+        registration_id: agent
+            .registry
+            .agent
+            .registration
+            .registration_id
+            .to_string(),
         session: agent.session.clone(),
         run: agent.facts.run.clone(),
     }
@@ -268,7 +273,7 @@ mod tests {
             session: None,
             facts: HerdsmanFacts::default(),
             registry: crate::registry_observation::RegistryView::test_joined(
-                &format!("test-{pane_id}"),
+                &crate::test_support::registration_id(&format!("test-{pane_id}")),
                 pane_id,
             ),
         }

@@ -53,7 +53,6 @@ const observationSnapshot: ObservationSnapshot = {
 		source: "pending",
 		registry: "pending",
 		retained: {},
-		containment: {},
 		awaiting_evidence: [],
 		foreground: {},
 	},

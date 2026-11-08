@@ -39,10 +39,10 @@ pub struct ManagedLaunchMetadata {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIdentity {
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
     pub session_id: String,
-    pub subject_id: String,
-    pub claim_id: String,
+    pub subject_id: crate::identity::SubjectId,
+    pub claim_id: crate::identity::ClaimId,
 }
 
 /// Inputs for publishing a message. The wire request ID carries the stable
@@ -50,8 +50,8 @@ pub struct AgentIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessagePublishParams {
-    pub sender_registration_id: String,
-    pub recipient_subject_id: String,
+    pub sender_registration_id: crate::identity::RegistrationId,
+    pub recipient_subject_id: crate::identity::SubjectId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     pub summary: String,
@@ -80,7 +80,7 @@ pub struct Message {
     pub version: u32,
     pub id: String,
     pub producer: AgentIdentity,
-    pub recipients: Vec<String>,
+    pub recipients: Vec<crate::identity::SubjectId>,
     pub body: PublishBody,
     #[schemars(range(min = 0u64, max = 9007199254740991u64))]
     pub created_at_unix_ms: u64,

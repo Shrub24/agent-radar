@@ -7,6 +7,8 @@
 //! everything here drives a small fake provider and a normalized observation:
 //! no CLI, no wire fixture, no subprocess.
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -278,7 +280,10 @@ fn agent(pane_id: &str, assigned_started_unix_ms: Option<u64>) -> AgentObservati
             ..HerdsmanFacts::default()
         },
         registry: RegistryView {
-            agent: registered_assignment(&format!("test-{pane_id}"), assigned_started_unix_ms),
+            agent: registered_assignment(
+                &support::registration_id(&format!("test-{pane_id}")),
+                assigned_started_unix_ms,
+            ),
             binding: Binding::Unjoined(Unjoined::NoLocation),
             spawn: None,
             managed: None,
@@ -453,9 +458,15 @@ fn assignment_age_is_measured_from_the_published_start() {
     let runtime = Arc::new(FakeRuntime::default());
     runtime.set_inventory(inventory(&["wA:p1"], vec![]));
     runtime.set_registrations(vec![
-        registered_assignment("aged", Some(946_684_800_000)),
-        registered_assignment("future", Some(4_102_444_800_000)),
-        registered_assignment("unassigned", None),
+        registered_assignment(
+            "00000000-0000-4000-aea1-0508eafbdaa0",
+            Some(946_684_800_000),
+        ),
+        registered_assignment(
+            "00000000-0000-4000-a65d-989191606a8c",
+            Some(4_102_444_800_000),
+        ),
+        registered_assignment("00000000-0000-4000-992e-34a105c1c2eb", None),
     ]);
     let mut state = ObservationState::new();
     let mut collector = collector_for(&runtime);
@@ -468,7 +479,9 @@ fn assignment_age_is_measured_from_the_published_start() {
         inventory
             .agents
             .iter()
-            .find(|agent| agent.registry.agent.registration.registration_id == registration_id)
+            .find(|agent| {
+                agent.registry.agent.registration.registration_id.as_str() == registration_id
+            })
             .expect("registered agent")
             .facts
             .assigned_for
@@ -476,17 +489,20 @@ fn assignment_age_is_measured_from_the_published_start() {
 
     // The age is measured from the published start, not presented as a
     // timestamp a reader would have to interpret against its own clock.
-    let age = aged_for("aged").expect("an age");
+    let age = aged_for("00000000-0000-4000-aea1-0508eafbdaa0").expect("an age");
     assert!(
         age > Duration::from_secs(60 * 60 * 24 * 365 * 20),
         "{age:?}"
     );
 
     // A start in the future is no age rather than a panic.
-    assert_eq!(aged_for("future"), Some(Duration::ZERO));
+    assert_eq!(
+        aged_for("00000000-0000-4000-a65d-989191606a8c"),
+        Some(Duration::ZERO)
+    );
 
     // No published start: no age.
-    assert_eq!(aged_for("unassigned"), None);
+    assert_eq!(aged_for("00000000-0000-4000-992e-34a105c1c2eb"), None);
 }
 
 #[test]
@@ -639,11 +655,11 @@ fn registered_at(registration_id: &str, pane_id: &str, claim: Option<(u64, i32)>
 #[test]
 fn only_fresh_registry_context_is_projected_as_the_task_session() {
     let session = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
-    let mut agent = registered_at("a1", "wA:p1", None);
+    let mut agent = registered_at("00000000-0000-4000-8200-08b2d80fd5b3", "wA:p1", None);
     agent.context = Some(
         serde_json::from_value(json!({
             "version": 1,
-            "registration_id": "a1",
+            "registration_id": "00000000-0000-4000-8200-08b2d80fd5b3",
             "writer": {
                 "source": "herdsman",
                 "incarnation": "11111111-1111-4111-8111-111111111111",
@@ -707,7 +723,11 @@ fn a_registration_joins_its_pane_only_on_the_exact_live_identity() {
         Some("pi".into()),
         Some("pi".into()),
     ));
-    runtime.set_registrations(vec![registered_at("a1", "wA:p1", Some((1_000, 4242)))]);
+    runtime.set_registrations(vec![registered_at(
+        "00000000-0000-4000-8200-08b2d80fd5b3",
+        "wA:p1",
+        Some((1_000, 4242)),
+    )]);
 
     assert!(refresh_until(&mut collector, &mut state, |state| state
         .inventory()
@@ -892,7 +912,11 @@ fn a_live_pane_carries_a_root_sample_and_neither_stale_nor_retained_panes_do() {
     );
     let mut state = ObservationState::new();
     runtime.set_inventory(inventory(&["wA:p1"], vec![]));
-    runtime.set_registrations(vec![registered_at("test-wA:p1", "wA:p1", None)]);
+    runtime.set_registrations(vec![registered_at(
+        "00000000-0000-4000-b32b-496fcfe9f8a8",
+        "wA:p1",
+        None,
+    )]);
     runtime.set_evidence(ForegroundEvidence::command(
         4242,
         Some("pi".into()),
@@ -974,7 +998,11 @@ fn a_build_beneath_a_pane_reaches_the_row_as_a_measured_sum() {
     );
     let mut state = ObservationState::new();
     runtime.set_inventory(inventory(&["wA:p1"], vec![]));
-    runtime.set_registrations(vec![registered_at("test-wA:p1", "wA:p1", None)]);
+    runtime.set_registrations(vec![registered_at(
+        "00000000-0000-4000-b32b-496fcfe9f8a8",
+        "wA:p1",
+        None,
+    )]);
     runtime.set_evidence(ForegroundEvidence::command(
         4242,
         Some("pi".into()),

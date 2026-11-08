@@ -4,8 +4,8 @@ use super::*;
 #[serde(deny_unknown_fields)]
 pub(super) struct SubjectParams {
     #[serde(default)]
-    pub(super) subject_id: Option<String>,
-    pub(super) claim_id: String,
+    pub(super) subject_id: Option<SubjectId>,
+    pub(super) claim_id: ClaimId,
     #[serde(default)]
     pub(super) spawn_request_id: Option<String>,
 }
@@ -144,7 +144,7 @@ pub(super) fn run_subject_control(
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EnrollParams {
-    pub(super) registration_id: String,
+    pub(super) registration_id: RegistrationId,
     pub(super) session: String,
 }
 
@@ -183,13 +183,9 @@ pub(super) fn execute_enroll(
             Arc::clone(&core.stopping),
         )
     };
-    let registration_id = id_param(
-        &params.registration_id,
-        "registration_id",
-        RegistrationId::required,
-    )?;
+    let registration_id = &params.registration_id;
     let now = store::now_ms();
-    let registration = match registry.get(&registration_id) {
+    let registration = match registry.get(registration_id) {
         Ok(Some(registration)) => registration,
         Ok(None) => {
             return Err(Refusal::new(
@@ -216,7 +212,7 @@ pub(super) fn execute_enroll(
             "registration claims no process to enroll".to_string(),
         ));
     };
-    match registry.context(&registration_id, now) {
+    match registry.context(registration_id, now) {
         Ok(Some(context))
             if context.context.freshness == registry::Freshness::Fresh
                 && context.context.session.as_deref() == Some(params.session.as_str()) => {}
@@ -259,7 +255,9 @@ pub(super) fn execute_enroll(
     let enrolled =
         match verify_live_occupant(&backend, &verifier, &pane, &claim, &stopping, verification) {
             Err(refusal) => Err(refusal.message),
-            Ok(()) => record_enrollment(&registry, &verifier, &params, &claim, &request.id, now),
+            Ok(()) => ClaimId::required(&request.id, "enrollment_id").and_then(|enrollment_id| {
+                record_enrollment(&registry, &verifier, &params, &claim, &enrollment_id, now)
+            }),
         };
     let settlement = match enrolled {
         Ok(subject_id) => Settlement::completed(vec![format!("enrolled subject {subject_id}")]),
@@ -275,12 +273,11 @@ pub(super) fn record_enrollment(
     verifier: &Arc<dyn ProcessVerifier>,
     params: &EnrollParams,
     claim: &crate::model::ProcessIdentity,
-    enrollment_id: &str,
+    enrollment_id: &ClaimId,
     now: i64,
 ) -> Result<ClaimId, String> {
-    let enrollment_id = ClaimId::required(enrollment_id, "enrollment_id")?;
-    let registration_id = RegistrationId::required(&params.registration_id, "registration_id")?;
-    let presence = registry::presence::current(registry, &registration_id)?
+    let registration_id = &params.registration_id;
+    let presence = registry::presence::current(registry, registration_id)?
         .ok_or("lifecycle enrollment requires a current presence claim")?;
     if presence.session_id.as_deref() != Some(params.session.as_str())
         || !matches!(
@@ -298,8 +295,8 @@ pub(super) fn record_enrollment(
     let launch = subjects::captured_launch(&effective)?;
     subjects::enroll_subject(
         registry,
-        &enrollment_id,
-        &registration_id,
+        enrollment_id,
+        registration_id,
         claim,
         &params.session,
         launch,
@@ -310,13 +307,13 @@ pub(super) fn record_enrollment(
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RestartParams {
-    pub(super) subject_id: String,
+    pub(super) subject_id: SubjectId,
     /// The operator names the claim it saw, which fences the restart.
     #[serde(default)]
-    pub(super) claim_id: Option<String>,
+    pub(super) claim_id: Option<ClaimId>,
     /// A parent names itself instead and sends the program the child restarts as.
     #[serde(default)]
-    pub(super) parent: Option<String>,
+    pub(super) parent: Option<RegistrationId>,
     #[serde(default)]
     pub(super) executable: Option<String>,
     #[serde(default)]
@@ -375,25 +372,17 @@ pub(super) fn run_restart(
     core: &Arc<Mutex<Core>>,
     verification: &Arc<VerificationBudget>,
 ) -> Reply {
-    if crate::model::SessionUuid::parse(&params.subject_id).is_none() {
-        return Err(Refusal::new(
-            Code::BadParams,
-            "`subject_id` must be a canonical UUID",
-        ));
-    }
-
     if let Some(response) = replay_existing_operation(
         ops::Operation::Restart,
         request,
-        Some(&params.subject_id),
+        Some(params.subject_id.as_str()),
         &requester,
         core,
     ) {
         return response;
     }
     let registry = Arc::clone(&locked(core).registry);
-    let subject_id = id_param(&params.subject_id, "subject_id", SubjectId::required)?;
-    let subject = match subjects::current_attachment(&registry, &subject_id) {
+    let subject = match subjects::current_attachment(&registry, &params.subject_id) {
         Ok(Some(subject)) => subject,
         Ok(None) => {
             return Err(Refusal::new(
@@ -410,7 +399,7 @@ pub(super) fn run_restart(
         }
     };
     match (&params.claim_id, &params.parent) {
-        (Some(claim_id), _) if claim_id.as_str() != subject.claim_id.as_str() => {
+        (Some(claim_id), _) if claim_id != &subject.claim_id => {
             return Err(Refusal::new(
                 Code::Refused,
                 "the requested claim is not current; nothing was signalled",
@@ -420,7 +409,7 @@ pub(super) fn run_restart(
             let owned = match subject.managed.parent_subject_id.clone() {
                 Some(parent_subject) => matches!(
                     subjects::current_attachment(&registry, &parent_subject),
-                    Ok(Some(claim)) if claim.process.bound_registration_id.as_ref().map(RegistrationId::as_str) == Some(parent.as_str())
+                    Ok(Some(claim)) if claim.process.bound_registration_id.as_ref() == Some(parent)
                 ),
                 None => false,
             };
@@ -785,12 +774,9 @@ pub(super) fn cancel_target(
 ) -> Result<(ClaimId, String), Refusal> {
     let internal = |error: String| Refusal::new(Code::Internal, error);
     let subject = match (&params.subject_id, &params.spawn_request_id) {
-        (Some(subject_id), None) => subjects::current_attachment(
-            registry,
-            &id_param(subject_id, "subject_id", SubjectId::required)?,
-        )
-        .map_err(internal)?
-        .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?,
+        (Some(subject_id), None) => subjects::current_attachment(registry, subject_id)
+            .map_err(internal)?
+            .ok_or_else(|| Refusal::new(Code::NotFound, "launch subject is not recorded"))?,
         (None, Some(request_id)) => {
             let edge = registry
                 .spawn_edge(request_id)
@@ -821,7 +807,7 @@ pub(super) fn cancel_target(
         }
     };
     let current = subjects::read_subject_record(registry, &subject.subject_id).map_err(internal)?;
-    if params.claim_id != subject.claim_id.as_str()
+    if params.claim_id != subject.claim_id
         || current.is_none_or(|record| record.current_claim.as_ref() != Some(&subject.claim_id))
     {
         return Err(Refusal::new(
@@ -850,8 +836,8 @@ pub(super) fn termination_outcome(
         executions: claim
             .map(|claim| {
                 vec![subjects::EndedExecution {
-                    subject_id: Some(claim.subject_id.to_string()),
-                    registration_id: claim.process.registration_id.to_string(),
+                    subject_id: Some(claim.subject_id.clone()),
+                    registration_id: claim.process.registration_id.clone(),
                     end: (&termination.exit).into(),
                     completion: completion.clone(),
                 }]

@@ -62,7 +62,7 @@ struct Entry {
 impl Entry {
     fn of(message: &Message, bytes: u64) -> Self {
         Self {
-            recipients: message.recipients.clone(),
+            recipients: message.recipients.iter().map(ToString::to_string).collect(),
             created_at: message.created_at_unix_ms,
             bytes,
             received: BTreeMap::new(),
@@ -149,7 +149,7 @@ impl MessageStore {
                 || message.recipients.iter().any(|recipient| {
                     index
                         .values()
-                        .filter(|entry| entry.pending_for(recipient))
+                        .filter(|entry| entry.pending_for(recipient.as_str()))
                         .count()
                         >= MAX_PENDING_PER_SUBJECT
                 })
@@ -213,7 +213,7 @@ impl MessageStore {
     ) -> Result<(MessageReceipt, bool), Error> {
         let _writes = self.writes();
         self.prune_received(crate::control_plane::store::now_ms())?;
-        let subject = &recipient.subject_id;
+        let subject = recipient.subject_id.as_str();
         if self.captured(id, subject)? {
             let first = self
                 .read_receipt(id, subject)?
@@ -241,7 +241,9 @@ impl MessageStore {
         )
         .map_err(Error::Internal)?;
         if let Some(entry) = self.index_mut().get_mut(id) {
-            entry.received.insert(subject.clone(), received_at_unix_ms);
+            entry
+                .received
+                .insert(subject.to_owned(), received_at_unix_ms);
             entry.bytes = entry.bytes.saturating_add(bytes.len() as u64);
         }
         Ok((receipt, true))
@@ -387,7 +389,7 @@ impl MessageStore {
                 "unsupported message receipt version".into(),
             ));
         }
-        if receipt.message_id != id || receipt.recipient.subject_id != subject {
+        if receipt.message_id != id || receipt.recipient.subject_id.as_str() != subject {
             return Err(Error::Internal(
                 "receipt does not match its filename".into(),
             ));
@@ -541,13 +543,6 @@ fn validate_message(message: &Message) -> Result<(), Error> {
             "recipients must be sorted and unique subject ids".into(),
         ));
     }
-    for recipient in &message.recipients {
-        if !is_id(recipient) {
-            return Err(Error::Invalid(
-                "recipient subject must be a canonical UUID".into(),
-            ));
-        }
-    }
     validate_body(&message.body)?;
     if message.created_at_unix_ms > crate::model::MAX_SAFE_JSON_INTEGER {
         return Err(Error::Invalid(
@@ -584,17 +579,8 @@ fn validate_body(body: &PublishBody) -> Result<(), Error> {
 }
 
 fn validate_identity(identity: &AgentIdentity) -> Result<(), Error> {
-    for (label, value) in [
-        ("registration", &identity.registration_id),
-        ("session", &identity.session_id),
-        ("claim", &identity.claim_id),
-    ] {
-        if value.is_empty() || value.chars().any(char::is_control) {
-            return Err(Error::Invalid(format!("{label} id is invalid")));
-        }
-    }
-    if !is_id(&identity.subject_id) {
-        return Err(Error::Invalid("subject id must be a canonical UUID".into()));
+    if identity.session_id.is_empty() || identity.session_id.chars().any(char::is_control) {
+        return Err(Error::Invalid("session id is invalid".into()));
     }
     Ok(())
 }
@@ -615,11 +601,13 @@ mod tests {
     use crate::control_plane::public_contracts::PublishBody;
 
     fn identity(subject: &str) -> AgentIdentity {
+        use crate::identity::{ClaimId, RegistrationId, SubjectId};
         AgentIdentity {
-            registration_id: format!("registration-{subject}"),
+            registration_id: RegistrationId::parse("0e000000-0000-4000-8000-00000000000e")
+                .expect("a registration id"),
             session_id: format!("session-{subject}"),
-            subject_id: subject.to_owned(),
-            claim_id: format!("claim-{subject}"),
+            subject_id: SubjectId::parse(subject).expect("a subject id"),
+            claim_id: ClaimId::parse("0c000000-0000-4000-8000-00000000000c").expect("a claim id"),
         }
     }
 
@@ -630,7 +618,9 @@ mod tests {
             producer: identity("11111111-1111-4111-8111-111111111111"),
             recipients: recipients
                 .iter()
-                .map(|value| (*value).to_string())
+                .map(|value| {
+                    crate::identity::SubjectId::parse(value).expect("a recipient subject id")
+                })
                 .collect(),
             body: PublishBody::Handoff {
                 correlation_id: Some("run-1".into()),

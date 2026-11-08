@@ -22,29 +22,20 @@ pub(super) fn presence_request(
         if request.method == "agent.release" {
             let release: presence::Release =
                 serde_json::from_value(request.params.clone()).map_err(|e| e.to_string())?;
-            let registration_id =
-                RegistrationId::required(&release.registration_id, "registration_id")?;
             let registration = registry
-                .get(&registration_id)?
+                .get(&release.registration_id)?
                 .ok_or("registration is not recorded")?;
             if registration.request.process.as_ref() != Some(&release.process)
                 || !matches!(verifier.inspect(release.process.pid), Ok(Some(p)) if p == release.process)
             {
                 return Err("release does not identify the registered live process".into());
             }
-            return presence::release(
-                &registry,
-                &registration_id,
-                &ClaimId::required(&release.claim_id, "claim_id")?,
-            );
+            return presence::release(&registry, &release.registration_id, &release.claim_id);
         }
         let report: presence::Report =
             serde_json::from_value(request.params.clone()).map_err(|e| e.to_string())?;
-        for id in [&report.claim_id, &report.session_id, &report.incarnation] {
+        for id in [&report.session_id, &report.incarnation] {
             registry::validate_registration_id(id)?;
-        }
-        if let Some(subject_id) = &report.subject_id {
-            registry::validate_registration_id(subject_id)?;
         }
         let process_observation = verifier.inspect(report.process.pid);
         match &process_observation {
@@ -54,7 +45,7 @@ pub(super) fn presence_request(
         }
         let registration = presence::registration(&registry, &report, now)?;
         let registration_id = registration.registration_id.clone();
-        let claim_id = ClaimId::required(&report.claim_id, "claim_id")?;
+        let claim_id = report.claim_id.clone();
         let mut claim = presence::begin(
             &registry,
             &registration_id,
@@ -113,7 +104,7 @@ pub(super) fn presence_request(
         )?;
         registry::context::report_presence(
             &registry,
-            registration.registration_id.as_str(),
+            &registration.registration_id,
             registry::PublisherIdentity {
                 source: registration.request.source.clone(),
                 incarnation: registration.request.incarnation.clone(),
@@ -131,15 +122,13 @@ pub(super) fn presence_request(
                 presence::save(&registry, &claim)?;
                 return Ok(claim);
             }
-            subjects::Attachment::Own(subject) if subject.claim_id.as_str() == report.claim_id => {
-                *subject
-            }
+            subjects::Attachment::Own(subject) if subject.claim_id == report.claim_id => *subject,
             subjects::Attachment::Own(_) | subjects::Attachment::Free => {
                 let id = record_enrollment(
                     &registry,
                     &verifier,
                     &EnrollParams {
-                        registration_id: registration.registration_id.to_string(),
+                        registration_id: registration.registration_id.clone(),
                         session: report.session_id,
                     },
                     &report.process,
@@ -152,8 +141,8 @@ pub(super) fn presence_request(
         let subject_id = subject.subject_id;
         if report
             .subject_id
-            .as_deref()
-            .is_some_and(|known| known != subject_id.as_str())
+            .as_ref()
+            .is_some_and(|known| known != &subject_id)
         {
             return Err("reported subject does not match Radar's stored claim".into());
         }
@@ -267,14 +256,7 @@ pub(super) fn registry_request(
                 Ok(value) => value,
                 Err(refusal) => return Response::refused(&request.id, &refusal),
             };
-            let registration_id = match id_param(
-                &publish.registration_id,
-                "registration_id",
-                RegistrationId::required,
-            ) {
-                Ok(registration_id) => registration_id,
-                Err(refusal) => return Response::refused(&request.id, &refusal),
-            };
+            let registration_id = publish.registration_id.clone();
             let core = locked(core);
             let now_ms = store::now_ms();
             match core.registry.publish_context(&publish, now_ms) {
@@ -318,7 +300,7 @@ pub(super) fn registry_request(
                 );
             }
             match core.registry.retire(
-                &params.registration_id,
+                params.registration_id.as_str(),
                 params.channel,
                 &params.writer_handle,
                 store::now_ms(),
@@ -345,15 +327,8 @@ pub(super) fn registry_request(
                     Arc::clone(&core.stopping),
                 )
             };
-            let registration_id = match id_param(
-                &params.registration_id,
-                "registration_id",
-                RegistrationId::required,
-            ) {
-                Ok(registration_id) => registration_id,
-                Err(refusal) => return Response::refused(&request.id, &refusal),
-            };
-            let registration = match registry.get(&registration_id) {
+            let registration_id = &params.registration_id;
+            let registration = match registry.get(registration_id) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     return Response::refused(
@@ -422,21 +397,12 @@ pub(super) fn registry_request(
                 Ok(value) => value,
                 Err(refusal) => return Response::refused(&request.id, &refusal),
             };
-            if SessionUuid::parse(&params.subject_id).is_none() {
-                return Response::refused(
-                    &request.id,
-                    &Refusal::new(Code::BadParams, "`subject_id` must be a canonical UUID"),
-                );
-            }
             let (registry, verifier) = {
                 let core = locked(core);
                 (Arc::clone(&core.registry), Arc::clone(&core.verifier))
             };
-            let subject_id = match id_param(&params.subject_id, "subject_id", SubjectId::required) {
-                Ok(subject_id) => subject_id,
-                Err(refusal) => return Response::refused(&request.id, &refusal),
-            };
-            let current = match subjects::current_attachment(&registry, &subject_id) {
+            let subject_id = &params.subject_id;
+            let current = match subjects::current_attachment(&registry, subject_id) {
                 Ok(Some(subject)) => subject,
                 Ok(None) => {
                     return Response::refused(
@@ -456,7 +422,7 @@ pub(super) fn registry_request(
             {
                 return registry_error(request, error);
             }
-            match subjects::current_attachment(&registry, &subject_id) {
+            match subjects::current_attachment(&registry, subject_id) {
                 Ok(Some(subject)) => respond(
                     &request.id,
                     Ok(answers::Subject {
@@ -792,19 +758,11 @@ pub(super) fn registry_request(
             // without reading the whole topology to page a bounded answer.
             let read = {
                 let core = locked(core);
-                let parent = match params.registration_id.as_deref() {
+                let parent = match &params.registration_id {
                     Some(registration_id) => {
-                        let registration_id = match id_param(
-                            registration_id,
-                            "registration_id",
-                            RegistrationId::required,
-                        ) {
-                            Ok(registration_id) => registration_id,
-                            Err(refusal) => return Response::refused(&request.id, &refusal),
-                        };
                         match crate::control_plane::registry::presence::attachment(
                             &core.registry,
-                            &registration_id,
+                            registration_id,
                         ) {
                             Ok(Some(attachment)) => Some(attachment.subject_id),
                             Ok(None) => {

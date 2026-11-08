@@ -5,6 +5,8 @@
 //! feeding the join that [`ui::render`] draws — over a real observation rather
 //! than a hand-built row, so a change to either half of the join fails here.
 
+mod support;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_radar::app::DetailPage;
@@ -42,7 +44,7 @@ const NO_SESSION: &str = "c1a2b3d4-e5f6-4a7b-8c9d-0e1a2b3c4d5e";
 /// — the running count beside it is not a task set — so the count publishes
 /// that many ids.
 fn task_session_view(pane_id: &str, session: &str) -> RegistryView {
-    let registration_id = format!("test-{pane_id}");
+    let registration_id = support::registration_id(&format!("test-{pane_id}"));
     let mut agent: RegistryAgent = serde_json::from_value(serde_json::json!({
         "registration": {
             "version": 1,

@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::control_plane::store::format_millis;
+use crate::identity::RegistrationId;
 use crate::model::SessionUuid;
 use crate::timestamp::timestamp_millis;
 
@@ -61,7 +62,7 @@ pub struct ContextValue {
 #[serde(deny_unknown_fields)]
 pub struct ContextRequest {
     /// The agent record whose current session this is.
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
     /// The publisher presenting itself: the writer a first publish binds, and
     /// the successor a replacement binds. Recorded as provenance, never looked
     /// up — a publisher restart is a new incarnation UUID, not a second agent.
@@ -83,7 +84,6 @@ pub struct ContextRequest {
 
 impl ContextRequest {
     pub fn validate(&self) -> Result<(), String> {
-        validate_registration_id(&self.registration_id)?;
         self.publisher.validate()?;
         if let Some(handle) = &self.writer_handle {
             validate_registration_id(handle)?;
@@ -167,7 +167,7 @@ impl AcceptedContext {
 #[serde(deny_unknown_fields)]
 pub struct SessionContext {
     pub version: u32,
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
     pub writer: WriterBinding,
     pub context: AcceptedContext,
 }
@@ -256,7 +256,7 @@ pub struct PublicSession {
 #[serde(deny_unknown_fields)]
 pub struct PublicContext {
     pub version: u32,
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
     pub writer: PublicWriterFacts,
     pub context: PublicSession,
 }
@@ -274,14 +274,14 @@ pub struct ContextWrite {
 /// Internal projection of the unified presence report for existing snapshot readers.
 pub(crate) fn report_presence(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     publisher: PublisherIdentity,
     session: Option<String>,
     now_ms: i64,
 ) -> Result<(), String> {
     let prior = read_record(registry, registration_id)?;
     let request = ContextRequest {
-        registration_id: registration_id.into(),
+        registration_id: registration_id.clone(),
         publisher,
         writer_handle: prior.as_ref().map(|p| p.writer.handle.clone()),
         replace: None,
@@ -312,9 +312,7 @@ pub fn publish(
     request.validate()?;
     let _transition = registry.transition();
     // The context is a fact about an agent record, so the subject must exist.
-    let registration_id =
-        crate::identity::RegistrationId::required(&request.registration_id, "registration_id")?;
-    registry.get(&registration_id)?.ok_or_else(|| {
+    registry.get(&request.registration_id)?.ok_or_else(|| {
         super::Error::NotFound(format!(
             "agent {} is not registered",
             request.registration_id
@@ -422,7 +420,7 @@ pub fn publish(
     write_record(registry, &record)?;
     registry.append_event(
         "context.updated",
-        Some(&request.registration_id),
+        Some(request.registration_id.as_str()),
         None,
         None,
     );
@@ -435,7 +433,7 @@ pub fn publish(
 /// Retire this agent's context writer without retracting its last report.
 pub fn retire(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     writer_handle: &str,
     now_ms: i64,
 ) -> Result<SessionContext, super::Error> {
@@ -461,7 +459,12 @@ pub fn retire(
         ..record
     };
     write_record(registry, &updated)?;
-    registry.append_event("context.retired", Some(registration_id), None, None);
+    registry.append_event(
+        "context.retired",
+        Some(registration_id.as_str()),
+        None,
+        None,
+    );
     Ok(updated)
 }
 
@@ -469,7 +472,7 @@ pub fn retire(
 /// when this agent has never published one.
 pub fn published(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
     now_ms: i64,
 ) -> Result<Option<PublicContext>, String> {
     Ok(read_record(registry, registration_id)?
@@ -491,9 +494,8 @@ fn refusal(reason: &str, incumbent: &WriterBinding) -> String {
 
 fn read_record(
     registry: &Registry,
-    registration_id: &str,
+    registration_id: &RegistrationId,
 ) -> Result<Option<SessionContext>, String> {
-    validate_registration_id(registration_id)?;
     let path = record_path(registry, registration_id);
     let bytes = match read_record_file(&path, MAX_CONTEXT_BYTES) {
         Ok(bytes) => bytes,
@@ -508,7 +510,7 @@ fn read_record(
             record.version
         ));
     }
-    if record.registration_id != registration_id {
+    if &record.registration_id != registration_id {
         return Err(format!(
             "context record id does not match its filename: {}",
             path.display()
@@ -532,7 +534,7 @@ fn read_record(
     Ok(Some(record))
 }
 
-fn record_path(registry: &Registry, registration_id: &str) -> PathBuf {
+fn record_path(registry: &Registry, registration_id: &RegistrationId) -> PathBuf {
     registry
         .publications()
         .join(format!("{registration_id}.context.json"))

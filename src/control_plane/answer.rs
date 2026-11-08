@@ -95,14 +95,14 @@ pub struct PublicClose {
 /// scope the client derives from it rather than receiving the naming rule twice.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Admitted {
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
 }
 
 /// What `launch.claim` answers a released launch: its registration and the
 /// program from the daemon's own record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claimed {
-    pub registration_id: String,
+    pub registration_id: crate::identity::RegistrationId,
     pub executable: String,
     pub argv: Vec<String>,
 }
@@ -248,7 +248,9 @@ pub(crate) struct ObservationProgress {
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum Management {
-    Managed { subject_id: String },
+    Managed {
+        subject_id: crate::identity::SubjectId,
+    },
     Unmanaged,
     Duplicate,
 }

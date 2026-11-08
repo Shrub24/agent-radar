@@ -1570,7 +1570,7 @@ fn context_request(
     session: Option<&str>,
 ) -> ContextRequest {
     ContextRequest {
-        registration_id: registration_id.into(),
+        registration_id: RegistrationId::parse(registration_id).expect("a registration id"),
         publisher,
         writer_handle: handle.map(str::to_string),
         replace: None,
@@ -1672,7 +1672,7 @@ fn a_context_switch_republishes_without_changing_identity_or_generation() {
     );
 
     let read = context_of(&registry, agent.registration_id.as_str(), 1_002);
-    assert_eq!(read.registration_id, agent.registration_id.as_str());
+    assert_eq!(read.registration_id, agent.registration_id);
     assert_eq!(read.writer.generation, 1);
     assert_eq!(read.writer.sequence, 2);
     assert_eq!(read.context.generation, 1);
@@ -1974,7 +1974,7 @@ fn context_replacement_after_retirement_advances_the_generation() {
     let successor = publisher(&agent.request.source, OTHER_INCARNATION);
 
     registry
-        .retire_context(agent.registration_id.as_str(), &old.handle, 1_500)
+        .retire_context(&agent.registration_id, &old.handle, 1_500)
         .expect("a retirement");
 
     // A replacement must name the exact incumbent it observed.

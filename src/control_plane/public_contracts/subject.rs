@@ -8,6 +8,7 @@ use crate::control_plane::registry::RegistryLocation;
 use crate::control_plane::registry::publication::{
     ExpectedWriter, PublicSnapshotFacts, PublicWriterFacts, PublicationUpdate, PublisherIdentity,
 };
+use crate::identity::{RegistrationId, SubjectId};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -47,7 +48,7 @@ pub struct ChannelFacts {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Subject {
-    pub subject_id: String,
+    pub subject_id: SubjectId,
     pub session_id: Option<String>,
     pub managed: ManagedMetadata,
     pub state: AttachmentState,
@@ -62,7 +63,7 @@ pub struct Subject {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetParams {
-    pub subject_id: String,
+    pub subject_id: SubjectId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -74,8 +75,8 @@ pub struct GetResult {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChildGetParams {
-    pub registration_id: String,
-    pub subject_id: String,
+    pub registration_id: RegistrationId,
+    pub subject_id: SubjectId,
 }
 
 /// Closes a child's pane. The caller names the child by subject; Radar resolves
@@ -83,8 +84,8 @@ pub struct ChildGetParams {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChildCloseParams {
-    pub registration_id: String,
-    pub subject_id: String,
+    pub registration_id: RegistrationId,
+    pub subject_id: SubjectId,
     pub intent: crate::control_plane::registry::CloseIntent,
 }
 
@@ -102,7 +103,7 @@ pub struct ListParams {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChildrenParams {
-    pub registration_id: String,
+    pub registration_id: RegistrationId,
     #[serde(default)]
     pub selection: Option<Selection>,
     #[serde(default)]
@@ -114,8 +115,8 @@ pub struct ChildrenParams {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentAcquire {
-    pub registration_id: String,
-    pub subject_id: String,
+    pub registration_id: RegistrationId,
+    pub subject_id: SubjectId,
     pub publisher: PublisherIdentity,
     #[serde(default)]
     pub replace: Option<ExpectedWriter>,
@@ -124,16 +125,16 @@ pub struct AssignmentAcquire {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentPublish {
-    pub registration_id: String,
-    pub subject_id: String,
+    pub registration_id: RegistrationId,
+    pub subject_id: SubjectId,
     pub update: PublicationUpdate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentRetire {
-    pub registration_id: String,
-    pub subject_id: String,
+    pub registration_id: RegistrationId,
+    pub subject_id: SubjectId,
     pub writer_handle: String,
 }
 

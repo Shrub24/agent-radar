@@ -45,8 +45,12 @@ mod tests {
 
     fn execution(subject: Option<&str>, end: ExecutionEnd) -> EndedExecution {
         EndedExecution {
-            subject_id: subject.map(str::to_string),
-            registration_id: "9d8c7b6a-5f4e-4d3c-9b2a-1809f7e6d5c4".into(),
+            subject_id: subject
+                .map(|id| crate::identity::SubjectId::parse(id).expect("a subject id")),
+            registration_id: crate::identity::RegistrationId::parse(
+                "9d8c7b6a-5f4e-4d3c-9b2a-1809f7e6d5c4",
+            )
+            .expect("a registration id"),
             end,
             completion: None,
         }
