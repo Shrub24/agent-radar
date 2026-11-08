@@ -54,8 +54,10 @@ fn after_prefix<'a>(title: &'a str, head: &str) -> Option<&'a str> {
 
 /// The first token of a title: what a provider name would have to be.
 fn leading_token(title: &str) -> &str {
+    // A hyphen splits only when spaced (`codex - notes`), so a name that holds
+    // one, like `Pi-Bolt`, stays a single token.
     let end = title
-        .find(|ch: char| ch.is_whitespace() || is_separator(ch))
+        .find(|ch: char| ch.is_whitespace() || (ch != '-' && is_separator(ch)))
         .unwrap_or(title.len());
     &title[..end]
 }
@@ -238,6 +240,19 @@ mod tests {
         assert_eq!(strip("- nix-homelab", "nix-homelab"), "- nix-homelab");
         assert_eq!(strip("nix-homelab", "nix-homelab"), "nix-homelab");
         assert_eq!(strip_workspace_suffix("a - b", None), "a - b");
+    }
+
+    #[test]
+    fn the_pi_bolt_name_is_stripped_whole_not_as_pi() {
+        let title = "Pi-Bolt - SOPS storage for Cloudflare tunnel credentials - nix";
+        let want = "SOPS storage for Cloudflare tunnel credentials - nix";
+        assert_eq!(display(title, None), want, "a pane row");
+        assert_eq!(display(title, Some("pi-bolt")), want, "an agent row");
+        assert_eq!(
+            display(title, Some("herdsman-pi")),
+            want,
+            "a registered agent"
+        );
     }
 
     #[test]
