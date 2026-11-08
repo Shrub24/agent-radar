@@ -4,6 +4,8 @@ Radar is alpha: breaking changes are expected and bump the minor version. The wi
 
 ## Radar 0.10.2
 
+- Library APIs distinguish subject, claim and registration IDs with validated types; their JSON representation and schemas remain strings.
+- Event pointers no longer identify an unattached process as a subject. Assignment publication events name the subject they describe, while process publication events name the registration; neither is published under the other identity kind.
 - **Breaking:** an agent row is a registration and nothing else. `AgentObservation` no longer carries `name`, `label` or `lineage`, and `HerdsmanFacts` no longer carries `name`, `label` or `managed_metadata`; the observation no longer carries `metadata_agents` and its `containment` map is gone. A backend's own agent records and `pi_herdsman_*` pane tokens no longer exist as a second kind of agent: the registry is the only producer of an agent row.
 - **Breaking:** `AgentObservation.registry` is required rather than optional, so a row either names its registration or is a pane row. Containment collapses to "an agent row is a registered agent", and nesting goes through the daemon's spawn edges alone.
 - The row's name comes from the registration's label, else the title's session provider, else the source the registration was published under, which is also what selects its vendor mark. An unreported execution or assignment is now stated as `unknown — nothing reported` rather than omitted.

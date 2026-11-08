@@ -465,6 +465,11 @@ pub use spawn::{
     Withdrawn,
 };
 
+pub(crate) enum EventTarget {
+    Subject(SubjectId),
+    Registration(RegistrationId),
+}
+
 impl Registry {
     /// Opens the registry under `root`, creating `root` and its `agents`,
     /// `publications`, `spawns` and `closes` directories if they are missing.
@@ -524,7 +529,7 @@ impl Registry {
     pub(crate) fn append_event(
         &self,
         kind: &str,
-        registration_id: Option<&str>,
+        target: Option<EventTarget>,
         spawn: Option<&str>,
         request_id: Option<&str>,
     ) {
@@ -534,14 +539,19 @@ impl Registry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         if let Some(store) = store {
+            let (subject_id, registration_id) = match target {
+                Some(EventTarget::Subject(id)) => (Some(id.to_string()), None),
+                Some(EventTarget::Registration(id)) => (None, Some(id)),
+                None => (None, None),
+            };
             let event = crate::control_plane::store::Event {
-                subject_id: None,
+                subject_id,
                 claim_id: None,
 
                 lifecycle_event_id: None,
                 seq: 0,
                 kind: kind.to_string(),
-                registration_id: registration_id.map(str::to_string),
+                registration_id,
                 spawn: spawn.map(str::to_string),
                 request_id: request_id.map(str::to_string),
                 at: crate::control_plane::store::now(),
@@ -933,7 +943,9 @@ impl Registry {
         }
         self.append_event(
             "agent.registered",
-            Some(registration.registration_id.as_str()),
+            Some(EventTarget::Registration(
+                registration.registration_id.clone(),
+            )),
             None,
             None,
         );

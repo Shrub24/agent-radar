@@ -13,7 +13,7 @@
 ## 3. Server and wire
 
 - [x] 3.1 Parse identity fields at request decode, type the public DTOs, and delete every stage-1 call-site conversion. Formatting, strict Clippy, all Rust targets, SDK typecheck and 133 tests, unchanged-schema contract check, OpenSpec validation, and checked Nix package build passed. Presentation fixtures now use canonical registration UUIDs; the startup-record refusal test uses the backend-independent bind API, with a failing negative control when record validation is removed.
-- [ ] 3.2 Delete any lookup that resolves one identity kind through another; a request naming a subject in a claim field is refused, not resolved. This includes the event pointer projection (`store/delivery.rs`), which publishes the event's record key as `subject_id` when the attachment names no subject, so a process-only event names its registration as a subject.
+- [x] 3.2 Delete any lookup that resolves one identity kind through another; a request naming a subject in a claim field is refused, not resolved. Public event claim and registration pointers are typed; process-only events never invent a subject, and assignment publication events name their subject rather than a registration. Delivery/replay and real publication tests pass; restoring the record-key-as-subject fallback fails the regression. Full Rust/SDK/OpenSpec gate and checked Nix package build passed.
 
 ## 4. UI session
 

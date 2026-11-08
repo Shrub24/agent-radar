@@ -420,7 +420,9 @@ pub fn publish(
     write_record(registry, &record)?;
     registry.append_event(
         "context.updated",
-        Some(request.registration_id.as_str()),
+        Some(super::EventTarget::Registration(
+            request.registration_id.clone(),
+        )),
         None,
         None,
     );
@@ -461,7 +463,7 @@ pub fn retire(
     write_record(registry, &updated)?;
     registry.append_event(
         "context.retired",
-        Some(registration_id.as_str()),
+        Some(super::EventTarget::Registration(registration_id.clone())),
         None,
         None,
     );

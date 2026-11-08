@@ -97,35 +97,42 @@ fn pointer(event: &LifecycleEvent, log: &Log) -> Option<Event> {
         Transition::ProcessCreated {
             registration_id, ..
         }
-        | Transition::Bound { registration_id } => Some(registration_id.to_string()),
-        Transition::Enrolled(facts) => facts
-            .execution
-            .bound_registration_id
+        | Transition::Bound { registration_id } => Some(registration_id.clone()),
+        Transition::Enrolled(facts) => facts.execution.bound_registration_id.clone(),
+        _ => facts
             .as_ref()
-            .map(ToString::to_string),
-        _ => None,
+            .map(|facts| facts.attachment.registration_id.clone())
+            .or_else(|| {
+                let id = event
+                    .subject_id
+                    .as_deref()
+                    .and_then(crate::identity::RegistrationId::parse)?;
+                log.process(&id).map(|_| id)
+            }),
     };
     let lifecycle_execution = event.operation_id.is_none() && facts.is_some();
-    let subject_id = if matches!(event.transition, Transition::ProcessCreated { .. }) {
-        None
+    let subject_id = if event.transition.is_container() {
+        event.subject_id.clone()
     } else {
-        facts
-            .as_ref()
-            .and_then(|facts| {
-                facts
-                    .attachment
-                    .subject_id
-                    .as_ref()
-                    .map(ToString::to_string)
-            })
-            .or_else(|| event.subject_id.clone())
+        facts.as_ref().and_then(|facts| {
+            facts
+                .attachment
+                .subject_id
+                .as_ref()
+                .map(ToString::to_string)
+        })
     };
     Some(Event {
         seq: 0,
         kind: kind.into(),
         subject_id,
         claim_id: lifecycle_execution
-            .then(|| event.subject_id.clone())
+            .then(|| {
+                event
+                    .subject_id
+                    .as_deref()
+                    .and_then(crate::identity::ClaimId::parse)
+            })
             .flatten(),
         lifecycle_event_id: Some(event.event_id.clone()),
         registration_id,

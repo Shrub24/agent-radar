@@ -104,12 +104,12 @@ pub struct Event {
     pub subject_id: Option<String>,
     /// Exact lifecycle execution affected by a subject event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_id: Option<String>,
+    pub claim_id: Option<crate::identity::ClaimId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_event_id: Option<String>,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registration_id: Option<String>,
+    pub registration_id: Option<crate::identity::RegistrationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,7 +703,6 @@ impl Store {
             return Err("event kind must be nonempty bounded text".into());
         }
         for identifier in [
-            &event.registration_id,
             &event.spawn,
             &event.request_id,
             &event.subject_id,
@@ -1527,7 +1526,7 @@ mod tests {
                     lifecycle_event_id: None,
                     seq: 0,
                     kind: format!("k{n}"),
-                    registration_id: Some("agent".into()),
+                    registration_id: Some(crate::identity::RegistrationId::random()),
                     spawn: None,
                     request_id: None,
                     at: "now".into(),
@@ -1552,7 +1551,7 @@ mod tests {
                 lifecycle_event_id: None,
                 seq: 0,
                 kind: "publication".into(),
-                registration_id: Some("a".into()),
+                registration_id: Some(crate::identity::RegistrationId::random()),
                 spawn: None,
                 request_id: None,
                 at: "later".into(),
@@ -1581,7 +1580,13 @@ mod tests {
                                 lifecycle_event_id: None,
                                 seq: 0,
                                 kind: "concurrent".into(),
-                                registration_id: Some(format!("{worker}-{item}")),
+                                registration_id: Some(
+                                    crate::identity::RegistrationId::parse(&format!(
+                                        "00000000-0000-4000-8000-{:012x}",
+                                        worker * 25 + item
+                                    ))
+                                    .unwrap(),
+                                ),
                                 spawn: None,
                                 request_id: None,
                                 at: "now".into(),

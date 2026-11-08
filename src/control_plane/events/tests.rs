@@ -67,8 +67,50 @@ fn a_process_can_be_recovered_without_fabricating_a_claim() {
             .unwrap()
             .is_empty()
     );
+    registry
+        .events
+        .lock()
+        .unwrap()
+        .append(
+            Stream::Process(&process.registration_id),
+            "2026-01-01T00:00:00.000Z",
+            Source::ProcessControl,
+            Transition::SignalRequested,
+        )
+        .unwrap();
+    let process = lifecycle::read_process(&registry, &process.registration_id)
+        .unwrap()
+        .unwrap();
+    let store = crate::control_plane::store::Store::open(&fixture.0).unwrap();
+    let pointers = store.events().unwrap();
+    for kind in ["process.created", "lifecycle.signal_requested"] {
+        assert!(
+            pointers.iter().any(|event| event.kind == kind),
+            "missing {kind} pointer"
+        );
+    }
+    assert!(
+        pointers
+            .iter()
+            .all(|event| event.subject_id.is_none() && event.claim_id.is_none()),
+        "a process-only pointer invented a subject or claim"
+    );
+    assert!(
+        pointers
+            .iter()
+            .all(|event| event.registration_id.as_ref() == Some(&process.registration_id)),
+        "a process-only pointer lost its registration"
+    );
+    drop(store);
     drop(registry);
     let restored = fixture.registry();
+    assert_eq!(
+        crate::control_plane::store::Store::open(&fixture.0)
+            .unwrap()
+            .events()
+            .unwrap(),
+        pointers
+    );
     let recovered = lifecycle::read_process(&restored, &process.registration_id)
         .unwrap()
         .unwrap();
@@ -81,6 +123,108 @@ fn a_process_can_be_recovered_without_fabricating_a_claim() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn publication_pointers_distinguish_subjects_from_registrations() {
+    use crate::control_plane::registry::publication::{
+        AcquireRequest, Channel, PublicationUpdate, PublishRequest, PublisherIdentity, Report,
+        Snapshot,
+    };
+    let fixture = Fixture::new();
+    let registry = fixture.registry();
+    let ticket = create(&registry);
+    let agent = registry
+        .register(
+            &serde_json::from_value(serde_json::json!({
+                "source": "test-publisher",
+                "incarnation": "11111111-1111-4111-8111-111111111111"
+            }))
+            .unwrap(),
+            1000,
+        )
+        .unwrap();
+    let store = crate::control_plane::store::Store::open(&fixture.0).unwrap();
+    registry.attach_journal(store.clone());
+    for (channel, target) in [
+        (Channel::Execution, agent.registration_id.to_string()),
+        (Channel::Assignment, ticket.subject_id.to_string()),
+    ] {
+        let before = store.events().unwrap().len();
+        let writer = registry
+            .acquire_writer(
+                &AcquireRequest {
+                    target_id: target.clone(),
+                    channel,
+                    publisher: PublisherIdentity {
+                        source: "test-publisher".into(),
+                        incarnation: "11111111-1111-4111-8111-111111111111".into(),
+                        reporting_owner: (channel == Channel::Assignment).then(|| "owner".into()),
+                    },
+                    replace: None,
+                },
+                1000,
+            )
+            .unwrap();
+        registry
+            .publish(
+                &PublishRequest {
+                    target_id: target.clone(),
+                    channel,
+                    update: PublicationUpdate {
+                        writer_handle: writer.handle.clone(),
+                        sequence: 1,
+                        lease_ms: None,
+                        observed_at: None,
+                        snapshot: Report::Execution(Snapshot {
+                            activity: "working".into(),
+                            waiting_reason: None,
+                            last_outcome: None,
+                            actions: Vec::new(),
+                        }),
+                    },
+                },
+                1001,
+            )
+            .unwrap();
+        registry
+            .retire(&target, channel, &writer.handle, 1002)
+            .unwrap();
+        let events = store.events().unwrap();
+        let events = &events[before..];
+        for kind in [
+            "publication.writer".to_string(),
+            format!("{}.published", channel.name()),
+            format!("{}.retired", channel.name()),
+        ] {
+            assert!(
+                events.iter().any(|event| event.kind == kind),
+                "missing {kind}"
+            );
+        }
+        for event in events {
+            match channel {
+                Channel::Assignment => {
+                    assert_eq!(
+                        event.subject_id.as_deref(),
+                        Some(ticket.subject_id.as_str())
+                    );
+                    assert!(
+                        event.registration_id.is_none(),
+                        "an assignment subject became a registration"
+                    );
+                }
+                Channel::Execution => {
+                    assert_eq!(event.registration_id.as_ref(), Some(&agent.registration_id));
+                    assert!(
+                        event.subject_id.is_none(),
+                        "an execution registration became a subject"
+                    );
+                }
+                Channel::Facts => unreachable!(),
+            }
+        }
+    }
 }
 
 #[test]
@@ -309,7 +453,7 @@ fn failed_pointer_delivery_recovers_from_the_log_without_duplicates() {
         .find(|event| event.kind == "process.created")
         .expect("process pointer");
     assert_eq!(
-        process.registration_id.as_deref(),
+        process.registration_id.as_ref().map(RegistrationId::as_str),
         Some(ticket.registration_id.as_str())
     );
     assert!(

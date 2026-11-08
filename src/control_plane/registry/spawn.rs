@@ -360,7 +360,7 @@ pub fn record(
     write_edge(registry, &edge)?;
     registry.append_event(
         "spawn.requested",
-        Some(edge.parent.as_str()),
+        Some(super::EventTarget::Registration(edge.parent.clone())),
         None,
         Some(&edge.request_id),
     );
@@ -676,7 +676,7 @@ fn bind_locked(
     write_edge(registry, &edge)?;
     registry.append_event(
         "spawn.bound",
-        Some(registration_id.as_str()),
+        Some(super::EventTarget::Registration(registration_id.clone())),
         None,
         Some(&edge.request_id),
     );

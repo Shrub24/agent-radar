@@ -68,6 +68,17 @@ pub enum Channel {
 }
 
 impl Channel {
+    fn event_target(self, id: &str) -> Result<super::EventTarget, String> {
+        match self {
+            Self::Assignment => crate::identity::SubjectId::required(id, "target_id")
+                .map(super::EventTarget::Subject),
+            Self::Execution | Self::Facts => {
+                crate::identity::RegistrationId::required(id, "target_id")
+                    .map(super::EventTarget::Registration)
+            }
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Execution => "execution",
@@ -826,20 +837,18 @@ pub fn acquire_writer(
     now_ms: i64,
 ) -> Result<WriterBinding, super::Error> {
     request.validate()?;
+    let target = request.channel.event_target(&request.target_id)?;
     let _transition = registry.transition();
-    if request.channel == Channel::Assignment {
-        crate::control_plane::lifecycle::read_subject_record(
-            registry,
-            &crate::identity::SubjectId::required(&request.target_id, "target_id")?,
-        )?
-        .ok_or("assignment subject is not recorded")?;
-    } else {
-        registry
-            .get(&crate::identity::RegistrationId::required(
-                &request.target_id,
-                "target_id",
-            )?)?
-            .ok_or_else(|| super::Error::NotFound("process is not registered".into()))?;
+    match &target {
+        super::EventTarget::Subject(subject) => {
+            crate::control_plane::lifecycle::read_subject_record(registry, subject)?
+                .ok_or("assignment subject is not recorded")?;
+        }
+        super::EventTarget::Registration(registration) => {
+            registry
+                .get(registration)?
+                .ok_or_else(|| super::Error::NotFound("process is not registered".into()))?;
+        }
     }
     let existing = read_record(registry, &request.target_id, request.channel)?;
     let is_new = existing.is_none();
@@ -882,7 +891,7 @@ pub fn acquire_writer(
         } else {
             "publication.writer_replaced"
         },
-        Some(&request.target_id),
+        Some(target),
         None,
         None,
     );
@@ -935,6 +944,7 @@ pub fn publish(
     now_ms: i64,
 ) -> Result<ChannelRecord, super::Error> {
     let report = request.validate()?;
+    let target = request.channel.event_target(&request.target_id)?;
     let _transition = registry.transition();
     let record = read_record(registry, &request.target_id, request.channel)?
         .ok_or_else(|| super::Error::NotFound("channel has no writer".into()))?;
@@ -989,7 +999,7 @@ pub fn publish(
             Channel::Assignment => "assignment.published",
             Channel::Facts => "facts.published",
         },
-        Some(&request.target_id),
+        Some(target),
         None,
         None,
     );
@@ -1005,6 +1015,7 @@ pub fn retire(
     now_ms: i64,
 ) -> Result<ChannelRecord, super::Error> {
     validate_registration_id(writer_handle)?;
+    let target = channel.event_target(registration_id)?;
     let _transition = registry.transition();
     let record = read_record(registry, registration_id, channel)?
         .ok_or_else(|| super::Error::NotFound("channel has no writer".into()))?;
@@ -1028,7 +1039,7 @@ pub fn retire(
             Channel::Assignment => "assignment.retired",
             Channel::Facts => "facts.retired",
         },
-        Some(registration_id),
+        Some(target),
         None,
         None,
     );

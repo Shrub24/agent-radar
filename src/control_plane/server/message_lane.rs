@@ -77,7 +77,7 @@ pub(super) fn message_request(core: &Arc<Mutex<Core>>, request: &Request) -> Res
                             "communication.message_published",
                             &message.id,
                             message.recipients.first().map(ToString::to_string),
-                            message.producer.registration_id.as_str(),
+                            &message.producer.registration_id,
                         );
                     }
                     respond(
@@ -141,7 +141,7 @@ pub(super) fn message_request(core: &Arc<Mutex<Core>>, request: &Request) -> Res
                             "communication.message_received",
                             &receipt.message_id,
                             Some(identity.subject_id.to_string()),
-                            identity.registration_id.as_str(),
+                            &identity.registration_id,
                         );
                     }
                     respond(
@@ -257,7 +257,7 @@ pub(super) fn append_message_event(
     kind: &str,
     message_id: &str,
     subject_id: Option<String>,
-    registration_id: &str,
+    registration_id: &RegistrationId,
 ) {
     let event = store::Event {
         subject_id,
@@ -265,7 +265,7 @@ pub(super) fn append_message_event(
         lifecycle_event_id: None,
         seq: 0,
         kind: kind.to_owned(),
-        registration_id: Some(registration_id.to_owned()),
+        registration_id: Some(registration_id.clone()),
         spawn: None,
         request_id: Some(message_id.to_owned()),
         at: store::now(),

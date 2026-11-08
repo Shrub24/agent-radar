@@ -1358,7 +1358,9 @@ mod tests {
             lifecycle_event_id: None,
             seq,
             kind: "agent.registered".to_string(),
-            registration_id: Some(format!("agent-{seq}")),
+            registration_id: Some(
+                RegistrationId::parse(&format!("00000000-0000-4000-8000-{seq:012x}")).unwrap(),
+            ),
             spawn: None,
             request_id: None,
             at: "2026-01-01T00:00:00.000Z".to_string(),
